@@ -347,7 +347,11 @@ fn read_layout(r: Sparse) -> Result<Parse> {
         }
         ColorType::RGBA(_) => (4, ColorHint::Rgb { alpha: true }),
         ColorType::Multiband { num_samples, .. } => {
-            let color = super::geotiff::multiband_color(&mut dec, num_samples);
+            let color = if super::geotiff::is_rgbi(&mut dec) {
+                ColorHint::Rgb { alpha: false }
+            } else {
+                super::geotiff::multiband_color(&mut dec, num_samples)
+            };
             (num_samples.max(1) as usize, color)
         }
         other => return Ok(Parse::NotTiled(format!("{other:?} images are read whole"))),
