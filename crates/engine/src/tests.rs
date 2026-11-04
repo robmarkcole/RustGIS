@@ -26579,25 +26579,17 @@ fn rgbi_mosaics_keep_nir_without_alpha_and_reject_mixed_band_roles() {
     use rustgis_map::raster::RasterLayer;
     let mut s = Session::new(Project::default());
     let gt = GeoTransform { origin_x: 0.0, origin_y: 2.0, pixel_width: 1.0, pixel_height: -1.0 };
-    for (name, alpha) in [("nir", false), ("rgba", true)] {
-        let r = Raster::new(
-            name,
-            2,
-            2,
-            vec![vec![200.0; 4], vec![100.0; 4], vec![50.0; 4], vec![0.0; 4]],
-            gt,
-            Crs::LonLat,
-            None,
-            ColorHint::Rgb { alpha },
-            "UInt8",
-        )
-        .unwrap();
+    for (name, alpha, count) in [("nir", false, 4), ("nir2", false, 4), ("rgba", true, 4), ("rgb", false, 3)] {
+        let mut bands = vec![vec![200.0; 4], vec![100.0; 4], vec![50.0; 4], vec![0.0; 4]];
+        bands.truncate(count);
+        let r = Raster::new(name, 2, 2, bands, gt, Crs::LonLat, None, ColorHint::Rgb { alpha }, "UInt8").unwrap();
         let bytes = geotiff::write(&r, 0).unwrap();
         s.map_mut().add_raster(name, RasterLayer::from_bytes(r, format!("{name}.tif"), bytes));
     }
-    for (name, images, alpha) in [("RGBI", vec!["nir"], false), ("RGBA", vec!["rgba"], true)] {
+    for (name, images, alpha) in [("RGBI", vec!["nir", "nir2"], false), ("RGBA", vec!["rgba"], true)] {
         s.run("imagery.workspace", &json!({"kind":"ortho", "name":name, "images":images, "cellSize":1})).unwrap();
         let result = s.run("imagery.mosaic", &json!({"name":name})).unwrap();
+        assert!(result.get("messages").is_none(), "{result}");
         let layer = s.map().layer(result["layer"].as_u64().unwrap() as u32).unwrap();
         let rl = layer.raster.as_ref().unwrap();
         let r = rl.data.as_ref().unwrap();
@@ -26607,6 +26599,27 @@ fn rgbi_mosaics_keep_nir_without_alpha_and_reject_mixed_band_roles() {
         // The embedded file must also keep NIR when a project is reopened.
         let back = geotiff::read(std::io::Cursor::new(rl.embedded.as_ref().unwrap().as_slice()), "saved").unwrap();
         assert_eq!((back.band_count(), back.color), (4, ColorHint::Rgb { alpha }));
+    }
+    for (name, images, lost) in [
+        ("RGBI + RGB", vec!["nir", "rgb"], vec!["nir"]),
+        ("two RGBI + RGB", vec!["rgb", "nir", "nir2"], vec!["nir", "nir2"]),
+        ("RGBA + RGB", vec!["rgba", "rgb"], vec!["rgba"]),
+    ] {
+        s.run("imagery.workspace", &json!({"kind":"ortho", "name":name, "images":images, "cellSize":1})).unwrap();
+        let result = s.run("imagery.mosaic", &json!({"name":name})).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1, "{result}");
+        let message = messages[0].as_str().unwrap();
+        assert!(message.starts_with(&format!("{} image(s)", lost.len())), "{message}");
+        assert!(message.contains("3-band mosaic"), "{message}");
+        for image in lost {
+            assert!(message.contains(&format!("'{image}': band(s) 4")), "{message}");
+        }
+        assert!(!message.contains("'rgb':"), "{message}");
+        let layer = s.map().layer(result["layer"].as_u64().unwrap() as u32).unwrap();
+        let r = layer.raster.as_ref().unwrap().data.as_ref().unwrap();
+        assert_eq!(r.band_count(), 3);
+        assert_eq!(r.color, ColorHint::Rgb { alpha: false });
     }
     s.run("imagery.workspace", &json!({"kind":"ortho", "name":"mixed", "images":["nir","rgba"], "cellSize":1})).unwrap();
     let e = s.run("imagery.mosaic", &json!({"name":"mixed"})).unwrap_err().to_string();

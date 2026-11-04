@@ -1423,6 +1423,22 @@ pub(crate) fn mosaic_work(s: &Session, p: &Value) -> Result<super::workflows::Wo
         return Err(format!("the mosaic would be {cols} × {rows} cells; set a larger cell size in the workspace options"));
     }
     let nb = imgs.iter().map(|r| r.band_count()).min().unwrap_or(1).min(if w.kind == "reality" { 1 } else { 4 });
+    let omitted: Vec<String> = w
+        .images
+        .iter()
+        .zip(&imgs)
+        .filter(|(_, r)| r.band_count() > nb)
+        .map(|(name, r)| {
+            let bands = ((nb + 1)..=r.band_count()).map(|b| b.to_string()).collect::<Vec<_>>().join(", ");
+            format!("'{name}': band(s) {bands}")
+        })
+        .collect();
+    let extra = (!omitted.is_empty()).then(|| {
+        json!({"messages": [format!(
+            "{} image(s) have bands omitted from the {nb}-band mosaic: {}",
+            omitted.len(), omitted.join("; ")
+        )]})
+    });
     Ok(Box::new(move || {
         let refs: Vec<&Raster> = imgs.iter().map(|r| &**r).collect();
         let mut bands = rasterops::mosaic(&refs, &e, cell, (cols, rows), nb, w.method == "mean")?;
@@ -1446,7 +1462,7 @@ pub(crate) fn mosaic_work(s: &Session, p: &Value) -> Result<super::workflows::Wo
         let out =
             Raster::new(format!("{} {suffix}", w.name), cols as u32, rows as u32, bands, gt, Crs::LonLat, Some(NODATA as f64), color, dt)
                 .map_err(|e| e.to_string())?;
-        super::workflows::made(out, None)
+        super::workflows::made(out, extra)
     }))
 }
 
