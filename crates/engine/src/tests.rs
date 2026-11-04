@@ -26571,3 +26571,44 @@ fn raster_classes_run_on_another_thread() {
     assert_eq!((&r["model"], &r["replaced"]), (&json!("scene_model 2"), &json!(false)), "{r}");
     assert_eq!(s.project.dl_models.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(), ["scene_model", "scene_model 2"]);
 }
+
+#[test]
+fn rgbi_mosaics_keep_nir_without_alpha_and_reject_mixed_band_roles() {
+    isolate_plugins();
+    use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster, geotiff};
+    use rustgis_map::raster::RasterLayer;
+    let mut s = Session::new(Project::default());
+    let gt = GeoTransform { origin_x: 0.0, origin_y: 2.0, pixel_width: 1.0, pixel_height: -1.0 };
+    for (name, alpha) in [("nir", false), ("rgba", true)] {
+        let r = Raster::new(
+            name,
+            2,
+            2,
+            vec![vec![200.0; 4], vec![100.0; 4], vec![50.0; 4], vec![0.0; 4]],
+            gt,
+            Crs::LonLat,
+            None,
+            ColorHint::Rgb { alpha },
+            "UInt8",
+        )
+        .unwrap();
+        let bytes = geotiff::write(&r, 0).unwrap();
+        s.map_mut().add_raster(name, RasterLayer::from_bytes(r, format!("{name}.tif"), bytes));
+    }
+    for (name, images, alpha) in [("RGBI", vec!["nir"], false), ("RGBA", vec!["rgba"], true)] {
+        s.run("imagery.workspace", &json!({"kind":"ortho", "name":name, "images":images, "cellSize":1})).unwrap();
+        let result = s.run("imagery.mosaic", &json!({"name":name})).unwrap();
+        let layer = s.map().layer(result["layer"].as_u64().unwrap() as u32).unwrap();
+        let rl = layer.raster.as_ref().unwrap();
+        let r = rl.data.as_ref().unwrap();
+        assert_eq!(r.band_count(), 4);
+        assert_eq!(r.color, ColorHint::Rgb { alpha });
+        assert_eq!(r.value(3, 0, 0), Some(0.0));
+        // The embedded file must also keep NIR when a project is reopened.
+        let back = geotiff::read(std::io::Cursor::new(rl.embedded.as_ref().unwrap().as_slice()), "saved").unwrap();
+        assert_eq!((back.band_count(), back.color), (4, ColorHint::Rgb { alpha }));
+    }
+    s.run("imagery.workspace", &json!({"kind":"ortho", "name":"mixed", "images":["nir","rgba"], "cellSize":1})).unwrap();
+    let e = s.run("imagery.mosaic", &json!({"name":"mixed"})).unwrap_err().to_string();
+    assert!(e.contains("matching band roles"), "{e}");
+}

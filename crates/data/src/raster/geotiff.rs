@@ -574,7 +574,7 @@ fn samples<R: Read + Seek>(dec: &mut Decoder<R>) -> usize {
 /// PhotometricInterpretation is changed; RGBI is still shown as RGB, without an alpha band.
 pub(crate) struct Unpaletted<R> {
     inner: R,
-    /// Where each palette image's PhotometricInterpretation value is, and what to show there.
+    /// Where each patched image's PhotometricInterpretation value is, and what to show there.
     patches: Vec<(u64, [u8; 2])>,
     /// IFDs whose RGB plus unspecified sample is shown to the decoder as multiband.
     rgb_ifds: Vec<u64>,
@@ -655,11 +655,10 @@ fn header_patches<R: Read + Seek>(r: &mut R) -> HeaderPatches {
             let palette = short(262) == Some(3);
             let rgbi = short(262) == Some(2) && short(277) == Some(4) && short(338) == Some(0);
             if palette || rgbi {
-                for (i, e) in entries.chunks(entry_len as usize).enumerate() {
-                    if u16_(e)? == 262 {
-                        let at = ifd + count_len + i as u64 * entry_len + value_at as u64;
-                        patches.bytes.push((at, if little { [1, 0] } else { [0, 1] }));
-                    }
+                // Patch only the entry inspected by `short`, even if a hostile IFD repeats it.
+                if let Some(i) = entries.chunks(entry_len as usize).position(|e| u16_(e) == Some(262)) {
+                    let at = ifd + count_len + i as u64 * entry_len + value_at as u64;
+                    patches.bytes.push((at, if little { [1, 0] } else { [0, 1] }));
                 }
                 patches.first_palette |= palette && k == 0;
                 if rgbi {
@@ -1194,10 +1193,9 @@ pub(super) fn read_limited_with_nodata(
     };
     let planar = dec.find_tag_unsigned::<u16>(Tag::PlanarConfiguration).ok().flatten() == Some(2);
     let n = (w as usize) * (h as usize);
-    // The decoder leaves out samples past the colour ones (RGB with an undefined fourth band, as
-    // in RGBI orthophotos) a tile row at a time, and writes a padded edge tile's whole width into
-    // the image: past its edge, over the start of the next row (issue #162). Such tiled images
-    // are read a tile at a time, as their chunks come back only as wide as the image.
+    // Extra samples the decoder leaves out can make padded edge tiles spill into the next row
+    // when read whole (issue #162). Read those tile by tile. RGBI now keeps its fourth sample
+    // through the patched reader, so it no longer needs this workaround.
     let tile_rows = dec.find_tag_unsigned::<u32>(Tag::TileLength).ok().flatten();
     let tiled = dec.find_tag_unsigned::<u32>(Tag::TileWidth).ok().flatten().is_some();
     let extra_samples = !planar && samples(&mut dec) > nbands && tiled;
@@ -1400,19 +1398,14 @@ pub(super) fn fits_bytes(r: &Raster, b: usize) -> bool {
     nodata_ok && (whole_bytes || s.count == 0)
 }
 
-/// The bands [`write`] writes of `r` given `band`: an RGB raster's colour bands (with a fourth as
-/// alpha when they are bytes and it is too, or when the raster says it is alpha), otherwise `band`
-/// alone.
+/// The bands [`write`] writes of `r` given `band`: RGB and its fourth sample (alpha only when
+/// declared alpha), otherwise `band` alone.
 pub fn written_bands(r: &Raster, band: usize) -> Vec<usize> {
     if !(matches!(r.color, ColorHint::Rgb { .. }) && r.bands.len() >= 3) {
         return vec![band];
     }
-    let alpha = if (0..3).all(|b| fits_bytes(r, b)) {
-        r.bands.len() >= 4 && fits_bytes(r, 3)
-    } else {
-        r.bands.len() >= 4 && matches!(r.color, ColorHint::Rgb { alpha: true })
-    };
-    (0..if alpha { 4 } else { 3 }).collect()
+    let fourth = r.bands.len() == 4 || (r.bands.len() > 4 && matches!(r.color, ColorHint::Rgb { alpha: true }));
+    (0..if fourth { 4 } else { 3 }).collect()
 }
 
 /// Writes a raster as a Deflate-compressed GeoTIFF: a colour raster's colour bands (RGB(A) bytes
@@ -1448,6 +1441,9 @@ pub fn write(r: &Raster, band: usize) -> Result<Vec<u8>> {
         ($img:expr, $written:expr) => {{
             let classes = super::gdal_metadata_of(r, $written);
             let e = $img.encoder();
+            if $written.len() == 4 && matches!(r.color, ColorHint::Rgb { alpha: false }) {
+                e.write_tag(Tag::ExtraSamples, &[0u16][..]).map_err(err)?;
+            }
             e.write_tag(Tag::ModelPixelScaleTag, &scale[..]).map_err(err)?;
             e.write_tag(Tag::ModelTiepointTag, &tie[..]).map_err(err)?;
             e.write_tag(Tag::GeoKeyDirectoryTag, &keys[..]).map_err(err)?;
@@ -1467,7 +1463,16 @@ pub fn write(r: &Raster, band: usize) -> Result<Vec<u8>> {
             }
         }};
     }
-    if rgb && let (Some(red), Some(green), Some(blue)) = (bytes(0), bytes(1), bytes(2)) {
+    // Without alpha or a no-data marker, byte samples cannot keep NaN holes (for example the
+    // cells outside a reprojected RGBI image). Keep those samples as floats instead.
+    let byte_holes = r.nodata.is_none()
+        && matches!(r.color, ColorHint::Rgb { alpha: false })
+        && written_bands(r, band).iter().any(|b| r.bands.get(*b).is_some_and(|b| b.stats.count < (w as usize) * (h as usize)));
+    if rgb
+        && !byte_holes
+        && (!written_bands(r, band).contains(&3) || fits_bytes(r, 3))
+        && let (Some(red), Some(green), Some(blue)) = (bytes(0), bytes(1), bytes(2))
+    {
         let alpha = if written_bands(r, band).contains(&3) { bytes(3) } else { None };
         let n = (w as usize) * (h as usize);
         if let Some(a) = alpha {
@@ -1622,6 +1627,28 @@ mod tests {
         assert_eq!(back.color, ColorHint::Rgb { alpha: false });
         assert_eq!(back.value(2, 1, 0), Some(60.0));
         assert_eq!(back.data_type, "UInt8");
+    }
+
+    #[test]
+    fn rgbi_byte_export_does_not_turn_nir_into_alpha() {
+        let gt = GeoTransform { origin_x: 0.0, origin_y: 2.0, pixel_width: 1.0, pixel_height: -1.0 };
+        let r = Raster::new(
+            "rgbi",
+            2,
+            2,
+            vec![vec![200.0; 4], vec![100.0; 4], vec![50.0; 4], vec![0.0; 4]],
+            gt,
+            Crs::LonLat,
+            None,
+            ColorHint::Rgb { alpha: false },
+            "UInt8",
+        )
+        .unwrap();
+        assert_eq!(written_bands(&r, 0), vec![0, 1, 2, 3]);
+        let back = read(std::io::Cursor::new(write(&r, 0).unwrap()), "rgb").unwrap();
+        assert_eq!((back.band_count(), back.color.clone()), (4, ColorHint::Rgb { alpha: false }));
+        assert_eq!(back.value(0, 0, 0), Some(200.0));
+        assert_eq!(back.value(3, 0, 0), Some(0.0));
     }
 
     /// An Equi7 tile (a Sentinel-1 product on TU Wien's grid, say) names its system by its EPSG
