@@ -200,6 +200,23 @@ A layer saved by an older version, which kept the file name it was downloaded un
 the service's address, shows **Add**; RustGIS won't guess by name. A service's downloaded layers
 are grouped under the service's host in the Layers pane's **Data Source** view, and **Copy Path**
 gives that address without its keys or tokens.
+
+Adding a layer or importing a group leaves the view where it is: only the first content added to an
+empty map (beyond its basemap) is framed. A map holds content once it has a layer (hidden or not), a
+tile overlay, or a cloud-optimised GeoTIFF, PMTiles or MBTiles tile layer (hidden, or drawn as a
+basemap, included). A plain basemap does not count, and neither does a map style a service offers:
+it draws as a basemap, under the layers.
+
+A PMTiles or MBTiles archive added as a file is the exception: it is framed on its bounds whatever
+the map holds, unless it covers the whole world. Features asked for over an area keep the view, or
+go to the box given. Layer files (`.rgislyr`) retain the current view even on an empty map.
+STAC searches frame their result footprints, in the browser and the commands, so the searched
+area is visible. Adding administrative boundaries follows the ordinary first-content rule.
+If several archives or styles request a view while their metadata loads, the latest request
+supersedes earlier pending requests. Panning or navigating elsewhere cancels pending framing.
+MBTiles metadata normally loads in the background. A read still pending after 30 seconds, or
+a worker pool saturated by stalled storage, reports an error; retry once the storage responds.
+
 An OGC API landing page works directly: RustGIS follows its advertised
 JSON collections link, so you don't need to append `/collections`. If the landing page also
 offers map tiles, they remain listed alongside the collections. A failed collections request
@@ -240,7 +257,7 @@ Scripts use `service.import {"url":"…","name":"My OGC Layer"}` and
 | OGC API Features | Collections | Their items downloaded as GeoJSON, following the service's `next` pages up to 100,000 features, or more on a computer with more memory (see Environments in the analysis guide; a command such as `service.add` waits a minute at most) |
 | OGC API Tiles | Collections' map and vector tiles; a landing page's dataset map tiles | A tile layer in WebMercatorQuad, from the tile template the tileset advertises (its `item` link; `…/tiles/WebMercatorQuad/{z}/{y}/{x}`, the usual path, when that can't be read), keeping the tiles link's query (a token), map tiles in the server's image format, vector tiles drawn layer by layer in colours of their own |
 | WCS 1.0 / 2.0 (a 1.1 service is asked in 1.0) | Coverages, with their bounds | A raster: GetCoverage of the map's view within the coverage's bounds (or its whole extent: `"bbox": "full"`), as a GeoTIFF in EPSG:4326, at most 2048 pixels on a side |
-| ArcGIS REST | FeatureServer and MapServer layers; a MapServer's map; an ImageServer; a VectorTileServer | Layers queried as GeoJSON (the layer's description read first, or given up on after 15 seconds), page by page past the server's record limit (`resultOffset`) up to 100,000 features or more on a computer with more memory (a command such as `service.add` waits a minute at most for the features), where the layer supports paging (ArcGIS Server 10.3 and later; otherwise up to the record limit); a map as its tile cache when it is Web Mercator's pyramid, else exported images; an ImageServer as exported images; a VectorTileServer as its MapLibre style |
+| ArcGIS REST | FeatureServer and MapServer layers; a MapServer's map; an ImageServer; a VectorTileServer | Layers queried as GeoJSON, or in protocol buffers (`f=pbf`, smaller and quicker to read) when the layer's description lists them and names its record limit (the description read first, or given up on after 15 seconds; a first protocol buffer page that can't be fetched or read has the layer read in GeoJSON), page by page past the server's record limit (`resultOffset`) up to 100,000 features or more on a computer with more memory (a command such as `service.add` waits a minute at most for the features), where the layer supports paging (ArcGIS Server 10.3 and later; otherwise up to the record limit); a map as its tile cache when it is Web Mercator's pyramid, else exported images; an ImageServer as exported images; a VectorTileServer as its MapLibre style |
 
 A WMS or WMTS layer's tiles are asked for down to the detail its service gives, and stretched
 only past it: a WMTS layer's over the zooms of its tile matrix set (or those its
