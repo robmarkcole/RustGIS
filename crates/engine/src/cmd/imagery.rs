@@ -1446,8 +1446,8 @@ pub(crate) fn mosaic_work(s: &Session, p: &Value) -> Result<super::workflows::Wo
         // rounded), so it displays as they do; anything else is Float32.
         let all_rgb = imgs.iter().all(|r| matches!(r.color, ColorHint::Rgb { .. }));
         let all_alpha = imgs.iter().all(|r| matches!(r.color, ColorHint::Rgb { alpha: true }));
-        if nb == 4 && all_rgb && !all_alpha && imgs.iter().any(|r| matches!(r.color, ColorHint::Rgb { alpha: true })) {
-            return Err("RGBI and RGBA images cannot share a mosaic's fourth band: use images with matching band roles".into());
+        if nb == 4 && !all_alpha && imgs.iter().any(|r| matches!(r.color, ColorHint::Rgb { alpha: true })) {
+            return Err("RGBA images cannot share a mosaic's fourth band with data bands: use images with matching band roles".into());
         }
         let color = if matches!(nb, 3 | 4) && all_rgb { ColorHint::Rgb { alpha: nb == 4 && all_alpha } } else { ColorHint::Gray };
         let all_u8 = imgs.iter().all(|r| r.data_type == "UInt8");

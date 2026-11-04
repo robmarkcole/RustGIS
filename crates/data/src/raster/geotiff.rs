@@ -2024,10 +2024,14 @@ mod tests {
     }
 
     fn rgbi_tiled_encoded(images: &[(u32, u32)], bits: u16, predictor: u16, pixel: impl Fn(u32, u32, u32) -> u16) -> Vec<u8> {
+        rgb_tiled_samples(&images.iter().map(|&(size, tile)| (size, tile, 4)).collect::<Vec<_>>(), bits, predictor, pixel)
+    }
+
+    fn rgb_tiled_samples(images: &[(u32, u32, u16)], bits: u16, predictor: u16, pixel: impl Fn(u32, u32, u32) -> u16) -> Vec<u8> {
         let full = images.first().map_or(1, |i| i.0);
         let mut out = vec![b'I', b'I', 42, 0, 0, 0, 0, 0];
         let mut next_link = 4;
-        for (i, &(size, tile)) in images.iter().enumerate() {
+        for (i, &(size, tile, samples)) in images.iter().enumerate() {
             let k = full / size;
             let n = size.div_ceil(tile);
             // The tiles' data first, then the IFD pointing at it.
@@ -2040,7 +2044,7 @@ mod tests {
                     let mut prev = [0u16; 4];
                     for x in 0..tile {
                         let (x, y) = ((t % n) * tile + x, (t / n) * tile + y);
-                        for b in 0..4 {
+                        for b in 0..u32::from(samples) {
                             let value = if x < size && y < size { pixel(b, x * k, y * k) } else { 0 };
                             let encoded = if predictor == 2 { value.wrapping_sub(prev[b as usize]) } else { value };
                             prev[b as usize] = value;
@@ -2060,18 +2064,20 @@ mod tests {
                 (254, 4, 1, longs(&[u32::from(i > 0)])),
                 (256, 4, 1, longs(&[size])),
                 (257, 4, 1, longs(&[size])),
-                (258, 3, 4, shorts(&[bits; 4])),
+                (258, 3, u32::from(samples), shorts(&vec![bits; usize::from(samples)])),
                 (259, 3, 1, shorts(&[if predictor == 1 { 1 } else { 8 }])),
                 (262, 3, 1, shorts(&[2])),
-                (277, 3, 1, shorts(&[4])),
+                (277, 3, 1, shorts(&[samples])),
                 (284, 3, 1, shorts(&[1])),
                 (317, 3, 1, shorts(&[predictor])),
                 (322, 4, 1, longs(&[tile])),
                 (323, 4, 1, longs(&[tile])),
                 (324, 4, offsets.len() as u32, longs(&offsets)),
                 (325, 4, counts.len() as u32, longs(&counts)),
-                (338, 3, 1, shorts(&[0])),
             ];
+            if samples == 4 {
+                e.push((338, 3, 1, shorts(&[0])));
+            }
             if i == 0 {
                 e.push((33550, 12, 3, doubles(&[0.2, 0.2, 0.0])));
                 e.push((33922, 12, 6, doubles(&[0.0, 0.0, 0.0, 641_000.0, 5_650_000.0, 0.0])));
@@ -2186,6 +2192,26 @@ mod tests {
                     for (b, value) in [1000 + p * 11, 2000 + p * 13, 3000 + p * 17, p % 3].iter().enumerate() {
                         assert_eq!(r.value(b, (p % 7).into(), (p / 7).into()), Some(f32::from(*value)));
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cog_overviews_require_matching_sample_counts() {
+        use super::super::cog::{self, Parse, Sparse};
+        for full in [3, 4] {
+            for overview in [3, 4] {
+                let bytes = rgb_tiled_samples(&[(40, 16, full), (20, 16, overview)], 8, 1, |b, x, y| (b * 10 + x + y) as u16);
+                let whole = Sparse::default().with_len(bytes.len() as u64).with(0, bytes);
+                if full == overview {
+                    let Parse::Done(layout) = cog::layout(&whole).unwrap() else { panic!("not a COG") };
+                    assert_eq!(layout.levels.len(), 2);
+                    assert_eq!(layout.bands, usize::from(full));
+                } else {
+                    let error = cog::layout(&whole).unwrap_err().to_string();
+                    assert!(error.contains(&format!("image 1 has {overview} samples per pixel")), "{error}");
+                    assert!(error.contains(&format!("full image has {full}")), "{error}");
                 }
             }
         }

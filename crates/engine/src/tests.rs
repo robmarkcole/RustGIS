@@ -27300,10 +27300,16 @@ fn rgbi_mosaics_keep_nir_without_alpha_and_reject_mixed_band_roles() {
     use rustgis_map::raster::RasterLayer;
     let mut s = Session::new(Project::default());
     let gt = GeoTransform { origin_x: 0.0, origin_y: 2.0, pixel_width: 1.0, pixel_height: -1.0 };
-    for (name, alpha, count) in [("nir", false, 4), ("nir2", false, 4), ("rgba", true, 4), ("rgb", false, 3)] {
+    for (name, color, count) in [
+        ("nir", ColorHint::Rgb { alpha: false }, 4),
+        ("nir2", ColorHint::Rgb { alpha: false }, 4),
+        ("rgba", ColorHint::Rgb { alpha: true }, 4),
+        ("rgb", ColorHint::Rgb { alpha: false }, 3),
+        ("multispectral", ColorHint::Gray, 4),
+    ] {
         let mut bands = vec![vec![200.0; 4], vec![100.0; 4], vec![50.0; 4], vec![0.0; 4]];
         bands.truncate(count);
-        let r = Raster::new(name, 2, 2, bands, gt, Crs::LonLat, None, ColorHint::Rgb { alpha }, "UInt8").unwrap();
+        let r = Raster::new(name, 2, 2, bands, gt, Crs::LonLat, None, color, "UInt8").unwrap();
         let bytes = geotiff::write(&r, 0).unwrap();
         s.map_mut().add_raster(name, RasterLayer::from_bytes(r, format!("{name}.tif"), bytes));
     }
@@ -27342,7 +27348,13 @@ fn rgbi_mosaics_keep_nir_without_alpha_and_reject_mixed_band_roles() {
         assert_eq!(r.band_count(), 3);
         assert_eq!(r.color, ColorHint::Rgb { alpha: false });
     }
-    s.run("imagery.workspace", &json!({"kind":"ortho", "name":"mixed", "images":["nir","rgba"], "cellSize":1})).unwrap();
-    let e = s.run("imagery.mosaic", &json!({"name":"mixed"})).unwrap_err().to_string();
-    assert!(e.contains("matching band roles"), "{e}");
+    for (name, images) in [
+        ("mixed", vec!["nir", "rgba"]),
+        ("mixed non-RGB", vec!["multispectral", "rgba"]),
+        ("mixed non-RGB reversed", vec!["rgba", "multispectral"]),
+    ] {
+        s.run("imagery.workspace", &json!({"kind":"ortho", "name":name, "images":images, "cellSize":1})).unwrap();
+        let e = s.run("imagery.mosaic", &json!({"name":name})).unwrap_err().to_string();
+        assert!(e.contains("matching band roles"), "{e}");
+    }
 }
