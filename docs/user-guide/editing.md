@@ -261,7 +261,8 @@ counterclockwise WGS 84 longitude/latitude Polygon with four corners, its featur
 and a `_rustgis_box` text property containing the versioned construction parameters and reference
 frame. Other GIS applications can use the polygons without interpreting that property.
 
-Reopen the GeoJSON, select its layer, enable editing and choose **Edit Rotated Boxes** to resume.
+Reopen the GeoJSON, select its layer and choose **Add or Edit Boxes** on the Annotate tab or
+the layer’s right-click menu to resume. Editing is enabled automatically.
 Keep `_rustgis_box` intact for constrained editing. RustGIS validates it against the polygon,
 accepting reversed winding and a different starting corner. If generic vertex edits or another
 application change the geometry, the box controls refuse to refit it silently; the feature remains

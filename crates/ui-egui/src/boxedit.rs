@@ -143,13 +143,13 @@ pub(crate) fn follow(app: &mut RustGisApp) {
     }
 }
 fn selected(app: &RustGisApp) -> Result<(u32, usize, BoxSpec), String> {
-    let id = app.session.active_layer.ok_or("select an annotation layer")?;
-    let l = app.session.map().layer(id).ok_or("no layer")?;
+    let id = app.session.active_layer.ok_or(tl!("select an annotation layer"))?;
+    let l = app.session.map().layer(id).ok_or(tl!("no layer"))?;
     if !supported(app) || !ready(app) || !app.session.map().editing.settings.enabled {
-        return Err("select a visible, editable annotation layer".into());
+        return Err(tl!("select a visible, editable annotation layer").into());
     }
     let [row] = l.selection.as_slice() else {
-        return Err("select one box to edit its dimensions".into());
+        return Err(tl!("select one box to edit its dimensions").into());
     };
     if l.drawn_rows(app.session.scale()).get(*row) != Some(&true) {
         return Err(tl!("The selected box is hidden by a filter.").into());
@@ -160,9 +160,8 @@ fn frame(app: &RustGisApp) -> Result<Frame, String> {
     app.boxes.reference.map_or_else(|| Ok(Frame::default()), |id| Frame::from_reference(&app.session, id))
 }
 fn run(app: &mut RustGisApp, id: &str, p: serde_json::Value) {
-    if let Err(e) = app.run(id, p) {
-        app.session.notify(e, true);
-    }
+    // RustGisApp::run reports failures, including redaction and duplicate suppression.
+    let _ = app.run(id, p);
 }
 pub(crate) fn panel(app: &mut RustGisApp, ctx: &egui::Context) {
     if app.session.tool != Tool::RotatedBox || app.session.active_layout.is_some() || app.mb.shown() || app.ws.catalog_view {
@@ -859,6 +858,17 @@ mod tests {
         assert!(app.boxes.classes.values.contains("truck"));
         app.session.map_mut().layer_mut(id).unwrap().dataset.fields[0].ty = rustgis_engine::data::FieldType::Integer;
         assert!(!ready(app), "record field alone does not make an annotation schema");
+    }
+    #[test]
+    fn annotation_commands_report_each_failure_once() {
+        let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        app.run("annotation.newLayer", json!({})).unwrap();
+        let mark = app.session.notice_mark();
+        run(&mut app, "annotation.setClass", json!({"class":"vehicle","color":"invalid"}));
+        assert_eq!(app.session.notices_since(mark).iter().filter(|notice| notice.error).count(), 1);
+        let mark = app.session.notice_mark();
+        run(&mut app, "annotation.setClass", json!({"class":"vehicle","color":"#3B82F6"}));
+        assert!(app.session.notices_since(mark).is_empty());
     }
     #[test]
     fn annotation_space_pan_preserves_tool_and_more_boxes_use_same_layer() {
