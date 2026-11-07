@@ -2106,6 +2106,7 @@ impl RustGisApp {
         // of another, so it ends when the open layout changes (or layouts come and go).
         let open_layout = |app: &Self| (app.session.active_layout, app.session.project.layouts.len());
         let layout_before = open_layout(self);
+        let tool_before = self.session.tool;
         let notice_mark = self.session.notice_mark();
         // A plugin's command that adds data by address doesn't freeze the app: the download is
         // left for the frame loop (`ui.addUrl`), as in the browser.
@@ -2117,7 +2118,10 @@ impl RustGisApp {
             self.session.run(id, &params)
         };
         r = self.deliver_gp_files(r);
-        if r.is_ok() && id == "tool.set" {
+        if r.is_ok() && matches!(id, "annotation.newLayer" | "annotation.resume") {
+            self.ui.tab = "Annotate".into();
+        }
+        if r.is_ok() && (id == "tool.set" || self.session.tool != tool_before) {
             self.map.cancel_sketch();
             boxedit::cancel(&mut self.boxes);
         }
@@ -4772,6 +4776,7 @@ impl RustGisApp {
         {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
+        boxedit::follow(self);
         if self.ui.backstage {
             backstage::show(self, ui);
         } else {
@@ -4965,6 +4970,8 @@ const MAX_STEP_BYTES: usize = 4 << 20;
 /// an optional `layer` that defaults to the active layer goes here, so a recorded step names it;
 /// `record_tests::every_optional_layer_is_classified` fails until it is placed here or there.
 const DEFAULTS_TO_ACTIVE_LAYER: &[&str] = &[
+    "annotation.resume",
+    "annotation.setClass",
     "select.byAttributes",
     "select.rows",
     "select.layerFromSelection",

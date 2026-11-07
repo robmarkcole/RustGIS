@@ -2224,6 +2224,12 @@ fn layer_menu(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, reorder: bool) {
         let _ = app.run("labels.enable", json!({"layer": l.id}));
         ui.close();
     }
+    if rustgis_engine::cmd::annotation::check_layer(&app.session, l.id).is_ok()
+        && ui.button(tl!("Add or Edit Boxes")).on_hover_text(tl!("Continue adding annotations to this layer, or edit its boxes.")).clicked()
+    {
+        let _ = app.run("annotation.resume", json!({"layer":l.id}));
+        ui.close();
+    }
     if !l.is_raster() && ui.button(tl!("Labeling Properties…")).clicked() {
         if let Err(e) = app.run("ui.pane.labeling", json!({"layer": l.id})) {
             app.session.notify(e, true);
@@ -8094,6 +8100,24 @@ mod tests {
         assert_eq!(h.state().session.revision, rev, "the menu ran a command on every frame");
     }
 
+    #[test]
+    fn annotation_layer_menu_resumes_on_the_existing_layer() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        app.run("annotation.newLayer", json!({})).unwrap();
+        let layer = app.session.map().layers[0].clone();
+        app.run("tool.set", json!({"tool":"explore"})).unwrap();
+        app.session.map_mut().editing.settings.enabled = false;
+        let mut h = egui_kittest::Harness::builder().build_ui_state(|ui, app: &mut RustGisApp| layer_menu(app, ui, &layer, true), app);
+        h.step();
+        h.get_by_label("Add or Edit Boxes").click();
+        h.step();
+        assert_eq!(h.state().session.tool, rustgis_engine::Tool::RotatedBox);
+        assert_eq!(h.state().session.active_layer, Some(layer.id));
+        assert_eq!(h.state().session.map().layers.len(), 1);
+        assert!(h.state().session.map().editing.settings.enabled);
+        assert_eq!(h.state().ui.tab, "Annotate");
+    }
     /// A feature layer's menu converts its labels into an annotation layer (#858), as View ›
     /// Labeling › Convert does, by the command's name.
     #[test]

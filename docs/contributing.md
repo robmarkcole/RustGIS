@@ -182,6 +182,7 @@ is space. Agree on that purpose before reorganising a tab.
 | Style | Deciding how a layer looks on the map: how its features are drawn and shown at different scales. |
 | Labeling | How the map is labelled: what gets a label, with which text, where, and at which scales, plus the label settings for the whole map. |
 | Edit | Creating and changing features and graphics on the map, and managing those edits. |
+| Annotate | Creating classed object annotations for training data: choosing a target layer, classes and shapes, navigating imagery and exporting annotations. |
 | Analyze | Turning existing data into new results, from single tools to repeatable workflows, scripts and automation. |
 | View | How the map and workspace are displayed: map appearance and view configuration, and which panes and windows are open. Basic navigation stays on Home. |
 | Publish | Getting work out to others: printing, exporting or sharing products such as maps, layouts, reports and packages, including on the web. |

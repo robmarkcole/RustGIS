@@ -2,11 +2,12 @@
 //! is a text attribute, preserved by existing project and GeoJSON readers and writers.
 use super::{ps, uint};
 use crate::{CmdResult, CommandSpec as C, Session};
-use rustgis_data::raster::{Crs, GeoTransform};
+use rustgis_data::raster::{Crs, GeoTransform, Transformer};
 use rustgis_data::{Dataset, Field, FieldType, Geometry, GeometryType, Value as Cell};
 use rustgis_geom::Coord;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::{cell::RefCell, rc::Rc};
 
 pub const RECORD: &str = "_rustgis_box";
 
@@ -28,7 +29,26 @@ impl Default for Frame {
         }
     }
 }
+// A bounded runtime-only cache: repeated EPSG conversions while drawing handles reuse the
+// parsed projection. CRS is the entire transformer key; the pixel transform is applied below.
+type CachedProjection = Option<(Crs, Rc<Transformer>)>;
+thread_local! {
+    static PROJECTION: RefCell<CachedProjection> = const { RefCell::new(None) };
+}
 impl Frame {
+    fn transformer(&self) -> Option<Rc<Transformer>> {
+        PROJECTION.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if let Some((crs, t)) = cache.as_ref()
+                && *crs == self.crs
+            {
+                return Some(Rc::clone(t));
+            }
+            let t = Rc::new(self.crs.transformer().ok()?);
+            *cache = Some((self.crs, Rc::clone(&t)));
+            Some(t)
+        })
+    }
     pub fn from_reference(s: &Session, id: u32) -> Result<Self, String> {
         let l = s.map().layer(id).ok_or("reference raster no longer exists")?;
         let r = l.raster.as_ref().and_then(|r| r.data.as_ref()).ok_or("choose a loaded reference raster")?;
@@ -44,13 +64,13 @@ impl Frame {
         if !self.transform.is_valid() {
             return None;
         }
-        self.crs.transformer().ok()?.to_lonlat(self.transform.to_world(p[0], p[1]))
+        self.transformer()?.to_lonlat(self.transform.to_world(p[0], p[1]))
     }
     pub fn to_local(&self, c: Coord) -> Option<[f64; 2]> {
         if !self.transform.is_valid() {
             return None;
         }
-        let c = self.crs.transformer().ok()?.from_lonlat(c)?;
+        let c = self.transformer()?.from_lonlat(c)?;
         let (x, y) = self.transform.to_pixel(c);
         (x.is_finite() && y.is_finite()).then_some([x, y])
     }
@@ -108,22 +128,22 @@ impl BoxSpec {
         // Local rectangles must remain strict convex quadrilaterals after transformation.
         // Cross products use coordinate differences, avoiding cancellation far from (0, 0).
         // Refuse folds/collapsed edges rather than export a self-intersecting polygon.
-        let turns: Vec<f64> = (0..4)
-            .map(|i| {
-                let a = ring[i];
-                let b = ring[(i + 1) % 4];
-                let c = ring[(i + 2) % 4];
-                (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x)
-            })
-            .collect();
-        if turns.iter().any(|v| !v.is_finite() || *v == 0. || v.signum() != turns[0].signum()) {
+        let mut turns = Vec::new();
+        for i in 0..4 {
+            let a = ring.get(i).ok_or("missing box corner")?;
+            let b = ring.get((i + 1) % 4).ok_or("missing box corner")?;
+            let c = ring.get((i + 2) % 4).ok_or("missing box corner")?;
+            turns.push((b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x));
+        }
+        let first_turn = *turns.first().ok_or("missing box corner")?;
+        if turns.iter().any(|v| !v.is_finite() || *v == 0. || v.signum() != first_turn.signum()) {
             return Err("box folds or collapses after transformation; use a smaller box".into());
         }
         // GeoJSON exterior rings are counterclockwise in longitude/latitude.
-        if turns[0] < 0. {
+        if first_turn < 0. {
             ring.reverse();
         }
-        ring.push(ring[0]);
+        ring.push(*ring.first().ok_or("missing box corner")?);
         Ok(Geometry::Polygon(vec![vec![ring]]))
     }
     /// Recognise only an unchanged box. Foreign vertex edits never silently get refitted.
@@ -147,14 +167,20 @@ impl BoxSpec {
             return Err("box geometry is missing".into());
         };
         let ring = polys.first().and_then(|p| p.first()).ok_or("box geometry is missing")?;
-        let target = &want[0][0];
+        let target = want.first().and_then(|p| p.first()).ok_or("box geometry is missing")?;
         let close = |a: &Coord, b: &Coord| (a.x - b.x).abs() < 1e-9 && (a.y - b.y).abs() < 1e-9;
         let same = polys.len() == 1
-            && polys[0].len() == 1
+            && polys.first().is_some_and(|p| p.len() == 1)
             && ring.len() == 5
-            && close(&ring[0], &ring[4])
+            && ring.first().zip(ring.get(4)).is_some_and(|(a, b)| close(a, b))
             && (0..4).any(|offset| {
-                (0..4).all(|i| close(&ring[i], &target[(offset + i) % 4])) || (0..4).all(|i| close(&ring[i], &target[(offset + 4 - i) % 4]))
+                let matches = |reversed| {
+                    (0..4).all(|i| {
+                        let at = if reversed { (offset + 4 - i) % 4 } else { (offset + i) % 4 };
+                        ring.get(i).zip(target.get(at)).is_some_and(|(a, b)| close(a, b))
+                    })
+                };
+                matches(false) || matches(true)
             });
         if !same {
             return Err("polygon differs from its box record; use Edit Vertices as an ordinary polygon".into());
@@ -165,12 +191,119 @@ impl BoxSpec {
 
 pub fn commands() -> Vec<C> {
     vec![
-        C::new("annotation.newLayer","New Box Annotation Layer","Edit › Features",new_layer).params(r#"{"name"?: text}"#),
-        C::new("annotation.addBox","Add Rotated Box","Edit › Features",add).when(super::design::need_editable)
+        C::new("annotation.newLayer","New Box Annotation Layer","Annotate › Layers",new_layer).params(r#"{"name"?: text}"#),
+        C::new("annotation.resume", "Add or Edit Boxes", "Annotate › Shapes", resume).params(r#"{"layer"?:name|id}"#),
+        C::new("annotation.setClass", "Set Annotation Class", "Annotate › Classes", set_class)
+            .params(r##"{"layer"?:name|id,"class":text,"color"?:"#RRGGBB"}"##),
+        C::new("annotation.addBox","Add Rotated Box","Annotate › Shapes",add).when(super::design::need_editable)
             .params(r#"{"layer"?, "box": {"version":1,"frame":{"crs":CRS,"transform":GeoTransform,"image":text|null},"center":[x,y],"width":number,"height":number,"angle":clockwise degrees}, "class"?:text}"#),
-        C::new("annotation.updateBox","Update Rotated Box","Edit › Features",update).when(super::design::need_editable)
+        C::new("annotation.updateBox","Update Rotated Box","Annotate › Shapes",update).when(super::design::need_editable)
             .params(r#"{"layer"?,"row":number,"box": as annotation.addBox,"class"?:text}"#),
     ]
+}
+/// Returns the configured class colour, including classes with no features yet.
+pub fn class_colors(s: &Session, id: u32) -> Vec<(String, rustgis_map::Rgba)> {
+    match s.map().layer(id).map(|l| &l.renderer) {
+        Some(rustgis_map::Renderer::Unique { field, classes, expression: None, .. }) if field.eq_ignore_ascii_case("class") => {
+            classes.iter().map(|(name, symbol)| (name.clone(), symbol.stroke)).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+/// Colour suggested for the next new class; existing class colours remain unchanged.
+pub fn default_class_color(i: usize) -> rustgis_map::Rgba {
+    use rustgis_map::Rgba;
+    let palette = [
+        Rgba::rgb(59, 130, 246),
+        Rgba::rgb(249, 115, 22),
+        Rgba::rgb(34, 197, 94),
+        Rgba::rgb(168, 85, 247),
+        Rgba::rgb(236, 72, 153),
+        Rgba::rgb(6, 182, 212),
+        Rgba::rgb(234, 179, 8),
+        Rgba::rgb(148, 90, 60),
+    ];
+    palette.get(i % palette.len()).copied().unwrap_or(Rgba::rgb(59, 130, 246)).shade(1. - (i / palette.len()).min(7) as f64 * 0.08)
+}
+fn ensure_class(l: &mut rustgis_map::Layer, name: &str, color: Option<rustgis_map::Rgba>) -> Result<bool, String> {
+    use rustgis_map::symbology::MAX_UNIQUE;
+    use rustgis_map::{Ramp, Renderer};
+    let converted = !matches!(&l.renderer, Renderer::Unique {field, expression:None, ..} if field.eq_ignore_ascii_case("class"));
+    if converted {
+        let (renderer, rest) = Renderer::unique_counted(&l.dataset, &[], "class", Ramp::Harbour, l.renderer.base_symbol())?;
+        if rest.features > 0 {
+            return Err(format!("more than {MAX_UNIQUE} annotation classes; simplify the class list before applying class colours"));
+        }
+        l.renderer = renderer;
+        if let Renderer::Unique { classes, .. } = &mut l.renderer {
+            for (_, symbol) in classes {
+                symbol.stroke = symbol.fill.with_alpha(255);
+                symbol.fill = symbol.fill.with_alpha(45);
+            }
+        }
+    }
+    let Renderer::Unique { classes, other, .. } = &mut l.renderer else { return Err("class renderer is unavailable".into()) };
+    let at = match classes.iter().position(|(c, _)| c == name) {
+        Some(i) => i,
+        None => {
+            if classes.len() >= MAX_UNIQUE {
+                return Err(format!("at most {MAX_UNIQUE} annotation classes are supported"));
+            }
+            let i = classes.len();
+            let c = default_class_color(i);
+            let mut symbol = *other;
+            symbol.stroke = c;
+            symbol.fill = c.with_alpha(45);
+            classes.push((name.to_string(), symbol));
+            i
+        }
+    };
+    if let Some(c) = color
+        && let Some((_, symbol)) = classes.get_mut(at)
+    {
+        symbol.stroke = c.with_alpha(255);
+        symbol.fill = c.with_alpha(45);
+    }
+    Ok(converted)
+}
+fn set_class(s: &mut Session, p: &Value) -> CmdResult {
+    let id = s.layer_id(p)?;
+    check_layer(s, id)?;
+    let name = class(p)?.ok_or("class is required")?;
+    let color = match p.get("color") {
+        None => None,
+        Some(Value::String(t)) => Some(rustgis_map::Rgba::from_hex(t).ok_or("color must be #RRGGBB or #RRGGBBAA")?),
+        Some(_) => return Err("color must be a hex colour string".into()),
+    };
+    let converted = ensure_class(s.map_mut().layer_mut(id).ok_or("no layer")?, name, color)?;
+    if converted {
+        s.notify(format!("Layer {id}: 1 layer changed to class-based annotation symbology; features are unchanged"), false);
+    }
+    Ok(json!({"class":name}))
+}
+fn resume(s: &mut Session, p: &Value) -> CmdResult {
+    let id = s.layer_id(p)?;
+    check_layer(s, id)?;
+    let l = s.map().layer(id).ok_or("no layer")?;
+    if !s.map().draws_at(l, s.scale()) {
+        return Err("show the annotation layer and its groups at this scale before annotating".into());
+    }
+    if !matches!(&l.renderer, rustgis_map::Renderer::Unique {field, expression:None, ..} if field.eq_ignore_ascii_case("class")) {
+        let name = l
+            .dataset
+            .field_index("class")
+            .and_then(|fi| match l.dataset.value(0, fi) {
+                Cell::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        ensure_class(s.map_mut().layer_mut(id).ok_or("no layer")?, &name, None)?;
+        s.notify(format!("Layer {id}: 1 layer changed to class-based annotation symbology"), false);
+    }
+    s.active_layer = Some(id);
+    s.map_mut().editing.settings.enabled = true;
+    s.tool = crate::Tool::RotatedBox;
+    Ok(json!({"layer":id}))
 }
 fn new_layer(s: &mut Session, p: &Value) -> CmdResult {
     let name = ps(p, "name").unwrap_or("Annotations").trim();
@@ -185,10 +318,7 @@ fn new_layer(s: &mut Session, p: &Value) -> CmdResult {
     let id = super::layer::add_dataset(s, ds);
     s.map_mut().editing.settings.enabled = true;
     if let Some(l) = s.map_mut().layer_mut(id) {
-        l.renderer.map_symbols(|symbol| {
-            symbol.fill = rustgis_map::Rgba::new(59, 130, 246, 35);
-            symbol.stroke = rustgis_map::Rgba::rgb(59, 130, 246);
-        });
+        l.renderer = rustgis_map::Renderer::unique(&l.dataset, &[], "class", rustgis_map::Ramp::Harbour, l.renderer.base_symbol())?;
     }
     s.tool = crate::Tool::RotatedBox;
     Ok(json!({"layer":id}))
@@ -203,7 +333,8 @@ fn parsed(p: &Value) -> Result<BoxSpec, String> {
     b.angle = b.angle.rem_euclid(360.);
     Ok(b)
 }
-fn check_layer(s: &Session, id: u32) -> Result<(), String> {
+/// Validates the shared command and editor schema requirements.
+pub fn check_layer(s: &Session, id: u32) -> Result<(), String> {
     let l = s.map().layer(id).ok_or("no layer")?;
     if l.is_streamed()
         || l.graphics
@@ -227,6 +358,8 @@ fn add(s: &mut Session, p: &Value) -> CmdResult {
     let id = s.layer_id(p)?;
     check_layer(s, id)?;
     let b = parsed(p)?;
+    let name = class(p)?.unwrap_or("");
+    let converted = ensure_class(s.map_mut().layer_mut(id).ok_or("no layer")?, name, None)?;
     let g = b.geometry()?;
     let record = serde_json::to_string(&b).map_err(|e| e.to_string())?;
     // Feature row IDs can be reassigned by GeoJSON readers. Keep a separate ordinary
@@ -242,13 +375,24 @@ fn add(s: &mut Session, p: &Value) -> CmdResult {
             break uid;
         }
     };
-    let result = super::edit::add_feature(
-        s,
-        &json!({"layer":id,"geometry":rustgis_data::io::geometry_to_geojson(&g),"attributes":{"annotation_id":uid,"class":class(p)?.unwrap_or(""),RECORD:record}}),
-    )?;
+    let mut attributes = serde_json::Map::new();
+    for (field, value) in [("annotation_id", json!(uid)), ("class", json!(name)), (RECORD, json!(record))] {
+        let key = ds.field_index(field).and_then(|i| ds.fields.get(i)).map(|f| f.name.clone()).ok_or("missing annotation field")?;
+        attributes.insert(key, value);
+    }
+    let result =
+        super::edit::add_feature(s, &json!({"layer":id,"geometry":rustgis_data::io::geometry_to_geojson(&g),"attributes":attributes}))?;
     let row = result.get("row").and_then(Value::as_u64).and_then(|r| usize::try_from(r).ok()).ok_or("box was not added")?;
     BoxSpec::from_row(&s.map().layer(id).ok_or("no layer")?.dataset, row)?;
+    if converted {
+        s.notify(format!("Layer {id}: 1 layer changed to class-based annotation symbology"), false);
+    }
+    notify_edges(s, id, row);
     Ok(result)
+}
+/// Corner transformation is the approximation step; export preserves this ordinary polygon.
+fn notify_edges(s: &mut Session, id: u32, row: usize) {
+    s.notify(format!("Layer {id}, row {row}: 1 annotation box represented by four transformed longitude/latitude corners; curved frame edges are not densified. Exact local construction is retained in {RECORD}."), false);
 }
 fn update(s: &mut Session, p: &Value) -> CmdResult {
     let id = s.layer_id(p)?;
@@ -257,6 +401,10 @@ fn update(s: &mut Session, p: &Value) -> CmdResult {
     let b = parsed(p)?;
     let g = b.geometry()?;
     let c = class(p)?;
+    let converted = match c {
+        Some(name) => ensure_class(s.map_mut().layer_mut(id).ok_or("no layer")?, name, None)?,
+        None => false,
+    };
     let l = s.map().layer(id).ok_or("no layer")?;
     let old = BoxSpec::from_row(&l.dataset, row)?;
     if b.frame != old.frame {
@@ -276,6 +424,12 @@ fn update(s: &mut Session, p: &Value) -> CmdResult {
     l.touch_geometry();
     super::design::apply(s, id, vec![super::design::Change { before: Some(before), row: Some(row) }])?;
     BoxSpec::from_row(&s.map().layer(id).ok_or("no layer")?.dataset, row)?;
+    if converted {
+        s.notify(format!("Layer {id}: 1 layer changed to class-based annotation symbology"), false);
+    }
+    if b != old {
+        notify_edges(s, id, row);
+    }
     Ok(json!({"row":row}))
 }
 
@@ -285,6 +439,85 @@ mod tests {
     use crate::Project;
     fn spec() -> BoxSpec {
         BoxSpec { version: 1, frame: Frame::default(), center: [1000., -2000.], width: 120., height: 30., angle: 37. }
+    }
+    #[test]
+    fn annotation_classes_color_existing_and_future_boxes_and_roundtrip() {
+        let mut s = Session::new(Project::default());
+        s.run("annotation.newLayer", &json!({})).unwrap();
+        let id = s.active_layer.unwrap();
+        // Accepted field names are case-insensitive, including imported class renderers.
+        let l = s.map_mut().layer_mut(id).unwrap();
+        for field in &mut l.dataset.fields {
+            field.name = field.name.to_uppercase();
+        }
+        if let rustgis_map::Renderer::Unique { field, .. } = &mut l.renderer {
+            *field = "CLASS".into();
+        }
+        for name in ["vehicle", "building", "vehicle"] {
+            s.run("annotation.addBox", &json!({"box":spec(),"class":name})).unwrap();
+        }
+        let symbols = |s: &Session| {
+            let l = s.map().layer(id).unwrap();
+            (0..3).map(|row| l.renderer.symbol_for(&l.dataset, row)).collect::<Vec<_>>()
+        };
+        let before = symbols(&s);
+        assert_eq!(before[0], before[2]);
+        assert_ne!(before[0].stroke, before[1].stroke);
+        s.run("annotation.setClass", &json!({"class":"vehicle","color":"#E53444"})).unwrap();
+        let changed = symbols(&s);
+        assert_eq!(changed[0].stroke.hex(), "#E53444");
+        assert_eq!(changed[0], changed[2]);
+        assert_eq!(changed[1], before[1]);
+        s.run("edit.undo", &json!({})).unwrap();
+        assert_eq!(symbols(&s), before);
+        s.run("annotation.setClass", &json!({"class":"tree","color":"#22AA55"})).unwrap();
+        let project: crate::Project = serde_json::from_str(&serde_json::to_string(&s.project).unwrap()).unwrap();
+        let read = Session::new(project);
+        assert_eq!(class_colors(&read, id), class_colors(&s, id));
+        s.map_mut().editing.settings.enabled = false;
+        s.tool = crate::Tool::Explore;
+        s.run("annotation.resume", &json!({"layer":id})).unwrap();
+        assert!(s.map().editing.settings.enabled);
+        assert_eq!(s.tool, crate::Tool::RotatedBox);
+        s.run("annotation.addBox", &json!({"box":spec(),"class":"tree"})).unwrap();
+        let l = s.map().layer(id).unwrap();
+        assert_eq!(l.dataset.features.len(), 4);
+        assert_eq!(l.renderer.symbol_for(&l.dataset, 3).stroke.hex(), "#22AA55");
+        let (bytes, loss) = rustgis_data::io::write_bytes(&l.dataset, "geojson").unwrap();
+        assert_eq!(loss, 0);
+        let (ds, _) = rustgis_data::io::read_bytes("annotations.geojson", &bytes).unwrap();
+        assert_eq!(ds.value(3, ds.field_index("class").unwrap()), &Cell::Text("tree".into()));
+        let imported = crate::cmd::layer::add_dataset(&mut s, ds);
+        s.run("annotation.resume", &json!({"layer":imported})).unwrap();
+        assert_eq!(class_colors(&s, imported).len(), 3, "GeoJSON classes get distinct layer styles on resume");
+    }
+    #[test]
+    fn annotation_projection_cache_tracks_crs_without_changing_records() {
+        let f = Frame { crs: Crs::Epsg(32631), ..Frame::default() };
+        let first = f.transformer().unwrap();
+        assert!(Rc::ptr_eq(&first, &f.transformer().unwrap()));
+        let point = f.to_lonlat([500_000., -5_000_000.]).unwrap();
+        let local = f.to_local(point).unwrap();
+        assert!((local[0] - 500_000.).abs() < 1e-5 && (local[1] + 5_000_000.).abs() < 1e-5);
+        let merc = Frame::default();
+        assert!(!Rc::ptr_eq(&first, &merc.transformer().unwrap()));
+        assert_eq!(merc.to_lonlat([0., 0.]), Some(Coord::new(0., 0.)));
+        let read: Frame = serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
+        assert_eq!(read, f);
+        assert_eq!(read.to_lonlat([500_000., -5_000_000.]), Some(point));
+    }
+    #[test]
+    fn annotation_corner_approximation_is_reported_at_construction() {
+        let mut s = Session::new(Project::default());
+        let mark = s.notice_mark();
+        s.run("annotation.newLayer", &json!({})).unwrap();
+        assert!(s.notices_since(mark).is_empty());
+        s.run("annotation.addBox", &json!({"box":spec()})).unwrap();
+        let notices = s.notices_since(mark);
+        assert_eq!(notices.iter().filter(|n| n.text.contains("1 annotation box") && n.text.contains("row 0")).count(), 1);
+        let mark = s.notice_mark();
+        s.run("annotation.updateBox", &json!({"row":0,"box":spec(),"class":"car"})).unwrap();
+        assert!(s.notices_since(mark).is_empty());
     }
     #[test]
     fn annotation_commands_roundtrip_and_undo_without_refitting() {

@@ -16,7 +16,8 @@ use crate::widgets::{
 };
 use crate::{RightPane, RustGisApp, icons};
 
-pub const TABS: [&str; 11] = ["Home", "Data", "Style", "Labeling", "Edit", "Analyze", "View", "Publish", "Plugins", "Settings", "Help"];
+pub const TABS: [&str; 12] =
+    ["Home", "Data", "Style", "Labeling", "Edit", "Annotate", "Analyze", "View", "Publish", "Plugins", "Settings", "Help"];
 
 /// Tabs that always show: Settings holds Customize › Ribbon, the way to show hidden tabs again.
 pub const FIXED_TABS: [&str; 2] = ["Settings", "Help"];
@@ -106,6 +107,7 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
                         "Style" => style_tab(app, ui),
                         "Labeling" => labeling_tab(app, ui),
                         "Edit" => edit_tab(app, ui),
+                        "Annotate" => annotate_tab(app, ui),
                         "Analyze" => analyze_tab(app, ui),
                         "View" => view_tab(app, ui),
                         "Publish" => publish_tab(app, ui),
@@ -2389,6 +2391,99 @@ fn active_layer(app: &RustGisApp) -> Option<&rustgis_engine::map::Layer> {
     app.session.active_layer.and_then(|id| app.session.map().layer(id))
 }
 
+/// Object annotation: classed training geometry, with room for additional shape tools.
+fn annotate_tab(app: &mut RustGisApp, ui: &mut Ui) {
+    group(ui, "Annotation Layers", |ui| {
+        big(
+            ui,
+            app,
+            "new",
+            "New Box\nAnnotation Layer",
+            "Create one layer containing multiple annotation classes.",
+            "annotation.newLayer",
+            Value::Null,
+            false,
+            false,
+        );
+        col(ui, |ui| {
+            let layers: Vec<_> = app
+                .session
+                .map()
+                .layers
+                .iter()
+                .filter(|l| rustgis_engine::cmd::annotation::check_layer(&app.session, l.id).is_ok())
+                .map(|l| (l.id, l.name.clone()))
+                .collect();
+            let current = app.session.active_layer;
+            let mut chosen = current;
+            let label = ui.label(tl!("Annotation layer"));
+            egui::ComboBox::from_id_salt("annotation_target")
+                .selected_text(layers.iter().find(|(id, _)| Some(*id) == current).map(|(_, n)| n.as_str()).unwrap_or(tl!("Select a layer")))
+                .show_ui(ui, |ui| {
+                    for (id, name) in &layers {
+                        ui.selectable_value(&mut chosen, Some(*id), name);
+                    }
+                })
+                .response
+                .labelled_by(label.id);
+            if chosen != current
+                && let Some(id) = chosen
+            {
+                let _ = app.run("annotation.resume", json!({"layer":id}));
+            }
+        });
+    });
+    group(ui, "Shapes", |ui| {
+        big(
+            ui,
+            app,
+            "g_rect",
+            "Add or Edit\nBoxes",
+            "Drag to add more boxes to the current annotation layer; use the paddle to rotate.",
+            "annotation.resume",
+            Value::Null,
+            app.session.tool == Tool::RotatedBox,
+            false,
+        );
+    });
+    group(ui, "Navigate", |ui| {
+        big(
+            ui,
+            app,
+            "explore",
+            "Pan",
+            "Pan normally, or hold Space and drag while annotating.",
+            "tool.set",
+            json!({"tool":"explore"}),
+            app.session.tool == Tool::Explore,
+            false,
+        );
+        ui.vertical(|ui| {
+            ui.small(tl!("Space + drag: temporary pan"));
+            ui.small(tl!("Wheel: zoom"));
+        });
+    });
+    group(ui, "Edits", |ui| {
+        col(ui, |ui| {
+            small(ui, app, "undo", "Undo", "Undo the last edit.", "edit.undo", Value::Null, false);
+            small(ui, app, "redo", "Redo", "Redo the last undone edit.", "edit.redo", Value::Null, false);
+        });
+    });
+    group(ui, "Output", |ui| {
+        big(
+            ui,
+            app,
+            "export_layer",
+            "Export\nFeatures",
+            "Export annotations and their classes as GeoJSON.",
+            "ui.exportLayer",
+            Value::Null,
+            false,
+            false,
+        );
+    });
+}
+
 /// Keeps edit commands and transient vertex modes together, with deeper settings in Editing.
 fn edit_tab(app: &mut RustGisApp, ui: &mut Ui) {
     let editing = app.session.map().editing.clone();
@@ -2489,10 +2584,6 @@ fn edit_tab(app: &mut RustGisApp, ui: &mut Ui) {
         );
     });
     group(ui, "Features", |ui| {
-        small_menu(ui, app, "g_rect", "Rotated Box", "Create and edit exact rotated rectangle annotations.", |ui, app| {
-            menu_item(ui, app, "g_rect", "New Box Annotation Layer", "annotation.newLayer", Value::Null);
-            menu_item(ui, app, "g_rect", "Edit Rotated Boxes", "tool.set", json!({"tool":"rotatedBox"}));
-        });
         let gt = app.session.active_layer.and_then(|id| app.session.map().layer(id)).map(|l| l.geometry_type());
         let (tool, icon) = match gt {
             Some(GeometryType::Polyline) => (Tool::CreateLine, "line_tool"),

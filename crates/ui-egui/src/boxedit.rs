@@ -7,7 +7,7 @@ use crate::{
 use egui::{Color32, Pos2, Rect, Stroke, Ui, vec2};
 use rustgis_engine::{
     Tool,
-    cmd::annotation::{BoxSpec, Frame, RECORD},
+    cmd::annotation::{BoxSpec, Frame, check_layer, class_colors, default_class_color},
     data::Feature,
 };
 use serde_json::json;
@@ -19,11 +19,59 @@ pub(crate) struct State {
     reference: Option<u32>,
     class: String,
     three_clicks: bool,
+    panning: bool,
     points: Vec<[f64; 2]>,
     sketch_frame: Option<Frame>,
     gesture: Option<Gesture>,
     preview: Option<BoxSpec>,
     error: Option<String>,
+    classes: Classes,
+}
+/// Only rescan class suggestions after source rows, schema or layer identity changes.
+#[derive(Default)]
+struct Classes {
+    key: Option<(u64, usize, u32, Option<usize>)>,
+    rows: std::sync::Weak<Vec<Feature>>,
+    values: std::collections::BTreeSet<String>,
+    limited: bool,
+}
+fn refresh_classes(app: &mut RustGisApp) {
+    let Some(l) = app.session.active_layer.and_then(|id| app.session.map().layer(id)) else {
+        app.boxes.classes = Classes::default();
+        return;
+    };
+    let fi = l.dataset.field_index("class");
+    let key = (app.session.opened, app.session.project.active_map, l.id, fi);
+    let rows = l.dataset.features.allocation_key();
+    let c = &mut app.boxes.classes;
+    if c.key == Some(key) && c.rows.ptr_eq(&rows) {
+        return;
+    }
+    c.key = Some(key);
+    c.rows = rows;
+    c.limited = l.dataset.features.len() > 10_000;
+    c.values = fi
+        .map(|fi| {
+            l.dataset
+                .features
+                .iter()
+                .take(10_000)
+                .filter_map(|f| match f.attrs.get(fi) {
+                    Some(rustgis_engine::data::Value::Text(c)) if !c.is_empty() => Some(c.clone()),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+}
+fn supported(app: &RustGisApp) -> bool {
+    app.session.map().camera.pitch == 0. && !app.session.map().projection.is_globe() && app.session.map().body == "earth"
+}
+fn ready(app: &RustGisApp) -> bool {
+    app.session.active_layer.is_some_and(|id| {
+        check_layer(&app.session, id).is_ok()
+            && app.session.map().layer(id).is_some_and(|l| app.session.map().draws_at(l, app.session.scale()))
+    })
 }
 struct Gesture {
     layer: u32,
@@ -42,6 +90,7 @@ enum Handle {
 }
 
 pub(crate) fn cancel(state: &mut State) {
+    state.panning = false;
     state.gesture = None;
     state.preview = None;
     state.points.clear();
@@ -57,7 +106,12 @@ pub(crate) fn follow(app: &mut RustGisApp) {
         || app.session.active_layout.is_some()
         || app.mb.shown()
         || app.ws.catalog_view
+        || app.ui.backstage
+        || !supported(app)
+        || !ready(app)
+        || !app.session.map().editing.settings.enabled
     {
+        app.boxes.panning = false;
         app.boxes.gesture = None;
         app.boxes.preview = None;
         app.boxes.points.clear();
@@ -76,10 +130,11 @@ pub(crate) fn follow(app: &mut RustGisApp) {
     if let Some(g) = &app.boxes.gesture {
         let valid = app.session.map().editing.settings.enabled
             && app.session.map().layer(g.layer).is_some_and(|l| {
-                l.visible
+                app.session.map().draws_at(l, app.session.scale())
                     && !l.is_streamed()
                     && g.rows.ptr_eq(&l.dataset.features.allocation_key())
-                    && g.row.is_none_or(|r| l.selection == [r])
+                    && g.row.is_none_or(|r| l.selection == [r] && l.drawn_rows(app.session.scale()).get(r) == Some(&true))
+                    && (g.row.is_some() || frame(app).as_ref() == Ok(&g.original.frame))
             });
         if !valid {
             app.boxes.gesture = None;
@@ -90,12 +145,15 @@ pub(crate) fn follow(app: &mut RustGisApp) {
 fn selected(app: &RustGisApp) -> Result<(u32, usize, BoxSpec), String> {
     let id = app.session.active_layer.ok_or("select an annotation layer")?;
     let l = app.session.map().layer(id).ok_or("no layer")?;
-    if !app.session.map().shows(l) || l.is_streamed() || l.graphics || !app.session.map().editing.settings.enabled {
+    if !supported(app) || !ready(app) || !app.session.map().editing.settings.enabled {
         return Err("select a visible, editable annotation layer".into());
     }
     let [row] = l.selection.as_slice() else {
         return Err("select one box to edit its dimensions".into());
     };
+    if l.drawn_rows(app.session.scale()).get(*row) != Some(&true) {
+        return Err(tl!("The selected box is hidden by a filter.").into());
+    }
     Ok((id, *row, BoxSpec::from_row(&l.dataset, *row)?))
 }
 fn frame(app: &RustGisApp) -> Result<Frame, String> {
@@ -110,15 +168,22 @@ pub(crate) fn panel(app: &mut RustGisApp, ctx: &egui::Context) {
     if app.session.tool != Tool::RotatedBox || app.session.active_layout.is_some() || app.mb.shown() || app.ws.catalog_view {
         return;
     }
+    refresh_classes(app);
     egui::Window::new(tl!("Rotated Box Annotations"))
         .id(egui::Id::unique("box_annotation_controls"))
-        .default_pos(Pos2::new(22., 235.))
+        .default_pos(Pos2::new((ctx.content_rect().right() - 310.).max(300.), 235.))
         .default_width(280.)
         .resizable(false)
+        .vscroll(true)
+        .default_height((ctx.content_rect().bottom() - 300.).max(240.))
+        .min_height((ctx.content_rect().bottom() - 300.).max(240.))
+        .max_height((ctx.content_rect().bottom() - 300.).max(240.))
         .show(ctx, |ui| {
-            let active = app.session.active_layer.and_then(|id| app.session.map().layer(id));
-            let ready = active.is_some_and(|l| l.dataset.field_index(RECORD).is_some() && !l.is_streamed() && l.visible && !l.graphics);
-            if !ready {
+            if let Some(l) = app.session.active_layer.and_then(|id| app.session.map().layer(id)) {
+                ui.label(crate::i18n::fmt("Annotating: {layer}", &[("layer", &l.name)]));
+            }
+            ui.small(tl!("Each drag adds another box to this layer. Space + drag pans without leaving annotation mode."));
+            if !ready(app) {
                 ui.label(tl!("Create an annotation layer, or select an existing one in Layers."));
                 if ui.button(tl!("New Box Annotation Layer")).clicked() {
                     run(app, "annotation.newLayer", json!({}));
@@ -158,34 +223,40 @@ pub(crate) fn panel(app: &mut RustGisApp, ctx: &egui::Context) {
             let class_label = ui.label(tl!("Class for new boxes"));
             ui.add(egui::TextEdit::singleline(&mut app.boxes.class).char_limit(200).hint_text(tl!("e.g. vehicle")))
                 .labelled_by(class_label.id);
-            let classes: std::collections::BTreeSet<String> = app
-                .session
-                .active_layer
-                .and_then(|id| app.session.map().layer(id))
-                .map(|l| {
-                    l.dataset
-                        .field_index("class")
-                        .map(|fi| {
-                            l.dataset
-                                .features
-                                .iter()
-                                .take(10000)
-                                .filter_map(|f| match f.attrs.get(fi) {
-                                    Some(rustgis_engine::data::Value::Text(c)) if !c.is_empty() => Some(c.clone()),
-                                    _ => None,
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default()
-                })
-                .unwrap_or_default();
-            if !classes.is_empty() {
+            let colors = app.session.active_layer.map(|id| class_colors(&app.session, id)).unwrap_or_default();
+            ui.horizontal(|ui| {
+                if ui.add_enabled(ready(app), egui::Button::new(tl!("Add Class"))).clicked() {
+                    run(app, "annotation.setClass", json!({"class":app.boxes.class}));
+                }
+                let c = colors.iter().find(|(name,_)| name == &app.boxes.class).map(|(_,c)| *c)
+                    .unwrap_or_else(|| default_class_color(colors.len()));
+                let mut rgb = [c.r(), c.g(), c.b()];
+                let label = ui.label(tl!("Class colour"));
+                let r = ui.add_enabled_ui(ready(app), |ui| ui.color_edit_button_srgb(&mut rgb)).inner.labelled_by(label.id);
+                if r.changed() {
+                    crate::widgets::one_step_per_press(app, &r);
+                    run(app, "annotation.setClass", json!({"class":app.boxes.class,"color":rustgis_engine::map::Rgba::rgb(rgb[0],rgb[1],rgb[2]).hex()}));
+                }
+            });
+            if app.boxes.classes.limited {
+                ui.small(tl!("Class suggestions use the first 10,000 features. Type any other class above."));
+            }
+            if !app.boxes.classes.values.is_empty() || !colors.is_empty() {
                 let existing_label = ui.label(tl!("Existing classes"));
                 egui::ComboBox::from_id_salt("box_classes")
                     .selected_text(tl!("Reuse a class"))
                     .show_ui(ui, |ui| {
-                        for c in classes {
-                            ui.selectable_value(&mut app.boxes.class, c.clone(), c);
+                        for (name, color) in &colors {
+                            ui.horizontal(|ui| {
+                                ui.colored_label(Color32::from_rgb(color.r(),color.g(),color.b()), "●");
+                                let label = if name.is_empty() { tl!("Unclassified") } else { name.as_str() };
+                                ui.selectable_value(&mut app.boxes.class, name.clone(), label);
+                            });
+                        }
+                        for c in &app.boxes.classes.values {
+                            if !colors.iter().any(|(name,_)| name == c) {
+                                ui.selectable_value(&mut app.boxes.class, c.clone(), c.as_str());
+                            }
                         }
                     })
                     .response
@@ -199,7 +270,7 @@ pub(crate) fn panel(app: &mut RustGisApp, ctx: &egui::Context) {
                 app.boxes.gesture = None;
             }
             ui.small(tl!(
-                "Drag a box, then drag its paddle to rotate. Shift snaps rotation to 15°. Esc cancels. Middle-drag pans; wheel zooms."
+                "Drag a box, then drag its paddle to rotate. Shift snaps rotation to 15°. Esc cancels. Space + drag or middle-drag pans; wheel zooms."
             ));
             ui.small(tl!("Hold Alt to draw a new box over an existing box."));
             if app.boxes.three_clicks {
@@ -208,11 +279,17 @@ pub(crate) fn panel(app: &mut RustGisApp, ctx: &egui::Context) {
             ui.separator();
             match selected(app) {
                 Ok((layer, row, mut b)) => {
+                    if let Some(l) = app.session.map().layer(layer) && let Some(fi) = l.dataset.field_index("class") {
+                        let value = l.dataset.value(row, fi).to_string();
+                        ui.label(crate::i18n::fmt("Selected class: {class}", &[("class", &value)]));
+                    }
                     ui.label(tl!("Selected box"));
                     ui.small(if b.frame.image.is_some() {
                         tl!("Dimensions in reference pixels; angle clockwise from image right.")
-                    } else {
+                    } else if b.frame == Frame::default() {
                         tl!("Dimensions in Web Mercator grid metres, not ground metres; angle clockwise from east.")
+                    } else {
+                        tl!("Dimensions in stored local grid units; angle clockwise from its positive x axis.")
                     });
                     let mut changed = false;
                     egui::Grid::new("box_dimensions").show(ui, |ui| {
@@ -241,10 +318,10 @@ pub(crate) fn panel(app: &mut RustGisApp, ctx: &egui::Context) {
             if let Some(e) = &app.boxes.error {
                 ui.colored_label(Color32::RED, e);
             }
-            if ui.button(tl!("Done")).clicked() {
-                run(app, "tool.set", json!({"tool":"select"}));
+            if ui.button(tl!("Pan / Stop Annotating")).clicked() {
+                run(app, "tool.set", json!({"tool":"explore"}));
             }
-            ui.small(tl!("Export this layer with Publish › Export Features as GeoJSON."));
+            ui.small(tl!("Export this layer with Annotate › Export Features as GeoJSON."));
         });
 }
 fn coords(app: &RustGisApp, rect: Rect, p: Pos2, f: &Frame) -> Option<[f64; 2]> {
@@ -339,21 +416,43 @@ fn manipulated(b: &BoxSpec, start: [f64; 2], p: [f64; 2], h: Handle, snap: bool)
     }
     out
 }
+/// A Space-started drag remains navigation until release, even if Space is released first.
+pub(crate) fn pan_gesture(app: &mut RustGisApp, ui: &Ui, resp: &egui::Response) -> bool {
+    let space = ui.input(|i| i.key_down(egui::Key::Space)) && !ui.ctx().egui_wants_keyboard_input();
+    if (resp.drag_started_by(egui::PointerButton::Primary) || resp.dragged_by(egui::PointerButton::Primary)) && space {
+        app.boxes.panning = true;
+        app.boxes.gesture = None;
+        if app.boxes.points.is_empty() {
+            app.boxes.preview = None;
+        }
+    }
+    if resp.dragged_by(egui::PointerButton::Middle) {
+        app.boxes.gesture = None;
+        if app.boxes.points.is_empty() {
+            app.boxes.preview = None;
+        }
+    }
+    let pan = app.boxes.panning || space;
+    if !ui.input(|i| i.pointer.primary_down()) {
+        app.boxes.panning = false;
+    }
+    pan
+}
 pub(crate) fn interact(app: &mut RustGisApp, ui: &Ui, resp: &egui::Response, rect: Rect) {
     follow(app);
-    if app.session.map().camera.pitch != 0. || app.session.map().projection.is_globe() || app.session.map().body != "earth" {
+    if !supported(app) {
         app.boxes.gesture = None;
         app.boxes.preview = None;
         app.boxes.points.clear();
         app.boxes.error = Some(tl!("Box annotation requires a flat, untilted Earth map.").into());
         return;
     }
-    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-        app.boxes.gesture = None;
-        app.boxes.preview = None;
-        app.boxes.points.clear();
-        app.boxes.error = None;
-        app.boxes.sketch_frame = None;
+    if !ui.ctx().egui_wants_keyboard_input()
+        && ui.ctx().memory(|m| m.top_modal_layer()).is_none()
+        && !app.ui.shortcut_editor.capturing()
+        && ui.input(|i| i.key_pressed(egui::Key::Escape))
+    {
+        run(app, "tool.set", json!({"tool":"explore"}));
         return;
     }
     if !app.session.map().editing.settings.enabled {
@@ -368,7 +467,7 @@ pub(crate) fn interact(app: &mut RustGisApp, ui: &Ui, resp: &egui::Response, rec
         None => return,
     };
     let Some(l) = app.session.map().layer(id) else { return };
-    if !l.visible || l.is_streamed() || l.dataset.field_index(RECORD).is_none() {
+    if !ready(app) {
         return;
     }
     let hover = resp.hover_pos();
@@ -429,6 +528,20 @@ pub(crate) fn interact(app: &mut RustGisApp, ui: &Ui, resp: &egui::Response, rec
             run(app, "annotation.addBox", json!({"layer":id,"box":b,"class":app.boxes.class}));
         }
     }
+    if app.boxes.gesture.is_none()
+        && app.boxes.three_clicks
+        && !app.boxes.points.is_empty()
+        && let Some(p) = hover
+        && let Some(f) = app.boxes.sketch_frame.clone()
+        && let Some(q) = coords(app, rect, p, &f)
+    {
+        app.boxes.preview = match app.boxes.points.as_slice() {
+            [a] => three(f, *a, q, q),
+            [a, b] => three(f, *a, *b, q),
+            _ => None,
+        };
+        app.boxes.error = (app.boxes.points.len() == 2).then(|| app.boxes.preview.as_ref().and_then(|b| b.geometry().err())).flatten();
+    }
     if resp.clicked()
         && let Some(p) = resp.interact_pointer_pos()
     {
@@ -437,7 +550,12 @@ pub(crate) fn interact(app: &mut RustGisApp, ui: &Ui, resp: &egui::Response, rec
             && !ui.input(|i| i.modifiers.alt)
             && let Some(c) = screen_to_lonlat(app, rect, p)
         {
-            let _ = app.session.run("select.atPoint", &json!({"lon":c.x,"lat":c.y,"tolerancePx":4}));
+            let scale = app.session.scale();
+            let tolerance = 4. * app.session.map().camera.res;
+            let hit =
+                app.session.map().to_map(c).and_then(|p| app.session.map_mut().hit(p, tolerance, scale, |l| l.id == id && l.selectable));
+            let rows: Vec<_> = hit.map(|(_, row)| row).into_iter().collect();
+            run(app, "select.rows", json!({"layer":id,"rows":rows}));
             if selected(app).is_ok() {
                 return;
             }
@@ -456,11 +574,10 @@ pub(crate) fn interact(app: &mut RustGisApp, ui: &Ui, resp: &egui::Response, rec
                             && let Some(b) = three(f, *a, *b, q)
                         {
                             match b.geometry() {
-                                Ok(_) => {
-                                    run(app, "annotation.addBox", json!({"layer":id,"box":b,"class":app.boxes.class}));
-                                    app.boxes.points.clear();
-                                    app.boxes.preview = None;
-                                }
+                                Ok(_) => match app.run("annotation.addBox", json!({"layer":id,"box":b,"class":app.boxes.class})) {
+                                    Ok(_) => cancel(&mut app.boxes),
+                                    Err(e) => app.boxes.error = Some(e),
+                                },
                                 Err(e) => app.boxes.error = Some(e),
                             }
                         }
@@ -469,19 +586,6 @@ pub(crate) fn interact(app: &mut RustGisApp, ui: &Ui, resp: &egui::Response, rec
                 Err(e) => app.boxes.error = Some(e),
             }
         }
-    }
-    if app.boxes.gesture.is_none()
-        && app.boxes.three_clicks
-        && !app.boxes.points.is_empty()
-        && let Some(p) = hover
-        && let Some(f) = app.boxes.sketch_frame.clone()
-        && let Some(q) = coords(app, rect, p, &f)
-    {
-        app.boxes.preview = match app.boxes.points.as_slice() {
-            [a] => three(f, *a, q, q),
-            [a, b] => three(f, *a, *b, q),
-            _ => None,
-        };
     }
 }
 pub(crate) fn draw(app: &RustGisApp, p: &egui::Painter, rect: Rect) {
@@ -494,7 +598,19 @@ pub(crate) fn draw(app: &RustGisApp, p: &egui::Painter, rect: Rect) {
     if corners.len() != 4 {
         return;
     }
-    let color = if app.boxes.error.is_some() { Color32::RED } else { Color32::from_rgb(38, 132, 255) };
+    let class = if app.boxes.preview.is_some() && app.boxes.gesture.as_ref().is_none_or(|g| g.row.is_none()) {
+        app.boxes.class.clone()
+    } else {
+        selected
+            .as_ref()
+            .and_then(|(id, row, _)| {
+                app.session.map().layer(*id).and_then(|l| l.dataset.field_index("class").map(|fi| l.dataset.value(*row, fi).to_string()))
+            })
+            .unwrap_or_default()
+    };
+    let colors = app.session.active_layer.map(|id| class_colors(&app.session, id)).unwrap_or_default();
+    let c = colors.iter().find(|(name, _)| name == &class).map(|(_, c)| *c).unwrap_or_else(|| default_class_color(colors.len()));
+    let color = if app.boxes.error.is_some() { Color32::RED } else { Color32::from_rgb(c.r(), c.g(), c.b()) };
     let mut outline = corners.clone();
     if let Some(first) = outline.first().copied() {
         outline.push(first);
@@ -584,6 +700,7 @@ mod tests {
         pointer(&mut h, centre, None);
         pointer(&mut h, centre, Some(true));
         pointer(&mut h, centre + vec2(45., 10.), None);
+        h.state_mut().ui.keymap.bindings.retain(|b| b.chord.key != egui::Key::Escape);
         h.event(egui::Event::Key {
             key: egui::Key::Escape,
             physical_key: None,
@@ -594,6 +711,7 @@ mod tests {
         h.step();
         pointer(&mut h, centre + vec2(45., 10.), Some(false));
         assert_eq!(selected(h.state()).unwrap().2, before);
+        assert_eq!(h.state().session.tool, Tool::Explore);
         // Context/source edits during a held drag invalidate the release as well.
         h.state_mut().run("tool.set", json!({"tool":"rotatedBox"})).unwrap();
         h.step();
@@ -607,6 +725,182 @@ mod tests {
         assert_eq!(selected(h.state()).unwrap().2, before);
     }
 
+    fn click(h: &mut egui_kittest::Harness<'_, RustGisApp>, p: Pos2) {
+        pointer(h, p, None);
+        pointer(h, p, Some(true));
+        pointer(h, p, Some(false));
+    }
+    #[test]
+    fn annotation_three_click_failure_retains_draft_and_recovers() {
+        let mut h = harness();
+        h.state_mut().boxes.three_clicks = true;
+        h.state_mut().run("data.domain", json!({"field":"class","coded":[["vehicle","Vehicle"]]})).unwrap();
+        h.state_mut().boxes.class = "invalid".into();
+        let rect = h.state().map.view_rect.unwrap().0;
+        let a = rect.center();
+        let b = a + vec2(110., 0.);
+        let c = b + vec2(0., 70.);
+        click(&mut h, a);
+        click(&mut h, b);
+        click(&mut h, b); // zero height
+        assert!(h.state().boxes.error.is_some());
+        pointer(&mut h, c, None);
+        assert!(h.state().boxes.error.is_none(), "a valid preview clears the geometry error");
+        click(&mut h, c); // invalid class fails the command
+        assert_eq!(h.state().boxes.points.len(), 2);
+        assert!(h.state().boxes.preview.is_some());
+        assert_eq!(h.state().session.map().layers[0].dataset.features.len(), 0);
+        h.state_mut().boxes.class = "vehicle".into();
+        click(&mut h, c);
+        assert!(h.state().boxes.points.is_empty());
+        assert!(h.state().boxes.error.is_none());
+        assert!(selected(h.state()).unwrap().2.height > 0.);
+    }
+    #[test]
+    fn annotation_visibility_context_and_reference_cancel_held_edits() {
+        let mut h = harness();
+        h.state_mut().run("annotation.addBox", json!({"box":b()})).unwrap();
+        h.step();
+        let id = h.state().session.active_layer.unwrap();
+        let rect = h.state().map.view_rect.unwrap().0;
+        let before = selected(h.state()).unwrap().2;
+        let centre = screen(h.state(), rect, &before, before.center).unwrap();
+        for context in 0..5 {
+            pointer(&mut h, centre, None);
+            pointer(&mut h, centre, Some(true));
+            pointer(&mut h, centre + vec2(35., 20.), None);
+            assert!(h.state().boxes.gesture.is_some());
+            match context {
+                0 => h.state_mut().session.map_mut().layer_mut(id).unwrap().definition_query = Some("class = 'hidden'".into()),
+                1 => {
+                    let mut group = rustgis_engine::map::LayerGroup::new("Hidden");
+                    group.children.push(id);
+                    group.visible = false;
+                    h.state_mut().session.map_mut().add_group(group);
+                }
+                2 => h.state_mut().ui.backstage = true,
+                3 => h.state_mut().session.map_mut().camera.pitch = 20.,
+                _ => h.state_mut().session.map_mut().editing.settings.enabled = false,
+            }
+            h.step();
+            assert!(h.state().boxes.gesture.is_none());
+            if context != 2 {
+                assert!(selected(h.state()).is_err());
+            }
+            pointer(&mut h, centre + vec2(35., 20.), Some(false));
+            let app = h.state_mut();
+            app.session.map_mut().layer_mut(id).unwrap().definition_query = None;
+            app.session.map_mut().groups.clear();
+            app.ui.backstage = false;
+            app.session.map_mut().camera.pitch = 0.;
+            app.session.map_mut().editing.settings.enabled = true;
+            h.step();
+            assert_eq!(selected(h.state()).unwrap().2, before);
+        }
+        // Only a NEW drag follows the chosen reference; existing-box moves retain their frame.
+        let app = h.state_mut();
+        let rows = app.session.map().layer(id).unwrap().dataset.features.allocation_key();
+        app.boxes.gesture =
+            Some(Gesture { layer: id, row: None, rows, original: before.clone(), start: before.center, handle: Handle::New });
+        app.boxes.reference = Some(u32::MAX); // removed/replaced reference
+        follow(app);
+        assert!(app.boxes.gesture.is_none());
+        app.boxes.reference = None;
+    }
+    #[test]
+    fn annotation_selection_ignores_overlapping_layers_and_point_picks_take_priority() {
+        let mut h = harness();
+        h.state_mut().run("annotation.addBox", json!({"box":b()})).unwrap();
+        let id = h.state().session.active_layer.unwrap();
+        h.state_mut().run("annotation.newLayer", json!({"name":"Above"})).unwrap();
+        h.state_mut().run("annotation.addBox", json!({"box":b()})).unwrap();
+        h.state_mut().session.active_layer = Some(id);
+        h.state_mut().run("select.clear", json!({})).unwrap();
+        h.step();
+        let rect = h.state().map.view_rect.unwrap().0;
+        let centre = screen(h.state(), rect, &b(), b().center).unwrap();
+        click(&mut h, centre);
+        assert_eq!(selected(h.state()).unwrap().0, id);
+        h.state_mut().workflow.pick = Some(crate::analysispane::Pick { purpose: "test", needed: 1, points: vec![] });
+        click(&mut h, centre + vec2(60., 30.));
+        assert_eq!(h.state().workflow.pick.as_ref().unwrap().points.len(), 1);
+        assert_eq!(h.state().session.map().layer(id).unwrap().dataset.features.len(), 1);
+        assert!(h.state().boxes.points.is_empty());
+        // Switching from an unfinished polygon must clear that tool's map sketch too.
+        h.state_mut().run("tool.set", json!({"tool":"createPolygon"})).unwrap();
+        click(&mut h, centre);
+        click(&mut h, centre + vec2(80., 30.));
+        assert!(h.state().map.sketch_len() > 0);
+        h.state_mut().run("annotation.newLayer", json!({})).unwrap();
+        assert_eq!(h.state().map.sketch_len(), 0);
+    }
+    #[test]
+    fn annotation_schema_and_class_cache_follow_source_changes() {
+        let mut h = harness();
+        let app = h.state_mut();
+        let id = app.session.active_layer.unwrap();
+        let ds = &mut app.session.map_mut().layer_mut(id).unwrap().dataset;
+        for _ in 0..10_001 {
+            ds.push(
+                None,
+                vec![rustgis_engine::data::Value::Null, rustgis_engine::data::Value::Text("car".into()), rustgis_engine::data::Value::Null],
+            );
+        }
+        refresh_classes(app);
+        assert!(app.boxes.classes.limited);
+        assert!(app.boxes.classes.values.contains("car"));
+        let old = app.boxes.classes.rows.clone();
+        refresh_classes(app);
+        assert!(app.boxes.classes.rows.ptr_eq(&old));
+        app.session.map_mut().layer_mut(id).unwrap().dataset.features.get_mut(0).unwrap().attrs[1] =
+            rustgis_engine::data::Value::Text("truck".into());
+        refresh_classes(app);
+        assert!(!app.boxes.classes.rows.ptr_eq(&old));
+        assert!(app.boxes.classes.values.contains("truck"));
+        app.session.map_mut().layer_mut(id).unwrap().dataset.fields[0].ty = rustgis_engine::data::FieldType::Integer;
+        assert!(!ready(app), "record field alone does not make an annotation schema");
+    }
+    #[test]
+    fn annotation_space_pan_preserves_tool_and_more_boxes_use_same_layer() {
+        let mut h = harness();
+        let id = h.state().session.active_layer.unwrap();
+        let rect = h.state().map.view_rect.unwrap().0;
+        let a = rect.center();
+        click(&mut h, a); // selection only, no box
+        let camera = h.state().session.map().camera;
+        h.event(egui::Event::Key {
+            key: egui::Key::Space,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        pointer(&mut h, a, Some(true));
+        pointer(&mut h, a + vec2(80., 40.), None);
+        h.event(egui::Event::Key {
+            key: egui::Key::Space,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        pointer(&mut h, a + vec2(100., 50.), None); // keeps panning after Space is released
+        pointer(&mut h, a + vec2(100., 50.), Some(false));
+        assert_ne!(h.state().session.map().camera, camera);
+        assert_eq!(h.state().session.tool, Tool::RotatedBox);
+        assert!(h.state().session.map().layer(id).unwrap().dataset.features.is_empty());
+        for (offset, name) in [(0., "vehicle"), (190., "building")] {
+            h.state_mut().boxes.class = name.into();
+            let a = a + vec2(offset - 100., -90.);
+            pointer(&mut h, a, Some(true));
+            pointer(&mut h, a + vec2(100., 60.), None);
+            pointer(&mut h, a + vec2(100., 60.), Some(false));
+        }
+        let l = h.state().session.map().layer(id).unwrap();
+        assert_eq!(h.state().session.map().layers.len(), 1);
+        assert_eq!(l.dataset.features.len(), 2);
+        assert_ne!(l.renderer.symbol_for(&l.dataset, 0).stroke, l.renderer.symbol_for(&l.dataset, 1).stroke);
+    }
     fn b() -> BoxSpec {
         BoxSpec { version: 1, frame: Frame::default(), center: [100., 200.], width: 80., height: 20., angle: 37. }
     }

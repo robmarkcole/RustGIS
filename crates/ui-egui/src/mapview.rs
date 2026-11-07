@@ -2253,6 +2253,34 @@ fn selection_preview(app: &mut RustGisApp, p: &egui::Painter, rect: Rect, t: &To
     }
 }
 
+/// Gives an outstanding map-point request priority over the current editing tool.
+fn point_pick(app: &mut RustGisApp, rect: Rect, p: Pos2, c: Coord) -> bool {
+    // Directions waiting for a place, or a click on another route, takes the click.
+    let nav = &app.ui.nav;
+    let other = (nav.routes.len() > 1 && app.ui.right == Some(crate::RightPane::Directions))
+        .then(|| {
+            (0..nav.routes.len())
+                .filter(|&k| k != nav.chosen)
+                .find(|&k| nav.routes.get(k).is_some_and(|r| crate::navui::near(r, p, |c| lonlat_to_screen(app, rect, c))))
+        })
+        .flatten();
+    if crate::navui::click(app, c, other) {
+        return true;
+    }
+    // The NLDI pane waiting for a point traces its flowline.
+    if crate::nldiui::click(app, c) {
+        return true;
+    }
+    // A workflow waiting for map points takes the click.
+    if let Some(pick) = &mut app.workflow.pick
+        && pick.points.len() < pick.needed
+    {
+        pick.points.push(c);
+        return true;
+    }
+    false
+}
+
 fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect) {
     let (w, h) = (rect.width() as f64, rect.height() as f64);
     let time = now(ui);
@@ -2374,12 +2402,28 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
         }
     }
 
+    // Pending point workflows own the pointer even while an annotation tool is selected.
+    let pending_pick = app.ui.nav.picking.is_some()
+        || crate::nldiui::wants_click(app)
+        || app.workflow.pick.as_ref().is_some_and(|pick| pick.points.len() < pick.needed);
+    if tool == Tool::RotatedBox && pending_pick {
+        crate::boxedit::cancel(&mut app.boxes);
+        if resp.clicked()
+            && let Some(p) = resp.interact_pointer_pos()
+            && let Some(c) = screen_to_lonlat(app, rect, p)
+        {
+            point_pick(app, rect, p, c);
+        }
+        return;
+    }
     if tool == Tool::RotatedBox {
-        if resp.dragged_by(egui::PointerButton::Middle) {
+        let space_pan = crate::boxedit::pan_gesture(app, ui, resp);
+        if resp.dragged_by(egui::PointerButton::Middle) || space_pan {
             let d = resp.drag_delta();
             pan(app, f64::from(d.x), f64::from(d.y), w, h);
             app.map.last_interaction = time;
             app.map.camera_moved = true;
+            return;
         }
         crate::boxedit::interact(app, ui, resp, rect);
         return;
@@ -2664,27 +2708,7 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
             app.map.popup = None;
             return;
         };
-        // Directions waiting for a place, or a click on another route, takes the click.
-        let nav = &app.ui.nav;
-        let other = (nav.routes.len() > 1 && app.ui.right == Some(crate::RightPane::Directions))
-            .then(|| {
-                (0..nav.routes.len())
-                    .filter(|&k| k != nav.chosen)
-                    .find(|&k| nav.routes.get(k).is_some_and(|r| crate::navui::near(r, p, |c| lonlat_to_screen(app, rect, c))))
-            })
-            .flatten();
-        if crate::navui::click(app, c, other) {
-            return;
-        }
-        // The NLDI pane waiting for a point traces its flowline.
-        if crate::nldiui::click(app, c) {
-            return;
-        }
-        // A workflow waiting for map points takes the click.
-        if let Some(pick) = &mut app.workflow.pick
-            && pick.points.len() < pick.needed
-        {
-            pick.points.push(c);
+        if point_pick(app, rect, p, c) {
             return;
         }
         if app.map.split_mode {

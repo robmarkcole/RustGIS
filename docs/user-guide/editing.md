@@ -208,12 +208,19 @@ styles too, which the topmost and visible modes leave out.
 
 ## Rotated box annotations
 
-**Edit › Features › Rotated Box › New Box Annotation Layer** creates a polygon layer and opens
-box controls. To resume an existing layer, select it in Layers, turn editing on, and choose
-**Edit Rotated Boxes** from the same menu.
+**Annotate › New Box Annotation Layer** creates one polygon layer containing multiple classes
+and opens its annotation controls. Each drag on empty map space adds another box to that same
+layer. To resume later, right-click the layer and choose **Add or Edit Boxes**, or choose its
+name in the Annotate tab's layer selector. Editing is enabled automatically.
 
-Choose a reference raster for new boxes, type a class (for example `vehicle`), then drag a box.
-The class stays selected for the next annotation; **Reuse a class** offers existing values.
+Choose a reference raster for new boxes. Type a class such as `vehicle` and click **Add Class**;
+use **Class colour** to change its colour. **Existing classes** selects a class for subsequent
+boxes, including classes defined before any boxes are drawn. New classes also receive colours
+automatically when a box is created. Multiple classes share one layer and appear separately in
+its legend. Changing a class colour updates every box of that class, while **Apply Class to
+Selected Box** changes only the selected box's class. Class names are exported in GeoJSON;
+custom colours are layer styling and are retained in a RustGIS project, not ordinary GeoJSON.
+
 Select a box to see its eight resize handles and its rotation paddle:
 
 - Drag the paddle to rotate about the centre. Hold Shift to snap to 15-degree steps.
@@ -224,7 +231,8 @@ Select a box to see its eight resize handles and its rotation paddle:
 - **Three-click creation** places the start and end of an edge, then the perpendicular height.
   Hold Alt when starting a box to draw over an existing annotation.
 - Escape cancels an unfinished box or held drag and returns to Pan. Each completed drag is one undo step.
-  Middle-drag pans and the wheel zooms. **Done** returns to feature selection.
+  **Space + drag** pans temporarily and keeps the box tool ready; middle-drag also pans and the
+  wheel zooms. **Pan / Stop Annotating** returns to Pan. Choose **Add or Edit Boxes** to continue.
 
 ### Where the rectangle is exact
 
@@ -248,7 +256,7 @@ footprints.
 
 ### GeoJSON export and reopening
 
-Use **Publish › Export Features**, with a `.geojson` destination. Each feature is a closed,
+Use **Annotate › Export Features** (also available under Publish), with a `.geojson` destination. Each feature is a closed,
 counterclockwise WGS 84 longitude/latitude Polygon with four corners, its feature ID, a stable `annotation_id` property, its `class`,
 and a `_rustgis_box` text property containing the versioned construction parameters and reference
 frame. Other GIS applications can use the polygons without interpreting that property.
@@ -260,5 +268,13 @@ application change the geometry, the box controls refuse to refit it silently; t
 available as an ordinary polygon through **Edit Vertices**. Unknown construction versions are
 likewise refused by the box editor and remain preserved as feature attributes.
 
+Use GeoJSON or a RustGIS project to retain constrained editing. Shapefile export shortens
+field names and limits text to 254 bytes, which can truncate the construction record and
+annotation ID; its exported polygons remain usable, but may no longer be editable as boxes.
+The exporter reports these truncations. Box recognition also deliberately uses a strict corner
+match: if a future projection library changes the regenerated corners, use Edit Vertices on
+the preserved polygon rather than accepting an automatic refit.
+
 The CLI and scripts can create a layer with `annotation.newLayer`, then use
-`annotation.addBox` and `annotation.updateBox`. Command search lists their full parameters.
+`annotation.addBox` and `annotation.updateBox`. `annotation.setClass` defines class colours and
+`annotation.resume` continues an existing layer. Command search lists their full parameters.
