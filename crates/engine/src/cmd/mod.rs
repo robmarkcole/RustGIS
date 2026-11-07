@@ -1,5 +1,6 @@
 //! Every command, grouped by ribbon tab.
 
+pub mod annotation;
 pub mod arcgis;
 pub mod catalogs;
 pub mod clipboard;
@@ -89,6 +90,7 @@ pub fn all() -> Vec<CommandSpec> {
     v.extend(cube_catalog::commands());
     v.extend(select::commands());
     v.extend(edit::commands());
+    v.extend(annotation::commands());
     v.extend(clipboard::commands());
     v.extend(labels::commands());
     v.extend(graphics::commands());

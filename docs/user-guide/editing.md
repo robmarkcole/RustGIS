@@ -205,3 +205,60 @@ no map layer is active then, and clicking one ends it). With **Selected in Layer
 the map then identifies that tile layer alone: a WMS layer is asked as above, and a vector tile
 layer, archive or MapLibre style lists its features. This works for catalog basemaps and MapLibre
 styles too, which the topmost and visible modes leave out.
+
+## Rotated box annotations
+
+**Edit › Features › Rotated Box › New Box Annotation Layer** creates a polygon layer and opens
+box controls. To resume an existing layer, select it in Layers, turn editing on, and choose
+**Edit Rotated Boxes** from the same menu.
+
+Choose a reference raster for new boxes, type a class (for example `vehicle`), then drag a box.
+The class stays selected for the next annotation; **Reuse a class** offers existing values.
+Select a box to see its eight resize handles and its rotation paddle:
+
+- Drag the paddle to rotate about the centre. Hold Shift to snap to 15-degree steps.
+- Drag a corner or edge handle to resize along the box's own axes. The opposite corner or edge
+  stays fixed; right angles are preserved even when a handle crosses to the other side.
+- Drag inside the selected box to move it. Width, height and clockwise angle can also be entered
+  numerically. **Apply Class to Selected Box** changes its class.
+- **Three-click creation** places the start and end of an edge, then the perpendicular height.
+  Hold Alt when starting a box to draw over an existing annotation.
+- Escape cancels an unfinished box or held drag and returns to Pan. Each completed drag is one undo step.
+  Middle-drag pans and the wheel zooms. **Done** returns to feature selection.
+
+### Where the rectangle is exact
+
+A raster reference uses the **loaded raster's pixel grid**, with subpixel precision: x increases
+right, y increases down, and angle increases clockwise from the image's rightward axis. Resizing
+and rotation regenerate corners from the centre, dimensions and angle; they do not repeatedly
+transform the last result. Changing the map view never changes the stored rectangle.
+
+RustGIS currently resamples rotated or skewed source rasters to north-up on import. An annotation
+on such a raster is exact in that resampled grid, **not in the original file's pixels**. An
+unreferenced scan or a reduced-resolution overview cannot be used as a reference. Without a
+raster, boxes use Web Mercator grid metres, which differ from ground metres away from the equator.
+The reference transform and coordinate system are saved with each box; moving or removing the
+reference layer does not change existing boxes.
+
+Box annotation is supported on flat, untilted Earth maps. Boxes crossing the antimeridian or the
+polar editing limit (85.05° latitude) are refused. A transformed rectangle can look like a
+quadrilateral in another projection. Export represents its four transformed corners; curved
+projected edges are not densified, so use this for local object annotations rather than regional
+footprints.
+
+### GeoJSON export and reopening
+
+Use **Publish › Export Features**, with a `.geojson` destination. Each feature is a closed,
+counterclockwise WGS 84 longitude/latitude Polygon with four corners, its feature ID, a stable `annotation_id` property, its `class`,
+and a `_rustgis_box` text property containing the versioned construction parameters and reference
+frame. Other GIS applications can use the polygons without interpreting that property.
+
+Reopen the GeoJSON, select its layer, enable editing and choose **Edit Rotated Boxes** to resume.
+Keep `_rustgis_box` intact for constrained editing. RustGIS validates it against the polygon,
+accepting reversed winding and a different starting corner. If generic vertex edits or another
+application change the geometry, the box controls refuse to refit it silently; the feature remains
+available as an ordinary polygon through **Edit Vertices**. Unknown construction versions are
+likewise refused by the box editor and remain preserved as feature attributes.
+
+The CLI and scripts can create a layer with `annotation.newLayer`, then use
+`annotation.addBox` and `annotation.updateBox`. Command search lists their full parameters.

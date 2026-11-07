@@ -2489,6 +2489,10 @@ fn edit_tab(app: &mut RustGisApp, ui: &mut Ui) {
         );
     });
     group(ui, "Features", |ui| {
+        small_menu(ui, app, "g_rect", "Rotated Box", "Create and edit exact rotated rectangle annotations.", |ui, app| {
+            menu_item(ui, app, "g_rect", "New Box Annotation Layer", "annotation.newLayer", Value::Null);
+            menu_item(ui, app, "g_rect", "Edit Rotated Boxes", "tool.set", json!({"tool":"rotatedBox"}));
+        });
         let gt = app.session.active_layer.and_then(|id| app.session.map().layer(id)).map(|l| l.geometry_type());
         let (tool, icon) = match gt {
             Some(GeometryType::Polyline) => (Tool::CreateLine, "line_tool"),

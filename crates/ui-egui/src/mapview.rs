@@ -545,6 +545,8 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
     crate::modelbuilder::follow_view(app);
     view_tabs(app, ui, &t);
     crate::vertexedit::cancel_stale_drag(app);
+    crate::boxedit::follow(app);
+    crate::boxedit::panel(app, ui.ctx());
     if app.mb.shown() {
         crate::modelbuilder::show(app, ui);
         return;
@@ -2372,6 +2374,16 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
         }
     }
 
+    if tool == Tool::RotatedBox {
+        if resp.dragged_by(egui::PointerButton::Middle) {
+            let d = resp.drag_delta();
+            pan(app, f64::from(d.x), f64::from(d.y), w, h);
+            app.map.last_interaction = time;
+            app.map.camera_moved = true;
+        }
+        crate::boxedit::interact(app, ui, resp, rect);
+        return;
+    }
     let shift = ui.input(|i| i.modifiers.shift);
     let middle = ui.input(|i| i.pointer.middle_down());
     let ctrl = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
@@ -2751,6 +2763,7 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
                 app.map.camera_moved = true;
             }
             Tool::EditVertices => crate::vertexedit::click(app, rect, p, c, shift),
+            Tool::RotatedBox => {}
             Tool::CreatePoint => {
                 let _ = app.run("edit.addFeature", with_template(app, json!({"geometry": {"type": "Point", "coordinates": [c.x, c.y]}})));
             }
@@ -2929,6 +2942,7 @@ fn attribution(map: &rustgis_engine::map::Map, sources: &[String]) -> String {
 /// Paints map decorations and interactive readouts, including measurements on the map's body.
 fn overlays(app: &mut RustGisApp, ui: &mut Ui, p: &egui::Painter, rect: Rect, t: &Tokens) {
     let accent = t.accent;
+    crate::boxedit::draw(app, p, rect);
     // Box drag.
     if let (Some((start, DragKind::Box)), Some(cur)) = (app.map.drag, ui.input(|i| i.pointer.latest_pos())) {
         let r = Rect::from_two_pos(start, cur);
@@ -3180,6 +3194,7 @@ fn overlays(app: &mut RustGisApp, ui: &mut Ui, p: &egui::Painter, rect: Rect, t:
         Tool::CreatePoint => Some("Click the map to add a point"),
         Tool::CreateLine => Some("Click to add vertices · double-click to finish the line"),
         Tool::CreatePolygon => Some("Click to add vertices · double-click to close the polygon"),
+        Tool::RotatedBox => Some("Draw a box · drag its paddle to rotate · Shift snaps angles · Esc cancels"),
         Tool::CutPolygon => Some("Draw a line across the selected polygons · double-click to cut them"),
         Tool::Reshape => Some("Draw a line across the selected feature's edge · double-click to reshape it"),
         Tool::Select => Some("Click or drag a box · Shift adds · Ctrl removes"),

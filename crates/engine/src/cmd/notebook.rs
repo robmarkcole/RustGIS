@@ -430,7 +430,7 @@ fn jupyter_outputs(outputs: &[Value]) -> (String, bool) {
             continue;
         }
         // Streams carry on where the last stream stopped; anything else starts a line.
-        if !text.is_empty() && !text.ends_with('\n') && !(stream && after_stream) {
+        if !(text.is_empty() || text.ends_with('\n') || stream && after_stream) {
             text.push('\n');
         }
         text.push_str(&piece);

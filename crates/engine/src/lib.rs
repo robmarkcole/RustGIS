@@ -316,6 +316,8 @@ pub enum Tool {
     CreatePoint,
     CreateLine,
     CreatePolygon,
+    /// Creates and adjusts constrained rectangle annotations.
+    RotatedBox,
     /// Moves, inserts and deletes the vertices of the selected features.
     EditVertices,
     /// Drags a layer's label to where it should be (`labels.move`), as QGIS's Move Label tool;
@@ -358,6 +360,7 @@ impl Tool {
             Tool::CreatePoint => "createPoint",
             Tool::CreateLine => "createLine",
             Tool::CreatePolygon => "createPolygon",
+            Tool::RotatedBox => "rotatedBox",
             Tool::EditVertices => "editVertices",
             Tool::MoveLabel => "moveLabel",
             Tool::CutPolygon => "cutPolygon",
@@ -381,6 +384,7 @@ impl Tool {
             Tool::CreatePoint,
             Tool::CreateLine,
             Tool::CreatePolygon,
+            Tool::RotatedBox,
             Tool::EditVertices,
             Tool::MoveLabel,
             Tool::CutPolygon,
@@ -402,6 +406,7 @@ impl Tool {
             Tool::CreatePoint => "Create Point",
             Tool::CreateLine => "Create Line",
             Tool::CreatePolygon => "Create Polygon",
+            Tool::RotatedBox => "Rotated Box",
             Tool::EditVertices => "Edit Vertices",
             Tool::MoveLabel => "Move Label",
             Tool::CutPolygon => "Cut Polygon",
