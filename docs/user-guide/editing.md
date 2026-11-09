@@ -294,8 +294,10 @@ survey_001.geojson
 
 Choose **Save Annotations** to write the associated GeoJSON. This is separate from saving the
 RustGIS project: saving a project does not automatically overwrite the GeoJSON. **Export Features**
-also carries the metadata when the destination is GeoJSON. Save As through the command's optional
-`path` writes a copy and refuses an existing unrelated destination.
+also carries the metadata when the destination is GeoJSON. Supplying the command's optional
+`path` exports a one-off copy and refuses an existing unrelated destination. It leaves the layer's
+association unchanged: later **Save Annotations** operations still write the original companion
+GeoJSON. Open the copied GeoJSON with **Annotate Image** to continue working from that copy.
 
 Select an imported image annotation layer and choose **Annotate Image** to reconnect its sibling
 TIFF. The CLI command `annotation.openImage` also accepts the path of either member of the pair.
@@ -389,7 +391,10 @@ local top-left, top-right, bottom-right, bottom-left, rotated around the stored 
 unclosed corners in the image's downward-y coordinate system, independently of the geographic
 polygon's winding/start vertex. They are derived from the construction record on each export;
 editing the derived `obb` property does not change the box. `annotation.obb` returns the same
-per-box exchange properties without writing a file.
+per-box exchange properties without writing a file. Its result reports `count` (returned boxes),
+`total` (all annotations) and `skipped` (annotations without OBB corners). A nonzero `skipped`
+count also produces one summary notice for the layer; empty and boxes-only layers produce none.
+Non-box annotations remain in the source GeoJSON.
 
 For [Supervision](https://supervision.roboflow.com/latest/detection/core/), collect these corners
 into `data[ORIENTED_BOX_COORDINATES]` with shape `(N, 4, 2)`; map stable category IDs to the dense

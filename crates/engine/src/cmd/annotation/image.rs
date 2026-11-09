@@ -18,7 +18,7 @@ pub fn commands() -> Vec<C> {
             .effects(Effects::NONE.with(Effect::Files))
             .view()
             .when(need_bound)
-            .params(r#"{"layer"?:annotation layer,"path"?:"*.geojson (default: associated sibling)"}"#),
+            .params(r#"{"layer"?:annotation layer,"path"?:"*.geojson (default: associated sibling; explicit path writes a copy without rebinding)"}"#),
         C::new("annotation.importClasses", "Import Annotation Classes", "Annotate › Classes", import_classes)
             .inputs(super::super::Inputs::single_layer)
             .roles(&[crate::ParamRole { key: "text", role: crate::Role::Opaque }])
@@ -309,7 +309,8 @@ fn save(s: &mut Session, p: &Value) -> CmdResult {
         return Err("image annotations must be saved as .geojson".into());
     }
     local(Path::new(&path))?;
-    // Save may replace only the already-associated companion. Save As never overwrites another file.
+    // An explicit destination writes a copy without rebinding dataset.source. Only the
+    // already-associated companion may be overwritten, whether or not a path was supplied.
     if Path::new(&path).exists() && l.dataset.source.as_ref().is_none_or(|src| !same_path(Path::new(src), Path::new(&path))) {
         return Err("destination exists; choose a new GeoJSON filename".into());
     }
@@ -362,16 +363,23 @@ fn obb(s: &mut Session, p: &Value) -> CmdResult {
     if ds.annotation.is_none() {
         return Err("OBB output requires an image-bound annotation layer".into());
     }
+    let total = ds.features.len();
     let geo = rustgis_data::io::to_geojson(ds);
     let boxes = geo
         .get("features")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|f| f.get("properties").filter(|p| p.get("obb").is_some()).cloned())
+        .enumerate()
+        .filter(|(row, _)| BoxSpec::from_row(ds, *row).is_ok())
+        .filter_map(|(_, f)| f.get("properties").filter(|p| p.get("obb").is_some()).cloned())
         .collect::<Vec<_>>();
+    let skipped = total.saturating_sub(boxes.len());
+    if skipped > 0 {
+        s.notify(format!("Layer {id}: {skipped} annotation features omitted from OBB output (only boxes have OBB corners)"), false);
+    }
     Ok(
-        json!({"boxes":boxes,"count":boxes.len(),"units":"original image pixels","cornerOrder":"local top-left, top-right, bottom-right, bottom-left"}),
+        json!({"boxes":boxes,"count":boxes.len(),"total":total,"skipped":skipped,"units":"original image pixels","cornerOrder":"local top-left, top-right, bottom-right, bottom-left"}),
     )
 }
 
@@ -414,6 +422,78 @@ mod tests {
     fn add_box(s: &mut Session, f: Frame) {
         let b = BoxSpec { version: 1, frame: f, center: [20., 18.], width: 16., height: 6., angle: 37. };
         s.run("annotation.addBox", &json!({"box":b,"class":"vehicle"})).unwrap();
+    }
+    #[test]
+    fn annotation_obb_reports_omissions_once_and_preserves_source_features() {
+        fn query(s: &mut Session, total: usize, count: usize) {
+            let before = serde_json::to_value(&s.project).unwrap();
+            let mark = s.notice_mark();
+            let out = s.run("annotation.obb", &json!({})).unwrap();
+            assert_eq!(out["total"], total);
+            assert_eq!(out["count"], count);
+            assert_eq!(out["skipped"], total - count);
+            assert_eq!(out["boxes"].as_array().unwrap().len(), count);
+            let notices = s.notices_since(mark);
+            if total == count {
+                assert!(notices.is_empty());
+            } else {
+                assert_eq!(notices.len(), 1);
+                assert!(!notices[0].error);
+                assert!(notices[0].text.contains(&format!("{} annotation features omitted", total - count)));
+                assert!(notices[0].text.contains("only boxes have OBB corners"));
+            }
+            assert_eq!(serde_json::to_value(&s.project).unwrap(), before);
+        }
+        let (dir, tif) = fixture();
+        let (mut s, id, f) = new_session(&tif);
+        query(&mut s, 0, 0);
+        add_box(&mut s, f.clone());
+        query(&mut s, 1, 1);
+        for shape in [
+            Shape::Circle { center: [40., 30.], radius: 4. },
+            Shape::Polygon { vertices: vec![[2., 2.], [8., 2.], [8., 8.], [2., 8.]] },
+            Shape::Point { position: [52., 35.] },
+        ] {
+            s.run("annotation.addShape", &json!({"shape":ShapeSpec{version:1,frame:f.clone(),shape},"class":"vehicle"})).unwrap();
+        }
+        // An external attribute named `obb` is not evidence of a constrained box.
+        let l = s.map_mut().layer_mut(id).unwrap();
+        let oi = l.dataset.ensure_field("obb", FieldType::Text);
+        l.dataset.features.get_mut(1).unwrap().attrs[oi] = Cell::Text("external attribute".into());
+        query(&mut s, 4, 1);
+        let ds = &s.map().layer(id).unwrap().dataset;
+        let uid = ds.value(0, ds.field_index("annotation_id").unwrap()).to_string();
+        s.run("annotation.delete", &json!({"annotation_id":uid})).unwrap();
+        query(&mut s, 3, 0);
+        drop(s);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn annotation_save_copy_preserves_binding_and_later_saves_target_original() {
+        let (dir, tif) = fixture();
+        let (mut s, id, f) = new_session(&tif);
+        add_box(&mut s, f);
+        s.run("annotation.saveImage", &json!({})).unwrap();
+        let original = tif.with_extension("geojson");
+        let source = s.map().layer(id).unwrap().dataset.source.clone();
+        let original_bytes = std::fs::read(&original).unwrap();
+        let copy = dir.join("copy.geojson");
+        s.run("annotation.saveImage", &json!({"path":copy})).unwrap();
+        let copy_bytes = std::fs::read(&copy).unwrap();
+        assert_eq!(copy_bytes, original_bytes);
+        assert_eq!(s.map().layer(id).unwrap().dataset.source, source);
+        assert!(s.run("annotation.saveImage", &json!({"path":copy})).is_err());
+        assert_eq!(std::fs::read(&copy).unwrap(), copy_bytes);
+        assert_eq!(std::fs::read(&original).unwrap(), original_bytes);
+        let mut b = BoxSpec::from_row(&s.map().layer(id).unwrap().dataset, 0).unwrap();
+        b.width = 20.;
+        s.run("annotation.updateBox", &json!({"row":0,"box":b})).unwrap();
+        s.run("annotation.saveImage", &json!({})).unwrap();
+        assert_ne!(std::fs::read(&original).unwrap(), original_bytes);
+        assert_eq!(std::fs::read(&copy).unwrap(), copy_bytes);
+        assert_eq!(s.map().layer(id).unwrap().dataset.source, source);
+        drop(s);
+        std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn annotation_image_pair_roundtrip_preserves_palette_ids_shapes_and_obb() {

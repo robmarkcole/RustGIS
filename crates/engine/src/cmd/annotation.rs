@@ -459,7 +459,7 @@ fn unique_id(s: &Session, id: u32) -> Result<String, String> {
     let uid = loop {
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let uid = format!("box-{tick:x}-{n:x}");
-        if !ds.features.iter().any(|f| f.attrs.get(fi) == Some(&Cell::Text(uid.clone()))) {
+        if !ds.features.iter().any(|f| matches!(f.attrs.get(fi), Some(Cell::Text(t)) if *t == uid)) {
             break uid;
         }
     };
