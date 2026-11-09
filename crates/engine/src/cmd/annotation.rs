@@ -225,6 +225,11 @@ const DATA_ROLES: &[crate::ParamRole] = &[
 
 pub fn commands() -> Vec<C> {
     let mut commands = vec![
+        C::new("annotation.delete", "Delete Selected Annotation", "Annotate › Edits", delete_annotation)
+            .inputs(super::Inputs::single_layer)
+            .roles(&[crate::ParamRole {key:"annotation_id",role:crate::Role::Opaque}])
+            .effects(crate::policy::Effects::NONE).when(super::design::need_editable)
+            .params(r#"{"layer"?:name|id,"annotation_id":text}"#),
         C::new("annotation.tool", "Choose Annotation Shape", "Annotate › Shapes", shapes::activate).roles(&[]).effects(crate::policy::Effects::NONE).view().when(super::design::need_editable)
             .params(r#"{"layer"?:name|id,"shape":"box"|"circle"|"polygon"|"point"}"#),
         C::new("annotation.addShape", "Add Annotation Shape", "Annotate › Shapes", shapes::add).inputs(super::design::new_feature_inputs).roles(DATA_ROLES).effects(crate::policy::Effects::NONE).when(super::design::need_editable)
@@ -416,6 +421,35 @@ fn class(p: &Value) -> Result<Option<&str>, String> {
         Some(Value::String(c)) if c.chars().count() <= 200 => Ok(Some(c)),
         _ => Err("class must be text of at most 200 characters".into()),
     }
+}
+/// Delete exactly one stable identity, independently of selections in any other layer.
+fn delete_annotation(s: &mut Session, p: &Value) -> CmdResult {
+    let id = s.layer_id(p)?;
+    check_layer(s, id)?;
+    let uid =
+        ps(p, "annotation_id").filter(|v| !v.is_empty() && v.len() <= 1024).ok_or("annotation_id is required (at most 1024 bytes)")?;
+    let l = s.map_mut().layer_mut(id).ok_or("no layer")?;
+    let fi = l.dataset.field_index("annotation_id").ok_or("missing annotation_id field")?;
+    let mut matches = l
+        .dataset
+        .features
+        .iter()
+        .enumerate()
+        .filter_map(|(row, f)| matches!(f.attrs.get(fi),Some(Cell::Text(value)) if value==uid).then_some(row));
+    let row = matches.next().ok_or("annotation no longer exists")?;
+    if matches.next().is_some() {
+        return Err("annotation_id is ambiguous; repair duplicate identities before deleting".into());
+    }
+    let before = l.dataset.features.remove(row);
+    l.selection.retain(|selected| *selected != row);
+    for selected in &mut l.selection {
+        if *selected > row {
+            *selected -= 1;
+        }
+    }
+    l.touch_geometry();
+    super::design::apply(s, id, vec![super::design::Change { before: Some(before), row: None }])?;
+    Ok(json!({"layer":id,"annotation_id":uid,"deleted":1}))
 }
 fn unique_id(s: &Session, id: u32) -> Result<String, String> {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -629,6 +663,37 @@ mod tests {
         let mark = s.notice_mark();
         s.run("annotation.updateBox", &json!({"row":0,"box":spec(),"class":"car"})).unwrap();
         assert!(s.notices_since(mark).is_empty());
+    }
+    #[test]
+    fn annotation_delete_is_scoped_undoable_and_rejects_ambiguous_identity() {
+        let mut s = Session::new(Project::default());
+        s.run("annotation.newLayer", &json!({"name":"Other"})).unwrap();
+        let other = s.active_layer.unwrap();
+        s.run("annotation.addBox", &json!({"box":spec()})).unwrap();
+        s.run("annotation.newLayer", &json!({"name":"Target"})).unwrap();
+        let id = s.active_layer.unwrap();
+        for _ in 0..3 {
+            s.run("annotation.addBox", &json!({"box":spec(),"class":"vehicle"})).unwrap();
+        }
+        s.run("select.rows", &json!({"layer":other,"rows":[0]})).unwrap();
+        s.run("select.rows", &json!({"layer":id,"rows":[0,1,2],"mode":"add"})).unwrap();
+        let palette = class_colors(&s, id);
+        let before = s.map().layer(id).unwrap().clone();
+        let fi = before.dataset.field_index("annotation_id").unwrap();
+        let uid = before.dataset.value(1, fi).to_string();
+        s.run("annotation.delete", &json!({"layer":id,"annotation_id":uid})).unwrap();
+        let l = s.map().layer(id).unwrap();
+        assert_eq!(l.dataset.features.len(), 2);
+        assert_eq!(l.selection, vec![0, 1]);
+        assert_eq!(s.map().layer(other).unwrap().selection, vec![0]);
+        assert_eq!(class_colors(&s, id), palette);
+        assert!(s.undo());
+        assert_eq!(s.map().layer(id).unwrap().dataset.features, before.dataset.features);
+        assert!(s.run("annotation.delete", &json!({"layer":id,"annotation_id":"missing"})).is_err());
+        s.map_mut().layer_mut(id).unwrap().dataset.features.get_mut(0).unwrap().attrs[fi] = Cell::Text(uid.clone());
+        let unchanged = serde_json::to_string(&s.project).unwrap();
+        assert!(s.run("annotation.delete", &json!({"layer":id,"annotation_id":uid})).is_err());
+        assert_eq!(serde_json::to_string(&s.project).unwrap(), unchanged);
     }
     #[test]
     fn annotation_commands_roundtrip_and_undo_without_refitting() {

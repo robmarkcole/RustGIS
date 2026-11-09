@@ -5642,6 +5642,7 @@ const MAX_STEP_BYTES: usize = 4 << 20;
 /// an optional `layer` that defaults to the active layer goes here, so a recorded step names it;
 /// `record_tests::every_optional_layer_is_classified` fails until it is placed here or there.
 const DEFAULTS_TO_ACTIVE_LAYER: &[&str] = &[
+    "annotation.delete",
     "annotation.openImage",
     "annotation.saveImage",
     "annotation.importClasses",

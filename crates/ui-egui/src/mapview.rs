@@ -311,6 +311,7 @@ pub struct MapView {
     pub menu_lonlat: Option<Coord>,
     /// The text graphic the context menu was opened on (layer id, row), for Edit Text.
     pub menu_text: Option<(u32, usize)>,
+    pub menu_annotation: Option<(u32, String)>,
     /// How the pointer's coordinates read (status bar, right-click menu); a preference.
     pub coord_format: crate::CoordReadout,
     pub render_ms: u64,
@@ -411,6 +412,7 @@ impl Default for MapView {
             kept_lonlat: None,
             menu_lonlat: None,
             menu_text: None,
+            menu_annotation: None,
             coord_format: crate::CoordReadout::Decimal,
             render_ms: 0,
             notices_seen: 0,
@@ -2460,6 +2462,7 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
             return;
         }
         crate::boxedit::interact(app, ui, resp, rect);
+        context_menu(app, ui, resp, rect);
         return;
     }
     let shift = ui.input(|i| i.modifiers.shift);
@@ -2857,16 +2860,22 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
     {
         ui.ctx().set_cursor_icon(icon);
     }
+    context_menu(app, ui, resp, rect);
+    if hover.is_some() && (matches!(tool, Tool::Measure | Tool::MeasureArea) || tool.draws_edit()) && !app.map.sketch.is_empty() {
+        ui.ctx().request_repaint();
+    }
+}
+
+/// Shared by ordinary navigation and annotation tools, which own an earlier interaction path.
+fn context_menu(app: &mut RustGisApp, ui: &Ui, resp: &egui::Response, rect: Rect) {
     if resp.secondary_clicked() {
+        app.map.menu_annotation = resp.interact_pointer_pos().and_then(|p| crate::boxedit::context_target(app, rect, p));
         app.map.menu_lonlat = app.map.pointer_lonlat;
         app.map.menu_text = resp.interact_pointer_pos().and_then(|p| text_graphic_at(app, ui.ctx(), rect, p));
     }
     // No menu off the Earth (a globe's corners): there is no place for it to act on.
     if let Some(c) = app.map.menu_lonlat {
         resp.context_menu(|ui| crate::mapmenu::show(app, ui, c));
-    }
-    if hover.is_some() && (matches!(tool, Tool::Measure | Tool::MeasureArea) || tool.draws_edit()) && !app.map.sketch.is_empty() {
-        ui.ctx().request_repaint();
     }
 }
 

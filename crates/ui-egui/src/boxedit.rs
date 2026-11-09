@@ -175,6 +175,100 @@ fn run(app: &mut RustGisApp, id: &str, p: serde_json::Value) {
     // RustGisApp::run reports failures, including redaction and duplicate suppression.
     let _ = app.run(id, p);
 }
+/// An annotation action must never fall through to the map-wide Delete command.
+pub(crate) fn delete_selected(app: &mut RustGisApp) {
+    if app.session.active_layout.is_some() || app.ui.backstage || app.mb.shown() || app.ws.catalog_view {
+        return;
+    }
+    let Ok((layer, row)) = selected_row(app) else { return };
+    let uid =
+        app.session.map().layer(layer).and_then(|l| l.dataset.field_index("annotation_id").map(|fi| l.dataset.value(row, fi))).and_then(
+            |v| match v {
+                rustgis_engine::data::Value::Text(id) if !id.is_empty() => Some(id.clone()),
+                _ => None,
+            },
+        );
+    if let Some(uid) = uid
+        && app.run("annotation.delete", json!({"layer":layer,"annotation_id":uid})).is_ok()
+    {
+        cancel(&mut app.boxes);
+    }
+}
+/// Capture the clicked object's identity; never reuse an earlier selection for an empty click.
+pub(crate) fn context_target(app: &mut RustGisApp, rect: Rect, p: Pos2) -> Option<(u32, String)> {
+    if !app.session.tool.is_annotation() || !supported(app) || !ready(app) || !app.session.map().editing.settings.enabled {
+        return None;
+    }
+    let id = app.session.active_layer?;
+    let c = screen_to_lonlat(app, rect, p)?;
+    let scale = app.session.scale();
+    let tolerance = 5. * app.session.map().camera.res;
+    let point = app.session.map().to_map(c)?;
+    let (_, row) = app.session.map_mut().hit(point, tolerance, scale, |l| l.id == id && l.selectable)?;
+    let l = app.session.map().layer(id)?;
+    let fi = l.dataset.field_index("annotation_id")?;
+    let rustgis_engine::data::Value::Text(uid) = l.dataset.value(row, fi) else { return None };
+    let uid = uid.clone();
+    let tool = rustgis_engine::cmd::annotation::ShapeSpec::from_row(&l.dataset, row)
+        .map(|s| s.tool())
+        .or_else(|_| BoxSpec::from_row(&l.dataset, row).map(|_| Tool::RotatedBox))
+        .ok()?;
+    cancel(&mut app.boxes);
+    app.run("select.rows", json!({"layer":id,"rows":[row]})).ok()?;
+    app.run("tool.set", json!({"tool":tool.code()})).ok()?;
+    Some((id, uid))
+}
+/// Revalidate the identity and visibility while the menu is open (rows can move after edits).
+fn context_row(app: &RustGisApp, target: &(u32, String)) -> Option<usize> {
+    let (id, row) = selected_row(app).ok()?;
+    if id != target.0 {
+        return None;
+    }
+    let l = app.session.map().layer(id)?;
+    let fi = l.dataset.field_index("annotation_id")?;
+    let expected = rustgis_engine::data::Value::Text(target.1.clone());
+    (l.dataset.value(row, fi) == &expected && l.dataset.features.iter().filter(|f| f.attrs.get(fi) == Some(&expected)).count() == 1)
+        .then_some(row)
+}
+pub(crate) fn context_menu(app: &mut RustGisApp, ui: &mut egui::Ui) {
+    let Some(target) = app.map.menu_annotation.clone() else { return };
+    let Some(row) = context_row(app, &target) else { return };
+    if ui.button(tl!("Delete Annotation")).clicked() {
+        delete_selected(app);
+        ui.close();
+        return;
+    }
+    let classes = rustgis_engine::cmd::annotation::class_colors(&app.session, target.0);
+    ui.menu_button(tl!("Change Class"), |ui| {
+        for (name, color) in classes {
+            let clicked = ui
+                .horizontal(|ui| {
+                    ui.colored_label(Color32::from_rgb(color.r(), color.g(), color.b()), "●");
+                    let label = if name.is_empty() { tl!("Unclassified") } else { name.as_str() };
+                    ui.button(label).clicked()
+                })
+                .inner;
+            if clicked {
+                if context_row(app, &target) == Some(row) {
+                    let params = app.session.map().layer(target.0).and_then(|l| {
+                        if let Ok(b) = BoxSpec::from_row(&l.dataset, row) {
+                            Some(("annotation.updateBox", json!({"layer":target.0,"row":row,"box":b,"class":name})))
+                        } else {
+                            rustgis_engine::cmd::annotation::ShapeSpec::from_row(&l.dataset, row)
+                                .ok()
+                                .map(|shape| ("annotation.updateShape", json!({"layer":target.0,"row":row,"shape":shape,"class":name})))
+                        }
+                    });
+                    if let Some((cmd, p)) = params {
+                        run(app, cmd, p);
+                    }
+                }
+                ui.close();
+            }
+        }
+    });
+    ui.separator();
+}
 pub(crate) fn panel(app: &mut RustGisApp, ctx: &egui::Context) {
     if !app.session.tool.is_annotation() || app.session.active_layout.is_some() || app.mb.shown() || app.ws.catalog_view {
         return;
@@ -344,6 +438,7 @@ pub(crate) fn panel(app: &mut RustGisApp, ctx: &egui::Context) {
                 }
             }
             }
+            if selected_row(app).is_ok() && ui.button(tl!("Delete Selected Annotation")).clicked() { delete_selected(app); }
             if !supported(app) {ui.colored_label(Color32::RED,tl!("Annotation requires a flat, untilted Earth map."));}
             if let Some(e) = &app.boxes.error {
                 ui.colored_label(Color32::RED, e);
@@ -694,6 +789,83 @@ pub(crate) fn draw(app: &RustGisApp, p: &egui::Painter, rect: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn annotation_context_actions_target_clicked_object_for_every_shape() {
+        use egui_kittest::kittest::Queryable;
+        use rustgis_engine::cmd::annotation::{Shape, ShapeSpec};
+        for shape in [
+            None,
+            Some(Shape::Circle { center: [0., 0.], radius: 40. }),
+            Some(Shape::Point { position: [0., 0.] }),
+            Some(Shape::Polygon { vertices: vec![[-40., -40.], [40., -40.], [0., 40.]] }),
+        ] {
+            let mut h = harness();
+            let id = h.state().session.active_layer.unwrap();
+            let b = BoxSpec { version: 1, frame: Frame::default(), center: [0., 0.], width: 80., height: 80., angle: 25. };
+            let mut away = b.clone();
+            away.center = [200., 0.];
+            h.state_mut().run("annotation.addBox", json!({"box":away,"class":"old"})).unwrap();
+            if let Some(shape) = shape {
+                h.state_mut()
+                    .run("annotation.addShape", json!({"shape":ShapeSpec{version:1,frame:Frame::default(),shape},"class":"old"}))
+                    .unwrap();
+            } else {
+                h.state_mut().run("annotation.addBox", json!({"box":b,"class":"old"})).unwrap();
+            }
+            h.state_mut().run("annotation.setClass", json!({"class":"new","color":"#00ff00"})).unwrap();
+            h.state_mut().run("select.rows", json!({"rows":[0]})).unwrap();
+            h.step();
+            let rect = h.state().map.view_rect.unwrap().0;
+            let p = lonlat_to_screen(h.state(), rect, Frame::default().to_lonlat([0., 0.]).unwrap()).unwrap();
+            for pressed in [true, false] {
+                h.event(egui::Event::PointerMoved(p));
+                h.event(egui::Event::PointerButton {
+                    pos: p,
+                    button: egui::PointerButton::Secondary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                });
+                h.step();
+            }
+            for _ in 0..4 {
+                h.step();
+            }
+            assert!(h.state().map.menu_lonlat.is_some());
+            assert!(h.state().map.menu_annotation.is_some());
+            let row = selected_row(h.state()).unwrap().1;
+            assert_eq!(row, 1, "right-click must select its target instead of reusing the prior selection");
+            let original = h.state().session.map().layer(id).unwrap().dataset.features[row].clone();
+            h.get_by_label("Change Class").click();
+            for _ in 0..4 {
+                h.step();
+            }
+            h.get_by_label("new").click();
+            h.step();
+            let ds = &h.state().session.map().layer(id).unwrap().dataset;
+            assert_eq!(ds.value(row, ds.field_index("class").unwrap()).to_string(), "new");
+            assert_eq!(ds.features[row].geometry, original.geometry);
+            assert_eq!(ds.features[row].id, original.id);
+            for pressed in [true, false] {
+                h.event(egui::Event::PointerMoved(p));
+                h.event(egui::Event::PointerButton {
+                    pos: p,
+                    button: egui::PointerButton::Secondary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                });
+                h.step();
+            }
+            for _ in 0..4 {
+                h.step();
+            }
+            h.get_by_label("Delete Annotation").click();
+            h.step();
+            assert_eq!(h.state().session.map().layer(id).unwrap().dataset.features.len(), 1);
+            h.state_mut().run("edit.undo", json!({})).unwrap();
+            assert_eq!(h.state().session.map().layer(id).unwrap().dataset.features.len(), 2);
+            assert!(context_target(h.state_mut(), rect, rect.min + vec2(30., 30.)).is_none());
+        }
+    }
     fn harness() -> egui_kittest::Harness<'static, RustGisApp> {
         let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
         app.run("annotation.newLayer", json!({})).unwrap();

@@ -618,6 +618,11 @@ pub fn shortcuts(app: &mut RustGisApp, ctx: &egui::Context) {
             }
             continue;
         }
+        // Annotation Delete is scoped to one object, even when other layers have selections.
+        if id == "edit.delete" && app.session.active_layout.is_none() && app.session.tool.is_annotation() {
+            crate::boxedit::delete_selected(app);
+            continue;
+        }
         // With Edit Vertices, Delete removes the chosen vertex rather than the feature.
         if id == "edit.delete"
             && app.session.active_layout.is_none()

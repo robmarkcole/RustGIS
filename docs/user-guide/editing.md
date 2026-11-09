@@ -261,6 +261,16 @@ to continue later. The target selector keeps subsequent annotations in that same
 zooms. Hold Alt to draw over an existing annotation. Escape cancels and returns to Pan. Each
 completed draw or drag is one undo step. Clicking an existing annotation chooses its shape tool.
 
+Click an annotation, then choose **Delete Selected Annotation** in its controls, or press **Delete**
+while annotating. This removes only that object from its layer, preserving the layer, class palette
+and selections in other layers. Undo restores it. With no single visible annotation selected, the
+Delete key does nothing in annotation mode. Save Annotations writes the deletion to the GeoJSON.
+
+While annotating, right-click an object to select it and choose **Delete Annotation** or **Change
+Class**. The class submenu uses the layer’s saved class colours, including unused categories. These
+actions affect only the clicked object and support Undo. Right-clicking empty map space keeps the
+usual map menu. Save Annotations writes these edits to the companion GeoJSON.
+
 GeoJSON exports points as Point features and the other shapes as Polygon features. Circles are
 **256-edge polygon approximations**; exact centre, radius and frozen reference frame are retained
 in the versioned `_rustgis_shape` text property for constrained editing when reopened. This is a
