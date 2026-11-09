@@ -2434,35 +2434,19 @@ fn annotate_tab(app: &mut RustGisApp, ui: &mut Ui) {
         });
     });
     group(ui, "Shapes", |ui| {
-        col(ui, |ui| {
-            for (label, icon, shape, tool) in [
-                ("Circle", "g_circle", "circle", Tool::AnnotationCircle),
-                ("Polygon", "g_polygon", "polygon", Tool::AnnotationPolygon),
-                ("Point", "g_point", "point", Tool::AnnotationPoint),
-            ] {
-                small(
-                    ui,
-                    app,
-                    icon,
-                    label,
-                    "Add and edit this annotation shape in the current layer.",
-                    "annotation.tool",
-                    json!({"shape":shape}),
-                    app.session.tool == tool,
-                );
-            }
-        });
-        big(
-            ui,
-            app,
-            "g_rect",
-            "Add or Edit\nBoxes",
-            "Drag to add more boxes to the current annotation layer; use the paddle to rotate.",
-            "annotation.tool",
-            json!({"shape":"box"}),
-            app.session.tool == Tool::RotatedBox,
-            false,
-        );
+        let shapes = [
+            ("Box", "g_rect", "box", Tool::RotatedBox, "Add and edit boxes in the current layer; use the paddle to rotate."),
+            ("Circle", "g_circle", "circle", Tool::AnnotationCircle, "Add and edit circles in the current layer."),
+            ("Polygon", "g_polygon", "polygon", Tool::AnnotationPolygon, "Add and edit polygons in the current layer."),
+            ("Point", "g_point", "point", Tool::AnnotationPoint, "Add and edit points in the current layer."),
+        ];
+        for column in shapes.chunks(2) {
+            col(ui, |ui| {
+                for (label, icon, shape, tool, hint) in column {
+                    small(ui, app, icon, label, hint, "annotation.tool", json!({"shape":shape}), app.session.tool == *tool);
+                }
+            });
+        }
     });
     group(ui, "Navigate", |ui| {
         big(
