@@ -46,6 +46,8 @@ pub const NOT_THIS_SESSION: &str = "This request's login does not belong to this
 pub const CHOOSE_CONNECTION: &str = "Several saved connections match this address. Choose a connection explicitly.";
 /// A `connection` that is not a saved web-service connection's id.
 pub const NO_SUCH_CONNECTION: &str = "No saved web-service connection with this id.";
+/// A request's `connection` that isn't text.
+pub const CONNECTION_TEXT: &str = "connection must be a saved web-service connection id (text)";
 /// The commands that add layers from a service, and so may record the connection they came from
 /// (their `connection` parameter, or the connection whose login their address is read with).
 pub const ADD_COMMANDS: &[&str] = &[
@@ -134,6 +136,16 @@ impl SessionLogins {
     /// Whether [`SessionLogins::anonymous`] reads are running: nothing may pick a login for them.
     pub(crate) fn is_anonymous(&self) -> bool {
         self.anonymous
+    }
+
+    /// The immutable runtime owner used by the networking crate's private account snapshot.
+    pub(crate) fn session_id(&self) -> u64 {
+        self.session
+    }
+
+    /// Sorted connection ids only; bearer bindings never enter the policy's JSON projection.
+    pub(crate) fn active_ids(&self) -> Vec<&str> {
+        self.active.keys().map(String::as_str).collect()
     }
 
     fn owner(&self, id: &str) -> String {
@@ -309,8 +321,10 @@ pub fn request(s: &mut Session, connection: Option<&str>, url: &str) -> Result<S
             return Ok(plain.to_string());
         }
         Some(c.clone())
-    } else if let Some(id) = s.database_logins.selection(WEB, &origin) {
-        candidates.iter().find(|c| c.id == id).map(|c| (*c).clone())
+    // A choice naming a connection no longer here (or no longer at this origin) is no choice:
+    // the sole connection left still lends its login.
+    } else if let Some(c) = s.database_logins.selection(WEB, &origin).and_then(|id| candidates.iter().find(|c| c.id == id)) {
+        Some((*c).clone())
     } else if candidates.len() == 1 {
         candidates.first().map(|c| (*c).clone())
     } else {
@@ -354,7 +368,7 @@ pub fn request_params<'a>(s: &mut Session, p: &'a Value) -> Result<std::borrow::
         None | Some(Value::Null) => None,
         Some(Value::String(id)) if id.trim().is_empty() => None,
         Some(Value::String(id)) => Some(id.as_str()),
-        Some(_) => return Err("connection is a saved web-service connection id.".into()),
+        Some(_) => return Err(CONNECTION_TEXT.into()),
     };
     if id.is_none() && (s.web_logins.anonymous || p.get("anonymous").and_then(Value::as_bool) == Some(true)) {
         // An address bound to a login is no authority for it here either.
@@ -791,16 +805,10 @@ fn named(s: &Session, params: &Value) -> Result<Option<Connection>, String> {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(id)) if id.trim().is_empty() => Ok(None),
         Some(Value::String(id)) => {
-            let c = s
-                .connections
-                .connections
-                .iter()
-                .find(|c| &c.id == id)
-                .filter(|c| is_service(c))
-                .ok_or("connection is the id of a saved web-service connection (connection.list)")?;
+            let c = s.connections.connections.iter().find(|c| &c.id == id).filter(|c| is_service(c)).ok_or(NO_SUCH_CONNECTION)?;
             Ok(Some(c.clone()))
         }
-        Some(_) => Err("connection is the id of a saved web-service connection (connection.list)".into()),
+        Some(_) => Err(CONNECTION_TEXT.into()),
     }
 }
 

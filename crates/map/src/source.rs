@@ -34,6 +34,8 @@ pub const VIEW_LIMIT: usize = if cfg!(target_arch = "wasm32") { 100_000 } else {
 /// The most features a view reads from a file by its web address (each one is fetched).
 pub const REMOTE_VIEW_LIMIT: usize = if cfg!(target_arch = "wasm32") { 30_000 } else { 60_000 };
 
+const RECONNECT_REQUIRED: &str = "this database source came from a peer; reconnect explicitly before reading it";
+
 /// A streamed layer's source.
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct SourceLayer {
@@ -93,6 +95,9 @@ pub struct SourceLayer {
     /// The last open failed because the server refused the login (no password given this session, or a wrong one).
     #[serde(skip)]
     pub login: bool,
+    /// Runtime-only: imported source selection awaits an explicit reconnect or exact peer retention.
+    #[serde(skip)]
+    reconnect_required: bool,
     /// The most features a view reads (0 = [`VIEW_LIMIT`]).
     #[serde(skip)]
     pub limit: usize,
@@ -526,10 +531,25 @@ pub struct Window {
 struct Pending {
     extent: Extent,
     result: Mutex<Option<Result<(Batch, window::Cache), String>>>,
+    still: Option<rustgis_data::source::remote::Still>,
 }
 
 /// A source being opened off the frame.
-type Opening = Arc<Mutex<Option<Result<Arc<dyn FeatureSource>, String>>>>;
+type Opening = Arc<OpeningState>;
+struct OpeningState {
+    result: Mutex<Option<Result<Arc<dyn FeatureSource>, String>>>,
+    still: Option<rustgis_data::source::remote::Still>,
+}
+impl OpeningState {
+    /// Owns the initiating carrier before an asynchronous source open can leave this thread.
+    fn new() -> Opening {
+        Arc::new(Self { result: Mutex::new(None), still: rustgis_data::source::remote::current_still() })
+    }
+    /// Retains the existing completion-slot locking behavior; authority stays outside its payload.
+    fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, Option<Result<Arc<dyn FeatureSource>, String>>>> {
+        self.result.lock()
+    }
+}
 
 /// Asks the app for a frame (the waker) with nothing new to draw: what landed while the map drew
 /// is said a frame after (see [`wake`] for something new to draw).
@@ -688,6 +708,11 @@ impl SourceLayer {
     /// Opens the source again (after a project loads). A source by its web address is opened off
     /// the frame: `Ok` while it is (see [`SourceLayer::is_pending`]), open once it has landed.
     pub fn open(&mut self) -> Result<(), String> {
+        rustgis_data::source::remote::check_still(&rustgis_data::source::remote::current_still())?;
+        if self.reconnect_required {
+            self.error = Some(RECONNECT_REQUIRED.into());
+            return Err(RECONNECT_REQUIRED.into());
+        }
         if let Some(url) = self.path.clone().filter(|p| rustgis_data::source::is_remote_name(p)) {
             return self.open_remote(&url);
         }
@@ -771,6 +796,10 @@ impl SourceLayer {
     /// (or footer) off the frame, taken by a later call when it has landed.
     fn open_remote(&mut self, url: &str) -> Result<(), String> {
         if let Some(slot) = self.opening.clone() {
+            if let Err(e) = rustgis_data::source::remote::check_still(&slot.still) {
+                self.opening = None;
+                return self.opened(Err(e));
+            }
             // A file that can't be read in place is downloaded whole into the same slot, by the
             // first copy to see it; the others wait on that download rather than start their own.
             let claimed = slot.lock().ok().is_some_and(|mut s| {
@@ -795,9 +824,9 @@ impl SourceLayer {
         }
         match rustgis_data::source::open_url_now(url) {
             Ok(s) => self.opened(Ok(Arc::from(s))),
-            Err(e) if e.to_string().contains(rustgis_data::source::remote::READ_WHOLE) => self.open_whole(url, Arc::new(Mutex::new(None))),
+            Err(e) if e.to_string().contains(rustgis_data::source::remote::READ_WHOLE) => self.open_whole(url, OpeningState::new()),
             Err(e) if e.to_string().contains(rustgis_data::source::remote::NEED) => {
-                let slot: Opening = Arc::new(Mutex::new(None));
+                let slot = OpeningState::new();
                 let land = slot.clone();
                 self.opening = Some(slot);
                 rustgis_data::source::open_url(
@@ -826,22 +855,25 @@ impl SourceLayer {
         let name = url.split(['?', '#']).next().unwrap_or(url).rsplit('/').next().unwrap_or("layer").to_string();
         let table = self.table.clone();
         let url = url.to_string();
-        rustgis_data::source::remote::fetch_whole(
-            &url.clone(),
-            Box::new(move |r| {
-                let r = match r {
-                    Ok(bytes) => rustgis_data::source::open_shared(&name, Arc::new(bytes), table.as_deref())
-                        .map(Arc::from)
-                        .map_err(|e| format!("{url}: {e}")),
-                    Err(rustgis_data::source::remote::Failed::Other(e)) => Err(format!("{url}: {e}")),
-                    Err(e) => Err(format!("{url}: couldn't be downloaded ({e:?})")),
-                };
-                if let Ok(mut s) = land.lock() {
-                    *s = Some(r);
-                }
-                wake();
-            }),
-        );
+        let still = land.still.clone();
+        rustgis_data::source::remote::with_optional_still(still, || {
+            rustgis_data::source::remote::fetch_whole(
+                &url.clone(),
+                Box::new(move |r| {
+                    let r = match r {
+                        Ok(bytes) => rustgis_data::source::open_shared(&name, Arc::new(bytes), table.as_deref())
+                            .map(Arc::from)
+                            .map_err(|e| format!("{url}: {e}")),
+                        Err(rustgis_data::source::remote::Failed::Other(e)) => Err(format!("{url}: {e}")),
+                        Err(e) => Err(format!("{url}: couldn't be downloaded ({e:?})")),
+                    };
+                    if let Ok(mut s) = land.lock() {
+                        *s = Some(r);
+                    }
+                    wake();
+                }),
+            );
+        });
         Ok(())
     }
 
@@ -925,6 +957,25 @@ impl SourceLayer {
 
     pub fn is_pending(&self) -> bool {
         self.pending.is_some() || self.opening.is_some()
+    }
+
+    /// Suspends automatic reads without changing the serialized source definition or any password.
+    pub fn require_reconnect(&mut self) {
+        self.reconnect_required = true;
+        self.handle = None;
+        self.opening = None;
+        self.pending = None;
+        self.error = Some(RECONNECT_REQUIRED.into());
+    }
+
+    /// Whether the source still needs its owner to authorize a reconnect.
+    pub fn reconnect_required(&self) -> bool {
+        self.reconnect_required
+    }
+
+    /// Releases a source after its owner explicitly reconnects or validates exact peer retention.
+    pub fn allow_reconnect(&mut self) {
+        self.reconnect_required = false;
     }
 
     /// Opens the source afresh, forgetting a failed or never-started open (and the window read
@@ -1042,7 +1093,8 @@ impl SourceLayer {
         let full_read = self.full_read;
         let fields = self.window_fields;
         let query = self.query.clone();
-        let pending = Arc::new(Pending { extent, result: Mutex::new(None) });
+        let still = rustgis_data::source::remote::current_still();
+        let pending = Arc::new(Pending { extent, result: Mutex::new(None), still: still.clone() });
         let p = pending.clone();
         // A source by its web address: the read runs as its bytes land (on the desktop and in
         // the browser alike), fetching what it needs in rounds.
@@ -1069,14 +1121,20 @@ impl SourceLayer {
             return;
         }
         let job = move || {
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                window::read_mode(h.as_ref(), &req, budget, &projection, estimate, full_read, fields, query.as_ref())
-            }))
-            .unwrap_or_else(|_| Err(rustgis_data::DataError::Format("the read failed unexpectedly".into())))
-            .map_err(|e| e.to_string());
-            if let Ok(mut slot) = p.result.lock() {
-                *slot = Some(r);
-            }
+            rustgis_data::source::remote::with_optional_still(still.clone(), || {
+                let r = rustgis_data::source::remote::check_still(&still)
+                    .and_then(|()| {
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            window::read_mode(h.as_ref(), &req, budget, &projection, estimate, full_read, fields, query.as_ref())
+                        }))
+                        .unwrap_or_else(|_| Err(rustgis_data::DataError::Format("the read failed unexpectedly".into())))
+                        .map_err(|e| e.to_string())
+                    })
+                    .and_then(|r| rustgis_data::source::remote::check_still(&still).map(|()| r));
+                if let Ok(mut slot) = p.result.lock() {
+                    *slot = Some(r);
+                }
+            })
         };
         #[cfg(not(target_arch = "wasm32"))]
         if !block {
@@ -1112,7 +1170,7 @@ impl SourceLayer {
         let Some(p) = self.pending.clone() else { return Polled::Idle };
         let start = web_time::Instant::now();
         loop {
-            let done = p.result.lock().ok().and_then(|mut r| r.take());
+            let done = p.result.lock().ok().and_then(|mut r| r.take()).map(|r| rustgis_data::source::remote::check_still(&p.still).and(r));
             match done {
                 Some(Ok((b, cache))) => {
                     self.pending = None;
@@ -1211,8 +1269,146 @@ pub fn generation() -> u64 {
     GENERATION.load(Ordering::Relaxed)
 }
 
+impl SourceLayer {
+    /// Persisted source address and local driver paths; handles and embedded data are opaque.
+    pub(crate) fn output_slots(&self) -> Vec<(crate::LayerRole, &str, bool, bool)> {
+        let SourceLayer {
+            path,
+            file_name: _,
+            table: _,
+            shapefile_crs: _,
+            embedded,
+            handle: _,
+            window: _,
+            render_lod: _,
+            pending: _,
+            projection: _,
+            ready_cache: _,
+            byte_budget: _,
+            estimated_row_bytes: _,
+            full_read: _,
+            saved_selection: _,
+            window_fields: _,
+            query: _,
+            opening: _,
+            error: _,
+            login: _,
+            reconnect_required: _,
+            limit: _,
+            reads: _,
+            gdal,
+            duckdb,
+            postgis,
+            mysql,
+            sqlserver,
+        } = self;
+        use crate::{LayerRole as R, paths};
+        let mut out = Vec::new();
+        if let Some(p) = path {
+            out.push((
+                R::Streamed,
+                p.as_str(),
+                true,
+                embedded.is_none()
+                    && gdal.is_none()
+                    && duckdb.is_none()
+                    && postgis.is_none()
+                    && mysql.is_none()
+                    && sqlserver.is_none()
+                    && paths::is_local(p),
+            ));
+        }
+        if let Some(g) = gdal {
+            out.push((R::GdalPath, g.path.as_str(), false, paths::is_local(&g.path)));
+        }
+        if let Some(d) = duckdb
+            && let Some(p) = &d.database
+        {
+            out.push((R::DuckDbDatabase, p.as_str(), true, paths::is_local(p)));
+        }
+        if let Some(pg) = postgis {
+            out.push((R::PostgisDatabase, pg.database.as_str(), true, false));
+        }
+        if let Some(my) = mysql {
+            out.push((R::MysqlDatabase, my.database.as_str(), true, false));
+        }
+        if let Some(ms) = sqlserver {
+            out.push((R::SqlServerDatabase, ms.database.as_str(), true, false));
+        }
+        out
+    }
+
+    /// Resolves a prepared field without examining its written contents.
+    pub(crate) fn output_slot_mut(&mut self, role: crate::LayerRole) -> Option<&mut String> {
+        match role {
+            crate::LayerRole::Streamed => self.path.as_mut(),
+            crate::LayerRole::GdalPath => Some(&mut self.gdal.as_mut()?.path),
+            crate::LayerRole::DuckDbDatabase => self.duckdb.as_mut()?.database.as_mut(),
+            crate::LayerRole::PostgisDatabase => Some(&mut self.postgis.as_mut()?.database),
+            crate::LayerRole::MysqlDatabase => Some(&mut self.mysql.as_mut()?.database),
+            crate::LayerRole::SqlServerDatabase => Some(&mut self.sqlserver.as_mut()?.database),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// A later frame's whole-file fallback owns the opening's carrier through send and landing.
+    #[test]
+    fn permission_policy_opening_fallback_retains_owner_outside_ambient_context() {
+        use rustgis_data::source::remote;
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        };
+        for (owned, revoke) in [(true, false), (true, true), (false, false)] {
+            let live = Arc::new(AtomicBool::new(true));
+            let check = live.clone();
+            let still = owned.then(|| Arc::new(move || check.load(Ordering::SeqCst)) as remote::Still);
+            let held = Arc::new(Mutex::new(None));
+            let hold = held.clone();
+            let sends = Arc::new(AtomicUsize::new(0));
+            let count = sends.clone();
+            let ranges = Arc::new(AtomicUsize::new(0));
+            let range_count = ranges.clone();
+            let url = format!("https://opening-fallback.invalid/{owned}-{revoke}.fgb");
+            remote::forget_file(&url);
+            remote::set_fetcher(move |_, want, done| match want {
+                remote::Want::Whole => {
+                    let context = remote::current_still();
+                    assert_eq!(context.is_some(), owned, "the actual later-frame fallback must re-enter its saved carrier");
+                    *hold.lock().unwrap() = Some((context, done));
+                }
+                _ => {
+                    range_count.fetch_add(1, Ordering::SeqCst);
+                    done(Err(remote::Failed::NoRanges));
+                }
+            });
+            let mut source = super::SourceLayer { path: Some(url.clone()), ..Default::default() };
+            remote::with_optional_still(still, || source.open()).unwrap();
+            assert_eq!(ranges.load(Ordering::SeqCst), 1, "actual opening tried a range");
+            assert!(source.opening.is_some());
+            assert!(remote::current_still().is_none());
+            // The next frame starts outside the original synchronous scope.
+            source.open().unwrap();
+            let (context, done) = held.lock().unwrap().take().unwrap();
+            live.store(!revoke, Ordering::SeqCst);
+            let mut ds = rustgis_data::Dataset::new("fallback", rustgis_data::GeometryType::Point, vec![]);
+            ds.push_next(Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(0., 0.))), vec![]);
+            let result = remote::check_still(&context).map_err(remote::Failed::Other).map(|()| {
+                count.fetch_add(1, Ordering::SeqCst);
+                rustgis_data::source::fgb::write(&ds).unwrap()
+            });
+            done(result);
+            assert_eq!(source.open().is_err(), revoke);
+            assert_eq!(source.is_open(), !revoke, "a revoked landing must never install the source");
+            assert_eq!(sends.load(Ordering::SeqCst), usize::from(!revoke));
+            assert!(remote::current_still().is_none());
+            remote::forget_file(&url);
+        }
+    }
+
     /// Reopening this same layer must invalidate populated decisions even without `reset`.
     #[test]
     fn reopening_a_populated_thinning_cache_uses_the_new_handle() {

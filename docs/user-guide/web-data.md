@@ -103,6 +103,15 @@ and band, such as INPE's [Brazil Data Cube](https://data.inpe.br/bdc/) or Sentin
   read at its own region's, found by reading one byte of its first file. Without a matching
   connection, a bucket that refuses anonymous reads (a private one, or one that charges the
   reader, as Landsat's does) is refused, naming it.
+- **A static collection laid out by date:** JAXA Earth's collections have no search, so `"url"` is
+  a `collection.json`, and only the period's date folders are read: one date's folders to find the
+  items over the area, then those items at each date, about one document per date and tile (a
+  tile that date doesn't have is missed in the others too). Documents that can't be read, or are
+  refused, are told in a notice. Collections with no year in their dates (climatologies) and hourly
+  ones are refused. A month or year folder is taken whole when the period reaches into it, so a
+  period from 15 January still has January's file. The codes a collection gives for a failed
+  retrieval (`dn.error`) draw on the map as values, inside its range or stretch, and a notice says
+  how many files have them; Trend Analysis and cube summaries skip them.
 - **Web app:** creating a cube with **Add as Time Series** is desktop-only. Saved cube tile
   layers can draw in the web app when their servers allow browser requests (CORS).
 - **Its trend:** the same search, given to Trend Analysis (`cube.trend` with `collection`,
@@ -409,8 +418,9 @@ reads it back the next time it is needed: when the pane opens or a file is read 
 server. A token saved without the box ticked deletes the one remembered before. An expired token
 is forgotten, here and in the credential store, and the pane asks for a new one.
 `earthdata.status` reports whether a token is kept, its expiry, whether it is remembered and
-whether an expired one was forgotten; `earthdata.logout` (**Remove token**) forgets it and deletes
-the remembered one. The command line (`--use-saved-secrets`) and Python (`use_saved_secrets=True`)
+whether an expired one was forgotten; `earthdata.logout` (**Remove token**) forgets it, deletes
+the remembered one and empties the download cache, so files and documents read with the token
+are read again when next needed. The command line (`--use-saved-secrets`) and Python (`use_saved_secrets=True`)
 use the remembered token too; without them, and in the web app, a token lasts for the session.
 
 In the web app, searching and footprints work, but NASA's data servers don't let web pages read
@@ -495,6 +505,16 @@ rustgis-cli run --cmd 'portal.files={"dataset":"giswqs/geospatial"}'
 rustgis-cli run --sample --cmd 'portal.add={"url":"https://data.geopf.fr/telechargement/download/LiDARHD-NUALID/NUALHD_1-0__LAZ_LAMB93_KE_2025-06-06/LHD_FXX_0652_6864_PTS_LAMB93_IGN69.copc.laz","name":"LiDAR HD 0652-6864"}'
 ```
 
+When forwarding query options to addresses supplied by a service, RustGIS copies only
+`collections`, `datetime`, `subset`, `subset-crs`, `crs`, `bgcolor` and `transparent`.
+Other settings, including keys, are inherited only by sub-addresses RustGIS constructs within
+the original source path. Some discovery paths report withheld settings in a counted notice.
+An advertised WMS GetMap address can replace the discovery address without inheriting its query;
+this does not produce that notice.
+If it needs authentication, supply an explicitly authorized address for that source rather than
+relying on a token being copied from the discovery address. Destination addresses keep settings
+they already contain.
+
 ### Layers that change with time
 
 A WMS or WMTS layer with a time dimension, from any service, goes on the
@@ -533,7 +553,11 @@ animation, and a layer whose only time is `current`:
 rustgis-cli run --cmd 'service.add={"url":"https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/1.0.0/WMTSCapabilities.xml","layer":"MODIS_Terra_CorrectedReflectance_TrueColor","time":"2024-06-01"}' --cmd 'share.exportMap={"path":"gibs.png"}'
 rustgis-cli run --cmd 'service.add={"url":"https://wms.geo.admin.ch/?SERVICE=WMS&REQUEST=GetCapabilities&VERSION=1.3.0","layer":"ch.swisstopo.pixelkarte-farbe-pk25.noscale"}' --cmd 'map.goToXY={"lon":7.4474,"lat":46.948,"scale":25000}' --cmd 'time.set={"interval":15}' --cmd 'time.export={"path":"bern.gif"}'
 rustgis-cli run --cmd 'service.add={"url":"https://wmts.geo.admin.ch/EPSG/3857/1.0.0/WMTSCapabilities.xml","layer":"ch.swisstopo.pixelkarte-farbe"}' --cmd 'share.exportMap={"path":"map.png"}'
+rustgis-cli run --cmd 'service.add={"url":"https://wmts.geo.admin.ch/EPSG/2056/1.0.0/WMTSCapabilities.xml","layer":"ch.swisstopo.pixelkarte-farbe"}' --cmd 'map.projection={"type":"EPSG:2056"}' --cmd 'map.goToXY={"lon":7.4474,"lat":46.948,"scale":20000}' --cmd 'share.exportMap={"path":"bern-lv95.tif"}'
 ```
+
+The last writes the view as a GeoTIFF in Swiss LV95 (EPSG:2056), placed on the ground, with the
+service's credits in its Copyright tag (see [Exporting](sharing.md#exporting)).
 
 ## United States
 

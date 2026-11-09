@@ -20,15 +20,33 @@ pub struct Clipboard {
 
 pub fn commands() -> Vec<C> {
     vec![
-        C::new("edit.copy", "Copy", "Edit › Clipboard", |s, _| copy(s)).view().key("Mod+C").when(need_selection),
-        C::new("edit.cut", "Cut", "Edit › Clipboard", cut).key("Mod+X").when(super::design::need_editable_selection),
+        C::new("edit.copy", "Copy", "Edit › Clipboard", |s, _| copy(s))
+            .roles(&[])
+            .effects(crate::policy::Effects::NONE)
+            .view()
+            .key("Mod+C")
+            .when(need_selection),
+        C::new("edit.cut", "Cut", "Edit › Clipboard", cut)
+            .roles(&[])
+            .effects(crate::policy::Effects::NONE)
+            .key("Mod+X")
+            .when(super::design::need_editable_selection),
         C::new("edit.paste", "Paste", "Edit › Clipboard", paste)
+            .roles(&[])
+            .effects(crate::policy::Effects::NONE)
             .key("Mod+V")
             .when(super::design::need_editable)
             .params(r#"{"layer"?, "text"?: GeoJSON text (the copied features when omitted)}"#),
         C::new("edit.pasteSpecial", "Paste Special", "Edit › Clipboard", paste_special)
+            .roles(&[])
+            .effects(crate::policy::Effects::NONE)
             .params(r#"{"name"?: string, "text"?: GeoJSON text (the copied features when omitted)}"#),
-        C::new("layer.copyPath", "Copy Path", "Edit › Clipboard", copy_path).view().when(need_layer).params(r#"{"layer"?}"#),
+        C::new("layer.copyPath", "Copy Path", "Edit › Clipboard", copy_path)
+            .roles(&[])
+            .effects(crate::policy::Effects::NONE)
+            .view()
+            .when(need_layer)
+            .params(r#"{"layer"?}"#),
     ]
 }
 
@@ -176,5 +194,10 @@ fn copy_path(s: &mut Session, p: &Value) -> CmdResult {
     let path = path.ok_or_else(|| format!("{} isn't stored in a file", l.name))?;
     // A service layer's address is its source: copied without keys, tokens or its password, as
     // the details pane shows it and a saved project keeps a web address.
-    Ok(json!({"text": crate::sources::redact(&path)}))
+    let text = crate::sources::redact(&path);
+    if text != path {
+        // Not the layer's name: it may hold an address with a key of its own.
+        s.notify("The copied address leaves out part of the layer's address (keys, tokens, a password, a login or a fragment), so it may not work as it is", false);
+    }
+    Ok(json!({"text": text}))
 }

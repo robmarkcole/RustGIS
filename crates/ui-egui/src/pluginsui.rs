@@ -397,10 +397,14 @@ fn tell_unloaded(app: &mut RustGisApp) {
     }
     let text = match failed.as_slice() {
         [] => return,
-        [(id, reason)] => crate::i18n::fmt(
-            "The plugin {id} wasn't loaded. Open Plugins › Plugin Manager to see it. {reason}",
-            &[("id", id), ("reason", reason)],
-        ),
+        // The way to it first, so a long reason cut from the notice doesn't take it along.
+        [(id, reason)] => match reason.trim().trim_end_matches('.') {
+            "" => crate::i18n::fmt("The plugin {id} wasn't loaded. Open Plugins › Plugin Manager to see it.", &[("id", id)]),
+            reason => crate::i18n::fmt(
+                "The plugin {id} wasn't loaded (open Plugins › Plugin Manager to see it): {reason}.",
+                &[("id", id), ("reason", reason)],
+            ),
+        },
         _ => {
             let ids: Vec<&str> = failed.iter().map(|(id, _)| id.as_str()).collect();
             crate::i18n::fmt(
@@ -613,11 +617,20 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
             Job::Blocklist { registry, slot } => match take(&slot) {
                 None => waiting.push(Job::Blocklist { registry, slot }),
                 Some(Ok(b)) => {
-                    let text = String::from_utf8_lossy(&b).to_string();
+                    // Not text is refused too: a replaced byte in an id would match nothing.
+                    let text = std::str::from_utf8(&b).map_err(|e| format!("it isn't text: {e}"));
                     #[cfg(not(target_arch = "wasm32"))]
-                    let pulled = rp::store::save_blocklist(&registry, &text).unwrap_or_default();
+                    let pulled = text.and_then(|t| rp::store::save_blocklist(&registry, t));
                     #[cfg(target_arch = "wasm32")]
-                    let pulled = rp::registry::parse_blocklist(&text).map(|l| rp::apply_blocklist(&registry, l)).unwrap_or_default();
+                    let pulled = text.and_then(rp::registry::parse_blocklist).map(|l| rp::apply_blocklist(&registry, l));
+                    // One that can't be read leaves the list in force as it was.
+                    let pulled = pulled.unwrap_or_else(|e| {
+                        app.session.warn(crate::i18n::fmt(
+                            "The plugin blocklist couldn't be read ({error}); the last one read, if any, stays in force.",
+                            &[("error", &e)],
+                        ));
+                        Vec::new()
+                    });
                     for name in pulled {
                         app.session.notify(
                             crate::i18n::fmt("{name} was withdrawn from the plugin registry and has been turned off.", &[("name", &name)]),
@@ -625,8 +638,16 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
                         );
                     }
                 }
-                // No blocklist: nothing is blocked.
-                Some(Err(_)) => {}
+                // Another registry may have no blocklist (it blocks nothing); the hosted one always
+                // has one, so the list in force may be out of date.
+                Some(Err(e)) => {
+                    if rp::registry::is_default(&registry) {
+                        app.session.warn(crate::i18n::fmt(
+                            "The plugin blocklist couldn't be downloaded ({error}); the last one read, if any, stays in force.",
+                            &[("error", &e)],
+                        ));
+                    }
+                }
             },
             Job::Download { entry, slot } => match take(&slot) {
                 None => waiting.push(Job::Download { entry, slot }),
@@ -1249,8 +1270,8 @@ mod tests {
         let mut app = app_fetching(|_| Err("unreachable".into()));
         let told = start(&mut app, vec![record("demo", "0")]);
         assert_eq!(told.len(), 1, "{told:?}");
-        assert!(told[0].0.starts_with("The plugin demo wasn't loaded."), "{told:?}");
-        assert!(told[0].0.ends_with("unreachable"), "{told:?}");
+        assert!(told[0].0.starts_with("The plugin demo wasn't loaded (open Plugins › Plugin Manager to see it): "), "{told:?}");
+        assert!(told[0].0.ends_with("unreachable."), "{told:?}");
 
         // A download that isn't the one installed.
         let mut app = app_fetching(|_| Ok(b"x".to_vec()));
@@ -1263,7 +1284,7 @@ mod tests {
         let damaged = Saved { data: Some("!not base64!".into()), url: None, ..record("damaged", "0") };
         let told = start(&mut app, vec![damaged]);
         assert_eq!(told.len(), 1, "{told:?}");
-        assert!(told[0].0.starts_with("The plugin damaged wasn't loaded.") && told[0].0.contains("damaged:"), "{told:?}");
+        assert!(told[0].0.starts_with("The plugin damaged wasn't loaded (open Plugins") && told[0].0.contains("damaged:"), "{told:?}");
 
         // Loaded: nothing to tell, nothing listed.
         struct Cleanup(#[allow(dead_code)] tempfile::TempDir);
@@ -1303,7 +1324,8 @@ mod tests {
         let listed: Vec<&str> = app.plugins.unloaded.iter().map(|u| u.saved.id.as_str()).collect();
         assert_eq!(listed, ["damaged"]);
         let told: Vec<&str> = app.session.notices_since(mark).iter().map(|n| n.text.as_str()).collect();
-        assert!(told.len() == 1 && told[0].starts_with("The plugin damaged wasn't loaded."), "{told:?}");
+        assert!(told.len() == 1 && told[0].starts_with("The plugin damaged wasn't loaded (open Plugins"), "{told:?}");
+        assert!(!told[0].contains(".."), "a reason's own full stop isn't doubled: {told:?}");
         assert!(rp::get("restore-new").is_some());
     }
 

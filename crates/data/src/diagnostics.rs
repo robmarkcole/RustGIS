@@ -344,11 +344,29 @@ impl Capture {
     /// request's own facts (address, method, status, duration) and its failure's message: the
     /// transport's, or the browser's. `details` may hold the few response headers a refusal
     /// keeps. A response body is never passed. Everything is redacted and bounded here.
-    pub fn network_failure(&self, source: &str, message: &str, details: &str, mut network: Network) {
+    pub fn network_failure(&self, source: &str, message: &str, details: &str, network: Network) {
+        self.keep_network_failure(source, message, details, network, false);
+    }
+
+    /// Keeps repeated policy refusals once while their sanitized facts remain in this bounded
+    /// history. Clearing or evicting the record permits it to be reported again.
+    pub fn network_failure_once(&self, source: &str, message: &str, details: &str, network: Network) {
+        self.keep_network_failure(source, message, details, network, true);
+    }
+
+    /// Compares sanitized facts under the retention lock, so Clear cannot lose a refusal.
+    fn keep_network_failure(&self, source: &str, message: &str, details: &str, mut network: Network, once: bool) {
         let Some(state) = self.0.upgrade() else { return };
         network.url = clean_address(&network.url);
+        if once {
+            // Rejected tile paths on one server are one policy refusal, not distinct attempts.
+            network.url = url::Url::parse(&network.url)
+                .ok()
+                .filter(|u| u.origin().is_tuple())
+                .map_or(network.url, |u| u.origin().ascii_serialization());
+        }
         network.method = known_method(&network.method);
-        History(state).retain(Record {
+        let record = Record {
             id: 0,
             timestamp_ms: timestamp_ms(),
             severity: Severity::Error,
@@ -356,7 +374,16 @@ impl Capture {
             message: bounded(message, MAX_MESSAGE_BYTES),
             details: bounded(details, MAX_DETAILS_BYTES),
             network: Some(network),
-        });
+        };
+        let mut state = lock(&state);
+        if once
+            && state.records.iter().any(|r| {
+                r.source == record.source && r.message == record.message && r.details == record.details && r.network == record.network
+            })
+        {
+            return;
+        }
+        store(&mut state, record);
     }
 }
 
@@ -491,73 +518,12 @@ fn normalized_key(key: &str) -> impl Iterator<Item = char> + '_ {
 
 /// Whether `key` is `target` (lower case, letters and digits) however it is written.
 fn key_is(key: &str, target: &str) -> bool {
-    normalized_key(key).eq(target.chars())
+    crate::address::normalized_name(key).is_some_and(|name| name == target)
 }
 
-/// A name with its percent and `\u` escapes decoded, to the depth an attacker could nest them.
-fn decoded_name(key: &str) -> String {
-    let mut name = key.to_string();
-    for _ in 0..4 {
-        let bytes = name.as_bytes();
-        let mut decoded = String::with_capacity(name.len());
-        let mut i = 0;
-        while let Some(&b) = bytes.get(i) {
-            if b == b'%'
-                && let Some(hex) = name.get(i + 1..i + 3)
-                && let Ok(value) = u8::from_str_radix(hex, 16)
-            {
-                decoded.push(char::from(value));
-                i += 3;
-            } else if b == b'\\'
-                && bytes.get(i + 1) == Some(&b'u')
-                && let Some(hex) = name.get(i + 2..i + 6)
-                && let Ok(value) = u32::from_str_radix(hex, 16)
-                && let Some(c) = char::from_u32(value)
-            {
-                decoded.push(c);
-                i += 6;
-            } else if let Some(c) = name.get(i..).and_then(|s| s.chars().next()) {
-                decoded.push(c);
-                i += c.len_utf8();
-            } else {
-                break;
-            }
-        }
-        if decoded == name {
-            break;
-        }
-        name = decoded;
-    }
-    name
-}
-
+/// Shared bounded name decoding; diagnostics additionally omit log-only fields.
 fn secret_name(key: &str) -> bool {
-    // Decode only names, never values: decoding a URL value could introduce whitespace and
-    // incorrectly end its redacted query. Work and allocation are capped by MAX_INPUT_BYTES, and
-    // a name with nothing to decode is not copied.
-    let decoded;
-    let name = if key.contains(['%', '\\']) {
-        decoded = decoded_name(key);
-        decoded.as_str()
-    } else {
-        key
-    };
-    let normalized: String = normalized_key(name).collect();
-    crate::source::credentials::secret_key(name)
-        || crate::source::credentials::secret_key(&normalized)
-        || normalized.contains("credential")
-        || normalized.contains("connectionstring")
-        || normalized.contains("privatekey")
-        || normalized.contains("accountkey")
-        // A prefixed name is still one: MAPBOX_API_KEY, X_API_KEY, AWS_ACCESS_KEY_ID.
-        || normalized.contains("apikey")
-        || normalized.contains("accesskey")
-        || normalized.contains("sharedaccess")
-        || normalized.contains("body")
-        || matches!(
-            normalized.as_str(),
-            "basic" | "bearer" | "authentication" | "wwwauthenticate" | "proxyauthenticate" | "userid" | "username"
-        )
+    crate::address::log_sensitive(key)
 }
 
 /// Whether the name is an HTTP credential header: its value is always a scheme and a credential
@@ -700,6 +666,12 @@ pub fn redact(text: &str) -> String {
             if after.starts_with("://") {
                 let url_end = rest.find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | '`')).unwrap_or(rest.len());
                 let address = rest.get(..url_end).unwrap_or("");
+                if crate::address::scheme_example(address.trim_end_matches([':', ',', ';', '.', ')', ']'])) {
+                    out.push_str(address);
+                    i += url_end;
+                    field_before = false;
+                    continue;
+                }
                 match url::Url::parse(address) {
                     // Nothing to take out: the address stays as written, its punctuation too
                     // ("https://example.org: timeout"), unless it holds control characters.
@@ -971,7 +943,7 @@ mod tests {
         // swallow the rest of the message.
         for text in [
             "The saved password is missing or doesn't match this connection.",
-            "4 layer address(es) were saved without their keys, tokens or passwords: after RustGIS closes, add those layers again to give them",
+            "4 layer address(es) were saved without their keys, tokens, passwords or URL fragments; after RustGIS closes, add those layers again to restore missing values",
             "3 layer(s) read the database of the connection 'db' and need its password: right-click the connection in Data Sources › Connections, or one of the layers, and choose Log In…",
             "Set Color's step keeps its key parameter. If that is an access key, delete the step (Edit Steps) before sharing the task.",
             "Exported /data/a[1].png",
@@ -1209,6 +1181,12 @@ mod tests {
     fn addresses_without_anything_to_take_out_stay_as_written() {
         assert_eq!(redact("Could not reach https://example.org: timeout"), "Could not reach https://example.org: timeout");
         assert_eq!(redact("failed https://example.org/a/b, retrying"), "failed https://example.org/a/b, retrying");
+        for text in ["plain http://, confirm before sending", "use https:// for encryption", "an S3:// address"] {
+            assert_eq!(redact(text), text);
+        }
+        for address in ["https://?token=RGSYNTH_example", "s3://#RGSYNTH_example", "https://u:RGSYNTH_example@"] {
+            assert!(!redact(address).contains("RGSYNTH_example"), "an incomplete address with content is still withheld");
+        }
     }
 
     /// Taking user information out rewrites the address, and the punctuation that ended it in the
@@ -1246,6 +1224,9 @@ mod tests {
         assert_eq!(redact("server: B.earer hidden"), "server: [REDACTED]");
         assert_eq!(redact("server: Ba-sic dXNlcjpwYXNz"), "server: [REDACTED]");
         assert_eq!(redact("pass%77ord=x"), "[REDACTED]");
+        for key in ["%2574oken", "%2525252574oken"] {
+            assert!(!redact(&format!("{key}=RGSYNTH_diagnostic_20261103")).contains("RGSYNTH_"));
+        }
     }
 
     #[test]

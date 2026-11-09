@@ -56,8 +56,9 @@ On the desktop, a file Add Data reads whole (a GeoTIFF or another raster, one GD
 GeoJSON of up to 32 MB, delimited text or a spreadsheet) is read in the background, so the map
 and the rest of the window stay in use: the status bar shows **Add Data**, how many files wait
 after it, and **Cancel**. Files dropped or added together are read one at a time and added in
-that order; one that asks which layers to add joins them once you choose. Cancel leaves the file being read and those waiting; opening another project, or
-switching to another map, leaves them too, and a message says which. A file read in place, a web
+that order; one that asks which layers to add joins them once you choose. Cancel drops the file
+being read and those waiting; opening another project, or switching to another map, drops them
+too, and a message says so (the files waiting are counted, not named). A file read in place, a web
 service or a database adds as before, and scripts read the file where the command runs. So does
 **Delimited Text…**: it reads the file with the columns picked as you press **Add**, so a read
 that fails (a column that isn't in the file, a coordinate system it doesn't know) keeps the
@@ -90,9 +91,15 @@ and S-JTSK, the same built-in Helmert datum transformation as the EPSG definitio
 transformation in the file takes precedence. RDN2008 and IGM95 are treated as WGS 84-like
 datums. These transformations do not replace regional grid corrections for survey accuracy. An
 unrecognized datum keeps its ellipsoid and produces a notice when no transformation is
-available. Swiss oblique Mercator, the standard Krovak East/North variant, and the oblique
-Mercator, Cassini-Soldner, polyconic and Equal Earth methods are supported from their
-parameters.
+available. Swiss oblique Mercator, the standard Krovak East/North variant, the oblique
+Mercator in its azimuth forms (the two-point form, with no azimuth, is refused), and the
+Cassini-Soldner, polyconic and Equal Earth methods are supported from their parameters, as are sinusoidal (MODIS), Robinson, orthographic and Mercator (variant A), in `.prj`
+files and in GeoTIFF keys. Esri's orthographic is a spherical projection: on an ellipsoid it is
+refused, with a notice, rather than computed as EPSG's ellipsoidal one. The equidistant
+cylindrical projection (EPSG:4087, World Equidistant Cylindrical) is computed on its ellipsoid,
+as EPSG defines it, not on a sphere, both for data and for a map drawn in it (as is the
+Equirectangular preset). An ellipsoid flatter than about 1/100, such as Jupiter's or Saturn's, is
+refused in it rather than approximated.
 
 Shapefile text uses a supported `.cpg` encoding, otherwise the `.dbf` code page, with UTF-8 as
 the fallback. Keep the sidecar files together.
@@ -110,7 +117,8 @@ fields, calculates field [expressions](expressions.md) and opens **Calculate Geo
 The geometry calculator fills a new double field or an existing numeric field with area,
 perimeter, length or point X/Y, for all or selected features. Point coordinates can be WGS 84
 degrees or a supported projected EPSG system's units. Areas, perimeters and lengths measure on
-the WGS 84 ellipsoid, with the exceptions for full-turn and polar rings listed under
+the WGS 84 ellipsoid; how full-turn rings (globe-wide bands) and rings split at the antimeridian
+are measured, and the exception for polar rings, are under
 [Geoprocessing](analysis.md#geoprocessing-tools).
 See [Editing](editing.md) for field
 calculations and data-design rules. Streamed layers must first be loaded with **Load All
@@ -119,7 +127,7 @@ Features**.
 ## Formats through GDAL
 
 When [GDAL](https://gdal.org) is installed (its `ogr2ogr` and `ogrinfo` programs on the `PATH`,
-or the folder holding them in `RUSTGIS_GDAL_BIN`; GDAL 3.7 or later), the desktop app also opens
+or the folder holding them in `RUSTGIS_GDAL_BIN`; GDAL 3.8 or later), the desktop app also opens
 the vector formats GDAL reads: DWG, MapInfo TAB, OpenStreetMap XML, File Geodatabases RustGIS
 can't read itself (compressed ones, or ones with raster fields)
 and more. RustGIS doesn't link to GDAL: each layer is converted once, by `ogr2ogr`, into a
@@ -619,6 +627,21 @@ database is kept without its password. The commands `sources.list`, `sources.sav
 `sources.favourite` and `sources.remove` read and change the lists, for the command line and the
 [AI Assistant](assistant.md). On the command line they last for the run.
 
+### Network downloads
+
+On desktop and the command line, web tiles, service documents and file downloads through
+**From URL…** connect directly, including `layer.addUrl`. These requests do not use
+`HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY`: a proxy could resolve a destination beyond the
+app's IP checks. There is no proxy override for these requests. If your network requires a
+proxy, download a file with a trusted external tool and open the local copy in RustGIS.
+Live tile and service access requires direct connectivity. The web app uses the browser's
+network settings. Browser GET and HEAD requests refuse redirects, including HTTP-to-HTTPS upgrades
+and CDN hops, because the app cannot inspect their destinations. This includes **From URL…**
+file downloads, fonts, service documents, tiles and sprites, and PMTiles/COG archive range
+reads. Supply the final address; for a redirecting file download, download it with a trusted
+external tool and open the local copy. The browser also controls DNS and local-network access;
+see [tile request limits](maps.md#basemaps).
+
 ### HTTPS certificates
 
 On desktop and the command line, RustGIS's HTTPS clients use platform certificate verification:
@@ -635,7 +658,8 @@ inspection proxy's) must be trusted by the operating system for the account runn
   variables select the trust sources instead of the default system locations (an empty
   `SSL_CERT_DIR` counts as unset).
   If no default system roots are found and neither variable is set, this client falls back to
-  its bundled Mozilla roots, so public HTTPS still works in minimal containers. It does not
+  its bundled Mozilla roots, so public HTTPS still works in minimal containers, and says so
+  once a session (in the status bar and the troubleshooting history). It does not
   add Mozilla roots to an existing CA store (even one it can't read) or an explicitly configured one.
 
 `SSL_CERT_FILE` and `SSL_CERT_DIR` do **not** override Windows or macOS trust for this client.
@@ -856,6 +880,9 @@ Relative links, including parent paths, resolve against the document's address w
 template placeholders or query values, including proxy parameters containing `https://` URLs.
 KVP requests replace capabilities operation parameters, keeping unrelated parameters such as
 MapServer's `map=`.
+A same-origin link whose path or query holds a space, backslash or control character keeps the
+login: tabs, line breaks and trailing spaces are dropped, a backslash in the path becomes `/` and
+other spaces, control characters and backslashes are percent-encoded (a space as `%20`).
 If a service supplies a same-origin link too long to carry its login, the request is refused
 instead of being fetched anonymously. Addresses that cannot be rebound to a login are left
 unchanged and reported.
@@ -1221,13 +1248,19 @@ routes, areas, observations…) to draw into. Add Folder connects a folder to th
 also lists the project's layouts, styles and tasks. A task's steps each run a command; New Task
 From History turns the geoprocessing history into a task you can replay.
 
-Saved projects, map and layer files, and packages keep no password, key, token or signature in
-layer web addresses. The open project keeps them for this session. RustGIS remembers the 32 most
-recent distinct saved snapshots whose addresses needed stripping. Opening a plain `.rgis` file
-whose bytes exactly match one of those snapshots restores its secrets; saving more distinct
-snapshots evicts the oldest. Changed files, packages, imports and files saved by another process
-never restore secrets. After a snapshot is evicted or RustGIS closes, add those layers again with
-their credentials.
+Saved projects, templates, map and layer files, and packages remove recognized credentials from
+supported addresses and recognized executable parameters. The open project keeps its credentials. Removal
+notices describe what a shared workflow or video will need again; an unchecked-content notice
+means opaque content was kept and needs your review. Unrecognized credentials can remain in
+addresses without a notice, so review addresses and preserved content before sharing.
+
+RustGIS remembers up to 32 distinct saved snapshots for explicit project reopening, with at most
+1 MiB of restoration data per snapshot and 8 MiB in total. A snapshot must match, and only its
+recorded, unchanged fields can regain credentials. Larger restoration records are not remembered;
+a notice says so. Imports, packages and peer exchanges do not use this memory. After eviction or
+closing RustGIS, sign in again or add the protected sources with their credentials. Feature data
+and user text remain data, so review them before sharing.
+
 A layer added from a saved web-service connection records the connection's id (`"connection"`
 in the `.rgis` file; never its login), so the project needs no token in its addresses. See
 [Web-service logins](#web-service-logins) for what happens when it opens where that connection or

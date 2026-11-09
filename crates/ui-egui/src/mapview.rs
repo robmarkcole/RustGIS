@@ -8,7 +8,9 @@ use rustgis_engine::analysis::{
     network::{radius_boundary_point, radius_distance_m},
     selection::MAX_POINTS,
 };
-use rustgis_engine::geom::{Coord, Extent, geodesic_length_m, geodesic_ring_area_m2, wgs84_length_m, wgs84_ring_perimeter_area_m2};
+use rustgis_engine::geom::{
+    Coord, Extent, geodesic_length_m, geodesic_ring_area_m2, geodesic_ring_perimeter_m, wgs84_length_m, wgs84_ring_perimeter_area_m2,
+};
 use rustgis_engine::map::layout::TextAlign;
 use rustgis_engine::map::projection::Flat;
 use rustgis_engine::map::{Camera, Globe, Projection};
@@ -302,11 +304,15 @@ pub struct MapView {
     /// A map or layout waiting for the user to confirm its deletion.
     pub deleting: Option<Deletion>,
     pub pointer_lonlat: Option<Coord>,
+    /// The last pointer position seen over a map, kept for the status bar readout after the
+    /// pointer leaves the map; with the map's instance and the session's `opened` it belongs to.
+    kept_lonlat: Option<(Coord, u64, u64)>,
     /// Where the map's context menu was opened: the pointer leaves the map for the menu.
     pub menu_lonlat: Option<Coord>,
     /// The text graphic the context menu was opened on (layer id, row), for Edit Text.
     pub menu_text: Option<(u32, usize)>,
-    pub dms: bool,
+    /// How the pointer's coordinates read (status bar, right-click menu); a preference.
+    pub coord_format: crate::CoordReadout,
     pub render_ms: u64,
     pub notices_seen: usize,
     pub toasts: Vec<Toast>,
@@ -402,9 +408,10 @@ impl Default for MapView {
             popup_rev: 0,
             deleting: None,
             pointer_lonlat: None,
+            kept_lonlat: None,
             menu_lonlat: None,
             menu_text: None,
-            dms: false,
+            coord_format: crate::CoordReadout::Decimal,
             render_ms: 0,
             notices_seen: 0,
             toasts: Vec::new(),
@@ -436,6 +443,18 @@ impl Default for MapView {
 }
 
 impl MapView {
+    /// The position the status bar shows: the last one over this map, kept while the pointer is
+    /// elsewhere. A position from another map or project no longer applies, so it is dropped.
+    pub fn kept_pointer_lonlat(&mut self, map_instance: u64, opened: u64) -> Option<Coord> {
+        match self.kept_lonlat {
+            Some((c, m, o)) if m == map_instance && o == opened => Some(c),
+            _ => {
+                self.kept_lonlat = None;
+                None
+            }
+        }
+    }
+
     /// Whether an exact frame is being composed off the UI thread, or the frame shown waits for
     /// tile pictures still to be drawn.
     pub fn drawing(&self) -> bool {
@@ -1523,6 +1542,16 @@ struct MovingLabel {
 /// what the Move Label tool grabs, as it is drawn now. Labels not of a layer's features aren't;
 /// nor any while a moving globe or tilted map draws them from where they were placed.
 fn label_at(app: &RustGisApp, rect: Rect, p: Pos2) -> Option<PlacedLabel> {
+    label_at_where(app, rect, p, |_| true)
+}
+
+/// The topmost moved label under the pointer, even beneath one never moved (Show all labels).
+fn pinned_label_at(app: &RustGisApp, rect: Rect, p: Pos2) -> Option<PlacedLabel> {
+    label_at_where(app, rect, p, |l| l.collide.pinned)
+}
+
+/// The topmost label under the pointer that `keep` accepts.
+fn label_at_where(app: &RustGisApp, rect: Rect, p: Pos2, keep: impl Fn(&PlacedLabel) -> bool) -> Option<PlacedLabel> {
     if app.map.key.is_none_or(|key| key.rev != app.session.revision || key.sources != rustgis_engine::map::source::generation()) {
         return None;
     }
@@ -1542,7 +1571,7 @@ fn label_at(app: &RustGisApp, rect: Rect, p: Pos2) -> Option<PlacedLabel> {
         return None;
     }
     let at = p - rect.min;
-    app.map.labels.iter().rev().filter(|l| l.collide.source.is_some() && !l.text.is_empty()).find_map(|l| {
+    app.map.labels.iter().rev().filter(|l| l.collide.source.is_some() && !l.text.is_empty() && keep(l)).find_map(|l| {
         let mut l = l.clone();
         // Where it is drawn now: its text at its own size, its callout's feature where it is.
         (l.x, l.y) = (shift.x + l.x * s, shift.y + l.y * s);
@@ -2286,6 +2315,9 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
     let time = now(ui);
     let hover = resp.hover_pos();
     app.map.pointer_lonlat = hover.and_then(|p| screen_to_lonlat(app, rect, p));
+    if let Some(c) = app.map.pointer_lonlat.filter(|c| c.is_finite()) {
+        app.map.kept_lonlat = Some((c, app.session.map().instance_id(), app.session.opened));
+    }
     let tool = app.session.tool;
     cancel_changed_selection(app, rect);
 
@@ -2741,8 +2773,7 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
             // Labels move by dragging them; Shift-clicking a moved one puts it back.
             Tool::MoveLabel => {
                 if shift
-                    && let Some((layer, feature, class)) =
-                        label_at(app, rect, p).filter(|l| l.collide.pinned).and_then(|l| l.collide.source)
+                    && let Some((layer, feature, class)) = pinned_label_at(app, rect, p).and_then(|l| l.collide.source)
                     && let Some(name) = label_class_name(app, layer, class)
                     && let Err(error) = app.run("labels.move", json!({"layer": layer, "class": name, "feature": feature, "to": null}))
                 {
@@ -3177,7 +3208,7 @@ fn overlays(app: &mut RustGisApp, ui: &mut Ui, p: &egui::Painter, rect: Rect, t:
                 if body.is_earth() {
                     wgs84_ring_perimeter_area_m2(ring)
                 } else {
-                    (body.length(geodesic_length_m(ring)), body.area(geodesic_ring_area_m2(ring)))
+                    (body.length(geodesic_ring_perimeter_m(ring)), body.area(geodesic_ring_area_m2(ring)))
                 }
             };
             let text = if tool == Tool::Measure {
@@ -4645,6 +4676,13 @@ mod tests {
         let pinned = h.state().map.labels.iter().find(|l| l.collide.pinned).map(|l| rect.min + vec2(l.x, l.y));
         let shift = egui::Modifiers { shift: true, ..none };
         let at = pinned.expect("the moved label drawn");
+        // A label never moved drawn over the moved one doesn't hide it from Shift-click.
+        let mut over = h.state().map.labels.iter().find(|l| l.collide.pinned).cloned().expect("the moved label");
+        (over.collide.pinned, over.text) = (false, "Over".into());
+        h.state_mut().map.labels.push(over);
+        assert_eq!(label_at(h.state(), rect, at).map(|l| l.text), Some("Over".into()), "the unmoved label is on top");
+        assert!(pinned_label_at(h.state(), rect, at).is_some_and(|l| l.collide.pinned), "the moved one is still found");
+        // Clicked with the unmoved label still on top: the moved one is put back.
         selection_pointer(&mut h, at, None, shift);
         selection_pointer(&mut h, at, Some(true), shift);
         selection_pointer(&mut h, at, Some(false), shift);
@@ -4900,6 +4938,7 @@ mod tests {
     /// included, so every step of a slider drag made the map flicker.
     #[test]
     fn a_style_change_over_tiles_keeps_the_frame_instead_of_a_preview() {
+        let _turn = crate::fetching::turn();
         let mut app = RustGisApp::with_sample();
         // Nothing listens there: the tiles fail, the map still draws.
         app.run("map.addTiles", json!({"url": "http://127.0.0.1:9/{z}/{x}/{y}.png", "name": "Offline"})).expect("tile layer");

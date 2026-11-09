@@ -6,6 +6,29 @@ use serde_json::Value;
 
 use crate::{CmdResult, Session};
 
+/// A redacted output projection. Never use it as executable parameters or approval identity.
+pub struct LogCopy(Value);
+
+impl LogCopy {
+    /// Consumes the output-only wrapper for serialization.
+    pub fn into_log_value(self) -> Value {
+        self.0
+    }
+}
+
+/// The session log's bounded, document-aware parameter policy, shared with the agent audit.
+/// The source value is never mutated and remains the only input to execution and planning.
+pub fn log_params(params: &Value) -> LogCopy {
+    LogCopy(kept_params(params))
+}
+
+/// Cleans a structural command/tool identifier for display and audit output only.
+/// The original identifier remains the sole input to lookup, execution and approval.
+pub fn log_identifier(id: &str) -> String {
+    let public = crate::roles::identifier(id, &mut crate::durable::Report::default());
+    crate::durable::generated_text(public.as_deref().unwrap_or(id))
+}
+
 /// Now, in milliseconds since 1970 (UTC).
 pub(crate) fn now_ms() -> u64 {
     web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
@@ -115,10 +138,104 @@ fn kept_error(e: &str) -> String {
 /// `v` without secrets: as History's Copy as code takes them out (`history::redacted`), and,
 /// first, inside the JSON a text holds (a script's command lines: `s3.connect {"secret": …}`),
 /// whose objects are redacted in place.
+/// A bounded review's display projection, without the log's clipping. Never used for
+/// execution, consent equality or provenance; the policy retains its private original.
+pub(crate) fn review_params(v: &Value) -> Result<Value, String> {
+    review_value(v, 0)
+}
+
+/// Projects bounded review data recursively, including JSON held inside nested script strings.
+/// A card that cannot show its structure safely is refused; log/diagnostic clipping is separate.
+fn review_value(v: &Value, depth: usize) -> Result<Value, String> {
+    if depth > 32 {
+        return Err("too deeply nested to show in full; ask for a smaller request".into());
+    }
+    Ok(match v {
+        Value::Object(o) => {
+            let mut out = serde_json::Map::new();
+            for (key, value) in o {
+                let sensitive =
+                    rustgis_data::address::normalized_name(key).as_deref() != Some("key") && rustgis_data::address::log_sensitive(key);
+                let Value::String(public_key) = review_value(&Value::String(key.clone()), depth + 1)? else {
+                    return Err("a review field name must be text".into());
+                };
+                let value = if sensitive { Value::String(String::new()) } else { review_value(value, depth + 1)? };
+                if out.insert(public_key, value).is_some() {
+                    return Err("redacted field names cannot be distinguished; simplify the request".into());
+                }
+            }
+            crate::cmd::history::redacted(&Value::Object(out))
+        }
+        Value::Array(a) => Value::Array(a.iter().map(|v| review_value(v, depth + 1)).collect::<Result<_, _>>()?),
+        Value::String(text) => {
+            let mut out = String::new();
+            let mut rest = text.as_str();
+            while let Some(at) = rest.find(['{', '[']) {
+                let (before, from) = rest.split_at(at);
+                out.push_str(before);
+                let mut values = serde_json::Deserializer::from_str(from).into_iter::<Value>();
+                match values.next() {
+                    Some(Ok(value @ (Value::Object(_) | Value::Array(_)))) => {
+                        let value = review_value(&value, depth + 1)?;
+                        out.push_str(&value.to_string());
+                        rest = from.get(values.byte_offset()..).unwrap_or("");
+                    }
+                    _ if from.get(1..).is_some_and(|r| r.trim_start().starts_with(['"', '\''])) || last_secret_name(from).is_some() => {
+                        return Err("structured text cannot be safely shown in full; simplify the request".into());
+                    }
+                    _ => {
+                        let first = from.chars().next().ok_or("empty structured text")?;
+                        out.push(first);
+                        rest = from.get(first.len_utf8()..).unwrap_or("");
+                    }
+                }
+            }
+            out.push_str(rest);
+            Value::String(crate::cmd::history::redacted_text(&sql_secrets_removed(&out)))
+        }
+        other => other.clone(),
+    })
+}
+
 fn redacted(v: &Value) -> Value {
     crate::cmd::history::redacted(&embedded_redacted(v, 0))
 }
 
+/// A bounded log-only context check for a short key beside nested connection settings.
+/// User data/documents do not make an ordinary join or lookup key a credential.
+pub(crate) fn address_context(key: &str, v: &Value, depth: usize) -> bool {
+    if depth >= 8 || matches!(key, "data" | "text" | "values" | "attributes" | "properties" | "features" | "geometry") {
+        return false;
+    }
+    match v {
+        Value::String(s) => {
+            let s = s.trim_start();
+            [
+                "http://",
+                "https://",
+                "s3://",
+                "rustgis-login:",
+                "rustgis-anonymous:",
+                "rustgis-s3:",
+                "postgres:",
+                "postgresql:",
+                "pg:",
+                "mysql:",
+                "mariadb:",
+                "mssql:",
+                "pmtiles:",
+                "cog:",
+            ]
+            .iter()
+            .any(|prefix| s.get(..prefix.len()).is_some_and(|head| head.eq_ignore_ascii_case(prefix)))
+        }
+        Value::Array(values) => values.iter().take(LOG_LIST_ITEMS).any(|v| address_context("", v, depth + 1)),
+        Value::Object(values) => values.iter().any(|(key, v)| address_context(key, v, depth + 1)),
+        _ => false,
+    }
+}
+
+/// Scrubs bounded nested log parameters and JSON embedded in text before the log retains them.
 fn embedded_redacted(v: &Value, depth: usize) -> Value {
     match v {
         Value::String(t) => {
@@ -126,8 +243,71 @@ fn embedded_redacted(v: &Value, depth: usize) -> Value {
             Value::String(sql_secrets_removed(&t))
         }
         Value::Array(a) if depth < 8 => Value::Array(a.iter().map(|x| embedded_redacted(x, depth + 1)).collect()),
-        Value::Object(o) if depth < 8 => Value::Object(o.iter().map(|(k, x)| (k.clone(), embedded_redacted(x, depth + 1))).collect()),
+        Value::Object(o) if depth < 8 => Value::Object(
+            o.iter()
+                .map(|(k, x)| {
+                    // Preserve History's plain-key refinement; the log-only fields share diagnostics'
+                    // canonical list.
+                    let sensitive =
+                        rustgis_data::address::normalized_name(k).as_deref() != Some("key") && rustgis_data::address::log_sensitive(k);
+                    (k.clone(), if sensitive { Value::String(String::new()) } else { embedded_redacted(x, depth + 1) })
+                })
+                .collect(),
+        ),
+        // Past eight levels, left out, as `clip` does: JSON read from a text wasn't clipped, and
+        // what is that deep isn't looked at.
+        Value::Array(_) | Value::Object(_) => Value::String("…".into()),
         other => other.clone(),
+    }
+}
+
+/// JSON whose every object has each of its keys once, as its text is read: deserializing one with
+/// a key written twice (at any depth) fails.
+struct UniqueKeys;
+
+impl<'de> Deserialize<'de> for UniqueKeys {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_any(UniqueKeys)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for UniqueKeys {
+    type Value = UniqueKeys;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("JSON")
+    }
+    fn visit_bool<E>(self, _: bool) -> Result<Self, E> {
+        Ok(self)
+    }
+    fn visit_i64<E>(self, _: i64) -> Result<Self, E> {
+        Ok(self)
+    }
+    fn visit_u64<E>(self, _: u64) -> Result<Self, E> {
+        Ok(self)
+    }
+    fn visit_f64<E>(self, _: f64) -> Result<Self, E> {
+        Ok(self)
+    }
+    fn visit_str<E>(self, _: &str) -> Result<Self, E> {
+        Ok(self)
+    }
+    fn visit_unit<E>(self) -> Result<Self, E> {
+        Ok(self)
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut items: A) -> Result<Self, A::Error> {
+        while items.next_element::<UniqueKeys>()?.is_some() {}
+        Ok(self)
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut keys: A) -> Result<Self, A::Error> {
+        let mut seen = std::collections::HashSet::new();
+        while let Some(key) = keys.next_key::<String>()? {
+            if !seen.insert(key) {
+                return Err(serde::de::Error::custom("a key written twice"));
+            }
+            keys.next_value::<UniqueKeys>()?;
+        }
+        Ok(self)
     }
 }
 
@@ -146,7 +326,19 @@ pub(crate) fn json_in_text_redacted(t: &str) -> String {
         match objects.next() {
             Some(Ok(v @ Value::Object(_))) => {
                 let end = objects.byte_offset();
-                out.push_str(&serde_json::to_string(&crate::cmd::history::redacted(&v)).unwrap_or_default());
+                // Redacted by the log's own rule, as its parameters are. When that takes nothing
+                // out, the object is kept as written: a script copied back from the log is the
+                // one that ran, and its spacing doesn't make it partial. Not when a key is written
+                // twice, though: the value read is the last one, but the text still holds the
+                // first (a secret, perhaps, under an escaped name), so that object is written
+                // out again from what was read.
+                let kept = redacted(&v);
+                let written = from.get(..end).unwrap_or("");
+                if kept == v && serde_json::from_str::<UniqueKeys>(written).is_ok() {
+                    out.push_str(written);
+                } else {
+                    out.push_str(&serde_json::to_string(&kept).unwrap_or_default());
+                }
                 rest = from.get(end..).unwrap_or("");
             }
             // Cut short by the clip, or an object that doesn't parse (a trailing comma, single
@@ -303,7 +495,19 @@ fn clip(v: &Value, chars: usize, items: usize, depth: usize) -> Value {
 
 /// The entry of command `id`, which started at `at` and took `took`; its error without secrets,
 /// clipped to [`LOG_ERROR_CHARS`].
-pub(crate) fn entry(id: &str, params: Value, res: &CmdResult, at: u64, took: web_time::Duration) -> LogEntry {
+/// `partial`: its parameters aren't all as given ([`kept_and_partial`]). It is the entry of the
+/// project given, its name as the log keeps it ([`kept_name`]) and its `Session::opened`: the one
+/// open as the command ended (the one it opened, for one that opens a project), or for an export,
+/// the one it started in.
+pub(crate) fn entry(
+    project: (String, u64),
+    id: &str,
+    params: Value,
+    partial: bool,
+    res: &CmdResult,
+    at: u64,
+    took: web_time::Duration,
+) -> LogEntry {
     let error = res.as_ref().err().map(|e| kept_error(e));
     LogEntry {
         at,
@@ -312,7 +516,26 @@ pub(crate) fn entry(id: &str, params: Value, res: &CmdResult, at: u64, took: web
         ok: res.is_ok(),
         error,
         millis: u64::try_from(took.as_millis()).unwrap_or(u64::MAX),
+        project: project.0,
+        opened: project.1,
+        partial,
+        plugin: None,
     }
+}
+
+/// A project's name as the log keeps it: cut at [`crate::cmd::MAX_NAME`] characters and a `…`, as
+/// a name read from a file may be longer than one given to `project.rename`.
+pub(crate) fn kept_name(name: &str) -> String {
+    let max = crate::cmd::MAX_NAME;
+    if name.chars().nth(max).is_some() { format!("{}…", name.chars().take(max).collect::<String>()) } else { name.to_string() }
+}
+
+/// `params` as the log keeps them ([`kept_params`]), and whether that is less than they were:
+/// cut to fit or with secrets taken out, so they wouldn't run again as they ran.
+pub(crate) fn kept_and_partial(params: &Value) -> (Value, bool) {
+    let kept = kept_params(params);
+    let partial = kept != *params;
+    (kept, partial)
 }
 
 /// Most entries the log keeps; past it, the oldest go first.
@@ -327,9 +550,9 @@ pub const LOG_LIST_ITEMS: usize = 100;
 pub const LOG_ERROR_CHARS: usize = 500;
 
 /// One command run in the session: when it started (UTC, milliseconds since 1970), its id, its
-/// parameters (secrets taken out, large values clipped), whether it succeeded, its error, and how
-/// long it took.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// parameters (secrets taken out, large values clipped), whether it succeeded, its error, how
+/// long it took, and the project it ran in.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct LogEntry {
     pub at: u64,
     pub command: String,
@@ -340,6 +563,21 @@ pub struct LogEntry {
     pub error: Option<String>,
     #[serde(default)]
     pub millis: u64,
+    /// The name of the project open when it ran (the one it opened, for a command that opens one).
+    #[serde(default)]
+    pub project: String,
+    /// Which of the session's projects that was ([`Session::opened`]), so two of the same name
+    /// (two new ones, both "Untitled") are told apart. The session's own: not saved with the log.
+    #[serde(skip)]
+    pub opened: u64,
+    /// Its parameters aren't all as given (cut to fit, or with secrets taken out): copied, they
+    /// wouldn't run as they ran.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub partial: bool,
+    /// The plugin whose session program asked for it between its commands: it counts with the
+    /// plugins' commands toward [`LOG_PLUGIN_LIMIT`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<String>,
 }
 
 impl LogEntry {
@@ -390,7 +628,7 @@ impl SessionLog {
         if self.off && !matches!(e.command.as_str(), "project.logCommands" | "project.clearLog") {
             return;
         }
-        let plugin = |e: &LogEntry| e.command.starts_with(rustgis_plugins::PREFIX);
+        let plugin = |e: &LogEntry| e.command.starts_with(rustgis_plugins::PREFIX) || e.plugin.is_some();
         if plugin(&e)
             && self.plugin_entries >= LOG_PLUGIN_LIMIT
             && let Some(oldest) = self.entries.iter().position(plugin)
@@ -416,7 +654,8 @@ impl SessionLog {
     /// into the last undo step ([`crate::Session::merge_undo`]). The entry keeps when the first
     /// started, takes the last one's parameters, and adds up how long they took.
     pub fn join_last(&mut self, mut e: LogEntry) {
-        if let Some(last) = self.entries.back_mut().filter(|l| l.ok && l.command == e.command) {
+        // A session plugin's entry between the steps isn't the user's step to join.
+        if let Some(last) = self.entries.back_mut().filter(|l| l.ok && l.command == e.command && l.plugin == e.plugin) {
             e.at = last.at;
             e.millis = last.millis.saturating_add(e.millis);
             *last = e;
@@ -480,7 +719,7 @@ impl SessionLog {
     /// line). Entry by entry, so a long log isn't held as text first.
     pub fn write(&self, w: &mut dyn std::io::Write, csv: bool) -> std::io::Result<()> {
         if csv {
-            w.write_all(b"time_utc,at,command,ok,millis,error,params\n")?;
+            w.write_all(b"time_utc,at,command,ok,millis,error,params,plugin,project\n")?;
         }
         self.entries.iter().try_for_each(|e| write_entry(w, e, csv))
     }
@@ -507,14 +746,16 @@ fn write_entry(w: &mut dyn std::io::Write, e: &LogEntry, csv: bool) -> std::io::
     if csv {
         writeln!(
             w,
-            "{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{}",
             e.time_utc(),
             e.at,
             csv_cell(&e.command),
             e.ok,
             e.millis,
             csv_cell(e.error.as_deref().unwrap_or("")),
-            csv_cell(&e.params.to_string())
+            csv_cell(&e.params.to_string()),
+            csv_cell(e.plugin.as_deref().unwrap_or("")),
+            csv_cell(&e.project)
         )
     } else {
         serde_json::to_writer(&mut *w, e).map_err(std::io::Error::other)?;

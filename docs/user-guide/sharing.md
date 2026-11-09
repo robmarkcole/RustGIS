@@ -4,10 +4,61 @@
 
 **Publish › Output › Export Map** writes the map view as a PNG with labels, the scale bar and
 tile credits. The ribbon exports at 192 DPI; `share.exportMap` accepts `width` and `height`
-in pixels and a `dpi` value (96 by default). **Print Map** opens a PDF of the map view, kept as
+in points, with the whole view fitted in them, and a `dpi` value (96 by default). A point is a
+pixel at 96 DPI, so `"width": 400` at 192 DPI is an image 800 pixels wide.
+
+Export Map to a `.tif` path writes the view as a GeoTIFF instead: an RGB image placed on the
+ground in the map's projection, so another GIS opens it where it belongs. It holds the layers,
+tile and WMS layers included, and the labels, but not the scale bar or the credits. The credits go
+into the file's Copyright tag, which holds plain ASCII: `©` and `®` are written as `(c)` and `(R)`,
+other characters as `?` and control characters as spaces, and the export says which. Its answer
+gives them in full as `copyright`. `"cog": true` writes a
+cloud-optimised GeoTIFF. A turned map is drawn north up over the box around the view (and says
+so). A tilted map, the globe and a map of another body are refused: export a PNG of those. One
+side holds at most 8192 pixels, so a large `width` or `height` needs a lower `dpi`; this holds for a
+PNG too, which is refused past it rather than cut off. With `"fit": true` an export too large for
+its `dpi` is drawn at the most that fits, and says so; the ribbon exports that way, at 192 DPI.
+`dpi` runs from 48 to 600 and a side from 16 points; a value outside is drawn at the limit, and
+said. An export holds
+at most 8000 points a side, PNG or GeoTIFF: with no `width` or `height`, a larger view is cut to
+its middle; a `width` or `height` past 8000 is drawn at 8000, holding less ground than asked (the whole
+view still fits). Either way the
+export says so. In a GeoTIFF,
+tiles still on their way when the export stops waiting, streamed layers still reading the view,
+and tile layers that can't be drawn leave gaps that would pass for data, so its export warns
+about them. The web app's Export Map downloads a PNG. A projection
+whose parameters GeoTIFF's keys can't hold (Mollweide, for example) is refused too:
+switch the map to an EPSG projection first.
+
+**Export Raster** writes a tile layer alone too: right-click a WMS, WMTS or XYZ layer (or a
+raster tile archive) in the Layers pane and choose **Export Raster…**, or pick it and use
+**Data › Export Raster**. Its own tiles over the view, at the zoom of the view's scale, are put together
+as an RGBA GeoTIFF in Web Mercator (EPSG:3857): a pixel of the file for a pixel of a tile, not
+resampled, with the layer's transparency and its credits in the Copyright tag. In a script,
+`share.exportRaster` takes `"tiles"` (the tile layer's name, or its index in the Layers pane, 0
+at the top), `"bbox"` (`[west, south, east, north]` in degrees, the view's by default), `"zoom"`
+(the tiles' zoom, 0 to 30) and `"cog"`. A zoom past the service's deepest enlarges its tiles, and
+says so. An export fetches at most 1024 tiles and holds at most 8192 pixels a side: past either it
+is refused, naming a zoom that fits, as many tile services' terms forbid bulk downloads
+(OpenStreetMap's tile usage policy, for one). Tiles that haven't come after a wait (up to a minute for
+each block of up to 2048 pixels), or can't be fetched or drawn (a server's "no tile here"
+included), leave gaps, and the export warns with how many; so does a box where it drew nothing.
+The layer's opacity is a display setting and isn't applied: the file keeps the tiles' own alpha. Vector tiles, and styles that draw them or draw tiles from more
+than one source, are refused: Export Map to a `.tif` writes what they draw. A style drawing only
+one source's raster tiles is written as those tiles. The web app exports the view with Export Map instead.
+
+**Print Map** opens a PDF of the map view, kept as
 vectors as a layout's PDF is (see Layouts), in the system viewer on desktop; **Capture To
-Clipboard** copies a map image. **Export To 3D** writes a layer as a Wavefront OBJ model with
-polygons extruded by a field.
+Clipboard** copies a map image. **Export To 3D** writes a layer as a Wavefront OBJ or binary STL model
+with polygons extruded by a field (`share.export3d` writes STL when `path` ends in `.stl`). STL
+holds closed solids only: lines and zero-height features are left out, zero-area triangles are
+skipped, and a cap that can't be triangulated is fanned over its outer ring, filling any holes;
+the notices say how many. OBJ
+uses metres east, up and south of the layer's south-west corner (Y up). STL uses metres east and
+north of the model's own south-west corner, which includes the cubes drawn for points and so can
+lie past the layer's, and up from the features' base (Z up, as slicers expect; a negative height
+goes below 0). Neither has a CRS; STL stores them as unitless 32-bit floats, so set the unit
+(metres) when you import it.
 
 **Data › Export** (or `share.exportLayer`, **Export Features**) writes a layer to GeoJSON, CSV,
 GeoPackage, GeoParquet, Shapefile (including a zip), FlatGeobuf, KML, KMZ or GPX (see

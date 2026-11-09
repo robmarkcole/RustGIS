@@ -308,6 +308,51 @@ impl Expr {
     }
 }
 
+/// The highest zoom a style is drawn at (see `template::style_zoom`).
+const MAX_STYLE_ZOOM: f32 = 24.0;
+
+/// How many steps to a zoom [`StyleLayer::color_relief_undrawable`] checks a layer's colours at,
+/// between the zooms they name.
+const ZOOM_GRID: f32 = 16.0;
+
+/// Collects the numbers `n` names: its literals and the stops of its steps and ramps, up to a
+/// few thousand (the grid still checks between past that).
+fn numbers(n: &Node, out: &mut Vec<f64>) {
+    if out.len() >= 4096 {
+        return;
+    }
+    let stops = |list: &[(f64, Node)], out: &mut Vec<f64>| {
+        for (at, o) in list {
+            out.push(*at);
+            numbers(o, out);
+        }
+    };
+    match n {
+        Node::Lit(Val::Num(v)) => out.push(*v),
+        Node::Lit(_) | Node::Var(_) | Node::LegacyGet(_) | Node::LegacyHas(_) => {}
+        Node::Call(_, args) => args.iter().for_each(|a| numbers(a, out)),
+        Node::Match(input, arms, default) => {
+            numbers(input, out);
+            arms.iter().for_each(|(_, o)| numbers(o, out));
+            numbers(default, out);
+        }
+        Node::Step(input, first, list) => {
+            numbers(input, out);
+            numbers(first, out);
+            stops(list, out);
+        }
+        Node::Interp(_, input, list) => {
+            numbers(input, out);
+            stops(list, out);
+        }
+        Node::Let(binds, body) => {
+            binds.iter().for_each(|(_, v)| numbers(v, out));
+            numbers(body, out);
+        }
+        Node::Tokens(inner) | Node::LegacyIn(inner, _) => numbers(inner, out),
+    }
+}
+
 /// Colours by height, from a `color-relief-color` (see [`Expr::elevation_ramp`]).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ElevationRamp {
@@ -497,6 +542,31 @@ fn calls(n: &Node, op: Op) -> bool {
         Node::Tokens(inner) | Node::LegacyIn(inner, _) => calls(inner, op),
         Node::Lit(_) | Node::Var(_) | Node::LegacyGet(_) | Node::LegacyHas(_) => false,
     }
+}
+
+/// A finite upper bound for numeric results at this zoom. Unknown arithmetic stays unbounded;
+/// a cap or a finite set of possible outputs can still bound a feature-dependent expression.
+fn numeric_upper(n: &Node, f: &FeatureCtx) -> Option<f64> {
+    if free(n) {
+        return eval(n, f, &mut Vec::new()).as_f64().filter(|v| v.is_finite());
+    }
+    let bound = |n| numeric_upper(n, f);
+    match n {
+        Node::Call(Op::Min, args) => args.iter().filter_map(bound).reduce(f64::min),
+        Node::Call(Op::Max | Op::Coalesce | Op::IsNumber, args) => numeric_upper_all(args.iter(), f),
+        Node::Call(Op::Case, args) => {
+            numeric_upper_all(args.iter().skip(1).step_by(2).chain(args.last().filter(|_| args.len() % 2 == 1)), f)
+        }
+        Node::Match(_, arms, default) => numeric_upper_all(arms.iter().map(|(_, n)| n).chain(std::iter::once(default.as_ref())), f),
+        Node::Step(_, first, stops) => numeric_upper_all(std::iter::once(first.as_ref()).chain(stops.iter().map(|(_, n)| n)), f),
+        // Interpolation and other arithmetic may create NaN or lose precision even from
+        // bounded inputs. Only an enclosing proven cap may narrow their full margin.
+        _ => None,
+    }
+}
+
+fn numeric_upper_all<'a>(nodes: impl Iterator<Item = &'a Node>, f: &FeatureCtx) -> Option<f64> {
+    nodes.map(|n| numeric_upper(n, f)).try_fold(f64::NEG_INFINITY, |upper, n| Some(upper.max(n?))).filter(|v| v.is_finite())
 }
 
 /// See [`Expr::feature_free`].
@@ -1150,7 +1220,7 @@ fn parse_sprites(entries: &[Json]) -> (Vec<(String, String)>, Vec<String>) {
     }
     if past > 0 {
         left_out.push(format!(
-            "{past} of {total} sprites left out, so their icons and patterns aren't drawn: a style's first {MAX_SPRITES} are read"
+            "{past} of {total} sprites left out, so their icons and patterns aren't drawn: only the first {MAX_SPRITES} with a usable id of their own and an address are used"
         ));
     }
     (sprites, left_out)
@@ -1213,6 +1283,8 @@ impl StyleView {
 pub enum Source {
     Vector {
         tiles: Vec<String>,
+        /// Runtime provenance of the tile templates; `None` for a user-selected template.
+        from: Option<crate::address::Origin>,
         url: Option<String>,
         min_zoom: u8,
         max_zoom: u8,
@@ -1220,6 +1292,8 @@ pub enum Source {
     },
     Raster {
         tiles: Vec<String>,
+        /// Runtime provenance of the tile templates; `None` for a user-selected template.
+        from: Option<crate::address::Origin>,
         url: Option<String>,
         tile_size: u32,
         min_zoom: u8,
@@ -1229,6 +1303,8 @@ pub enum Source {
     /// Elevation tiles, for `hillshade` and `color-relief` layers.
     RasterDem {
         tiles: Vec<String>,
+        /// Runtime provenance of the tile templates; `None` for a user-selected template.
+        from: Option<crate::address::Origin>,
         url: Option<String>,
         tile_size: u32,
         min_zoom: u8,
@@ -1310,14 +1386,14 @@ impl Source {
         let (tiles, url, attribution) = (strings(get("tiles")), str_of(get("url")), str_of(get("attribution")).unwrap_or_default());
         let (min_zoom, max_zoom) = (zoom_u8(get("minzoom"), 0), zoom_u8(get("maxzoom"), 22));
         match get("type").and_then(Json::as_str) {
-            Some("vector") => Source::Vector { tiles, url, min_zoom, max_zoom, attribution },
+            Some("vector") => Source::Vector { tiles, from: None, url, min_zoom, max_zoom, attribution },
             Some("raster") => {
                 let tile_size = get("tileSize").and_then(Json::as_u64).map_or(512, |t| t.clamp(1, 4096) as u32);
-                Source::Raster { tiles, url, tile_size, min_zoom, max_zoom, attribution }
+                Source::Raster { tiles, from: None, url, tile_size, min_zoom, max_zoom, attribution }
             }
             Some("raster-dem") => {
                 let tile_size = get("tileSize").and_then(Json::as_u64).map_or(512, |t| t.clamp(1, 4096) as u32);
-                Source::RasterDem { tiles, url, tile_size, min_zoom, max_zoom, attribution, encoding: DemEncoding::parse(j) }
+                Source::RasterDem { tiles, from: None, url, tile_size, min_zoom, max_zoom, attribution, encoding: DemEncoding::parse(j) }
             }
             _ => Source::Other,
         }
@@ -1481,6 +1557,8 @@ pub struct StyleLayer {
     filter: Option<Expr>,
     paint: HashMap<String, Expr>,
     layout: HashMap<String, Expr>,
+    /// See [`StyleLayer::color_relief_undrawable`]; worked out once, when parsed.
+    relief_undrawable: bool,
 }
 
 impl StyleLayer {
@@ -1512,7 +1590,7 @@ impl StyleLayer {
                 .collect()
         };
         let zoom = |k: &str, d: f32| o.get(k).and_then(Json::as_f64).map(|z| z as f32).filter(|z| z.is_finite()).unwrap_or(d);
-        Some(StyleLayer {
+        let mut layer = StyleLayer {
             id: str_of(o.get("id")).unwrap_or_default(),
             kind,
             source: str_of(o.get("source")),
@@ -1523,7 +1601,10 @@ impl StyleLayer {
             filter: o.get("filter").filter(|f| !f.is_null()).map(Expr::filter),
             paint: props(o.get("paint").and_then(Json::as_object)),
             layout: props(layout_json),
-        })
+            relief_undrawable: false,
+        };
+        layer.relief_undrawable = layer.find_relief_undrawable();
+        Some(layer)
     }
 
     /// Filter result (true without a filter).
@@ -1559,6 +1640,22 @@ impl StyleLayer {
     /// Whether the paint property `name` depends on the zoom.
     pub fn paint_uses_zoom(&self, name: &str) -> bool {
         self.paint.get(name).is_some_and(Expr::uses_zoom)
+    }
+
+    /// A conservative width at this zoom, including the property's default when evaluation
+    /// fails. `None` leaves an unbounded expression to the drawing's full margin.
+    pub(crate) fn paint_width_bound(&self, name: &str, zoom: f32, default: f32) -> Option<f32> {
+        let f = FeatureCtx::zoom_only(zoom);
+        let Some(expr) = self.paint.get(name) else { return Some(default) };
+        if expr.feature_free() {
+            return Some(self.width(name, &f, default));
+        }
+        numeric_upper(&expr.0, &f).map(|v| (v as f32).max(default)).filter(|v| v.is_finite())
+    }
+
+    /// Whether a layout property can differ between features at the same zoom.
+    pub(crate) fn layout_uses_features(&self, name: &str) -> bool {
+        self.layout.get(name).is_some_and(|expr| !expr.feature_free())
     }
 
     /// Whether the paint property `name` asks the sprite for an image.
@@ -1733,6 +1830,36 @@ impl StyleLayer {
     /// can draw (see [`Expr::elevation_ramp`]).
     pub fn color_relief_ramp(&self, zoom: f32) -> Option<ElevationRamp> {
         self.paint.get("color-relief-color")?.elevation_ramp(zoom)
+    }
+
+    /// Whether it is a shown `color-relief` layer that RustGIS can't colour at some zoom it
+    /// shows at (its `color-relief-color` isn't a [`color_relief_ramp`](Self::color_relief_ramp)
+    /// there), and so skips there.
+    pub fn color_relief_undrawable(&self) -> bool {
+        self.relief_undrawable
+    }
+
+    /// Works out [`color_relief_undrawable`](Self::color_relief_undrawable): the colours are
+    /// checked at each zoom from 0 to [`MAX_STYLE_ZOOM`] the layer shows at that the expression
+    /// names (the stops and thresholds of zoom steps, ramps and comparisons), and on a grid of
+    /// [`ZOOM_GRID`] steps to a zoom for anything worked out from the zoom between them.
+    fn find_relief_undrawable(&self) -> bool {
+        if self.kind != LayerKind::ColorRelief || !self.visible {
+            return false;
+        }
+        let shown = |z: &f32| (0.0..=MAX_STYLE_ZOOM).contains(z) && self.visible_at(*z);
+        let Some(expr) = self.paint.get("color-relief-color") else {
+            return (0..=MAX_STYLE_ZOOM as u32).map(|z| z as f32).chain([self.min_zoom]).any(|z| shown(&z));
+        };
+        let lo = self.min_zoom.clamp(0.0, MAX_STYLE_ZOOM);
+        if !expr.uses_zoom() {
+            return [lo, MAX_STYLE_ZOOM].iter().any(shown) && expr.elevation_ramp(lo).is_none();
+        }
+        let mut named = Vec::new();
+        numbers(&expr.0, &mut named);
+        let grid = (0..=((MAX_STYLE_ZOOM - lo) * ZOOM_GRID) as u32).map(|i| lo + i as f32 / ZOOM_GRID);
+        let named = named.into_iter().filter(|z| z.is_finite()).map(|z| z as f32);
+        [lo, MAX_STYLE_ZOOM].into_iter().chain(grid).chain(named).filter(shown).any(|z| expr.elevation_ramp(z).is_none())
     }
 
     /// `color-relief-opacity` (default 1).
@@ -2310,6 +2437,7 @@ mod tests {
             st.source("r"),
             Some(&Source::Raster {
                 tiles: vec!["https://r/{z}/{x}/{y}.png".into()],
+                from: None,
                 url: None,
                 tile_size: 256,
                 min_zoom: 0,
@@ -2324,6 +2452,7 @@ mod tests {
             v,
             Source::Vector {
                 tiles: vec!["https://x/{z}/{x}/{y}.pbf".into()],
+                from: None,
                 url: Some("https://x/tiles.json".into()),
                 min_zoom: 0,
                 max_zoom: 14,

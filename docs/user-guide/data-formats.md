@@ -24,12 +24,12 @@ not every EPSG code; azimuthal equidistant systems such as Equi7 need the deskto
 | GeoRSS | `.rss`, `.atom`, `.georss`, or `.xml` | Add Data, drop the file, upload, or From URL… | RSS 2.0, RSS 1.0 and Atom feeds with GeoRSS Simple, GeoRSS GML or W3C Basic Geo places: points, lines and polygons layers with each item's title, link, description, date, id and category. |
 | LandXML | `.landxml`, or `.xml` | Add Data, drop the file, or upload | Coordinate geometry points, parcels (polygons), alignments (lines; curves as chords) and TIN surfaces (a triangle per face, with its mean elevation), converted from the file's `epsgCode` or `"crs"`. |
 | Encoded polylines | text | `layer.addEncodedPolyline` with `"polyline"` (one or a list) | Google's encoding, precision 5, or 6 (`"precision"`) as OSRM and Valhalla can give: a line layer. |
-| GML | `.gml` | Add Data, drop the file, or upload | Simple features in GML 2 and 3 (WFS answers, OGR's GML): a layer per feature type, its simple elements as fields. Converted from the `srsName` (EPSG codes, URNs and URLs; the URN and URL forms of geographic systems are latitude first). |
+| GML | `.gml` | Add Data, drop the file, or upload | Simple features in GML 2 and 3 (WFS answers, OGR's GML): a layer per feature type, its simple elements as fields (a property holding nested values, another GML value or a second shape isn't read, and is said). Converted from the `srsName` (EPSG codes, URNs and URLs; the URN and URL forms of geographic systems are latitude first). |
 | MapInfo Interchange | `.mif` with its `.mid` (or both zipped) | Add Data, drop the file, or upload the zip | Points, lines, polylines, regions (holes found by nesting), rectangles and ellipses; text and arcs are rows without geometry. Converted from the `CoordSys`: longitude/latitude, Transverse Mercator, Lambert Conformal Conic, Albers or Mercator. A loose `.mif` upload has no `.mid` attributes; zip both files to keep them in the web app. |
 | OpenStreetMap PBF | `.osm.pbf`, or `.pbf` containing OSM data | Add Data, drop the file, or upload | Points (tagged nodes), lines and multipolygons (closed ways that are areas, and multipolygon and boundary relations), with common tags as fields and the rest in `other_tags`, as GDAL gives them. Up to 40 million nodes (4 million in the web app); on the desktop, extracts over 256 MiB open through GDAL when it is installed. Vector-tile `.pbf` files use Add Tile Layer instead. |
 | ArcGIS feature-service answers (protocol buffer) | `.pbf` holding an answer to an ArcGIS query with `f=pbf`, or the query's address | Add Data, drop the file, upload, or From URL… with the query's address (`…/FeatureServer/0/query?…&f=pbf`) | One page of the layer: the fields and values the same query gives as GeoJSON, with the fields' aliases as their display names (dates as milliseconds since 1970, date-only and time values as text), points, lines or polygons converted to longitude/latitude from the answer's coordinate system. Z and M values, geometry, blob and raster fields are left out, with a notice. A page that stopped at the service's record limit keeps its features, with a notice that the rest aren't in it. A query the service refuses (an empty answer), a count, ids or an extent, curves, multipatches and envelopes give an error. Told from OpenStreetMap data by its content. |
 | TopoJSON | `.topojson`, or `.json` | Add Data, drop the file, or upload | Shared arcs (quantized or not) are rebuilt into geometries. A `.topojson` adds a layer per object, up to 64; a topology named `.json` adds its first object and names the others in a notice. Use `.topojson` to add them all. |
-| CityJSON | `.city.json`, or `.json` | Add Data, drop the file, upload, or From URL… | CityJSON 1.1 and 2.0, read in 2D: a layer per City Object type and geometry family (a name two layers would share, such as two long types cut to their first 64 characters, or two that differ only in ASCII case, gets ` (2)`, ` (3)`… on the later ones: the first number no other layer's name uses). Surfaces and solids become footprints (LoD 0, else the `GroundSurface` surfaces, else the union of the faces of the highest LoD, else the outline of the points; a geometry of more than 200,000 faces is the outline of its points (of its ground's, for a footprint from the ground), with a notice, unless its footprint is its ground and all of its ground faces are within the cap), with `z_min`, `z_max` and `height` fields, from every level of detail and the children's heights included, so Style › Extrusion stands them up. Also `id`, `type`, `parent`, `lod` and the object's attributes. A `.city.json`, or a model from an address, adds every layer, up to 64; a file named `.json` adds its first layer with something to draw and names the others in a notice. A file that names no coordinate system and isn't longitude/latitude is refused: for now the way to add it is the `"crs"` parameter of `layer.addData`, from the command line, Python or the AI Assistant. Geometry instances are drawn as a point at their reference point, with no height, and `TINRelief` objects aren't drawn; a notice says so, as it does for addresses. Appearance (materials and textures) isn't read, and a notice says how much is left out. Heights are kept in the file's unit: in a coordinate system that doesn't measure in metres, a notice says so, as Style › Extrusion reads metres. In a zip, a `"crs"` applies only to a model that names no coordinate system RustGIS knows. In the browser a footprint that needs a union is the outline of the object's points; a notice says so. Extrusions have no base height yet, so a part above the ground stands on the ground. |
+| CityJSON | `.city.json`, or `.json` | Add Data, drop the file, upload, or From URL… | CityJSON 1.1 and 2.0, read in 2D: a layer per City Object type and geometry family (a name two layers would share, such as two long types cut to their first 64 characters, or two that differ only in ASCII case, gets ` (2)`, ` (3)`… on the later ones: the first number no other layer's name uses). Surfaces and solids become footprints (LoD 0, else the `GroundSurface` surfaces, else the union of the faces of the highest LoD, each tried when the one before gives no area, else the outline of the points; lines and points come from their highest level of detail that draws; a level passed over because its X or Y isn't a finite number, or is too large, is named in a notice; a geometry of more than 200,000 faces is the outline of its points (of its ground's, for a footprint from the ground), with a notice, unless its footprint is its ground and all of its ground faces are within the cap), with `z_min`, `z_max` and `height` fields, from every level of detail and the children's heights included, so Style › Extrusion stands them up. Also `id`, `type`, `parent`, `lod` and the object's attributes; one named as one of these fields, or as another attribute of its layer but for case, takes a number (`height_1`), the same in every row, and a notice lists them. A `.city.json`, or a model from an address, adds every layer, up to 64; a file named `.json` adds its first layer with something to draw and names the others in a notice. A file that names no coordinate system and isn't longitude/latitude is refused: for now the way to add it is the `"crs"` parameter of `layer.addData`, from the command line, Python or the AI Assistant. Geometry instances are drawn as a point at their reference point, with no height, and `TINRelief` objects aren't drawn; a notice says so, as it does for addresses. Appearance (materials and textures) isn't read, and a notice says how much is left out. Heights are kept in the file's unit: in a coordinate system that doesn't measure in metres, a notice says so, as Style › Extrusion reads metres. In a zip, a `"crs"` applies only to a model that names no coordinate system RustGIS knows. In the browser a footprint that needs a union is the outline of the object's points; a notice says so. Extrusions have no base height yet, so a part above the ground stands on the ground. |
 | AutoCAD DXF | `.dxf` (ASCII) | Add Data, drop the file, or upload | Points, lines and polygons layers from the drawing's entities: POINT, LINE, LWPOLYLINE and POLYLINE (bulges drawn as arcs; closed ones stay lines; polyface meshes become polygons), CIRCLE, ARC, ELLIPSE, SPLINE, HELIX, LEADER, MLINE (its centre line), TEXT, MTEXT, ATTRIB and constant ATTDEF (points with their text, at the alignment point of justified text), HATCH boundaries (holes found by nesting), SOLID, TRACE and 3DFACE (polygons). Blocks (named in any case) are drawn where INSERTs place them (scaled, rotated, in arrays, nested up to 8 deep), and so are DIMENSIONs' blocks (a linear dimension without one draws its lines and measured text). Entities in an object's own coordinate system are turned into the drawing's. Fields: `layer`, `entity`, `color` (ACI, BYLAYER and BYBLOCK resolved), `linetype`, `text`, `height`, `rotation`, `block`, `elevation` and `paperspace`. The drawing's layouts (paper space: title blocks, viewport frames) are left out, with a notice, unless `"paperSpace": true`. A drawing never says its coordinate system: give `"crs"` (such as `EPSG:2263`), or its coordinates are kept as they are, with a notice. `"layer"` picks one of the drawing's own layers, and `info.fileLayers` lists them. Up to 2 million features (500,000 in the web app). Not read: binary DXF, MULTILEADER, WIPEOUT, IMAGE and ACIS solids (3DSOLID, REGION), named in a notice. |
 | Geotagged photos | `.jpg`, `.jpeg` | Add Data (several at once in the web app), drop them, upload, or `layer.addPhotos` with `"paths"` or a `"folder"` | JPEGs with a GPS position in their EXIF become points in the **Photos** layer (photos added one at a time join it): each with its `name`, `file`, `time` (when it was taken), `altitude`, `direction` (where the camera faced), `camera` and a `thumbnail` of at most 160 pixels, kept with the feature so the project needs no other file. Identify shows the thumbnail. Photos without a position are named in a notice and left out; a layer holds up to 2,000 photos. A JPEG is always read as a photo unless `layer.addData` or `layer.addDataBytes` is given `"as": "scan"` (a phone photo of a paper map, say: see [Scans with no coordinates](#rasters)). |
 | LiDAR point clouds | `.las`, `.laz` (COPC too) | Add Data, drop the file, upload, or From URL… | LAS 1.0–1.4 (point formats 0–10) and LAZ, on desktop and web: points with `z`, `intensity`, `classification`, `return` and colour (`red`, `green`, `blue`), coloured by ASPRS class or elevation. An evenly spread sample is read once, at most 2 million points (500,000 in the web app); views use that sample, not the COPC spatial index. LAZ decompression reads at most the first 400 million points (40 million on the web), with a notice when capped. Converted from the file's WKT or GeoTIFF-key record; without one, coordinates are kept with a notice. A local project keeps the path; uploads keep the file bytes. Remote files download whole. |
@@ -58,7 +58,7 @@ identify and run through tools like any layer; **Load All Features** loads one t
 
 ## Formats read through GDAL
 
-With [GDAL](https://gdal.org) installed (its `ogr2ogr` and `ogrinfo` on the `PATH`, GDAL 3.7 or
+With [GDAL](https://gdal.org) installed (its `ogr2ogr` and `ogrinfo` on the `PATH`, GDAL 3.8 or
 later), the desktop app also reads the vector formats below. Each layer is converted once into a
 cached, indexed FlatGeobuf, so large ones stream too: see [Formats through
 GDAL](data.md#formats-through-gdal).
@@ -189,6 +189,13 @@ tile), without a STAC catalogue:
   may take two minutes more): past that the window is given up, saying how many bands were read.
   A window reads 256 bands at most. A window near the limit takes several hundred MB of memory
   while it is read and kept.
+- The Add Data From URL dialog has no box to fill in, so a window is asked for by a command. On
+  the command line and in a script, `layer.addUrl` waits for it and answers what was added. In the
+  desktop app, `ui.addUrl` with `"bbox"` reads it off the frame: the map stays in use, and the
+  layer is added when the read lands. These are read one at a time, with 16 under way at most,
+  and the next starts once the app has taken the last. If another project is opened meanwhile, one
+  still waiting isn't read, and one being read can't be cancelled yet: it runs to its end and
+  isn't added. Each is said in a notice.
 - The file's no-data, colour table (a palette file draws in its colours) and band names come
   with it, and class names given as `CLASS_<value>` items in GDAL's metadata tag, as the MapBiomas
   files on Source Cooperative give theirs. These come from the file's own tags: an `.aux.xml`
@@ -199,7 +206,9 @@ tile), without a STAC catalogue:
   keeps only its first band once the project is reopened, with a notice. Files stored bottom up
   aren't read this way yet. In the web app, `"bbox"` is refused for now: the file is drawn in
   place without it. An address that names another kind of file (`.geojson`, `.fgb`) is refused
-  with `"bbox"` before anything is read; `"cog": true` takes a GeoTIFF by another name.
+  with `"bbox"` before anything is read; `"cog": true` takes a GeoTIFF by another name. A
+  window is a raster layer that the time slider doesn't step through, so `"cube": true` is
+  refused with it.
 
 A GeoParquet or FlatGeobuf file by its address is read in place too, a view at a time, however
 large: the layer is streamed like a large local file, and the view's features are fetched in the
@@ -300,6 +309,20 @@ Scripts use `service.import {"url":"…","name":"My OGC Layer"}` and
 | OGC API Tiles | Collections' map and vector tiles; a landing page's dataset map tiles | A tile layer in WebMercatorQuad, from the tile template the tileset advertises (its `item` link; `…/tiles/WebMercatorQuad/{z}/{y}/{x}`, the usual path, when that can't be read), keeping the tiles link's query (a token), map tiles in the server's image format, vector tiles drawn layer by layer in colours of their own |
 | WCS 1.0 / 2.0 (a 1.1 service is asked in 1.0) | Coverages, with their bounds | A raster: GetCoverage of the map's view within the coverage's bounds (or its whole extent: `"bbox": "full"`), as a GeoTIFF in EPSG:4326, at most 2048 pixels on a side |
 | ArcGIS REST | FeatureServer and MapServer layers; a MapServer's map; an ImageServer; a VectorTileServer | Layers queried as GeoJSON, or in protocol buffers (`f=pbf`, smaller and quicker to read) when the layer's description lists them and names its record limit (the description read first, or given up on after 15 seconds; a first protocol buffer page that can't be fetched or read has the layer read in GeoJSON, with a notice saying why), page by page past the server's record limit (`resultOffset`) up to 100,000 features or more on a computer with more memory (in protocol buffers, also no more than a quarter of the computer's memory once read, from 512 MB, the web app's limit, up to 3 GB; a later page past it ends the read with a notice, and the first page is always kept, within the reader's own limits for a page) (a command such as `service.add` waits a minute at most for the features), where the layer supports paging (ArcGIS Server 10.3 and later; otherwise up to the record limit); a map as its tile cache when it is Web Mercator's pyramid, else exported images; an ImageServer as exported images; a VectorTileServer as its MapLibre style |
+
+A long list stops at its first 2,000 layers, and a note says how many the service has. An OGC
+API service stops at its first 2,000 collections instead, and each can make up to three layers
+(features, map tiles and vector tiles), so its list can be longer. Which ones come first is up to the service, and some change their order between
+answers. `service.add` still takes any of them by name, up to 100,000 in one document, fewer
+when the document's request addresses (an OGC API's, its own; a WMS's GetMap, GetFeatureInfo
+and legend addresses together), which each layer's repeat, are very long: at least 2,000 up to
+about 32 KB, and fewer than are listed past that, at least one, with a note. A list also stops
+early, with a note, once its layers' document addresses (each layer's `source_url`) reach
+64 MiB: 2,000 layers each repeating an address over 32 KB, or the more layers of an OGC API's
+list each repeating a somewhat shorter one. An ArcGIS service or directory is an exception: it is read up to
+2,000 layers, folders and services, and lists all it reads.
+A dynamic MapServer offers each of those layers twice, as features and as a
+map, so its list can be twice as long. A note says how many are left out past either limit.
 
 A WMS or WMTS layer's tiles are asked for down to the detail its service gives, and stretched
 only past it: a WMTS layer's over the zooms of its tile matrix set (or those its
@@ -548,7 +571,7 @@ were rounded, and Export Raster, which writes the rounded values, says so again.
 | Vector tiles | Mapbox Vector Tiles (`.pbf`, `.mvt`) template, or TileJSON | Add Tile Layer | Drawn in a built-in style that knows the OpenMapTiles, Protomaps and Shortbread schemas. |
 | MapLibre styles | `style.json` | Add Tile Layer | A supported subset of vector and raster sources, sprites, expressions and zoom functions; see [Maps and Basemaps](maps.md#basemaps) for styling limits. |
 | PMTiles | `.pmtiles`: a web address, or a desktop file | Add Tile Layer (or **Tile Archive File…**), Add Data, or drop a local file on desktop | Version 3 archives only: PNG, JPEG or WebP rasters, or MVT vectors; uncompressed, gzip, Brotli or Zstandard. Read a tile at a time by byte ranges (CORS on the web). Browser local-file uploads aren't supported; use an archive's web address. The map moves to the archive's bounds, except a world archive. Vector archives use the built-in basemap style, or a colour per layer when added as an overlay. |
-| MBTiles | `.mbtiles`: a file | Add Data, drop the file, Add Tile Layer's **Tile Archive File…** button, or upload in the web app | Raster (PNG, JPEG, WebP) or vector tiles, as its metadata says, drawn as PMTiles archives are. The desktop reads the file in place, a tile at a time. The web app reads an upload into memory (the plain `tiles` table and the deduplicated layouts of mbutil, TileMill and Planetiler) and keeps it for the session: a project saved there asks for the file again. |
+| MBTiles | `.mbtiles`: a file | Add Data, drop the file, Add Tile Layer's **Tile Archive File…** button, or upload in the web app | Raster (PNG, JPEG, WebP) or vector tiles, as its metadata says, drawn as PMTiles archives are. The desktop reads the file in place, a tile at a time; on Windows the file can't be moved or deleted while a map draws it, until its layer is removed. The web app reads an upload into memory (the plain `tiles` table and the deduplicated layouts of mbutil, TileMill and Planetiler) and keeps it for the session: a project saved there asks for the file again. |
 
 ## Writing
 
@@ -556,15 +579,16 @@ were rounded, and Export Raster, which writes the rounded values, says so again.
 | --- | --- | --- |
 | GeoJSON (`.geojson`, `.json`), CSV | Data › Export (`share.exportLayer`) | The Export Features dialog picks the format; the chosen extension is appended when needed. In the web app it downloads any vector format below except GeoPackage and FlatGeobuf (a Shapefile as one zip). A streamed layer exports its whole source: on the desktop, to GeoJSON, CSV, FlatGeobuf, GeoPackage or GeoParquet a chunk at a time with no limit on its size (a GeoParquet source's row groups are read whole, so on the desktop each holds at most 16,777,216 rows; a layer read in place from the GeoPackage it goes into is read whole first), otherwise loaded whole (see [Streamed layers](data.md)); remote sources on the web must be downloaded first. |
 | GeoPackage | Data › Export to `.gpkg` (desktop) | A new file with one feature table (an attributes table for a layer without geometry) in the layer's coordinate system (see below), with an R-tree and GeoPackage 1.4 triggers to maintain it. An existing destination is refused unless the export adds a table to it or replaces one of its feature or attribute tables (`mode`, see [Exporting](sharing.md)), leaving its other tables as they were. Unique feature ids that fit signed 64-bit integers are kept; otherwise SQLite assigns new ids. |
-| GeoParquet (`.parquet`, `.geoparquet`) | Data › Export | GeoParquet 1.1: WKB geometry in WGS 84, Zstd level 9 compression, row groups of up to 65,536 features and a `bbox` covering column with byte-stream-split encoding. The covering keeps spatial range reads available; compression favours smaller files over export speed. A standalone table without geometry writes plain Parquet. |
+| GeoParquet (`.parquet`, `.geoparquet`) | Data › Export | GeoParquet 1.1: WKB geometry in WGS 84, Zstd level 9 compression, row groups of up to 65,536 features and a `bbox` covering column with byte-stream-split encoding. The covering keeps spatial range reads available; compression favours smaller files over export speed. Reading the file needs Zstd support, and reading its `bbox` column needs byte-stream-split support, which current GDAL, PyArrow and DuckDB have and some older readers lack (some of those refuse the file). A standalone table without geometry writes plain Parquet. |
 | Shapefile | Data › Export to `.shp` (or `.zip` for the files zipped) | Writes `.shp`, `.shx`, `.dbf`, `.prj` (the coordinate system, see below) and `.cpg` (UTF-8). Field names are cut to 10 bytes (made unique ignoring case, and reported), text to at most 254 bytes, and numbers that do not fit their dBase field are left empty. Export notices count shortened text, non-null values left empty (including incompatible types), and numbers rounded to the field's precision, and name the affected source fields; features without geometry, and lines of a single point, are left out (and reported). |
 | FlatGeobuf | Data › Export to `.fgb` | In the layer's coordinate system (see below), with a spatial index; features without geometry are left out (and reported). Desktop only: the writer needs a temporary file, which the browser doesn't have. |
 | KML, KMZ, GPX | Data › Export to `.kml`, `.kmz` or `.gpx` | Placemarks named by a `name` field, if there is one; features without geometry are left out. |
 | GeoJSON, KML, GPX, CSV, CSV with WKT | Analyze › Workflows › Data Interop (`data.convert`; `"format": "geojson"`, `"kml"`, `"gpx"`, `"csv"` or `"wkt"`) | Returns text when `"path"` is omitted; writes a file on desktop when it is given. |
-| GeoTIFF / Cloud-optimised GeoTIFF | Data › Export Raster (`share.exportRaster`) | Untiled GeoTIFF by default; `"cog": true` writes 512-pixel tiles, Deflate compression and overviews. Writes the loaded raster's resolution (an overview when that is what was opened), the selected band or its colour bands. The web app's Export Raster downloads an ordinary GeoTIFF. |
+| GeoTIFF / Cloud-optimised GeoTIFF | Data › Export Raster (`share.exportRaster`) | Untiled GeoTIFF by default; `"cog": true` writes 512-pixel tiles, Deflate compression and overviews. Writes the loaded raster's resolution (an overview when that is what was opened), the selected band or its colour bands. A WMS, WMTS or XYZ tile layer (`"tiles"`) is written as its tiles at one zoom, RGBA in Web Mercator (see [Sharing](sharing.md#exporting)). The web app's Export Raster downloads an ordinary GeoTIFF. |
 | PNG | Publish › Export Map (`share.exportMap`) | Configurable DPI, with labels, scale bar and tile credits. |
+| GeoTIFF of the map view | Publish › Export Map to `.tif` (`share.exportMap`) | The view as an RGB GeoTIFF in the map's projection, with labels but no scale bar; tile credits in the Copyright tag; `"cog": true` for a cloud-optimised one. Flat, untilted maps of the Earth only (see [Exporting](sharing.md#exporting)). |
 | PDF | Layouts, reports, presentations and the map view (Print Map), as vectors | |
-| Wavefront OBJ, glTF | Publish › Export To 3D, Share As › Web Scene | Polygons extruded by a field. |
+| Wavefront OBJ, STL, glTF | Publish › Export To 3D, Share As › Web Scene | Polygons extruded by a field. STL is binary and triangles only (no lines). |
 | Web map, OGC API Features, MapLibre style | Publish › Share As | Open-format files that need no server: see [Sharing](sharing.md). |
 | Raster tiles | `imagery.hostedImagery` | A zip of `tiles/z/x/y.png` tiles, `tiles.json` and a viewer page; at most 5,000 tiles and 256 MiB of tile data. |
 
@@ -579,9 +603,9 @@ RustGIS keeps x and y only. When a source has Z or M values (heights or measures
 they were dropped, and exporting or converting the layer (or exporting a standalone table that
 holds geometry), or sharing it as a web map, web layer or OGC API Features, says what's written
 lacks them.
-Shapefile, GeoPackage, GeoParquet, FlatGeobuf, PostGIS, File Geodatabase, GeoJSON, KML (altitudes
-other than 0), GML and CSV WKT columns are checked; sources read through GDAL or DuckDB, and SQL
-Server tables, aren't yet. GPX elevations and LiDAR heights are kept as fields, and a File
+Shapefile, GeoPackage, GeoParquet, FlatGeobuf, PostGIS, SQL Server, File Geodatabase, GeoJSON, KML
+(altitudes other than 0), GML and CSV WKT columns are checked; sources read through GDAL or DuckDB
+aren't yet. GPX elevations and LiDAR heights are kept as fields, and a File
 Geodatabase multipatch's heights as `z_min` and `z_max`. Where a source doesn't declare its
 dimensions, only a sample is checked: the first 16 rows of a GeoParquet file without geometry types
 (in its first row group), and the first 16 rows with a geometry of a GeoPackage table with optional
@@ -594,6 +618,32 @@ another system says so; written back in that same system they are exact, and not
 Coordinates beyond ±180.5° longitude or ±90.5° latitude (a CSV of eastings and northings without its
 `"crs"`, a Shapefile without its `.prj`) aren't longitude/latitude: an export says they're out of
 place, and Define Projection, below, places them.
+
+Coordinate systems of other bodies than the Earth (Mars, the Moon and the rest of the IAU's
+`IAU_2015` codes, or any datum whose ellipsoid isn't the Earth's) aren't read as such yet: every
+layer is placed on the Earth.
+
+- **Read, with a notice.** A layer whose coordinates are the body's longitude/latitude, counted
+  east, is read as it is: a geographic `.prj` or WKT, a GeoTIFF's own keys, an IAU code ending in
+  `00` or `02`, or a projection RustGIS unprojects. Adding it says that the map, its scale bar and
+  measurements take it for the Earth.
+- **Refused.** A layer whose coordinates would land in the wrong place as longitude/latitude is
+  refused, and the error says why:
+  - projected metres the reader can't convert: a FlatGeobuf, GeoParquet or GeoJSON whose system
+    is another body's projection, a GeoPackage one known only by its IAU code, or a projection
+    RustGIS doesn't read;
+  - geocentric X/Y/Z (a GeoParquet system);
+  - longitude/latitude in another unit than degrees (a GeoParquet or GeoTIFF one);
+  - longitudes counted west: planetographic systems, and projections of them, unless their axes
+    say they count east. An Esri `.prj` has no axes, so a planetographic one is refused.
+- **Exported.** Exporting such a layer as WGS 84 longitude/latitude says so. Exported in its own
+  system, a vector file (a Shapefile's `.prj`, say) gives its datum only by the ellipsoid's axes,
+  and that is said too. A GeoTIFF read with its own GeoKeys is written back with them and their
+  citation. Projecting such a layer onto another ellipsoid (the Earth's) is refused. A layer known
+  to be another body's only by an IAU code, or by an ellipsoid its reader doesn't keep
+  (GeoParquet), keeps no system, so its export can't tell. Adding it says so instead: an export
+  takes its coordinates for WGS 84 longitude/latitude, and one in a projection projects them as
+  the Earth's.
 
 ## Define Projection
 

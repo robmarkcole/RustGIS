@@ -8,23 +8,23 @@ use crate::{CmdResult, CommandSpec as C, Session};
 
 pub fn commands() -> Vec<C> {
     vec![
-        C::new("edit.calculateGeometry", "Calculate Geometry", "Attribute Table", crate::geometry_calc::run)
+        C::new("edit.calculateGeometry", "Calculate Geometry", "Attribute Table", crate::geometry_calc::run).roles(&[]).effects(crate::policy::Effects::NONE)
             .when(super::design::need_editable)
             .params(r#"{"layer"?, "field": string, "create": bool, "overwrite": bool, "property": string, "unit": string, "epsg"?: number, "scope": "all"|"selected"}"#),
-        C::new("edit.addFeature", "Create Feature", "Edit › Features", add_feature)
+        C::new("edit.addFeature", "Create Feature", "Edit › Features", add_feature).inputs(super::design::new_feature_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
             .when(super::design::need_editable)
             .params(r#"{"layer"?, "geometry": GeoJSON geometry (lon/lat), "attributes"?: {field: value}, "template"?: feature template}"#),
-        C::new("edit.delete", "Delete", "Edit › Features", delete).key("Delete").when(super::design::need_editable_selection),
-        C::new("edit.setValue", "Edit Attribute", "Attribute Table", set_value)
+        C::new("edit.delete", "Delete", "Edit › Features", delete).roles(&[]).effects(crate::policy::Effects::NONE).key("Delete").when(super::design::need_editable_selection),
+        C::new("edit.setValue", "Edit Attribute", "Attribute Table", set_value).roles(&[]).effects(crate::policy::Effects::NONE)
             .when(super::design::need_editable)
             .params(r#"{"layer"?, "row": number, "field": string, "value": any}"#),
-        C::new("edit.addField", "Add Field", "Data › Data Design › Fields", add_field)
+        C::new("edit.addField", "Add Field", "Data › Data Design › Fields", add_field).roles(&[]).effects(crate::policy::Effects::NONE)
             .when(need_layer)
             .params(r#"{"layer"?, "name": string, "type": "long"|"double"|"text"|"boolean"}"#),
-        C::new("edit.deleteField", "Delete Field", "Data › Data Design › Fields", delete_field)
+        C::new("edit.deleteField", "Delete Field", "Data › Data Design › Fields", delete_field).roles(&[]).effects(crate::policy::Effects::NONE)
             .when(need_layer)
             .params(r#"{"layer"?, "field": string}"#),
-        C::new("edit.calculateField", "Calculate Field", "Attribute Table", calculate_field)
+        C::new("edit.calculateField", "Calculate Field", "Attribute Table", calculate_field).roles(&[]).effects(crate::policy::Effects::NONE)
             .when(super::design::need_editable)
             .params(r#"{"layer"?, "field": string, "expression": "an expression: fields, 'text', numbers, + - * / % ^ ||, functions (see the Expressions page)"}"#),
     ]
@@ -32,7 +32,7 @@ pub fn commands() -> Vec<C> {
 
 pub(crate) fn add_feature(s: &mut Session, p: &Json) -> CmdResult {
     let id = s.layer_id(p)?;
-    let g = p.get("geometry").and_then(rustgis_data::io::geometry_from_geojson).ok_or("geometry must be a GeoJSON geometry")?;
+    let g = geometry_param(p)?;
     let l = s.map_mut().layer_mut(id).ok_or("no layer")?;
     let want = l.geometry_type();
     let ok = want == g.kind() || want == GeometryType::None;
@@ -66,6 +66,25 @@ pub(crate) fn add_feature(s: &mut Session, p: &Json) -> CmdResult {
     l.selection = vec![row];
     super::design::apply(s, id, vec![super::design::Change { before: None, row: Some(row) }])?;
     Ok(json!({"row": row}))
+}
+
+/// The `geometry` parameter as a geometry. A GeometryCollection of more or fewer than one member
+/// (at any depth) is refused as such, not as something that isn't GeoJSON.
+pub(crate) fn geometry_param(p: &Json) -> Result<Geometry, String> {
+    let given = p.get("geometry");
+    if let Some(g) = given.and_then(rustgis_data::io::geometry_from_geojson) {
+        return Ok(g);
+    }
+    let mut g = given;
+    // Bounded by the JSON's own depth: each round goes one level in.
+    while let Some(c) = g.filter(|g| g.get("type").and_then(Json::as_str) == Some("GeometryCollection")) {
+        match c.get("geometries").and_then(Json::as_array).map(Vec::as_slice) {
+            Some([only]) => g = Some(only),
+            Some(_) => return Err("a GeometryCollection must hold exactly one geometry".into()),
+            None => break,
+        }
+    }
+    Err("geometry must be a GeoJSON geometry".into())
 }
 
 /// Rejects empty or degenerate geometry, which would break extents, labels and rendering.

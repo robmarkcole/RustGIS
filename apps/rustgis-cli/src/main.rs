@@ -10,7 +10,7 @@
 //!     --cmd 'share.exportMap={"path":"out.png"}' [--save out.rgis]
 //! rustgis-cli run … --use-saved-secrets            # use what the desktop app saved in the system keychain
 //! rustgis-cli ask [--sample | --project p.rgis | --data f.geojson …] "Which cities have over 10 million people?" \
-//!     [--provider anthropic|openai|chatgpt|gemini|openrouter|ollama|custom|requesty] [--model M] [--base-url URL] [--yes] [--save out.rgis] [--trace log.txt]
+//!     [--provider anthropic|openai|chatgpt|gemini|openrouter|ollama|custom|requesty|trustedrouter] [--model M] [--base-url URL] [--yes] [--save out.rgis] [--trace log.txt]
 //! rustgis-cli ask --models [--provider P]                # list the provider's models
 //! rustgis-cli ask --accounts | --account CLIENT_ID       # list or select a saved registration
 //! rustgis-cli ask --remove-account CLIENT_ID             # sign out and forget a saved registration
@@ -685,7 +685,16 @@ fn mcp(s: &mut Session, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Runs the command line, then stops the session plugins' programs its commands started.
 fn main() -> ExitCode {
+    let code = cli();
+    // Session plugins' programs a command started end with the command line.
+    rustgis_engine::plugins::session::stop_all();
+    code
+}
+
+/// The command line: loads the plugins, then runs the subcommand the arguments name.
+fn cli() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(cmd) = args.first().map(|s| s.as_str()) else { return usage() };
     if !args.iter().any(|a| a == "--no-plugins") {

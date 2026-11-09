@@ -18,13 +18,13 @@ pub fn commands() -> Vec<C> {
     vec![
         C::new("embeddings.datasets", "Satellite Embedding Datasets", "Home › Add › Web Data", |_, _| {
             Ok(json!({"datasets": emb::DATASETS.iter().map(|d| d.to_json()).collect::<Vec<_>>()}))
-        })
+        }).roles(&[]).effects(crate::policy::Effects::NONE)
         .view(),
         // Not a view: it adds the footprints layer (by default).
-        C::new("embeddings.search", "Search Satellite Embeddings", "Home › Add › Web Data", search).params(
+        C::new("embeddings.search", "Search Satellite Embeddings", "Home › Add › Web Data", search).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network)).params(
             r#"{"dataset": "alphaearth" | "earth-index" | "tessera", "year"?: number (AlphaEarth and Tessera: 2017–2025, default 2024), "bbox"?: [west, south, east, north] | "view" (the map's extent, the default), "footprints"?: bool (adds the tiles' footprints as a layer, default true)}"#,
         ),
-        C::new("embeddings.add", "Add Satellite Embeddings", "Home › Add › Web Data", add).params(
+        C::new("embeddings.add", "Add Satellite Embeddings", "Home › Add › Web Data", add).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network)).params(
             r#"{"dataset": "alphaearth" | "earth-index" | "tessera", "url"?: "AlphaEarth's tile or Earth Index's file, as embeddings.search lists it (Earth Index: default the MGRS tile at the view's centre)", "year"?: number (Tessera, default 2024), "bands"?: [red, green, blue] (bands from 1; AlphaEarth default [2, 17, 10], Tessera [1, 2, 3]), "stretch"?: number (AlphaEarth: dequantised values shown over ±stretch, default 0.3), "dimension"?: number (Earth Index: a vector value kept as each point's `value`, from 1), "bbox"?: [west, south, east, north] | "view" (Earth Index and Tessera: the area read, default the map's extent), "name"?: text, "ran"?: (internal: what the app read)}"#,
         ),
     ]
@@ -148,13 +148,15 @@ fn add(s: &mut Session, p: &Value) -> CmdResult {
             });
             // Its header read first, so its bands are known; the layer is framed only when it is the
             // map's first content (no "zoom" is passed, so add_cog defaults it to that). In the
-            // browser nothing may wait, and it is read as the map draws.
+            // browser nothing may wait, nor may a plugin's command in the app (it runs on the
+            // frame): it is read as the map draws.
+            let probe = cfg!(not(target_arch = "wasm32")) && !s.leave_downloads;
             #[cfg(not(target_arch = "wasm32"))]
-            if !crate::render::rustgis_tiles::cog::probe_blocking(file)? {
+            if probe && !crate::render::rustgis_tiles::cog::probe_blocking(file)? {
                 return Err(format!("{file}: not a cloud-optimised GeoTIFF"));
             }
             let look = crate::render::rustgis_tiles::cog::with_look(file, &look);
-            super::layer::add_cog(s, &json!({"name": name}), &look, cfg!(not(target_arch = "wasm32")))
+            super::layer::add_cog(s, &json!({"name": name}), &look, probe)
         }
         "earth-index" => add_points(s, p, name),
         _ => add_tessera(s, p, d, name),
@@ -311,6 +313,26 @@ mod tests {
         }
         assert_eq!(bands(&json!({"bands": [2, 17, 10]}), 64, [0, 0, 0]), Ok([1, 16, 9]));
         assert_eq!(band_label([1, 16, 9]), "2, 17, 10");
+    }
+
+    /// A plugin's command in the app (`leave_downloads`) doesn't read an AlphaEarth tile's header
+    /// on the frame: the layer is added and read as the map draws.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn alphaearth_added_without_waiting_when_downloads_are_left() {
+        let url = "https://127.0.0.1:9/annual/2024/10N/x.tiff";
+        let mut s = Session::new(Project::default());
+        s.leave_downloads = true;
+        let r = s.run("embeddings.add", &json!({"dataset": "alphaearth", "url": url}));
+        assert!(r.is_ok(), "{r:?}");
+        // The tile is added with its AlphaEarth look.
+        let tile = s.map().tiles.last().map(|t| t.url.clone()).unwrap_or_default();
+        let (file, look) = crate::render::rustgis_tiles::cog::split(&tile);
+        assert_eq!(file, url);
+        assert!(look.aef, "{tile}");
+        // Elsewhere its header is read first, so an unreadable tile is refused.
+        let mut t = Session::new(Project::default());
+        assert!(t.run("embeddings.add", &json!({"dataset": "alphaearth", "url": url})).is_err());
     }
 
     #[test]

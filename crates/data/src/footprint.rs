@@ -29,6 +29,11 @@ const VERTICES_PER_FACE: usize = 5;
 /// they overflow to a NaN, on which the hull panics (in the browser, where it can't be caught).
 const MAX_COORDINATE: f64 = 1e150;
 
+/// Whether a point's X and Y are ones a footprint takes: finite numbers within [`MAX_COORDINATE`].
+pub(crate) fn usable_xy(p: &P3) -> bool {
+    p[0].abs() <= MAX_COORDINATE && p[1].abs() <= MAX_COORDINATE
+}
+
 /// Why a footprint is the hull of its points.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Hull {
@@ -38,24 +43,46 @@ pub(crate) enum Hull {
     Unmerged,
 }
 
+/// Whether a face's outer `ring` shows from above, in a shape `size` across (its larger X or Y
+/// span), by the cosine of its tilt (its projected area over its area): walls, even leaning ones,
+/// show as slivers, which cover nothing and which the union can't always take. Faces narrower than
+/// a ten-thousandth of the shape are left out too (a flat shape).
+pub(crate) fn shows(ring: &[P3], size: f64) -> bool {
+    let (mut nx, mut ny, mut nz) = (0.0, 0.0, 0.0);
+    let (mut longest, mut area2) = (0.0f64, 0.0);
+    // From the ring's first point: projected coordinates run to millions, whose products would
+    // lose the millimetres a small face is measured in.
+    let o = ring.first().copied().unwrap_or([0.0; 3]);
+    let local: Vec<P3> = ring.iter().map(|p| [p[0] - o[0], p[1] - o[1], p[2] - o[2]]).collect();
+    for (a, b) in local.iter().zip(local.iter().cycle().skip(1)) {
+        nx += (a[1] - b[1]) * (a[2] + b[2]);
+        ny += (a[2] - b[2]) * (a[0] + b[0]);
+        nz += (a[0] - b[0]) * (a[1] + b[1]);
+        longest = longest.max((b[0] - a[0]).hypot(b[1] - a[1]));
+        area2 += a[0] * b[1] - b[0] * a[1];
+    }
+    let n = nx.hypot(ny).hypot(nz);
+    n > 0.0 && nz.abs() / n > 0.05 && longest > 0.0 && area2.abs() / longest > size * 1e-4
+}
+
 /// A shape's footprint: the union of its `faces` (each its outer ring and then its holes) seen from
 /// above. Faces standing on edge, such as walls, show nothing and are left out. The footprint is the
 /// hull of `points` when no face shows, or when its faces aren't merged: `truncated` (the reader left
 /// some out, or can't vouch for them, as with a height that isn't a finite number), more seen from
-/// above than [`MAX_UNION_FACES`] or than `budget` has left (which they then take from it). `points` are all the shape's points, in any grouping: they also set the scale
-/// below which a face is too narrow to show. A shape with a point or a face whose X or Y isn't a
-/// finite number, or passes [`MAX_COORDINATE`], has no footprint: the hull, and orienting a face,
-/// panic on NaN. A height that isn't a finite number (or passes the limit) can't say which way a face looks: all of them
-/// go, not only that one (which would drop it silently), and the hull stands in.
-pub(crate) fn footprint(
-    faces: &[Vec<Vec<P3>>],
+/// above than [`MAX_UNION_FACES`] or than `budget` has left (which they then take from it).
+/// `points` are all the shape's points, in any grouping: they also set the scale below which a face
+/// is too narrow to show. A shape with a point or a face whose X or Y isn't a finite number, or
+/// passes [`MAX_COORDINATE`], has no footprint: the hull, and orienting a face, panic on NaN. A
+/// height that isn't a finite number (or passes the limit) can't say which way a face looks: all of
+/// them go, not only that one (which would drop it silently), and the hull stands in.
+pub(crate) fn footprint<F: AsRef<[Vec<P3>]>>(
+    faces: &[F],
     truncated: bool,
     points: &[Vec<P3>],
     budget: &mut usize,
 ) -> (Option<Geometry>, Option<Hull>) {
     use geo::{ConvexHull, Orient, orient::Direction};
-    let usable = |p: &P3| p[0].abs() <= MAX_COORDINATE && p[1].abs() <= MAX_COORDINATE;
-    if !points.iter().chain(faces.iter().flatten()).flatten().all(usable) {
+    if !points.iter().chain(faces.iter().flat_map(|f| f.as_ref())).flatten().all(usable_xy) {
         return (None, None);
     }
     // A height past the limit too: the tilt of a face, measured below, overflows on it.
@@ -67,34 +94,14 @@ pub(crate) fn footprint(
     if !size.is_finite() {
         return (None, None);
     }
-    // A face shows from above by the cosine of its tilt (its projected area over its area): walls,
-    // even leaning ones, show as slivers, which cover nothing and which the union can't always
-    // take. Faces narrower than a ten-thousandth of the shape are left out too (a flat shape).
-    let shows = |ring: &[P3]| {
-        let (mut nx, mut ny, mut nz) = (0.0, 0.0, 0.0);
-        let (mut longest, mut area2) = (0.0f64, 0.0);
-        // From the ring's first point: projected coordinates run to millions, whose products would
-        // lose the millimetres a small face is measured in.
-        let o = ring.first().copied().unwrap_or([0.0; 3]);
-        let local: Vec<P3> = ring.iter().map(|p| [p[0] - o[0], p[1] - o[1], p[2] - o[2]]).collect();
-        for (a, b) in local.iter().zip(local.iter().cycle().skip(1)) {
-            nx += (a[1] - b[1]) * (a[2] + b[2]);
-            ny += (a[2] - b[2]) * (a[0] + b[0]);
-            nz += (a[0] - b[0]) * (a[1] + b[1]);
-            longest = longest.max((b[0] - a[0]).hypot(b[1] - a[1]));
-            area2 += a[0] * b[1] - b[0] * a[1];
-        }
-        let n = nx.hypot(ny).hypot(nz);
-        n > 0.0 && nz.abs() / n > 0.05 && longest > 0.0 && area2.abs() / longest > size * 1e-4
-    };
     let ring2 = |r: &[P3]| geo::LineString::from(r.iter().map(|p| (p[0], p[1])).collect::<Vec<_>>());
     // Past the cap, a partial union would be wrong: the hull below stands in.
     let seen: Vec<geo::Polygon<f64>> = faces
         .iter()
         .filter(|_| !truncated)
         .filter_map(|face| {
-            let (outer, holes) = face.split_first()?;
-            (outer.len() >= 3 && shows(outer))
+            let (outer, holes) = face.as_ref().split_first()?;
+            (outer.len() >= 3 && shows(outer, size))
                 .then(|| geo::Polygon::new(ring2(outer), holes.iter().map(|h| ring2(h)).collect()).orient(Direction::Default))
         })
         .collect();
@@ -193,7 +200,7 @@ mod tests {
         assert_eq!(footprint(&[vec![huge.clone()]], false, std::slice::from_ref(&huge), &mut budget), (None, None));
         let at = MAX_COORDINATE;
         let large = vec![[at, at, 0.0], [-at, at, 0.0], [-at, -at, 0.0], [at, -at, 0.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]];
-        let (shape, hull) = footprint(&[], false, std::slice::from_ref(&large), &mut budget);
+        let (shape, hull) = footprint::<Vec<Vec<P3>>>(&[], false, std::slice::from_ref(&large), &mut budget);
         assert!(shape.is_some() && hull == Some(Hull::NoFaces), "{shape:?}");
         assert_eq!(budget, 10);
     }
@@ -233,9 +240,9 @@ mod tests {
     #[test]
     fn too_few_or_unusable_points_make_none() {
         let mut budget = 10;
-        assert_eq!(footprint(&[], false, &[vec![[0.0, 0.0, 0.0], [1.0, 1.0, 0.0]]], &mut budget), (None, None));
-        assert_eq!(footprint(&[], false, &[vec![[f64::NAN, 0.0, 0.0]; 4]], &mut budget), (None, None));
-        assert_eq!(footprint(&[], false, &[], &mut budget), (None, None));
+        assert_eq!(footprint::<Vec<Vec<P3>>>(&[], false, &[vec![[0.0, 0.0, 0.0], [1.0, 1.0, 0.0]]], &mut budget), (None, None));
+        assert_eq!(footprint::<Vec<Vec<P3>>>(&[], false, &[vec![[f64::NAN, 0.0, 0.0]; 4]], &mut budget), (None, None));
+        assert_eq!(footprint::<Vec<Vec<P3>>>(&[], false, &[], &mut budget), (None, None));
     }
 
     /// A point or a face that isn't a finite number makes no footprint rather than reaching the
@@ -248,13 +255,13 @@ mod tests {
         for bad in [f64::NAN, f64::INFINITY] {
             let mut odd = square.clone();
             odd.insert(2, [bad, 5.0, 0.0]);
-            assert_eq!(footprint(&[], false, &[square.clone(), odd.clone()], &mut budget), (None, None), "point {bad}");
+            assert_eq!(footprint::<Vec<Vec<P3>>>(&[], false, &[square.clone(), odd.clone()], &mut budget), (None, None), "point {bad}");
             assert_eq!(footprint(&[vec![odd.clone()]], false, std::slice::from_ref(&square), &mut budget), (None, None), "face {bad}");
             let hole = vec![[2.0, 2.0, 0.0], [2.0, 4.0, 0.0], [4.0, bad, 0.0], [4.0, 2.0, 0.0], [2.0, 2.0, 0.0]];
             let face = vec![square.clone(), hole];
             assert_eq!(footprint(&[face], false, std::slice::from_ref(&square), &mut budget), (None, None), "hole {bad}");
             odd[2] = [5.0, bad, 0.0];
-            assert_eq!(footprint(&[], false, &[odd], &mut budget), (None, None), "y {bad}");
+            assert_eq!(footprint::<Vec<Vec<P3>>>(&[], false, &[odd], &mut budget), (None, None), "y {bad}");
         }
         assert_eq!(budget, 10, "nothing was merged");
     }

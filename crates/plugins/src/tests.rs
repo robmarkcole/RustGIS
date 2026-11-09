@@ -15,6 +15,9 @@ impl Host for Recorder {
         self.ops.push(op.to_string());
         match op {
             "host.echo" => Ok(params.clone()),
+            // A host request that fails unexpectedly.
+            #[allow(clippy::panic)]
+            "host.panic" => panic!("a host request failed unexpectedly"),
             _ => Err(format!("no '{op}'")),
         }
     }
@@ -250,6 +253,92 @@ fn tools_join_the_geoprocessing_tools() {
     crate::unload("unit-tools");
 }
 
+/// Old prepared tool jobs cannot run after their plugin is toggled, replaced or removed.
+#[test]
+fn prepared_tools_keep_their_load_and_refuse_revoked_handles() {
+    struct Empty;
+    impl rustgis_analysis::Inputs for Empty {
+        /// The fixed-output plugin needs no project dataset.
+        fn dataset(&self, _: &str) -> Option<&rustgis_data::Dataset> {
+            None
+        }
+        /// The fixture gives the plugin no selected rows.
+        fn selection(&self, _: &str) -> &[usize] {
+            &[]
+        }
+    }
+
+    let plugin = load("unit-pinned-tool", &[]);
+    let job = crate::tools::prepare_pinned(&plugin, "m", &Empty, &json!({})).unwrap();
+    assert!(crate::is_current(&plugin));
+    assert_eq!(job.run(&crate::tools::Control::default()).unwrap().messages, ["made"]);
+
+    crate::set_enabled("unit-pinned-tool", false).unwrap();
+    assert!(!crate::is_current(&plugin));
+    assert!(job.run(&crate::tools::Control::default()).unwrap_err().contains("changed or was disabled"));
+    crate::set_enabled("unit-pinned-tool", true).unwrap();
+    let enabled = crate::get("unit-pinned-tool").unwrap();
+    assert!(crate::is_current(&enabled));
+    assert!(!crate::is_current(&plugin), "enabling cannot revive an old load");
+    let job = crate::tools::prepare_pinned(&enabled, "m", &Empty, &json!({})).unwrap();
+
+    let replacement = load("unit-pinned-tool", &[]);
+    assert!(crate::is_current(&replacement));
+    assert!(!crate::is_current(&enabled), "identical package bytes still make a new load");
+    assert!(job.run(&crate::tools::Control::default()).is_err());
+    let err = crate::tools::prepare_pinned(&enabled, "m", &Empty, &json!({"input": "Missing"})).err().unwrap();
+    assert!(err.contains("updated or removed"), "refuse before reading inputs: {err}");
+    let job = crate::tools::prepare_pinned(&replacement, "m", &Empty, &json!({})).unwrap();
+    crate::unload("unit-pinned-tool");
+    assert!(!crate::is_current(&replacement));
+    assert!(job.run(&crate::tools::Control::default()).is_err());
+
+    let withdrawn = load("unit-pinned-withdrawn", &[]);
+    let job = crate::tools::prepare_pinned(&withdrawn, "m", &Empty, &json!({})).unwrap();
+    crate::apply_blocklist(
+        "https://pinned-test.invalid/registry.json",
+        vec![registry::Blocked { id: "unit-pinned-withdrawn".into(), sha256: None, reason: "test withdrawal".into() }],
+    );
+    assert!(!crate::is_current(&withdrawn));
+    assert!(job.run(&crate::tools::Control::default()).is_err());
+}
+
+/// A schema captured from one registry snapshot cannot be paired with another plugin load.
+#[test]
+fn pinned_tool_schema_refuses_changed_defaults_display_and_stale_load() {
+    // This schema-comparison scenario holds its own publication; other fixtures reload the
+    // process-wide provider, which may legitimately make a concurrent lookup unavailable.
+    #[cfg(not(target_arch = "wasm32"))]
+    if std::env::var_os("RUSTGIS_SCHEMA_PIN_TEST_CHILD").is_none() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::pinned_tool_schema_refuses_changed_defaults_display_and_stale_load", "--nocapture"])
+            .env("RUSTGIS_SCHEMA_PIN_TEST_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(String::from_utf8_lossy(&out.stdout).contains("test result: ok. 1 passed; 0 failed;"));
+        return;
+    }
+    crate::tools::register();
+    let first = load("unit-schema-pin", &[]);
+    let spec = rustgis_analysis::resolve("plugin:unit-schema-pin/m").unwrap();
+    crate::tools::matches_pinned(&first, spec.spec()).unwrap();
+    let mut manifest: Value = serde_json::from_str(&testing::manifest("unit-schema-pin", &[])).unwrap();
+    manifest["tools"][0]["name"] = json!("Different operation");
+    manifest["tools"][0]["params"][1]["default"] = json!(42);
+    let text = manifest.to_string();
+    let bytes = testing::zip_of(&[("plugin.json", text.as_bytes()), ("plugin.wasm", &testing::wasm())]);
+    let second = crate::load(Package::from_zip(&bytes).unwrap(), "test").unwrap();
+    assert!(crate::tools::matches_pinned(&first, spec.spec()).unwrap_err().contains("updated or removed"));
+    assert!(crate::tools::matches_pinned(&second, spec.spec()).unwrap_err().contains("schema or display"));
+    let current = rustgis_analysis::resolve("plugin:unit-schema-pin/m").unwrap();
+    crate::tools::matches_pinned(&second, current.spec()).unwrap();
+    assert_eq!(current.resolve_params(&json!({"input":"Cities"})).unwrap()["size"], 42);
+    crate::set_enabled("unit-schema-pin", false).unwrap();
+    assert!(crate::tools::matches_pinned(&second, current.spec()).is_err());
+    crate::unload("unit-schema-pin");
+}
+
 /// Registry and blocklist parsing validates entries and resolves package addresses safely.
 #[test]
 fn registries_and_blocklists_are_read_defensively() {
@@ -306,6 +395,18 @@ fn registries_and_blocklists_are_read_defensively() {
     assert!(registry::blocked(&list, "x", "anything").is_some());
     assert!(registry::blocked(&list, "y", &sha).is_some());
     assert!(registry::blocked(&list, "y", &"b".repeat(64)).is_none());
+    // A list too long to read whole is refused, not cut short.
+    let entry = json!({"id": "x"});
+    let full = Value::Array(vec![entry.clone(); registry::MAX_ENTRIES]);
+    assert_eq!(registry::parse_blocklist(&full.to_string()).unwrap().len(), registry::MAX_ENTRIES);
+    let over = Value::Array(vec![entry; registry::MAX_ENTRIES + 1]);
+    assert!(registry::parse_blocklist(&over.to_string()).unwrap_err().contains("at most"));
+    // A refused entry isn't quoted at length.
+    let long = json!([{"id": "x".repeat(100_000)}, "y".repeat(100_000)]);
+    for list in [json!([long[0].clone()]), json!([long[1].clone()])] {
+        let e = registry::parse_blocklist(&list.to_string()).unwrap_err();
+        assert!(e.starts_with("blocklist entry 1") && e.len() < 400, "{}", e.len());
+    }
 }
 
 /// Blocklisting unloads affected plugins and prevents them from being loaded again.
@@ -317,6 +418,25 @@ fn blocked_plugins_are_unloaded_and_refused() {
     assert!(crate::get("unit-blocked").is_none());
     let pkg = Package::from_zip(&testing::package("unit-blocked", &[])).unwrap();
     assert!(crate::load(pkg, "t").unwrap_err().contains("malware"));
+    // A refresh of the wrong shape is refused and leaves the withdrawal in place.
+    for text in [
+        "{}",
+        r#"{"blocked": {}}"#,
+        r#"{"blocked": null}"#,
+        "1",
+        r#"[{"reason": "no id"}]"#,
+        "[1]",
+        r#"[{"id": "ok"}, {"reason": "no id"}]"#,
+        r#"[{"id": "unit-blocked", "sha256": "sha256:abc"}]"#,
+        r#"[{"id": "Unit Blocked"}]"#,
+        r#"[{"id": "unit blocked"}]"#,
+    ] {
+        assert!(crate::store::save_blocklist(registry::DEFAULT_URL, text).is_err(), "{text}");
+        assert!(crate::blocked("unit-blocked", "any").is_some(), "{text} cleared the blocklist");
+    }
+    // Only an explicitly empty list clears it.
+    assert_eq!(registry::parse_blocklist(r#"{"blocked": []}"#).unwrap(), Vec::new());
+    assert_eq!(registry::parse_blocklist("[]").unwrap(), Vec::new());
     crate::set_blocklist(Vec::new());
     // Another registry's blocklist only adds: it can't bring back what the hosted one withdrew.
     load("unit-blocked", &[]);
@@ -526,7 +646,7 @@ fn plugin_tab_total_item_limit_counts_menus_and_entries_across_groups() {
 fn plugin_panels_are_checked() {
     let ok = Manifest::parse(&testing::panel_manifest("paneled")).unwrap();
     let panel = ok.panel.as_ref().unwrap();
-    assert_eq!(panel.items.len(), 7);
+    assert_eq!(panel.items.len(), 8);
     // A button's id is its command's unless it has one; a tab's `panel` opens the panel.
     assert!(panel.item("q-newer").is_none() && panel.item("newer").is_some_and(|i| i.command == "q-newer"));
     assert!(matches!(ok.entry("panel"), Some(crate::Entry::Panel(_))));
@@ -575,7 +695,18 @@ fn plugin_panels_are_checked() {
         (item(json!({"kind": "slider", "id": "s", "max": 1.5})), "plugin.json"),
         (item(json!({"kind": "button", "command": "h", "max": 3})), "for sliders"),
         (item(json!({"kind": "checkbox", "id": "c", "label": "C", "steps": true})), "for sliders"),
-        (item(json!({"kind": "button", "command": "h", "default": true})), "only checkboxes and sliders"),
+        (item(json!({"kind": "button", "command": "h", "default": true})), "only checkboxes, sliders"),
+        (item(json!({"kind": "choice", "id": "c", "options": [{"id": "a"}, {"id": "a"}]})), "unique id"),
+        (item(json!({"kind": "choice", "id": "c", "options": ["a"]})), "unique id"),
+        (item(json!({"kind": "choice", "id": "c", "options": [{"id": "a"}], "default": "b"})), "one of its options"),
+        (item(json!({"kind": "slider", "id": "s", "max": 3, "options": [{"id": "a"}]})), "for dropdowns"),
+        (item(json!({"kind": "date", "id": "d", "default": "2023-02-29"})), "YYYY-MM-DD"),
+        (item(json!({"kind": "date", "id": "d", "default": "2023-2-1"})), "YYYY-MM-DD"),
+        (item(json!({"kind": "date", "id": "d", "min": 1})), "for sliders and ranges"),
+        (item(json!({"kind": "range", "id": "r", "max": 9, "default": [5, 2]})), "low first"),
+        (item(json!({"kind": "range", "id": "r", "max": 9, "default": [0, 10]})), "from min to max"),
+        (item(json!({"kind": "range", "id": "r", "max": 9, "default": 3})), "[low, high]"),
+        (item(json!({"kind": "range", "id": "r", "min": 4, "max": 1})), "min must not be above"),
         (item(json!({"kind": "button", "command": "h", "text": "t"})), "for texts"),
         (item(json!({"kind": "text", "id": "t", "text": long})), "too long"),
         (item(json!({"kind": "text", "id": "t", "label": 7})), "plugin.json"),
@@ -602,7 +733,8 @@ fn plugin_panel_state_round_trips() {
     let p = crate::load(pkg, "test").unwrap();
     let decl = p.manifest.panel.clone().unwrap();
     let mut st = PanelState::new(&decl);
-    assert_eq!(st.values, [("local".to_string(), json!(false)), ("release".to_string(), json!(0))].into_iter().collect());
+    let defaults = [("local", json!(false)), ("release", json!(0)), ("span", json!([2, 8]))];
+    assert_eq!(st.values, defaults.into_iter().map(|(k, v)| (k.to_string(), v)).collect());
     assert_eq!(st.items["selected"].text, "None yet");
     // The state command answers the panel's state; the host takes it in.
     let cmd = crate::command("plugin:unit-panel/p").unwrap();
@@ -620,7 +752,7 @@ fn plugin_panel_state_round_trips() {
     assert_eq!(changed, ["local", "release"]);
     let echo = crate::command("plugin:unit-panel/q").unwrap();
     let got = crate::run_command_with_panel(&echo, &mut Recorder::default(), &json!({"a": 1}), Some(st.request(&changed))).unwrap();
-    assert_eq!(got["panel"], json!({"values": {"local": true, "release": 3}, "changed": ["local", "release"]}));
+    assert_eq!(got["panel"], json!({"values": {"local": true, "release": 3, "span": [2, 8]}, "changed": ["local", "release"]}));
     assert_eq!(got["params"], json!({"a": 1}));
     assert_eq!(got["kind"], "command");
     // Without a panel, no `panel` in the request.
@@ -748,7 +880,7 @@ fn a_panel_tree_takes_nodes_and_a_chosen_one() {
         {"id": "env", "label": "Ambiente", "count": 2, "children": [{"id": "501", "label": "Árboles"}, {"id": "502"}]},
         {"id": "farm", "label": "Agricultura", "count": 1, "children": [{"id": "601", "label": "Productividad Rural"}]},
     ]);
-    st.apply(&decl, &json!({"items": {"catalogue": {"nodes": nodes}}, "values": {"catalogue": "601"}}));
+    assert_eq!(st.apply(&decl, &json!({"items": {"catalogue": {"nodes": nodes}}, "values": {"catalogue": "601"}})).notice(), None);
     let tree = &st.items["catalogue"].nodes;
     assert_eq!(tree.len(), 2);
     assert_eq!((tree[0].count, tree[0].children[1].label.as_str()), (Some(2), "502"), "a label defaults to the id");
@@ -766,6 +898,10 @@ fn a_panel_tree_takes_nodes_and_a_chosen_one() {
         kept.apply(&decl, &json!({"items": {"catalogue": {"nodes": junk}}}));
         assert_eq!((kept.items["catalogue"].nodes.len(), kept.chosen("catalogue")), (2, Some("501")), "{junk}");
     }
+    // A node repeated, or without an id, at any depth is left out and counted.
+    let mut lossy = st.clone();
+    let junk = json!([{"id": "env", "children": [{"id": "env"}, {"label": "x", "children": [{"id": "y"}]}]}]);
+    assert_eq!(lossy.apply(&decl, &json!({"items": {"catalogue": {"nodes": junk}}})).nodes, 3);
     // New nodes without the chosen one: none chosen.
     st.apply(&decl, &json!({"items": {"catalogue": {"nodes": [{"id": "env"}]}}}));
     assert_eq!(st.chosen("catalogue"), None);
@@ -825,7 +961,7 @@ fn hostile_panel_trees_are_tamed() {
     assert!(Manifest::parse(&m.to_string()).unwrap_err().contains("search is for trees"));
     let mut m: Value = serde_json::from_str(&testing::panel_manifest("bad-tree")).unwrap();
     m["panel"]["items"].as_array_mut().unwrap().push(json!({"kind": "tree", "id": "t", "default": "a"}));
-    assert!(Manifest::parse(&m.to_string()).unwrap_err().contains("only checkboxes and sliders have a default"));
+    assert!(Manifest::parse(&m.to_string()).unwrap_err().contains("dates have a default"));
 }
 
 #[test]
@@ -1026,9 +1162,9 @@ fn process_plugins_that_hang_are_stopped() {
 #[test]
 fn process_tools_show_progress_and_can_be_cancelled() {
     let dir = process_folder("proc-cancel", &[]);
-    let p = crate::prepare(Package::from_dir(&dir).unwrap(), "test").unwrap();
+    let p = crate::load(Package::from_dir(&dir).unwrap(), "test").unwrap();
     let job = crate::tools::Job {
-        plugin: std::sync::Arc::new(p),
+        plugin: p.clone(),
         name: "Work Forever".into(),
         request: json!({"abi": 1, "kind": "tool", "id": "w", "params": {}, "layers": {}, "lang": "en"}),
     };
@@ -1051,13 +1187,211 @@ fn process_tools_show_progress_and_can_be_cancelled() {
     assert!(e == "Work Forever: cancelled" && t0.elapsed() < std::time::Duration::from_secs(10), "{e}");
     // Progress shows while a tool runs, but isn't kept in its messages as log lines are.
     let job = crate::tools::Job {
-        plugin: std::sync::Arc::new(crate::prepare(Package::from_dir(&dir).unwrap(), "test").unwrap()),
+        plugin: p,
         name: "Make Points".into(),
         request: json!({"abi": 1, "kind": "tool", "id": "m", "params": {}, "layers": {}, "lang": "en"}),
     };
     let control = crate::tools::Control::default();
     assert_eq!(job.run(&control).unwrap().messages, vec!["made"]);
     assert_eq!(control.last_log().as_deref(), Some("making"));
+    crate::unload("proc-cancel");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Whether a process is gone: not there, or (on Linux) a zombie nothing has reaped yet, as in a
+/// container with no init to reap orphans.
+#[cfg(unix)]
+fn gone(pid: rustix::process::Pid) -> bool {
+    rustix::process::test_kill_process(pid).is_err()
+        || std::fs::read_to_string(format!("/proc/{}/stat", pid.as_raw_nonzero()))
+            .ok()
+            .and_then(|s| s.rsplit_once(") ").map(|(_, rest)| rest.starts_with('Z')))
+            .unwrap_or(false)
+}
+
+/// A session test plugin played by this binary, prepared (not loaded).
+fn session_plugin(id: &str) -> (crate::Plugin, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!("rustgis-test-session-{id}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let run = testing::child_run("tests::process_child");
+    std::fs::write(dir.join("plugin.json"), testing::session_manifest(id, &[], &run)).unwrap();
+    (crate::prepare(Package::from_dir(&dir).unwrap(), "test").unwrap(), dir)
+}
+
+/// The request for the test plugin's command `id`, without parameters.
+fn command(id: &str) -> Value {
+    json!({"abi": 1, "kind": "command", "id": id, "params": {}, "lang": "en"})
+}
+
+/// Polls `plugin`'s program until `done` says so, for a few seconds at most.
+fn poll_until(plugin: &str, host: &mut Recorder, done: impl Fn(&crate::session::Polled, &Recorder) -> bool) -> crate::session::Polled {
+    let t0 = std::time::Instant::now();
+    loop {
+        let polled = crate::session::poll(plugin, host);
+        if done(&polled, host) || t0.elapsed() > std::time::Duration::from_secs(20) {
+            return polled;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// A program's error output past what is kept is counted, so the log can say so.
+#[test]
+fn error_output_past_what_is_kept_is_counted() {
+    let text: String = (0..25).map(|i| format!("line {i}\n")).collect();
+    let kept = crate::process::errors(std::io::Cursor::new(text.into_bytes()), None);
+    let t0 = std::time::Instant::now();
+    while kept.lock().unwrap().dropped < 5 && t0.elapsed() < std::time::Duration::from_secs(10) {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let k = kept.lock().unwrap();
+    assert_eq!((k.dropped, k.lines.len(), k.lines.front().map(String::as_str)), (5, 20, Some("line 5")));
+}
+
+#[test]
+fn session_plugins_keep_one_program_running() {
+    let (p, dir) = session_plugin("sess-keep");
+    assert_eq!(p.info()["session"], true);
+    let mut host = Recorder::default();
+    let pid = crate::call(&p, &mut host, &command("i"), false).unwrap();
+    assert!(crate::session::is_running("sess-keep"));
+    assert_eq!(crate::call(&p, &mut host, &command("h"), false).unwrap(), json!({"hello": "world"}));
+    assert_eq!(crate::call(&p, &mut host, &command("i"), false).unwrap(), pid, "the same program answers");
+    // A host request inside a command is answered as a per-call plugin's is.
+    let forward = json!({"abi": 1, "kind": "command", "id": "f", "params": {"op": "host.echo", "params": {"a": 1}}, "lang": "en"});
+    assert_eq!(crate::call(&p, &mut host, &forward, false).unwrap(), json!({"a": 1}));
+    assert_eq!(crate::call(&p, &mut host, &command("e"), false).unwrap_err(), "nope");
+
+    // Between commands it asks when it likes; the answer carries its id. It hears events.
+    let later = json!({"abi": 1, "kind": "command", "id": "k", "params": {"op": "host.echo", "params": {"a": 1}}, "lang": "en"});
+    assert_eq!(crate::call(&p, &mut host, &later, false).unwrap(), "asked");
+    let polled = poll_until("sess-keep", &mut host, |_, h| h.ops.len() >= 2);
+    assert_eq!(host.ops, ["host.echo", "host.echo"]);
+    assert!(polled.ended.is_none());
+    crate::session::event("sess-keep", &json!({"event": "selection"}));
+    let heard = crate::call(&p, &mut host, &command("v"), false).unwrap();
+    assert_eq!(heard["answers"], json!([{"ok": {"a": 1}, "id": "a2"}]));
+    assert_eq!(heard["events"], json!(["selection"]));
+
+    // A program that stops reading while the map moves gets the latest view when it reads again,
+    // not every one that came meanwhile.
+    assert_eq!(crate::call(&p, &mut host, &command("p"), false).unwrap(), "paused");
+    for i in 0..5_000 {
+        crate::session::event("sess-keep", &json!({"event": "view", "view": {"scale": i, "pad": "x".repeat(100)}}));
+    }
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    poll_until("sess-keep", &mut host, |_, _| true);
+    let heard = crate::call(&p, &mut host, &command("v"), false).unwrap();
+    let views = heard["events"].as_array().unwrap().len();
+    assert!(views < 5_000, "{views} views queued");
+    assert_eq!(heard["last_view"]["scale"], 4_999, "the latest view is the one kept");
+
+    // A host request that fails unexpectedly is an error answer; the program stays running.
+    let panics = json!({"abi": 1, "kind": "command", "id": "f", "params": {"op": "host.panic", "params": {}}, "lang": "en"});
+    let e = crate::call(&p, &mut host, &panics, false).unwrap_err();
+    assert!(e.contains("'host.panic' failed unexpectedly"), "{e}");
+    assert_eq!(crate::call(&p, &mut host, &command("i"), false).unwrap(), pid, "the same program still answers");
+
+    // Stopped, it's gone; the next command starts it again.
+    crate::session::stop("sess-keep");
+    assert!(!crate::session::is_running("sess-keep"));
+    #[cfg(unix)]
+    {
+        let old = rustix::process::Pid::from_raw(pid.as_i64().unwrap() as i32).unwrap();
+        assert!(rustix::process::test_kill_process(old).is_err(), "{old:?} still runs");
+    }
+    assert_ne!(crate::call(&p, &mut host, &command("i"), false).unwrap(), pid);
+    // A tool still runs a program of its own, once.
+    let tool = json!({"abi": 1, "kind": "tool", "id": "m", "params": {}, "layers": {}, "lang": "en"});
+    assert_eq!(crate::call(&p, &mut host, &tool, true).unwrap()["messages"], json!(["made"]));
+    crate::session::stop("sess-keep");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn session_plugins_that_end_or_fail_are_started_again() {
+    let (p, dir) = session_plugin("sess-end");
+    let mut host = Recorder::default();
+    // Exiting by itself (its window closed) is no failure, and it is no longer running.
+    assert_eq!(crate::call(&p, &mut host, &command("z"), false).unwrap(), "bye");
+    let polled = poll_until("sess-end", &mut host, |p, _| p.ended.is_some());
+    assert_eq!(polled.ended, Some(crate::session::Ended { failed: false, last_error: None, unread: false, reason: None }));
+    assert!(!crate::session::is_running("sess-end"));
+    // What a program left running when it exited is stopped with it (on Unix).
+    #[cfg(unix)]
+    {
+        let left = crate::call(&p, &mut host, &command("l"), false).unwrap();
+        assert!(poll_until("sess-end", &mut host, |p, _| p.ended.is_some()).ended.is_some(), "the session didn't end");
+        let pid = rustix::process::Pid::from_raw(left.as_i64().unwrap() as i32).unwrap();
+        let t0 = std::time::Instant::now();
+        while !gone(pid) && t0.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(gone(pid), "{pid:?} still runs");
+    }
+    // What it sent as it exited is still handled: a last request, a last log line.
+    let last = json!({"abi": 1, "kind": "command", "id": "w", "params": {"op": "host.echo", "params": {"last": true}}, "lang": "en"});
+    assert_eq!(crate::call(&p, &mut host, &last, false).unwrap(), "bye");
+    let polled = poll_until("sess-end", &mut host, |p, _| p.ended.is_some());
+    assert_eq!(polled.ended.map(|e| e.failed), Some(false));
+    assert!(host.ops.contains(&"host.echo".to_string()) && host.logs.contains(&"last words".to_string()), "{:?} {:?}", host.ops, host.logs);
+    // A crash is an error naming what it wrote last; the next command starts it again.
+    let e = crate::call(&p, &mut host, &command("c"), false).unwrap_err();
+    assert!(e.contains("exited without answering") && e.contains("boom"), "{e}");
+    assert!(!crate::session::is_running("sess-end"));
+    assert_eq!(crate::call(&p, &mut host, &command("h"), false).unwrap(), json!({"hello": "world"}));
+    // One that stops answering is stopped.
+    let spec =
+        crate::process::Spec { session: true, ..crate::process::Spec::new(&testing::child_run("tests::process_child"), &dir).unwrap() };
+    let t0 = std::time::Instant::now();
+    let e = crate::session::command("sess-spin", &spec, &mut host, &command("s"), std::time::Duration::from_secs(2)).unwrap_err();
+    assert!(e.contains("too long") && t0.elapsed() < std::time::Duration::from_secs(20), "{e}");
+    assert!(!crate::session::is_running("sess-spin"));
+    // Updated, the running program is the old version's: stopped. Turned off, it stops too.
+    let p = crate::register(p);
+    assert!(!crate::session::is_running("sess-end"));
+    crate::call(&p, &mut host, &command("h"), false).unwrap();
+    assert!(crate::session::is_running("sess-end"));
+    crate::set_enabled("sess-end", false).unwrap();
+    assert!(!crate::session::is_running("sess-end"));
+    // Removed, it stops as well.
+    crate::set_enabled("sess-end", true).unwrap();
+    let p = crate::get("sess-end").unwrap();
+    crate::call(&p, &mut host, &command("h"), false).unwrap();
+    assert!(crate::session::is_running("sess-end"));
+    assert!(crate::unload("sess-end"));
+    assert!(!crate::session::is_running("sess-end") && crate::get("sess-end").is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A program that exits while something it left running keeps writing into its output, faster
+/// than it's read, is still ended poll after poll, with what it left running.
+#[cfg(unix)]
+#[test]
+fn an_exited_session_whose_output_keeps_flowing_is_ended() {
+    let (p, dir) = session_plugin("sess-flow");
+    let mut host = Recorder::default();
+    let left = crate::call(&p, &mut host, &command("r"), false).unwrap();
+    let pid = rustix::process::Pid::from_raw(left.as_i64().unwrap() as i32).unwrap();
+    // Polled as frames would be, for a while at most: until it has exited there's nothing to
+    // count, and a poll with nothing new returns at once.
+    let mut ended = None;
+    let t0 = std::time::Instant::now();
+    while t0.elapsed() < std::time::Duration::from_secs(30) {
+        if let Some(e) = crate::session::poll("sess-flow", &mut host).ended {
+            ended = Some(e);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let ended = ended.expect("the session didn't end");
+    assert!(ended.unread, "{ended:?}");
+    assert!(!crate::session::is_running("sess-flow"));
+    let t0 = std::time::Instant::now();
+    while !gone(pid) && t0.elapsed() < std::time::Duration::from_secs(10) {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(gone(pid), "{pid:?} still runs");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1077,6 +1411,9 @@ fn process_manifests_are_checked() {
     assert!(base(json!({"runtime": "process", "run": {"windos": ["x"]}})).unwrap_err().contains("names no program"));
     assert!(base(json!({"runtime": "process", "run": vec!["a"; 65]})).is_err());
     assert!(base(json!({"run": ["python3"]})).unwrap_err().contains("process plugins"));
+    // Only a process plugin keeps a program running.
+    assert!(base(json!({"runtime": "process", "run": ["x"], "session": true})).unwrap().session);
+    assert!(base(json!({"session": true})).unwrap_err().contains("process plugins"));
     assert!(base(json!({"runtime": "native"})).is_err());
     // A program by a relative path stays in the plugin's folder.
     assert!(base(json!({"runtime": "process", "run": ["bin/tool"]})).is_ok());
@@ -1101,6 +1438,32 @@ fn process_manifests_are_checked() {
     let m = base(json!({"runtime": "process", "run": {other: ["x"]}})).unwrap();
     let pkg = Package { manifest: m, wasm: Vec::new(), sha256: String::new(), dir: Some(std::env::temp_dir()), skills: Vec::new() };
     assert!(crate::prepare(pkg, "test").unwrap_err().contains("doesn't run on this platform"));
+}
+
+/// A refused refresh leaves the cached hosted blocklist byte for byte, and a cache that can't be
+/// read at start is reported rather than ignored.
+#[test]
+fn cached_blocklist_survives_refused_refreshes() {
+    let plugins = std::env::temp_dir().join(format!("rustgis-test-blocklist-cache-{}", std::process::id()));
+    let _store = store_lock();
+    crate::store::set_dir(Some(plugins.clone()));
+    std::fs::create_dir_all(&plugins).unwrap();
+    let cache = plugins.join("blocklist.json");
+    let good = r#"{"blocked": [{"id": "cached-withdrawal"}]}"#;
+    std::fs::write(&cache, good).unwrap();
+    for text in ["{}", r#"{"blocked": {}}"#, r#"[{"id": "ok"}, {"reason": "no id"}]"#] {
+        assert!(crate::store::save_blocklist(registry::DEFAULT_URL, text).is_err(), "{text}");
+        assert_eq!(std::fs::read_to_string(&cache).unwrap(), good, "{text} overwrote the cache");
+    }
+    std::fs::write(&cache, r#"[{"id": "a"}, {"reason": "no id"}]"#).unwrap();
+    let errors = crate::store::load_installed();
+    assert!(errors.iter().any(|e| e.contains("blocklist.json") && e.contains("entry 2")), "{errors:?}");
+    // So is one that isn't text; none at all is fine.
+    std::fs::write(&cache, [0xff, 0xfe]).unwrap();
+    assert!(crate::store::load_installed().iter().any(|e| e.contains("blocklist.json")));
+    std::fs::remove_file(&cache).unwrap();
+    assert!(crate::store::load_installed().is_empty());
+    let _ = std::fs::remove_dir_all(&plugins);
 }
 
 #[test]
@@ -1354,4 +1717,83 @@ fn python_environments_are_prepared_one_at_a_time() {
     assert_eq!(crate::pyenv::status("pyenv-lock"), Some(true));
     crate::unload("pyenv-lock");
     let _ = std::fs::remove_dir_all(&plugins);
+}
+
+/// The test panel with a dropdown, a date and a range added (#1622).
+fn choice_date_range_panel() -> crate::PanelDecl {
+    let mut m: Value = serde_json::from_str(&testing::panel_manifest("cdr-panel")).unwrap();
+    let items = m["panel"]["items"].as_array_mut().unwrap();
+    items.push(json!({"kind": "choice", "id": "product", "label": "Product", "command": "q",
+        "options": [{"id": "hls", "label": "DSWx-HLS"}, {"id": "s1"}], "default": "s1"}));
+    items.push(json!({"kind": "date", "id": "start", "label": "Start", "default": "2023-04-01"}));
+    items.push(json!({"kind": "date", "id": "end", "label": "End"}));
+    items.push(json!({"kind": "range", "id": "months", "label": "Months", "min": 0, "max": 11, "default": [2, 5], "steps": true}));
+    items.push(json!({"kind": "range", "id": "all", "label": "All", "min": 1, "max": 4}));
+    Manifest::parse(&m.to_string()).unwrap().panel.unwrap()
+}
+
+/// A dropdown takes its options from `plugin.json` or the plugin and the chosen option's id as its
+/// value; a date takes `YYYY-MM-DD`; a range takes `[low, high]` within its ends (#1622).
+#[test]
+fn panel_dropdowns_dates_and_ranges_keep_their_values() {
+    use crate::PanelState;
+    let decl = choice_date_range_panel();
+    let mut st = PanelState::new(&decl);
+    assert_eq!(st.chosen("product"), Some("s1"), "the declared default");
+    assert_eq!(st.items["product"].nodes.iter().map(|n| n.label.as_str()).collect::<Vec<_>>(), ["DSWx-HLS", "s1"]);
+    assert_eq!((st.chosen("start"), st.chosen("end")), (Some("2023-04-01"), None));
+    assert_eq!(st.range("months"), (2, 5));
+    assert_eq!(st.range("all"), (1, 4), "a range without a default spans its ends");
+    let req = st.request(&[]);
+    assert_eq!(req["values"]["months"], json!([2, 5]));
+    assert_eq!(req["values"]["end"], Value::Null);
+
+    // Values set by the pane or a script: kept only when they fit.
+    assert_eq!(st.set_values(&decl, &json!({"product": "hls", "end": "2024-02-29", "months": [9, 3]})), ["product", "end", "months"]);
+    assert_eq!((st.chosen("product"), st.chosen("end"), st.range("months")), (Some("hls"), Some("2024-02-29"), (3, 9)), "low first");
+    assert!(st.set_values(&decl, &json!({"product": "nope", "end": "2023-02-29", "start": "today", "months": 4})).is_empty());
+    assert_eq!(st.set_values(&decl, &json!({"months": [-5, 40]})), ["months"]);
+    assert_eq!(st.range("months"), (0, 11), "kept within its ends");
+    assert_eq!(st.set_values(&decl, &json!({"end": null, "product": null})), ["product", "end"]);
+    assert_eq!((st.chosen("product"), st.chosen("end")), (None, None));
+
+    // The plugin replaces the options and the ends: the values follow.
+    st.set_values(&decl, &json!({"product": "s1", "months": [8, 11]}));
+    let clean = st.apply(&decl, &json!({"items": {"product": {"options": [{"id": "a", "label": "A"}, {"id": "b"}]}, "months": {"min": 0, "max": 9, "labels": ["Jan"]}}}));
+    assert_eq!((clean.notice(), clean), (None, crate::Dropped::default()), "nothing left out, nothing said");
+    assert_eq!(st.chosen("product"), None, "the chosen option is gone");
+    assert_eq!(st.range("months"), (8, 9), "within the new ends");
+    assert_eq!(st.slider_label("months", 0), "Jan");
+    let lossy = st.apply(
+        &decl,
+        &json!({"items": {"product": {"options": [{"id": "a"}, {"id": "a"}, "junk", {"label": "no id"}]}}, "values": {"product": "a", "end": "2023-02-30", "nope": 1}}),
+    );
+    assert_eq!((st.items["product"].nodes.len(), st.chosen("product")), (1, Some("a")), "repeated and id-less options are left out");
+    // ... and said, with the values not taken.
+    assert_eq!(lossy, crate::Dropped { values: vec!["end".into(), "nope".into()], nodes: 3 });
+    let said = lossy.notice().unwrap();
+    assert!(
+        said.starts_with("3 option(s) or tree node(s) left out")
+            && said.ends_with("2 value(s) not taken (no such widget, or not a value it holds): end, nope"),
+        "{said}"
+    );
+    assert_eq!(crate::panel::not_taken(&json!({"product": "a", "x": 1}), &["product".into()]), ["x"]);
+    // Options are flat: children are dropped.
+    st.apply(&decl, &json!({"items": {"product": {"options": [{"id": "p", "children": [{"id": "c"}]}]}}}));
+    assert!(st.items["product"].nodes[0].children.is_empty());
+    // A date's options or a range's nodes aren't theirs: ignored.
+    st.apply(&decl, &json!({"items": {"start": {"options": [{"id": "x"}]}, "months": {"nodes": [{"id": "x"}]}}}));
+    assert!(st.items["start"].nodes.is_empty() && st.items["months"].nodes.is_empty());
+}
+
+#[test]
+fn panel_dates_are_real_dates() {
+    use crate::panel::date;
+    assert_eq!(date("2024-02-29"), Some((2024, 2, 29)));
+    assert_eq!(date("2000-02-29"), Some((2000, 2, 29)));
+    for bad in
+        ["1900-02-29", "2023-13-01", "2023-00-10", "2023-04-31", "0000-01-01", "2023-4-01", "2023-04-1 ", "+023-04-01", "2023/04/01", ""]
+    {
+        assert_eq!(date(bad), None, "{bad}");
+    }
 }

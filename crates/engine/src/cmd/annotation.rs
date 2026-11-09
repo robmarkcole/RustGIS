@@ -189,15 +189,20 @@ impl BoxSpec {
     }
 }
 
+// Construction records and class names are user data, including image names that resemble
+// addresses. These commands only edit loaded features; new rows can sample elevation below.
+const DATA_ROLES: &[crate::ParamRole] =
+    &[crate::ParamRole { key: "box", role: crate::Role::Opaque }, crate::ParamRole { key: "class", role: crate::Role::Opaque }];
+
 pub fn commands() -> Vec<C> {
     vec![
-        C::new("annotation.newLayer","New Box Annotation Layer","Annotate › Layers",new_layer).params(r#"{"name"?: text}"#),
-        C::new("annotation.resume", "Add or Edit Boxes", "Annotate › Shapes", resume).params(r#"{"layer"?:name|id}"#),
-        C::new("annotation.setClass", "Set Annotation Class", "Annotate › Classes", set_class)
+        C::new("annotation.newLayer","New Box Annotation Layer","Annotate › Layers",new_layer).roles(DATA_ROLES).effects(crate::policy::Effects::NONE).params(r#"{"name"?: text}"#),
+        C::new("annotation.resume", "Add or Edit Boxes", "Annotate › Shapes", resume).roles(DATA_ROLES).effects(crate::policy::Effects::NONE).params(r#"{"layer"?:name|id}"#),
+        C::new("annotation.setClass", "Set Annotation Class", "Annotate › Classes", set_class).roles(DATA_ROLES).effects(crate::policy::Effects::NONE)
             .params(r##"{"layer"?:name|id,"class":text,"color"?:"#RRGGBB"}"##),
-        C::new("annotation.addBox","Add Rotated Box","Annotate › Shapes",add).when(super::design::need_editable)
+        C::new("annotation.addBox","Add Rotated Box","Annotate › Shapes",add).inputs(super::design::new_feature_inputs).roles(DATA_ROLES).effects(crate::policy::Effects::NONE).when(super::design::need_editable)
             .params(r#"{"layer"?, "box": {"version":1,"frame":{"crs":CRS,"transform":GeoTransform,"image":text|null},"center":[x,y],"width":number,"height":number,"angle":clockwise degrees}, "class"?:text}"#),
-        C::new("annotation.updateBox","Update Rotated Box","Annotate › Shapes",update).when(super::design::need_editable)
+        C::new("annotation.updateBox","Update Rotated Box","Annotate › Shapes",update).roles(DATA_ROLES).effects(crate::policy::Effects::NONE).when(super::design::need_editable)
             .params(r#"{"layer"?,"row":number,"box": as annotation.addBox,"class"?:text}"#),
     ]
 }
@@ -440,6 +445,39 @@ mod tests {
     fn spec() -> BoxSpec {
         BoxSpec { version: 1, frame: Frame::default(), center: [1000., -2000.], width: 120., height: 30., angle: 37. }
     }
+    #[test]
+    fn annotation_commands_keep_loaded_edits_available_to_scoped_callers() {
+        use crate::policy::{Call, Effects, Revocation, Scope};
+        struct Live;
+        impl Revocation for Live {
+            fn allows(&self, _: Effects) -> bool {
+                true
+            }
+        }
+        let scope = Scope::assistant(1544, std::sync::Arc::new(Live));
+        let mut s = Session::new(Project::default());
+        let calls = [
+            ("annotation.newLayer", json!({})),
+            ("annotation.resume", json!({})),
+            ("annotation.setClass", json!({"class":"vehicle", "color":"#E53444"})),
+            ("annotation.addBox", json!({"box":spec(), "class":"vehicle"})),
+            ("annotation.updateBox", json!({"row":0, "box":spec(), "class":"building"})),
+        ];
+        for (id, params) in calls {
+            s.run_scoped(scope.clone(), &Call::command(id, params)).unwrap();
+        }
+        let layer = s.map().layer(s.active_layer.unwrap()).unwrap();
+        assert_eq!(layer.dataset.features.len(), 1);
+        assert_eq!(layer.dataset.value(0, layer.dataset.field_index("class").unwrap()), &Cell::Text("building".into()));
+        // User data that resembles a credential-bearing address is retained verbatim in
+        // replayable command output, rather than silently changing the annotation class/frame.
+        let mut b = spec();
+        b.frame.image = Some("https://example.invalid/image?token=user-data".into());
+        let params = json!({"box":b, "class":"https://example.invalid/class?token=user-data"});
+        let (clean, _) = crate::roles::command("annotation.addBox", &params, 0);
+        assert_eq!(clean.as_ref().unwrap_or(&params), &params);
+    }
+
     #[test]
     fn annotation_classes_color_existing_and_future_boxes_and_roundtrip() {
         let mut s = Session::new(Project::default());

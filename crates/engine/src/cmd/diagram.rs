@@ -17,17 +17,27 @@ enum Asked {
     Scaled(f32, f32),
 }
 
+/// Registers diagram styling and inspection over the selected layer's resident data.
 pub fn commands() -> Vec<C> {
     vec![
         C::new("layer.diagram", "Set Diagram", "Style › Drawing", set)
+            .roles(&[])
+            .effects(crate::policy::Effects::NONE)
+            .inputs(super::Inputs::single_layer)
             .when(need_feature_layer)
             .params(
                 r##"{"layer"?, "kind": "pie"|"bar", "fields": [numeric field names, or {"field": name, "color"?: "#RRGGBB"|"#RRGGBBAA"}] (a slice or bar each, in order; colours default to the palette new layers take), "size"?: points (fixed: a pie's radius or a bar chart's height, the same for every feature) | {"from"?: points (default 6), "to"?: points (default 40)} (grown with the categories' sum, square-root scaled as Proportional symbols are; the default), "startAngle"?: degrees clockwise from north (a pie's first slice; default 0), "labels"?: "none"|"value"|"percent"|"both" (what each slice or bar says beside it: its value in the legend's number format, its share of the total in percent, or both; default "none"), "background"?: "#RRGGBB"|"#RRGGBBAA"|null (the disc or box behind the chart; default none), "outline"?: {"color"?: "#RRGGBB"|"#RRGGBBAA" (default #4D4D4D), "width"?: points (default 0.75)}} (drawn on each feature over its symbol)"##,
             ),
         C::new("layer.clearDiagram", "Clear Diagram", "Style › Drawing", |s, p| with(s, p, |l| l.diagram = None))
+            .roles(&[])
+            .effects(crate::policy::Effects::NONE)
+            .inputs(super::Inputs::single_layer)
             .when(need_feature_layer)
             .params(r#"{"layer"?: name|id (removes the layer's diagram; the renderer is untouched)}"#),
         C::new("layer.diagramInfo", "Diagram Settings", "Style › Drawing", info)
+            .roles(&[])
+            .effects(crate::policy::Effects::NONE)
+            .inputs(super::Inputs::single_layer)
             .view()
             .when(need_feature_layer)
             .params(r#"{"layer"?: name|id} → {"kind", "fields": [{"field", "color"}], "size": points (fixed) | {"from", "to", "min", "max"} (scaled; min and max are the range of sums it was measured over), "startAngle"?, "labels", "background"?, "outline"} or null without one (layer.diagram takes it back as it is)"#),
@@ -221,7 +231,39 @@ fn set(s: &mut Session, p: &Value) -> CmdResult {
             false,
         );
     }
+    hidden_notice(s, id);
     Ok(out)
+}
+
+/// Says when the layer's diagram won't show because of how the layer is drawn (#1596): binned
+/// points draw their bins, not their features, and an extruded polygon in a tilted flat map
+/// stands up in perspective where a flat chart has no place. Called by `layer.diagram` and by the
+/// aggregation and extrusion commands, whichever comes second.
+pub(crate) fn hidden_notice(s: &mut Session, id: u32) {
+    if let Some(text) = s.map().layer(id).and_then(hidden_text) {
+        s.notify(text, false);
+    }
+}
+
+/// What [`hidden_notice`] says about `l`, or `None` when its diagram (if any) shows: also given
+/// for each such layer a project, map file or layer file opens with.
+pub(crate) fn hidden_text(l: &rustgis_map::Layer) -> Option<String> {
+    l.diagram.as_ref()?;
+    // A name read from a file may be any length.
+    let name = crate::project::short_name(&l.name);
+    match l.geometry_type() {
+        GeometryType::Point if l.aggregation.is_some() => Some(format!(
+            "Layer '{}': its diagram doesn't show while its points are aggregated into bins; turn Aggregation off to see it",
+            name
+        )),
+        // Given on the globe too, which draws the polygons flat with their charts: the map may
+        // be made flat and tilted later.
+        GeometryType::Polygon if l.extrusion.is_some() => Some(format!(
+            "Layer '{}': while its polygons are extruded, its diagram doesn't show when a flat map is tilted (it shows untilted, and on the globe)",
+            name
+        )),
+        _ => None,
+    }
 }
 
 /// The range of the categories' sums over `ds`'s features, which a scaled size grows over: (0, 1)
@@ -458,5 +500,145 @@ mod tests {
         s.run("layer.diagram", &json!({"kind": "pie", "fields": ["v"], "size": 12})).unwrap();
         let said: Vec<&str> = s.notices_since(mark).iter().map(|n| n.text.as_str()).collect();
         assert_eq!(said, ["1 value(s) in 1 field(s) ('v') are zero, negative or not numbers, and are not drawn"]);
+    }
+
+    /// A project's diagrams and layouts read as saved say nothing; a damaged diagram or a layout
+    /// value out of range is said once per kind, with a count (#1597, #1599).
+    #[test]
+    fn opening_a_project_reports_diagram_and_layout_repairs() {
+        let (mut s, id) = regions();
+        s.run("layer.diagram", &json!({"kind": "pie", "fields": ["pop_male", "pop_female"]})).unwrap();
+        s.run("layout.new", &json!({"name": "Poster"})).unwrap();
+        let clean = serde_json::to_string(&s.project).unwrap();
+        let quiet = Session::new(Project::from_json(&clean).unwrap());
+        assert!(quiet.notices.is_empty(), "{:?}", quiet.notices.iter().map(|n| &n.text).collect::<Vec<_>>());
+
+        let mut v: serde_json::Value = serde_json::from_str(&clean).unwrap();
+        let layers = v["maps"][0]["layers"].as_array_mut().unwrap();
+        let at = layers.iter().position(|l| l["id"] == json!(id)).unwrap();
+        let mut broken = layers[at].clone();
+        broken["id"] = json!(9999);
+        broken["diagram"] = json!({"kind": "hexagon"});
+        let cats = layers[at]["diagram"]["categories"].as_array_mut().unwrap();
+        let first = cats[0].clone();
+        let mut repeat = first.clone();
+        repeat["field"] = json!("POP_MALE");
+        let mut blank = first;
+        blank["field"] = json!(" ");
+        cats.push(repeat);
+        cats.push(blank);
+        layers.push(broken);
+        let legend = v["layouts"][0]["elements"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|e| e["kind"].get("Legend").is_some())
+            .expect("the map template has a legend");
+        legend["kind"]["Legend"]["columns"] = json!(999);
+        let opened = Session::new(Project::from_json(&v.to_string()).unwrap());
+        let said: Vec<&str> = opened.notices.iter().map(|n| n.text.as_str()).collect();
+        assert_eq!(said.len(), 4, "{said:?}");
+        for text in [
+            "1 diagram(s) that could not be read or named no field removed",
+            "1 diagram category(ies) with a blank field name",
+            "1 diagram category(ies) repeating an earlier field kept",
+            "1 layout element(s) with a value out of range, a repeated id, an over-long name or a missing map frame reference repaired while opening the project (in \"Poster\")",
+        ] {
+            assert!(said.iter().any(|t| t.contains(text)), "{text}: {said:?}");
+        }
+        let mut reopened = Session::new(Project::default());
+        reopened.run("project.openText", &json!({"text": v.to_string()})).unwrap();
+        assert_eq!(reopened.notices.iter().filter(|n| n.text.contains("while opening the project")).count(), 4);
+        // The repairs are kept, not only reported.
+        for s in [&opened, &reopened] {
+            let columns = s.project.layouts[0].elements.iter().find_map(|e| match &e.kind {
+                rustgis_map::layout::ElementKind::Legend { columns, .. } => Some(*columns),
+                _ => None,
+            });
+            assert_eq!(columns, Some(rustgis_map::layout::MAX_LEGEND_COLUMNS));
+            let layer = s.map().layer(id).unwrap();
+            assert_eq!(layer.diagram.as_ref().map(|d| d.categories.len()), Some(3), "the blank category goes, the repeat stays");
+            assert!(s.map().layer(9999).unwrap().diagram.is_none());
+        }
+        // A peer open (an embedding page) says the same, and a clean one nothing.
+        let mut peer = Session::new(Project::default());
+        let mark = peer.notices.len();
+        peer.open_peer_text(crate::Peer::Embedder, &clean).unwrap();
+        assert!(peer.notices[mark..].iter().all(|n| !n.text.contains("while opening the project")));
+        let mark = peer.notices.len();
+        peer.open_peer_text(crate::Peer::Embedder, &v.to_string()).unwrap();
+        assert_eq!(peer.notices[mark..].iter().filter(|n| n.text.contains("while opening the project")).count(), 4);
+        // Layouts past the most a project keeps, removed when a map import checks the project,
+        // are said too, and an import into a project within the limit says nothing of layouts.
+        let map = serde_json::to_string(s.map()).unwrap();
+        let mut full = Session::new(Project::default());
+        full.run("map.import", &json!({"text": map})).unwrap();
+        assert!(full.notices.iter().all(|n| !n.text.contains("layout")));
+        let one = full.project.layouts.first().cloned().unwrap_or_else(|| rustgis_map::layout::Layout::new("L", 210.0, 297.0));
+        full.project.layouts = vec![one; 201];
+        let mark = full.notices.len();
+        full.run("map.import", &json!({"text": map})).unwrap();
+        let said: Vec<&str> = full.notices[mark..].iter().map(|n| n.text.as_str()).collect();
+        assert!(
+            said.iter().any(|t| t.contains("1 layout(s) beyond the 200 a project holds removed while checking the project")),
+            "{said:?}"
+        );
+        // A map import takes the layers' diagrams, so says what reading them changed.
+        let mut damaged_map: serde_json::Value = serde_json::from_str(&map).unwrap();
+        let layer = damaged_map["layers"].as_array_mut().unwrap().iter_mut().find(|l| l["id"] == json!(id)).unwrap();
+        let cats = layer["diagram"]["categories"].as_array_mut().unwrap();
+        let mut blank = cats[0].clone();
+        blank["field"] = json!(" ");
+        cats.push(blank);
+        let mut imported = Session::new(Project::default());
+        imported.run("map.import", &json!({"text": damaged_map.to_string()})).unwrap();
+        let said: Vec<&str> = imported.notices.iter().map(|n| n.text.as_str()).collect();
+        assert_eq!(said.iter().filter(|t| t.contains("1 diagram category(ies) with a blank field name")).count(), 1, "{said:?}");
+        // The cap the reader keeps is the one commands keep: no 201st layout to lose.
+        assert!(full.run("layout.new", &json!({})).is_err());
+        assert!(full.run("layout.duplicate", &json!({"layout": 0})).is_err());
+        let mark = full.notices.len();
+        assert!(full.run("layout.import", &json!({"text": v["layouts"][0].to_string()})).is_err());
+        assert!(full.notices[mark..].iter().all(|n| !n.text.contains("while importing the layout file")), "refused, so nothing repaired");
+        assert_eq!(full.project.layouts.len(), 200);
+        // A layer file added says what reading its diagram changed, and a clean one nothing.
+        let layer_text = serde_json::to_string(s.map().layer(id).unwrap()).unwrap();
+        let mut added = Session::new(Project::default());
+        crate::cmd::layer::add_layer_text(&mut added, &layer_text).unwrap();
+        assert!(added.notices.iter().all(|n| !n.text.contains("diagram")));
+        let mut damaged_layer: serde_json::Value = serde_json::from_str(&layer_text).unwrap();
+        let cats = damaged_layer["diagram"]["categories"].as_array_mut().unwrap();
+        let mut blank = cats[0].clone();
+        blank["field"] = json!(" ");
+        cats.push(blank);
+        crate::cmd::layer::add_layer_text(&mut added, &damaged_layer.to_string()).unwrap();
+        assert_eq!(added.notices.iter().filter(|n| n.text.contains("1 diagram category(ies) with a blank field name")).count(), 1);
+        let kept: Vec<Vec<&str>> = added
+            .map()
+            .layers
+            .iter()
+            .filter_map(|l| l.diagram.as_ref())
+            .map(|d| d.categories.iter().map(|c| c.field.as_str()).collect())
+            .collect();
+        assert_eq!(kept, [["pop_male", "pop_female"], ["pop_male", "pop_female"]], "the blank category goes, the rest stay");
+        // A layout file imported says what it repaired, and a clean one nothing.
+        let layout = v["layouts"][0].to_string();
+        let mut imports = Session::new(Project::default());
+        imports.run("layout.import", &json!({"text": serde_json::to_string(&quiet.project.layouts[0]).unwrap()})).unwrap();
+        assert!(imports.notices.iter().all(|n| !n.text.contains("layout")));
+        imports.run("layout.import", &json!({"text": layout})).unwrap();
+        assert_eq!(
+            imports
+                .notices
+                .iter()
+                .filter(|n| n.text.contains("1 layout element(s)") && n.text.contains("while importing the layout file"))
+                .count(),
+            1
+        );
+        // Importing its styles takes no diagrams or layouts, so says nothing of them.
+        let mut styled = Session::new(Project::default());
+        let mark = styled.notices.len();
+        styled.run("style.import", &json!({"text": v.to_string()})).unwrap();
+        assert!(styled.notices[mark..].iter().all(|n| !n.text.contains("diagram") && !n.text.contains("layout")));
     }
 }

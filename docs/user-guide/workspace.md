@@ -11,6 +11,20 @@ streamed layers reopen their sources, and file-backed rasters reopen their files
 sources accessible when moving a project. See [Project items](data.md#project-items) for
 templates, packages and files for individual items.
 
+A project file holds the features of every layer loaded whole (GeoJSON, KML/KMZ, GPX, and
+Shapefiles of up to 100,000 features), so a project of many such layers grows large. How large a
+project can be saved and opened follows the computer's memory: on the desktop, as much as a
+quarter of it holds open (about 800 MiB of project for every 16 GB), from 512 MiB up to 4 GiB; in
+the web app and a 32-bit build, 512 MiB. Save refuses a project past it, rather than writing one that can't be opened
+again, and Open refuses a larger file, saying its size, the limit, and how much memory a computer
+needs to open it. A project saved on a
+computer with more memory may need one like it to open. A project package (`.rgispkg`) holds
+at most 1 GiB once unzipped (256 MiB in the web app), its project and its files together, as zip
+archives do here; the package file itself is smaller. `gp.env` reports the limit as
+`projectBytes`. A GeoPackage, FlatGeobuf, GeoParquet or Shapefile of more than 100,000 features
+(or any, added with `"stream": true`) is read in place and stays out of the project file; a
+smaller one is loaded whole.
+
 **Open** also accepts a project package (`.rgispkg`), as do drag-and-drop and the desktop
 command line. A package opens as a new, unsaved project; Save writes a plain `.rgis` file.
 Opening or creating a project clears undo history; saving does not.
@@ -32,9 +46,19 @@ The browser app doesn't ask yet; it warns before you leave a page with unsaved c
 default), RustGIS keeps your changes as a [recovery copy](#autosave-and-recovery) and offers them
 back the next time it starts; with autosave off, they are lost, so save before you quit.
 
-Saved layer addresses omit passwords, access keys, tokens and signatures. The open session
-keeps them, but after restarting RustGIS a protected source may need you to sign in to its
-connection again or add it again with credentials.
+Saving removes recognized credentials from supported layer and video addresses and from
+recognized task, model, notebook and history parameters. Notices count detected removals and
+content that could not be checked. Unrecognized credentials can remain in addresses without a
+notice. Diagnostic logging uses a broader sensitive-name list: a parameter named `auth` or
+`jwt` may be hidden in a diagnostic message while remaining in a saved address. Inspect
+shared addresses when a service uses names outside the recognized saved-credential rules.
+The open session keeps its credentials, but a saved workflow or protected source may
+need them again when reopened. User notes, feature data and opaque content are preserved.
+Review addresses and preserved content before sharing a file; see
+[Sharing projects and generated items](https://github.com/opengeos/RustGIS/blob/main/SECURITY.md#sharing-projects-and-generated-items)
+for the supported scope.
+A cloud-optimised GeoTIFF's look in its address (`#bands=…`, `#range=…`, `#dequantize=aef`, a data
+cube's fixed range too) is saved; any other `#` part isn't.
 
 ### Autosave and recovery
 
@@ -42,7 +66,7 @@ The desktop app keeps a recovery copy of unsaved work. While the project has cha
 saved, it writes a copy every few minutes (5 by default), and only when something changed since
 the last one. Choose how often, or turn it off, in **Settings › Autosave**
 (`ui.autosave={"minutes": 10}`; `0` is off). The copy is written in the background, so a large
-project doesn't hold up the app. It leaves out layer passwords, keys and tokens, as a saved project
+project doesn't hold up the app. It removes recognized layer credentials, as a saved project
 does. It is kept in the `recovery` folder of the app's
 [data folder](../installation.md#settings-data-and-cache-folders), not beside your project.
 Saving, opening or starting another project, and choosing **Don't Save** when you quit remove it.
@@ -75,17 +99,26 @@ The browser app doesn't autosave yet; it warns before you leave a page with unsa
 
 RustGIS keeps a **log** of the commands run in the session: what was done, when, with what, and
 whether it worked. It is an audit trail of the session, for reviewing work or recalling what was
-run; it runs nothing again (History's Copy as code and recorded tasks do that). Every
+run; it runs nothing again by itself, but an entry can be copied back as a Script pane line. Every
 front end goes into it alike: the app, scripts, the AI Assistant, the command line, Python and MCP.
 
 In the app, the **History** pane has two views: **Tool runs**, the tools run on the project (saved
 with it, and each can run again), and **Session log**, which shows the log newest first: each
-command with whether it worked, when it started (UTC), how long it took, its error and its
-parameters (on one line; all of them on hover, and a right-click copies them). It lists the newest
-200 that match and says how many there are; type part of a command's id (`layer.`, `export`) to
-filter, or tick **Failed only**. **Save Log As…** writes the whole log as CSV or JSON Lines, as
-the name's extension says (CSV without one; in the browser it is downloaded as CSV, and the
-download isn't itself an entry in the log, as a saved file is). **Clear Log** empties it and
+command with whether it worked, when it started (UTC) and in which project, how long it took, its
+error and its parameters (on one line; all of them on hover). It lists the newest 200 that match
+and says how many there are; type part of a command's id (`layer.`, `export`) to filter, press
+**This project** to list only the commands run in the project open now (two projects of the same
+name are told apart), or tick **Failed only**.
+
+A right-click on an entry offers **Copy Parameters** and **Copy Command**, the entry as a line for
+the Script pane (`layer.buffer {"distance":10}`; undo and redo as themselves). A script run offers
+**Copy Script** and **Open in Script Pane** instead, which puts the script in the Script pane in
+place of its own (Ctrl+Z, ⌘+Z on a Mac, brings that back; not while the pane runs one). Where the
+log cut an entry's parameters short or took secrets out of them, copying its command or its
+parameters says so, as it may not run as it ran, and its script can be neither copied nor opened:
+it would run only in part. **Save Log As…** writes the whole log as CSV or JSON Lines, as the
+name's extension says (CSV without one; in the browser it is downloaded as CSV, and the download
+isn't itself an entry in the log, as a saved file is). **Clear Log** empties it and
 **Log Commands** turns it off or on.
 
 - **What goes in:** each command that changes the project, and each that names a file, folder,
@@ -97,7 +130,11 @@ download isn't itself an entry in the log, as a saved file is). **Clear Log** em
   file permission, since it names the files and addresses the user's commands used.
 - **Each entry:** `at` (when it started, in milliseconds since 1970, UTC; for a plugin's command
   that waited for its downloads, when its last run started), `command`, `params`, `ok`, `error`
-  when it failed, and `millis`, how long it took.
+  when it failed, `millis`, how long it took, `project`, the name of the project open when it ran
+  (the one it opened, for a command that opens one), and `partial`, true when its parameters were
+  cut short or had secrets taken out, and, for what a session plugin's program asked
+  for between the plugin's commands, `plugin`, that plugin's id (left out of `project.log` and
+  JSON Lines for other entries; an empty cell in CSV).
 - **For the session only:** the log is kept in memory, across the projects opened or made in the
   session, until RustGIS closes or the log is cleared. A saved project, its recovery copy, a
   package or a template carries none of it, so sharing a project shares no log. Reading, writing
@@ -122,9 +159,10 @@ From scripts: `project.log {"since"?, "until"?, "command"?, "failed"?, "limit"?}
 newest last (`command` is an id, or the start of one ending in a dot, `layer.`; `limit` is a whole
 number, 100 by default and at most 1,000, with `count` saying how many match), and
 `project.exportLog {"path": "log.csv"}` writes it out as CSV (one row an entry, the parameters as a
-JSON column) or JSON Lines (`.jsonl` or `.ndjson`), as the path's extension says; any other
-extension (a `.json`, a project) is refused, whatever `format` is given. `project.clearLog` empties
-it (leaving its own entry) and `project.logCommands {"on": false}` stops it (what is there stays).
+JSON column, the project last) or JSON Lines (`.jsonl` or `.ndjson`), as the path's extension says;
+any other extension (a `.json`, a project) is refused, whatever `format` is given.
+`project.clearLog` empties it (leaving its own entry) and `project.logCommands {"on": false}` stops
+it (what is there stays).
 
 ### GeoLibre projects
 
@@ -399,8 +437,8 @@ duplication and nudging have their own [layout shortcuts](layouts.md#layouts).
       **Delete**. A recorded tool's step is named after the tool.
     - In the Browser pane, a click on a task opens its steps; **Run All Steps** is in its context
       menu.
-    - A task from a file (`.rgistask`, or inside a project or a package) can't read or write files
-      or run scripts. Its built-in analysis tools may still name their output layers with a plain
+    - A task from a file (`.rgistask`, or inside a project or a package) can't read or write files,
+      use the network, run other software or perform actions reserved to the user. Its built-in analysis tools may still name their output layers with a plain
       name: one with `/`, `\`, `.` or `:` (a folder, an extension or a drive) makes the task count
       as writing files, so write `Buffer 1500 m` rather than `Buffer 1.5 km`. GeoLibre and plugin
       tools' outputs are refused.
@@ -460,7 +498,7 @@ duplication and nudging have their own [layout shortcuts](layouts.md#layouts).
 - **Plugins**: **Plugins › Plugin Manager** installs, updates and removes [plugins](../plugins.md)
   from the registry at [plugins.rustgis.app](https://plugins.rustgis.app) or from a file.
 - **Language**: **Settings › Language** switches the interface among
-  [20 languages](../i18n.md) and chooses the [worldview](maps.md#worldview) of the built-in
+  [21 languages](../i18n.md) and chooses the [worldview](maps.md#worldview) of the built-in
   borders.
 - **Theme**: **Settings › Theme** picks the interface colours, spacing and text sizes, from the
   built-in Light and Dark themes, a theme [file](../themes.md) in the desktop app’s themes folder, or

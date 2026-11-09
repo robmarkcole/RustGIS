@@ -18,6 +18,7 @@ pub mod gdal;
 pub mod geotiff;
 mod lzw;
 pub mod pam;
+pub mod planetary;
 pub mod wkt;
 pub mod zarr;
 
@@ -576,9 +577,21 @@ pub struct Raster {
     /// left out.
     pub lost: Vec<String>,
     /// How many values of each band changed when read as `f32` (Int32 IDs past 16,777,216, Float64
-    /// values with more digits than `f32` holds), by band; empty when none did. NaN and no-data
-    /// values aren't counted.
+    /// values with more digits than `f32` holds), by band; empty when none did. NaN values and
+    /// samples that are the no-data value aren't counted (one that rounds onto it is). The two are
+    /// compared once read as `f32`: a long decimal whose `f32` reading differs from the no-data
+    /// value's (rounded through `f64`) is counted, as it isn't masked as no-data either.
     pub rounded: Vec<u64>,
+    /// By band, whether the band holds some values rounded when its source was read, how many
+    /// not known: a raster made from part of one with `rounded` values (a clip, a pixel edit)
+    /// keeps an unknown share of them, so it carries this mark instead of a count. Empty when
+    /// none does.
+    pub rounded_some: Vec<bool>,
+    /// Who holds the rights to the picture (the TIFF Copyright tag): the credits a map's tile
+    /// layers ask for, on a GeoTIFF of the view. Read from a GeoTIFF that has it, and written
+    /// when this raster is exported; a raster made from it (clipped, reprojected) starts
+    /// without.
+    pub copyright: Option<String>,
     transformer: Transformer,
     extent: Extent,
 }
@@ -605,6 +618,54 @@ pub(crate) fn gdal_metadata_of(r: &Raster, bands: &[usize]) -> Option<String> {
     let names: Vec<Option<&str>> = bands.iter().map(|b| band_name_of(r, *b)).collect();
     let first = bands.first().and_then(|b| r.bands.get(*b)).map_or(&[][..], |b| &b.classes[..]);
     pam::gdal_metadata(&names, first)
+}
+
+/// Text for a TIFF ASCII tag, which holds 7-bit ASCII only: control characters (a NUL would end
+/// it early) as spaces, `©` and `®` as `(c)` and `(R)`, any other character outside ASCII as `?`
+/// ([`tag_text_changes`] counts them), trimmed.
+pub fn tag_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '©' => out.push_str("(c)"),
+            '®' => out.push_str("(R)"),
+            c if c.is_control() => out.push(' '),
+            c if c.is_ascii() => out.push(c),
+            _ => out.push('?'),
+        }
+    }
+    out.trim().to_string()
+}
+
+/// What [`tag_text`] changes in `s` (the trimmed ends not counted): how many `©` and `®` it
+/// writes as `(c)` and `(R)`, how many characters as `?`, and how many control characters as
+/// spaces, line breaks and tabs among them.
+pub fn tag_text_changes(s: &str) -> (usize, usize, usize) {
+    let inner = s.trim_matches(|c: char| c.is_control() || c.is_ascii_whitespace());
+    let symbols = inner.chars().filter(|c| matches!(c, '©' | '®')).count();
+    let questioned = inner.chars().filter(|c| !c.is_ascii() && !c.is_control() && !matches!(c, '©' | '®')).count();
+    (symbols, questioned, inner.chars().filter(|c| c.is_control()).count())
+}
+
+/// What writing `s` to a TIFF ASCII tag ([`tag_text`]) changes, for an export to say: `None`
+/// when it is written as it is (or is empty); that no tag is written when nothing of it is left.
+pub fn tag_text_note(s: &str) -> Option<String> {
+    // Nothing a tag can hold (control characters only): the writers write no tag.
+    if tag_text(s).is_empty() {
+        return (!s.is_empty()).then(|| "the credits hold nothing a Copyright tag can, so the file has none".to_string());
+    }
+    let (symbols, questioned, spaced) = tag_text_changes(s);
+    let count = |n: usize, one: &str, many: &str| if n == 1 { format!("1 {one}") } else { format!("{n} {many}") };
+    let parts: Vec<String> = [
+        (symbols, count(symbols, "© or ® as (c) or (R)", "©s or ®s as (c) or (R)")),
+        (questioned, count(questioned, "character as ?", "characters as ?")),
+        (spaced, count(spaced, "control character as a space", "control characters as spaces")),
+    ]
+    .into_iter()
+    .filter(|(n, _)| *n > 0)
+    .map(|(_, part)| part)
+    .collect();
+    (!parts.is_empty()).then(|| format!("the Copyright tag holds ASCII only, so it is written with {}", parts.join(", ")))
 }
 
 /// How many of the names [`gdal_metadata_of`] writes for `bands` hold a character XML can't (a
@@ -700,6 +761,8 @@ impl Raster {
             georeferenced: true,
             lost: Vec::new(),
             rounded: Vec::new(),
+            rounded_some: Vec::new(),
+            copyright: None,
             transformer,
             extent: Extent::EMPTY,
         };
@@ -885,6 +948,30 @@ impl Raster {
         self.bands.len()
     }
 
+    /// Whether band `b` holds values rounded when its source was read: counted in `rounded`, or
+    /// marked in `rounded_some` with no count.
+    pub fn band_rounded(&self, b: usize) -> bool {
+        self.rounded.get(b).is_some_and(|n| *n > 0) || self.rounded_some.get(b).copied().unwrap_or(false)
+    }
+
+    /// Marks this raster, made from part of `src` band for band (a clip, a pixel edit, a
+    /// resample), as holding some of `src`'s rounded values, how many unknown: the bands of `src`
+    /// that held any are marked, and the count, which was `src`'s whole, isn't kept.
+    pub fn keep_rounded_mark(&mut self, src: &Raster) {
+        self.keep_rounded_marks(std::iter::once(src));
+    }
+
+    /// As [`Raster::keep_rounded_mark`], for a raster made from parts of several (a mosaic): a
+    /// band is marked when any source's band of that number held rounded values.
+    pub fn keep_rounded_marks<'a>(&mut self, srcs: impl IntoIterator<Item = &'a Raster>) {
+        let mut marks = vec![false; self.band_count()];
+        for src in srcs {
+            marks.iter_mut().enumerate().for_each(|(b, m)| *m |= src.band_rounded(b));
+        }
+        self.rounded = Vec::new();
+        self.rounded_some = if marks.contains(&true) { marks } else { Vec::new() };
+    }
+
     /// Whether a value is a real measurement (not no-data or NaN).
     pub fn is_valid(&self, v: f32) -> bool {
         // Compared in f32, as the pixels (and the statistics) are: a no-data value such as
@@ -971,7 +1058,7 @@ pub fn read_path(path: &Path) -> Result<Raster> {
                 return Err(DataError::Format("the ASCII grid is too large to open".into()));
             }
             let text = std::fs::read_to_string(path)?;
-            ascii::read_with_nodata(&text, &name, sidecar_crs(path), sidecar_nodata)?
+            read_ascii(path, &text, &name, sidecar_nodata)?
         }
         #[cfg(not(target_arch = "wasm32"))]
         _ if gdal::is_gdal_raster_name(&path.to_string_lossy()) => {
@@ -996,7 +1083,7 @@ pub fn read_path(path: &Path) -> Result<Raster> {
         // The second read gives all the first did: the first goes before it, so two aren't held.
         drop(r);
         r = if ext == "asc" {
-            ascii::read_with_nodata(&std::fs::read_to_string(path)?, &name, sidecar_crs(path), nd)?
+            read_ascii(path, &std::fs::read_to_string(path)?, &name, nd)?
         } else {
             #[cfg(not(target_arch = "wasm32"))]
             let again = geotiff::read_file_with_nodata(path, &name, nd)?;
@@ -1303,9 +1390,32 @@ pub fn read_bytes(file_name: &str, bytes: &[u8]) -> Result<Raster> {
     }
 }
 
-/// The coordinate system in a `.prj` next to an ASCII grid, when it's one RustGIS understands.
-fn sidecar_crs(path: &Path) -> Option<Crs> {
-    wkt::crs_from_wkt(&read_prj(path)?).ok()
+/// An ASCII grid at `path` (its `text`), in the coordinate system of the `.prj` next to it.
+fn read_ascii(path: &Path, text: &str, name: &str, nodata: Option<f64>) -> Result<Raster> {
+    let (crs, unread) = sidecar_crs(path)?;
+    let mut r = ascii::read_with_nodata(text, name, crs, nodata)?;
+    // A .prj that couldn't be read leaves the grid in longitude/latitude, as a Shapefile's does.
+    r.lost.extend(unread.map(|e| format!("the .prj file: {e}; coordinates are read as longitude/latitude")));
+    Ok(r)
+}
+
+/// The coordinate system in the `.prj` next to an ASCII grid, when RustGIS understands it. Else
+/// why it doesn't, so the grid is read without it and says so. Another body's system RustGIS
+/// doesn't understand is an error instead, because the grid would land in the wrong place as
+/// longitude/latitude.
+fn sidecar_crs(path: &Path) -> Result<(Option<Crs>, Option<String>)> {
+    let Some(prj) = read_prj(path) else {
+        // One that is there but can't be read as text (not UTF-8, too large to be one) is said too.
+        let there = std::fs::metadata(path.with_extension("prj")).is_ok_and(|m| m.is_file());
+        return Ok((None, there.then(|| "it can't be read as text".to_string())));
+    };
+    match wkt::crs_from_wkt(&prj) {
+        Ok(crs) => Ok((Some(crs), None)),
+        Err(e) => match planetary::refused_wkt(&prj, &e) {
+            Some(refused) => Err(DataError::Format(format!("the .prj file: {refused}"))),
+            None => Ok((None, Some(e))),
+        },
+    }
 }
 
 /// The text of the `.prj` next to a file (`None` when there's none, or it's too large to be one).

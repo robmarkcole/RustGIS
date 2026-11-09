@@ -43,6 +43,9 @@ pub struct Recovery {
     /// Copies written before it was known read as `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub quit: bool,
+    /// Counted output notices shown when this copy is recovered.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<String>,
 }
 
 /// Where a shell keeps the recovery copy. Writing and clearing may happen in the background, but
@@ -131,7 +134,7 @@ fn now_secs() -> u64 {
 /// a lossy spelling of the name.
 fn about(app: &RustGisApp) -> Recovery {
     let path = app.session.path.as_ref().and_then(|p| std::path::absolute(p).unwrap_or_else(|_| p.clone()).to_str().map(str::to_string));
-    Recovery { name: app.session.project.name.clone(), path, time: now_secs(), quit: false }
+    Recovery { name: app.session.project.name.clone(), path, time: now_secs(), quit: false, notices: Vec::new() }
 }
 
 /// Reads the interval preference and the copy an earlier run left (from [`RustGisApp::with_services`]).
@@ -290,6 +293,9 @@ pub(crate) fn recover(app: &mut RustGisApp, p: &Value) -> Result<Value, String> 
     next_offer(app);
     let text = crate::i18n::fmt("Recovered unsaved work in {name}. Save to keep it.", &[("name", &app.session.project.name)]);
     app.session.notify(text, false);
+    for notice in offered.notices {
+        app.session.notify(notice, false);
+    }
     // Other copies wait for the next start: recovering one now would replace this work.
     let waiting = waiting(app);
     if waiting > 0 {
@@ -667,8 +673,9 @@ mod folder {
     /// Writes this run's copy: the description line, then the project's text, in one atomic
     /// write, so a stop part way leaves the previous copy whole.
     fn write(dir: &Path, project: Project, about: &Recovery) -> Result<(), String> {
-        let text = project.recovery_text()?;
-        let header = serde_json::to_string(about).map_err(|e| e.to_string())?;
+        let (text, report) = project.recovery_text_with_report()?;
+        let about = Recovery { notices: report.notices(), ..about.clone() };
+        let header = serde_json::to_string(&about).map_err(|e| e.to_string())?;
         let mut bytes = Vec::with_capacity(header.len() + 1 + text.len());
         bytes.extend_from_slice(header.as_bytes());
         bytes.push(b'\n');
@@ -721,11 +728,13 @@ mod folder {
         fn read_pending(&self) -> Result<String, String> {
             let path = self.list().first().map(|(p, _)| p.clone()).ok_or("there is no unsaved work to recover")?;
             let mut bytes = Vec::new();
+            let max = rustgis_engine::project::max_bytes() + MAX_HEADER;
             std::fs::File::open(&path)
-                .and_then(|f| f.take(rustgis_engine::project::MAX_BYTES + MAX_HEADER + 1).read_to_end(&mut bytes))
+                .and_then(|f| f.take(max + 1).read_to_end(&mut bytes))
                 .map_err(|e| format!("{}: {e}", path.display()))?;
-            if bytes.len() as u64 > rustgis_engine::project::MAX_BYTES + MAX_HEADER {
-                return Err("the recovery copy is too large".into());
+            if bytes.len() as u64 > max {
+                let mib = ((max - MAX_HEADER) >> 20).to_string();
+                return Err(crate::i18n::fmt("the recovery copy is too large (maximum {mib} MiB on this computer)", &[("mib", &mib)]));
             }
             // The description line goes in place: a copy near the size limit isn't held twice.
             let mut text = String::from_utf8(bytes).map_err(|_| "the recovery copy isn't text".to_string())?;

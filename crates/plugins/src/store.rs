@@ -75,8 +75,23 @@ fn write_state(st: &State) -> Result<(), String> {
 pub fn load_installed() -> Vec<String> {
     let mut errors = Vec::new();
     let Some(dir) = dir() else { return errors };
-    if let Some(list) = std::fs::read_to_string(dir.join("blocklist.json")).ok().and_then(|t| registry::parse_blocklist(&t).ok()) {
-        crate::set_blocklist(list);
+    // A cache that can't be read (or one an older version saved that this one refuses) is
+    // reported, not trusted; there being none is fine.
+    let cached = dir.join("blocklist.json");
+    let list = match std::fs::read_to_string(&cached) {
+        Ok(text) => registry::parse_blocklist(&text).map(Some),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.to_string()),
+    };
+    match list {
+        Ok(Some(list)) => {
+            crate::set_blocklist(list);
+        }
+        Ok(None) => {}
+        Err(e) => errors.push(format!(
+            "{}: {e}; it was ignored, so withdrawn plugins may not be blocked until the blocklist is fetched again",
+            cached.display()
+        )),
     }
     let st = read_state();
     let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
@@ -125,16 +140,22 @@ pub fn unpack(bytes: &[u8], pkg: &mut Package) -> Result<(), String> {
         return Ok(());
     }
     let target = unpacked_dir(&pkg.manifest.id).ok_or("there is no folder for plugins")?;
-    unpack_to(bytes, &pkg.sha256, &target)?;
+    unpack_to(bytes, &pkg.sha256, &target, &pkg.manifest.id)?;
     pkg.dir = Some(target);
     Ok(())
 }
 
 /// Unpacks a package to `target`, the folder a process plugin runs from, unless that copy is
 /// already there.
-fn unpack_to(bytes: &[u8], sha256: &str, target: &Path) -> Result<(), String> {
+fn unpack_to(bytes: &[u8], sha256: &str, target: &Path, id: &str) -> Result<(), String> {
     match stage(bytes, sha256, target)? {
-        Some(staged) => swap_in(&staged, target),
+        Some(staged) => {
+            // A session plugin's program runs from these files (on Windows they can't be
+            // replaced while it does): it stops first.
+            let was_running = crate::session::is_running(id);
+            crate::session::stop(id);
+            swap_in(&staged, target).map_err(|e| if was_running { format!("{e} (its running program was stopped first)") } else { e })
+        }
         None => Ok(()),
     }
 }
@@ -255,7 +276,11 @@ pub fn install_bytes(bytes: &[u8]) -> Result<Arc<Plugin>, String> {
         return Err(format!("{}: {e}", path.display()));
     }
     if let Some((s, target)) = &staged {
-        swap_in(s, target)?;
+        // A session plugin's program runs from these files (on Windows they can't be replaced
+        // while it does): it stops first.
+        let was_running = crate::session::is_running(&plugin.manifest.id);
+        crate::session::stop(&plugin.manifest.id);
+        swap_in(s, target).map_err(|e| if was_running { format!("{e} (its running program was stopped first)") } else { e })?;
     }
     Ok(crate::register(plugin))
 }
