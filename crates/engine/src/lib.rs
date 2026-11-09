@@ -382,6 +382,9 @@ pub enum Tool {
     CreatePolygon,
     /// Creates and adjusts constrained rectangle annotations.
     RotatedBox,
+    AnnotationCircle,
+    AnnotationPolygon,
+    AnnotationPoint,
     /// Moves, inserts and deletes the vertices of the selected features.
     EditVertices,
     /// Drags a layer's label to where it should be (`labels.move`), as QGIS's Move Label tool;
@@ -411,6 +414,9 @@ pub const GRAPHIC_TOOLS: &[(&str, &str, &str)] = &[
 ];
 
 impl Tool {
+    pub fn is_annotation(self) -> bool {
+        matches!(self, Self::RotatedBox | Self::AnnotationCircle | Self::AnnotationPolygon | Self::AnnotationPoint)
+    }
     pub fn code(self) -> &'static str {
         match self {
             Tool::Explore => "explore",
@@ -425,6 +431,9 @@ impl Tool {
             Tool::CreateLine => "createLine",
             Tool::CreatePolygon => "createPolygon",
             Tool::RotatedBox => "rotatedBox",
+            Tool::AnnotationCircle => "annotationCircle",
+            Tool::AnnotationPolygon => "annotationPolygon",
+            Tool::AnnotationPoint => "annotationPoint",
             Tool::EditVertices => "editVertices",
             Tool::MoveLabel => "moveLabel",
             Tool::CutPolygon => "cutPolygon",
@@ -449,6 +458,9 @@ impl Tool {
             Tool::CreateLine,
             Tool::CreatePolygon,
             Tool::RotatedBox,
+            Tool::AnnotationCircle,
+            Tool::AnnotationPolygon,
+            Tool::AnnotationPoint,
             Tool::EditVertices,
             Tool::MoveLabel,
             Tool::CutPolygon,
@@ -471,6 +483,9 @@ impl Tool {
             Tool::CreateLine => "Create Line",
             Tool::CreatePolygon => "Create Polygon",
             Tool::RotatedBox => "Rotated Box",
+            Tool::AnnotationCircle => "Annotation Circle",
+            Tool::AnnotationPolygon => "Annotation Polygon",
+            Tool::AnnotationPoint => "Annotation Point",
             Tool::EditVertices => "Edit Vertices",
             Tool::MoveLabel => "Move Label",
             Tool::CutPolygon => "Cut Polygon",

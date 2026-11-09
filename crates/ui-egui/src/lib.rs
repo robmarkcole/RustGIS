@@ -90,6 +90,7 @@ mod scriptcomplete;
 mod searchbox;
 mod serviceui;
 mod sessionlog;
+mod shapeedit;
 mod shortcutfile;
 mod shortcutui;
 mod showme;
@@ -2296,7 +2297,7 @@ impl RustGisApp {
             AppDispatch::Direct => self.session.run(id, &params),
         };
         r = self.deliver_gp_files(r);
-        if r.is_ok() && matches!(id, "annotation.newLayer" | "annotation.resume") {
+        if r.is_ok() && matches!(id, "annotation.newLayer" | "annotation.resume" | "annotation.tool") {
             self.ui.tab = "Annotate".into();
         }
         if r.is_ok() && (id == "tool.set" || self.session.tool != tool_before) {
@@ -5627,6 +5628,9 @@ const MAX_STEP_BYTES: usize = 4 << 20;
 /// an optional `layer` that defaults to the active layer goes here, so a recorded step names it;
 /// `record_tests::every_optional_layer_is_classified` fails until it is placed here or there.
 const DEFAULTS_TO_ACTIVE_LAYER: &[&str] = &[
+    "annotation.tool",
+    "annotation.addShape",
+    "annotation.updateShape",
     "annotation.resume",
     "annotation.setClass",
     "select.byAttributes",

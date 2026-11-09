@@ -2438,7 +2438,7 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
     let pending_pick = app.ui.nav.picking.is_some()
         || crate::nldiui::wants_click(app)
         || app.workflow.pick.as_ref().is_some_and(|pick| pick.points.len() < pick.needed);
-    if tool == Tool::RotatedBox && pending_pick {
+    if tool.is_annotation() && pending_pick {
         crate::boxedit::cancel(&mut app.boxes);
         if resp.clicked()
             && let Some(p) = resp.interact_pointer_pos()
@@ -2448,13 +2448,15 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
         }
         return;
     }
-    if tool == Tool::RotatedBox {
+    if tool.is_annotation() {
         let space_pan = crate::boxedit::pan_gesture(app, ui, resp);
         if resp.dragged_by(egui::PointerButton::Middle) || space_pan {
             let d = resp.drag_delta();
-            pan(app, f64::from(d.x), f64::from(d.y), w, h);
-            app.map.last_interaction = time;
-            app.map.camera_moved = true;
+            if d != egui::Vec2::ZERO {
+                pan(app, f64::from(d.x), f64::from(d.y), w, h);
+                app.map.last_interaction = time;
+                app.map.camera_moved = true;
+            }
             return;
         }
         crate::boxedit::interact(app, ui, resp, rect);
@@ -2818,7 +2820,7 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
                 app.map.camera_moved = true;
             }
             Tool::EditVertices => crate::vertexedit::click(app, rect, p, c, shift),
-            Tool::RotatedBox => {}
+            Tool::RotatedBox | Tool::AnnotationCircle | Tool::AnnotationPolygon | Tool::AnnotationPoint => {}
             Tool::CreatePoint => {
                 let _ = app.run("edit.addFeature", with_template(app, json!({"geometry": {"type": "Point", "coordinates": [c.x, c.y]}})));
             }
@@ -3249,6 +3251,9 @@ fn overlays(app: &mut RustGisApp, ui: &mut Ui, p: &egui::Painter, rect: Rect, t:
         Tool::CreatePoint => Some("Click the map to add a point"),
         Tool::CreateLine => Some("Click to add vertices · double-click to finish the line"),
         Tool::CreatePolygon => Some("Click to add vertices · double-click to close the polygon"),
+        Tool::AnnotationCircle => Some("Drag from centre to rim · Space + drag pans · Esc cancels"),
+        Tool::AnnotationPolygon => Some("Click vertices · Enter or double-click finishes · Backspace removes a vertex · Space + drag pans"),
+        Tool::AnnotationPoint => Some("Click to place points · Drag a selected point to move · Space + drag pans"),
         Tool::RotatedBox => Some("Draw a box · drag its paddle to rotate · Shift snaps angles · Esc cancels"),
         Tool::CutPolygon => Some("Draw a line across the selected polygons · double-click to cut them"),
         Tool::Reshape => Some("Draw a line across the selected feature's edge · double-click to reshape it"),

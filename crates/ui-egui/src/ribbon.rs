@@ -2398,7 +2398,7 @@ fn annotate_tab(app: &mut RustGisApp, ui: &mut Ui) {
             ui,
             app,
             "new",
-            "New Box\nAnnotation Layer",
+            "New\nAnnotation Layer",
             "Create one layer containing multiple annotation classes.",
             "annotation.newLayer",
             Value::Null,
@@ -2434,14 +2434,32 @@ fn annotate_tab(app: &mut RustGisApp, ui: &mut Ui) {
         });
     });
     group(ui, "Shapes", |ui| {
+        col(ui, |ui| {
+            for (label, icon, shape, tool) in [
+                ("Circle", "g_circle", "circle", Tool::AnnotationCircle),
+                ("Polygon", "g_polygon", "polygon", Tool::AnnotationPolygon),
+                ("Point", "g_point", "point", Tool::AnnotationPoint),
+            ] {
+                small(
+                    ui,
+                    app,
+                    icon,
+                    label,
+                    "Add and edit this annotation shape in the current layer.",
+                    "annotation.tool",
+                    json!({"shape":shape}),
+                    app.session.tool == tool,
+                );
+            }
+        });
         big(
             ui,
             app,
             "g_rect",
             "Add or Edit\nBoxes",
             "Drag to add more boxes to the current annotation layer; use the paddle to rotate.",
-            "annotation.resume",
-            Value::Null,
+            "annotation.tool",
+            json!({"shape":"box"}),
             app.session.tool == Tool::RotatedBox,
             false,
         );

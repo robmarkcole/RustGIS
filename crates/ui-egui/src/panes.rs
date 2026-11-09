@@ -2236,7 +2236,7 @@ fn layer_menu(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, reorder: bool) {
         ui.close();
     }
     if rustgis_engine::cmd::annotation::check_layer(&app.session, l.id).is_ok()
-        && ui.button(tl!("Add or Edit Boxes")).on_hover_text(tl!("Continue adding annotations to this layer, or edit its boxes.")).clicked()
+        && ui.button(tl!("Annotate Features")).on_hover_text(tl!("Continue adding or editing annotation shapes in this layer.")).clicked()
     {
         let _ = app.run("annotation.resume", json!({"layer":l.id}));
         ui.close();
@@ -8234,7 +8234,7 @@ mod tests {
         app.session.map_mut().editing.settings.enabled = false;
         let mut h = egui_kittest::Harness::builder().build_ui_state(|ui, app: &mut RustGisApp| layer_menu(app, ui, &layer, true), app);
         h.step();
-        h.get_by_label("Add or Edit Boxes").click();
+        h.get_by_label("Annotate Features").click();
         h.step();
         assert_eq!(h.state().session.tool, rustgis_engine::Tool::RotatedBox);
         assert_eq!(h.state().session.active_layer, Some(layer.id));

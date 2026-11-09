@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{cell::RefCell, rc::Rc};
 
+mod shapes;
+pub use shapes::{CIRCLE_SEGMENTS, MAX_VERTICES, SHAPE_RECORD, Shape, ShapeSpec};
+
 pub const RECORD: &str = "_rustgis_box";
 
 /// Frozen annotation coordinates: x right, y down. An image uses its full-resolution grid;
@@ -106,6 +109,7 @@ impl BoxSpec {
             return Err("unsupported rotated-box metadata version".into());
         }
         if !self.frame.transform.is_valid()
+            || self.frame.transformer().is_none()
             || self.frame.crs.lacks_datum_shift()
             || !self.center.iter().chain([&self.width, &self.height, &self.angle]).all(|v| v.is_finite() && v.abs() <= 1e10)
             || self.width < 1e-6
@@ -191,13 +195,22 @@ impl BoxSpec {
 
 // Construction records and class names are user data, including image names that resemble
 // addresses. These commands only edit loaded features; new rows can sample elevation below.
-const DATA_ROLES: &[crate::ParamRole] =
-    &[crate::ParamRole { key: "box", role: crate::Role::Opaque }, crate::ParamRole { key: "class", role: crate::Role::Opaque }];
+const DATA_ROLES: &[crate::ParamRole] = &[
+    crate::ParamRole { key: "shape", role: crate::Role::Opaque },
+    crate::ParamRole { key: "box", role: crate::Role::Opaque },
+    crate::ParamRole { key: "class", role: crate::Role::Opaque },
+];
 
 pub fn commands() -> Vec<C> {
     vec![
-        C::new("annotation.newLayer","New Box Annotation Layer","Annotate › Layers",new_layer).roles(DATA_ROLES).effects(crate::policy::Effects::NONE).params(r#"{"name"?: text}"#),
-        C::new("annotation.resume", "Add or Edit Boxes", "Annotate › Shapes", resume).roles(DATA_ROLES).effects(crate::policy::Effects::NONE).params(r#"{"layer"?:name|id}"#),
+        C::new("annotation.tool", "Choose Annotation Shape", "Annotate › Shapes", shapes::activate).roles(&[]).effects(crate::policy::Effects::NONE).view().when(super::design::need_editable)
+            .params(r#"{"layer"?:name|id,"shape":"box"|"circle"|"polygon"|"point"}"#),
+        C::new("annotation.addShape", "Add Annotation Shape", "Annotate › Shapes", shapes::add).inputs(super::design::new_feature_inputs).roles(DATA_ROLES).effects(crate::policy::Effects::NONE).when(super::design::need_editable)
+            .params(r#"{"layer"?:name|id,"shape":{"version":1,"frame":as annotation.addBox,"shape":{"kind":"point","position":[x,y]}|{"kind":"circle","center":[x,y],"radius":number}|{"kind":"polygon","vertices":[[x,y],...] }},"class"?:text}"#),
+        C::new("annotation.updateShape", "Update Annotation Shape", "Annotate › Shapes", shapes::update).roles(DATA_ROLES).effects(crate::policy::Effects::NONE).when(super::design::need_editable)
+            .params(r#"{"layer"?:name|id,"row":number,"shape":as annotation.addShape,"class"?:text}"#),
+        C::new("annotation.newLayer","New Annotation Layer","Annotate › Layers",new_layer).roles(DATA_ROLES).effects(crate::policy::Effects::NONE).params(r#"{"name"?: text}"#),
+        C::new("annotation.resume", "Resume Annotation", "Annotate › Shapes", resume).roles(DATA_ROLES).effects(crate::policy::Effects::NONE).params(r#"{"layer"?:name|id}"#),
         C::new("annotation.setClass", "Set Annotation Class", "Annotate › Classes", set_class).roles(DATA_ROLES).effects(crate::policy::Effects::NONE)
             .params(r##"{"layer"?:name|id,"class":text,"color"?:"#RRGGBB"}"##),
         C::new("annotation.addBox","Add Rotated Box","Annotate › Shapes",add).inputs(super::design::new_feature_inputs).roles(DATA_ROLES).effects(crate::policy::Effects::NONE).when(super::design::need_editable)
@@ -244,6 +257,7 @@ fn ensure_class(l: &mut rustgis_map::Layer, name: &str, color: Option<rustgis_ma
             for (_, symbol) in classes {
                 symbol.stroke = symbol.fill.with_alpha(255);
                 symbol.fill = symbol.fill.with_alpha(45);
+                symbol.size = symbol.size.max(8.);
             }
         }
     }
@@ -263,11 +277,13 @@ fn ensure_class(l: &mut rustgis_map::Layer, name: &str, color: Option<rustgis_ma
             i
         }
     };
-    if let Some(c) = color
-        && let Some((_, symbol)) = classes.get_mut(at)
-    {
-        symbol.stroke = c.with_alpha(255);
-        symbol.fill = c.with_alpha(45);
+    if let Some((_, symbol)) = classes.get_mut(at) {
+        // Polygon base symbols have size zero; mixed annotation layers need visible points.
+        symbol.size = symbol.size.max(8.);
+        if let Some(c) = color {
+            symbol.stroke = c.with_alpha(255);
+            symbol.fill = c.with_alpha(45);
+        }
     }
     Ok(converted)
 }
@@ -302,12 +318,22 @@ fn resume(s: &mut Session, p: &Value) -> CmdResult {
                 _ => None,
             })
             .unwrap_or_default();
-        ensure_class(s.map_mut().layer_mut(id).ok_or("no layer")?, &name, None)?;
+        if l.dataset.features.is_empty() {
+            let l = s.map_mut().layer_mut(id).ok_or("no layer")?;
+            l.renderer = rustgis_map::Renderer::unique(&l.dataset, &[], "class", rustgis_map::Ramp::Harbour, l.renderer.base_symbol())?;
+        } else {
+            ensure_class(s.map_mut().layer_mut(id).ok_or("no layer")?, &name, None)?;
+        }
         s.notify(format!("Layer {id}: 1 layer changed to class-based annotation symbology"), false);
     }
     s.active_layer = Some(id);
     s.map_mut().editing.settings.enabled = true;
-    s.tool = crate::Tool::RotatedBox;
+    s.tool = if s.tool.is_annotation() {
+        s.tool
+    } else {
+        let l = s.map().layer(id).ok_or("no layer")?;
+        l.selection.first().and_then(|row| ShapeSpec::from_row(&l.dataset, *row).ok()).map(|s| s.tool()).unwrap_or(crate::Tool::RotatedBox)
+    };
     Ok(json!({"layer":id}))
 }
 fn new_layer(s: &mut Session, p: &Value) -> CmdResult {
@@ -343,12 +369,13 @@ pub fn check_layer(s: &Session, id: u32) -> Result<(), String> {
     let l = s.map().layer(id).ok_or("no layer")?;
     if l.is_streamed()
         || l.graphics
-        || l.geometry_type() != GeometryType::Polygon
+        || !matches!(l.geometry_type(), GeometryType::Polygon | GeometryType::Point)
+        || l.dataset.field_index(SHAPE_RECORD).and_then(|i| l.dataset.fields.get(i)).is_some_and(|f| f.ty != FieldType::Text)
         || ["annotation_id", "class", RECORD]
             .iter()
             .any(|n| l.dataset.field_index(n).and_then(|i| l.dataset.fields.get(i)).is_none_or(|f| f.ty != FieldType::Text))
     {
-        return Err("select a box annotation layer (New Box Annotation Layer)".into());
+        return Err("select an annotation layer (New Annotation Layer)".into());
     }
     Ok(())
 }
@@ -359,16 +386,7 @@ fn class(p: &Value) -> Result<Option<&str>, String> {
         _ => Err("class must be text of at most 200 characters".into()),
     }
 }
-fn add(s: &mut Session, p: &Value) -> CmdResult {
-    let id = s.layer_id(p)?;
-    check_layer(s, id)?;
-    let b = parsed(p)?;
-    let name = class(p)?.unwrap_or("");
-    let converted = ensure_class(s.map_mut().layer_mut(id).ok_or("no layer")?, name, None)?;
-    let g = b.geometry()?;
-    let record = serde_json::to_string(&b).map_err(|e| e.to_string())?;
-    // Feature row IDs can be reassigned by GeoJSON readers. Keep a separate ordinary
-    // property so annotation identity survives exports, filtering and subsequent imports.
+fn unique_id(s: &Session, id: u32) -> Result<String, String> {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let tick = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|t| t.as_nanos()).unwrap_or(0);
     let ds = &s.map().layer(id).ok_or("no layer")?.dataset;
@@ -380,13 +398,35 @@ fn add(s: &mut Session, p: &Value) -> CmdResult {
             break uid;
         }
     };
-    let mut attributes = serde_json::Map::new();
-    for (field, value) in [("annotation_id", json!(uid)), ("class", json!(name)), (RECORD, json!(record))] {
-        let key = ds.field_index(field).and_then(|i| ds.fields.get(i)).map(|f| f.name.clone()).ok_or("missing annotation field")?;
-        attributes.insert(key, value);
-    }
-    let result =
-        super::edit::add_feature(s, &json!({"layer":id,"geometry":rustgis_data::io::geometry_to_geojson(&g),"attributes":attributes}))?;
+    Ok(uid)
+}
+fn insert(s: &mut Session, id: u32, geometry: Geometry, given: &[(&str, Cell)]) -> CmdResult {
+    let l = s.map_mut().layer_mut(id).ok_or("no layer")?;
+    let attrs = l
+        .dataset
+        .fields
+        .iter()
+        .map(|f| given.iter().find(|(name, _)| name.eq_ignore_ascii_case(&f.name)).map(|(_, v)| v.clone()).unwrap_or(Cell::Null))
+        .collect();
+    l.dataset.push(Some(geometry), attrs);
+    l.touch_geometry();
+    let row = l.dataset.features.len().saturating_sub(1);
+    l.selection = vec![row];
+    super::design::apply(s, id, vec![super::design::Change { before: None, row: Some(row) }])?;
+    Ok(json!({"row":row}))
+}
+fn add(s: &mut Session, p: &Value) -> CmdResult {
+    let id = s.layer_id(p)?;
+    check_layer(s, id)?;
+    let b = parsed(p)?;
+    let name = class(p)?.unwrap_or("");
+    let converted = ensure_class(s.map_mut().layer_mut(id).ok_or("no layer")?, name, None)?;
+    let g = b.geometry()?;
+    let record = serde_json::to_string(&b).map_err(|e| e.to_string())?;
+    // Feature row IDs can be reassigned by GeoJSON readers. Keep a separate ordinary
+    // property so annotation identity survives exports, filtering and subsequent imports.
+    let uid = unique_id(s, id)?;
+    let result = insert(s, id, g, &[("annotation_id", Cell::Text(uid)), ("class", Cell::Text(name.into())), (RECORD, Cell::Text(record))])?;
     let row = result.get("row").and_then(Value::as_u64).and_then(|r| usize::try_from(r).ok()).ok_or("box was not added")?;
     BoxSpec::from_row(&s.map().layer(id).ok_or("no layer")?.dataset, row)?;
     if converted {

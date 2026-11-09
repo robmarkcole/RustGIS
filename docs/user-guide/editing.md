@@ -240,11 +240,42 @@ the map then identifies that tile layer alone: a WMS layer is asked as above, an
 layer, archive or MapLibre style lists its features. This works for catalog basemaps and MapLibre
 styles too, which the topmost and visible modes leave out.
 
-## Rotated box annotations
+## Object annotations
 
-**Annotate › New Box Annotation Layer** creates one polygon layer containing multiple classes
+The **Annotate** tab supports boxes (including paddle rotation), circles, freeform polygons and
+points. All shapes and classes can share one annotation layer. Create **New Annotation Layer**,
+choose a class and colour, and choose a shape. Right-click the layer and choose **Annotate Features**
+to continue later. The target selector keeps subsequent annotations in that same layer.
+
+- **Point:** click to place each point; click an existing point to select it, then drag to move.
+  The selected point's X and Y fields use its stored reference grid.
+- **Circle:** drag from the centre to the rim. Click to select, drag inside to move, or drag a rim
+  handle to change the radius. A numeric Radius control uses reference pixels or local grid units.
+- **Polygon:** click successive vertices. Double-click, click the first vertex, press Enter, or
+  choose **Finish Polygon** to close it. Backspace removes the last draft vertex. Crossing or
+  touching edges are refused. A failed finish keeps the outline so you can correct it and retry.
+  Select a polygon and drag a vertex to reshape it, or drag inside to move the whole polygon.
+- **Box:** drag to create; use the rotation paddle, side/corner handles and numeric controls below.
+
+**Space + drag** and middle-drag pan between annotations and during a polygon draft; the wheel
+zooms. Hold Alt to draw over an existing annotation. Escape cancels and returns to Pan. Each
+completed draw or drag is one undo step. Clicking an existing annotation chooses its shape tool.
+
+GeoJSON exports points as Point features and the other shapes as Polygon features. Circles are
+**256-edge polygon approximations**; exact centre, radius and frozen reference frame are retained
+in the versioned `_rustgis_shape` text property for constrained editing when reopened. This is a
+circle in the chosen image/local grid, not a geodesic ground-distance circle. The same property
+retains point and freeform polygon coordinates in their frozen local grid. As with boxes, external
+geometry edits can invalidate the construction record; ordinary feature editing remains available.
+Freeform polygons currently support a single outline (3–512 vertices), without holes. Use GeoJSON
+for a mixed point/polygon layer; formats that only accept one geometry family may refuse it or
+report conversion losses. Class colours remain project styling.
+
+### Rotated boxes
+
+**Annotate › New Annotation Layer** creates one annotation layer containing multiple classes
 and opens its annotation controls. Each drag on empty map space adds another box to that same
-layer. To resume later, right-click the layer and choose **Add or Edit Boxes**, or choose its
+layer. To resume later, right-click the layer and choose **Annotate Features**, or choose its
 name in the Annotate tab's layer selector. Editing is enabled automatically.
 
 Choose a reference raster for new boxes. Type a class such as `vehicle` and click **Add Class**;
