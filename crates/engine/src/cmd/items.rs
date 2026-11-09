@@ -365,6 +365,18 @@ fn to_json<T: serde::Serialize>(v: &T) -> Result<Vec<u8>, String> {
     serde_json::to_vec(v).map_err(|e| e.to_string())
 }
 
+/// Standalone map/layer objects predate project headers. Guard the new dataset metadata without
+/// buffering another parsed copy of a potentially large embedded raster or feature collection.
+fn annotation_format(mut bytes: Vec<u8>, required: bool) -> Result<Vec<u8>, String> {
+    if required {
+        if bytes.first() != Some(&b'{') {
+            return Err("image annotation map/layer must serialize as an object".into());
+        }
+        bytes.splice(1..1, format!("\"format\":{},", crate::project::FORMAT).bytes());
+    }
+    Ok(bytes)
+}
+
 /// Whether command `id` can be added as a task's step (`task.addStep`): a built-in command, and
 /// not a task's own (a step doesn't run a task).
 pub fn can_be_step(s: &Session, id: &str) -> bool {
@@ -711,7 +723,7 @@ fn package_map(s: &mut Session, mobile: bool, tol: f64) -> Result<Vec<u8>, Strin
         m.release_tiles(&hidden);
         m.layers.retain(|l| kept(l));
         for l in &mut m.layers {
-            if l.is_raster() || tol <= 0.0 {
+            if l.is_raster() || l.dataset.annotation.is_some() || tol <= 0.0 {
                 continue;
             }
             for f in &mut l.dataset.features {
@@ -724,11 +736,12 @@ fn package_map(s: &mut Session, mobile: bool, tol: f64) -> Result<Vec<u8>, Strin
     }
     crate::project::ensure_map_imports_complete(&m)?;
     let name = m.name.clone();
-    let (text, report) = crate::durable::output_owned(m, |m| serde_json::to_string(m).map_err(|e| e.to_string()))?;
+    let guarded = m.layers.iter().any(|l| l.dataset.annotation.is_some());
+    let (bytes, report) = crate::durable::output_owned(m, |m| annotation_format(to_json(m)?, guarded))?;
     crate::durable::notify(s, &report);
     let kind = if mobile { "mobile map package" } else { "map package" };
     let readme = format!("{} — a RustGIS {kind}.\nAdd it to a project with Data › Import.\n", name);
-    rustgis_data::zip::write(&[(format!("{}.rgismap", safe(&name)), text.into_bytes()), ("README.txt".into(), readme.into_bytes())])
+    rustgis_data::zip::write(&[(format!("{}.rgismap", safe(&name)), bytes), ("README.txt".into(), readme.into_bytes())])
 }
 
 /// The geoprocessing history with the layers its runs made, as GeoJSON.
@@ -1510,7 +1523,8 @@ pub fn item_bytes(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Vec
             crate::project::ensure_map_imports_complete(map)?;
             let map = embedded_map(map, &mut MAX_EMBED.clone());
             let name = map.name.clone();
-            (name, durable_bytes(s, map)?)
+            let guarded = map.layers.iter().any(|l| l.dataset.annotation.is_some());
+            (name, durable_bytes(s, map, guarded)?)
         }
         "layer" => {
             let id = s.layer_id(p)?;
@@ -1520,7 +1534,8 @@ pub fn item_bytes(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Vec
             }
             let layer = embed_layer(l, &mut MAX_EMBED.clone());
             let name = layer.name.clone();
-            (name, durable_bytes(s, layer)?)
+            let guarded = layer.dataset.annotation.is_some();
+            (name, durable_bytes(s, layer, guarded)?)
         }
         "styles" => {
             if s.project.styles.is_empty() {
@@ -1541,7 +1556,7 @@ pub fn item_bytes(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Vec
                 t.name = n.chars().take(200).collect();
             }
             let name = t.name.clone();
-            let bytes = durable_bytes(s, t)?;
+            let bytes = durable_bytes(s, t, false)?;
             if source_references > 0 {
                 s.notify(format!("{source_references} data source reference(s) left out of the template, which keeps no features"), false);
             }
@@ -1627,8 +1642,8 @@ pub(crate) fn save_item(s: &mut Session, kind: &str, p: &Value) -> CmdResult {
 }
 
 /// Consumes the existing item draft, emitting losses after serialization has completed.
-fn durable_bytes<T: crate::durable::Durable + serde::Serialize>(s: &mut Session, value: T) -> Result<Vec<u8>, String> {
-    let (bytes, report) = crate::durable::output_owned(value, to_json)?;
+fn durable_bytes<T: crate::durable::Durable + serde::Serialize>(s: &mut Session, value: T, guarded: bool) -> Result<Vec<u8>, String> {
+    let (bytes, report) = crate::durable::output_owned(value, |v| annotation_format(to_json(v)?, guarded))?;
     crate::durable::notify(s, &report);
     Ok(bytes)
 }

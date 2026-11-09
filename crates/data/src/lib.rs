@@ -5,6 +5,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod address;
+pub mod annotation;
 pub mod cityjson;
 mod citymodel;
 pub mod color;
@@ -303,6 +304,9 @@ impl<'de> Deserialize<'de> for Features {
 /// tools and plugins. Projected source coordinates must be normalized before insertion.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 pub struct Dataset {
+    /// Image binding and palette, retained by projects and GeoJSON exports.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "annotation::deserialize")]
+    pub annotation: Option<annotation::Metadata>,
     pub name: String,
     pub geometry_type: GeometryType,
     pub fields: Vec<Field>,
@@ -332,8 +336,11 @@ impl Serialize for Dataset {
     /// Saves CRS recovery and dropped Z/M state with the dataset, but omits disposable streamed rows.
     fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut st = s.serialize_struct("Dataset", 8)?;
+        let mut st = s.serialize_struct("Dataset", 9)?;
         st.serialize_field("name", &self.name)?;
+        if let Some(meta) = &self.annotation {
+            st.serialize_field("annotation", meta)?;
+        }
         st.serialize_field("geometry_type", &self.geometry_type)?;
         st.serialize_field("fields", &self.fields)?;
         let none: &[Feature] = &[];
@@ -493,6 +500,7 @@ impl Dataset {
     /// Creates an empty, complete dataset whose coordinates are assumed to be WGS 84.
     pub fn new(name: impl Into<String>, geometry_type: GeometryType, fields: Vec<Field>) -> Self {
         Dataset {
+            annotation: None,
             name: name.into(),
             geometry_type,
             fields,

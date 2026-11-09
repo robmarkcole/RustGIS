@@ -41,6 +41,27 @@ struct Geo {
     referenced: bool,
 }
 
+/// The original first-image grid, before display resampling, for image-bound annotations.
+pub fn annotation_image<R: Read + Seek>(input: R, file_name: &str) -> Result<crate::annotation::Image> {
+    let mut dec = Decoder::new(input).map_err(err)?;
+    let (width, height) = dec.dimensions().map_err(err)?;
+    let geo = geo_tags(&mut dec)?;
+    if !geo.referenced {
+        return Err(err("image annotations require embedded GeoTIFF georeferencing"));
+    }
+    let crs = geo.crs.or(geo.geographic_model.then_some(Crs::LonLat)).ok_or_else(|| err("image coordinate system is unsupported"))?;
+    let t = geo.transform;
+    let image = crate::annotation::Image {
+        file_name: file_name.into(),
+        width,
+        height,
+        crs,
+        affine: geo.affine.unwrap_or([t.origin_x, t.pixel_width, 0., t.origin_y, 0., t.pixel_height]),
+    };
+    image.validate().map_err(DataError::Format)?;
+    Ok(image)
+}
+
 /// Whether the first sample past the colour ones is declared alpha (extra sample 1, associated, or
 /// 2, unassociated).
 pub(super) fn extra_alpha<R: Read + Seek>(dec: &mut Decoder<R>) -> bool {
@@ -1863,6 +1884,11 @@ mod tests {
 
     #[test]
     fn rotated_matrix_is_turned_north_up() {
+        let matrix = [30., 5., 0., 400_000., 3., -30., 0., 5_000_000., 0., 0., 0., 0., 0., 0., 0., 1.];
+        let original = annotation_image(std::io::Cursor::new(tests_support::matrix_tiff(matrix, false)), "rot.tif").unwrap();
+        assert_eq!((original.width, original.height), (20, 10));
+        assert_eq!(original.affine, [400_000., 30., 5., 5_000_000., 3., -30.]);
+
         // Issue #251: GDAL's geotransform (400000, 30, 5, 5000000, 3, -30).
         let m = [30.0, 5.0, 0.0, 400_000.0, 3.0, -30.0, 0.0, 5_000_000.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0];
         let r = read(std::io::Cursor::new(tests_support::matrix_tiff(m, false)), "rot").unwrap();

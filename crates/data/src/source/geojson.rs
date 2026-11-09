@@ -163,6 +163,9 @@ impl GeoJsonSource {
         if scan.skipped > 0 {
             notes.push(format!("{} features had unreadable geometry", scan.skipped));
         }
+        if rest.contains_key("rustgis_annotation") {
+            return Err(DataError::Unsupported("image annotation GeoJSON must be read whole to preserve its binding and palette".into()));
+        }
         let reproject = Reproject::known(declared_crs(&rest, &mut notes)?);
         // The declaration may come after the features, so only now can each be tried: those the
         // declared system can't convert are found here (and left out of every read, the count,

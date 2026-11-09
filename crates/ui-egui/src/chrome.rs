@@ -800,6 +800,7 @@ fn search_action(id: &str) -> Option<SearchAction> {
         "style.add" => OpenItem("styles"),
         "style.import" => OpenItem("importStyles"),
         "style.importQgis" => OpenItem("qgisStyle"),
+        "annotation.importClasses" => OpenItem("annotationClasses"),
         "project.importGeolibre" => OpenItem("geolibreProject"),
         "project.importQgis" => OpenItem("qgisProject"),
         "style.save" => SaveItem("styles"),

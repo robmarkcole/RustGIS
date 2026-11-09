@@ -200,6 +200,7 @@ fn layer_geojson(inputs: &dyn Inputs, name: &str) -> Result<Value, String> {
         return Ok(rustgis_data::io::to_geojson(ds));
     }
     let sub = rustgis_data::Dataset {
+        annotation: ds.annotation.clone(),
         name: ds.name.clone(),
         geometry_type: ds.geometry_type,
         fields: ds.fields.clone(),

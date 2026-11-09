@@ -1147,6 +1147,11 @@ pub fn add_dataset(s: &mut Session, mut ds: rustgis_data::Dataset) -> u32 {
         ds.name = format!("{base} ({i})");
     }
     let id = s.map_mut().add_dataset(ds);
+    if let Some(l) = s.map_mut().layer_mut(id)
+        && let Err(e) = super::annotation::image::restore(l)
+    {
+        s.notify(e, true);
+    }
     s.active_layer = Some(id);
     id
 }

@@ -269,7 +269,136 @@ retains point and freeform polygon coordinates in their frozen local grid. As wi
 geometry edits can invalidate the construction record; ordinary feature editing remains available.
 Freeform polygons currently support a single outline (3–512 vertices), without holes. Use GeoJSON
 for a mixed point/polygon layer; formats that only accept one geometry family may refuse it or
-report conversion losses. Class colours remain project styling.
+report conversion losses. For map-based annotation layers, class colours remain project styling. Image-bound GeoJSON also retains its category palette, as described below.
+
+### One image and one GeoJSON
+
+For image datasets, load a georeferenced `.tif` or `.tiff`, select its raster layer, and choose
+**Annotate › Annotate Image**. RustGIS creates an annotation layer bound to that TIFF's original
+pixel grid, or resumes its sibling GeoJSON:
+
+```text
+survey_001.tif
+survey_001.geojson
+```
+
+Choose **Save Annotations** to write the associated GeoJSON. This is separate from saving the
+RustGIS project: saving a project does not automatically overwrite the GeoJSON. **Export Features**
+also carries the metadata when the destination is GeoJSON. Save As through the command's optional
+`path` writes a copy and refuses an existing unrelated destination.
+
+Select an imported image annotation layer and choose **Annotate Image** to reconnect its sibling
+TIFF. The CLI command `annotation.openImage` also accepts the path of either member of the pair.
+Discovery first uses the same basename and `.tif`/`.tiff` (also uppercase extensions). If none
+exists, the validated image basename recorded in the GeoJSON is tried in that same folder. Multiple distinct
+TIFF matches are an error; select the intended loaded raster explicitly. Renaming both files
+together works: the dimensions, coordinate system and full affine grid must still match. A
+mismatched or unrelated sibling GeoJSON is refused and left unchanged. Matching filenames identify
+the pair, but do not prove the pixels are unchanged if an image has been replaced with another
+image on exactly the same grid.
+
+All new shapes use the bound image grid; the reference chooser is replaced by the filename and
+original dimensions. This includes rotated/skewed TIFFs: their original six-term affine transform
+is read before the display reader resamples pixels north-up. Annotation coordinates remain in
+**original image pixels**, not the resampled display grid. Full GeoTIFFs with embedded georeferencing and supported coordinate systems are required.
+Streamed rasters, overviews, unreferenced scans, CRS overrides and subdatasets are refused; export
+a corrected GeoTIFF first when the source needs a georeferencing override.
+In the browser, upload the original TIFF, select it and choose Annotate Image, then use
+**Export Features** to download the GeoJSON. Sibling discovery and Save Annotations require local
+filesystem access and are desktop workflows.
+
+Classes, stable category IDs and RGB colours are embedded in the same GeoJSON, including classes
+with no features. **Import Classes…** reads the palette from another image annotation GeoJSON
+without importing its features or changing the target image. It merges by exact name and ID;
+conflicting identities are errors, and the import is undoable. Recolouring a class preserves its
+ID. Use a shared imported palette across images to keep dataset category identities consistent.
+New categories receive the next unused positive ID; sorting the legend does not assign IDs.
+
+### Single-file annotation metadata and OBB exchange
+
+The collection's `rustgis_annotation` member contains this versioned metadata (illustrative):
+
+```json
+{
+  "version": 1,
+  "image": {
+    "file_name": "survey_001.tif",
+    "width": 4096,
+    "height": 2048,
+    "crs": {"Epsg": 32633},
+    "affine": [400000, 0.5, 0, 5000000, 0, -0.5]
+  },
+  "categories": [
+    {"id": 1, "name": "vehicle", "color": [59, 130, 246]}
+  ]
+}
+```
+
+This is a RustGIS annotation convention using GeoJSON's
+[foreign members](https://www.rfc-editor.org/rfc/rfc7946.html#section-6.1), not a native Roboflow or
+Label Studio import format. Categories borrow COCO's `id` and `name` vocabulary and its panoptic
+RGB colour convention. Other GIS applications can use the geographic features, but may discard
+collection metadata when rewriting the file. No XML or palette sidecar is needed.
+
+`file_name` is a basename, never an absolute path or URL. Pixel `(0, 0)` is the upper-left **corner**
+of the original image; pixel centres are at half-integers. Coordinates are continuous/subpixel,
+x right and y down. `affine` is in GDAL order:
+
+```text
+world_x = affine[0] + x * affine[1] + y * affine[2]
+world_y = affine[3] + x * affine[4] + y * affine[5]
+```
+
+World coordinates use `image.crs`; GeoJSON geometry remains WGS 84 longitude/latitude. Saved CRS
+values are `"WebMercator"`, `"LonLat"`, `{"Epsg": code}` or `{"Proj": {"proj4": "…", "label": "…"}}`.
+The affine is invertible and may include rotation and skew. Width/height describe the original
+image, not a view, overview or training chip.
+
+Each feature retains a stable `annotation_id` and `class`. Export derives its `category_id` from
+the category table. Construction properties are **JSON-encoded text strings**, with these decoded
+contents:
+
+| Property | Required construction fields |
+| --- | --- |
+| `_rustgis_box` | `version: 1`, `frame`, `center: [x,y]`, positive `width`, positive `height`, clockwise `angle` in degrees |
+| `_rustgis_shape` (circle) | `version: 1`, `frame`, `shape: {"kind":"circle","center":[x,y],"radius":r}` |
+| `_rustgis_shape` (polygon) | `version: 1`, `frame`, `shape: {"kind":"polygon","vertices":[[x,y],…]}` |
+| `_rustgis_shape` (point) | `version: 1`, `frame`, `shape: {"kind":"point","position":[x,y]}` |
+
+`frame` retains `crs`, `transform` (origin_x, origin_y, pixel_width, pixel_height), and `image`
+(the construction image name, which may remain a provenance label after a rename; the binding
+filename identifies the current pair). Image-bound frames additionally retain `affine`, which takes precedence over
+`transform` and must match the binding's original grid. Legacy map-based frames without `affine`
+continue to use `transform`. Circle radii and rectangle dimensions are exact in that grid.
+Circle geometry is a 256-edge closed polygon approximation; retaining its centre, radius and frame
+is required to resume circle editing. A polygon outline has 3–512 distinct vertices, without a
+repeated closing vertex in the construction record. Its GeoJSON exterior ring is closed.
+
+Box features additionally export an `obb` property containing **four ordered `[x,y]` pixel corners**:
+local top-left, top-right, bottom-right, bottom-left, rotated around the stored centre. These are
+unclosed corners in the image's downward-y coordinate system, independently of the geographic
+polygon's winding/start vertex. They are derived from the construction record on each export;
+editing the derived `obb` property does not change the box. `annotation.obb` returns the same
+per-box exchange properties without writing a file.
+
+For [Supervision](https://supervision.roboflow.com/latest/detection/core/), collect these corners
+into `data[ORIENTED_BOX_COORDINATES]` with shape `(N, 4, 2)`; map stable category IDs to the dense
+class indices used by the consumer. For [YOLO OBB](https://docs.ultralytics.com/datasets/obb/),
+divide each x by image width and y by image height, then emit the four corners with the target
+class index. The native annotation GeoJSON remains the editable source.
+
+Coordinates outside the image are retained, not silently clipped. Training conversion must
+explicitly reject, retain or clip them; clipping may turn a rectangle into a non-rectangle.
+Circles/polygons do not acquire an OBB automatically, and points need a task-specific policy.
+COCO detection boxes are axis-aligned: a consumer must explicitly request an enclosing box or
+segmentation conversion. Stock RF-DETR OBB training compatibility is not implied by preserving
+OBB annotations. Cropping, tiling or resizing training images requires transforming the pixel
+coordinates into the corresponding output image grid.
+
+RustGIS validates stored construction against geometry and refuses incompatible external edits
+or unknown metadata versions. Image annotation layers and their palettes survive project saves.
+Projects written by this version use format 2; older RustGIS versions must refuse them. Standalone
+map/layer files containing image metadata also carry a format-2 guard.
 
 ### Rotated boxes
 
@@ -284,7 +413,8 @@ boxes, including classes defined before any boxes are drawn. New classes also re
 automatically when a box is created. Multiple classes share one layer and appear separately in
 its legend. Changing a class colour updates every box of that class, while **Apply Class to
 Selected Box** changes only the selected box's class. Class names are exported in GeoJSON;
-custom colours are layer styling and are retained in a RustGIS project, not ordinary GeoJSON.
+for map-based layers, custom colours are retained in a RustGIS project. Image-bound GeoJSON
+also carries the category palette.
 
 Select a box to see its eight resize handles and its rotation paddle:
 
@@ -297,7 +427,7 @@ Select a box to see its eight resize handles and its rotation paddle:
   Hold Alt when starting a box to draw over an existing annotation.
 - Escape cancels an unfinished box or held drag and returns to Pan. Each completed drag is one undo step.
   **Space + drag** pans temporarily and keeps the box tool ready; middle-drag also pans and the
-  wheel zooms. **Pan / Stop Annotating** returns to Pan. Choose **Add or Edit Boxes** to continue.
+  wheel zooms. **Pan / Stop Annotating** returns to Pan. Choose **Box** to continue.
 
 ### Where the rectangle is exact
 
@@ -326,8 +456,8 @@ counterclockwise WGS 84 longitude/latitude Polygon with four corners, its featur
 and a `_rustgis_box` text property containing the versioned construction parameters and reference
 frame. Other GIS applications can use the polygons without interpreting that property.
 
-Reopen the GeoJSON, select its layer and choose **Add or Edit Boxes** on the Annotate tab or
-the layer’s right-click menu to resume. Editing is enabled automatically.
+Reopen the GeoJSON, select its layer and choose **Box** on the Annotate tab or
+**Annotate Features** in the layer’s right-click menu to resume. Editing is enabled automatically.
 Keep `_rustgis_box` intact for constrained editing. RustGIS validates it against the polygon,
 accepting reversed winding and a different starting corner. If generic vertex edits or another
 application change the geometry, the box controls refuse to refit it silently; the feature remains

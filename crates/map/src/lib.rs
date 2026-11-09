@@ -2885,6 +2885,7 @@ impl Layer {
         } = self;
         let mut out = Vec::new();
         let rustgis_data::Dataset {
+            annotation: _,
             name: _,
             geometry_type: _,
             fields: _,

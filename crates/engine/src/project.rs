@@ -55,7 +55,8 @@ pub fn open_command(path: &str) -> &'static str {
 }
 /// Saved-document compatibility version, independent of the RustGIS release version.
 /// Advance it when an older reader would lose meaningful saved information on resaving.
-pub const FORMAT: u32 = 1;
+/// Format 2 retains image annotation bindings/palettes; format 1 remains readable.
+pub const FORMAT: u32 = 2;
 /// Largest project file read or saved in the browser, or on a computer whose memory isn't known
 /// (512 MiB): the floor of [`max_bytes`].
 pub const BYTES_FLOOR: u64 = 512 << 20;
@@ -402,6 +403,8 @@ pub struct Table {
 /// them). Read field by field, since `flatten` would buffer every row first.
 #[derive(Deserialize)]
 struct TableFile {
+    #[serde(default, deserialize_with = "rustgis_data::annotation::deserialize")]
+    annotation: Option<rustgis_data::annotation::Metadata>,
     #[serde(default)]
     id: u32,
     name: String,
@@ -420,10 +423,11 @@ struct TableFile {
 
 impl From<TableFile> for Table {
     fn from(t: TableFile) -> Self {
-        let TableFile { id, name, geometry_type, fields, features, source, crs, crs_incomplete, zm_dropped } = t;
+        let TableFile { annotation, id, name, geometry_type, fields, features, source, crs, crs_incomplete, zm_dropped } = t;
         Table {
             id,
             dataset: Dataset {
+                annotation,
                 name,
                 geometry_type,
                 fields,
@@ -1508,6 +1512,7 @@ impl Durable for Table {
     fn prepare(&self, p: &mut Prepare<'_>) {
         let Self { id: _, dataset } = self;
         let Dataset {
+            annotation: _, // Image filenames and grids are opaque annotation user data.
             name: _,
             geometry_type: _,
             fields: _,

@@ -2393,6 +2393,30 @@ fn active_layer(app: &RustGisApp) -> Option<&rustgis_engine::map::Layer> {
 
 /// Object annotation: classed training geometry, with room for additional shape tools.
 fn annotate_tab(app: &mut RustGisApp, ui: &mut Ui) {
+    group(ui, "Image", |ui| {
+        col(ui, |ui| {
+            small(
+                ui,
+                app,
+                "raster_layer",
+                "Annotate Image",
+                "Create or resume the selected TIFF's sibling GeoJSON, or reconnect an image annotation layer.",
+                "annotation.openImage",
+                Value::Null,
+                false,
+            );
+            small(
+                ui,
+                app,
+                "save",
+                "Save Annotations",
+                "Save image annotations, classes, colours and OBB corners to the associated GeoJSON.",
+                "annotation.saveImage",
+                Value::Null,
+                false,
+            );
+        });
+    });
     group(ui, "Annotation Layers", |ui| {
         big(
             ui,
@@ -2463,6 +2487,20 @@ fn annotate_tab(app: &mut RustGisApp, ui: &mut Ui) {
         ui.vertical(|ui| {
             ui.small(tl!("Space + drag: temporary pan"));
             ui.small(tl!("Wheel: zoom"));
+        });
+    });
+    group(ui, "Classes", |ui| {
+        col(ui, |ui| {
+            small(
+                ui,
+                app,
+                "open",
+                "Import Classes…",
+                "Import categories and colours from another image annotation GeoJSON.",
+                "annotation.importClasses",
+                Value::Null,
+                false,
+            );
         });
     });
     group(ui, "Edits", |ui| {

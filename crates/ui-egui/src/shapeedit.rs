@@ -408,6 +408,7 @@ pub(crate) fn draw(app: &RustGisApp, p: &egui::Painter, rect: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use egui_kittest::kittest::Queryable;
     fn harness() -> egui_kittest::Harness<'static, RustGisApp> {
         let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
         app.run("annotation.newLayer", json!({})).unwrap();
@@ -502,6 +503,50 @@ mod tests {
         assert_eq!(h.state().session.tool, Tool::AnnotationCircle);
         click(&mut h, rect.center() - vec2(180., 40.));
         assert_eq!(h.state().session.tool, Tool::AnnotationPoint);
+    }
+    #[test]
+    fn annotation_image_bound_ui_uses_original_pixels_for_circle_and_obb() {
+        use rustgis_engine::data::annotation::{Image, Metadata};
+        use rustgis_engine::data::raster::Crs;
+        let mut h = harness();
+        let id = h.state().session.active_layer.unwrap();
+        let image = Image {
+            file_name: "tile.tif".into(),
+            width: 2048,
+            height: 2048,
+            crs: Crs::WebMercator,
+            affine: [-1024., 1., 0.2, 1024., 0.1, -1.],
+        };
+        h.state_mut().session.map_mut().layer_mut(id).unwrap().dataset.annotation =
+            Some(Metadata { version: 1, image: image.clone(), categories: Vec::new() });
+        h.state_mut().boxes.class = "vehicle".into();
+        h.state_mut().run("annotation.tool", json!({"shape":"circle"})).unwrap();
+        h.step();
+        let rect = h.state().map.view_rect.unwrap().0;
+        let a = rect.center() - vec2(130., 80.);
+        drag(&mut h, a, a + vec2(45., 0.));
+        assert_eq!(selected(h.state()).unwrap().2.frame.affine, Some(image.affine));
+        h.state_mut().run("annotation.tool", json!({"shape":"box"})).unwrap();
+        h.step();
+        let a = rect.center() + vec2(30., 70.);
+        drag(&mut h, a, a + vec2(90., 50.));
+        let boxes = h.state_mut().run("annotation.obb", json!({})).unwrap();
+        assert_eq!(boxes["count"], 1);
+        assert_eq!(boxes["boxes"][0]["obb"].as_array().unwrap().len(), 4);
+        assert!(boxes["boxes"][0]["obb"][0][0].as_f64().unwrap() > 500.);
+        assert_eq!(h.state().session.map().layer(id).unwrap().dataset.features.len(), 2);
+        assert!(h.query_by_label("Image: tile.tif").is_some());
+        let bytes = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let captured = bytes.clone();
+        h.state_mut().services.download = Some(Box::new(move |_, value| {
+            *captured.borrow_mut() = value;
+            Ok(())
+        }));
+        h.state_mut().run("ui.exportLayer", json!({"format":"geojson"})).unwrap();
+        let geo: serde_json::Value = serde_json::from_slice(&bytes.borrow()).unwrap();
+        assert_eq!(geo["rustgis_annotation"]["image"]["file_name"], "tile.tif");
+        assert_eq!(geo["rustgis_annotation"]["categories"][0]["name"], "vehicle");
+        assert_eq!(geo["features"][1]["properties"]["obb"].as_array().unwrap().len(), 4);
     }
     #[test]
     fn annotation_small_circle_rim_resizes_without_moving_centre() {

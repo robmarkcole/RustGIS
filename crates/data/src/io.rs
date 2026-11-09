@@ -461,7 +461,7 @@ fn projected_bytes(ds: &Dataset, ext: &str, crs: Crs) -> Result<(Vec<u8>, usize)
     crate::progress::begin(ds.features.len());
     Ok(match ext {
         "geojson" | "json" => {
-            let mut w = GeoJsonWriter::new(Vec::new(), &ds.name, &ds.fields)?;
+            let mut w = GeoJsonWriter::new(Vec::new(), &ds.name, &ds.fields, ds.annotation.as_ref())?;
             w.write(&ds.features)?;
             (w.finish()?, 0)
         }
@@ -1148,6 +1148,15 @@ impl Collector {
     fn finish(self, name: &str, root: &Map<String, Json>) -> Result<(Dataset, ReadReport)> {
         let mut report = ReadReport { skipped: self.skipped, ..ReadReport::default() };
         let mut ds = Dataset::new(name, GeometryType::None, self.schema.fields());
+        if let Some(raw) = root.get("rustgis_annotation") {
+            if raw.to_string().len() > crate::annotation::MAX_BYTES {
+                return Err(DataError::Format("annotation metadata is too large".into()));
+            }
+            let meta: crate::annotation::Metadata =
+                serde_json::from_value(raw.clone()).map_err(|e| DataError::Format(format!("invalid annotation metadata: {e}")))?;
+            meta.validate().map_err(DataError::Format)?;
+            ds.annotation = Some(meta);
+        }
         ds.features.reserve(self.features.len());
         if report.skipped > 0 {
             report.messages.push(format!("{} features had unreadable geometry", report.skipped));
@@ -1178,7 +1187,32 @@ impl Collector {
             zm += usize::from(had_z);
             ds.features.push(crate::Feature { id: n as u64 + 1, geometry: geom, attrs });
         }
-        ds.geometry_type = dominant_type(&ds);
+        if let Some(meta) = ds.annotation.clone() {
+            // Empty collections still carry the annotation schema and unused category palette.
+            if ds.features.is_empty() {
+                for name in ["annotation_id", "class", "_rustgis_box", "_rustgis_shape"] {
+                    ds.ensure_field(name, FieldType::Text);
+                }
+            } else {
+                let ci = ds.field_index("class").ok_or_else(|| DataError::Format("image annotations need a class field".into()))?;
+                for row in 0..ds.features.len() {
+                    if !matches!(ds.value(row,ci), Value::Text(n) if meta.categories.iter().any(|c|c.name==*n)) {
+                        return Err(DataError::Format("annotation class is absent from its category table".into()));
+                    }
+                    if let Some(fi) = ds.field_index("category_id") {
+                        let expected = meta
+                            .categories
+                            .iter()
+                            .find(|c| *ds.value(row, ci) == Value::Text(c.name.clone()))
+                            .map(|c| Value::Int(i64::from(c.id)));
+                        if Some(ds.value(row, fi)) != expected.as_ref() {
+                            return Err(DataError::Format("annotation category_id conflicts with its class name".into()));
+                        }
+                    }
+                }
+            }
+        }
+        ds.geometry_type = if ds.annotation.is_some() && ds.features.is_empty() { GeometryType::Polygon } else { dominant_type(&ds) };
         if let Some((crs, _)) = &declared {
             ds.crs = Some(*crs);
             if unconverted > 0 {
@@ -1200,12 +1234,18 @@ impl Collector {
 /// Reads a GeoJSON document already parsed: a FeatureCollection, Feature or bare geometry. Only a
 /// FeatureCollection's `crs` is read (a Feature's or a geometry's isn't part of the legacy text).
 fn read_geojson_value(root: Json, name: &str) -> Result<(Dataset, ReadReport)> {
+    if root.get("rustgis_annotation").is_some() && root.get("type").and_then(Json::as_str) != Some("FeatureCollection") {
+        return Err(DataError::Format("image annotation metadata requires a FeatureCollection".into()));
+    }
     let mut features = Collector::default();
     let mut top = Map::new();
     match root.get("type").and_then(Json::as_str) {
         Some("FeatureCollection") => {
             for f in root.get("features").and_then(Json::as_array).into_iter().flatten() {
                 features.add(f);
+            }
+            if let Some(meta) = root.get("rustgis_annotation") {
+                top.insert("rustgis_annotation".into(), meta.clone());
             }
             if let Some(crs) = root.get("crs") {
                 top.insert("crs".to_string(), crs.clone());
@@ -1269,15 +1309,22 @@ pub(crate) fn dominant_type(ds: &Dataset) -> GeometryType {
 
 /// A dataset as a GeoJSON FeatureCollection value, in longitude/latitude.
 pub fn to_geojson(ds: &Dataset) -> Json {
-    let features: Vec<Json> = ds.features.iter().map(|f| feature_to_geojson(&ds.fields, f)).collect();
-    json!({"type": "FeatureCollection", "name": ds.name, "features": features})
+    let features: Vec<Json> = ds.features.iter().map(|f| feature_to_geojson(&ds.fields, f, ds.annotation.as_ref())).collect();
+    let mut root = json!({"type": "FeatureCollection", "name": ds.name, "features": features});
+    if let Some(meta) = &ds.annotation {
+        root["rustgis_annotation"] = json!(meta);
+    }
+    root
 }
 
 /// A feature as a GeoJSON Feature, its attributes named by `fields`.
-fn feature_to_geojson(fields: &[Field], f: &crate::Feature) -> Json {
+fn feature_to_geojson(fields: &[Field], f: &crate::Feature, annotation: Option<&crate::annotation::Metadata>) -> Json {
     let mut props = Map::new();
     for (field, v) in fields.iter().zip(&f.attrs) {
         props.insert(field.name.clone(), v.to_json());
+    }
+    if let Some(meta) = annotation {
+        crate::annotation::decorate(&mut props, meta);
     }
     json!({"type": "Feature", "id": f.id, "properties": props, "geometry": f.geometry.as_ref().map(geometry_to_geojson)})
 }
@@ -1288,16 +1335,22 @@ fn feature_to_geojson(fields: &[Field], f: &crate::Feature) -> Json {
 pub(crate) struct GeoJsonWriter<W: std::io::Write> {
     out: W,
     fields: Vec<Field>,
+    annotation: Option<crate::annotation::Metadata>,
     first: bool,
 }
 
 impl<W: std::io::Write> GeoJsonWriter<W> {
     /// Starts the collection named `name`, its features' attributes named by `fields`.
-    pub(crate) fn new(mut out: W, name: &str, fields: &[Field]) -> Result<Self> {
+    pub(crate) fn new(mut out: W, name: &str, fields: &[Field], annotation: Option<&crate::annotation::Metadata>) -> Result<Self> {
         out.write_all(br#"{"type":"FeatureCollection","name":"#)?;
         serde_json::to_writer(&mut out, name).map_err(|e| DataError::Format(e.to_string()))?;
+        if let Some(meta) = annotation {
+            meta.validate().map_err(DataError::Format)?;
+            out.write_all(br#","rustgis_annotation":"#)?;
+            serde_json::to_writer(&mut out, meta).map_err(|e| DataError::Format(e.to_string()))?;
+        }
         out.write_all(br#","features":["#)?;
-        Ok(GeoJsonWriter { out, fields: fields.to_vec(), first: true })
+        Ok(GeoJsonWriter { out, fields: fields.to_vec(), annotation: annotation.cloned(), first: true })
     }
 
     /// Writes the next features.
@@ -1307,7 +1360,8 @@ impl<W: std::io::Write> GeoJsonWriter<W> {
             if !std::mem::take(&mut self.first) {
                 self.out.write_all(b",")?;
             }
-            serde_json::to_writer(&mut self.out, &feature_to_geojson(&self.fields, f)).map_err(|e| DataError::Format(e.to_string()))?;
+            serde_json::to_writer(&mut self.out, &feature_to_geojson(&self.fields, f, self.annotation.as_ref()))
+                .map_err(|e| DataError::Format(e.to_string()))?;
         }
         Ok(())
     }
@@ -1597,7 +1651,7 @@ pub(crate) fn read_rows(
     if wkt.is_some() {
         // The most common kind, as GeoJSON's reader takes it; rows of other kinds are kept (they
         // draw), and said.
-        ds.geometry_type = dominant_type(&ds);
+        ds.geometry_type = if ds.annotation.is_some() && ds.features.is_empty() { GeometryType::Polygon } else { dominant_type(&ds) };
         let other = ds.features.iter().filter_map(|f| f.geometry.as_ref()).filter(|g| g.kind() != ds.geometry_type).count();
         if other > 0 {
             report
@@ -2244,7 +2298,7 @@ fn read_shapefile_parts(mut parts: ShapefileParts, name: &str, crs: Option<Crs>)
         ds.push_next(geom, attrs);
     }
     ds.drop_zm(&mut report, zm_shapes);
-    ds.geometry_type = dominant_type(&ds);
+    ds.geometry_type = if ds.annotation.is_some() && ds.features.is_empty() { GeometryType::Polygon } else { dominant_type(&ds) };
     // A bad .prj must not turn a spatial layer into an attribute-only table and hide the
     // conversion warning. Its shapes can be recovered by importing with an override.
     if ds.geometry_type == GeometryType::None && unconverted > 0 {

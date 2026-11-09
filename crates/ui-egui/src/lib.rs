@@ -2297,7 +2297,7 @@ impl RustGisApp {
             AppDispatch::Direct => self.session.run(id, &params),
         };
         r = self.deliver_gp_files(r);
-        if r.is_ok() && matches!(id, "annotation.newLayer" | "annotation.resume" | "annotation.tool") {
+        if r.is_ok() && matches!(id, "annotation.newLayer" | "annotation.resume" | "annotation.tool" | "annotation.openImage") {
             self.ui.tab = "Annotate".into();
         }
         if r.is_ok() && (id == "tool.set" || self.session.tool != tool_before) {
@@ -3532,6 +3532,7 @@ impl RustGisApp {
                     "importStyles" => ("style.import", &["rgislyr", "rgismap", "rgis", "rgisx"], "RustGIS layers, maps and projects"),
                     "geolibreProject" => ("project.importGeolibre", &["geolibre", "json"], "GeoLibre project"),
                     "qgisProject" => ("project.importQgis", &["qgs", "qgz"], "QGIS project"),
+                    "annotationClasses" => ("annotation.importClasses", &["geojson"], "Annotation GeoJSON"),
                     "qgisStyle" => ("style.importQgis", &["qml"], "QGIS layer style"),
                     "template" => ("project.fromTemplate", &["rgistemplate"], "RustGIS project template"),
                     "task" => ("task.import", &["rgistask"], "RustGIS task"),
@@ -3918,13 +3919,20 @@ impl RustGisApp {
             }
             "ui.exportLayer" if self.services.download.is_some() => {
                 let id = self.export_target(p)?;
+                rustgis_engine::cmd::annotation::image::validate(&self.session, id)?;
                 let l = self.session.map().layer(id).ok_or_else(|| tl!("select a layer in the Layers pane first").to_string())?;
                 // Any format the dialog offers here (`dialogs::export_formats`): not GeoPackage or
                 // FlatGeobuf, which the data crate refuses in the browser.
                 let ext = p.get("format").and_then(Value::as_str).unwrap_or("geojson").to_ascii_lowercase();
                 rustgis_engine::cmd::share::gpkg_table(p, &ext)?;
                 // A streamed layer exports its whole source, not the features read for the view.
-                let whole = if l.is_streamed() { Some(l.load_all()?) } else { None };
+                let whole = if l.dataset.annotation.is_some() {
+                    Some(rustgis_engine::cmd::annotation::image::export_dataset(l)?)
+                } else if l.is_streamed() {
+                    Some(l.load_all()?)
+                } else {
+                    None
+                };
                 // In the layer's own coordinate system, as share.exportLayer writes a file.
                 let ds = whole.as_ref().unwrap_or(&l.dataset);
                 use rustgis_engine::data::io;
@@ -3939,7 +3947,13 @@ impl RustGisApp {
                 };
                 let ext = if ext == "shp" { "zip".to_string() } else { ext };
                 let name = format!("{}.{ext}", l.name);
-                let notes = rustgis_engine::data::export_notes([(ds, l.extent())], &name, crs);
+                let mut notes = rustgis_engine::data::export_notes([(ds, l.extent())], &name, crs);
+                if ds.annotation.is_some() && !matches!(ext.as_str(), "geojson" | "json") {
+                    notes.push(i18n::fmt(
+                        "{name}: 1 image binding and category palette omitted; use GeoJSON to retain annotation metadata.",
+                        &[("name", &name)],
+                    ));
+                }
                 let mut dbf_notes = Vec::new();
                 if ext == "zip" {
                     dbf_notes.extend(io::shapefile_names_note(&ds.fields, &name));
@@ -5628,6 +5642,10 @@ const MAX_STEP_BYTES: usize = 4 << 20;
 /// an optional `layer` that defaults to the active layer goes here, so a recorded step names it;
 /// `record_tests::every_optional_layer_is_classified` fails until it is placed here or there.
 const DEFAULTS_TO_ACTIVE_LAYER: &[&str] = &[
+    "annotation.openImage",
+    "annotation.saveImage",
+    "annotation.importClasses",
+    "annotation.obb",
     "annotation.tool",
     "annotation.addShape",
     "annotation.updateShape",

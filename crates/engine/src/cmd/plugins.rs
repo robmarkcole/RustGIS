@@ -365,6 +365,7 @@ impl Bridge<'_> {
         let limit = uint(p, "limit").and_then(|n| usize::try_from(n).ok()).unwrap_or(usize::MAX);
         let rows: Vec<usize> = if b(p, "selected") == Some(true) { l.selection.clone() } else { (0..l.dataset.features.len()).collect() };
         let ds = rustgis_data::Dataset {
+            annotation: l.dataset.annotation.clone(),
             name: l.name.clone(),
             geometry_type: l.dataset.geometry_type,
             fields: l.dataset.fields.clone(),

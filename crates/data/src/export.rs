@@ -125,7 +125,7 @@ fn write_chunks_to(
             return Err(DataError::Unsupported("GeoPackage in the browser".into()));
         }
         "geojson" | "json" => write_atomic_with(path, |out| {
-            let mut w = GeoJsonWriter::new(out, &layer.name, &layer.fields)?;
+            let mut w = GeoJsonWriter::new(out, &layer.name, &layer.fields, layer.annotation.as_ref())?;
             feed(&mut |features| w.write(features))?;
             w.finish()?;
             Ok::<_, DataError>(0)

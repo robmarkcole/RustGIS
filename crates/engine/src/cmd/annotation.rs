@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{cell::RefCell, rc::Rc};
 
+pub mod image;
 mod shapes;
 pub use shapes::{CIRCLE_SEGMENTS, MAX_VERTICES, SHAPE_RECORD, Shape, ShapeSpec};
 
@@ -22,6 +23,9 @@ pub struct Frame {
     pub crs: Crs,
     pub transform: GeoTransform,
     pub image: Option<String>,
+    /// Original TIFF grid for image-bound annotations, including rotation and skew.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub affine: Option<[f64; 6]>,
 }
 impl Default for Frame {
     fn default() -> Self {
@@ -29,6 +33,7 @@ impl Default for Frame {
             crs: Crs::WebMercator,
             transform: GeoTransform { origin_x: 0., origin_y: 0., pixel_width: 1., pixel_height: -1. },
             image: None,
+            affine: None,
         }
     }
 }
@@ -61,20 +66,37 @@ impl Frame {
         if r.crs.lacks_datum_shift() {
             return Err("reference raster needs a datum shift that this version cannot apply accurately".into());
         }
-        Ok(Self { crs: r.crs, transform: r.transform, image: Some(l.name.clone()) })
+        Ok(Self { crs: r.crs, transform: r.transform, image: Some(l.name.clone()), affine: None })
+    }
+    pub fn valid(&self) -> bool {
+        match self.affine {
+            Some([x, a, b, y, c, d]) => [x, a, b, y, c, d].iter().all(|v| v.is_finite()) && (a * d - b * c).is_normal(),
+            None => self.transform.is_valid(),
+        }
     }
     pub fn to_lonlat(&self, p: [f64; 2]) -> Option<Coord> {
-        if !self.transform.is_valid() {
+        if !self.valid() {
             return None;
         }
-        self.transformer()?.to_lonlat(self.transform.to_world(p[0], p[1]))
+        let world = match self.affine {
+            Some([x, a, b, y, c, d]) => Coord::new(x + a * p[0] + b * p[1], y + c * p[0] + d * p[1]),
+            None => self.transform.to_world(p[0], p[1]),
+        };
+        self.transformer()?.to_lonlat(world)
     }
     pub fn to_local(&self, c: Coord) -> Option<[f64; 2]> {
-        if !self.transform.is_valid() {
+        if !self.valid() {
             return None;
         }
         let c = self.transformer()?.from_lonlat(c)?;
-        let (x, y) = self.transform.to_pixel(c);
+        let (x, y) = match self.affine {
+            Some([ox, a, b, oy, cx, d]) => {
+                let det = a * d - b * cx;
+                let (dx, dy) = (c.x - ox, c.y - oy);
+                ((d * dx - b * dy) / det, (a * dy - cx * dx) / det)
+            }
+            None => self.transform.to_pixel(c),
+        };
         (x.is_finite() && y.is_finite()).then_some([x, y])
     }
 }
@@ -108,7 +130,7 @@ impl BoxSpec {
         if self.version != 1 {
             return Err("unsupported rotated-box metadata version".into());
         }
-        if !self.frame.transform.is_valid()
+        if !self.frame.valid()
             || self.frame.transformer().is_none()
             || self.frame.crs.lacks_datum_shift()
             || !self.center.iter().chain([&self.width, &self.height, &self.angle]).all(|v| v.is_finite() && v.abs() <= 1e10)
@@ -202,7 +224,7 @@ const DATA_ROLES: &[crate::ParamRole] = &[
 ];
 
 pub fn commands() -> Vec<C> {
-    vec![
+    let mut commands = vec![
         C::new("annotation.tool", "Choose Annotation Shape", "Annotate › Shapes", shapes::activate).roles(&[]).effects(crate::policy::Effects::NONE).view().when(super::design::need_editable)
             .params(r#"{"layer"?:name|id,"shape":"box"|"circle"|"polygon"|"point"}"#),
         C::new("annotation.addShape", "Add Annotation Shape", "Annotate › Shapes", shapes::add).inputs(super::design::new_feature_inputs).roles(DATA_ROLES).effects(crate::policy::Effects::NONE).when(super::design::need_editable)
@@ -217,7 +239,9 @@ pub fn commands() -> Vec<C> {
             .params(r#"{"layer"?, "box": {"version":1,"frame":{"crs":CRS,"transform":GeoTransform,"image":text|null},"center":[x,y],"width":number,"height":number,"angle":clockwise degrees}, "class"?:text}"#),
         C::new("annotation.updateBox","Update Rotated Box","Annotate › Shapes",update).roles(DATA_ROLES).effects(crate::policy::Effects::NONE).when(super::design::need_editable)
             .params(r#"{"layer"?,"row":number,"box": as annotation.addBox,"class"?:text}"#),
-    ]
+    ];
+    commands.extend(image::commands());
+    commands
 }
 /// Returns the configured class colour, including classes with no features yet.
 pub fn class_colors(s: &Session, id: u32) -> Vec<(String, rustgis_map::Rgba)> {
@@ -244,6 +268,9 @@ pub fn default_class_color(i: usize) -> rustgis_map::Rgba {
     palette.get(i % palette.len()).copied().unwrap_or(Rgba::rgb(59, 130, 246)).shade(1. - (i / palette.len()).min(7) as f64 * 0.08)
 }
 fn ensure_class(l: &mut rustgis_map::Layer, name: &str, color: Option<rustgis_map::Rgba>) -> Result<bool, String> {
+    if l.dataset.annotation.is_some() && name.trim().is_empty() {
+        return Err("choose a named class before adding image annotations".into());
+    }
     use rustgis_map::symbology::MAX_UNIQUE;
     use rustgis_map::{Ramp, Renderer};
     let converted = !matches!(&l.renderer, Renderer::Unique {field, expression:None, ..} if field.eq_ignore_ascii_case("class"));
@@ -285,6 +312,7 @@ fn ensure_class(l: &mut rustgis_map::Layer, name: &str, color: Option<rustgis_ma
             symbol.fill = c.with_alpha(45);
         }
     }
+    image::sync_palette(l)?;
     Ok(converted)
 }
 fn set_class(s: &mut Session, p: &Value) -> CmdResult {
@@ -367,6 +395,9 @@ fn parsed(p: &Value) -> Result<BoxSpec, String> {
 /// Validates the shared command and editor schema requirements.
 pub fn check_layer(s: &Session, id: u32) -> Result<(), String> {
     let l = s.map().layer(id).ok_or("no layer")?;
+    if l.dataset.annotation.as_ref().is_some_and(|m| m.version != 1) {
+        return Err("unsupported image annotation metadata version; update RustGIS".into());
+    }
     if l.is_streamed()
         || l.graphics
         || !matches!(l.geometry_type(), GeometryType::Polygon | GeometryType::Point)
@@ -419,6 +450,7 @@ fn add(s: &mut Session, p: &Value) -> CmdResult {
     let id = s.layer_id(p)?;
     check_layer(s, id)?;
     let b = parsed(p)?;
+    image::check_frame(s, id, &b.frame)?;
     let name = class(p)?.unwrap_or("");
     let converted = ensure_class(s.map_mut().layer_mut(id).ok_or("no layer")?, name, None)?;
     let g = b.geometry()?;
@@ -444,6 +476,7 @@ fn update(s: &mut Session, p: &Value) -> CmdResult {
     check_layer(s, id)?;
     let row = uint(p, "row").and_then(|r| usize::try_from(r).ok()).ok_or("row is required")?;
     let b = parsed(p)?;
+    image::check_frame(s, id, &b.frame)?;
     let g = b.geometry()?;
     let c = class(p)?;
     let converted = match c {
@@ -675,6 +708,7 @@ mod tests {
                 crs: Crs::Epsg(32631),
                 transform: GeoTransform { origin_x: 500_000., origin_y: 5_400_000., pixel_width: 0.5, pixel_height: -1.5 },
                 image: Some("test.tif".into()),
+                affine: None,
             },
             ..spec()
         };

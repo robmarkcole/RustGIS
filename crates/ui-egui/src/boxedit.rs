@@ -166,6 +166,9 @@ fn selected(app: &RustGisApp) -> Result<(u32, usize, BoxSpec), String> {
     Ok((id, row, BoxSpec::from_row(&l.dataset, row)?))
 }
 pub(crate) fn frame(app: &RustGisApp) -> Result<Frame, String> {
+    if let Some(f) = app.session.active_layer.and_then(|id| rustgis_engine::cmd::annotation::image::bound_frame(&app.session, id)) {
+        return Ok(f);
+    }
     app.boxes.reference.map_or_else(|| Ok(Frame::default()), |id| Frame::from_reference(&app.session, id))
 }
 fn run(app: &mut RustGisApp, id: &str, p: serde_json::Value) {
@@ -197,6 +200,12 @@ pub(crate) fn panel(app: &mut RustGisApp, ctx: &egui::Context) {
                     run(app, "annotation.newLayer", json!({}));
                 }
             }
+            let bound = app.session.active_layer.and_then(|id| app.session.map().layer(id)).and_then(|l|l.dataset.annotation.as_ref()).map(|m|m.image.clone());
+            if let Some(image) = bound {
+                ui.label(crate::i18n::fmt("Image: {name}", &[("name", &image.file_name)]));
+                ui.small(crate::i18n::fmt("Original pixels: {width} × {height}", &[("width", &image.width.to_string()), ("height", &image.height.to_string())]));
+                ui.small(tl!("All new annotations use this image's original pixel grid. The GeoJSON includes categories, colours and rotated-box corners."));
+            } else {
             let refs: Vec<_> = app.session.map().layers.iter().filter(|l| l.is_raster()).map(|l| (l.id, l.name.clone())).collect();
             let title = app
                 .boxes
@@ -227,6 +236,7 @@ pub(crate) fn panel(app: &mut RustGisApp, ctx: &egui::Context) {
             ui.small(tl!("Pixel coordinates use the loaded raster grid. Rotated source images are resampled by the reader."));
             if app.boxes.reference.is_none() {
                 ui.small(tl!("No image reference: annotations use Web Mercator grid metres, not ground metres."));
+            }
             }
             let class_label = ui.label(tl!("Class for new annotations"));
             ui.add(egui::TextEdit::singleline(&mut app.boxes.class).char_limit(200).hint_text(tl!("e.g. vehicle")))

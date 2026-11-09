@@ -582,7 +582,11 @@ pub(crate) fn layer_work(s: &Session, p: &Value) -> Result<Work, String> {
     let path = ps(p, "path").ok_or("path is required")?.to_string();
     // The layer as it is now: its features are shared, and a streamed one's source is read on the
     // export's thread.
-    let l = s.map().layer(id).ok_or("no layer")?.clone();
+    super::annotation::image::validate(s, id)?;
+    let mut l = s.map().layer(id).ok_or("no layer")?.clone();
+    if l.dataset.annotation.is_some() {
+        l.dataset = super::annotation::image::export_dataset(&l)?;
+    }
     let asked = ps(p, "crs").map(str::trim).filter(|c| !c.is_empty()).map(Crs::parse).transpose()?;
     // Checked now, so a bad table option is refused before the export starts.
     let ext = Path::new(&path).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
@@ -626,7 +630,12 @@ fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, gpkg: Gpk
         }
     };
     // A streamed layer's extent is its whole source's.
-    let notes = rustgis_data::export_notes([(ds, l.extent())], path, crs);
+    let mut notes = rustgis_data::export_notes([(ds, l.extent())], path, crs);
+    if ds.annotation.is_some() && !matches!(ext.as_str(), "geojson" | "json") {
+        notes.push(format!(
+            "{path}: 1 image binding and category palette omitted; use GeoJSON to retain image annotation metadata and OBB corners"
+        ));
+    }
     // A Shapefile (`.shp`, or zipped to `.zip`) cuts field names to dBase's.
     let shapefile = matches!(ext.as_str(), "shp" | "zip");
     let mut dbf_notes = Vec::new();

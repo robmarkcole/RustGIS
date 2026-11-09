@@ -32,7 +32,7 @@ impl ShapeSpec {
         if self.version != 1 {
             return Err("unsupported annotation metadata version".into());
         }
-        if !self.frame.transform.is_valid() || self.frame.crs.lacks_datum_shift() || self.frame.transformer().is_none() {
+        if !self.frame.valid() || self.frame.crs.lacks_datum_shift() || self.frame.transformer().is_none() {
             return Err("annotation needs a supported coordinate reference frame".into());
         }
         let convert = |p: [f64; 2]| -> Result<Coord, String> {
@@ -200,6 +200,7 @@ pub(super) fn add(s: &mut Session, p: &Value) -> CmdResult {
     let id = s.layer_id(p)?;
     check_layer(s, id)?;
     let shape = parsed(p)?;
+    image::check_frame(s, id, &shape.frame)?;
     let g = shape.geometry()?;
     let name = super::class(p)?.unwrap_or("");
     let converted = super::ensure_class(s.map_mut().layer_mut(id).ok_or("no layer")?, name, None)?;
@@ -222,6 +223,7 @@ pub(super) fn update(s: &mut Session, p: &Value) -> CmdResult {
     check_layer(s, id)?;
     let row = uint(p, "row").and_then(|r| usize::try_from(r).ok()).ok_or("row is required")?;
     let shape = parsed(p)?;
+    image::check_frame(s, id, &shape.frame)?;
     let old = ShapeSpec::from_row(&s.map().layer(id).ok_or("no layer")?.dataset, row)?;
     if old.frame != shape.frame || std::mem::discriminant(&old.shape) != std::mem::discriminant(&shape.shape) {
         return Err("an existing annotation's shape kind and reference frame cannot change".into());
