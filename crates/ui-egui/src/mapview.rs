@@ -2453,6 +2453,13 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
     if tool.is_annotation() {
         let space_pan = crate::boxedit::pan_gesture(app, ui, resp);
         if resp.dragged_by(egui::PointerButton::Middle) || space_pan {
+            if resp.hovered() || resp.is_pointer_button_down_on() {
+                ui.ctx().set_cursor_icon(if ui.input(|i| i.pointer.primary_down() || i.pointer.middle_down()) {
+                    egui::CursorIcon::Grabbing
+                } else {
+                    egui::CursorIcon::Grab
+                });
+            }
             let d = resp.drag_delta();
             if d != egui::Vec2::ZERO {
                 pan(app, f64::from(d.x), f64::from(d.y), w, h);

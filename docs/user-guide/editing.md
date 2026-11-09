@@ -258,8 +258,12 @@ to continue later. The target selector keeps subsequent annotations in that same
 - **Box:** drag to create; use the rotation paddle, side/corner handles and numeric controls below.
 
 **Space + drag** and middle-drag pan between annotations and during a polygon draft; the wheel
-zooms. Hold Alt to draw over an existing annotation. Escape cancels and returns to Pan. Each
-completed draw or drag is one undo step. Clicking an existing annotation chooses its shape tool.
+zooms. Space is a temporary override: release it to resume the same annotation tool, then click an
+existing annotation to edit it. A press begun with Space stays navigation through mouse release,
+even if Space is released first or the pointer moves too little to become a drag. A hand cursor
+marks navigation; the annotation cursor returns afterward. Hold Alt to draw over an existing
+annotation. Escape cancels and returns to Pan. Each completed draw or drag is one undo step.
+Clicking an existing annotation chooses its shape tool.
 
 Click an annotation, then choose **Delete Selected Annotation** in its controls, or press **Delete**
 while annotating. This removes only that object from its layer, preserving the layer, class palette

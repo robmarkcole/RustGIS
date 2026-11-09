@@ -541,10 +541,10 @@ fn manipulated(b: &BoxSpec, start: [f64; 2], p: [f64; 2], h: Handle, snap: bool)
     }
     out
 }
-/// A Space-started drag remains navigation until release, even if Space is released first.
+/// A Space-started press remains navigation through mouse release, even below the drag threshold.
 pub(crate) fn pan_gesture(app: &mut RustGisApp, ui: &Ui, resp: &egui::Response) -> bool {
     let space = ui.input(|i| i.key_down(egui::Key::Space)) && !ui.ctx().egui_wants_keyboard_input();
-    if (resp.drag_started_by(egui::PointerButton::Primary) || resp.dragged_by(egui::PointerButton::Primary)) && space {
+    if space && resp.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_down()) {
         app.boxes.panning = true;
         crate::shapeedit::cancel_drag(app);
         app.boxes.gesture = None;
@@ -1130,6 +1130,76 @@ mod tests {
         assert_eq!(h.state().session.map().layers.len(), 1);
         assert_eq!(l.dataset.features.len(), 2);
         assert_ne!(l.renderer.symbol_for(&l.dataset, 0).stroke, l.renderer.symbol_for(&l.dataset, 1).stroke);
+    }
+    #[test]
+    fn annotation_space_release_resumes_selection_and_editing_for_all_shapes() {
+        use rustgis_engine::cmd::annotation::{Shape, ShapeSpec};
+        for kind in ["box", "circle", "polygon", "point"] {
+            for space_first in [false, true] {
+                for delta in [vec2(0., 0.), vec2(80., 40.)] {
+                    let mut h = harness();
+                    let id = h.state().session.active_layer.unwrap();
+                    let frame = Frame::default();
+                    let shape = match kind {
+                        "circle" => Some(Shape::Circle { center: [0., 0.], radius: 40. }),
+                        "polygon" => Some(Shape::Polygon { vertices: vec![[-40., -40.], [40., -40.], [0., 40.]] }),
+                        "point" => Some(Shape::Point { position: [0., 0.] }),
+                        _ => None,
+                    };
+                    if let Some(shape) = shape {
+                        h.state_mut().run("annotation.addShape", json!({"shape":ShapeSpec{version:1,frame:frame.clone(),shape}})).unwrap();
+                    } else {
+                        let b = BoxSpec { version: 1, frame: frame.clone(), center: [0., 0.], width: 80., height: 50., angle: 25. };
+                        h.state_mut().run("annotation.addBox", json!({"box":b})).unwrap();
+                    }
+                    h.state_mut().run("annotation.tool", json!({"shape":kind})).unwrap();
+                    h.state_mut().run("select.clear", json!({})).unwrap();
+                    h.step();
+                    let tool = h.state().session.tool;
+                    let rect = h.state().map.view_rect.unwrap().0;
+                    let a = rect.center() - vec2(150., 90.);
+                    pointer(&mut h, a, None);
+                    let space = |h: &mut egui_kittest::Harness<'_, RustGisApp>, pressed| {
+                        h.event(egui::Event::Key {
+                            key: egui::Key::Space,
+                            physical_key: None,
+                            pressed,
+                            repeat: false,
+                            modifiers: egui::Modifiers::NONE,
+                        });
+                        h.step();
+                    };
+                    space(&mut h, true);
+                    assert_eq!(h.output().platform_output.cursor_icon, egui::CursorIcon::Grab);
+                    pointer(&mut h, a, Some(true));
+                    assert_eq!(h.output().platform_output.cursor_icon, egui::CursorIcon::Grabbing);
+                    pointer(&mut h, a + delta, None);
+                    if space_first {
+                        space(&mut h, false);
+                        pointer(&mut h, a + delta, Some(false));
+                    } else {
+                        pointer(&mut h, a + delta, Some(false));
+                        space(&mut h, false);
+                    }
+                    h.step();
+                    assert_eq!(h.state().session.tool, tool);
+                    assert_eq!(h.state().session.map().layer(id).unwrap().dataset.features.len(), 1, "{kind}, {space_first}, {delta:?}");
+                    assert!(h.state().map.popup.is_none());
+                    assert_eq!(h.output().platform_output.cursor_icon, egui::CursorIcon::Crosshair);
+                    let centre = lonlat_to_screen(h.state(), rect, frame.to_lonlat([0., 0.]).unwrap()).unwrap();
+                    click(&mut h, centre);
+                    assert_eq!(selected_row(h.state()).unwrap(), (id, 0));
+                    let before = h.state().session.map().layer(id).unwrap().dataset.features[0].geometry.clone();
+                    pointer(&mut h, centre, Some(true));
+                    pointer(&mut h, centre + vec2(15., 10.), None);
+                    pointer(&mut h, centre + vec2(15., 10.), Some(false));
+                    let layer = h.state().session.map().layer(id).unwrap();
+                    assert_eq!(layer.dataset.features.len(), 1);
+                    assert_ne!(layer.dataset.features[0].geometry, before);
+                    assert!(h.state().map.popup.is_none());
+                }
+            }
+        }
     }
     fn b() -> BoxSpec {
         BoxSpec { version: 1, frame: Frame::default(), center: [100., 200.], width: 80., height: 20., angle: 37. }
