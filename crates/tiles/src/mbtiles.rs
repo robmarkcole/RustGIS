@@ -322,6 +322,11 @@ pub fn info_ready(archive: &str, timeout: Duration) -> Result<Option<Arc<Info>>,
             let address = archive.to_string();
             let worker_key = key.clone();
             let still = crate::cache::current_still();
+            // Under way until the read is over, as a tile is: an export waits for it.
+            let counted = crate::cache::Counted::start();
+            // Spawned unlocked: a thread that can't start drops `counted` inside `spawn`, and that
+            // drop wakes the map, whose waker may ask for this file's metadata again.
+            drop(all);
             let spawned = std::thread::Builder::new().name("rustgis-mbtiles-info".into()).spawn(move || {
                 crate::cache::with_optional_still(still, || {
                     let result = crate::cache::check_still(&crate::cache::current_still()).and_then(|_| read_info(&address));
@@ -329,10 +334,14 @@ pub fn info_ready(archive: &str, timeout: Duration) -> Result<Option<Arc<Info>>,
                 });
                 pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&worker_key);
                 ready.notify_all();
-                crate::cache::notify();
+                // The map draws again with what it read, then the read no longer counts.
+                drop(counted);
             });
+            all = pending.lock().unwrap_or_else(|e| e.into_inner());
             if let Err(error) = spawned {
                 all.remove(&key);
+                // A caller that began waiting for it meanwhile stops waiting.
+                ready.notify_all();
                 return Err(format!("could not start an MBTiles metadata read: {error}"));
             }
         }

@@ -370,3 +370,51 @@ fn a_reload_between_series_pages_refuses_the_engine_pdf_without_replacing_destin
         assert!(pdf.starts_with(b"%PDF") && pdf.windows(b"/Count 2".len()).any(|part| part == b"/Count 2"));
     }
 }
+
+/// An archive's first read held on the thread that reads it (by the request's still check, asked
+/// there before the read): a complete render waits for that read, however long it is held, rather
+/// than running out of idle passes and drawing the archive as tiles still on their way.
+#[test]
+fn a_complete_render_waits_for_a_held_archive_read() {
+    for kind in [TileKind::PmTiles, TileKind::MbTiles] {
+        let dir = Fixture::new();
+        let path = dir.path().join(format!("held.{}", kind.code()));
+        archive(&path, kind, false);
+        let mut map = Map::new("Held");
+        map.graticule = false;
+        map.camera = Camera::new(data::Coord::new(0.0, 0.0), 100_000.0);
+        map.tiles.push(TileLayer::new("Held", kind, path.to_string_lossy()));
+        let view = render::View { width: 64.0, height: 64.0, pixels_per_point: 1.0, camera: map.camera, sky: false };
+        // A PMTiles archive is read by range on the tile workers, an MBTiles file's metadata on
+        // a thread of its own.
+        let reader = if kind == TileKind::PmTiles { "rustgis-tiles-" } else { "rustgis-mbtiles-info" };
+        let (paused, receive) = mpsc::sync_channel(1);
+        let resume = Arc::new(Barrier::new(2));
+        let held = Arc::new(AtomicBool::new(false));
+        let still: cache::Still = {
+            let resume = resume.clone();
+            Arc::new(move || {
+                if std::thread::current().name().is_some_and(|n| n.starts_with(reader)) && !held.swap(true, Ordering::SeqCst) {
+                    paused.send(()).unwrap();
+                    resume.wait();
+                }
+                true
+            })
+        };
+        let (placed, answer) = mpsc::channel();
+        let worker = std::thread::spawn(move || placed.send(cache::with_still(still, || render::render_placed(&mut map, &view))).unwrap());
+        receive.recv_timeout(std::time::Duration::from_secs(30)).unwrap();
+        let counted = cache::in_flight() > 0;
+        // Held far longer than six idle passes take: the render is still waiting for it.
+        let waited = answer.recv_timeout(std::time::Duration::from_millis(500)).is_err();
+        // Released before asserting, so a failure doesn't leave the reader on the barrier.
+        resume.wait();
+        assert!(counted, "a held {kind:?} read is under way");
+        assert!(waited, "the render gave up on a held {kind:?} read");
+        let placed = answer.recv_timeout(std::time::Duration::from_secs(60)).unwrap().unwrap();
+        worker.join().unwrap();
+        assert_eq!(placed.credits, ["Old archive credits"], "{kind:?}: {:?}", placed.gaps);
+        assert!(placed.pixmap.pixel(8, 8).unwrap().red() > 200, "{kind:?}: {:?}", placed.gaps);
+        assert!(placed.gaps.iter().all(|g| !g.contains("still on their way")), "{kind:?}: {:?}", placed.gaps);
+    }
+}

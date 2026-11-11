@@ -1735,6 +1735,28 @@ pub(crate) fn fetch_local(url: String, done: Done) {
     );
 }
 
+/// Work the map waits for that runs off the fetch workers (an MBTiles file's metadata, read on a
+/// thread of its own), counted in [`in_flight`] from [`Counted::start`] until dropped, as a fetch
+/// is: an export waiting for the map's tiles waits for it too. However it ends (answered, unwound
+/// by a panic, or its thread never started), the drop draws again and the count goes down once.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) struct Counted(());
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Counted {
+    pub(crate) fn start() -> Self {
+        IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
+        Self(())
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for Counted {
+    fn drop(&mut self) {
+        finished();
+    }
+}
+
 /// Something the map draws from arrived outside the cache (a PMTiles archive's header): draw
 /// again.
 pub(crate) fn notify() {
