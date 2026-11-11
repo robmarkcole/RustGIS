@@ -3995,7 +3995,7 @@ fn parts_left_out(url: &str, bytes: &[u8], p: &Value) -> Option<String> {
     if more > 0 {
         said.push(format!("and {more} more Shapefiles without some of theirs"));
     }
-    (!said.is_empty()).then(|| format!("{}: {}", crate::sources::redact(url), said.join("; ")))
+    (!said.is_empty()).then(|| format!("{}: {}", crate::sources::address_in_message(url), said.join("; ")))
 }
 
 /// A Shapefile by its `.shp` address, waited for (#1238): the `.shp`, then its `.dbf`, `.shx`,
@@ -4975,7 +4975,7 @@ fn add_download(s: &mut Session, p: &Value) -> CmdResult {
     }
     // No window landed for it: a whole file isn't added in a window's place.
     if p.get("window").is_some_and(Value::is_object) {
-        let shown = crate::sources::redact(&url);
+        let shown = crate::sources::address_in_message(&url);
         return Err(format!("{shown}: \"window\" is for a window the app read off the frame: use layer.addUrl with \"bbox\""));
     }
     // A download read already (an ArcGIS layer's protocol buffer pages, joined): added as read,

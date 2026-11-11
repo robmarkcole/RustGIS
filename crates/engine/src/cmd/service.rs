@@ -502,7 +502,7 @@ fn advertised_template_with(
     let mut doc = list.to_string();
     // Each fallback is said, as [`left_template`] says it.
     for _ in 0..2 {
-        let shown = crate::sources::redact(&doc);
+        let shown = crate::sources::address_in_message(&doc);
         if let Err(e) = crate::render::rustgis_tiles::address::check(&doc, Some(list)) {
             let e = crate::sources::message_with_address(&doc, &e);
             out.fallback = Some(format!("{shown}: this tile set document was refused, so the standard tile address is used: {e}"));
@@ -541,8 +541,10 @@ fn advertised_template_with(
             }
         }
     }
-    out.fallback =
-        Some(format!("{}: its tile sets lead on past two documents, so the standard tile address is used", crate::sources::redact(list)));
+    out.fallback = Some(format!(
+        "{}: its tile sets lead on past two documents, so the standard tile address is used",
+        crate::sources::address_in_message(list)
+    ));
     out
 }
 
@@ -561,7 +563,7 @@ fn left_template(s: &mut Session, source: &str, list: &str, vector: bool, withhe
     let mut out = AdvertisedTemplate { template: None, crossed_origin: crosses_origin(source, list), fallback: None };
     let mut doc = list.to_string();
     for _ in 0..2 {
-        let shown = crate::sources::redact(&doc);
+        let shown = crate::sources::address_in_message(&doc);
         if let Err(e) = crate::render::rustgis_tiles::address::check(&doc, Some(list)) {
             let e = crate::sources::message_with_address(&doc, &e);
             s.notify(format!("{shown}: this tile set document was refused, so the standard tile address is used: {e}"), false);
@@ -601,7 +603,10 @@ fn left_template(s: &mut Session, source: &str, list: &str, vector: bool, withhe
         }
     }
     s.notify(
-        format!("{}: its tile sets lead on past two documents, so the standard tile address is used", crate::sources::redact(list)),
+        format!(
+            "{}: its tile sets lead on past two documents, so the standard tile address is used",
+            crate::sources::address_in_message(list)
+        ),
         false,
     );
     Ok(LeftTemplate::Read(out))
@@ -1463,6 +1468,19 @@ mod tests {
         let next = json!({"tilesets":[{"tileMatrixSetId":"WebMercatorQuad","links":[{"rel":"self","href":"https://tiles-fallback.example.invalid/next"}]}]});
         let far = advertised_template_with(list, list, false, &mut withheld, |_| Ok(serde_json::to_vec(&next).unwrap_or_default()));
         assert!(far.fallback.as_ref().is_some_and(|n| n.contains("past two documents")), "{:?}", far.fallback);
+        // The address named in the notice says its secret query went; one without a query says nothing.
+        let keyed = "https://tiles-fallback.example.invalid/tiles?key=hunter2";
+        let far = advertised_template_with(keyed, keyed, false, &mut withheld, |_| Ok(serde_json::to_vec(&next).unwrap_or_default()));
+        let said = far.fallback.unwrap_or_default();
+        assert!(said.starts_with("https://tiles-fallback.example.invalid/tiles[query omitted]: its tile sets lead on past"), "{said}");
+        assert!(!said.contains("hunter2"), "{said}");
+        let bare = "https://tiles-fallback.example.invalid/tiles";
+        let far = advertised_template_with(bare, bare, false, &mut withheld, |_| Ok(serde_json::to_vec(&next).unwrap_or_default()));
+        let said = far.fallback.unwrap_or_default();
+        assert!(
+            said.starts_with("https://tiles-fallback.example.invalid/tiles: its tile sets lead on past") && !said.contains("omitted]"),
+            "{said}"
+        );
     }
 
     #[test]

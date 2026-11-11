@@ -431,9 +431,9 @@ fn same_tile(t: &rustgis_map::tiles::TileLayer, added: &rustgis_map::tiles::Tile
 fn not_started(cancelled: &[String]) -> String {
     match cancelled {
         [] => String::new(),
-        [one] => format!("; its download of {} wasn't started, and won't be", crate::sources::redact(one)),
+        [one] => format!("; its download of {} wasn't started, and won't be", crate::sources::address_in_message(one)),
         many => {
-            let shown: Vec<_> = many.iter().map(|u| crate::sources::redact(u)).collect();
+            let shown: Vec<_> = many.iter().map(|u| crate::sources::address_in_message(u)).collect();
             format!("; its {} downloads not yet started won't be: {}", many.len(), shown.join(", "))
         }
     }
@@ -546,7 +546,7 @@ impl UrlWaits {
         let mut addresses = Vec::new();
         for (n, asked) in late {
             self.land(n, Err(format!("no download in {} minutes", REQUEST_WAIT.as_secs() / 60)), Added::default());
-            addresses.extend(asked["url"].as_str().map(crate::sources::redact));
+            addresses.extend(asked["url"].as_str().map(crate::sources::address_in_message));
             self.remember_given_up(n, asked);
         }
         addresses
@@ -1242,7 +1242,7 @@ mod tests {
         s.poll_plugin_retries();
         let said: Vec<_> = s.notices_since(mark).iter().filter(|n| n.error && n.text.contains("stopped waiting")).collect();
         assert_eq!(said.len(), 1, "{said:?}");
-        assert!(said[0].text.starts_with("https://x.org/slow.csv") && !said[0].text.contains("hunter2"));
+        assert!(said[0].text.starts_with("https://x.org/slow.csv[query omitted]: no download") && !said[0].text.contains("hunter2"));
         // A real late claim is refused before its bytes can add anything.
         let id = s.download_started_for(&taken[0]).unwrap();
         assert!(s.download_landed(id, b"x,y\n1,2\n".to_vec()));
@@ -1259,8 +1259,9 @@ mod tests {
         assert_eq!(said.len(), 1, "{said:?}");
         assert!(
             said[0].text.starts_with("2 downloads")
-                && said[0].text.contains("https://x.org/a.csv")
+                && said[0].text.contains("https://x.org/a.csv[query omitted]")
                 && said[0].text.contains("https://x.org/b.csv")
+                && !said[0].text.contains("b.csv[")
         );
         assert!(!said[0].text.contains("hunter2"));
         rustgis_plugins::unload("eng-slow-real");
@@ -1365,8 +1366,21 @@ mod tests {
         for cancelled in
             [vec!["https://x.org/a?token=hunter2".into()], vec!["https://x.org/a?token=hunter2".into(), "https://x.org/b".into()]]
         {
-            assert!(!not_started(&cancelled).contains("hunter2"));
+            let said = not_started(&cancelled);
+            assert!(!said.contains("hunter2") && said.contains("https://x.org/a[query omitted]"), "{said}");
+            // A second address with nothing taken out is named as it is.
+            assert_eq!(said.contains("https://x.org/b"), cancelled.len() == 2, "{said}");
         }
+        for clean in [vec!["https://x.org/a".into()], vec!["https://x.org/a".into(), "https://x.org/b".into()]] {
+            assert!(!not_started(&clean).contains("omitted]"), "no query went, none said");
+        }
+        // A notice's own redaction already drops a public query and says so, whatever composed it:
+        // naming the address with `address_in_message` changes that for secret queries only.
+        let public = "https://x.org/wms?LAYER=a";
+        let old = Session::redacted(&format!("its download of {} wasn't started", crate::sources::redact(public)));
+        let new = Session::redacted(&format!("its download of {} wasn't started", crate::sources::address_in_message(public)));
+        assert_eq!(old.as_str(), new.as_str());
+        assert!(new.as_str().contains("https://x.org/wms[query omitted]"), "{}", new.as_str());
     }
 
     /// Sharing is bounded by the original plugin incarnation; duplicate clicks of that owner

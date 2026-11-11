@@ -14474,6 +14474,7 @@ fn shapefile_by_its_shp_address() {
         parts.iter().map(|(e, b)| (format!("/PI/TERESINA/HIDROGRAFIA/PI_2211001_RIOS.{e}?token=1"), b.clone())).collect();
     // The same without its .prj and .cpg, and one without its .dbf.
     files.extend(parts.iter().filter(|(e, _)| !matches!(*e, "prj" | "cpg")).map(|(e, b)| (format!("/plain/rios.{e}"), b.clone())));
+    files.extend(parts.iter().filter(|(e, _)| !matches!(*e, "prj" | "cpg")).map(|(e, b)| (format!("/keyed/rios.{e}?token=zz"), b.clone())));
     files.extend(parts.iter().filter(|(e, _)| *e != "dbf").map(|(e, b)| (format!("/nodbf/rios.{e}"), b.clone())));
     files.extend(parts.iter().filter(|(e, _)| *e != "shx").map(|(e, b)| (format!("/noshx/rios.{e}"), b.clone())));
     // One whose signature doesn't cover its .prj, and one whose address answers with its parts zipped.
@@ -14518,6 +14519,7 @@ fn shapefile_by_its_shp_address() {
     assert_eq!(r["features"], 1, "{r}");
     let said = &s.notices.last().unwrap().text;
     assert!(said.contains("no .prj, .cpg found or readable beside it (2 of 3") && said.contains("longitude/latitude"), "{said}");
+    assert!(said.contains("/plain/rios.shp: rios.shp: no .prj") && !said.contains("omitted]"), "{said}");
     // Their 404s are expected: noted once for the server, not recorded as failed requests.
     let records = s.diagnostics.records();
     let failed = |r: &&rustgis_data::diagnostics::Record| {
@@ -14529,6 +14531,10 @@ fn shapefile_by_its_shp_address() {
     s.run("layer.addUrl", &json!({"url": format!("{base}/plain/rios.shp"), "name": "Com crs", "crs": "EPSG:31983"})).unwrap();
     let said = &s.notices.last().unwrap().text;
     assert!(said.contains("no .prj, .cpg found or readable beside it") && !said.contains("longitude/latitude"), "{said}");
+    // A secret query taken out of the address in the notice is said; no query, no marker.
+    s.run("layer.addUrl", &json!({"url": format!("{base}/keyed/rios.shp?token=zz"), "name": "Keyed", "crs": "EPSG:31983"})).unwrap();
+    let said = &s.notices.last().unwrap().text;
+    assert!(said.contains("/keyed/rios.shp[query omitted]: rios.shp: no .prj") && !said.contains("zz"), "{said}");
     // A long name keeps its extension (and is still a .shp's zip).
     let long = crate::cmd::layer::url_file_name(&format!("https://x.org/{}.shp", "a".repeat(200)), b"PK\x03\x04").unwrap();
     assert!(long.ends_with(".zip") && long.chars().count() <= 120, "{long}");
@@ -35471,6 +35477,12 @@ fn a_cog_windows_read_is_apart_from_adding_it() {
     assert!(s.download_landed(id, b"{}".to_vec()));
     let e = s.run("layer.addDownload", &json!({"id": id, "url": url, "window": {"bbox": [1, 2, 3, 4]}})).unwrap_err();
     assert!(e.contains("\"window\" is for") && !e.contains("hidden-1330"), "{e}");
+    assert!(e.contains("scene.tif[query omitted]: \"window\" is for"), "{e}");
+    let id = s.download_started();
+    assert!(s.download_landed(id, b"{}".to_vec()));
+    let plain = url.split('?').next().unwrap_or(&url).to_string();
+    let e = s.run("layer.addDownload", &json!({"id": id, "url": plain, "window": {"bbox": [1, 2, 3, 4]}})).unwrap_err();
+    assert!(e.contains("scene.tif: \"window\" is for") && !e.contains("omitted]"), "no query went, none said: {e}");
     // A project opened while it was read: it isn't kept to be added.
     let read = read_cog_window(&window_asked(&s, &p).unwrap()).unwrap();
     let id = s.download_started();
