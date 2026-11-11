@@ -25,7 +25,13 @@ pub(crate) struct Done {
     /// It was stopped part-way ([`TiltSettle::cancel`]): no frame, but nothing wrong with it.
     pub cancelled: bool,
     pub archives: render::ArchiveRevision,
+    /// What [`TiltSettle::start_prepared`]'s `prepare` made of the frame on the worker (a GPU
+    /// scene's buffers, uploaded there instead of on the UI thread).
+    pub prepared: Option<Prepared>,
 }
+
+/// What a worker made of its finished frame, for the caller that asked for it to read back.
+pub(crate) type Prepared = Box<dyn std::any::Any + Send>;
 
 /// The frame being drawn (at most one at a time), and what it is for.
 pub(crate) struct TiltSettle<K> {
@@ -69,7 +75,7 @@ fn draw(mut map: Map, view: View, backend: Backend, stop: Stop) -> Done {
     // Stopped only if it came back without a picture: a stop after the renderer's last look
     // leaves a finished frame.
     let cancelled = rendered.is_none() && stop.load(std::sync::atomic::Ordering::Relaxed);
-    Done { rendered, view, map, ms: t0.elapsed().as_millis() as u64, incomplete, cancelled, archives }
+    Done { rendered, view, map, ms: t0.elapsed().as_millis() as u64, incomplete, cancelled, archives, prepared: None }
 }
 
 impl<K: Copy + PartialEq> TiltSettle<K> {
@@ -107,6 +113,29 @@ impl<K: Copy + PartialEq> TiltSettle<K> {
         let stop = Stop::default();
         let flag = stop.clone();
         self.start_with(ctx, key, stop, move || draw(map, view, backend, flag));
+    }
+
+    /// [`TiltSettle::start_backend`], then `prepare` on the worker with the finished frame (not
+    /// one stopped meanwhile): what it returns comes back as [`Done::prepared`]. Uploading a GPU
+    /// scene's buffers takes as long as drawing a detailed one, so that is done there too (#1750).
+    pub fn start_prepared(
+        &mut self,
+        ctx: &egui::Context,
+        key: K,
+        map: Map,
+        view: View,
+        backend: Backend,
+        prepare: impl FnOnce(&Done) -> Option<Prepared> + Send + 'static,
+    ) {
+        let stop = Stop::default();
+        let flag = stop.clone();
+        self.start_with(ctx, key, stop, move || {
+            let mut done = draw(map, view, backend, flag.clone());
+            if !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                done.prepared = prepare(&done);
+            }
+            done
+        });
     }
 
     /// Asks the frame being drawn to stop (it is out of date): the renderer looks between layers,
