@@ -229,7 +229,10 @@ fn draw_page(
                 // A frame larger than the page budget is drawn at a lower resolution and scaled up.
                 let fppp = ppp.min((MAX_PIXELS / (fw * fh).max(1.0)).sqrt()).max(0.01);
                 let view = View { width: fw, height: fh, pixels_per_point: fppp, camera: cam, sky: false };
-                let Some(mut frame_pm) = frame_canvas(map, cam, fw, fh, fppp, pm.is_recording(), pending) else {
+                // The grid is drawn with the frame's map, before its attribution, which keeps
+                // clear of the grid's labels.
+                let grid = grid.as_ref().map(|g| (g, layout.decimal_comma));
+                let Some(mut frame_pm) = frame_canvas(map, cam, fw, fh, fppp, pm.is_recording(), pending, grid) else {
                     if frame_requires_complete(map, &view) {
                         return None;
                     }
@@ -242,15 +245,12 @@ fn draw_page(
                     frame_pm.overflowed() || pm.recorded_cost().saturating_add(frame_pm.recorded_cost()) > crate::vector::max_cost();
                 if frame_pm.is_recording()
                     && too_large
-                    && let Some(pixels) = frame_canvas(map, cam, fw, fh, fppp, false, pending)
+                    && let Some(pixels) = frame_canvas(map, cam, fw, fh, fppp, false, pending, grid)
                 {
                     frame_pm = pixels;
                     if let Some(list) = record.as_deref_mut() {
                         list.push((e.id, e.name.clone()));
                     }
-                }
-                if let Some(g) = grid {
-                    draw_grid(&mut frame_pm, map, &view, g, layout.decimal_comma);
                 }
                 if let Some(other) = extent_of.and_then(frame)
                     && let Some(om) = maps.get(other.1)
@@ -470,19 +470,29 @@ fn draw_page(
 /// page needs them all. Refuses a linked archive changed during the complete frame.
 pub fn frame_map(map: &mut Map, camera: rustgis_map::Camera, w: f64, h: f64, ppp: f64) -> Result<Pixmap, String> {
     let revisions = crate::archive_revisions([&*map]);
-    let result = frame_canvas(map, camera, w, h, ppp, false, &mut false).map(Canvas::into_pixmap);
+    let result = frame_canvas(map, camera, w, h, ppp, false, &mut false, None).map(Canvas::into_pixmap);
     revisions.finish([&*map], result, "could not draw the map frame")
 }
 
 /// [`frame_map`] on a canvas: one that records (see [`crate::canvas`]) when `record` and the
-/// frame can be kept as vectors (flat, north up, without view effects), else its pixels.
+/// frame can be kept as vectors (flat, north up, without view effects), else its pixels; with
+/// `grid` (and whether the layout writes a decimal comma) drawn on it under the attribution.
 /// `pending` is set when some of its tiles, or a read of its streamed layers or rasters, were
 /// still on their way (in the browser, which doesn't wait for them).
-fn frame_canvas(map: &mut Map, camera: rustgis_map::Camera, w: f64, h: f64, ppp: f64, record: bool, pending: &mut bool) -> Option<Canvas> {
+fn frame_canvas(
+    map: &mut Map,
+    camera: rustgis_map::Camera,
+    w: f64,
+    h: f64,
+    ppp: f64,
+    record: bool,
+    pending: &mut bool,
+    grid: Option<(&Grid, bool)>,
+) -> Option<Canvas> {
     let view = View { width: w, height: h, pixels_per_point: ppp, camera, sky: false };
     let img = if record { crate::render_complete_recorded(map, &view) } else { crate::render_complete(map, &view) }?;
     *pending |= img.tiles_pending || img.data_pending;
-    Some(finish_frame(img, ppp))
+    Some(finish_frame(img, ppp, grid.map(|(g, comma)| (&*map, &view, g, comma))))
 }
 
 /// [`frame_map`] without waiting for tiles still on their way, for a preview drawn while the
@@ -490,18 +500,62 @@ fn frame_canvas(map: &mut Map, camera: rustgis_map::Camera, w: f64, h: f64, ppp:
 /// under the pointer.
 pub fn frame_map_preview(map: &mut Map, camera: rustgis_map::Camera, w: f64, h: f64, ppp: f64) -> Option<Pixmap> {
     let view = View { width: w, height: h, pixels_per_point: ppp, camera, sky: false };
-    crate::render(map, &view).map(|img| finish_frame(img, ppp).into_pixmap())
+    crate::render(map, &view).map(|img| finish_frame(img, ppp, None).into_pixmap())
 }
 
-/// A rendered frame map with its labels and attribution drawn on it: on its recording when it
-/// was recorded, else on its pixels.
-fn finish_frame(img: crate::Rendered, ppp: f64) -> Canvas {
+/// A rendered frame map with its labels, its `grid` (drawn on `map` in `view`, with a decimal
+/// comma or not) and its attribution drawn on it: on its recording when it was recorded, else on
+/// its pixels. The attribution keeps clear of the grid's labels.
+fn finish_frame(img: crate::Rendered, ppp: f64, grid: Option<(&Map, &View, &Grid, bool)>) -> Canvas {
     let mut pm = img.recorded.unwrap_or_else(|| Canvas::from_pixmap(img.pixmap));
     for l in img.unplaced.iter().chain(&img.labels) {
         text::draw(&mut pm, l, ppp as f32);
     }
-    crate::draw_attribution(&mut pm, &img.attribution, ppp as f32);
+    let labels = grid.map(|(map, view, g, comma)| draw_grid(&mut pm, map, view, g, comma)).unwrap_or_default();
+    let (w, h) = (pm.width() as f32 / ppp as f32, pm.height() as f32 / ppp as f32);
+    let inset = crate::attribution_text(&img.attribution).map_or((0.0, 0.0), |(_, tw)| attribution_inset((w, h), tw, &labels));
+    crate::draw_attribution(&mut pm, &img.attribution, ppp as f32, inset);
     pm
+}
+
+/// How far further in (up from the bottom, in from the right, in points) the attribution `tw`
+/// points wide goes on a frame `w` × `h` points, so it covers none of the grid's bottom and right
+/// `labels` (each one's edge, and its box in points: left, top, right, bottom). It goes above a
+/// bottom label under it. Beside a right label, it goes left of it when it still fits in the frame
+/// there, else above it; when neither fits, as far left as the frame holds it. Where none is in
+/// the way, it stays in the corner.
+fn attribution_inset((w, h): (f32, f32), tw: f32, labels: &[(Edge, [f32; 4])]) -> (f32, f32) {
+    let size = crate::ATTRIBUTION_SIZE;
+    // Half the credit's height, its halo included, and the gap it keeps from a label.
+    let (half, gap) = (size * 0.8, 2.0);
+    let (mut bottom, mut right) = (0.0f32, 0.0f32);
+    // The credit's foot set `gap` above a label's top `y`: how far up from the bottom that is.
+    let above = |y: f32| h - size * 0.9 + half - y + gap;
+    // Each move clears the label for good (the credit only goes up and left), so each label is
+    // met once at most; the last resort ends the search.
+    for _ in 0..=labels.len() {
+        // Its whole width, where it is drawn: a credit wider than the frame runs past both edges.
+        let (cx, cy) = (crate::attribution_center(w, tw, right), h - bottom - size * 0.9);
+        let (x0, x1, y0, y1) = (cx - tw / 2.0, cx + tw / 2.0, cy - half, cy + half);
+        let hit = labels
+            .iter()
+            .filter(|(e, _)| matches!(e, Edge::Bottom | Edge::Right))
+            .find(|(_, b)| x0 < b[2] && b[0] < x1 && y0 < b[3] && b[1] < y1);
+        match hit {
+            // Left of the label, its right end `gap` short of it, when all of it stays in.
+            Some((Edge::Right, b)) if b[0] - gap - tw >= 0.0 => right += x1 - (b[0] - gap),
+            // Above the label, when all of it stays in.
+            Some((Edge::Right, b)) if b[1] - gap - 2.0 * half >= 0.0 => bottom = above(b[1]),
+            // Neither: as far left as the frame holds it (a credit wider than the frame stays put).
+            Some((Edge::Right, _)) => {
+                right += x0.max(0.0);
+                break;
+            }
+            Some((_, b)) => bottom = above(b[1]),
+            None => break,
+        }
+    }
+    (bottom, right)
 }
 
 /// Expands layout text tokens: the page ones here, the map ones from the first frame.
@@ -1067,8 +1121,9 @@ fn nice_step(span: f64, smallest: f64) -> f64 {
 
 /// A grid over a frame: lines across it, ticks along its edges or both, labelled at the edges the
 /// grid names. A graticule's lines are latitudes and longitudes; a measured grid's are eastings and
-/// northings in its coordinate system, bent through it onto the map.
-fn draw_grid(pm: &mut Canvas, map: &Map, view: &View, g: &Grid, comma: bool) {
+/// northings in its coordinate system, bent through it onto the map. Gives the labels drawn: each
+/// one's edge and its box in points (left, top, right, bottom).
+fn draw_grid(pm: &mut Canvas, map: &Map, view: &View, g: &Grid, comma: bool) -> Vec<(Edge, [f32; 4])> {
     let ppp = view.pixels_per_point as f32;
     let (w, h) = (view.width, view.height);
     // The frame's edges in longitude/latitude: its corners and points along each side.
@@ -1083,7 +1138,7 @@ fn draw_grid(pm: &mut Canvas, map: &Map, view: &View, g: &Grid, comma: bool) {
         ext.expand(*c);
     }
     if ext.is_empty() {
-        return;
+        return Vec::new();
     }
     // Each line: its points in longitude/latitude, its label, and whether it runs north–south
     // (labelled along the top and bottom first).
@@ -1102,7 +1157,7 @@ fn draw_grid(pm: &mut Canvas, map: &Map, view: &View, g: &Grid, comma: bool) {
         }
         GridKind::Measured => {
             let center = map.to_lonlat(view.camera.to_map(w / 2.0, h / 2.0, w, h)).unwrap_or_else(|| ext.center());
-            let Some(tr) = measured_crs(g, map, center).and_then(|c| c.transformer().ok()) else { return };
+            let Some(tr) = measured_crs(g, map, center).and_then(|c| c.transformer().ok()) else { return Vec::new() };
             measured_lines(g, &tr, &lonlats, comma, &mut lines);
         }
     }
@@ -1168,17 +1223,27 @@ fn draw_grid(pm: &mut Canvas, map: &Map, view: &View, g: &Grid, comma: bool) {
         Edge::Left | Edge::Right if !vertical => label_px,
         _ => text::measure(s, label_px / 1.33, false),
     };
+    let mut drawn = Vec::new();
     for (edge, at, s) in kept_labels(labels, (pw, ph), along, label_px, ppp) {
         let tw = text::measure(&s, label_px / 1.33, false);
-        match edge {
-            Edge::Top => text::text_at(pm, &s, at, inset + label_px * 0.4, label_px, label_color, false, text::Align::Center, true),
-            Edge::Bottom => text::text_at(pm, &s, at, ph - inset - label_px * 0.4, label_px, label_color, false, text::Align::Center, true),
-            Edge::Left if vertical => rotated_text(pm, &s, inset + label_px * 0.4, at, label_px, label_color),
-            Edge::Right if vertical => rotated_text(pm, &s, pw - inset - label_px * 0.4, at, label_px, label_color),
-            Edge::Left => text::text_at(pm, &s, inset, at, label_px, label_color, false, text::Align::Left, true),
-            Edge::Right => text::text_at(pm, &s, pw - inset - tw, at, label_px, label_color, false, text::Align::Left, true),
+        // Its centre, and half its size across and down (its halo and descenders included).
+        let (flat, upright) = ((tw / 2.0, label_px * 0.6), (label_px * 0.6, tw / 2.0));
+        let (cx, cy, (hw, hh)) = match edge {
+            Edge::Top => (at, inset + label_px * 0.4, flat),
+            Edge::Bottom => (at, ph - inset - label_px * 0.4, flat),
+            Edge::Left if vertical => (inset + label_px * 0.4, at, upright),
+            Edge::Right if vertical => (pw - inset - label_px * 0.4, at, upright),
+            Edge::Left => (inset + tw / 2.0, at, flat),
+            Edge::Right => (pw - inset - tw / 2.0, at, flat),
+        };
+        if matches!(edge, Edge::Left | Edge::Right) && vertical {
+            rotated_text(pm, &s, cx, cy, label_px, label_color);
+        } else {
+            text::text_at(pm, &s, cx, cy, label_px, label_color, false, text::Align::Center, true);
         }
+        drawn.push((edge, [(cx - hw) / ppp, (cy - hh) / ppp, (cx + hw) / ppp, (cy + hh) / ppp]));
     }
+    drawn
 }
 
 /// The graticule labels drawn, of those at each edge crossing (`labels`: edge, place along it,
@@ -3815,6 +3880,135 @@ mod tests {
         let vertical = grid_page(g(GridEdges { top: false, bottom: false, left: true, right: false }, Orientation::Vertical));
         assert!(count(&vertical, left, ink) > 0);
         assert!(across(&vertical) < across(&horizontal), "{} columns, against {}", across(&vertical), across(&horizontal));
+    }
+
+    /// A tile layer's credit on a frame with a labelled grid (#1767): in the bottom-right corner,
+    /// where it was drawn, it runs over the bottom labels; the frame moves it clear of every label,
+    /// whichever edges carry them and however the side ones run, and leaves the labels as the grid
+    /// drew them.
+    #[test]
+    fn a_frames_attribution_keeps_clear_of_its_grid_labels() {
+        use rustgis_map::layout::{Grid, GridEdges};
+        let (fw, fh, ppp) = (80.0 * PT_PER_MM, 80.0 * PT_PER_MM, 2.0);
+        let map = Map::new("m");
+        let view = View {
+            width: fw,
+            height: fh,
+            pixels_per_point: ppp,
+            camera: frame_camera(&map, Coord::new(0.0, 0.0), 2e8, 0.0, 0.0),
+            sky: false,
+        };
+        let credit = vec!["© OpenStreetMap contributors".to_string()];
+        let white = || {
+            let mut pm = Pixmap::new((fw * ppp) as u32, (fh * ppp) as u32).unwrap();
+            pm.fill(tiny_skia::Color::WHITE);
+            pm
+        };
+        // Whether each pixel is darkened by text, antialiased edges included.
+        let shaded = |pm: &Pixmap| pm.pixels().iter().map(|p| p.red() < 200 && p.green() < 200 && p.blue() < 200).collect::<Vec<_>>();
+        let grid =
+            |edges, label_orientation| Grid { step: 30.0, color: Rgba::new(0, 0, 0, 0), edges, label_orientation, ..Grid::default() };
+        // The grid's labels and the credit, each on its own frame (the credit `inset` from the
+        // corner, else where the frame puts it); the pixels both darken.
+        let overlap = |g: &Grid, credit: &[String], inset: Option<(f32, f32)>| {
+            let mut labels_pm = Canvas::from_pixmap(white());
+            let labels = draw_grid(&mut labels_pm, &map, &view, g, false);
+            assert!(!labels.is_empty());
+            let (w, h) = (fw as f32, fh as f32);
+            let tw = crate::attribution_text(credit).unwrap().1;
+            let inset = inset.unwrap_or_else(|| attribution_inset((w, h), tw, &labels));
+            let mut credit_pm = Canvas::from_pixmap(white());
+            crate::draw_attribution(&mut credit_pm, credit, ppp as f32, inset);
+            shaded(labels_pm.pixmap()).iter().zip(shaded(credit_pm.pixmap())).filter(|(a, b)| **a && *b).count()
+        };
+        let default = grid(GridEdges::default(), Orientation::Horizontal);
+        assert!(overlap(&default, &credit, Some((0.0, 0.0))) > 20, "in the corner, the credit runs over the bottom labels");
+        for (bottom, right) in [(true, false), (true, true), (false, true)] {
+            for orientation in [Orientation::Horizontal, Orientation::Vertical] {
+                let g = grid(GridEdges { top: true, bottom, left: true, right }, orientation);
+                assert_eq!(overlap(&g, &credit, None), 0, "bottom {bottom}, right {right}, {orientation:?}");
+            }
+        }
+        // A credit wider than the frame (several layers' credits, a narrow frame) runs past both
+        // edges; it keeps clear of the bottom and right labels all the same.
+        let long = vec![
+            "© OpenStreetMap contributors".to_string(),
+            "MapBiomas, sistemas de irrigação (CC BY 4.0)".to_string(),
+            "Instituto Brasileiro de Geografia e Estatística".to_string(),
+        ];
+        assert!(crate::attribution_text(&long).unwrap().1 > fw as f32);
+        for (bottom, right) in [(true, true), (false, true)] {
+            for orientation in [Orientation::Horizontal, Orientation::Vertical] {
+                let g = grid(GridEdges { top: false, bottom, left: false, right }, orientation);
+                assert_eq!(overlap(&g, &long, None), 0, "long credit: bottom {bottom}, right {right}, {orientation:?}");
+            }
+        }
+        // Drawn with the frame's map: the labels' pixels are the grid's alone.
+        let mut labels_pm = Canvas::from_pixmap(white());
+        let all = grid(GridEdges { top: false, bottom: true, left: false, right: true }, Orientation::Horizontal);
+        let labels = draw_grid(&mut labels_pm, &map, &view, &all, false);
+        let img = crate::Rendered {
+            pixmap: white(),
+            labels: Vec::new(),
+            unplaced: Vec::new(),
+            attribution: credit.clone(),
+            tiles_pending: false,
+            data_pending: false,
+            tile_errors: Vec::new(),
+            partial: Vec::new(),
+            pending_in_place: Vec::new(),
+            recorded: None,
+        };
+        let framed = finish_frame(img, ppp, Some((&map, &view, &all, false)));
+        let (a, b) = (labels_pm.pixmap(), framed.pixmap());
+        assert_ne!(a.data(), b.data(), "the credit is drawn");
+        for (_, [x0, y0, x1, y1]) in &labels {
+            let px = |v: f32| (v * ppp as f32) as u32;
+            for (x, y) in (px(*y0)..px(*y1)).flat_map(|y| (px(*x0)..px(*x1)).map(move |x| (x, y))) {
+                assert_eq!(a.pixel(x, y), b.pixel(x, y), "({x}, {y})");
+            }
+        }
+    }
+
+    /// The credit stays in the corner with nothing under it, goes up above a bottom label and left
+    /// of a right one (above it, when going left would take it out of the frame), and pays no heed
+    /// to the top and left labels.
+    #[test]
+    fn attribution_inset_steps_round_the_labels_in_its_way() {
+        let (size, tw) = ((200.0, 100.0), 60.0);
+        assert_eq!(attribution_inset(size, tw, &[]), (0.0, 0.0));
+        // A bottom label under the credit, another left of it.
+        let under = [(Edge::Bottom, [150.0, 88.0, 170.0, 98.0]), (Edge::Bottom, [40.0, 88.0, 60.0, 98.0])];
+        let (bottom, right) = attribution_inset(size, tw, &under);
+        assert_eq!(right, 0.0);
+        // The credit's foot (its centre plus half its height) sits 2 points over the label's top.
+        assert!((100.0 - bottom - crate::ATTRIBUTION_SIZE * 0.9 + crate::ATTRIBUTION_SIZE * 0.8 - 86.0).abs() < 1e-3, "{bottom}");
+        // A right label beside it once it is up: it moves left of it too.
+        let both = [under[0], (Edge::Right, [180.0, 70.0, 197.0, 82.0])];
+        let (b2, r2) = attribution_inset(size, tw, &both);
+        assert_eq!(b2, bottom);
+        assert!((200.0 - r2 - 4.0 - 178.0).abs() < 1e-3, "{r2}");
+        // Labels on the other edges are not in its way.
+        let others = [(Edge::Left, [130.0, 88.0, 196.0, 98.0]), (Edge::Top, [130.0, 88.0, 196.0, 98.0])];
+        assert_eq!(attribution_inset(size, tw, &others), (0.0, 0.0));
+        // Left of a right label it would leave the frame (180 points from x = 16, a label at
+        // x = 163, it would start at x = -19): it goes above the label instead, still in the
+        // corner's column.
+        let side = [(Edge::Right, [163.0, 85.0, 197.0, 97.0])];
+        let (b3, r3) = attribution_inset(size, 180.0, &side);
+        assert_eq!(r3, 0.0);
+        assert!((100.0 - b3 - crate::ATTRIBUTION_SIZE * 0.9 + crate::ATTRIBUTION_SIZE * 0.8 - 83.0).abs() < 1e-3, "{b3}");
+        // No room above it either (a frame 20 points tall): as far left as the frame holds it,
+        // starting at its left edge.
+        let low = [(Edge::Right, [163.0, 3.0, 197.0, 15.0])];
+        let (b4, r4) = attribution_inset((200.0, 20.0), 180.0, &low);
+        assert_eq!(b4, 0.0);
+        assert!((crate::attribution_center(200.0, 180.0, r4) - 90.0).abs() < 1e-3, "{r4}");
+        // Wider than the frame: never left (it can't fit), above the label when there is room.
+        let (b5, r5) = attribution_inset(size, 300.0, &side);
+        assert_eq!((b5, r5), (b3, 0.0));
+        let (b6, r6) = attribution_inset((200.0, 20.0), 300.0, &low);
+        assert_eq!((b6, r6), (0.0, 0.0), "it stays where it was drawn");
     }
 
     #[test]
