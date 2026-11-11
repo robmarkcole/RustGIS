@@ -2,7 +2,8 @@ name: CI
 
 # macOS and Windows are slow: pushes to main test on every platform, pull requests on Linux, plus
 # macOS when labelled `ci:macos`, Windows (x64 and ARM64) when labelled `ci:windows`, and both for
-# `ci:full`.
+# `ci:full`. A manual run tests on every platform, or on Linux alone when asked (a fork checking a
+# branch before its pull request runs the pull request's own checks).
 # Adding the label runs that platform straight away (ci-label.yml); later pushes include it here.
 
 on:
@@ -10,6 +11,12 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      platforms:
+        description: Platforms to test on
+        type: choice
+        options: [all, linux]
+        default: all
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -100,6 +107,7 @@ jobs:
           EVENT: ${{ github.event_name }}
           ACTION: ${{ github.event.action }}
           LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          PLATFORMS: ${{ inputs.platforms }}
         run: echo "os=$(.github/scripts/platforms.sh)" >> "$GITHUB_OUTPUT"
 
   test:
