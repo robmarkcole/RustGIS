@@ -107,9 +107,8 @@ fn settling_after_a_camera_animation_re_renders_fully() {
         }
     }
     assert!(settled, "the animation finished");
-    for _ in 0..5 {
-        h.step();
-    }
+    // A flat map's settled frame is drawn off the UI thread (#1750): wait for it to arrive.
+    wait_for_frame(&mut h);
     let app = h.state();
     let (cam, tex_cam) = (app.session.map().camera, app.map.full_frame_camera());
     assert_eq!((tex_cam.center, tex_cam.res), (cam.center, cam.res), "a full re-render followed the settled camera (tex_camera refreshed)");
