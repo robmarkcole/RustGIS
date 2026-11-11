@@ -448,14 +448,20 @@ fn draw_with(
     }
     let (bw, bh) = (x1 - x0, y1 - y0);
 
-    // Exact source positions on a coarse grid.
+    // Exact source positions on a coarse grid, its rows spread over the threads (a projected
+    // raster's transformation is most of a frame's work on one, #1792): each position is worked
+    // out alone, so the grid is the same on any number.
     let (gw, gh) = (bw / STEP + 2, bh / STEP + 2);
-    let mut grid = Vec::with_capacity(gw * gh);
-    for gy in 0..gh {
-        for gx in 0..gw {
-            grid.push(source(r, view, place, k, (x0 + gx * STEP) as f64, (y0 + gy * STEP) as f64));
+    let mut grid = vec![None; gw * gh];
+    // (A few points aren't worth a thread.)
+    let grid_threads = if gw * gh < 1024 { 1 } else { threads.clamp(1, gh) };
+    let grid_rows = gh.div_ceil(grid_threads);
+    each_chunk(grid_threads, grid.chunks_mut(grid_rows * gw).enumerate(), |(i, chunk)| {
+        for (j, cell) in chunk.iter_mut().enumerate() {
+            let (gx, gy) = (j % gw, i * grid_rows + j / gw);
+            *cell = source(r, view, place, k, (x0 + gx * STEP) as f64, (y0 + gy * STEP) as f64);
         }
-    }
+    });
 
     // Pass 1: band values (and hillshade) for each screen pixel.
     let bands = style.renderer.bands();
@@ -553,7 +559,40 @@ fn draw_with(
     }
     let quality = if style.resampling == Resampling::Bilinear { FilterQuality::Bilinear } else { FilterQuality::Nearest };
     let at = Transform::from_row(k as f32, 0.0, 0.0, k as f32, (x0 as f64 * k) as f32, (y0 as f64 * k) as f32);
-    pm.draw_pixmap(0, 0, lay.as_ref(), &PixmapPaint { opacity, quality, ..PixmapPaint::default() }, at, None);
+    // The rows it covers on screen.
+    let rows = ((y0 as f64 * k).floor().max(0.0) as usize, (((y0 + bh) as f64 * k).ceil() as usize).min(pm.height() as usize));
+    draw_scaled(pm, &lay, &PixmapPaint { opacity, quality, ..PixmapPaint::default() }, at, rows, threads);
+}
+
+/// Rows of the screen drawn as one band when a raster is scaled up (see [`draw_scaled`]).
+const BAND: usize = 64;
+
+/// Draws `src` onto `pm` through `at` as tiny-skia's `draw_pixmap` does, on `threads` threads.
+/// The screen rows `rows` (where `src` lands) are drawn in bands of [`BAND`] rows, each on its
+/// own as the same rows of `pm` with `at` moved up by the band's top, and the threads take runs
+/// of whole bands: the bands are the same on any number of threads, so the pixels are too.
+/// (Moving `at` rounds a bilinear sample a unit differently here and there from drawing the
+/// whole at once.) Scaling a frame's raster up to a high-density screen on one thread took more
+/// than half the frame (#1792).
+fn draw_scaled(pm: &mut Pixmap, src: &Pixmap, paint: &PixmapPaint, at: Transform, (top, bottom): (usize, usize), threads: usize) {
+    let (w, stride) = (pm.width(), pm.width() as usize * 4);
+    let bottom = bottom.min(pm.height() as usize);
+    let Some(covered) = pm.data_mut().get_mut(top.min(bottom) * stride..bottom * stride) else { return };
+    let bands = (bottom.saturating_sub(top)).div_ceil(BAND);
+    if bands == 0 {
+        return;
+    }
+    let threads = threads.clamp(1, bands);
+    let run = bands.div_ceil(threads) * BAND;
+    each_chunk(threads, covered.chunks_mut(run * stride).enumerate(), |(i, data)| {
+        for (j, band) in data.chunks_mut(BAND * stride).enumerate() {
+            let h = (band.len() / stride) as u32;
+            let first = top + i * run + j * BAND;
+            if let Some(mut part) = tiny_skia::PixmapMut::from_bytes(band, w, h) {
+                part.draw_pixmap(0, 0, src.as_ref(), paint, at.post_translate(0.0, -(first as f32)), None);
+            }
+        }
+    });
 }
 
 /// What pass 1 of [`draw`] reads: where each screen pixel falls in the raster, and how to
@@ -718,16 +757,29 @@ fn threads_for(pixels: usize) -> usize {
     rustgis_data::threads::max().min(MAX_DRAW_THREADS)
 }
 
-/// Runs `f` on each item, spread over `threads` threads (in turn on this one when it is one).
+/// Runs `f` on each item, spread over `threads` threads (in turn on this one when it is one). An
+/// item whose thread the system refuses is run on this one: it costs speed, not the drawing.
 fn each_chunk<T: Send>(threads: usize, items: impl Iterator<Item = T>, f: impl Fn(T) + Sync) {
     if threads <= 1 {
         items.for_each(f);
         return;
     }
     let f = &f;
+    // Each item in a slot of its own, so one whose thread wasn't started is still at hand.
+    let slots: Vec<std::sync::Mutex<Option<T>>> = items.map(|item| std::sync::Mutex::new(Some(item))).collect();
+    let take = |slot: &std::sync::Mutex<Option<T>>| slot.lock().ok().and_then(|mut s| s.take());
     std::thread::scope(|scope| {
-        for item in items {
-            scope.spawn(move || f(item));
+        for slot in &slots {
+            let started = std::thread::Builder::new().spawn_scoped(scope, move || {
+                if let Some(item) = take(slot) {
+                    f(item);
+                }
+            });
+            if started.is_err()
+                && let Some(item) = take(slot)
+            {
+                f(item);
+            }
         }
     });
 }
@@ -979,6 +1031,35 @@ mod tests {
         let far = View { width: 3.0, height: 1.0, pixels_per_point: 2.0, camera: Camera::world(), sky: false };
         let mut tiny = Pixmap::new(6, 2).unwrap();
         draw(&mut tiny, &r, &style, None, &far, 1.0, true, Place::Flat(&Flat::Mercator, "mercator"));
+    }
+
+    /// #1792: a projected raster scaled up to a high-density screen, its reprojection grid and
+    /// its scaling spread over threads, comes out as drawn on one, pixel for pixel, at any
+    /// scale, opacity and resampling, partly in view or filling it.
+    #[test]
+    fn scaled_up_on_threads_as_on_one() {
+        // 200 × 200 cells of 5 m in Swiss LV95, valued in a ramp with a few holes.
+        let gt = GeoTransform { origin_x: 2_696_000.0, origin_y: 1_262_000.0, pixel_width: 5.0, pixel_height: -5.0 };
+        let data: Vec<f32> = (0..200 * 200).map(|i| if i % 97 == 0 { -9999.0 } else { ((i % 200) + (i / 200)) as f32 }).collect();
+        let r =
+            Raster::new("dem", 200, 200, vec![data], gt, Crs::from_epsg(2056).unwrap(), Some(-9999.0), ColorHint::Gray, "Float32").unwrap();
+        let centre = lonlat_to_merc(Coord::new(8.7205, 47.4985));
+        for (res, ppp) in [(2.0, 1.5), (2.0, 2.0), (0.7, 1.5), (0.7, 1.75), (6.0, 2.0)] {
+            for (opacity, resampling) in [(1.0, Resampling::Bilinear), (0.6, Resampling::Nearest), (1.0, Resampling::Nearest)] {
+                let mut style = RasterStyle::default_for(&r);
+                style.resampling = resampling;
+                let camera = Camera { center: centre, res, bearing: 0.0, pitch: 0.0 };
+                let view = View { width: 300.0, height: 200.0, pixels_per_point: ppp, camera, sky: false };
+                let size = ((300.0 * ppp).ceil() as u32, (200.0 * ppp).ceil() as u32);
+                let mut one = Pixmap::new(size.0, size.1).unwrap();
+                one.fill(tiny_skia::Color::from_rgba8(20, 120, 40, 255));
+                let mut many = one.clone();
+                draw_with(&mut one, &r, &style, None, &view, opacity, false, Place::Flat(&Flat::Mercator, "mercator"), 1);
+                draw_with(&mut many, &r, &style, None, &view, opacity, false, Place::Flat(&Flat::Mercator, "mercator"), 7);
+                assert!(one.data() == many.data(), "res {res} ppp {ppp} opacity {opacity} {resampling:?}");
+                assert!(one.pixels().iter().any(|p| p.green() != 120), "res {res} ppp {ppp}: the raster is drawn");
+            }
+        }
     }
 
     /// #1109: a lon/lat grid stored from 0 to 360° draws west of Greenwich too, from its columns
