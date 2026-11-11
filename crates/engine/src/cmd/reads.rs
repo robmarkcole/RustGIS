@@ -1,8 +1,8 @@
 //! Reads the desktop app makes on a thread of its own before a command adds what they read
 //! (#1291 step 3): Add Data's whole-file reads (a raster, a raster GDAL converts, a GeoJSON,
 //! delimited text or spreadsheet read whole, a CityJSON or CityGML model's layers), Reload Data, Load All
-//! Features, Convert To Annotation's read of a layer read in place, native models or scripts and the
-//! Error Inspector's topology check (#1291). [`read_ahead`]
+//! Features, Convert To Annotation's read of a layer read in place, native models or scripts, the
+//! Error Inspector's topology check (#1291) and Source File State's hashing of a layer's file. [`read_ahead`]
 //! takes what the read needs of the session, [`ReadAhead::run`] reads on the thread, and [`read_land`]
 //! runs the admitted command under its initiating owner: the command takes
 //! it instead of reading again, so what it adds, says, logs and puts in Undo is the same as when
@@ -139,7 +139,8 @@ pub(crate) fn prepare(s: &Session, op: Authorized<CommandOp>, owner: Continuatio
             (name, work, None)
         }
         "topology.validate" => ("Error Inspector", super::design::topology_ahead(s, params), None),
-        _ => return Err("only Add Data, Load All, Reload Data, Convert To Annotation, models, scripts, tile archives and topology prepare background work".into()),
+        "source.syncState" => ("Source File State", super::publish::sync_ahead(s, params), None),
+        _ => return Err("only Add Data, Load All, Reload Data, Convert To Annotation, models, scripts, tile archives, topology and Source File State prepare background work".into()),
     };
     let name = work.as_ref().map_or(name, |work| work.name);
     Ok(ReadAhead { name, op, owner, source, work })

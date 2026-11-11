@@ -59,6 +59,9 @@ fn copy(s: &mut Session, p: &Value) -> CmdResult {
         .map(|l| {
             let mut l = l.clone();
             l.selection.clear();
+            // A copy isn't the layer read from its file: it can't say whether the file has its
+            // edits, nor write them back.
+            l.synced = None;
             l
         })
         .collect();

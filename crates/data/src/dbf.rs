@@ -181,11 +181,13 @@ pub(crate) fn read_cpg(path: &std::path::Path, notes: &mut Vec<String>) -> Optio
     }
 }
 
+/// Every ASCII case of the `.cpg` extension, the conventional spellings first: tried in turn,
+/// without scanning a potentially large directory, and the first there wins.
+pub(crate) const CPG_SPELLINGS: [&str; 8] = ["cpg", "CPG", "Cpg", "cPg", "cpG", "CPg", "CpG", "cPG"];
+
 fn try_read_cpg(path: &std::path::Path) -> std::io::Result<Option<Vec<u8>>> {
     use std::io::Read;
-    // Check every ASCII case combination without scanning a potentially large directory.
-    // Prefer the conventional spellings if multiple sidecars exist.
-    for ext in ["cpg", "CPG", "Cpg", "cPg", "cpG", "CPg", "CpG", "cPG"] {
+    for ext in CPG_SPELLINGS {
         match std::fs::File::open(path.with_extension(ext)) {
             Ok(file) => {
                 let mut bytes = Vec::new();

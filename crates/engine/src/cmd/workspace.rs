@@ -604,6 +604,8 @@ fn snapshot(m: &mut rustgis_map::Map, e: &Extent) -> rustgis_map::Map {
         c.dataset.features =
             l.dataset.features.iter().filter(|f| f.geometry.as_ref().is_some_and(|g| g.extent().intersects(e))).cloned().collect();
         c.selection.clear();
+        // Only part of the rows read: no longer the layer its file's record describes.
+        c.synced = None;
         c.touch_geometry();
         out.layers.push(c);
     }

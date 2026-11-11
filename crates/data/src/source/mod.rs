@@ -562,6 +562,7 @@ fn materialize_within(src: &dyn FeatureSource, budget: u64) -> Result<(Dataset, 
     let report = ReadReport {
         skipped: skipped + src.skipped_at_open(),
         messages: info.notes.iter().map(|n| format!("{}: {n}", info.name)).collect(),
+        synced: None,
     };
     if ds.geometry_type == GeometryType::None
         && let Some(g) = ds.features.iter().find_map(|f| f.geometry.as_ref())

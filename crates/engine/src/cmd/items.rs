@@ -667,6 +667,7 @@ fn template(p: &Project) -> (Project, TemplateLosses) {
             // A feature-less template has no loaded rows to save back to a source.
             l.postgis = None;
             l.gpkg = None;
+            l.synced = None;
             if let Some(rl) = &mut l.raster {
                 rl.embedded = None;
             }

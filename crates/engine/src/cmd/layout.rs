@@ -1759,6 +1759,7 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
                     // Simplified sketches aren't the source's rows: saving them would overwrite it.
                     layer.gpkg = None;
                     layer.postgis = None;
+                    layer.synced = None;
                     layer.dataset.features = l
                         .dataset
                         .features

@@ -337,6 +337,30 @@ the default and discarding edits defaults to false. Only an explicit
 `{"layer":42,"path":"/data/cities.fgb","table":null}`; `table` is a string for a selected table
 or raster subdataset.
 
+### Source file state
+
+A layer read whole from a Shapefile or a `.geojson` file keeps its features in the project, so
+edits change the project, not the file. It also keeps a record of what was read: each part of
+the file's size and SHA-256 hash, and a hash of the layer's rows. `source.syncState` compares
+the layer with the rows read, and the file with the parts read, and answers `inSync`, `edited`
+(the layer has edits since it was read), `sourceChanged` (the file changed since it was read)
+or `both`, with the names of the parts that changed. It doesn't compare the layer with the file
+as it is now: the same edit made to both shows as `both`. Only the bytes count: writing the
+same bytes again isn't a change, while a copy that puts back the file's size and time with other
+bytes is one.
+Undoing every edit makes the layer match its record again, so it reads `inSync` if the file
+hasn't changed either. A number that isn't finite (NaN, infinity), which a
+project saves as empty, shows the layer as `edited` once its project is opened again. On the desktop the file and the rows are hashed
+in the background, with progress and Cancel in the status bar.
+
+The record is made just before the file is read, so a file written to while it was being read
+shows as changed, unless the write was undone before RustGIS looked again. A layer read in
+place and a `.json` file have no record. The record is saved with the project; the web app
+can't check it.
+
+On the desktop, make the layer active and choose **Source File State** in Command Search; what it
+found shows in the status bar. CLI and Python: `source.syncState` with `{"layer":"parcels"}`.
+
 ## Keyboard shortcuts
 
 | Keys | Action |
