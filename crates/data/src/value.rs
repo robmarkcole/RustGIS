@@ -101,6 +101,16 @@ impl Value {
     pub fn is_null(&self) -> bool {
         matches!(self, Value::Null)
     }
+    /// The value as a file writes it in text: a number in full, as the shortest text that reads
+    /// back as the same number, and nothing for null. [`Display`](std::fmt::Display) is for
+    /// showing a value, and rounds numbers to 6 decimals.
+    pub fn to_file_text(&self) -> String {
+        match self {
+            Value::Null => String::new(),
+            Value::Float(f) => f.to_string(),
+            other => other.to_string(),
+        }
+    }
     /// Converts a JSON value to an attribute value.
     pub fn from_json(v: &serde_json::Value) -> Value {
         match v {

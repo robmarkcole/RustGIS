@@ -1359,7 +1359,8 @@ pub(crate) fn coerce(v: Value, ty: FieldType) -> Value {
         (_, Value::Null) => Value::Null,
         (FieldType::Double, Value::Int(i)) => Value::Float(i as f64),
         (FieldType::Text, v @ Value::Text(_)) => v,
-        (FieldType::Text, v) => Value::Text(v.to_string()),
+        // A number in full, as a file writes it: `Display` rounds to 6 decimals.
+        (FieldType::Text, v) => Value::Text(v.to_file_text()),
         (_, v) => v,
     }
 }
@@ -1862,11 +1863,8 @@ const FORMULA_START: [char; 6] = ['=', '+', '-', '@', '\t', '\r'];
 /// A cell's text; text that a spreadsheet would run as a formula is prefixed with `'`.
 fn csv_cell(v: &Value) -> String {
     match v {
-        Value::Null => String::new(),
         Value::Text(t) if t.starts_with(FORMULA_START) => format!("'{t}"),
-        // The shortest text that reads back as the same number: `Display` rounds to 6 decimals.
-        Value::Float(f) => f.to_string(),
-        other => other.to_string(),
+        other => other.to_file_text(),
     }
 }
 
@@ -3930,6 +3928,18 @@ mod tests {
         // UTF-8 says nothing; binary data named .csv is refused.
         assert!(read_bytes("t.csv", "nome,n\nJosé,1\n".as_bytes()).unwrap().1.messages.is_empty());
         assert!(read_bytes("t.csv", b"a,b\n\x00\xff\x01,2\n").is_err());
+    }
+
+    /// A GeoJSON column of text and numbers is read as text, its numbers in full rather than
+    /// rounded as they're shown.
+    #[test]
+    fn a_mixed_geojson_column_keeps_its_numbers_in_full() {
+        let text = r#"{"type":"FeatureCollection","features":[
+            {"type":"Feature","properties":{"v":"a"},"geometry":{"type":"Point","coordinates":[1,2]}},
+            {"type":"Feature","properties":{"v":0.1234567891},"geometry":{"type":"Point","coordinates":[3,4]}}]}"#;
+        let (ds, _) = read_geojson(text, "t").unwrap();
+        assert_eq!(ds.fields[0].ty, FieldType::Text);
+        assert_eq!(ds.value(1, 0), &Value::Text("0.1234567891".into()));
     }
 
     #[test]
