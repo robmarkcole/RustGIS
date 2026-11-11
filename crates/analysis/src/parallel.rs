@@ -31,6 +31,16 @@ pub(crate) fn threads_for(items: usize, min_items: usize) -> usize {
     cores().min(items.div_ceil(BATCH)).max(1)
 }
 
+/// How many threads to make `items` long items on, one at a time ([`try_map_each_on`]): one below
+/// `min_items` and in the browser, no more than there are items, and, beyond one thread's
+/// `scratch_bytes`, no more than [`scratch_budget`] holds.
+pub(crate) fn threads_for_each(items: usize, min_items: usize, scratch_bytes: usize) -> usize {
+    if cfg!(target_arch = "wasm32") || items < min_items {
+        return 1;
+    }
+    cores().min(items).min(1 + scratch_budget() / scratch_bytes.max(1)).max(1)
+}
+
 /// [`threads_for`], each thread holding up to `scratch_bytes` at its peak (a feature's raster
 /// masks, say): beyond one thread's, no more than [`scratch_budget`] holds.
 pub(crate) fn threads_for_scratch(items: usize, min_items: usize, scratch_bytes: usize) -> usize {
@@ -161,6 +171,29 @@ pub(crate) fn try_map_on<T: Sync, S, R: Send, E: Send + From<Cancelled>>(
     scratch: impl Fn() -> S + Sync,
     f: impl Fn(&mut S, usize, &T) -> Result<R, E> + Sync,
 ) -> Result<Vec<R>, E> {
+    try_map_by(items, threads, BATCH, scratch, f)
+}
+
+/// [`try_map_on`] with each thread taking one item at a time: for a few long items (a union of
+/// many polygons each, say), which batches of [`BATCH`] would leave on one thread.
+pub(crate) fn try_map_each_on<T: Sync, S, R: Send, E: Send + From<Cancelled>>(
+    items: &[T],
+    threads: usize,
+    scratch: impl Fn() -> S + Sync,
+    f: impl Fn(&mut S, usize, &T) -> Result<R, E> + Sync,
+) -> Result<Vec<R>, E> {
+    try_map_by(items, threads, 1, scratch, f)
+}
+
+/// [`try_map_on`], each thread taking `take` items at a time.
+fn try_map_by<T: Sync, S, R: Send, E: Send + From<Cancelled>>(
+    items: &[T],
+    threads: usize,
+    take: usize,
+    scratch: impl Fn() -> S + Sync,
+    f: impl Fn(&mut S, usize, &T) -> Result<R, E> + Sync,
+) -> Result<Vec<R>, E> {
+    let take = take.max(1);
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     if threads <= 1 || items.len() <= 1 {
         let mut s = scratch();
@@ -186,8 +219,8 @@ pub(crate) fn try_map_on<T: Sync, S, R: Send, E: Send + From<Cancelled>>(
             let mut s = scratch();
             let mut made = Vec::new();
             while !failed.load(Ordering::Relaxed) {
-                let from = next.fetch_add(BATCH, Ordering::Relaxed);
-                let Some(batch) = items.get(from..items.len().min(from.saturating_add(BATCH))).filter(|b| !b.is_empty()) else { break };
+                let from = next.fetch_add(take, Ordering::Relaxed);
+                let Some(batch) = items.get(from..items.len().min(from.saturating_add(take))).filter(|b| !b.is_empty()) else { break };
                 // Cancel is looked at, and progress counted, item by item, as on one thread: an item
                 // can take long (a large zone, say), so a batch of them would hold both back.
                 for (k, item) in batch.iter().enumerate() {
@@ -532,6 +565,35 @@ mod tests {
         }));
         assert!(r.is_err(), "no worker took a row");
         assert!(ran.load(std::sync::atomic::Ordering::Relaxed) < 1_000, "{}", ran.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// A few long items each get a thread of their own, as many as there are (below the cores),
+    /// and come back in their places.
+    #[test]
+    fn long_items_are_taken_one_at_a_time() {
+        assert_eq!(threads_for_each(1, 2, 1), 1);
+        assert_eq!(threads_for_each(3, 2, 1), cores().min(3));
+        assert_eq!(threads_for_each(3, 2, usize::MAX), 1);
+        let items: Vec<usize> = (0..5).collect();
+        let seen = std::sync::Mutex::new(std::collections::HashSet::new());
+        let made = try_map_each_on(
+            &items,
+            5,
+            || (),
+            |_, i, &x| {
+                if let Ok(mut s) = seen.lock() {
+                    s.insert(std::thread::current().id());
+                }
+                // Long enough that the other threads start and take the rest.
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                Ok::<_, Cancelled>((i, x * 10))
+            },
+        )
+        .unwrap();
+        assert_eq!(made, vec![(0, 0), (1, 10), (2, 20), (3, 30), (4, 40)]);
+        if cores() > 1 {
+            assert!(seen.lock().unwrap().len() > 1, "five long items stayed on one thread");
+        }
     }
 
     #[test]

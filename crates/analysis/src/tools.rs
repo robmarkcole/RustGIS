@@ -1314,7 +1314,7 @@ fn nothing_covered(tool: &str, layer: &str, left: LeftOut) -> String {
     format!("{tool}: none of the {} feature(s) of '{layer}' covers anything: {what}", left.no_polygon + left.no_area)
 }
 
-/// What a feature [`overlay_zones`] leaves out holds: no geometry, or a geometry [`polygon_of`]
+/// What a feature [`overlay_zones_on`] leaves out holds: no geometry, or a geometry [`polygon_of`]
 /// gives nothing for.
 const NO_POLYGON: &str = "no geometry, a point or line, or an empty polygon";
 
@@ -1661,7 +1661,7 @@ const CLIP_BATCH: usize = if cfg!(test) { 16 } else { 4096 };
 const MAX_CACHED_MASKS: usize = 8;
 
 /// The memory a union kept by Clip holds, about: its coordinates, its rings' and polygons' own
-/// parts, and the key naming its masks.
+/// parts, and the key naming its masks. Split sizes its areas' polygons with it, keyless.
 fn kept_union_bytes(key: &[usize], m: &MultiPolygon<f64>) -> usize {
     use std::mem::size_of;
     let coords = |r: &geo::LineString<f64>| r.0.capacity().saturating_mul(size_of::<geo::Coord<f64>>());
@@ -1964,7 +1964,7 @@ fn mask_of(poly: MultiPolygon<f64>) -> MultiPolygon<f64> {
     if poly.0.len() > 1 { union_all(poly.0.iter()) } else { poly.orient(Direction::Default) }
 }
 
-/// How an overlay tool uses its overlay polygons, for [`overlay_zones`].
+/// How an overlay tool uses its overlay polygons, for [`overlay_zones_on`].
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ZoneUse {
     /// Its output comes only from inside them (Intersect, Split): with none left, it would be
@@ -1991,20 +1991,10 @@ enum ZoneMade {
 /// unless `use_` is [`ZoneUse::AsIs`], those of several parts whose union is empty ([`NO_AREA`]),
 /// as they cover nothing. A polygon of one part is only oriented, its edges kept exactly, so one
 /// with no area stays a zone, as it always has.
-fn overlay_zones<'a>(
-    inp: &'a dyn Inputs,
-    p: &Json,
-    k: &str,
-    tool: &str,
-    use_: ZoneUse,
-) -> Result<(&'a Dataset, Vec<Zone>, LeftOut), String> {
-    overlay_zones_on(inp, p, k, tool, use_, None)
-}
-
-/// [`overlay_zones`] on `threads` threads (by the number of zones when `None`). A zone of several
-/// parts is a union: each zone is made on its own, on several threads when there are many
-/// (#1252), and they come back in order, as on one thread; Cancel is looked at, and progress
-/// counted, between zones.
+///
+/// On `threads` threads (by the number of zones when `None`). A zone of several parts is a union:
+/// each zone is made on its own, on several threads when there are many (#1252), and they come
+/// back in order, as on one thread; Cancel is looked at, and progress counted, between zones.
 fn overlay_zones_on<'a>(
     inp: &'a dyn Inputs,
     p: &Json,
@@ -2450,9 +2440,33 @@ fn split_key(v: &Value) -> String {
 /// [`MAX_SPLIT_NAME`] characters, control characters dropped); one with no value is named by its
 /// id, as is one whose value is blank once its control characters are dropped. A name the map
 /// already has gets a number when the layer is added. Layers left with no features are left out;
-/// selections in both layers count. Split features left out by [`overlay_zones`] are counted; with
+/// selections in both layers count. Split features left out by [`overlay_zones_on`] are counted; with
 /// none left, it's an error.
 fn split(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
+    split_on(inp, p, None)
+}
+
+/// The split areas [`split_on`] works on at a time a thread: their masks are held until their
+/// layers are made. Small in tests, so they cross from one batch to the next.
+const SPLIT_AREA_BATCH: usize = if cfg!(test) { 2 } else { 4 };
+/// The (area, feature) parts [`split_on`] makes at a time, so the list of them and their results
+/// stay bounded however many features an area's extent takes in. Small in tests, so they cross
+/// from one chunk to the next.
+const SPLIT_PART_CHUNK: usize = if cfg!(test) { 64 } else { 65_536 };
+
+/// [`split`] on `threads` threads (by the number of items in each step, and the memory each takes,
+/// when `None`), with the same layers, bit for bit, as on one (#1252). The split polygons are made
+/// into masks on several threads ([`overlay_zones_on`]). Then the input features some split area
+/// meets are made ready for the overlay ([`dissolved`]) on several, once each. Then the split
+/// areas, [`SPLIT_AREA_BATCH`] a thread at a time: their masks (a union for an area of several
+/// polygons) on several, then every feature's part in each area on several, [`SPLIT_PART_CHUNK`]
+/// parts at a time, and their layers in order. The masks' threads are as many as half the scratch
+/// memory work may take holds of their batches' masks and the one each makes; the parts' as many
+/// as the other half holds of twice the largest input feature's and area's coordinates. Cancel
+/// is looked at, and progress counted, item by item in each step; one feature made ready, one
+/// area's union and one part are each a step without a look, which can be long for an area of
+/// many large polygons.
+fn split_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result<ToolResult, String> {
     let ds = input(inp, p, "input")?;
     if ds.geometry_type == GeometryType::None {
         return Err(format!("'{}' has no geometry", ds.name));
@@ -2465,7 +2479,7 @@ fn split(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
         Some(Json::String(name)) => Some(find_field_case_insensitive(input(inp, p, "split")?, name.trim())?),
         Some(other) => return Err(format!("Split Field must be a field name, not {other}")),
     };
-    let (sp, zones, left_out) = overlay_zones(inp, p, "split", "Split", ZoneUse::Inside)?;
+    let (sp, zones, left_out) = overlay_zones_on(inp, p, "split", "Split", ZoneUse::Inside, threads)?;
     // The split polygons of each layer, in the order their first polygon comes, keyed by the exact
     // value, so values that would be named alike stay apart. A layer named by a value and one named
     // by an id are kept apart even when the two read the same.
@@ -2500,42 +2514,145 @@ fn split(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
         ds.features.get(r).and_then(|f| f.geometry.as_ref()).is_some_and(|g| matches!(g, Geometry::Point(_) | Geometry::MultiPoint(_)))
     };
     let points_at_poles = AtPoles::new(located.iter().map(|(r, e)| if point(*r) { poles(e) } else { (false, false) }));
-    // Each input feature as the overlay takes it, made once, when a split polygon first meets it.
-    let mut whole: Vec<Option<std::borrow::Cow<'_, Geometry>>> = vec![None; located.len()];
-    let mut layers = Vec::new();
-    let mut empty = 0usize;
+    // Each split area: its polygons, their extent and the poles they reach.
+    let areas: Vec<(String, Vec<&Zone>, Extent, (bool, bool))> = groups
+        .into_iter()
+        .map(|(name, members)| {
+            let polys: Vec<&Zone> = members.iter().filter_map(|zi| zones.get(*zi)).collect();
+            let ext = polys.iter().fold(Extent::EMPTY, |e, z| e.union(&z.ext));
+            let reached = polys.iter().map(|z| poles(&z.ext)).fold((false, false), |(n, s), (zn, zs)| (n || zn, s || zs));
+            (name, polys, ext, reached)
+        })
+        .collect();
+    // The input features an area meets, by their place in `located`, in the index's order.
+    let met_by = |ext: &Extent, reached: (bool, bool), cand_buf: &mut Vec<usize>| {
+        index.candidates_into(ext, cand_buf);
+        points_at_poles.add_to(reached, cand_buf);
+        cand_buf.retain(|&li| {
+            located.get(li).is_some_and(|(r, e)| {
+                ds.features.get(*r).is_some_and(|f| f.geometry.is_some())
+                    && (e.intersects(ext) || (point(*r) && meet_at_a_pole(poles(e), reached)))
+            })
+        });
+    };
+    // Which features some area meets, and how many parts there are to make: looked up area by
+    // area (the index's lookups, quick), counted area by area, with Cancel looked at for each and
+    // every few thousand features an area meets.
+    let mut needed = vec![false; located.len()];
+    let mut pairs = 0usize;
     let mut cand_buf = Vec::new();
-    // A layer each: Cancel is looked at, and progress counted, layer by layer.
-    crate::control::begin(groups.len());
-    for (done, (name, members)) in groups.into_iter().enumerate() {
+    crate::control::begin(areas.len());
+    for (done, (_, _, ext, reached)) in areas.iter().enumerate() {
         crate::control::check()?;
         crate::control::reached(done);
-        let polys: Vec<&Zone> = members.iter().filter_map(|zi| zones.get(*zi)).collect();
-        let mask = match polys.as_slice() {
-            [only] => std::borrow::Cow::Borrowed(&only.poly),
-            _ => std::borrow::Cow::Owned(union_all(polys.iter().flat_map(|z| z.poly.0.iter()))),
-        };
-        let ext = polys.iter().fold(Extent::EMPTY, |e, z| e.union(&z.ext));
-        let reached = polys.iter().map(|z| poles(&z.ext)).fold((false, false), |(n, s), (zn, zs)| (n || zn, s || zs));
-        let mut out = copy_schema(ds, format!("{prefix}_{name}"), ds.geometry_type);
-        keep_source_crs(&mut out, ds, sp);
-        index.candidates_into(&ext, &mut cand_buf);
-        points_at_poles.add_to(reached, &mut cand_buf);
-        for &li in &cand_buf {
-            // A layer can take most of the input: Cancel is looked at feature by feature too.
-            crate::control::check()?;
-            let Some((r, e)) = located.get(li) else { continue };
-            let Some(f) = ds.features.get(*r) else { continue };
-            let meets = e.intersects(&ext) || (point(*r) && meet_at_a_pole(poles(e), reached));
-            let (Some(g), Some(slot)) = (f.geometry.as_ref().filter(|_| meets), whole.get_mut(li)) else { continue };
-            if let Some(c) = part(slot.get_or_insert_with(|| dissolved(g)), &mask, true) {
-                out.push_next(Some(c), f.attrs.clone());
+        met_by(ext, *reached, &mut cand_buf);
+        pairs = pairs.saturating_add(cand_buf.len());
+        for (k, &li) in cand_buf.iter().enumerate() {
+            if k % 4096 == 4095 {
+                crate::control::check()?;
+            }
+            if let Some(n) = needed.get_mut(li) {
+                *n = true;
             }
         }
-        if out.features.is_empty() {
-            empty += 1;
-        } else {
-            layers.push(OutputLayer::Vector(out));
+    }
+    let needed: Vec<usize> = needed.iter().enumerate().filter_map(|(li, &n)| n.then_some(li)).collect();
+    let largest_feature =
+        needed.iter().filter_map(|&li| ds.features.get(located.get(li)?.0)?.geometry.as_ref()).map(coord_bytes).max().unwrap_or(0);
+    let area_bytes = |polys: &[&Zone]| polys.iter().map(|z| kept_union_bytes(&[], &z.poly)).fold(0usize, usize::saturating_add);
+    let largest_area = areas.iter().map(|(_, polys, ..)| area_bytes(polys)).max().unwrap_or(0);
+    // Only an area of several polygons has its mask made (a union); one polygon's is borrowed.
+    let largest_union = areas.iter().filter(|(_, polys, ..)| polys.len() > 1).map(|(_, polys, ..)| area_bytes(polys)).max().unwrap_or(0);
+    let threads_for = |n: usize, scratch: usize| {
+        threads.unwrap_or_else(|| crate::parallel::threads_for_scratch(n, PARALLEL_FEATURES, scratch.saturating_mul(2)))
+    };
+    // Counted item by item: the features made ready, the areas' masks and the parts.
+    crate::control::begin(needed.len().saturating_add(areas.len()).saturating_add(pairs));
+    // Each input feature as the overlay takes it, made once.
+    let made = crate::parallel::try_map_on(
+        &needed,
+        threads_for(needed.len(), largest_feature),
+        || (),
+        |_, _, &li| Ok::<_, String>(located.get(li).and_then(|(r, _)| ds.features.get(*r)?.geometry.as_ref()).map(dissolved)),
+    )?;
+    let mut whole: Vec<Option<std::borrow::Cow<'_, Geometry>>> = vec![None; located.len()];
+    for (li, w) in needed.iter().zip(made) {
+        if let Some(slot) = whole.get_mut(*li) {
+            *slot = w;
+        }
+    }
+    // A mask is a union of one area's polygons, worth a thread of its own from two areas on, each
+    // thread taking one area at a time; a thread holds its batch's masks and the one it makes.
+    // Doubled, as `threads_for` doubles: the masks take at most half the scratch memory, the
+    // parts' work the other half.
+    let mask_threads = threads
+        .unwrap_or_else(|| {
+            crate::parallel::threads_for_each(areas.len(), 2, largest_union.saturating_mul(SPLIT_AREA_BATCH + 1).saturating_mul(2))
+        })
+        .max(1);
+    // A part's work: the feature and its part, and the overlay's own copy of the mask, about.
+    let part_work = largest_feature.saturating_add(largest_area).saturating_mul(2);
+    let mut layers = Vec::new();
+    let mut empty = 0usize;
+    for batch in areas.chunks(mask_threads.saturating_mul(SPLIT_AREA_BATCH)) {
+        // The batch's masks: one area's polygon as it is, several unioned.
+        let masks = crate::parallel::try_map_each_on(
+            batch,
+            mask_threads,
+            || (),
+            |_, _, (_, polys, ..)| {
+                Ok::<_, String>(match polys.as_slice() {
+                    [only] => std::borrow::Cow::Borrowed(&only.poly),
+                    _ => std::borrow::Cow::Owned(union_all(polys.iter().flat_map(|z| z.poly.0.iter()))),
+                })
+            },
+        )?;
+        let mut outs: Vec<Dataset> = batch
+            .iter()
+            .map(|(name, ..)| {
+                let mut out = copy_schema(ds, format!("{prefix}_{name}"), ds.geometry_type);
+                keep_source_crs(&mut out, ds, sp);
+                out
+            })
+            .collect();
+        // Every feature each area meets, area by area in order, their parts made on several
+        // threads [`SPLIT_PART_CHUNK`] at a time and added to their layers in that order.
+        let make = |work: &[(usize, usize)], outs: &mut Vec<Dataset>| -> Result<(), String> {
+            let parts = crate::parallel::try_map_on(
+                work,
+                threads_for(work.len(), part_work),
+                || (),
+                |_, _, &(ai, li)| {
+                    let (Some(mask), Some(Some(g))) = (masks.get(ai), whole.get(li)) else { return Ok::<_, String>(None) };
+                    Ok(part(g, mask, true))
+                },
+            )?;
+            for (&(ai, li), c) in work.iter().zip(parts) {
+                let (Some(out), Some(c), Some(f)) = (outs.get_mut(ai), c, located.get(li).and_then(|(r, _)| ds.features.get(*r))) else {
+                    continue;
+                };
+                out.push_next(Some(c), f.attrs.clone());
+            }
+            Ok(())
+        };
+        let mut work: Vec<(usize, usize)> = Vec::new();
+        for (ai, (_, _, ext, reached)) in batch.iter().enumerate() {
+            met_by(ext, *reached, &mut cand_buf);
+            for &li in &cand_buf {
+                work.push((ai, li));
+                if work.len() >= SPLIT_PART_CHUNK {
+                    make(&work, &mut outs)?;
+                    work.clear();
+                }
+            }
+        }
+        make(&work, &mut outs)?;
+        for out in outs {
+            if out.features.is_empty() {
+                empty += 1;
+            } else {
+                layers.push(OutputLayer::Vector(out));
+            }
         }
     }
     let mut msg = format!("Split: {} layers", layers.len());
@@ -12083,6 +12200,78 @@ mod tests {
                         format!("{:?}", (&b.geometry, &b.attrs)),
                         "{name}, {threads} threads"
                     );
+                }
+            }
+        }
+    }
+
+    /// Split gives the same layers, bit for bit, on several threads as on one (#1252): areas of one
+    /// polygon and of several (by a field), polygons of one and of several parts, lines and points,
+    /// features without geometry, an area that holds nothing, and, at the tests'
+    /// [`SPLIT_AREA_BATCH`] and [`SPLIT_PART_CHUNK`], several batches of areas and chunks of parts;
+    /// the threads set or found by the sizes.
+    #[test]
+    fn split_on_several_threads_is_on_one() {
+        let mut input = Dataset::new("input", GeometryType::Polygon, vec![Field::new("v", FieldType::Integer)]);
+        let mut lines = Dataset::new("lines", GeometryType::Polyline, vec![Field::new("v", FieldType::Integer)]);
+        let mut points = Dataset::new("points", GeometryType::Point, vec![Field::new("v", FieldType::Integer)]);
+        let mut areas = Dataset::new("areas", GeometryType::Polygon, vec![Field::new("zone", FieldType::Integer)]);
+        for i in 0..600i64 {
+            let (x, y) = ((i * 37 % 300) as f64 * 0.1, (i * 53 % 120) as f64 * 0.1);
+            let none = i % 97 == 0;
+            let poly = if i % 7 == 0 {
+                let ring = |x: f64| {
+                    vec![Coord::new(x, y), Coord::new(x + 0.4, y), Coord::new(x + 0.4, y + 0.4), Coord::new(x, y + 0.4), Coord::new(x, y)]
+                };
+                Geometry::Polygon(vec![vec![ring(x)], vec![ring(x + 0.25)]])
+            } else {
+                sq(x, y, 0.35)
+            };
+            input.push(if none { None } else { Some(poly) }, vec![Value::Int(i)]);
+            let line = Geometry::Line(vec![vec![Coord::new(x, y), Coord::new(x + 0.9, y + 0.3)]]);
+            lines.push(if none { None } else { Some(line) }, vec![Value::Int(i)]);
+            points.push(if none { None } else { Some(Geometry::Point(Coord::new(x + 0.05, y + 0.05))) }, vec![Value::Int(i)]);
+        }
+        // A grid of areas over the features, every fourth zone value shared by two areas, and one
+        // area far from everything.
+        for i in 0..40i64 {
+            let (x, y) = ((i % 8) as f64 * 4.0, (i / 8) as f64 * 2.5);
+            areas.push(Some(sq(x, y, 4.2)), vec![Value::Int(if i % 4 == 0 { 1000 } else { i })]);
+        }
+        areas.push(Some(sq(80.0, 80.0, 1.0)), vec![Value::Int(2000)]);
+        let m = Map(HashMap::from([
+            ("input".to_string(), input),
+            ("lines".to_string(), lines),
+            ("points".to_string(), points),
+            ("areas".to_string(), areas),
+        ]));
+        let layers = |r: ToolResult| match r.output {
+            Output::Layers(ls) => ls
+                .into_iter()
+                .map(|l| match l {
+                    OutputLayer::Vector(d) => {
+                        format!("{} {:?}", d.name, d.features.iter().map(|f| (&f.geometry, &f.attrs)).collect::<Vec<_>>())
+                    }
+                    _ => panic!("not a vector layer"),
+                })
+                .collect::<Vec<_>>(),
+            _ => panic!("not layers"),
+        };
+        for name in ["input", "lines", "points"] {
+            for field in [None, Some("zone")] {
+                let mut p = serde_json::json!({"input": name, "split": "areas"});
+                if let Some(f) = field {
+                    p["field"] = f.into();
+                }
+                let one = split_on(&m, &p, Some(1)).unwrap();
+                let one_messages = one.messages.clone();
+                assert!(one_messages.iter().any(|m| m.contains("held no features")), "{name}, {field:?}: {one_messages:?}");
+                let one = layers(one);
+                assert!(one.len() > 10, "{name}, {field:?}: {}", one.len());
+                for threads in [Some(2), Some(7), Some(16), None] {
+                    let many = split_on(&m, &p, threads).unwrap();
+                    assert_eq!(many.messages, one_messages, "{name}, {field:?}, {threads:?} threads");
+                    assert_eq!(layers(many), one, "{name}, {field:?}, {threads:?} threads");
                 }
             }
         }
