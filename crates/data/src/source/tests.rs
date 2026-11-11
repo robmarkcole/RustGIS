@@ -1632,8 +1632,10 @@ fn flatgeobuf_and_geoparquet_by_address() {
         assert!(!s.complete && s.features.len() <= 500 && s.features.len() >= 250, "{name}: {}", s.features.len());
     }
 
-    // Files without an index or a covering are read whole instead.
-    let p = d.join("plain.parquet");
+    // Files without an index or a covering are read whole instead. Not plain.parquet: the
+    // tests run at once and share this folder, and geoparquet_with_and_without_a_covering
+    // writes and reads that one.
+    let p = d.join("r-plain.parquet");
     write_parquet(&p, false);
     remote::testing::serve("https://test.example/plain.parquet", std::fs::read(&p).unwrap());
     let e = open_url_blocking("https://test.example/plain.parquet").err().map(|e| e.to_string()).unwrap_or_default();
