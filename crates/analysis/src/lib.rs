@@ -47,7 +47,10 @@ pub use density::{
 };
 pub use parallel::scratch_budget;
 pub use parameters::StatisticList;
-pub use tools::{TOOLS, find_field_case_insensitive, holds_coordinates, max_buffer_bytes, param_applies, simplify_geometry, zonal_bands};
+pub use tools::{
+    TOOLS, find_field_case_insensitive, holds_coordinates, max_buffer_bytes, min_pad, param_applies, points_in, projected_crs, raster_crs,
+    simplify_geometry, zonal_bands,
+};
 
 use rustgis_data::Dataset;
 use serde_json::Value;

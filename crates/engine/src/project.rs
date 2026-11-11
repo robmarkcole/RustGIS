@@ -506,6 +506,36 @@ pub struct GpEnvironment {
     /// The cell size (degrees) of rasters tools create, when they don't say.
     #[serde(default)]
     pub cell_size: Option<f64>,
+    /// The projected coordinate system the Geostatistical Wizard makes its surface in, and the cell
+    /// size in its units, when the run doesn't say; `None`: degrees, with `cell_size`. Kept apart
+    /// from `cell_size` so an older RustGIS, which reads only that, still makes it in degrees rather
+    /// than reading this system's units as degrees: losing it costs that version the setting, not
+    /// the raster.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projected: Option<ProjectedCells>,
+}
+
+impl GpEnvironment {
+    /// The cell size set for rasters made in `crs`: the projected one's in its own system, the
+    /// degree one in longitude/latitude (whether or not a system is set), none in another system.
+    pub fn cell_in(&self, crs: rustgis_data::raster::Crs) -> Option<f64> {
+        match self.projected {
+            Some(g) if g.crs == crs => g.cell_size,
+            _ if crs == rustgis_data::raster::Crs::LonLat => self.cell_size,
+            _ => None,
+        }
+    }
+}
+
+/// A projected coordinate system for the rasters the environment sets ([`GpEnvironment::projected`]).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProjectedCells {
+    /// The system, never one in degrees: `gp.env` refuses those, and opening a project leaves one
+    /// out.
+    pub crs: rustgis_data::raster::Crs,
+    /// The cell size in the system's units; `None`: the tool's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell_size: Option<f64>,
 }
 
 /// A model: geoprocessing steps run in order. A parameter value `%n` stands for the output layer
@@ -1302,6 +1332,31 @@ impl Project {
         p.read_notices =
             label_losses::notices_for_maps(text, &p, map_limit.is_some())?.into_iter().map(|(part, text)| (part, text.into())).collect();
         p.read_notices.extend(repair_notices);
+        // What `gp.env` refuses, which only a hand-edited file holds, is left out, and said: a system
+        // in degrees or geocentric (its cell size would be read in the wrong units) or one this
+        // version can't project to, and a cell size that isn't above 0.
+        if let Some(g) = p.gp_env.projected.filter(|g| g.crs.is_geographic() || g.crs.is_geocentric() || g.crs.transformer().is_err()) {
+            p.gp_env.projected = None;
+            p.read_notices.push((
+                ReadPart::Items,
+                NoticeText::format(
+                    "the environment's coordinate system {crs} isn't a projected one this version can use, so it was left out",
+                    [("crs", g.crs.label().into())],
+                ),
+            ));
+        }
+        if let Some(g) = p.gp_env.projected.as_mut()
+            && let Some(c) = g.cell_size.filter(|c| !(c.is_finite() && *c > 0.0))
+        {
+            g.cell_size = None;
+            p.read_notices.push((
+                ReadPart::Items,
+                NoticeText::format(
+                    "the environment's cell size {size} isn't above 0, so it was left out",
+                    [("size", c.to_string().into())],
+                ),
+            ));
+        }
         if excluded_maps > 0 {
             p.read_notices.push((
                 ReadPart::Maps,

@@ -738,7 +738,7 @@ pub static TOOLS: &[ToolSpec] = &[
                 kind: K::Text,
                 required: false,
                 default: "",
-                help: "A projected coordinate system (e.g. EPSG:32618) to make the raster in, its units for the extent and pixel size; longitude/latitude in degrees when empty.",
+                help: "A projected coordinate system (e.g. EPSG:32618) to make the raster in, its units for the extent and pixel size; longitude/latitude in degrees when empty or EPSG:4326.",
             },
             P { name: "output", label: "Output Name", kind: K::Text, required: false, default: "", help: "" },
         ],
@@ -904,7 +904,7 @@ pub static TOOLS: &[ToolSpec] = &[
                 kind: K::Text,
                 required: false,
                 default: "",
-                help: "A projected coordinate system (e.g. EPSG:32618) to make the raster in, its units for the extent, pixel size and range; longitude/latitude in degrees when empty.",
+                help: "A projected coordinate system (e.g. EPSG:32618) to make the raster in, its units for the extent, pixel size and range; longitude/latitude in degrees when empty or EPSG:4326.",
             },
             P { name: "output", label: "Output Name", kind: K::Text, required: false, default: "", help: "" },
         ],
@@ -4057,7 +4057,7 @@ fn idw_interpolation(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
             }
         });
     }
-    let (crs, crs_note) = interpolation_crs(ds, p, "IDW Interpolation")?;
+    let (crs, crs_note) = raster_crs(ds, p, "IDW Interpolation")?;
     let (pts, beyond_note) = points_in(crs, pts)?;
     let extent = match s(p, "extent").trim() {
         "" => {
@@ -4144,7 +4144,7 @@ fn kriging_interpolation(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
             }
         }
     }
-    let (crs, crs_note) = interpolation_crs(ds, p, "Ordinary Kriging")?;
+    let (crs, crs_note) = raster_crs(ds, p, "Ordinary Kriging")?;
     let (mut raw_pts, beyond_note) = points_in(crs, raw_pts)?;
     // Deduplicate sample points by coordinate to prevent singular kriging matrix
     raw_pts.sort_by(|a, b| a.0.x.total_cmp(&b.0.x).then_with(|| a.0.y.total_cmp(&b.0.y)));
@@ -4239,38 +4239,54 @@ fn kriging_interpolation(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
     })
 }
 
-/// The coordinate system IDW Interpolation and Ordinary Kriging make their grid in: the projected
-/// system given as `crs`, or longitude/latitude in degrees when it is empty, as before `crs` was
-/// there. The note says what the run used where that could surprise: the compatibility note on
+/// The coordinate system an interpolation (`tool`) makes its grid in: the projected system given as
+/// `p`'s `crs`, or longitude/latitude in degrees when it is empty or `EPSG:4326`, as before `crs`
+/// was there. The note says what the run used where that could surprise: the compatibility note on
 /// the system given, or degrees for a layer read from a projected file.
-fn interpolation_crs(ds: &Dataset, p: &Json, tool: &str) -> Result<(Crs, Option<String>), String> {
+pub fn raster_crs(ds: &Dataset, p: &Json, tool: &str) -> Result<(Crs, Option<String>), String> {
     if p.get("crs").is_some_and(|v| !v.is_null() && !v.is_string()) {
         return Err("crs must be text".into());
     }
     match s(p, "crs").trim() {
-        "" => Ok((
-            Crs::LonLat,
-            ds.crs.filter(|c| !c.is_geographic()).map(|c| {
-                format!(
-                    "{tool}: made in degrees of longitude and latitude, though {} was read in {}; set its coordinate system (crs) to make it in that system's units",
-                    ds.name,
-                    c.label()
-                )
-            }),
-        )),
+        "" => Ok((Crs::LonLat, degrees_note(ds, tool))),
+        // Asked for by name: degrees, with nothing to say.
+        text if Crs::parse(text).is_ok_and(|c| c == Crs::LonLat) => Ok((Crs::LonLat, None)),
         text => {
-            let (crs, note) = crs_with_compatibility_note(text)?;
-            if crs.is_geographic() {
-                return Err("crs must be a projected coordinate system with linear units (such as UTM or State Plane, e.g. EPSG:32618); leave it empty to work in degrees".into());
-            }
+            let (crs, note) = projected_crs(text)?;
             Ok((crs, note.map(|note| format!("{tool}: its coordinate system: {note}"))))
         }
     }
 }
 
+/// The projected coordinate system `text` names, and its compatibility note, or an error for one
+/// in degrees: a raster's cells are measured in a projected system's units.
+pub fn projected_crs(text: &str) -> Result<(Crs, Option<&'static str>), String> {
+    let (crs, note) = crs_with_compatibility_note(text)?;
+    if crs.is_geocentric() {
+        return Err("crs must be a projected coordinate system, not a geocentric one (X, Y and Z from the Earth's centre)".into());
+    }
+    if crs.is_geographic() {
+        return Err("crs must be a projected coordinate system with linear units (such as UTM or State Plane, e.g. EPSG:32618); leave it empty to work in degrees".into());
+    }
+    Ok((crs, note))
+}
+
+/// The note `tool` gives when it makes a raster in degrees from `ds`, read from a file in a
+/// projected system: it names the system and the setting that would use it.
+fn degrees_note(ds: &Dataset, tool: &str) -> Option<String> {
+    ds.crs.filter(|c| !c.is_geographic()).map(|c| {
+        format!(
+            "{tool}: made in degrees of longitude and latitude, though {} was read in {}; set its coordinate system (crs) to make it in that system's units",
+            ds.name,
+            c.label()
+        )
+    })
+}
+
 /// `pts` (longitude/latitude) in `crs`, and a note counting those left out because the system
-/// can't hold them (see [`in_projected`]).
-fn points_in(crs: Crs, pts: Vec<(Coord, f64)>) -> Result<(Vec<(Coord, f64)>, Option<String>), String> {
+/// can't hold them (see [`in_projected`]). One short step without a Cancel check: a point costs a
+/// projection and its round trip, far less than the interpolation that follows.
+pub fn points_in(crs: Crs, pts: Vec<(Coord, f64)>) -> Result<(Vec<(Coord, f64)>, Option<String>), String> {
     if crs == Crs::LonLat {
         return Ok((pts, None));
     }
@@ -4289,8 +4305,8 @@ fn beyond_note(crs: Crs, beyond: usize) -> Option<String> {
 }
 
 /// The least an interpolation grid reaches past points in a row, which span no area: 0.01° in
-/// degrees, or about as far (1 km) in a projected system's units.
-fn min_pad(crs: Crs) -> f64 {
+/// degrees, or 1000 of a projected system's units (1 km in metres).
+pub fn min_pad(crs: Crs) -> f64 {
     if crs.is_geographic() { 0.01 } else { 1000.0 }
 }
 
@@ -9915,7 +9931,7 @@ mod tests {
             assert!(d.iter().all(|v| (1.0..=4.0).contains(v)), "{tool}: {d:?}");
             assert!(d[d.len() - g.width as usize] < d[g.width as usize - 1], "{tool}: south-west below north-east");
 
-            for (crs, why) in [(serde_json::json!("EPSG:4326"), "geographic"), (serde_json::json!(32616), "not text")] {
+            for (crs, why) in [(serde_json::json!("EPSG:4269"), "geographic, not WGS 84"), (serde_json::json!(32616), "not text")] {
                 let p = serde_json::json!({"input": "wells", "field": "v", "crs": crs});
                 assert!(crate::run(tool, &m, &p).is_err(), "{tool}: {why}");
             }

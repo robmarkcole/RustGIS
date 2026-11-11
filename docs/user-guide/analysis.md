@@ -531,15 +531,16 @@ cell by 1/distanceᴾ, where P is the distance coefficient (2 by default). Lines
 contribute their vertices. Leave the extent empty to use the input's, or give it as
 `xmin,ymin,xmax,ymax`. `pixelSize` sets the cell size; when omitted it starts at 300 cells
 across the extent and coarsens for large inputs. The result is a Float32 GeoTIFF layer. The
-**Geostatistical Wizard** is a separate IDW workflow, in degrees: it uses 12 nearest neighbours
-by default (`neighbors`), rather than every point.
+**Geostatistical Wizard** is a separate IDW workflow, with its coordinate system from Environments
+(below): it uses 12 nearest neighbours by default (`neighbors`), rather than every point.
 
 IDW Interpolation and Ordinary Kriging make their raster in the projected coordinate system given
 as `crs` (such as `EPSG:32616` for UTM zone 16N, or a State Plane code), and then take the
 extent, pixel size and Kriging's `range` in its units, usually metres or feet. Without `crs`
 they work in longitude and latitude, with all three in degrees, as they did before `crs` was
-there; for a layer read from a projected file they then say so, naming its system. A geographic
-`crs` is refused, and points the system can't hold are left out and counted.
+there; for a layer read from a projected file they then say so, naming its system. `EPSG:4326`
+also means degrees; another geographic `crs` is refused, and points the system can't hold are left
+out and counted.
 
 **Ordinary Kriging** (`kriging`) estimates both a value and its uncertainty. Set `input` and a
 numeric `field`, then choose a `model`: **Spherical** (default), **Exponential** or **Gaussian**.
@@ -1243,9 +1244,17 @@ Rasters these make are kept in the project. **Environments** (`gp.env`) set an e
 view, full extent, a layer or a longitude/latitude box (or `null` to clear it). For tools that
 honour it, this restricts an unselected main feature input by bounding-box intersection, not by
 clipping its geometry; an existing selection takes precedence and overlay inputs stay whole.
-The Geostatistical Wizard uses the environment's extent and raster cell size (degrees).
-IDW Interpolation and Ordinary Kriging instead use their own `extent` and `pixelSize` parameters;
-the environment does not set their output grids.
+The environment can also set a projected coordinate system for the Geostatistical Wizard's rasters
+(`gp.env={"crs": "EPSG:32616"}`, or **Set Coordinate System**; `null` goes back to degrees), and
+`cellSize` is then in its units. That cell size is kept apart from the cell size in degrees, so an
+older RustGIS opening the project keeps making rasters in degrees; `gp.env` returns the system and
+its cell size as `projected` (`crs` there is the text to give it back), and `cellSize` stays the one
+in degrees. The Geostatistical Wizard
+uses the environment's extent, coordinate system and cell size; its own `crs` and `cellSize` win
+over them (`EPSG:4326` asks for degrees, with the degree cell size), and without a system it works
+in degrees, as before. IDW Interpolation and Ordinary Kriging
+instead use their own `extent`, `pixelSize` and `crs` parameters; the environment does not set
+their output grids.
 
 **Threads** (`gp.threads={"threads": 8}`) sets the most threads one piece of work uses, 1 to 1024
 (`null`: the default, the computer's cores up to 16). It is never more than the cores, holds for

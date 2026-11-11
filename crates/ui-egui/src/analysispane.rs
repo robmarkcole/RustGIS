@@ -50,6 +50,16 @@ pub struct Workflow {
     /// The Spectral Analysis section's profile: the points read and charted.
     pub spectral: crate::spectralui::Spectral,
     pub selected_only: Option<bool>,
+    /// The projected coordinate system the Geostatistical Wizard's surface is made in; empty: the
+    /// environment's, or degrees.
+    pub crs: String,
+    /// The system the Wizard's surface was last to be made in (its own, else the environment's):
+    /// when it changes, the cell size typed for it is cleared.
+    pub wizard_system: String,
+    /// The projected coordinate system typed for the environment's Set Coordinate System.
+    pub env_crs: String,
+    /// The cell size typed for the environment, apart from the Wizard's, which is the run's own.
+    pub env_cell: String,
     pub zonal_stats: ZonalStatsForm,
     /// A workflow running on a thread of its own: its progress and Cancel show, and what it made
     /// lands through [`land_job`].
@@ -708,14 +718,38 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             heading(ui, "Interpolate a surface from points (IDW)");
             combo(ui, "wf_i", "Layer", &mut app.workflow.layer, &points);
             combo(ui, "wf_if", "Field", &mut app.workflow.field, &numeric);
+            // Empty: the environment's system, or degrees without one.
+            let degrees = app.workflow.crs.trim().is_empty() && app.session.project.gp_env.projected.is_none();
+            ui.add(
+                egui::TextEdit::singleline(&mut app.workflow.crs)
+                    .hint_text(match app.session.project.gp_env.projected {
+                        Some(g) => g.crs.label(),
+                        None => tl!("projected system (EPSG:32616), or degrees").to_string(),
+                    })
+                    .desired_width(f32::INFINITY),
+            );
+            // A cell size typed for one system means nothing in another: when the system the surface
+            // will be made in changes (typed here, or the environment's), the size is cleared.
+            let system = match app.workflow.crs.trim() {
+                "" => app.session.project.gp_env.projected.map(|g| g.crs.code()).unwrap_or_default(),
+                typed => typed.to_string(),
+            };
+            if system != app.workflow.wizard_system {
+                app.workflow.number.clear();
+                app.workflow.wizard_system = system;
+            }
             ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut app.workflow.number).hint_text(tl!("cell size °")).desired_width(80.0));
+                let hint = if degrees { tl!("cell size °") } else { tl!("cell size") };
+                ui.add(egui::TextEdit::singleline(&mut app.workflow.number).hint_text(hint).desired_width(80.0));
                 ui.add(egui::TextEdit::singleline(&mut app.workflow.number2).hint_text(tl!("power 2")).desired_width(60.0));
             });
             if ui.button(tl!("Run")).clicked() {
                 let mut p = json!({"layer": app.workflow.layer, "field": app.workflow.field, "power": num(&app.workflow.number2, 2.0)});
                 if let Ok(c) = app.workflow.number.trim().parse::<f64>() {
                     p["cellSize"] = json!(c);
+                }
+                if !app.workflow.crs.trim().is_empty() {
+                    p["crs"] = json!(app.workflow.crs.trim());
                 }
                 run(app, "analysis.interpolate", p);
             }
@@ -823,11 +857,39 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                     }
                 }
             });
+            let system = env.projected.map(|g| g.crs.label()).unwrap_or_else(|| tl!("Degrees").to_string());
+            let cells = env.cell_in(env.projected.map_or(rustgis_engine::data::raster::Crs::LonLat, |g| g.crs));
+            let cells = cells.map(|c| c.to_string()).unwrap_or_else(|| tl!("the tool's own").to_string());
+            ui.label(
+                egui::RichText::new(crate::i18n::fmt("Rasters: {system}, cell size {cells}", &[("system", &system), ("cells", &cells)]))
+                    .small(),
+            );
+            ui.horizontal_wrapped(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut app.workflow.env_crs).hint_text("EPSG:32616").desired_width(110.0));
+                // An empty box sets nothing; going back to degrees is its own button, so a click
+                // never clears the system and its cell size by accident.
+                let typed = app.workflow.env_crs.trim().to_string();
+                if ui.add_enabled(!typed.is_empty(), egui::Button::new(tl!("Set Coordinate System"))).clicked() {
+                    run(app, "gp.env", json!({"crs": typed}));
+                }
+                if ui.add_enabled(env.projected.is_some(), egui::Button::new(tl!("Degrees"))).clicked() {
+                    run(app, "gp.env", json!({"crs": null}));
+                }
+            });
             ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut app.workflow.number).hint_text(tl!("cell size °")).desired_width(80.0));
+                let hint = if env.projected.is_some() { tl!("cell size") } else { tl!("cell size °") };
+                ui.add(egui::TextEdit::singleline(&mut app.workflow.env_cell).hint_text(hint).desired_width(80.0));
                 if ui.button(tl!("Set Cell Size")).clicked() {
-                    let v = app.workflow.number.trim().parse::<f64>().ok();
-                    run(app, "gp.env", json!({"cellSize": v}));
+                    // Empty clears the size; text that isn't a number is refused, not taken as empty.
+                    let typed = app.workflow.env_cell.trim().to_string();
+                    match typed.parse::<f64>() {
+                        // `inf` and `NaN` parse, but aren't sizes (and go out as null, which clears).
+                        Ok(v) if v.is_finite() => run(app, "gp.env", json!({"cellSize": v})),
+                        Err(_) if typed.is_empty() => run(app, "gp.env", json!({"cellSize": null})),
+                        _ => {
+                            app.workflow.error = Some(crate::i18n::fmt("'{size}' isn't a cell size: give a number", &[("size", &typed)]));
+                        }
+                    }
                 }
             });
         }

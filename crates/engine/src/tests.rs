@@ -39501,6 +39501,132 @@ fn interpolation_says_the_features_it_leaves_out() {
     assert!(e.contains("(2 features with no geometry or no usable point, 1 whose value isn't a number left out)"), "{e}");
 }
 
+/// The Geostatistical Wizard makes its surface in a projected system (#1743): the one given as
+/// `crs`, else the environment's (`gp.env` `crs`, with a cell size in its units). Without either it
+/// stays in degrees, and says so for a layer read in a projected system. The environment keeps its
+/// system apart from the degree cell size an older RustGIS reads, and saves it with the project.
+#[test]
+fn interpolation_in_a_projected_coordinate_system() {
+    use rustgis_data::raster::Crs;
+    use rustgis_data::{Dataset, Field, FieldType, Geometry, GeometryType, Value as V};
+    use rustgis_geom::Coord;
+    let mut s = world();
+    // Wells around Memphis, read in UTM zone 16N.
+    let mut wells = Dataset::new("wells", GeometryType::Point, vec![Field::new("depth", FieldType::Double)]);
+    for (x, y, depth) in [(-90.05, 35.10, 10.0), (-89.95, 35.10, 20.0), (-90.05, 35.20, 30.0), (-89.95, 35.20, 40.0)] {
+        wells.push(Some(Geometry::Point(Coord::new(x, y))), vec![V::Float(depth)]);
+    }
+    wells.crs = Some(Crs::Epsg(32616));
+    crate::cmd::layer::add_dataset(&mut s, wells);
+    let surface = |s: &mut Session, p: Value| {
+        let mark = s.notice_mark();
+        let v = s.run("analysis.interpolate", &p).unwrap_or_else(|e| panic!("{p}: {e}"));
+        let notices: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+        let r = s.map().layer(v["layer"].as_u64().unwrap() as u32).unwrap().raster.as_ref().unwrap().data.clone().unwrap();
+        (r.crs, r.transform.pixel_width, notices)
+    };
+    let in_degrees = |notices: &[String]| notices.iter().any(|n| n.contains("made in degrees") && n.contains(&Crs::Epsg(32616).label()));
+
+    let (crs, cell, notices) = surface(&mut s, json!({"layer": "wells", "field": "depth", "crs": "EPSG:32616", "cellSize": 500}));
+    assert_eq!((crs, cell), (Crs::Epsg(32616), 500.0));
+    assert!(!in_degrees(&notices), "{notices:?}");
+    let (crs, cell, notices) = surface(&mut s, json!({"layer": "wells", "field": "depth", "cellSize": 0.01}));
+    assert_eq!((crs, cell), (Crs::LonLat, 0.01));
+    assert!(in_degrees(&notices), "{notices:?}");
+
+    // The environment's system, with its cell size in metres; its degree cell size stays apart.
+    let env = s.run("gp.env", &json!({"crs": "EPSG:32616", "cellSize": 250})).unwrap();
+    assert_eq!((env["cellSize"].clone(), env["projected"]["cellSize"].clone()), (Value::Null, json!(250.0)), "{env}");
+    assert_eq!(env["projected"]["crs"], "EPSG:32616", "{env}");
+    let (crs, cell, notices) = surface(&mut s, json!({"layer": "wells", "field": "depth"}));
+    assert_eq!((crs, cell), (Crs::Epsg(32616), 250.0));
+    assert!(!in_degrees(&notices), "{notices:?}");
+    // An empty `crs` is none given: the environment's still applies.
+    let (crs, cell, _) = surface(&mut s, json!({"layer": "wells", "field": "depth", "crs": ""}));
+    assert_eq!((crs, cell), (Crs::Epsg(32616), 250.0));
+    // EPSG:4326 asks for degrees over the environment's system.
+    let (crs, _, _) = surface(&mut s, json!({"layer": "wells", "field": "depth", "crs": "EPSG:4326", "cellSize": 0.01}));
+    assert_eq!(crs, Crs::LonLat);
+    // The run's own cell size wins over the environment's.
+    let (_, cell, _) = surface(&mut s, json!({"layer": "wells", "field": "depth", "cellSize": 500}));
+    assert_eq!(cell, 500.0);
+    let saved = serde_json::to_value(&s.project.gp_env).unwrap();
+    assert_eq!(saved["cell_size"], Value::Null, "{saved}");
+    assert_eq!(serde_json::from_value::<crate::project::GpEnvironment>(saved).unwrap(), s.project.gp_env);
+    // A whole project opened again keeps the system and its cell size, with nothing to say.
+    let mut reopened = Project::from_json(&serde_json::to_string(&s.project).unwrap()).unwrap();
+    assert_eq!(reopened.gp_env, s.project.gp_env);
+    assert!(reopened.take_read_notices(&[crate::project::ReadPart::Items]).is_empty());
+    // A system given to the run wins, and the environment's cell size isn't read in another one.
+    let (crs, mercator_cell, _) = surface(&mut s, json!({"layer": "wells", "field": "depth", "crs": "EPSG:3857"}));
+    assert_eq!(crs, Crs::WebMercator);
+
+    // The same system again keeps its cell size; a bad call changes nothing.
+    s.run("gp.env", &json!({"crs": "EPSG:32616"})).unwrap();
+    assert_eq!(s.project.gp_env.cell_in(Crs::Epsg(32616)), Some(250.0));
+    let before = s.project.gp_env.clone();
+    assert!(s.run("gp.env", &json!({"extent": [0, 0, 1, 1], "crs": "EPSG:3857", "cellSize": -1})).is_err());
+    assert_eq!(s.project.gp_env, before, "the extent set before the refusal is rolled back too");
+    assert!(s.run("gp.env", &json!({"crs": "EPSG:4326", "cellSize": 100})).is_err());
+    assert_eq!(s.project.gp_env, before);
+
+    // A point Web Mercator can't hold is left out and counted; the others make the surface.
+    let mut polar = Dataset::new("polar", GeometryType::Point, vec![Field::new("depth", FieldType::Double)]);
+    for (x, y, depth) in [(-90.05, 35.10, 10.0), (-89.95, 35.20, 20.0), (0.0, 89.0, 30.0)] {
+        polar.push(Some(Geometry::Point(Coord::new(x, y))), vec![V::Float(depth)]);
+    }
+    crate::cmd::layer::add_dataset(&mut s, polar);
+    let (crs, _, notices) = surface(&mut s, json!({"layer": "polar", "field": "depth", "crs": "EPSG:3857"}));
+    assert_eq!(crs, Crs::WebMercator);
+    // Both points left make it: its values reach from near one's to near the other's.
+    let polar = s.map().layer_by_name("polar_depth_idw").unwrap().raster.as_ref().unwrap().data.clone().unwrap();
+    let values: Vec<f32> = polar.bands[0].data.iter().copied().filter(|v| polar.is_valid(*v)).collect();
+    let (low, high) = values.iter().fold((f32::MAX, f32::MIN), |(l, h), v| (l.min(*v), h.max(*v)));
+    assert!(low < 12.0 && high > 18.0 && high <= 20.0, "{low}..{high}");
+    let label = Crs::WebMercator.label();
+    let beyond = format!("polar: 1 point(s) beyond what {label} can hold (past 85.05° of latitude) were left out");
+    assert!(notices.contains(&beyond), "{notices:?}");
+
+    // Degrees are refused as a system; clearing the environment's goes back to degrees.
+    assert!(s.run("analysis.interpolate", &json!({"layer": "wells", "field": "depth", "crs": "EPSG:4269"})).is_err());
+    assert!(s.run("gp.env", &json!({"crs": "EPSG:4326"})).is_err());
+    assert!(s.run("gp.env", &json!({"crs": 32616})).is_err());
+    assert!(s.run("gp.env", &json!({"crs": "EPSG:4978"})).is_err(), "geocentric");
+    s.run("gp.env", &json!({"crs": null})).unwrap();
+    assert_eq!(s.project.gp_env.projected, None);
+    // The run in another system above took its own cell size, as it does with no environment.
+    let (_, cell, _) = surface(&mut s, json!({"layer": "wells", "field": "depth", "crs": "EPSG:3857"}));
+    assert_eq!(cell, mercator_cell);
+    assert!(s.run("gp.env", &json!({"cellSize": 500})).is_err(), "500 degrees");
+
+    // A hand-edited project whose environment system is in degrees opens without it, and says so.
+    let mut env = serde_json::to_value(crate::project::GpEnvironment::default()).unwrap();
+    env["projected"] = json!({"crs": "LonLat", "cell_size": 250.0});
+    let mut text = serde_json::to_value(&s.project).unwrap();
+    text["gp_env"] = env;
+    let mut opened = Project::from_json(&text.to_string()).unwrap();
+    assert_eq!(opened.gp_env.projected, None);
+    let said = opened.take_read_notices(&[crate::project::ReadPart::Items]);
+    assert!(format!("{said:?}").contains("environment's coordinate system"), "{said:?}");
+    // So does a geocentric system, and a cell size that isn't above 0 (the system kept).
+    let mut text = serde_json::to_value(&s.project).unwrap();
+    text["gp_env"]["projected"] = json!({"crs": {"Epsg": 4978}, "cell_size": 250.0});
+    let mut opened = Project::from_json(&text.to_string()).unwrap();
+    assert_eq!(opened.gp_env.projected, None);
+    assert!(format!("{:?}", opened.take_read_notices(&[crate::project::ReadPart::Items])).contains("isn't a projected one"));
+    // And a code this version has no definition for.
+    text["gp_env"]["projected"] = json!({"crs": {"Epsg": 1}, "cell_size": 250.0});
+    let mut opened = Project::from_json(&text.to_string()).unwrap();
+    assert_eq!(opened.gp_env.projected, None);
+    assert!(format!("{:?}", opened.take_read_notices(&[crate::project::ReadPart::Items])).contains("isn't a projected one"));
+    text["gp_env"]["projected"] = json!({"crs": {"Epsg": 32616}, "cell_size": -5.0});
+    let mut opened = Project::from_json(&text.to_string()).unwrap();
+    assert_eq!(opened.gp_env.projected.map(|g| (g.crs, g.cell_size)), Some((Crs::Epsg(32616), None)));
+    assert!(format!("{:?}", opened.take_read_notices(&[crate::project::ReadPart::Items])).contains("isn't above 0"));
+    let clean = Project::from_json(&serde_json::to_string(&s.project).unwrap()).unwrap();
+    assert!(clean.read_notices.is_empty(), "{:?}", clean.read_notices);
+}
+
 /// `share.exportMap` to a `.tif` writes the view placed on the ground (#1561): in the map's
 /// projection, each pixel where the view drew it, RGB; a turned view north up over its box, and
 /// says so; a tilted view, the globe and junk refused.
