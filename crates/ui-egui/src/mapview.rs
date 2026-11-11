@@ -349,6 +349,11 @@ pub struct MapView {
     tilt_settle: crate::tilt_settle::TiltSettle<Key>,
     /// The frame shown has tile pictures still to draw: drawn again.
     filling: bool,
+    /// The last frame painted showed the tilted map's drape.
+    drape_painted: bool,
+    /// When the settled frame of a tilted map over terrain replaced its drape: it fades in over
+    /// the drape (see [`settle_fade`]).
+    tilt_fade: Option<f64>,
     /// Shooting stars around the globe.
     comets: crate::comets::Comets,
     /// GPU map backend: pipelines (built lazily from the render state), the uploaded scene,
@@ -437,6 +442,8 @@ impl Default for MapView {
             tilt_drape: Default::default(),
             tilt_settle: Default::default(),
             filling: false,
+            drape_painted: false,
+            tilt_fade: None,
             label_map: Vec::new(),
             comets: Default::default(),
             gpu_renderer: None,
@@ -1016,6 +1023,11 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                     rustgis_engine::render::RenderOutput::Cpu(r) => {
                         app.map.gpu_frame = None;
                         show_frame(app, ui.ctx(), r, &done.view, (w, h), k, time, globe_view);
+                        // Over terrain the settled frame's mesh is finer than the drape's
+                        // (#1523): the relief's outline would jump, so it fades in over it.
+                        if app.map.drape_painted && done.view.camera.pitch != 0.0 && done.map.view.terrain.is_some() {
+                            app.map.tilt_fade = Some(time);
+                        }
                     }
                     rustgis_engine::render::RenderOutput::Gpu(scene) => {
                         if !show_gpu_frame(app, scene, &done.view, k, time) {
@@ -1252,11 +1264,18 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     // Behind the (possibly shifted or shrunk) last frame: the map's own background, so zooming
     // out never shows a band of window colour around it.
     let background = app.session.map().palette().0;
+    let fade = app.map.tilt_fade.filter(|_| !tilt_draped && app.map.tilt_drape.drawn()).and_then(|at| settle_fade(time - at));
+    if fade.is_some() {
+        ui.ctx().request_repaint();
+    } else {
+        app.map.tilt_fade = None;
+    }
+    app.map.drape_painted = tilt_draped;
     if draped {
         app.map.drape.paint(ui.ctx(), &painter, rect, app.session.map(), ppp);
     } else if globe_view {
         app.map.drape.paint_space(ui.ctx(), &painter, rect, app.session.map(), ppp);
-    } else if tilt_draped {
+    } else if tilt_draped || fade.is_some() {
         app.map.tilt_drape.paint(&painter, rect, app.session.map());
     } else {
         painter.rect_filled(rect, 0.0, c32(background));
@@ -1319,7 +1338,8 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             },
         ));
     } else if let Some(tex) = app.map.texture.as_ref().filter(|_| !draped && !tilt_draped) {
-        painter.image(tex.id(), tex_rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+        let tint = fade.map_or(Color32::WHITE, |a| Color32::from_white_alpha((a * 255.0).round() as u8));
+        painter.image(tex.id(), tex_rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), tint);
     }
     // Shooting stars, while space shows around the globe.
     let g = Globe::new(&cam, w, h);
@@ -1513,6 +1533,16 @@ fn show_frame(
 /// How much wider and taller than the view a frame drawn mid-motion to fill a gap is, so the
 /// next steps of zooming out or panning are covered too.
 const GAP_SPAN: f64 = 1.5;
+
+/// How long (s) the settled frame of a tilted map over terrain takes to fade in over its drape.
+const SETTLE_FADE: f64 = 0.25;
+
+/// How opaque the settled frame of a tilted map over terrain stands `since` seconds after it
+/// replaced the drape, easing in over [`SETTLE_FADE`]; `None` once it has (or for no number).
+fn settle_fade(since: f64) -> Option<f32> {
+    let t = since / SETTLE_FADE;
+    (0.0..1.0).contains(&t).then_some((t * t * (3.0 - 2.0 * t)) as f32)
+}
 
 /// How long (s) the view's size holds before the map is drawn at it again (see `hold`).
 const RESIZE_SETTLE: f64 = 0.15;
@@ -5306,6 +5336,82 @@ mod tests {
         h.step();
         let st = h.state();
         assert!(st.map.key.is_some_and(|k| k.rev == st.session.revision), "the hidden layer stayed on screen");
+    }
+
+    /// Over terrain the settled frame's mesh is finer than the moving drape's (#1523): the
+    /// frame fades in over the drape, rather than replacing it at once, which made the relief's
+    /// outline jump.
+    #[test]
+    fn a_tilted_map_over_terrain_fades_its_settled_frame_in_over_the_drape() {
+        use rustgis_engine::data::raster::{ColorHint, Crs, GeoTransform, Raster};
+        let mut app = RustGisApp::with_sample();
+        {
+            let m = app.session.map_mut();
+            m.basemap = rustgis_engine::map::Basemap::Blank;
+            let n = 64usize;
+            let heights: Vec<f32> = (0..n * n)
+                .map(|i| {
+                    let (x, y) = ((i % n) as f32 / n as f32 - 0.5, (i / n) as f32 / n as f32 - 0.5);
+                    3000.0 * (-(x * x + y * y) * 20.0).exp()
+                })
+                .collect();
+            let gt = GeoTransform { origin_x: 9.0, origin_y: 49.0, pixel_width: 2.0 / n as f64, pixel_height: -2.0 / n as f64 };
+            let dem = Raster::new("dem", n as u32, n as u32, vec![heights], gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
+            m.add_raster("dem", rustgis_engine::map::RasterLayer::from_path(dem, "dem.tif"));
+            m.view.terrain = Some(rustgis_engine::map::view::Terrain {
+                source: rustgis_engine::map::view::TerrainSource::Layer("dem".into()),
+                exaggeration: 2.0,
+            });
+            m.camera =
+                Camera { center: rustgis_engine::geom::lonlat_to_merc(Coord::new(10.0, 47.6)), res: 300.0, bearing: 0.0, pitch: 60.0 };
+        }
+        let mut h =
+            egui_kittest::Harness::builder().with_size(vec2(900.0, 600.0)).with_step_dt(1.0 / 60.0).with_max_steps(10_000).build_ui_state(
+                |ui, app: &mut RustGisApp| {
+                    let ctx = ui.ctx().clone();
+                    app.logic(&ctx);
+                    app.ui(ui);
+                },
+                app,
+            );
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let step = |h: &mut egui_kittest::Harness<'_, RustGisApp>, what: &str| {
+            assert!(std::time::Instant::now() < end, "{what}");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            h.step();
+        };
+        // The first frame, drawn while the drape stood in for it, fades in too.
+        while h.state().map.key.is_none_or(|k| k.draft) || h.state().map.drawing() || h.state().map.tilt_fade.is_some() {
+            step(&mut h, "the first frame did not arrive");
+        }
+        // The map moves a little each frame: its drape is painted.
+        for _ in 0..10 {
+            let now = h.ctx.input(|i| i.time);
+            let st = h.state_mut();
+            st.map.last_interaction = now;
+            st.session.map_mut().camera.center.x += 200.0;
+            step(&mut h, "the drape did not come");
+        }
+        while !h.state().map.drape_painted {
+            let now = h.ctx.input(|i| i.time);
+            h.state_mut().map.last_interaction = now;
+            step(&mut h, "the drape was not painted");
+        }
+        // At rest the settled frame comes and fades in over the drape, which then goes.
+        let mut fading = 0;
+        while fading == 0 || h.state().map.tilt_fade.is_some() {
+            if h.state().map.tilt_fade.is_some() {
+                fading += 1;
+                assert!(!h.state().map.drape_painted, "the drape counts as painted only while it moves");
+            }
+            step(&mut h, "the settled frame did not fade in and end");
+        }
+        // Over several frames: about SETTLE_FADE at 60 frames a second.
+        assert!(fading >= 5, "{fading} frames");
+        assert_eq!(super::settle_fade(-0.1), None);
+        assert_eq!(super::settle_fade(super::SETTLE_FADE), None);
+        assert_eq!(super::settle_fade(f64::NAN), None);
+        assert!(super::settle_fade(0.0) == Some(0.0) && super::settle_fade(super::SETTLE_FADE / 2.0) == Some(0.5));
     }
 
     /// Dragging a side pane resizes the map view every frame. The map is not drawn again for

@@ -69,8 +69,11 @@ back about the centre of view, so the horizon comes into sight past the curve of
 
 **Terrain** gives a tilted map relief, as MapLibre's terrain does: the map is draped over the
 ground's heights, labels and point markers stand on it, and nearer slopes hide what lies behind
-them. The heights come from a DEM raster layer of the project (heights in metres; the layer can
-stay hidden) or from elevation tiles: Terrarium (`terrarium`, as the free
+them. While the map moves, the relief is laid on a coarse grid, to keep up; once it settles, and
+in exported maps, on a grid four times finer each way, so a ridge's outline follows the ridge
+(the settled map fades in over the moving one in a quarter of a second). The heights come from a
+DEM raster layer of the project (heights in metres; the layer can stay hidden) or from elevation
+tiles: Terrarium (`terrarium`, as the free
 `https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png`) or Mapbox
 Terrain-RGB (`mapbox`, also MapTiler's). **View › Scene › Terrain** turns it on from the active
 layer (make the DEM the active layer first) and off again; a notice names the layer and says to

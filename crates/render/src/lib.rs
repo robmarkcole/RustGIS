@@ -2028,7 +2028,8 @@ impl ArchiveRevision {
         if self.0 != current.0 {
             return Err("a tile archive changed during rendering; export again after the reload finishes".to_string());
         }
-        result.ok_or_else(|| failure.to_string())
+        // A frame cut short by Cancel (see `drape_terrain`) says it was cancelled.
+        result.ok_or_else(|| rustgis_data::progress::check().err().map_or_else(|| failure.to_string(), |e| e.to_string()))
     }
 }
 
@@ -2533,7 +2534,10 @@ fn render_tilted(map: &mut Map, view: &View, full_res_rasters: bool, sources_rea
     }
     match &ground {
         Some(g) => {
-            drape_terrain(pm.pixels(), view, map, &kept, g);
+            // Cut short by Cancel, the frame isn't handed on: half its ground would be missing.
+            if !drape_terrain(pm.pixels(), view, map, &kept, g) {
+                return None;
+            }
             tiles_pending |= g.pending();
         }
         None => warp.finish(pm.pixels()),
@@ -2566,7 +2570,10 @@ fn render_tilted(map: &mut Map, view: &View, full_res_rasters: bool, sources_rea
 /// triangles raised to the ground's height and mapped from its picture, every band keeping to
 /// its own stretch of ground, all drawn far to near so nearer slopes hide what lies behind
 /// them; fog with distance, and the sky behind. (Without terrain, [`Warp`] does it per pixel.)
-fn drape_terrain(pm: &mut Pixmap, view: &View, map: &Map, bands: &[(View, (f64, f64), Pixmap)], ground: &terrain::Ground) {
+/// Reading the grids' heights and ordering the triangles (tens of milliseconds) doesn't look at
+/// Cancel; drawing them, the long part, does. False when an export cancelled meanwhile stopped
+/// it, the picture left half drawn.
+fn drape_terrain(pm: &mut Pixmap, view: &View, map: &Map, bands: &[(View, (f64, f64), Pixmap)], ground: &terrain::Ground) -> bool {
     let (sky, fog) = tilt_sky(map);
     let cam = view.camera;
     let (w, h) = (view.width, view.height);
@@ -2589,14 +2596,18 @@ fn drape_terrain(pm: &mut Pixmap, view: &View, map: &Map, bands: &[(View, (f64, 
         }
         None => pm.fill(c(fog)),
     }
-    // Every band's triangles: (depth, band, screen and picture corners).
-    type Tri = (f64, usize, [(f64, f64); 3], [(f64, f64); 3]);
-    let mut tris: Vec<Tri> = Vec::new();
-    let n = terrain::CELLS;
+    // Every band's triangles: (depth, band, cell * 2 + which half), with each band's grid of
+    // vertices (screen point, picture point, depth). Indices, not corners: the settled mesh is
+    // fine (`terrain::SETTLED_CELLS`), and corners copied into each triangle took 112 bytes a
+    // triangle against 16 (13 MB against 8 with the grids, for a 1600 × 1100 export).
+    type Vertex = ((f64, f64), (f64, f64), f64);
+    let n = terrain::SETTLED_CELLS;
+    let (pw, ph) = (f64::from(pm.width()), f64::from(pm.height()));
+    let mut grids: Vec<Vec<Option<Vertex>>> = Vec::with_capacity(bands.len());
+    let mut tris: Vec<(f64, u32, u32)> = Vec::new();
     for (bi, (v, (d0, d1), pic)) in bands.iter().enumerate() {
         let kb = f64::from(pic.width()) / v.width.max(1e-9);
-        // A band's grid: screen point, picture point and depth of each vertex.
-        let grid: Vec<Option<((f64, f64), (f64, f64), f64)>> = (0..=n)
+        let grid: Vec<Option<Vertex>> = (0..=n)
             .flat_map(|j| (0..=n).map(move |i| (i, j)))
             .map(|(i, j)| {
                 let (lx, ly) = (v.width * i as f64 / n as f64, v.height * j as f64 / n as f64);
@@ -2609,35 +2620,36 @@ fn drape_terrain(pm: &mut Pixmap, view: &View, map: &Map, bands: &[(View, (f64, 
             .collect();
         // Its own stretch of ground, a little over at the seams.
         let margin = ((d1.min(far) - d0) * 0.02).max(0.0);
-        for j in 0..n {
-            for i in 0..n {
-                let at = |i: usize, j: usize| grid.get(j * (n + 1) + i).copied().flatten();
-                let (Some(a), Some(b), Some(c), Some(d)) = (at(i, j), at(i + 1, j), at(i, j + 1), at(i + 1, j + 1)) else { continue };
-                for [p, q, r] in [[a, b, d], [a, d, c]] {
-                    let depth = (p.2 + q.2 + r.2) / 3.0;
-                    if depth < d0 - margin || depth > d1 + margin || p.2.min(q.2).min(r.2) > far {
-                        continue;
-                    }
-                    // Wholly off one side of the picture: nothing to draw.
-                    let (pw, ph) = (f64::from(pm.width()), f64::from(pm.height()));
-                    let xs = [p.0.0, q.0.0, r.0.0];
-                    let ys = [p.0.1, q.0.1, r.0.1];
-                    if xs.iter().all(|x| *x < 0.0)
-                        || xs.iter().all(|x| *x > pw)
-                        || ys.iter().all(|y| *y < 0.0)
-                        || ys.iter().all(|y| *y > ph)
-                    {
-                        continue;
-                    }
-                    tris.push((depth, bi, [p.0, q.0, r.0], [p.1, q.1, r.1]));
+        for (cell, (i, j)) in (0..n).flat_map(|j| (0..n).map(move |i| (i, j))).enumerate() {
+            let Some(halves) = triangles(&grid, n, i, j) else { continue };
+            for (half, [p, q, r]) in halves.into_iter().enumerate() {
+                let depth = (p.2 + q.2 + r.2) / 3.0;
+                if depth < d0 - margin || depth > d1 + margin || p.2.min(q.2).min(r.2) > far {
+                    continue;
                 }
+                // Wholly off one side of the picture: nothing to draw.
+                let xs = [p.0.0, q.0.0, r.0.0];
+                let ys = [p.0.1, q.0.1, r.0.1];
+                if xs.iter().all(|x| *x < 0.0) || xs.iter().all(|x| *x > pw) || ys.iter().all(|y| *y < 0.0) || ys.iter().all(|y| *y > ph) {
+                    continue;
+                }
+                tris.push((depth, bi as u32, (cell * 2 + half) as u32));
             }
         }
+        grids.push(grid);
     }
     tris.sort_by(|a, b| b.0.total_cmp(&a.0));
     let fog_paint = |t: f64| paint(fog, t as f32);
-    for (depth, bi, dst, src) in tris {
-        let Some((_, _, pic)) = bands.get(bi) else { continue };
+    for (drawn, (depth, bi, at)) in tris.into_iter().enumerate() {
+        // An export cancelled meanwhile (see `rustgis_data::progress`) stops here: it writes
+        // nothing. The settled frame on screen has no run to cancel.
+        if drawn % 4096 == 0 && rustgis_data::progress::check().is_err() {
+            return false;
+        }
+        let (Some((_, _, pic)), Some(grid)) = (bands.get(bi as usize), grids.get(bi as usize)) else { continue };
+        let cell = at as usize / 2;
+        let Some([p, q, r]) = triangles(grid, n, cell % n, cell / n).and_then(|t| t.get(at as usize % 2).copied()) else { continue };
+        let (dst, src) = ([p.0, q.0, r.0], [p.1, q.1, r.1]);
         let Some(t) = affine(src, dst) else { continue };
         // A hair larger all round, so neighbours leave no seam.
         let (cx, cy) = ((dst[0].0 + dst[1].0 + dst[2].0) / 3.0, (dst[0].1 + dst[1].1 + dst[2].1) / 3.0);
@@ -2659,6 +2671,15 @@ fn drape_terrain(pm: &mut Pixmap, view: &View, map: &Map, bands: &[(View, (f64, 
             pm.fill_path(&path, &fog_paint(f), FillRule::Winding, Transform::identity(), None);
         }
     }
+    true
+}
+
+/// The two triangles of the cell (`i`, `j`) of a band's grid of `n` cells a side, [a, b, d] and
+/// [a, d, c] of its corners a b / c d; none when a corner couldn't be placed.
+fn triangles<V: Copy>(grid: &[Option<V>], n: usize, i: usize, j: usize) -> Option<[[V; 3]; 2]> {
+    let at = |i: usize, j: usize| grid.get(j * (n + 1) + i).copied().flatten();
+    let (a, b, c, d) = (at(i, j)?, at(i + 1, j)?, at(i, j + 1)?, at(i + 1, j + 1)?);
+    Some([[a, b, d], [a, d, c]])
 }
 
 /// The affine map taking the triangle `src` onto `dst` (physical pixels); `None` for a
@@ -8510,6 +8531,95 @@ mod tests {
             Some(rustgis_map::view::Terrain { source: rustgis_map::view::TerrainSource::Layer("none".into()), exaggeration: 1.0 });
         assert!(terrain::Ground::of(&hilly, &camera).is_none());
         assert!(render(&mut hilly, &view).is_some());
+    }
+
+    #[test]
+    fn a_narrow_ridge_stands_in_a_settled_tilted_frame() {
+        // #1523: an east-west ridge narrower than a row of the moving drape's mesh, lying between
+        // two of its rows, stands up in the settled frame. On that mesh the frame is the same as
+        // over flat ground: none of its corners is on the ridge.
+        use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster};
+        let camera = Camera { center: Coord::new(0.0, 0.0), res: 600.0, bearing: 0.0, pitch: 60.0 };
+        let view = View { width: 400.0, height: 300.0, pixels_per_point: 1.0, camera, sky: false };
+        // The band holding the view's centre, and the moving mesh's rows there (a band north up
+        // has rows of one northing).
+        let bands = camera.tilt_bands(view.width, view.height);
+        let b = bands.iter().find(|b| b.depth.0 < 1.0 && b.depth.1 > 1.0).expect("the centre's band");
+        let row = |j: f64| b.camera.to_map(b.width / 2.0, b.height * j / terrain::CELLS as f64, b.width, b.height).y;
+        let j = (0..terrain::CELLS).min_by(|&p, &q| row(p as f64 + 0.5).abs().total_cmp(&row(q as f64 + 0.5).abs())).unwrap_or(0) as f64;
+        let (mid, spacing) = (row(j + 0.5), (row(j) - row(j + 1.0)).abs());
+        assert!(terrain::SETTLED_CELLS >= 4 * terrain::CELLS && spacing > 1000.0, "{spacing}");
+        let half = 0.3125 * spacing;
+        // DEMs in Web Mercator round it, their cells a sixteenth of the rows apart: one with the
+        // ridge (shown), one flat.
+        let cell = spacing / 16.0;
+        let (cols, rows) = (400usize, 400usize);
+        let (x0, y0) = (-(cols as f64) * cell / 2.0, mid + rows as f64 * cell / 2.0);
+        let gt = GeoTransform { origin_x: x0, origin_y: y0, pixel_width: cell, pixel_height: -cell };
+        let dem = |name: &str, ridge: f32| {
+            let heights: Vec<f32> =
+                (0..cols * rows).map(|k| if ((y0 - ((k / cols) as f64 + 0.5) * cell) - mid).abs() <= half { ridge } else { 0.0 }).collect();
+            Raster::new(name, cols as u32, rows as u32, vec![heights], gt, Crs::WebMercator, None, ColorHint::Gray, "Float32").unwrap()
+        };
+        let mut m = Map::new("Map");
+        m.basemap = rustgis_map::Basemap::Blank;
+        m.add_raster("dem", rustgis_map::RasterLayer::from_path(dem("dem", 9000.0), "dem.tif"));
+        let flat = m.add_raster("flat", rustgis_map::RasterLayer::from_path(dem("flat", 0.0), "flat.tif"));
+        if let Some(l) = m.layer_mut(flat) {
+            l.visible = false;
+        }
+        let terrain = |name: &str| {
+            Some(rustgis_map::view::Terrain { source: rustgis_map::view::TerrainSource::Layer(name.into()), exaggeration: 2.0 })
+        };
+        // Where its far edge lies flat, and raised to its height.
+        m.view.terrain = terrain("dem");
+        let g = terrain::Ground::of(&m, &camera).expect("terrain");
+        let top = Coord::new(0.0, mid + half * 0.9);
+        let (u, v) = camera.ground_px(top);
+        let flat_y = camera.project_raised(u, v, 0.0, view.width, view.height).expect("in view").1;
+        let raised_y = camera.project_raised(u, v, g.up_px(top, &camera), view.width, view.height).expect("in view").1;
+        assert!(flat_y - raised_y > 20.0, "{flat_y} vs {raised_y}");
+        let ridge = render(&mut m, &view).expect("a frame");
+        m.view.terrain = terrain("flat");
+        let ground = render(&mut m, &view).expect("a frame");
+        // In the middle column, the ridge stands up to near its height: the frames differ there.
+        let differs = (0..300).filter(|&y| ridge.pixmap.pixel(200, y) != ground.pixmap.pixel(200, y)).min().expect("the ridge stands up");
+        let drawn = f64::from(differs);
+        assert!(drawn < flat_y - 0.5 * (flat_y - raised_y), "drawn from {drawn}: flat {flat_y}, raised {raised_y}");
+    }
+
+    #[test]
+    fn a_cancelled_export_stops_laying_the_map_over_its_terrain() {
+        // Cancelled once the terrain's drawing has looked once: halfway through its triangles.
+        struct CancelledMidway(std::sync::atomic::AtomicUsize);
+        impl rustgis_data::progress::Probe for CancelledMidway {
+            fn cancelled(&self) -> bool {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 1
+            }
+            fn begin(&self, _: u64) {}
+            fn advance(&self, _: u64) {}
+        }
+        let camera = Camera { center: lonlat_to_merc(Coord::new(0.0, -0.6)), res: 600.0, bearing: 0.0, pitch: 65.0 };
+        let view = View { width: 400.0, height: 300.0, pixels_per_point: 1.0, camera, sky: false };
+        let mut m = hill_map();
+        m.view.terrain =
+            Some(rustgis_map::view::Terrain { source: rustgis_map::view::TerrainSource::Layer("dem".into()), exaggeration: 2.0 });
+        if let Some(l) = m.layers.iter_mut().find(|l| l.name == "dem") {
+            l.visible = true;
+        }
+        assert!(render(&mut m, &view).is_some());
+        assert!(render_png(&mut m, &view).is_ok());
+        // Cancelled, the frame stops with its ground half laid, and isn't handed on: an export
+        // says it was cancelled.
+        let probe = std::sync::Arc::new(CancelledMidway(std::sync::atomic::AtomicUsize::new(0)));
+        {
+            let _probe = rustgis_data::progress::install(Some(probe.clone()));
+            assert!(render(&mut m, &view).is_none());
+        }
+        assert!(probe.0.load(std::sync::atomic::Ordering::Relaxed) >= 2, "the drawing went on after the first look");
+        probe.0.store(0, std::sync::atomic::Ordering::Relaxed);
+        let _probe = rustgis_data::progress::install(Some(probe));
+        assert_eq!(render_png(&mut m, &view).err().as_deref(), Some(rustgis_data::DataError::Cancelled.to_string().as_str()));
     }
 
     #[test]

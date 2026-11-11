@@ -30,8 +30,9 @@ const TILE_REFRESH: f64 = 0.5;
 /// Mesh cells along each side of a band: fine enough that the texture's straight-line
 /// interpolation across a cell doesn't show the perspective.
 const CELLS: usize = 16;
-/// Mesh cells along each side of a band over terrain: the relief needs finer ones (the
-/// settled frame's own).
+/// Mesh cells along each side of a band over terrain: the moving drape's, as
+/// `render::terrain::CELLS`, kept coarse because the mesh is laid out every frame (the settled
+/// frame's is finer, `render::terrain::SETTLED_CELLS`).
 const TERRAIN_CELLS: usize = render::terrain::CELLS;
 
 struct Drape {
@@ -120,6 +121,11 @@ impl TiltDrape {
             self.let_go = None;
         }
         running
+    }
+
+    /// Whether there is a drape to paint.
+    pub fn drawn(&self) -> bool {
+        self.drape.is_some()
     }
 
     /// Whether the next drape is being drawn.
