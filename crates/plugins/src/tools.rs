@@ -282,12 +282,17 @@ pub fn prepare_pinned(plugin: &Arc<Plugin>, tid: &str, inputs: &dyn Inputs, para
 }
 
 /// The request running the tool `decl`: its parameters and layers, and its files beside them
-/// (`files`, by parameter), the parameters keeping only the files' names.
+/// (`files`, by parameter), the parameters keeping only the files' names. A `file` parameter in
+/// `path` mode keeps its file's full path instead, and its file isn't read.
 pub(crate) fn request(decl: &crate::manifest::ToolDecl, params: &Value, layers: Map<String, Value>) -> Result<Value, String> {
     let mut params = params.clone();
     let mut files = Map::new();
     for p in decl.params.iter().filter(|p| p.kind == "file") {
         let Some(v) = params.get(&p.name).filter(|v| !v.is_null() && v.as_str() != Some("")) else { continue };
+        if p.mode == crate::manifest::FileMode::Path {
+            params[&p.name] = Value::String(file_path(v).map_err(|e| format!("{}: {e}", p.label))?);
+            continue;
+        }
         let file = file_input(v).map_err(|e| format!("{}: {e}", p.label))?;
         params[&p.name] = file["name"].clone();
         files.insert(p.name.clone(), file);
@@ -321,6 +326,24 @@ fn file_input(v: &Value) -> Result<Value, String> {
     let path = v.as_str().ok_or("give a file path")?;
     let bytes = read_file(path)?;
     Ok(json!({"name": base_name(path), "data": base64::engine::general_purpose::STANDARD.encode(bytes)}))
+}
+
+/// The full path of the file a `path` mode parameter names, checked to be a file but not read.
+/// A relative path is made full here, as the plugin's program runs in its own folder.
+#[cfg(not(target_arch = "wasm32"))]
+fn file_path(v: &Value) -> Result<String, String> {
+    let path = v.as_str().ok_or("give a file path")?;
+    let full = std::path::absolute(path).map_err(|e| format!("{path}: {e}"))?;
+    if !std::fs::metadata(&full).map_err(|e| format!("{path}: {e}"))?.is_file() {
+        return Err(format!("{path} is not a file"));
+    }
+    full.into_os_string().into_string().map_err(|_| format!("{path}: the path isn't valid Unicode"))
+}
+
+/// Process plugins, the only ones with `path` mode parameters, don't run in the browser.
+#[cfg(target_arch = "wasm32")]
+fn file_path(_: &Value) -> Result<String, String> {
+    Err("the browser has no file paths to give a plugin".into())
 }
 
 /// Whether `s` is standard, padded base64 (checked without decoding it).

@@ -99,6 +99,24 @@ pub enum Runtime {
     Skills,
 }
 
+/// What a `file` parameter hands its tool.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FileMode {
+    /// The file's contents, read by RustGIS (at most `tools::MAX_FILE`), in the request's `files`.
+    #[default]
+    Contents,
+    /// The file's full path, unread and of any size: process plugins only, which read it
+    /// themselves (#1438).
+    Path,
+}
+
+impl FileMode {
+    fn is_contents(&self) -> bool {
+        *self == FileMode::Contents
+    }
+}
+
 /// A process plugin's program and arguments, the same everywhere or by platform.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -211,6 +229,9 @@ pub struct ParamDecl {
     /// For `file`: the extensions the file picker offers (`nc`, `tif`); empty for any file.
     #[serde(default)]
     pub extensions: Vec<String>,
+    /// For `file`: whether the tool gets the file's contents (the default) or its path.
+    #[serde(default, skip_serializing_if = "FileMode::is_contents")]
+    pub mode: FileMode,
     #[serde(default)]
     pub help: String,
 }
@@ -706,6 +727,13 @@ impl Manifest {
             // A file parameter hands the tool a file's contents: only with `files`.
             if p.kind == "file" && !self.has(Permission::Files) {
                 return Err(format!("plugin.json: {owner}: '{}' is a file, which needs the 'files' permission", p.name));
+            }
+            // A path is only of use to a program that can open it.
+            if p.mode == FileMode::Path && (p.kind != "file" || self.runtime != Runtime::Process) {
+                return Err(format!(
+                    "plugin.json: {owner}: '{}' has mode 'path', which only a process plugin's file parameter can have",
+                    p.name
+                ));
             }
             if p.extensions.len() > MAX_EXTENSIONS
                 || p.extensions.iter().any(|e| e.is_empty() || e.len() > 16 || !e.chars().all(|c| c.is_ascii_alphanumeric()))

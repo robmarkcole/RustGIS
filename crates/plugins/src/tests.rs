@@ -1397,6 +1397,48 @@ fn file_parameters_need_files_and_hand_tools_the_file() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn path_mode_file_parameters_hand_process_tools_the_path_unread() {
+    let wasm: Value = serde_json::from_str(&testing::manifest("path-param", &["files"])).unwrap();
+    let mut m: Value = serde_json::from_str(&testing::process_manifest("path-param", &["files"], &["prog".into()])).unwrap();
+    // Only a process plugin's file parameter takes `path`, and the mode must be one RustGIS knows.
+    let mut bad = wasm.clone();
+    bad["tools"][2]["params"][1]["mode"] = json!("path");
+    assert!(Manifest::parse(&bad.to_string()).unwrap_err().contains("mode 'path'"));
+    let mut bad = m.clone();
+    bad["tools"][2]["params"][0]["mode"] = json!("path");
+    assert!(Manifest::parse(&bad.to_string()).unwrap_err().contains("mode 'path'"));
+    let mut bad = m.clone();
+    bad["tools"][2]["params"][1]["mode"] = json!("folder");
+    assert!(Manifest::parse(&bad.to_string()).is_err());
+    m["tools"][2]["params"][1]["mode"] = json!("path");
+    let parsed = Manifest::parse(&m.to_string()).unwrap();
+    let decl = parsed.tools.iter().find(|t| t.id == "r").unwrap();
+
+    // A file over the contents limit goes as its full path, unread, with no `files`.
+    let dir = std::env::temp_dir().join(format!("rustgis-test-path-param-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("tile.las");
+    std::fs::File::create(&path).unwrap().set_len(crate::tools::MAX_FILE as u64 + 1).unwrap();
+    let r = crate::tools::request(decl, &json!({"model": path.display().to_string()}), Default::default()).unwrap();
+    assert_eq!(r["params"]["model"], path.display().to_string());
+    assert!(r.get("files").is_none());
+    // A relative path is made full: the plugin's program runs in its own folder. (Tests run in
+    // the crate's folder.)
+    let r = crate::tools::request(decl, &json!({"model": "Cargo.toml"}), Default::default()).unwrap();
+    assert_eq!(r["params"]["model"], std::env::current_dir().unwrap().join("Cargo.toml").display().to_string());
+    // A missing file, a folder, file contents or a non-text value is an error.
+    for bad in [
+        json!(dir.join("missing.las").display().to_string()),
+        json!(dir.display().to_string()),
+        json!({"name": "a.las", "data": ""}),
+        json!(7),
+    ] {
+        assert!(crate::tools::request(decl, &json!({"model": bad}), Default::default()).is_err(), "{bad}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ---------------------------------------------------------------------------------------------
 // process plugins
 
