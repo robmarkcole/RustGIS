@@ -4303,7 +4303,12 @@ impl RustGisApp {
                 let ext = p.get("format").and_then(Value::as_str).unwrap_or("geojson").to_ascii_lowercase();
                 rustgis_engine::cmd::share::gpkg_table(p, &ext)?;
                 // A streamed layer exports its whole source, not the features read for the view.
-                let whole = if l.is_streamed() { Some(l.load_all()?) } else { None };
+                let (whole, lost) = if l.is_streamed() {
+                    let (ds, lost) = l.load_all_counted()?;
+                    (Some(ds), lost)
+                } else {
+                    (None, Default::default())
+                };
                 // In the layer's own coordinate system, as share.exportLayer writes a file.
                 let ds = whole.as_ref().unwrap_or(&l.dataset);
                 use rustgis_engine::data::io;
@@ -4331,6 +4336,11 @@ impl RustGisApp {
                     dbf_notes.extend(rustgis_engine::data::source::parquet::values_note(ds, &name));
                 }
                 dbf_notes.extend(io::dates_as_text_note(&ds.fields, &name));
+                dbf_notes.extend(rustgis_engine::cmd::share::gpkg_dates_note(ds, &ext, &name));
+                if lost.rows > 0 {
+                    dbf_notes.push(format!("{name}: {} rows couldn't be read and were left out", lost.rows));
+                }
+                dbf_notes.extend(lost.dates.iter().map(|n| format!("{name}: {}: {n}, so they're empty in the export", l.name)));
                 // CSV holds a point a row, GPX a name for each feature and no areas.
                 dbf_notes.extend(io::export_losses_notes(ds, &ext, io::name_field(ds), &name));
                 if let Some(note) = io::left_out_note(&name, &ext, left_out) {

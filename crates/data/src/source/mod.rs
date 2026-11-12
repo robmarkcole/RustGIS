@@ -236,6 +236,40 @@ pub struct Batch {
     pub complete: bool,
     /// Rows that couldn't be read.
     pub skipped: usize,
+    /// Values in date fields that weren't dates and are read as null, counted for each field by
+    /// its position; empty when there were none. Said by [`unread_dates_note`].
+    pub unread_dates: Vec<usize>,
+}
+
+/// Counts one more value of the field at `k` that wasn't a date ([`Batch::unread_dates`]).
+pub(crate) fn unread_date(counts: &mut Vec<usize>, k: usize) {
+    if counts.len() <= k {
+        counts.resize(k + 1, 0);
+    }
+    if let Some(n) = counts.get_mut(k) {
+        *n = n.saturating_add(1);
+    }
+}
+
+/// Adds the counts of a later read to `counts` ([`Batch::unread_dates`]).
+pub fn add_unread_dates(counts: &mut Vec<usize>, more: &[usize]) {
+    if counts.len() < more.len() {
+        counts.resize(more.len(), 0);
+    }
+    for (c, n) in counts.iter_mut().zip(more) {
+        *c = c.saturating_add(*n);
+    }
+}
+
+/// What a read says of values in date fields that weren't dates ([`Batch::unread_dates`]), naming
+/// the first five fields. `None` when there were none.
+pub fn unread_dates_note(fields: &[crate::Field], counts: &[usize]) -> Option<String> {
+    let total: usize = counts.iter().sum();
+    if total == 0 {
+        return None;
+    }
+    let what = if total == 1 { "1 value isn't a date and was".to_string() } else { format!("{total} values aren't dates and were") };
+    Some(format!("{what} read as empty, in {}", crate::io::named_fields(fields, counts)))
 }
 
 /// A vector data source read in place.
@@ -551,7 +585,7 @@ pub fn materialize(src: &dyn FeatureSource) -> Result<(Dataset, ReadReport)> {
 /// [`materialize`], with `budget` bytes for a source read a chunk at a time.
 fn materialize_within(src: &dyn FeatureSource, budget: u64) -> Result<(Dataset, ReadReport)> {
     let info = src.info();
-    let (features, skipped) = if src.visits_chunks() { read_chunks(src, budget)? } else { read_at_once(src)? };
+    let (features, skipped, unread_dates) = if src.visits_chunks() { read_chunks(src, budget)? } else { read_at_once(src)? };
     let mut ds = Dataset::new(info.name.clone(), info.geometry_type, info.fields.clone());
     ds.crs = info.coordinate_system();
     // A streamed Shapefile skips unconvertible shapes rather than retaining empty geometry.
@@ -559,11 +593,14 @@ fn materialize_within(src: &dyn FeatureSource, budget: u64) -> Result<(Dataset, 
     ds.crs_incomplete = (info.format == "Shapefile" && skipped > 0) || src.lost_to_crs();
     ds.zm_dropped = info.zm_dropped;
     ds.features = features.into();
-    let report = ReadReport {
+    let unread_dates = unread_dates_note(&info.fields, &unread_dates);
+    let mut report = ReadReport {
         skipped: skipped + src.skipped_at_open(),
         messages: info.notes.iter().map(|n| format!("{}: {n}", info.name)).collect(),
         synced: None,
+        unread_dates: unread_dates.clone(),
     };
+    report.messages.extend(unread_dates.map(|n| format!("{}: {n}", info.name)));
     if ds.geometry_type == GeometryType::None
         && let Some(g) = ds.features.iter().find_map(|f| f.geometry.as_ref())
     {
@@ -572,9 +609,9 @@ fn materialize_within(src: &dyn FeatureSource, budget: u64) -> Result<(Dataset, 
     Ok((ds, report))
 }
 
-/// Every feature of a source in one read, and the rows it skipped, refusing a source over
-/// [`MAX_LIMIT`] and an incomplete read.
-fn read_at_once(src: &dyn FeatureSource) -> Result<(Vec<Feature>, usize)> {
+/// Every feature of a source in one read, the rows it skipped and the dates it couldn't read
+/// ([`Batch::unread_dates`]), refusing a source over [`MAX_LIMIT`] and an incomplete read.
+fn read_at_once(src: &dyn FeatureSource) -> Result<(Vec<Feature>, usize, Vec<usize>)> {
     let info = src.info();
     let too_many = |n| DataError::Format(format!("{}: the layer has {n} features, more than the {MAX_LIMIT} read at once", info.name));
     // Refuse before reading or allocating a sample when the source already knows its size.
@@ -597,12 +634,12 @@ fn read_at_once(src: &dyn FeatureSource) -> Result<(Vec<Feature>, usize)> {
     if info.count.is_none() && batch.features.len() >= MAX_LIMIT {
         return Err(DataError::Format(format!("{}: the layer has more features than the {MAX_LIMIT} read at once", info.name)));
     }
-    Ok((batch.features, batch.skipped))
+    Ok((batch.features, batch.skipped, batch.unread_dates))
 }
 
-/// Every feature of a source that can be read a chunk at a time, and the rows it skipped,
-/// refusing the source once its features would hold more than `budget` bytes.
-fn read_chunks(src: &dyn FeatureSource, budget: u64) -> Result<(Vec<Feature>, usize)> {
+/// Every feature of a source that can be read a chunk at a time, the rows it skipped and the dates
+/// it couldn't read, refusing the source once its features would hold more than `budget` bytes.
+fn read_chunks(src: &dyn FeatureSource, budget: u64) -> Result<(Vec<Feature>, usize, Vec<usize>)> {
     let info = src.info();
     let row_bytes = std::mem::size_of::<Feature>() as u64;
     let too_large = || {
@@ -637,7 +674,7 @@ fn read_chunks(src: &dyn FeatureSource, budget: u64) -> Result<(Vec<Feature>, us
         features.extend(chunk);
         Ok(())
     })?;
-    Ok((features, batch.skipped))
+    Ok((features, batch.skipped, batch.unread_dates))
 }
 
 /// The geometry type of a source that doesn't declare one, from its first feature.

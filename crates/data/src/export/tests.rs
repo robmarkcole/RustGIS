@@ -86,7 +86,13 @@ impl FeatureSource for Runs {
         &self.info
     }
     fn read(&self, _: &Request) -> Result<Batch> {
-        Ok(Batch { features: self.features.clone(), matched: self.features.len() as u64, complete: true, skipped: 0 })
+        Ok(Batch {
+            features: self.features.clone(),
+            matched: self.features.len() as u64,
+            complete: true,
+            skipped: 0,
+            unread_dates: Vec::new(),
+        })
     }
     fn visits_chunks(&self) -> bool {
         self.chunks
@@ -164,6 +170,8 @@ fn a_streamed_export_writes_what_a_whole_export_writes() {
                 let what = format!("{format} to .{ext} in {}", crs.label());
                 let unfit = streamed.unfit.clone();
                 assert!(unfit.iter().all(|n| *n == 0), "{what}: {unfit:?}");
+                let utc_dates = streamed.utc_dates.clone();
+                assert!(utc_dates.iter().all(|n| *n == 0), "{what}: {utc_dates:?}");
                 let expected = Exported {
                     written: whole.features.len() - left_out,
                     left_out,
@@ -173,6 +181,8 @@ fn a_streamed_export_writes_what_a_whole_export_writes() {
                     beyond_web_mercator: 0,
                     // Counted over the chunks as the whole layer counts it.
                     csv: if ext == "csv" { crate::io::CsvLosses::of(&whole.features, whole.geometry_type) } else { Default::default() },
+                    unread_dates: Vec::new(),
+                    utc_dates,
                 };
                 assert_eq!(streamed, expected, "{what}");
                 let (a, b) = (read_back(&a), read_back(&b));

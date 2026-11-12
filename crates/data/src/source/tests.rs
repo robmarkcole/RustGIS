@@ -3217,18 +3217,102 @@ fn gpkg_tables(path: &Path) -> Vec<String> {
     st.query_map([], |r| r.get(0)).unwrap().collect::<std::result::Result<_, _>>().unwrap()
 }
 
-/// A GeoPackage export writes dates and date-times as their ISO 8601 text, not as null.
+/// A GeoPackage export writes DATE and DATETIME columns, as GeoPackage gives them: a date-time with
+/// a zone in UTC with `Z` (its other offset said), one without a zone without, milliseconds always.
+/// The desktop and browser readers read them back as dates; a value that isn't one, as null, said
+/// with its field.
 #[test]
-fn geopackage_export_writes_dates_as_iso_text() {
+fn geopackage_dates_are_written_and_read_as_dates() {
     let workspace = tempfile::tempdir().unwrap();
     let path = workspace.path().join("permits.gpkg");
     let fields = vec![Field::new("issued", FieldType::Date), Field::new("seen", FieldType::DateTime)];
     let mut permits = Dataset::new("permits", GeometryType::Point, fields);
-    let row = vec![Value::parse("2026-03-05", FieldType::Date), Value::parse("2026-03-05T14:30:00+02:00", FieldType::DateTime)];
-    permits.push(Some(Geometry::Point(Coord::new(1.0, 2.0))), row);
+    let (day, at) = (|d| Value::parse(d, FieldType::Date), |t| Value::parse(t, FieldType::DateTime));
+    let rows = [
+        [day("2026-03-05"), at("2026-03-05T14:30:00+02:00")],
+        [day("1999-12-31"), at("2026-03-05T14:30:00.000250")],
+        [Value::Null, Value::Null],
+        // What another program may leave: text that isn't a date, a number, and empty text (no loss).
+        [Value::Text("2026-02-30".into()), Value::Int(1_772_700_000)],
+        [Value::Text(String::new()), Value::Null],
+        // A midnight without a zone says a day: a date.
+        [Value::Text("2026-01-01T00:00:00".into()), Value::Null],
+    ];
+    for row in &rows {
+        permits.push(Some(Geometry::Point(Coord::new(1.0, 2.0))), row.to_vec());
+    }
     crate::io::write_path(&permits, &path).unwrap();
-    let back = open_path(&path, None).unwrap().read(&Request { extent: None, limit: 10 }).unwrap().features;
-    assert_eq!(back[0].attrs, [Value::Text("2026-03-05".into()), Value::Text("2026-03-05T14:30:00+02:00".into())]);
+    assert_eq!(
+        crate::io::utc_dates_note(&permits.fields, &crate::io::offset_dates(permits.features.iter(), &permits.fields), "permits.gpkg")
+            .as_deref(),
+        Some("permits.gpkg: 1 date-time was written in UTC, as GeoPackage stores them, without their own offsets, in 'seen'")
+    );
+    let c = rusqlite::Connection::open(&path).unwrap();
+    let declared: Vec<String> = c
+        .prepare("SELECT type FROM pragma_table_info('permits') WHERE name IN ('issued', 'seen') ORDER BY cid")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    assert_eq!(declared, ["DATE", "DATETIME"]);
+    let stored: Vec<(Option<String>, Option<String>)> = c
+        .prepare("SELECT issued, seen FROM permits ORDER BY fid LIMIT 3")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    let text = |s: &str| Some(s.to_string());
+    assert_eq!(
+        stored,
+        [(text("2026-03-05"), text("2026-03-05T12:30:00.000Z")), (text("1999-12-31"), text("2026-03-05T14:30:00.000250")), (None, None)]
+    );
+    drop(c);
+    let desktop = open_path(&path, None).unwrap();
+    let browser = gpkg_mem::GpkgMemSource::open_shared(Shared(Arc::new(std::fs::read(&path).unwrap())), None).unwrap();
+    for src in [desktop.as_ref(), &browser as &dyn FeatureSource] {
+        assert_eq!(src.info().fields.iter().map(|f| f.ty).collect::<Vec<_>>(), [FieldType::Date, FieldType::DateTime]);
+        let (ds, report) = materialize(src).unwrap();
+        let read: Vec<_> = ds.features.iter().map(|f| f.attrs.clone()).collect();
+        let null = vec![Value::Null; 2];
+        // The moment is kept, at UTC.
+        let utc = vec![day("2026-03-05"), at("2026-03-05T12:30:00Z")];
+        assert_eq!(read, [utc, rows[1].to_vec(), null.clone(), null.clone(), null.clone(), vec![day("2026-01-01"), Value::Null]]);
+        assert!(
+            report.messages.contains(&"permits: 2 values aren't dates and were read as empty, in 'issued', 'seen'".to_string()),
+            "{report:?}"
+        );
+    }
+    // The export says the text it wrote in a date field that isn't a date, and a date-time with a
+    // time in one, which reads back empty too.
+    let mut moment = Dataset::new("m", GeometryType::None, permits.fields.clone());
+    moment.push(None, vec![at("2026-03-05T14:30:00"), Value::Int(1_772_700_000)]);
+    assert_eq!(crate::io::text_in_dates(moment.features.iter(), &moment.fields), [1, 1]);
+    let text = crate::io::text_in_dates(permits.features.iter(), &permits.fields);
+    assert_eq!(
+        crate::io::text_in_dates_note(&permits.fields, &text, "permits.gpkg").as_deref(),
+        Some("permits.gpkg: 2 values aren't dates and were written as they are, and read back empty, in 'issued', 'seen'")
+    );
+    // Dates by a declared type's own name, not a part of another.
+    let ty = |d: &str| super::gpkg_blob::field_type(d);
+    assert_eq!(
+        ["DATE", "datetime", "TIMESTAMP(3)", "UPDATED_INT", "DATEish TEXT", "TEXT"].map(ty),
+        [
+            Some(FieldType::Date),
+            Some(FieldType::DateTime),
+            Some(FieldType::DateTime),
+            Some(FieldType::Integer),
+            Some(FieldType::Text),
+            Some(FieldType::Text)
+        ]
+    );
+    // A clean table says nothing.
+    let clean = workspace.path().join("clean.gpkg");
+    permits.features = permits.features.iter().take(3).cloned().collect::<Vec<_>>().into();
+    crate::io::write_path(&permits, &clean).unwrap();
+    let (_, report) = materialize(open_path(&clean, None).unwrap().as_ref()).unwrap();
+    assert!(!report.messages.iter().any(|m| m.contains("aren't dates") || m.contains("isn't a date")), "{report:?}");
 }
 
 /// An export into an existing GeoPackage adds a table beside the others, refuses one whose name

@@ -37,6 +37,14 @@ map are unchanged. The toolbar says how many columns are hidden, and clicking it
 Hiding the column the rows are sorted by clears the sort. The order and hidden columns are kept
 per table until another project is opened, and are not saved in the project.
 
+A text column's menu also has **Convert to Date** and **Convert to Date and Time**
+(`edit.convertField`, `"type"`: `date` or `datetime`): the field becomes a date field and each
+value is read as ISO 8601 (`2026-03-05`; `2026-03-05T14:30:00+02:00`, or with a space for the
+`T`). Text that isn't a date becomes empty, and a notice counts those rows and shows the first
+few; undo brings the text back. Use it for dates from CSV, GeoJSON or other files that hold them as
+text. A field with a domain, subtypes or contingent values, or one a definition query or display
+filter would no longer read as dates (comparing it with a number), is refused.
+
 <figure markdown="span">
   ![The attribute table docked under the map: the 14 African countries of more than 30 million people, selected by attributes, highlighted on the map and in the table](https://assets.rustgis.app/images/attribute-table.webp)
   <figcaption>The attribute table, with a selection highlighted on the map and in the table.</figcaption>

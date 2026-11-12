@@ -143,6 +143,16 @@ pub struct HiddenFills {
     pub partial: bool,
 }
 
+/// What a whole read of a layer's source ([`Layer::load_all_counted`]) couldn't read.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Unreadable {
+    /// Rows left out.
+    pub rows: usize,
+    /// What it says of values in date fields that weren't dates, read as null
+    /// ([`rustgis_data::source::unread_dates_note`]).
+    pub dates: Option<String>,
+}
+
 /// A layer: a dataset drawn with a renderer and labels.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Layer {
@@ -578,6 +588,11 @@ impl Layer {
         {
             self.dataset.fields = info.fields.clone();
         }
+        if let Some(info) = self.source.as_ref().and_then(|s| s.info()) {
+            let mut fields = self.dataset.fields.clone();
+            self.date_fields_from_source(&mut fields, &info.fields);
+            self.dataset.fields = fields;
+        }
         // An opened source's dropped Z or M values, for a project saved without the mark. Added to,
         // not replaced: a source that couldn't tell (a check that timed out) mustn't clear a mark the
         // project kept, and a stale one gives one notice too many rather than one too few.
@@ -591,7 +606,10 @@ impl Layer {
         // A failed read leaves nothing drawn for it (its error shows in Layers), not the
         // previous view's features.
         match src.poll(block) {
-            source::Polled::Done(_, batch) => self.install(batch.features),
+            source::Polled::Done(_, batch) => {
+                src.saw_unread_dates(&batch.unread_dates);
+                self.install(batch.features)
+            }
             source::Polled::Failed(_) => self.install(Vec::new()),
             source::Polled::Idle | source::Polled::Waiting => {}
         }
@@ -599,7 +617,10 @@ impl Layer {
         if let Some(e) = src.wanted(view) {
             src.start(e, block);
             match src.poll(block) {
-                source::Polled::Done(_, batch) => self.install(batch.features),
+                source::Polled::Done(_, batch) => {
+                    src.saw_unread_dates(&batch.unread_dates);
+                    self.install(batch.features)
+                }
                 source::Polled::Failed(_) => self.install(Vec::new()),
                 // A thread that couldn't start leaves an error and no read.
                 source::Polled::Idle if src.error.is_some() => self.install(Vec::new()),
@@ -678,9 +699,56 @@ impl Layer {
         self.load_all_counted().map(|(ds, _)| ds)
     }
 
-    /// [`Layer::load_all`], with the number of rows of the source that couldn't be read.
-    pub fn load_all_counted(&self) -> Result<(Dataset, usize), String> {
-        let Some(copy) = self.open_source()? else { return Ok((self.dataset.clone(), 0)) };
+    /// Gives `fields` (the layer's, as a project saved before RustGIS read a source's date columns
+    /// as dates lists them: text) the source's date types, so the live layer and its whole reads
+    /// and exports say what the source now gives. A field stays text when the layer's definition
+    /// query, a display filter, an attribute rule or a label class reads it as text (comparing it
+    /// with a number) and wouldn't read it as dates, so it keeps working.
+    fn date_fields_from_source(&self, fields: &mut [rustgis_data::Field], source: &[rustgis_data::Field]) {
+        let filters: Vec<&str> = self
+            .definition_query
+            .iter()
+            .map(String::as_str)
+            .chain(self.display_filters.iter().map(|f| f.where_.as_str()))
+            .chain(self.design.rules.iter().map(|r| r.expression.as_str()))
+            .chain(
+                std::iter::once(&self.labels.default)
+                    .chain(&self.labels.classes)
+                    .flat_map(|c| c.where_.as_deref().into_iter().chain(c.by.text.as_deref())),
+            )
+            .collect();
+        for k in 0..fields.len() {
+            let Some(f) = fields.get(k) else { continue };
+            let Some(ty) = source.iter().find(|s| s.name == f.name && s.ty.is_temporal()).map(|s| s.ty) else { continue };
+            if f.ty != rustgis_data::FieldType::Text {
+                continue;
+            }
+            let before = rustgis_data::Dataset::new("", self.dataset.geometry_type, fields.to_vec());
+            let mut after = before.clone();
+            if let Some(f) = after.fields.get_mut(k) {
+                f.ty = ty;
+            }
+            let reads =
+                |q: &str| rustgis_data::query::parse_fields(q, &before).is_err() || rustgis_data::query::parse_fields(q, &after).is_ok();
+            // A calculation rule the expression language doesn't read is the earlier calculator's
+            // (`issued + 1`), which only the engine parses: one that names the field keeps it text.
+            let name = f.name.to_lowercase();
+            let calculates = self.design.rules.iter().any(|r| {
+                r.kind == design::RuleKind::Calculation
+                    && rustgis_data::query::parse_fields(&r.expression, &before).is_err()
+                    // Anywhere in the text: the earlier calculator reads names with spaces
+                    // (`Date issued + 1`), and matching too much only keeps the field text.
+                    && r.expression.to_lowercase().contains(&name)
+            });
+            if !calculates && filters.iter().all(|q| reads(q)) {
+                fields.clone_from_slice(&after.fields);
+            }
+        }
+    }
+
+    /// [`Layer::load_all`], with what of the source couldn't be read.
+    pub fn load_all_counted(&self) -> Result<(Dataset, Unreadable), String> {
+        let Some(copy) = self.open_source()? else { return Ok((self.dataset.clone(), Unreadable::default())) };
         let (mut ds, report) = copy.read_all()?;
         ds.name = self.dataset.name.clone();
         ds.zm_dropped |= self.dataset.zm_dropped;
@@ -694,9 +762,12 @@ impl Layer {
         // (A project that lists no fields keeps the source's, as `sync_source` gives it.)
         if !self.dataset.fields.is_empty() {
             ds.fields = self.dataset.fields.clone();
+            if let Some(info) = copy.info() {
+                self.date_fields_from_source(&mut ds.fields, &info.fields);
+            }
         }
         ds.source = self.dataset.source.clone();
-        Ok((ds, report.skipped))
+        Ok((ds, Unreadable { rows: report.skipped, dates: report.unread_dates }))
     }
 
     /// A streamed layer's source, to export whole a chunk at a time, with a dataset of no
@@ -720,6 +791,7 @@ impl Layer {
         ds.zm_dropped = info.zm_dropped || self.dataset.zm_dropped;
         if !self.dataset.fields.is_empty() {
             ds.fields = self.dataset.fields.clone();
+            self.date_fields_from_source(&mut ds.fields, &info.fields);
         }
         // (A source declaring no geometry type takes its first geometry's when exported, as a
         // whole read does.)
@@ -3082,6 +3154,53 @@ mod tests {
     use super::*;
     use rustgis_data::{Field, FieldType, Value};
     use rustgis_geom::lonlat_to_merc;
+
+    /// A text field an old project lists for a source's date column becomes a date field, unless
+    /// a filter reads it as text and wouldn't as dates: then it stays text and the filter works.
+    #[test]
+    fn source_dates_upgrade_text_fields_a_filter_still_reads() {
+        let fields = vec![Field::new("issued", FieldType::Text)];
+        let source = [Field::new("issued", FieldType::Date)];
+        let mut layer = Layer::new(1, Dataset::new("permits", rustgis_data::GeometryType::Point, fields.clone()));
+        for (query, ty) in
+            [(None, FieldType::Date), (Some("issued >= '2026-01-01'"), FieldType::Date), (Some("issued >= 2026"), FieldType::Text)]
+        {
+            layer.definition_query = query.map(String::from);
+            let mut got = fields.clone();
+            layer.date_fields_from_source(&mut got, &source);
+            assert_eq!(got[0].ty, ty, "{query:?}");
+        }
+        // Kept as text, the field holds the dates the source reads, and the filter keeps the rows
+        // it kept when they were text.
+        let rows = |values: [Value; 2]| {
+            let mut ds = Dataset::new("permits", GeometryType::None, fields.clone());
+            for v in values {
+                ds.push(None, vec![v]);
+            }
+            let q = rustgis_data::query::parse("issued >= 2026", &ds).unwrap();
+            (0..2).map(|r| rustgis_data::query::eval(&q, &ds, r)).collect::<Vec<bool>>()
+        };
+        let day = |d: &str| Value::parse(d, FieldType::Date);
+        let text = |d: &str| Value::Text(d.into());
+        assert_eq!(rows([day("2026-03-05"), day("2025-12-31")]), rows([text("2026-03-05"), text("2025-12-31")]));
+        // An attribute rule is kept reading too.
+        layer.definition_query = None;
+        for (kind, expression) in [(design::RuleKind::Constraint, "issued >= 2026"), (design::RuleKind::Calculation, "Issued + 1 days")] {
+            layer.design.rules =
+                vec![design::AttributeRule { name: "Recent".into(), kind, field: String::new(), expression: expression.into() }];
+            let mut got = fields.clone();
+            layer.date_fields_from_source(&mut got, &source);
+            assert_eq!(got[0].ty, FieldType::Text, "{expression}");
+        }
+        // And a label class's clause.
+        layer.design.rules.clear();
+        let mut class = layer.labels.default.clone();
+        class.where_ = Some("issued >= 2026".into());
+        layer.labels.classes.push(class);
+        let mut got = fields.clone();
+        layer.date_fields_from_source(&mut got, &source);
+        assert_eq!(got[0].ty, FieldType::Text);
+    }
 
     fn points() -> Dataset {
         let mut d = Dataset::new("pts", GeometryType::Point, vec![Field::new("n", FieldType::Integer)]);

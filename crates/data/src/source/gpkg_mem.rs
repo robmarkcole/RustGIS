@@ -310,10 +310,15 @@ impl GpkgMemSource {
     }
 }
 
-/// An attribute value of a field's type.
-fn value(v: &Val, ty: FieldType) -> Value {
-    match (v, ty) {
-        (Val::Null, _) | (Val::Blob(_), _) => Value::Null,
+/// An attribute value of a field's type: `None` for one a date field can't hold, read as null
+/// and counted ([`Batch::unread_dates`]).
+fn value(v: &Val, ty: FieldType) -> Option<Value> {
+    Some(match (v, ty) {
+        (Val::Null, _) => Value::Null,
+        (v, FieldType::Date | FieldType::DateTime) => {
+            return super::gpkg_blob::temporal(if let Val::Text(t) = v { Some(t) } else { None }, ty);
+        }
+        (Val::Blob(_), _) => Value::Null,
         (Val::Int(i), FieldType::Boolean) => Value::Bool(*i != 0),
         (Val::Int(i), FieldType::Double) => Value::Float(*i as f64),
         (Val::Int(i), _) => Value::Int(*i),
@@ -321,7 +326,7 @@ fn value(v: &Val, ty: FieldType) -> Value {
         (Val::Real(f), _) => Value::Float(*f),
         (Val::Text(t), FieldType::Text) => Value::Text(t.clone()),
         (Val::Text(t), ty) => Value::parse_source(t, ty),
-    }
+    })
 }
 
 impl FeatureSource for GpkgMemSource {
@@ -334,7 +339,7 @@ impl FeatureSource for GpkgMemSource {
         let limit = clamp_limit(req.limit);
         let native = req.extent.map(|e| self.reproject.extent_from_lonlat(&e));
         let mut sample = if native.is_none() { Sampler::with_total(limit, self.info.count.unwrap_or(0)) } else { Sampler::new(limit) };
-        let mut skipped = 0;
+        let (mut skipped, mut unread_dates) = (0, Vec::new());
         self.db
             .rows(&self.table, |rowid, r| {
                 let blob = match r.get(self.geom_col) {
@@ -343,7 +348,7 @@ impl FeatureSource for GpkgMemSource {
                     // has no place to match an extent.
                     Some(Val::Null | Val::Blob(_)) | None => {
                         if native.is_none() && sample.wants() {
-                            sample.keep(Feature { id: rowid as u64, geometry: None, attrs: self.attrs(r) });
+                            sample.keep(Feature { id: rowid as u64, geometry: None, attrs: self.attrs(r, &mut unread_dates) });
                         }
                         return ControlFlow::Continue(());
                     }
@@ -375,11 +380,11 @@ impl FeatureSource for GpkgMemSource {
                     return ControlFlow::Continue(());
                 }
                 // Integer keys, negative ones too, map to distinct ids.
-                sample.keep(Feature { id: rowid as u64, geometry: Some(geometry), attrs: self.attrs(r) });
+                sample.keep(Feature { id: rowid as u64, geometry: Some(geometry), attrs: self.attrs(r, &mut unread_dates) });
                 ControlFlow::Continue(())
             })
             .map_err(err)?;
-        Ok(Batch { matched: sample.seen(), complete: sample.complete(), features: sample.items, skipped })
+        Ok(Batch { matched: sample.seen(), complete: sample.complete(), features: sample.items, skipped, unread_dates })
     }
 
     /// The upload is held in memory already, so every table can be visited.
@@ -426,7 +431,7 @@ impl FeatureSource for GpkgMemSource {
                     }
                 };
                 out.matched += 1;
-                match chunks.push(Feature { id: rowid as u64, geometry, attrs: self.attrs(r) }) {
+                match chunks.push(Feature { id: rowid as u64, geometry, attrs: self.attrs(r, &mut out.unread_dates) }) {
                     Ok(()) => ControlFlow::Continue(()),
                     Err(e) => {
                         failed = Some(e);
@@ -444,8 +449,20 @@ impl FeatureSource for GpkgMemSource {
 }
 
 impl GpkgMemSource {
-    /// A row's field values, in `info.fields` order.
-    fn attrs(&self, r: &[Val]) -> Vec<Value> {
-        self.info.fields.iter().zip(&self.field_cols).map(|(f, &c)| r.get(c).map(|v| value(v, f.ty)).unwrap_or(Value::Null)).collect()
+    /// A row's field values, in `info.fields` order, counting in `unread_dates` the dates that
+    /// aren't ones.
+    fn attrs(&self, r: &[Val], unread_dates: &mut Vec<usize>) -> Vec<Value> {
+        let mut out = Vec::with_capacity(self.info.fields.len());
+        for (k, (f, &c)) in self.info.fields.iter().zip(&self.field_cols).enumerate() {
+            out.push(match r.get(c).map(|v| value(v, f.ty)) {
+                Some(Some(v)) => v,
+                Some(None) => {
+                    super::unread_date(unread_dates, k);
+                    Value::Null
+                }
+                None => Value::Null,
+            });
+        }
+        out
     }
 }

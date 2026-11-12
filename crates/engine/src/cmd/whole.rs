@@ -5,7 +5,7 @@
 //! definition query.
 
 use rustgis_data::Dataset;
-use rustgis_map::Layer;
+use rustgis_map::{Layer, Unreadable};
 
 use crate::Session;
 
@@ -24,10 +24,12 @@ enum Rows {
     Source(Box<Layer>),
 }
 
-/// The rows of a layer's source that a whole read couldn't read and left out.
+/// The rows of a layer's source that a whole read couldn't read and left out, and the values in
+/// its date fields that weren't dates.
 pub(crate) struct Unread {
     layer: String,
     rows: usize,
+    dates: Option<String>,
 }
 
 impl Whole {
@@ -58,19 +60,28 @@ impl Whole {
     /// is a single step that doesn't, as for Load All Features.
     pub(crate) fn read(self) -> Result<(Dataset, Unread), String> {
         let Whole { name, rows } = self;
-        let (ds, rows) = match rows {
-            Rows::Held(ds) => (ds, 0),
+        let (ds, unread) = match rows {
+            Rows::Held(ds) => (ds, Unreadable::default()),
             Rows::Source(l) => l.load_all_counted().map_err(|e| format!("{name}: {e}"))?,
         };
-        Ok((ds, Unread { layer: name, rows }))
+        Ok((ds, Unread::of(name, unread)))
     }
 }
 
 impl Unread {
-    /// Says the rows left out, as Load All Features says them (nothing when none were).
+    /// What a whole read of `layer` couldn't read, to say.
+    fn of(layer: String, unread: Unreadable) -> Self {
+        Unread { layer, rows: unread.rows, dates: unread.dates }
+    }
+
+    /// Says the rows left out, as Load All Features says them, and the dates read as null
+    /// (nothing when there were none).
     pub(crate) fn say(&self, s: &mut Session) {
         if self.rows > 0 {
             s.warn(unread_notice(&self.layer, self.rows));
+        }
+        if let Some(dates) = &self.dates {
+            s.notify(format!("{}: {dates}", self.layer), false);
         }
     }
 
@@ -82,7 +93,7 @@ impl Unread {
 
 /// A whole read made before its command runs ([`super::reads`]): the source it read, the fields
 /// the layer listed then, and what it read with the number of rows that couldn't be read.
-type ReadAhead = (rustgis_map::source::SourceLayer, Vec<rustgis_data::Field>, Result<(Dataset, usize), String>);
+type ReadAhead = (rustgis_map::source::SourceLayer, Vec<rustgis_data::Field>, Result<(Dataset, Unreadable), String>);
 
 /// The key the whole read of `l` made ahead is taken by.
 fn ahead_key(l: &Layer) -> String {
@@ -109,13 +120,13 @@ pub(crate) fn take_or_read(s: &mut Session, id: u32) -> Result<(Dataset, Unread)
     let key = ahead_key(s.map().layer(id).ok_or("no such layer")?);
     let ahead = super::reads::take::<ReadAhead>(s, &key);
     let l = s.map().layer(id).ok_or("no such layer")?;
-    let (ds, rows) = match ahead {
+    let (ds, unread) = match ahead {
         Some((copied, fields, read)) if l.source.as_ref().is_some_and(|src| src.same_opening(&copied)) && fields == l.dataset.fields => {
             read?
         }
         _ => l.load_all_counted()?,
     };
-    Ok((ds, Unread { layer: l.name.clone(), rows }))
+    Ok((ds, Unread::of(l.name.clone(), unread)))
 }
 
 /// Loads a layer read in place whole, in place of its view, as an export's copy of the project
@@ -125,16 +136,16 @@ pub(crate) fn take_or_read(s: &mut Session, id: u32) -> Result<(Dataset, Unread)
 pub(crate) fn load_into(l: &mut Layer) -> Result<Unread, String> {
     let name = l.name.clone();
     if !l.is_streamed() {
-        return Ok(Unread { layer: name, rows: 0 });
+        return Ok(Unread::of(name, Unreadable::default()));
     }
     let selected = l.selected_ids();
-    let (ds, rows) = l.load_all_counted().map_err(|e| format!("{name}: {e}"))?;
+    let (ds, unread) = l.load_all_counted().map_err(|e| format!("{name}: {e}"))?;
     l.dataset = ds;
     l.dataset.windowed = false;
     l.source = None;
     l.selection = l.dataset.features.iter().enumerate().filter(|(_, f)| selected.contains(&f.id)).map(|(i, _)| i).collect();
     l.touch_geometry();
-    Ok(Unread { layer: name, rows })
+    Ok(Unread::of(name, unread))
 }
 
 /// The notice for `unread` rows of `layer`'s source that couldn't be read.

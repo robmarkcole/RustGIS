@@ -92,6 +92,12 @@ pub struct SourceLayer {
     /// Losses from a conversion actually performed while opening, consumed once by its caller.
     #[serde(skip)]
     conversion_notes_unsaid: Vec<String>,
+    /// Values in date fields a view read found weren't dates ([`Batch::unread_dates`]), until
+    /// said by [`SourceLayer::take_unread_dates`]; once said, later reads aren't counted again.
+    #[serde(skip)]
+    unread_dates: Option<Vec<usize>>,
+    #[serde(skip)]
+    unread_dates_said: bool,
     #[serde(skip)]
     window: Option<Window>,
     /// Whole-source thinning decisions shared by render snapshots, independent of view rows.
@@ -667,6 +673,25 @@ impl SourceLayer {
     pub fn unavailable_areas(&self, features: &rustgis_data::Features) -> Option<AmbiguousAreas> {
         self.area_features.as_ref().filter(|key| Weak::ptr_eq(key, &features.allocation_key())).map(|_| self.area_counts)
     }
+    /// Keeps what view reads found of values in date fields that weren't dates, until
+    /// [`SourceLayer::take_unread_dates`] says it. Once said, later reads aren't counted: they
+    /// read the same features again, and the notice says Load All Features counts them all.
+    pub fn saw_unread_dates(&mut self, counts: &[usize]) {
+        if self.unread_dates_said || !counts.iter().any(|n| *n > 0) {
+            return;
+        }
+        rustgis_data::source::add_unread_dates(self.unread_dates.get_or_insert_with(Vec::new), counts);
+    }
+
+    /// What view reads found of values in date fields that weren't dates
+    /// ([`rustgis_data::source::unread_dates_note`]), once for the source.
+    pub fn take_unread_dates(&mut self) -> Option<String> {
+        let fields = self.info()?.fields.clone();
+        let counts = self.unread_dates.take()?;
+        self.unread_dates_said = true;
+        rustgis_data::source::unread_dates_note(&fields, &counts)
+    }
+
     /// Whether another installed window needs its retained display expressions checked.
     pub fn take_display_window(&mut self) -> bool {
         if self.reads == self.display_read_said {
@@ -1214,6 +1239,9 @@ impl SourceLayer {
         self.pending = None;
         self.error = None;
         self.login = false;
+        // A new opening may hold other values: what was said of the last one doesn't hold.
+        self.unread_dates = None;
+        self.unread_dates_said = false;
         self.reset();
         self.open()
     }
@@ -1529,6 +1557,8 @@ impl SourceLayer {
             conversion_info: _,
             conversion_fallback: _,
             conversion_notes_unsaid: _,
+            unread_dates: _,
+            unread_dates_said: _,
             gdal,
             duckdb,
             postgis,

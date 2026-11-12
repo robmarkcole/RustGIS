@@ -182,6 +182,15 @@ impl Value {
             _ => false,
         }
     }
+    /// [`parse`](Value::parse), for dates held as text in a file or a text field: a date field also
+    /// takes a midnight without a zone (`2026-03-05T00:00:00`), which says only its day.
+    pub fn parse_stored(text: &str, ty: FieldType) -> Value {
+        match (ty, Value::parse(text, ty)) {
+            (FieldType::Date, Value::Null) => DateTime::parse(text).filter(|t| t.is_date()).map_or(Value::Null, |t| Value::Date(t.date())),
+            (_, v) => v,
+        }
+    }
+
     /// Parses user text into a value of `ty` (empty → Null). Text a number field can't hold,
     /// including a non-finite Double (`NaN`, `inf`), is Null. Dates are ISO 8601: `YYYY-MM-DD`
     /// for a date; that, a time and an optional zone for a date-time. Text that isn't one is Null.

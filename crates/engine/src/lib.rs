@@ -2027,8 +2027,16 @@ impl Session {
         // Streamed vector windows land after project opening too. Check each installed read
         // once, keeping the same counted notice channel as retained resident expressions.
         let mut landed = Vec::new();
+        let mut dates = Vec::new();
         for map in &mut self.project.maps {
             for layer in &mut map.layers {
+                // Values in date fields that weren't dates, once for a layer read in place.
+                if let Some(note) = layer.source.as_mut().and_then(|source| source.take_unread_dates()) {
+                    dates.push(format!(
+                        "{}: some values in its date fields aren't dates and show as empty (Load All Features counts them all); so far, {note}",
+                        layer.name
+                    ));
+                }
                 if layer.source.as_mut().is_some_and(|source| source.take_display_window()) {
                     landed.push(&*layer);
                 }
@@ -2036,6 +2044,9 @@ impl Session {
         }
         if let Some(message) = cmd::design::display_area_messages(landed.into_iter()) {
             self.notify(message, false);
+        }
+        for note in dates {
+            self.notify(note, false);
         }
         let (mut lost, mut held, mut failed, mut dropped) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for m in &mut self.project.maps {

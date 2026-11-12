@@ -392,7 +392,10 @@ changed or disappeared in the file since it was loaded, nothing is saved. A cons
 trigger failure also rolls everything back; pending edits remain in the layer. New features
 get source-assigned keys that cannot alias loaded rows, and unrelated columns and tables remain
 intact. The saved rows are read back within the transaction, so the layer keeps values assigned
-by defaults and triggers before it starts tracking its next edits. If a DELETE trigger recreates
+by defaults and triggers before it starts tracking its next edits. Dates are saved as a
+GeoPackage export writes them: a date-time with another offset than UTC's is saved in UTC, and a
+notice says so. A stored date that isn't one loads as empty, with a notice, and is left as it is
+unless that value is edited. If a DELETE trigger recreates
 a target row, that stored row reappears in the layer and is not counted as deleted. If triggers
 change or remove other rows already loaded in the layer, those rows are refreshed or removed
 before the next edits; rows outside the load are not added.

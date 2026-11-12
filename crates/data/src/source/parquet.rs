@@ -526,7 +526,7 @@ impl FeatureSource for ParquetSource {
             }
         }
         let matched = (if late { sample.seen() } else { matched }).saturating_mul(thinned as u64);
-        Ok(Batch { matched, complete: sample.complete() && thinned == 1, skipped, features: sample.items })
+        Ok(Batch { matched, complete: sample.complete() && thinned == 1, skipped, features: sample.items, unread_dates: Vec::new() })
     }
 
     fn remote(&self) -> Option<Arc<Remote>> {

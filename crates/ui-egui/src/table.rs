@@ -314,6 +314,8 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
             let mut cancel: Option<(u64, usize)> = None;
             let mut sort_click: Option<usize> = None;
             let mut column_action: Option<(usize, ColumnAction)> = None;
+            // A text field to convert to dates ("date") or date-times ("datetime").
+            let mut convert: Option<(usize, &str)> = None;
             egui::ScrollArea::horizontal().show(ui, |ui| {
                 let mut tb = TableBuilder::new(ui)
                     .striped(true)
@@ -367,6 +369,17 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
                                     if ui.add_enabled(hidden_n > 0, egui::Button::new(tl!("Show All Columns"))).clicked() {
                                         show_all = true;
                                         ui.close();
+                                    }
+                                    if is_layer && fd.ty == rustgis_engine::data::FieldType::Text {
+                                        ui.separator();
+                                        if ui.button(tl!("Convert to Date")).clicked() {
+                                            convert = Some((i, "date"));
+                                            ui.close();
+                                        }
+                                        if ui.button(tl!("Convert to Date and Time")).clicked() {
+                                            convert = Some((i, "datetime"));
+                                            ui.close();
+                                        }
                                     }
                                 });
                             });
@@ -461,6 +474,17 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
                 }
                 if show_all {
                     view.show_all();
+                }
+            }
+            if let Some((i, ty)) = convert
+                && let Some(fd) = ds.fields.get(i)
+            {
+                // Refused (a streamed layer, a data design on the field): said, unless the command said so.
+                let mark = app.session.notice_mark();
+                if let Err(e) = app.run("edit.convertField", json!({"layer": layer_id, "field": fd.name, "type": ty}))
+                    && app.session.notices_since(mark).is_empty()
+                {
+                    app.session.notify(e, true);
                 }
             }
             if let Some((r, add)) = clicked

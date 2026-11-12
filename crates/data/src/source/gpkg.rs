@@ -369,11 +369,31 @@ impl GpkgSource {
     }
 
     /// Turns a row (id, geometry, fields…) into a feature; `None` for an unreadable geometry.
-    fn feature(&self, r: &rusqlite::Row<'_>, native: Option<&Extent>, req: &Request) -> rusqlite::Result<Row> {
+    /// Dates that aren't ones are counted in `unread_dates` ([`Batch::unread_dates`]).
+    fn feature(
+        &self,
+        r: &rusqlite::Row<'_>,
+        native: Option<&Extent>,
+        req: &Request,
+        unread_dates: &mut Vec<usize>,
+    ) -> rusqlite::Result<Row> {
         // Integer keys, negative ones too, map to distinct ids.
         let Some(id) = r.get::<_, Option<i64>>(0)?.map(|i| i as u64) else { return Ok(Row::Bad) };
-        let attrs =
-            || self.info.fields.iter().enumerate().map(|(i, f)| r.get_ref(i + 2).map(|v| value(v, f.ty)).unwrap_or(Value::Null)).collect();
+        let mut attrs = || {
+            let mut out = Vec::with_capacity(self.info.fields.len());
+            for (k, f) in self.info.fields.iter().enumerate() {
+                out.push(match r.get_ref(k + 2).map(|v| value(v, f.ty)) {
+                    Ok(Some(v)) => v,
+                    Ok(None) => {
+                        super::unread_date(unread_dates, k);
+                        Value::Null
+                    }
+                    // The select list holds a column for every field, so there is no column to miss.
+                    Err(_) => Value::Null,
+                });
+            }
+            out
+        };
         let blob = match r.get_ref(1)? {
             ValueRef::Blob(b) if !is_whole_empty_blob(b) => b,
             // A row without geometry (NULL, or an empty one) is kept in a whole read; it has no
@@ -448,7 +468,8 @@ impl FeatureSource for GpkgSource {
                     let mut st = conn.prepare(&sql).map_err(err)?;
                     let mut rows = st.query(params_from_iter(chunk.iter())).map_err(err)?;
                     while let Some(r) = rows.next().map_err(err)? {
-                        push(self.feature(r, native.as_ref(), req).map_err(err)?, &mut out);
+                        let row = self.feature(r, native.as_ref(), req, &mut out.unread_dates).map_err(err)?;
+                        push(row, &mut out);
                     }
                     if out.features.len() >= limit {
                         out.features.truncate(limit);
@@ -481,7 +502,7 @@ impl FeatureSource for GpkgSource {
                     if known && !sample.wants() {
                         continue;
                     }
-                    match self.feature(r, native.as_ref(), req).map_err(err)? {
+                    match self.feature(r, native.as_ref(), req, &mut out.unread_dates).map_err(err)? {
                         Row::Feature(f) if known || sample.wants() => sample.keep(f),
                         Row::Feature(_) | Row::Skip => {}
                         Row::Bad => out.skipped += 1,
@@ -528,7 +549,7 @@ impl FeatureSource for GpkgSource {
         let mut rows = st.query([]).map_err(err)?;
         let mut out = Batch { complete: true, ..Batch::default() };
         while let Some(r) = rows.next().map_err(err)? {
-            match self.feature(r, native.as_ref(), &req).map_err(err)? {
+            match self.feature(r, native.as_ref(), &req, &mut out.unread_dates).map_err(err)? {
                 Row::Feature(f) => {
                     out.matched += 1;
                     chunks.push(f)?;
@@ -975,8 +996,9 @@ fn create_table(conn: &Connection, layout: &Layout) -> Result<()> {
             FieldType::Integer => "INTEGER",
             FieldType::Double => "REAL",
             FieldType::Boolean => "BOOLEAN",
-            // Dates are ISO text until GeoPackage's own DATE and DATETIME are written.
-            FieldType::Text | FieldType::Date | FieldType::DateTime => "TEXT",
+            FieldType::Text => "TEXT",
+            FieldType::Date => "DATE",
+            FieldType::DateTime => "DATETIME",
         };
         cols.push(format!("{} {ty}", quote(col)));
     }
@@ -1143,6 +1165,8 @@ fn register(conn: &Connection, layout: &Layout, extent: Extent) -> Result<()> {
     Ok(())
 }
 
+/// The SQLite value written for `v` in a column of a `ty` field: numbers and yes/no as numbers,
+/// dates as GeoPackage's ISO 8601 text ([`gpkg_datetime`]), text kept as it is.
 fn sql_value(v: &Value, ty: FieldType) -> rusqlite::types::Value {
     use rusqlite::types::Value as Sql;
     match (v, ty) {
@@ -1152,9 +1176,16 @@ fn sql_value(v: &Value, ty: FieldType) -> rusqlite::types::Value {
         (Value::Float(_), _) => Sql::Null,
         (Value::Bool(b), _) => Sql::Integer(i64::from(*b)),
         (Value::Text(s), FieldType::Text) => Sql::Text(s.clone()),
-        // A date or date-time as its ISO 8601 text, in the TEXT column its field is written as.
-        (Value::Date(_) | Value::DateTime(_), _) => Sql::Text(v.to_string()),
-        (Value::Text(s), FieldType::Date | FieldType::DateTime) => Sql::Text(s.clone()),
+        (Value::Date(d), FieldType::DateTime) => Sql::Text(gpkg_datetime(crate::date::DateTime::from_date(*d))),
+        (Value::Date(d), _) => Sql::Text(d.to_string()),
+        (Value::DateTime(t), FieldType::Date) if t.is_date() => Sql::Text(t.date().to_string()),
+        (Value::DateTime(t), _) => Sql::Text(gpkg_datetime(*t)),
+        // Text that reads as a date is written as that date; other text is kept as it is, though
+        // a read finds it isn't a date and gives null.
+        (Value::Text(s), FieldType::Date | FieldType::DateTime) => match Value::parse_stored(s, ty) {
+            Value::Null => Sql::Text(s.clone()),
+            date => sql_value(&date, ty),
+        },
         (v, ty) => match Value::parse_source(&v.to_string(), ty) {
             Value::Int(x) => Sql::Integer(x),
             Value::Float(x) if x.is_finite() => Sql::Real(x),
@@ -1164,9 +1195,32 @@ fn sql_value(v: &Value, ty: FieldType) -> rusqlite::types::Value {
     }
 }
 
-fn value(v: ValueRef<'_>, ty: FieldType) -> Value {
-    match (v, ty) {
+/// A date-time as a GeoPackage DATETIME holds it, `YYYY-MM-DDTHH:MM:SS.SSSZ`: one with a zone in
+/// UTC, so another offset isn't kept ([`crate::io::offset_dates`] counts them), and one without a
+/// zone without the `Z`, rather than relabelled as UTC. Milliseconds are always written, and
+/// microseconds when there are any, so nothing is cut.
+fn gpkg_datetime(t: crate::date::DateTime) -> String {
+    let t = match t.offset() {
+        Some(o) if o != 0 => crate::date::DateTime::with_offset(t.micros(), 0).unwrap_or(t),
+        _ => t,
+    };
+    let mut text = t.to_string();
+    // `YYYY-MM-DDTHH:MM:SS` is 19 bytes, then the fraction if any, then the zone.
+    if text.get(19..20) != Some(".") && text.len() >= 19 {
+        text.insert_str(19, ".000");
+    }
+    text
+}
+
+/// An attribute value of a field's type: `None` for one a date field can't hold, read as null
+/// and counted ([`Batch::unread_dates`]).
+fn value(v: ValueRef<'_>, ty: FieldType) -> Option<Value> {
+    Some(match (v, ty) {
         (ValueRef::Null, _) => Value::Null,
+        (v, FieldType::Date | FieldType::DateTime) => {
+            let text = if let ValueRef::Text(t) = v { Some(String::from_utf8_lossy(t)) } else { None };
+            return super::gpkg_blob::temporal(text.as_deref(), ty);
+        }
         (ValueRef::Integer(i), FieldType::Boolean) => Value::Bool(i != 0),
         (ValueRef::Integer(i), FieldType::Double) => Value::Float(i as f64),
         (ValueRef::Integer(i), _) => Value::Int(i),
@@ -1175,7 +1229,7 @@ fn value(v: ValueRef<'_>, ty: FieldType) -> Value {
         (ValueRef::Text(t), FieldType::Text) => Value::Text(String::from_utf8_lossy(t).into_owned()),
         (ValueRef::Text(t), ty) => Value::parse_source(&String::from_utf8_lossy(t), ty),
         (ValueRef::Blob(_), _) => Value::Null,
-    }
+    })
 }
 
 /// An SQL identifier, quoted.

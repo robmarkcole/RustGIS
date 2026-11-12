@@ -85,6 +85,6 @@ impl FeatureSource for LidarSource {
         let limit = req.limit.max(1);
         let step = hits.len().div_ceil(limit).max(1);
         let features: Vec<Feature> = hits.into_iter().step_by(step).take(limit).cloned().collect();
-        Ok(Batch { complete: !incomplete && features.len() as u64 == matched, matched, features, skipped: 0 })
+        Ok(Batch { complete: !incomplete && features.len() as u64 == matched, matched, features, skipped: 0, unread_dates: Vec::new() })
     }
 }

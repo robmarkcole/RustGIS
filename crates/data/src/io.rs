@@ -2267,6 +2267,7 @@ fn read_shapefile_parts(mut parts: ShapefileParts, name: &str, crs: Option<Crs>)
     let mut encoding_notes = Vec::new();
     let encoding = crate::dbf::encoding(parts.cpg.as_deref(), parts.dbf.get(29).copied().unwrap_or(0), &mut encoding_notes);
     crate::dbf::readable_header_date(&mut parts.dbf);
+    let date_columns = crate::dbf::dates_as_text(&mut parts.dbf);
     let dbf = shapefile::dbase::ReaderBuilder::new()
         .with_encoding(encoding.decoder())
         .build(Cursor::new(parts.dbf))
@@ -2276,9 +2277,11 @@ fn read_shapefile_parts(mut parts: ShapefileParts, name: &str, crs: Option<Crs>)
         .fields()
         .iter()
         .filter(|f| f.name() != "DeletionFlag")
-        .map(|f| {
+        .enumerate()
+        .map(|(k, f)| {
             use shapefile::dbase::FieldType as D;
             let ty = match f.field_type() {
+                _ if date_columns.contains(&k) => FieldType::Date,
                 D::Numeric | D::Float | D::Double | D::Currency => FieldType::Double,
                 D::Integer => FieldType::Integer,
                 D::Logical => FieldType::Boolean,
@@ -2308,6 +2311,7 @@ fn read_shapefile_parts(mut parts: ShapefileParts, name: &str, crs: Option<Crs>)
         }),
     };
     let (mut converted, mut unconverted, mut zm_shapes) = (0usize, 0usize, 0usize);
+    let mut unread_dates = vec![0usize; ds.fields.len()];
     let mut source_kind = GeometryType::None;
     let pt = |x: f64, y: f64| Coord::new(x, y);
     for item in reader.iter_shapes_and_records() {
@@ -2363,7 +2367,15 @@ fn read_shapefile_parts(mut parts: ShapefileParts, name: &str, crs: Option<Crs>)
         let attrs = ds
             .fields
             .iter()
-            .map(|f| match record.get(&f.name) {
+            .zip(&mut unread_dates)
+            .map(|(f, unread)| match record.get(&f.name) {
+                Some(FieldValue::Character(Some(s))) if f.ty == FieldType::Date => match crate::dbf::date(s.as_bytes()) {
+                    Ok(d) => d.map_or(Value::Null, Value::Date),
+                    Err(()) => {
+                        *unread += 1;
+                        Value::Null
+                    }
+                },
                 Some(FieldValue::Character(Some(s))) => Value::Text(s.trim().to_string()),
                 Some(FieldValue::Numeric(Some(n))) if n.is_finite() => Value::Float(*n),
                 Some(FieldValue::Float(Some(n))) => Value::Float(f64::from(*n)),
@@ -2372,13 +2384,14 @@ fn read_shapefile_parts(mut parts: ShapefileParts, name: &str, crs: Option<Crs>)
                 Some(FieldValue::Currency(d)) => Value::Float(*d),
                 Some(FieldValue::Logical(Some(b))) => Value::Bool(*b),
                 Some(FieldValue::Memo(s)) => Value::Text(s.clone()),
-                Some(FieldValue::Date(Some(d))) => Value::Text(format!("{:04}-{:02}-{:02}", d.year(), d.month(), d.day())),
                 _ => Value::Null,
             })
             .collect();
         ds.push_next(geom, attrs);
     }
     ds.drop_zm(&mut report, zm_shapes);
+    report.unread_dates = crate::source::unread_dates_note(&ds.fields, &unread_dates);
+    report.messages.extend(report.unread_dates.iter().map(|n| format!("{name}: {n}")));
     ds.geometry_type = dominant_type(&ds);
     // A bad .prj must not turn a spatial layer into an attribute-only table and hide the
     // conversion warning. Its shapes can be recovered by importing with an override.
@@ -2499,28 +2512,105 @@ pub fn shapefile_names_note(fields: &[Field], target: &str) -> Option<String> {
     Some(format!("{target}: {count} changed to fit a Shapefile (10 bytes at most, unique ignoring case): {}{more}", listed.join(", ")))
 }
 
-/// What an export to `target` says of its date fields: Shapefile, GeoPackage, GeoParquet and
-/// FlatGeobuf have date columns, which this version doesn't write yet, so their dates go in as ISO
-/// 8601 text and the field type is lost. `None` for other formats, whose dates are text anyway, or
-/// without date fields.
+/// What an export to `target` says of the date fields it writes as ISO 8601 text, losing the field
+/// type: a Shapefile's date-time fields (a `.dbf` has date fields only), and GeoParquet's and
+/// FlatGeobuf's date fields, which this version doesn't write as dates yet. `None` for other formats,
+/// whose dates are text anyway or are written as dates, or without such fields.
 pub fn dates_as_text_note(fields: &[Field], target: &str) -> Option<String> {
     let ext = Path::new(target).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-    if !matches!(ext.as_str(), "shp" | "zip" | "gpkg" | "parquet" | "geoparquet" | "fgb") {
-        return None;
-    }
-    let dates: Vec<String> = fields.iter().filter(|f| f.ty.is_temporal()).map(|f| format!("'{}'", dbf_notice_name(&f.name))).collect();
+    let as_text = |ty: FieldType| match ext.as_str() {
+        "shp" | "zip" => ty == FieldType::DateTime,
+        "parquet" | "geoparquet" | "fgb" => ty.is_temporal(),
+        _ => false,
+    };
+    let dates: Vec<String> = fields.iter().filter(|f| as_text(f.ty)).map(|f| format!("'{}'", dbf_notice_name(&f.name))).collect();
     if dates.is_empty() {
         return None;
     }
     let target: String = target.chars().map(dbf_notice_char).collect();
     let listed: Vec<&str> = dates.iter().take(5).map(String::as_str).collect();
     let more = if dates.len() > 5 { format!(" and {} more", dates.len() - 5) } else { String::new() };
-    let count = if dates.len() == 1 { "1 date field was".to_string() } else { format!("{} date fields were", dates.len()) };
+    let kind = if matches!(ext.as_str(), "shp" | "zip") { "date-time field" } else { "date field" };
+    let count = if dates.len() == 1 { format!("1 {kind} was") } else { format!("{} {kind}s were", dates.len()) };
     Some(format!("{target}: {count} written as text (ISO 8601), not as dates: {}{more}", listed.join(", ")))
 }
 
+/// Counts, for each field, the date-times at an offset other than UTC's (`+02:00`), which a
+/// GeoPackage holds in UTC: the moment is kept, the offset it was shown at isn't.
+pub fn offset_dates<'a>(features: impl IntoIterator<Item = &'a crate::Feature>, fields: &[Field]) -> Vec<usize> {
+    let offset = |v: &Value| matches!(v, Value::DateTime(t) if t.offset().is_some_and(|o| o != 0));
+    let mut counts = vec![0usize; fields.len()];
+    for f in features {
+        for ((n, field), v) in counts.iter_mut().zip(fields).zip(&f.attrs) {
+            // Text in a date field that reads as a date is written as that date.
+            let text = matches!(v, Value::Text(t) if field.ty.is_temporal() && offset(&Value::parse_stored(t, field.ty)));
+            if offset(v) || text {
+                *n += 1;
+            }
+        }
+    }
+    counts
+}
+
+/// What a GeoPackage export to `target` says of the date-times it wrote in UTC ([`offset_dates`]).
+/// `None` when there were none.
+pub fn utc_dates_note(fields: &[Field], counts: &[usize], target: &str) -> Option<String> {
+    let total: usize = counts.iter().sum();
+    if total == 0 {
+        return None;
+    }
+    let target: String = target.chars().map(dbf_notice_char).collect();
+    let what = if total == 1 { "1 date-time was".to_string() } else { format!("{total} date-times were") };
+    Some(format!(
+        "{target}: {what} written in UTC, as GeoPackage stores them, without their own offsets, in {}",
+        named_fields(fields, counts)
+    ))
+}
+
+/// Counts, for each date field, the values in it that a GeoPackage export writes in a form a read
+/// gives back as null: text that isn't a date, a number or yes/no, and a date-time with a time or
+/// zone in a date field.
+pub fn text_in_dates<'a>(features: impl IntoIterator<Item = &'a crate::Feature>, fields: &[Field]) -> Vec<usize> {
+    let mut counts = vec![0usize; fields.len()];
+    for f in features {
+        for ((n, field), v) in counts.iter_mut().zip(fields).zip(&f.attrs) {
+            let text = matches!(v, Value::Text(t) if !v.asks_null() && Value::parse_stored(t, field.ty).is_null());
+            let moment = field.ty == FieldType::Date && matches!(v, Value::DateTime(t) if !t.is_date());
+            let other = matches!(v, Value::Int(_) | Value::Float(_) | Value::Bool(_));
+            if field.ty.is_temporal() && (text || moment || other) {
+                *n += 1;
+            }
+        }
+    }
+    counts
+}
+
+/// What a GeoPackage export to `target` says of the text it wrote in date fields
+/// ([`text_in_dates`]). `None` when there was none.
+pub fn text_in_dates_note(fields: &[Field], counts: &[usize], target: &str) -> Option<String> {
+    let total: usize = counts.iter().sum();
+    if total == 0 {
+        return None;
+    }
+    let target: String = target.chars().map(dbf_notice_char).collect();
+    let what = if total == 1 {
+        "1 value isn't a date and was written as it is, and reads".to_string()
+    } else {
+        format!("{total} values aren't dates and were written as they are, and read")
+    };
+    Some(format!("{target}: {what} back empty, in {}", named_fields(fields, counts)))
+}
+
+/// The fields with a count, quoted, the first five named: `'a', 'b' and 3 more`.
+pub(crate) fn named_fields(fields: &[Field], counts: &[usize]) -> String {
+    let named: Vec<String> =
+        fields.iter().zip(counts).filter(|(_, n)| **n > 0).map(|(f, _)| format!("'{}'", dbf_notice_name(&f.name))).collect();
+    let more = if named.len() > 5 { format!(" and {} more", named.len() - 5) } else { String::new() };
+    format!("{}{more}", named.iter().take(5).cloned().collect::<Vec<_>>().join(", "))
+}
+
 /// Keeps a diagnostic on one line and prevents field names from reordering its text.
-pub(crate) fn dbf_notice_char(c: char) -> char {
+pub fn dbf_notice_char(c: char) -> char {
     let reorders = matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
     if c.is_control() || reorders || matches!(c, '\u{2028}' | '\u{2029}') { ' ' } else { c }
 }
@@ -2561,8 +2651,9 @@ pub fn shapefile_values_notes(ds: &Dataset, target: &str) -> Vec<String> {
             }
             let Some(loss) = counts.get_mut(k) else { continue };
             match field.ty {
-                // A date field is written as its text too, so text held in one is cut the same way.
-                FieldType::Text | FieldType::Date | FieldType::DateTime if value.to_string().len() > 254 => loss.text += 1,
+                // A date-time field is written as its text too, so text held in one is cut the same way.
+                FieldType::Text | FieldType::DateTime if value.to_string().len() > 254 => loss.text += 1,
+                FieldType::Date if !value.asks_null() && dbf_date(value).is_none() => loss.empty += 1,
                 FieldType::Integer | FieldType::Double => {
                     let d = decimals.get(k).copied().unwrap_or(0);
                     match dbf_number(value, field.ty, d) {
@@ -2661,6 +2752,20 @@ fn dbf_number(v: &Value, ty: FieldType, d: usize) -> Option<f64> {
         exact && format!("{x:.d$}").len() <= if ty == FieldType::Integer { 18 } else { 24 }
     })?;
     Some(if ty == FieldType::Integer { x.round() } else { x })
+}
+
+/// The day a `.dbf` date field holds for `v`: a date, a date-time at midnight without a zone, or
+/// text that is one. Anything else is left empty.
+fn dbf_date(v: &Value) -> Option<crate::date::Date> {
+    match v {
+        Value::Date(d) => Some(*d),
+        Value::DateTime(t) if t.is_date() => Some(t.date()),
+        Value::Text(t) => match Value::parse_stored(t, FieldType::Date) {
+            Value::Date(d) => Some(d),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// The Boolean values the dBase writer accepts; an incompatible value is left empty.
@@ -2954,8 +3059,9 @@ pub fn shapefile_parts_in(ds: &Dataset, crs: Crs) -> Result<(Vec<(&'static str, 
                 table.add_numeric_field(dbf_name(n)?, 24, u8::try_from(d).unwrap_or(15))
             }
             FieldType::Boolean => table.add_logical_field(dbf_name(n)?),
-            // Dates are ISO text until Shapefile's own date fields are written.
-            FieldType::Text | FieldType::Date | FieldType::DateTime => {
+            FieldType::Date => table.add_date_field(dbf_name(n)?),
+            // A `.dbf` has no date-time field that other programs read, so they're ISO text.
+            FieldType::Text | FieldType::DateTime => {
                 let longest = ds.features.iter().filter_map(|r| r.attrs.get(k)).map(|v| v.to_string().len()).max().unwrap_or(0);
                 table.add_character_field(dbf_name(n)?, u8::try_from(longest.clamp(1, 254)).unwrap_or(254))
             }
@@ -2968,7 +3074,11 @@ pub fn shapefile_parts_in(ds: &Dataset, crs: Crs) -> Result<(Vec<(&'static str, 
             let value = match f.ty {
                 FieldType::Integer | FieldType::Double => FieldValue::Numeric(dbf_number(v, f.ty, decimals.get(k).copied().unwrap_or(0))),
                 FieldType::Boolean => FieldValue::Logical(dbf_boolean(v)),
-                FieldType::Text | FieldType::Date | FieldType::DateTime => {
+                FieldType::Date => FieldValue::Date(dbf_date(v).and_then(|d| {
+                    let (y, m, d) = d.ymd();
+                    shapefile::dbase::Date::new(u32::try_from(d).ok()?, u32::try_from(m).ok()?, u32::try_from(y).ok()?).ok()
+                })),
+                FieldType::Text | FieldType::DateTime => {
                     FieldValue::Character((!v.is_null()).then(|| cut(&v.to_string(), 254).to_string()))
                 }
             };
@@ -4566,21 +4676,86 @@ mod tests {
     #[test]
     fn dates_written_as_text_are_said() {
         let fields = [Field::new("id", FieldType::Integer), Field::new("issued", FieldType::Date), Field::new("ts", FieldType::DateTime)];
-        for target in ["a.shp", "a.zip", "a.gpkg", "a.parquet", "a.fgb"] {
+        for target in ["a.parquet", "a.fgb"] {
             assert_eq!(
                 dates_as_text_note(&fields, target).as_deref(),
                 Some(format!("{target}: 2 date fields were written as text (ISO 8601), not as dates: 'issued', 'ts'").as_str())
             );
         }
-        // Formats without date columns, and layers without dates, say nothing.
-        for target in ["a.geojson", "a.csv", "a.kml"] {
+        // A Shapefile writes dates as dates, and only its date-times as text.
+        for target in ["a.shp", "a.zip"] {
+            assert_eq!(
+                dates_as_text_note(&fields, target).as_deref(),
+                Some(format!("{target}: 1 date-time field was written as text (ISO 8601), not as dates: 'ts'").as_str())
+            );
+        }
+        // Formats without date columns, GeoPackage with them, and layers without dates say nothing.
+        for target in ["a.geojson", "a.csv", "a.kml", "a.gpkg"] {
             assert_eq!(dates_as_text_note(&fields, target), None, "{target}");
         }
-        assert_eq!(dates_as_text_note(&fields[..1], "a.gpkg"), None);
-        // Text held in a date field is cut to a Shapefile's 254 bytes like any text, and said.
-        let mut ds = Dataset::new("d", GeometryType::Point, vec![Field::new("issued", FieldType::Date)]);
-        ds.push(Some(Geometry::Point(Coord::new(0.0, 0.0))), vec![Value::Text("x".repeat(300))]);
-        assert_eq!(shapefile_values_notes(&ds, "a.shp"), ["a.shp: 1 text value was cut to at most 254 bytes, in 'issued'"]);
+        assert_eq!(dates_as_text_note(&fields[..2], "a.shp"), None);
+        // Text held in a date-time field is cut to a Shapefile's 254 bytes like any text, and said;
+        // text in a date field that isn't a date is left empty, and said.
+        let fields = vec![Field::new("ts", FieldType::DateTime), Field::new("issued", FieldType::Date)];
+        let mut ds = Dataset::new("d", GeometryType::Point, fields);
+        ds.push(Some(Geometry::Point(Coord::new(0.0, 0.0))), vec![Value::Text("x".repeat(300)), Value::Text("soon".into())]);
+        assert_eq!(
+            shapefile_values_notes(&ds, "a.shp"),
+            [
+                "a.shp: 1 text value was cut to at most 254 bytes, in 'ts'",
+                "a.shp: 1 value couldn't be written to its dBase field and was left empty, in 'issued'"
+            ]
+        );
+    }
+
+    /// A Shapefile's date fields are written as `.dbf` dates and read back as dates, whole and
+    /// streamed; its date-times as text. A date that isn't one (`20260230`) is null and said, and
+    /// its shape is kept; a blank or zero date is just null.
+    #[test]
+    fn shapefile_dates_are_written_and_read_as_dates() {
+        let fields = vec![Field::new("issued", FieldType::Date), Field::new("ts", FieldType::DateTime)];
+        let mut ds = Dataset::new("permits", GeometryType::Point, fields);
+        // A midnight without a zone held as text in a date field is written as its day.
+        let mut midnight = Dataset::new("m", GeometryType::Point, ds.fields.clone());
+        midnight.push(Some(Geometry::Point(Coord::new(0.0, 0.0))), vec![Value::Text("2026-01-01T00:00:00".into()), Value::Null]);
+        let (bytes, _) = write_bytes(&midnight, "zip").unwrap();
+        assert_eq!(read_bytes("m.zip", &bytes).unwrap().0.features[0].attrs[0], Value::parse("2026-01-01", FieldType::Date));
+        assert!(shapefile_values_notes(&midnight, "m.shp").is_empty());
+        for (i, day) in ["2026-03-05", "1999-12-31", "2000-01-01", "0001-01-01", ""].into_iter().enumerate() {
+            let at = Value::parse("2026-03-05T14:30:00+02:00", FieldType::DateTime);
+            ds.push(Some(Geometry::Point(Coord::new(i as f64, 1.0))), vec![Value::parse(day, FieldType::Date), at]);
+        }
+        let (bytes, _) = write_bytes(&ds, "zip").unwrap();
+        let (back, report) = read_bytes("permits.zip", &bytes).unwrap();
+        assert_eq!(back.fields.iter().map(|f| f.ty).collect::<Vec<_>>(), [FieldType::Date, FieldType::Text]);
+        let days: Vec<Value> = back.features.iter().map(|f| f.attrs[0].clone()).collect();
+        let expected: Vec<Value> = ds.features.iter().map(|f| f.attrs[0].clone()).collect();
+        assert_eq!(days, expected);
+        assert_eq!(back.features[0].attrs[1], Value::Text("2026-03-05T14:30:00+02:00".into()));
+        assert!(!report.messages.iter().any(|m| m.contains("date")), "{report:?}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let shp = dir.path().join("permits.shp");
+        write_path(&ds, &shp).unwrap();
+        let dbf = shp.with_extension("dbf");
+        let mut table = std::fs::read(&dbf).unwrap();
+        let replace = |table: &mut Vec<u8>, from: &[u8], to: &[u8]| {
+            let at = table.windows(from.len()).position(|w| w == from).unwrap();
+            table[at..at + to.len()].copy_from_slice(to);
+        };
+        replace(&mut table, b"19991231", b"20260230");
+        replace(&mut table, b"20000101", b"00000000");
+        std::fs::write(&dbf, table).unwrap();
+        let whole = read_shapefile_in(&shp, "permits", None).unwrap();
+        let streamed = crate::source::materialize(&crate::source::shp::ShpSource::open_path(&shp, "permits").unwrap()).unwrap();
+        for (read, (back, report)) in [("whole", whole), ("streamed", streamed)] {
+            let days: Vec<Value> = back.features.iter().map(|f| f.attrs[0].clone()).collect();
+            let at = |d| Value::parse(d, FieldType::Date);
+            assert_eq!(days, [at("2026-03-05"), Value::Null, Value::Null, at("0001-01-01"), Value::Null], "{read}");
+            assert!(back.features.iter().all(|f| f.geometry.is_some()), "{read}");
+            let note = report.messages.iter().find(|m| m.contains("date")).unwrap_or_else(|| panic!("{read}: {report:?}"));
+            assert_eq!(note, "permits: 1 value isn't a date and was read as empty, in 'issued'", "{read}");
+        }
     }
 
     /// The notice for field names a Shapefile can't hold names each change as the file has it,

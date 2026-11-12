@@ -53,6 +53,7 @@ pub fn commands() -> Vec<C> {
                 dbf_notes.extend(rustgis_data::source::parquet::values_note(&t.dataset, path));
             }
             dbf_notes.extend(rustgis_data::io::dates_as_text_note(&t.dataset.fields, path));
+            dbf_notes.extend(gpkg_dates_note(&t.dataset, &ext, path));
             // CSV holds a point a row, GPX a name for each feature and no areas.
             let name_field = rustgis_data::io::name_field(&t.dataset);
             dbf_notes.extend(rustgis_data::io::export_losses_notes(&t.dataset, &ext, name_field, path));
@@ -648,6 +649,17 @@ pub(crate) fn layer_work(s: &Session, p: &Value) -> Result<Work, String> {
     }))
 }
 
+/// What a GeoPackage export of `ds` says of its dates: date-times written in UTC, and text in
+/// date fields that isn't a date. Nothing for another format, or when there was none.
+pub fn gpkg_dates_note(ds: &rustgis_data::Dataset, ext: &str, path: &str) -> Vec<String> {
+    use rustgis_data::io::{offset_dates, text_in_dates, text_in_dates_note, utc_dates_note};
+    if ext != "gpkg" {
+        return Vec::new();
+    }
+    let utc = utc_dates_note(&ds.fields, &offset_dates(ds.features.iter(), &ds.fields), path);
+    utc.into_iter().chain(text_in_dates_note(&ds.fields, &text_in_dates(ds.features.iter(), &ds.fields), path)).collect()
+}
+
 /// Writes layer `l` to `path`, in `asked` or the system the format defaults to; a GeoPackage's
 /// table goes where `gpkg` says.
 fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, gpkg: GpkgTable) -> Result<Wrote, String> {
@@ -659,7 +671,12 @@ fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, gpkg: Gpk
     // A streamed layer exports its whole source, not the features read for the view: a chunk at
     // a time where the source and format allow, so its size isn't limited by memory.
     let chunks = if l.is_streamed() && rustgis_data::export::streams(&ext) && !from_target { l.chunk_export()? } else { None };
-    let (whole, unread) = if l.is_streamed() && chunks.is_none() { l.load_all_counted().map(|(ds, n)| (Some(ds), n))? } else { (None, 0) };
+    let (whole, unreadable) = if l.is_streamed() && chunks.is_none() {
+        l.load_all_counted().map(|(ds, n)| (Some(ds), n))?
+    } else {
+        (None, rustgis_map::Unreadable::default())
+    };
+    let unread = unreadable.rows;
     let ds = chunks.as_ref().map(|(_, layer)| layer).or(whole.as_ref()).unwrap_or(&l.dataset);
     // GeoJSON, KML and GPX are longitude/latitude; the others keep the layer's own system unless
     // told another.
@@ -669,21 +686,29 @@ fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, gpkg: Gpk
         return Err(format!("{path}: {e}"));
     }
     let parquet = matches!(ext.as_str(), "parquet" | "geoparquet");
-    let (written, left_out, skipped, table, unfit, null_numbers, moved, csv) = match &chunks {
+    let (written, left_out, skipped, table, unfit, null_numbers, moved, csv, dates) = match &chunks {
         Some((src, layer)) => {
             let (e, table) =
                 rustgis_data::export::write_source_to(src.as_ref(), layer, Path::new(&path), crs, &gpkg).map_err(|e| e.to_string())?;
             // Counted as the chunks were written, as the layer holds none of them.
             let unfit = rustgis_data::source::parquet::unfit_note(&layer.fields, &e.unfit, path);
             let moved = rustgis_data::web_mercator_moved_note(path, &layer.name, e.beyond_web_mercator);
-            (e.written, e.left_out, e.skipped, table, unfit, e.null_numbers, moved, e.csv)
+            let mut dates: Vec<String> = rustgis_data::source::unread_dates_note(&layer.fields, &e.unread_dates)
+                .map(|n| format!("{path}: {}: {n}, so they're empty in the export", layer.name))
+                .into_iter()
+                .collect();
+            dates.extend(rustgis_data::io::utc_dates_note(&layer.fields, &e.utc_dates, path));
+            (e.written, e.left_out, e.skipped, table, unfit, e.null_numbers, moved, e.csv, dates)
         }
         None => {
             let (left_out, table) = rustgis_data::io::write_path_to(ds, Path::new(&path), crs, &gpkg).map_err(|e| e.to_string())?;
             let unfit = if parquet { rustgis_data::source::parquet::values_note(ds, path) } else { None };
             let null_numbers = rustgis_data::export::numbers_written_as_null(&ds.features, &ds.fields, &ext);
             let csv = if ext == "csv" { rustgis_data::io::CsvLosses::of(&ds.features, ds.geometry_type) } else { Default::default() };
-            (ds.features.len().saturating_sub(left_out), left_out, unread, table, unfit, null_numbers, None, csv)
+            let mut dates: Vec<String> =
+                unreadable.dates.iter().map(|n| format!("{path}: {}: {n}, so they're empty in the export", ds.name)).collect();
+            dates.extend(gpkg_dates_note(ds, &ext, path));
+            (ds.features.len().saturating_sub(left_out), left_out, unread, table, unfit, null_numbers, None, csv, dates)
         }
     };
     // The features written give their own extent. A streamed layer written a chunk at a time has
@@ -719,6 +744,7 @@ fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, gpkg: Gpk
     said.extend(notes);
     said.extend(dbf_notes);
     said.extend(unfit);
+    said.extend(dates);
     if shapefile && rustgis_data::raster::wkt::to_wkt(crs).is_none() {
         said.push(format!("{path}: no .prj written, as {} has no WKT form", crs.label()));
     }

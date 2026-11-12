@@ -43,6 +43,13 @@ pub struct Exported {
     pub beyond_web_mercator: usize,
     /// Geometry a CSV can't hold, counted over all chunks (none for the other formats).
     pub csv: crate::io::CsvLosses,
+    /// Per field of the layer, values of the source's date fields that weren't dates, so are
+    /// written as null ([`crate::source::Batch::unread_dates`], said by
+    /// [`crate::source::unread_dates_note`]).
+    pub unread_dates: Vec<usize>,
+    /// Per field of the layer, date-times a GeoPackage holds in UTC rather than at their own
+    /// offset ([`crate::io::offset_dates`]; empty for the other formats).
+    pub utc_dates: Vec<usize>,
 }
 
 /// Writes every feature of `src` to `path` in the format of its extension, in `crs` (see
@@ -105,12 +112,15 @@ fn write_chunks_to(
     let mut beyond_web_mercator = 0usize;
     let mut null_numbers = 0usize;
     let mut csv = crate::io::CsvLosses::default();
+    let mut unread_dates = Vec::new();
+    let mut utc_dates = Vec::new();
     let mut feed = |add: &mut dyn FnMut(&[Feature]) -> Result<()>| -> Result<()> {
         // A GeoPackage export that starts again feeds the features again, and counts them again.
         total = 0;
         beyond_web_mercator = 0;
         null_numbers = 0;
         csv = crate::io::CsvLosses::default();
+        utc_dates.clear();
         // The writers count the features; a source that doesn't know how many leaves the total at 0.
         crate::progress::begin(src.info().count.map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX)));
         let batch = src.visit_chunks(None, bytes, &mut |mut chunk| {
@@ -131,9 +141,13 @@ fn write_chunks_to(
             if ext == "csv" {
                 csv += crate::io::CsvLosses::of(&chunk, geometry_type);
             }
+            if ext == "gpkg" {
+                crate::source::add_unread_dates(&mut utc_dates, &crate::io::offset_dates(chunk.iter(), &layer.fields));
+            }
             add(&chunk)
         })?;
         skipped = batch.skipped;
+        unread_dates = batch.unread_dates;
         Ok(())
     };
     let mut table = None;
@@ -171,7 +185,8 @@ fn write_chunks_to(
             Ok::<_, DataError>(0)
         })?,
     };
-    Ok((Exported { written: total.saturating_sub(left_out), left_out, skipped, null_numbers, unfit, beyond_web_mercator, csv }, table))
+    let written = total.saturating_sub(left_out);
+    Ok((Exported { written, left_out, skipped, null_numbers, unfit, beyond_web_mercator, csv, unread_dates, utc_dates }, table))
 }
 
 /// Counts attributes a GeoJSON or GeoPackage writer replaces with null. Other formats have

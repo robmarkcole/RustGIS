@@ -179,7 +179,7 @@ fn read_filtered(
         }
         Ok(())
     })?;
-    Ok((Batch { features: kept, matched: seen, complete: step == 1, skipped: summary.skipped }, areas))
+    Ok((Batch { features: kept, matched: seen, complete: step == 1, skipped: summary.skipped, unread_dates: summary.unread_dates }, areas))
 }
 
 /// An expression parsed against source metadata still needs validation against decoded geometry.

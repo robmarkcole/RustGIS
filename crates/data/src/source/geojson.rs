@@ -290,7 +290,7 @@ impl FeatureSource for GeoJsonSource {
             };
             features.push(Feature { id: u64::from(i) + 1, geometry, attrs: geojson_attrs(&json, &self.info.fields) });
         }
-        Ok(Batch { features, matched: matched as u64, complete: step == 1, skipped })
+        Ok(Batch { features, matched: matched as u64, complete: step == 1, skipped, unread_dates: Vec::new() })
     }
 }
 

@@ -170,6 +170,40 @@ pub(crate) fn readable_header_date(dbf: &mut [u8]) {
     }
 }
 
+/// Marks a `.dbf`'s date (`D`) columns as character columns in its header, so `dbase` hands their
+/// bytes over as text for [`date`] to read instead of failing the whole record on a date it can't
+/// read (`20260230`, `00000000`). Returns the positions of those columns.
+pub(crate) fn dates_as_text(dbf: &mut [u8]) -> Vec<usize> {
+    let header_len = usize::from(u16::from_le_bytes([dbf.get(8).copied().unwrap_or(0), dbf.get(9).copied().unwrap_or(0)]));
+    let mut dates = Vec::new();
+    for (k, start) in (32..header_len.min(dbf.len())).step_by(32).enumerate() {
+        if dbf.get(start).is_none_or(|b| *b == 0x0D) {
+            break;
+        }
+        if let Some(ty) = dbf.get_mut(start + 11)
+            && ty.eq_ignore_ascii_case(&b'D')
+        {
+            *ty = b'C';
+            dates.push(k);
+        }
+    }
+    dates
+}
+
+/// A date (`D`) field's value, `YYYYMMDD`: `Ok(None)` when it's blank or zeros, as writers leave
+/// a date empty, and `Err(())` when it isn't a date (`20260230`, `2026-3-5`).
+pub(crate) fn date(field: &[u8]) -> std::result::Result<Option<crate::date::Date>, ()> {
+    let t = field.trim_ascii();
+    if t.is_empty() || t == b"00000000" || field.iter().all(|b| *b == 0) {
+        return Ok(None);
+    }
+    let [y0, y1, y2, y3, m0, m1, d0, d1] = *t else { return Err(()) };
+    let digits = |b: &[u8]| -> std::result::Result<i64, ()> {
+        b.iter().try_fold(0i64, |n, c| if c.is_ascii_digit() { Ok(n * 10 + i64::from(c - b'0')) } else { Err(()) })
+    };
+    crate::date::Date::from_ymd(digits(&[y0, y1, y2, y3])?, digits(&[m0, m1])?, digits(&[d0, d1])?).map(Some).ok_or(())
+}
+
 /// A code-page label should be a few bytes. Bound reads even for a hostile sidecar.
 pub(crate) fn read_cpg(path: &std::path::Path, notes: &mut Vec<String>) -> Option<Vec<u8>> {
     match try_read_cpg(path) {
@@ -204,6 +238,34 @@ fn try_read_cpg(path: &std::path::Path) -> std::io::Result<Option<Vec<u8>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `.dbf` date is a day, blank or zeros are empty, and anything else isn't a date.
+    #[test]
+    fn dbf_dates() {
+        let day = |y, m, d| Ok(crate::date::Date::from_ymd(y, m, d));
+        assert_eq!(date(b"20260305"), day(2026, 3, 5));
+        assert_eq!(date(b"00010101"), day(1, 1, 1));
+        for empty in [&b""[..], b"        ", b"00000000", b"\0\0\0\0\0\0\0\0"] {
+            assert_eq!(date(empty), Ok(None), "{empty:?}");
+        }
+        for bad in [&b"20260230"[..], b"20261301", b"2026-3-5", b"2026030", b"202603050", b"abcdefgh", b"00000101", b"0000    "] {
+            assert_eq!(date(bad), Err(()), "{bad:?}");
+        }
+    }
+
+    /// Date columns are marked as character columns, and their positions given; others are kept.
+    #[test]
+    fn date_columns_read_as_text() {
+        let mut dbf = vec![0u8; 32 + 3 * 32 + 1];
+        dbf[8] = (dbf.len()) as u8;
+        for (k, ty) in b"CDd".iter().copied().enumerate() {
+            dbf[32 + k * 32 + 11] = ty;
+        }
+        dbf[32 + 3 * 32] = 0x0D;
+        assert_eq!(dates_as_text(&mut dbf), [1, 2]);
+        assert_eq!([dbf[43], dbf[75], dbf[107]], [b'C', b'C', b'C']);
+        assert!(dates_as_text(&mut [0u8; 10]).is_empty());
+    }
 
     /// A header date that isn't one gets a placeholder; a real one, and a header cut too short
     /// to have one, are left as they are.
