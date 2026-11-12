@@ -1461,6 +1461,27 @@ pub(super) fn read_limited_with_nodata(
     if ycbcr {
         ycbcr_to_rgb(&mut bands);
     }
+    // The image's internal transparency mask: its masked pixels are no-data, as outside a
+    // reprojection are. One that can't be read leaves them as stored, and says so.
+    let mut mask_lost = None;
+    match super::mask::find(&mut dec, image, if decimate_by > 1 { (full_w, full_h) } else { (w, h) }) {
+        super::mask::Found::At(m) => match super::mask::read(&mut dec, m, decimate_by) {
+            Ok(opaque) if opaque.len() == n => {
+                for band in &mut bands {
+                    for (v, _) in band.iter_mut().zip(&opaque).filter(|(_, o)| !**o) {
+                        *v = f32::NAN;
+                    }
+                }
+            }
+            Ok(_) => mask_lost = Some("its transparency mask doesn't match its image".to_string()),
+            Err(DataError::Cancelled) => return Err(DataError::Cancelled),
+            Err(e) => mask_lost = Some(e.to_string()),
+        },
+        super::mask::Found::Elsewhere => mask_lost = Some("the file has none for the image read".to_string()),
+        super::mask::Found::Unscanned(why) => mask_lost = Some(why),
+        super::mask::Found::None => {}
+    }
+    let mask_lost = mask_lost.map(|why| format!("its transparency mask isn't applied ({why}): masked pixels draw as stored"));
     // A scan keeps a stand-in transform, sized to the pixels read.
     if !geo.referenced {
         let mut r = Raster::new(name, w, h, bands, super::unreferenced(w, h), Crs::LonLat, geo.nodata, color, data_type)?;
@@ -1470,6 +1491,7 @@ pub(super) fn read_limited_with_nodata(
         r.copyright = copyright.filter(|c| !c.is_empty());
         r.lost.extend(copyright_lost);
         r.lost.extend(table_lost);
+        r.lost.extend(mask_lost);
         if let Some(p) = &described {
             r.apply_pam(p, super::pam::GDAL_METADATA);
         }
@@ -1524,6 +1546,7 @@ pub(super) fn read_limited_with_nodata(
     r.lost.extend(copyright_lost);
     r.lost.extend(super::planetary::note_of(crs));
     r.lost.extend(table_lost);
+    r.lost.extend(mask_lost);
     if let Some(p) = &described {
         r.apply_pam(p, super::pam::GDAL_METADATA);
     }
@@ -2504,11 +2527,26 @@ mod tests {
     /// As [`rgb_tiled_samples`], each image `(size, tile, samples, subfile type)` in turn: a
     /// transparency mask has the subfile type 4.
     fn rgb_tiled_images(images: &[(u32, u32, u16, u32)], bits: u16, predictor: u16, pixel: impl Fn(u32, u32, u32) -> u16) -> Vec<u8> {
+        rgb_tiled_masked(images, bits, predictor, pixel, |_, _, _| true)
+    }
+
+    /// As [`rgb_tiled_images`], with a real mask for each image whose subfile type has bit 2 set:
+    /// 1 bit a pixel, opaque where `opaque(size, x, y)` (in the mask's own pixels) holds, deflated unless
+    /// `predictor` is 1.
+    fn rgb_tiled_masked(
+        images: &[(u32, u32, u16, u32)],
+        bits: u16,
+        predictor: u16,
+        pixel: impl Fn(u32, u32, u32) -> u16,
+        opaque: impl Fn(u32, u32, u32) -> bool,
+    ) -> Vec<u8> {
         let full = images.first().map_or(1, |i| i.0);
         let mut out = vec![b'I', b'I', 42, 0, 0, 0, 0, 0];
         let mut next_link = 4;
         for (i, &(size, tile, samples, subfile)) in images.iter().enumerate() {
             let k = full / size;
+            let (mask, deflated) = (subfile & 4 != 0, predictor != 1);
+            let (samples, bits, predictor) = if mask { (1, 1, 1) } else { (samples, bits, predictor) };
             let n = size.div_ceil(tile);
             // The tiles' data first, then the IFD pointing at it.
             let mut offsets = Vec::new();
@@ -2517,6 +2555,17 @@ mod tests {
                 offsets.push(out.len() as u32);
                 let mut raw = Vec::new();
                 for y in 0..tile {
+                    if mask {
+                        let y = (t / n) * tile + y;
+                        let mut row = vec![0u8; tile.div_ceil(8) as usize];
+                        for x in (0..tile).filter(|x| (t % n) * tile + x < size && y < size) {
+                            if opaque(size, (t % n) * tile + x, y) {
+                                row[(x / 8) as usize] |= 0x80 >> (x % 8);
+                            }
+                        }
+                        raw.extend(row);
+                        continue;
+                    }
                     let mut prev = [0u16; 4];
                     for x in 0..tile {
                         let (x, y) = ((t % n) * tile + x, (t / n) * tile + y);
@@ -2528,7 +2577,7 @@ mod tests {
                         }
                     }
                 }
-                let encoded = if predictor == 1 { raw } else { miniz_oxide::deflate::compress_to_vec_zlib(&raw, 6) };
+                let encoded = if predictor == 1 && !(mask && deflated) { raw } else { miniz_oxide::deflate::compress_to_vec_zlib(&raw, 6) };
                 counts.push(encoded.len() as u32);
                 out.extend(encoded);
             }
@@ -2541,8 +2590,8 @@ mod tests {
                 (256, 4, 1, longs(&[size])),
                 (257, 4, 1, longs(&[size])),
                 (258, 3, u32::from(samples), shorts(&vec![bits; usize::from(samples)])),
-                (259, 3, 1, shorts(&[if predictor == 1 { 1 } else { 8 }])),
-                (262, 3, 1, shorts(&[2])),
+                (259, 3, 1, shorts(&[if predictor == 1 && !(mask && deflated) { 1 } else { 8 }])),
+                (262, 3, 1, shorts(&[if mask { 4 } else { 2 }])),
                 (277, 3, 1, shorts(&[samples])),
                 (284, 3, 1, shorts(&[1])),
                 (317, 3, 1, shorts(&[predictor])),
@@ -2754,6 +2803,147 @@ mod tests {
         let Parse::Done(layout) = cog::layout(&whole).unwrap() else { panic!("not a COG") };
         assert_eq!(layout.levels.iter().map(|l| (l.width, l.ifd)).collect::<Vec<_>>(), [(32, 0), (16, 4)]);
         assert!(layout.lost.iter().all(|n| !n.contains("scan for overviews stopped")), "{:?}", layout.lost);
+    }
+
+    /// Sets `tag`'s value (a short, in place) in the `ifd`-th image of a little-endian TIFF.
+    fn set_short(bytes: &mut [u8], ifd: usize, tag: u16, value: u16) {
+        let long = |b: &[u8], at: usize| u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]) as usize;
+        let mut at = long(bytes, 4);
+        for _ in 0..ifd {
+            at = long(bytes, at + 2 + 12 * usize::from(u16::from_le_bytes([bytes[at], bytes[at + 1]])));
+        }
+        for k in 0..usize::from(u16::from_le_bytes([bytes[at], bytes[at + 1]])) {
+            let e = at + 2 + 12 * k;
+            if bytes[e..e + 2] == tag.to_le_bytes() {
+                bytes[e + 8..e + 10].copy_from_slice(&value.to_le_bytes());
+            }
+        }
+    }
+
+    /// The issue's file: a JPEG RGB image's border masked by an internal mask (stored black), its
+    /// centre kept, one black centre pixel included.
+    fn masked_rgb(predictor: u16) -> Vec<u8> {
+        let centre = |x: u32, y: u32| (8..24).contains(&x) && (8..24).contains(&y);
+        let pixel = move |b: u32, x: u32, y: u32| if centre(x, y) && (x, y) != (12, 12) { [200, 120, 40][b as usize] } else { 0 };
+        rgb_tiled_masked(&[(32, 16, 3, 0), (32, 16, 1, 4)], 8, predictor, pixel, move |_, x, y| centre(x, y))
+    }
+
+    #[test]
+    fn an_internal_mask_makes_masked_pixels_transparent() {
+        for predictor in [1, 2] {
+            let r = read(std::io::Cursor::new(masked_rgb(predictor)), "masked").unwrap();
+            assert_eq!((r.width, r.height, r.band_count(), r.color.clone()), (32, 32, 3, ColorHint::Rgb { alpha: false }));
+            for y in 0..32 {
+                for x in 0..32 {
+                    for b in 0..3 {
+                        let inside = (8..24).contains(&x) && (8..24).contains(&y);
+                        let want = if !inside {
+                            None
+                        } else if (x, y) == (12, 12) {
+                            Some(0.0)
+                        } else {
+                            Some([200.0, 120.0, 40.0][b])
+                        };
+                        assert_eq!(r.value(b, x as i64, y as i64), want, "band {b} at {x},{y}");
+                    }
+                }
+            }
+            assert!(r.lost.is_empty(), "{:?}", r.lost);
+            // The statistics leave the masked pixels out.
+            assert_eq!(r.bands[0].stats.count, 16 * 16);
+        }
+    }
+
+    #[test]
+    fn a_file_without_a_mask_is_unchanged() {
+        let pixel = |b: u32, x: u32, y: u32| (b * 10 + x + y) as u16;
+        let r = read(std::io::Cursor::new(rgb_tiled_samples(&[(32, 16, 3)], 8, 1, pixel)), "plain").unwrap();
+        assert!(r.lost.is_empty(), "{:?}", r.lost);
+        assert_eq!(r.bands[0].stats.count, 32 * 32);
+        assert_eq!(r.value(1, 0, 0), Some(10.0));
+    }
+
+    #[test]
+    fn an_overviews_own_mask_applies_when_the_overview_is_read() {
+        // The full image's mask hides its left 8 columns, the overview's its top 4 rows.
+        let opaque = |size: u32, x: u32, y: u32| if size == 64 { x >= 8 } else { y >= 4 };
+        let images = [(64, 16, 3, 0), (32, 16, 3, 1), (32, 16, 1, 5), (64, 16, 1, 4)];
+        let bytes = rgb_tiled_masked(&images, 8, 1, |b, _, _| u16::try_from(b + 1).unwrap_or(0) * 50, opaque);
+        // Masks may come in any order; 3 × 32 × 32 samples fit, 3 × 64 × 64 don't.
+        let r = read_limited(reader(std::io::Cursor::new(&bytes)).unwrap(), "overview", 4_000, None).unwrap();
+        assert_eq!((r.width, r.height, r.overview), (32, 32, Some((64, 64))));
+        for (x, y) in [(0, 0), (31, 3), (0, 3)] {
+            assert_eq!(r.value(0, x, y), None, "{x},{y}");
+        }
+        for (x, y) in [(0, 4), (3, 4), (31, 31), (2, 20)] {
+            assert_eq!(r.value(0, x, y), Some(50.0), "{x},{y}");
+        }
+        assert!(r.lost.is_empty(), "{:?}", r.lost);
+        // The whole image has its own.
+        let full = read(std::io::Cursor::new(&bytes), "full").unwrap();
+        assert_eq!((full.width, full.value(0, 7, 40), full.value(0, 8, 0)), (64, None, Some(50.0)));
+    }
+
+    #[test]
+    fn an_overview_without_a_mask_of_its_own_says_so() {
+        // Only the full image has a mask: the overview read draws as stored, and says why.
+        let images = [(64, 16, 3, 0), (32, 16, 3, 1), (64, 16, 1, 4)];
+        let bytes = rgb_tiled_masked(&images, 8, 1, |_, _, _| 50, |_, x, _| x >= 8);
+        let r = read_limited(reader(std::io::Cursor::new(&bytes)).unwrap(), "overview", 4_000, None).unwrap();
+        assert_eq!((r.width, r.value(0, 0, 0)), (32, Some(50.0)));
+        assert_eq!(
+            r.lost,
+            ["its transparency mask isn't applied (the file has none for the image read): masked pixels draw as stored"],
+            "{:?}",
+            r.lost
+        );
+    }
+
+    #[test]
+    fn a_mask_follows_an_image_read_every_other_pixel() {
+        // No overview fits: every second pixel of the full image is read, with its mask's.
+        let opaque = |_: u32, x: u32, y: u32| (x / 3 + y / 5).is_multiple_of(2);
+        let bytes = rgb_tiled_masked(&[(64, 16, 3, 0), (64, 16, 1, 4)], 8, 1, |_, _, _| 90, opaque);
+        let r = read_limited(reader(std::io::Cursor::new(&bytes)).unwrap(), "sparse", 4_000, None).unwrap();
+        assert_eq!((r.width, r.overview), (32, Some((64, 64))));
+        for y in 0..32u32 {
+            for x in 0..32u32 {
+                let want = opaque(64, x * 2, y * 2).then_some(90.0);
+                assert_eq!(r.value(0, i64::from(x), i64::from(y)), want, "{x},{y}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_mask_that_cant_be_read_is_said_once_and_the_image_loads() {
+        let mut bytes = masked_rgb(1);
+        // JPEG, which masks aren't read in.
+        set_short(&mut bytes, 1, 259, 7);
+        let r = read(std::io::Cursor::new(&bytes), "bad").unwrap();
+        assert_eq!(r.lost.len(), 1, "{:?}", r.lost);
+        assert!(r.lost[0].starts_with("its transparency mask isn't applied (a transparency mask's compression (7)"), "{:?}", r.lost);
+        assert_eq!(r.value(0, 0, 0), Some(0.0), "masked pixels draw as stored");
+        assert_eq!(r.value(0, 20, 20), Some(200.0));
+        // More than one bit a pixel.
+        let mut bytes = masked_rgb(1);
+        set_short(&mut bytes, 1, 258, 8);
+        let r = read(std::io::Cursor::new(&bytes), "bad").unwrap();
+        assert!(r.lost.iter().any(|n| n.contains("isn't 1 bit a pixel")), "{:?}", r.lost);
+        assert_eq!(r.value(0, 0, 0), Some(0.0));
+    }
+
+    #[test]
+    fn a_cog_header_says_its_masks_arent_applied_in_place() {
+        use super::super::cog::{self, Parse, Sparse};
+        let layout = |bytes: Vec<u8>| {
+            let whole = Sparse::default().with_len(bytes.len() as u64).with(0, bytes);
+            let Parse::Done(layout) = cog::layout(&whole).unwrap() else { panic!("not a COG") };
+            layout
+        };
+        let l = layout(masked_rgb(1));
+        assert_eq!(l.lost, ["1 transparency mask(s) aren't applied when tiles are read in place: masked pixels draw as stored"]);
+        let plain = layout(rgb_tiled_samples(&[(32, 16, 3)], 8, 1, |b, _, _| b as u16));
+        assert!(plain.lost.is_empty(), "{:?}", plain.lost);
     }
 
     /// An RGBI image too large to read whole, with a three-sample overview that would fit: the

@@ -17,6 +17,7 @@ mod esri;
 pub mod gdal;
 pub mod geotiff;
 mod lzw;
+mod mask;
 pub mod pam;
 pub mod planetary;
 pub mod wkt;

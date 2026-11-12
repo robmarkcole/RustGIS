@@ -439,10 +439,14 @@ fn read_layout(r: Sparse) -> Result<Parse> {
     let mut mismatched_count = 0usize;
     // Images passed over (not overviews, or with another sample count).
     let mut skipped = 0usize;
+    // Transparency masks passed over.
+    let mut masks = 0usize;
     loop {
         let subfile = dec.find_tag_unsigned::<u32>(Tag::NewSubfileType).ok().flatten().unwrap_or(0);
-        // Transparency masks are skipped, and count toward the scan's bound.
+        // Transparency masks are skipped (a tile is read without its mask's), said, and count
+        // toward the scan's bound.
         if subfile & 4 != 0 {
+            masks += 1;
             skipped += 1;
             if skipped >= MAX_SKIPPED && dec.more_images() {
                 lost.push(format!("the scan for overviews stopped after {skipped} skipped images: later images aren't read"));
@@ -511,6 +515,9 @@ fn read_layout(r: Sparse) -> Result<Parse> {
             "{mismatched_count} overview(s) with samples per pixel other than the full image's {full_samples} are left out: {}{more}",
             mismatched.join(", ")
         ));
+    }
+    if masks > 0 {
+        lost.push(format!("{masks} transparency mask(s) aren't applied when tiles are read in place: masked pixels draw as stored"));
     }
     if levels.is_empty() {
         return Ok(Parse::NotTiled("no image".into()));

@@ -112,7 +112,7 @@ pub(crate) fn chunk<R: Read + Seek>(dec: &mut Decoder<R>, index: u32) -> Result<
 /// LZW-decodes `input`, at most `max` bytes of it. A stream may stop short of its end code, as
 /// libtiff allows; it ends where its bytes do. The output grows as bytes come out, not from what
 /// the file's header claims.
-fn decode(input: &[u8], max: usize) -> Vec<u8> {
+pub(super) fn decode(input: &[u8], max: usize) -> Vec<u8> {
     let mut lzw = weezl::decode::Configuration::with_tiff_size_switch(weezl::BitOrder::Msb, 8).build();
     let (mut inp, mut out) = (input, Vec::new());
     let mut buf = vec![0u8; max.min(64 << 10)];
