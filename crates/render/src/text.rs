@@ -928,13 +928,14 @@ impl Edt {
             z[k + 1] = f64::INFINITY;
         }
         k = 0;
-        for q in 0..n {
+        // (`out` holds `n` values, one for each q.)
+        for (q, out) in self.out.iter_mut().enumerate() {
             while z[k + 1] < q as f64 {
                 k += 1;
             }
             let p = v[k];
             let dq = q as f64 - p as f64;
-            self.out[q] = dq * dq + f[p];
+            *out = dq * dq + f[p];
         }
         &self.out
     }
