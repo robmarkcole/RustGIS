@@ -483,8 +483,9 @@ duplication and nudging have their own [layout shortcuts](layouts.md#layouts).
       <figcaption>The Time Slider in cumulative mode: every event up to 2018 is drawn.</figcaption>
     </figure>
 
-    - **Bind To Time Slider** (a layer's context menu, or the bar's **Layers** menu) picks the
-      layer's date field: the one most of whose values read as dates. Text dates (`2015-03-01`,
+    - **Bound to the time slider** (the Time tab of a layer's [Layer Properties](cartography.md#layer-properties),
+      or the bar's **Layers** menu) picks the layer's date field: the one most of whose values read
+      as dates, or the one chosen in its list. Text dates (`2015-03-01`,
       `2015-03-01T12:00:00Z`, `2015/3/1`), epoch milliseconds or seconds, and years (`1958`) all
       read; times are UTC. Only the features whose date falls in the slider's window draw (and
       show in the legend). The bar's bars count each step's features.

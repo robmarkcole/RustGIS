@@ -2408,21 +2408,8 @@ fn layer_menu(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, reorder: bool) {
             ui.close();
         }
     } else {
-        // The definition query is on the Query tab of Properties… (#1803).
-        if l.time.is_some() {
-            if ui.button(tl!("Unbind From Time Slider")).clicked() {
-                let _ = app.run("time.unbind", json!({"layer": l.id}));
-                ui.close();
-            }
-        } else if ui
-            .add_enabled(!rustgis_engine::map::time::time_fields(&l.dataset).is_empty(), egui::Button::new(tl!("Bind To Time Slider")))
-            .on_disabled_hover_text(tl!("No field of this layer holds dates."))
-            .clicked()
-        {
-            app.time.hidden = false;
-            let _ = app.run("time.bind", json!({"layer": l.id}));
-            ui.close();
-        }
+        // The definition query and the time slider binding are on the Query and Time tabs of
+        // Properties… (#1803).
         if ui.button(tl!("Export Features…")).clicked() {
             let _ = app.run("ui.exportLayer", Value::Null);
             ui.close();

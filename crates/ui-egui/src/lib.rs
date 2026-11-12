@@ -3008,17 +3008,17 @@ impl RustGisApp {
             }
             // The Layer Properties pane (#1803), on `{"layer": id}` when given (a layer's
             // right-click menu), as the Labeling pane is; feature and raster layers alike. With
-            // `{"tab": "general"|"source"|"display"|"query"}` it shows that tab (Data › Definition
-            // Query asks for "query", a feature layer's only).
+            // `{"tab": "general"|"source"|"display"|"query"|"time"}` it shows that tab (Data ›
+            // Definition Query asks for "query"; "query" and "time" are a feature layer's only).
             "ui.pane.layerProperties" => {
                 let given = match p.get("layer").filter(|l| !l.is_null()) {
                     Some(_) => Some(self.session.layer_id(p)?),
                     None => None,
                 };
                 let tab = match p.get("tab").filter(|t| !t.is_null()) {
-                    Some(t) => {
-                        Some(t.as_str().and_then(layerprops::Topic::parse).ok_or("unknown tab: give general, source, display or query")?)
-                    }
+                    Some(t) => Some(
+                        t.as_str().and_then(layerprops::Topic::parse).ok_or("unknown tab: give general, source, display, query or time")?,
+                    ),
                     None => None,
                 };
                 let layer = given.or(self.session.active_layer).and_then(|id| self.session.map().layer(id));
@@ -3026,8 +3026,10 @@ impl RustGisApp {
                 if (given.is_some() || tab.is_some() || !self.ui.right_open.contains(&RightPane::LayerProperties)) && layer.is_none() {
                     return Err("select a layer in the Layers pane first".into());
                 }
-                if tab == Some(layerprops::Topic::Query) && layer.is_some_and(|l| l.is_raster()) {
-                    return Err("a raster layer has no definition query: the Query tab is a feature layer's".into());
+                if tab.is_some_and(layerprops::Topic::feature_only) && layer.is_some_and(|l| l.is_raster()) {
+                    return Err(
+                        "a raster layer has no definition query or time binding: the Query and Time tabs are a feature layer's".into()
+                    );
                 }
                 if let Some(id) = given {
                     self.session.run("layer.select", &json!({"layer": id}))?;

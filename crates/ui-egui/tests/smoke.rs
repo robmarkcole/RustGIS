@@ -891,6 +891,7 @@ fn every_tab_pane_and_dialog_renders() {
         ("ui.pane.labeling", json!({"layer": "Cities"})),
         ("ui.pane.layerProperties", json!({"layer": "Cities"})),
         ("ui.pane.layerProperties", json!({"layer": "Cities", "tab": "query"})),
+        ("ui.pane.layerProperties", json!({"layer": "Cities", "tab": "time"})),
         ("ui.pane.geoprocessing", json!(null)),
         ("ui.gp.open", json!({"tool": "buffer"})),
         ("ui.pane.history", json!(null)),

@@ -62,6 +62,12 @@ fn unit_label(u: Unit) -> String {
     .to_string()
 }
 
+/// A date field as the lists that bind a layer by it show it: its name and the share of its values
+/// that read as dates (the Layers menu here, the Time tab of Layer Properties).
+pub(crate) fn field_share(field: &str, share: f64) -> String {
+    crate::i18n::fmt("{field} ({share}%)", &[("field", field), ("share", &format!("{:.0}", share * 100.0))])
+}
+
 /// Whether the bar shows: the map has a slider and the bar wasn't closed.
 pub fn open(app: &RustGisApp) -> bool {
     app.session.map().time.is_some() && !app.time.hidden
@@ -350,9 +356,7 @@ fn layers_menu(app: &mut RustGisApp, ui: &mut Ui) {
                     .selected_text(current.as_str())
                     .show_ui(ui, |ui| {
                         for (f, share) in fields {
-                            let label =
-                                crate::i18n::fmt("{field} ({share}%)", &[("field", f), ("share", &format!("{:.0}", share * 100.0))]);
-                            if ui.selectable_label(*f == current, label).clicked() {
+                            if ui.selectable_label(*f == current, field_share(f, *share)).clicked() {
                                 let _ = app.run("time.bind", json!({"layer": id, "field": f}));
                             }
                         }

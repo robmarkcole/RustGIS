@@ -5,7 +5,7 @@
 //! every change undoes on its own. Only what it shows is kept: the tab chosen
 //! (`UiState::layer_properties_tab`), and in egui's memory the header's light and a name or query
 //! being typed. A tab per topic shows one part at a time: General, Source, Display and, for a
-//! feature layer, Query. The pane follows the selected layer, as the Symbology and Labeling panes
+//! feature layer, Query and Time. The pane follows the selected layer, as the Symbology and Labeling panes
 //! do; its header (the layer's type and name, also on the pane's tab) lights up for a moment when
 //! the layer changes, so a change made next isn't made on another layer unawares.
 
@@ -34,6 +34,7 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         Topic::Source => source(app, ui, &l, t),
         Topic::Display => display(app, ui, &l, t),
         Topic::Query => query(app, ui, &l, t),
+        Topic::Time => time(app, ui, &l),
     }
 }
 
@@ -118,6 +119,8 @@ pub enum Topic {
     Display,
     /// A feature layer's definition query.
     Query,
+    /// A feature layer's binding to the time slider.
+    Time,
 }
 
 impl Topic {
@@ -128,17 +131,23 @@ impl Topic {
             "source" => Topic::Source,
             "display" => Topic::Display,
             "query" => Topic::Query,
+            "time" => Topic::Time,
             _ => return None,
         })
+    }
+
+    /// Whether only a feature layer has this topic (a raster has no definition query or time binding).
+    pub fn feature_only(self) -> bool {
+        matches!(self, Topic::Query | Topic::Time)
     }
 }
 
 /// The tab row, and the tab chosen in it. It is the pane's, not a layer's: choosing another layer
-/// keeps the topic in view. A raster has no Query tab: it shows General, and the Query tab comes
+/// keeps the topic in view. A raster has no Query or Time tab: it shows General, and the tab comes
 /// back with the next feature layer.
 fn topic(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) -> Topic {
     let chosen = app.ui.layer_properties_tab;
-    let mut tab = if l.is_raster() && chosen == Topic::Query { Topic::General } else { chosen };
+    let mut tab = if l.is_raster() && chosen.feature_only() { Topic::General } else { chosen };
     let shown = tab;
     let mut tabs = vec![
         crate::widgets::Tab { label: "General", icon: "identify", hover: None, value: Topic::General },
@@ -147,6 +156,7 @@ fn topic(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) -> Topic {
     ];
     if !l.is_raster() {
         tabs.push(crate::widgets::Tab { label: "Query", icon: "def_query", hover: None, value: Topic::Query });
+        tabs.push(crate::widgets::Tab { label: "Time", icon: "time_slider", hover: None, value: Topic::Time });
     }
     crate::widgets::tabs(ui, t, egui::Id::unique("layer_properties_topic"), &mut tab, &tabs);
     if tab != shown {
@@ -368,6 +378,61 @@ fn mask_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer) {
     });
 }
 
+/// The layer's binding to the time slider (`time.bind`, `time.unbind`), as the slider's Layers
+/// menu sets it: whether the slider's window picks the features that draw, and by which date
+/// field. Finding the fields that hold dates reads up to 500 values of each, so it is done only
+/// while the field list is open, as that menu does. The slider's own settings stay on View › Time.
+fn time(app: &mut RustGisApp, ui: &mut Ui, l: &Layer) {
+    let bound = l.time.as_ref().map(|b| b.field.clone());
+    let mut on = bound.is_some();
+    if ui
+        .checkbox(&mut on, tl!("Bound to the time slider"))
+        .on_hover_text(tl!("Only the features whose date falls in the slider's window draw"))
+        .changed()
+    {
+        bind(app, l, on, None);
+    }
+    ui.horizontal(|ui| {
+        let input_label = ui.label(tl!("Date field"));
+        let shown = bound.clone().unwrap_or_else(|| tl!("Not bound").to_string());
+        egui::ComboBox::from_id_salt(("layer_properties_time_field", l.instance_id()))
+            .selected_text(shown)
+            .width(160.0)
+            .show_ui(ui, |ui| {
+                // Read only while the list is open: finding date fields reads every field's values.
+                let fields = rustgis_engine::map::time::time_fields(&l.dataset);
+                if fields.is_empty() {
+                    ui.label(tl!("No field of this layer holds dates."));
+                }
+                for (f, share) in &fields {
+                    let on = bound.as_deref() == Some(f.as_str());
+                    if ui.selectable_label(on, crate::timebar::field_share(f, *share)).clicked() && !on {
+                        bind(app, l, true, Some(f));
+                    }
+                }
+            })
+            .response
+            .labelled_by(input_label.id);
+    });
+    ui.weak(tl!("The slider's span, step and playback are on View › Time."));
+}
+
+/// Binds the layer to the time slider (by `field`, or the one most of whose values read as dates),
+/// showing the slider, or unbinds it.
+fn bind(app: &mut RustGisApp, l: &Layer, on: bool, field: Option<&str>) {
+    if !on {
+        run(app, "time.unbind", json!({"layer": l.id}));
+        return;
+    }
+    let mut p = json!({"layer": l.id});
+    if let Some(f) = field {
+        p["field"] = json!(f);
+    }
+    if run(app, "time.bind", p).is_some() {
+        app.time.hidden = false;
+    }
+}
+
 /// Where the query being typed for the layer `instance` is kept, with the query it was begun from.
 fn query_key(instance: u64) -> egui::Id {
     egui::Id::unique(("layer_properties_query", instance))
@@ -553,15 +618,85 @@ mod tests {
         }
         let raster = add_raster(&mut app);
         assert!(app.run("ui.pane.layerProperties", json!({"layer": raster, "tab": "query"})).is_err(), "a raster has no query");
+        assert!(app.run("ui.pane.layerProperties", json!({"layer": raster, "tab": "time"})).is_err(), "nor a time binding");
         assert_eq!(app.session.active_layer, Some(cities), "a refusal doesn't select the raster");
         app.run("ui.pane.layerProperties", json!({"layer": raster, "tab": "display"})).unwrap();
         assert_eq!((app.session.active_layer, app.ui.layer_properties_tab), (Some(raster), super::Topic::Display));
     }
 
-    /// A raster has no Query tab: the pane shows General instead, and the Query tab comes back
+    /// A feature layer of two points, added to the map and selected; its id. With `with_dates` they
+    /// have two date fields (`when` and `seen`), else a name only.
+    fn add_events(app: &mut RustGisApp, with_dates: bool) -> u32 {
+        let props = |when: &str, seen: &str| if with_dates { json!({"when": when, "seen": seen}) } else { json!({"name": "Fair"}) };
+        let text = json!({"type": "FeatureCollection", "features": [
+            {"type": "Feature", "geometry": {"type": "Point", "coordinates": [0, 0]}, "properties": props("2025-01-01", "2024-06-01")},
+            {"type": "Feature", "geometry": {"type": "Point", "coordinates": [1, 1]}, "properties": props("2025-02-01", "2024-07-01")},
+        ]})
+        .to_string();
+        let (ds, _) = rustgis_engine::data::io::read_geojson(&text, "Events").unwrap();
+        let id = app.session.map_mut().add_dataset(ds);
+        app.session.run("layer.select", &json!({"layer": id})).unwrap();
+        id
+    }
+
+    /// The Time tab binds the layer to the time slider and unbinds it, a step each, and binding
+    /// shows the slider's bar.
+    #[test]
+    fn the_time_tab_binds_and_unbinds_the_layer() {
+        let mut app = with_cities();
+        let id = add_events(&mut app, true);
+        app.time.hidden = true;
+        let steps = app.session.undo_depth();
+        let mut h = harness(app);
+        h.run();
+        open_tab(&mut h, "Time");
+        h.get_by_role_and_label(Role::CheckBox, "Bound to the time slider").click();
+        h.run();
+        assert!(h.state().session.map().layer(id).unwrap().time.is_some(), "bound");
+        assert!(!h.state().time.hidden, "the bar shows");
+        assert_eq!(h.state().session.undo_depth(), steps + 1);
+        h.get_by_role_and_label(Role::CheckBox, "Bound to the time slider").click();
+        h.run();
+        assert!(h.state().session.map().layer(id).unwrap().time.is_none(), "unbound");
+        assert_eq!(h.state().session.undo_depth(), steps + 2);
+    }
+
+    /// The date field list offers the fields that hold dates, and choosing one binds the layer by
+    /// it. `when` is chosen: binding with no field given would take `seen`, the first of the two.
+    #[test]
+    fn the_date_field_list_binds_by_the_field_chosen() {
+        let mut app = with_cities();
+        let id = add_events(&mut app, true);
+        let mut h = harness(app);
+        h.run();
+        open_tab(&mut h, "Time");
+        h.get_by_role_and_label(Role::ComboBox, "Date field").click();
+        h.run();
+        h.get_by_label("when (100%)").click();
+        h.run();
+        let field = h.state().session.map().layer(id).unwrap().time.as_ref().map(|t| t.field.clone());
+        assert_eq!(field.as_deref(), Some("when"));
+    }
+
+    /// A layer with no dates isn't bound, and the notice says why.
+    #[test]
+    fn a_layer_without_dates_says_so() {
+        let mut app = with_cities();
+        let id = add_events(&mut app, false);
+        let mark = app.session.notice_mark();
+        let mut h = harness(app);
+        h.run();
+        open_tab(&mut h, "Time");
+        h.get_by_role_and_label(Role::CheckBox, "Bound to the time slider").click();
+        h.run();
+        assert!(h.state().session.map().layer(id).unwrap().time.is_none());
+        assert!(h.state().session.notices_since(mark).iter().any(|n| n.text.contains("no field of this layer holds dates")));
+    }
+
+    /// A raster has no Query or Time tab: the pane shows General instead, and the tab comes back
     /// with the next feature layer.
     #[test]
-    fn a_raster_shows_general_for_the_query_tab() {
+    fn a_raster_shows_general_for_the_query_and_time_tabs() {
         let mut app = with_cities();
         let cities = app.session.active_layer.unwrap();
         let raster = add_raster(&mut app);
@@ -574,6 +709,14 @@ mod tests {
         h.state_mut().session.run("layer.select", &json!({"layer": cities})).unwrap();
         h.run_steps(2);
         assert!(h.query_by_role_and_label(Role::MultilineTextInput, "Where").is_some(), "Query in view again");
+        h.state_mut().ui.layer_properties_tab = super::Topic::Time;
+        h.state_mut().session.run("layer.select", &json!({"layer": raster})).unwrap();
+        h.run_steps(2);
+        assert!(h.query_by_role_and_label(Role::Button, "Time").is_none(), "no Time tab");
+        assert!(h.query_by_role_and_label(Role::TextInput, "Name").is_some(), "General in view");
+        h.state_mut().session.run("layer.select", &json!({"layer": cities})).unwrap();
+        h.run_steps(2);
+        assert!(h.query_by_role_and_label(Role::CheckBox, "Bound to the time slider").is_some(), "Time in view again");
     }
 
     /// Apply sets the clause typed, Clear removes it, each a step of its own; a clause the layer

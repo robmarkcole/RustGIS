@@ -684,6 +684,10 @@ time:
   line says what is wrong with a clause as you type it, **Apply** (or Ctrl+Enter) sets it and
   **Clear** draws every feature again. A clause being typed is kept while you look at another tab;
   choosing another layer or Escape in the box drops it.
+- **Time**, for a feature layer: **Bound to the time slider**, and the **Date field** it is bound
+  by (the list shows the fields whose values read as dates, with the share that does). Only the
+  features whose date falls in the slider's window draw; the slider's span, step and playback are
+  on [View › Time](workspace.md). Each change undoes on its own.
 
 Open it with Layers › right-click › **Properties…** or **View › Windows › Layer Properties**;
 **Data › Definition Query** opens it on the Query tab. It
