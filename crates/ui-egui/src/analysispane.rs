@@ -61,6 +61,12 @@ pub struct Workflow {
     /// The system the Wizard's layer was read in, and the one its surface is made in from it
     /// ([`rustgis_engine::analysis::layer_raster_crs`]), kept so it is worked out once.
     pub layer_system: Option<(rustgis_engine::data::raster::Crs, Option<rustgis_engine::data::raster::Crs>)>,
+    /// The coordinate system typed for a new ortho or reality workspace; empty: the images'
+    /// projected system, else degrees.
+    pub workspace_crs: String,
+    /// The projected system that text last read as (`None`: none, or degrees), so a cell size
+    /// typed for one system is cleared when another is typed, not at each keystroke.
+    pub workspace_system: Option<rustgis_engine::data::raster::Crs>,
     /// The projected coordinate system typed for the environment's Set Coordinate System.
     pub env_crs: String,
     /// The cell size typed for the environment, apart from the Wizard's, which is the run's own.
@@ -1247,18 +1253,60 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                     }
                 });
             }
-            ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut app.workflow.number).hint_text(tl!("cell size °")).desired_width(80.0));
-                if ui.button(tl!("New Workspace From Visible Rasters")).clicked() {
-                    let images: Vec<String> =
-                        app.session.map().layers.iter().filter(|l| l.is_raster() && l.visible).map(|l| l.name.clone()).collect();
-                    let mut p = json!({"kind": kind, "images": images});
-                    if let Ok(c) = app.workflow.number.trim().parse::<f64>() {
-                        p["cellSize"] = json!(c);
-                    }
-                    run(app, "imagery.workspace", p);
+            // The hints say the grid the workspace gets: without a system, a cell size is in
+            // degrees and keeps the mosaic in degrees, as in older projects.
+            // Read once as it's typed (below), not each frame.
+            let degrees = app.workflow.workspace_system.is_none();
+            let crs_hint = if app.workflow.number.trim().is_empty() {
+                tl!("the images' projected system, else degrees")
+            } else {
+                tl!("degrees, as the cell size is in degrees")
+            };
+            let system_label = ui.label(tl!("Coordinate system"));
+            let system = ui
+                .add(egui::TextEdit::singleline(&mut app.workflow.workspace_crs).hint_text(crs_hint).desired_width(f32::INFINITY))
+                .labelled_by(system_label.id)
+                .on_hover_text(tl!("A projected system such as EPSG:32616, or EPSG:4326 for degrees"));
+            // A cell size typed for another system isn't sent in this one's units: it is cleared
+            // once the text reads as another system, and kept while it reads as none yet.
+            if system.changed() {
+                let typed = app.workflow.workspace_crs.trim();
+                let now = if typed.is_empty() {
+                    Some(None)
+                } else {
+                    rustgis_engine::data::raster::Crs::parse(typed)
+                        .ok()
+                        .map(|c| Some(c).filter(|c| *c != rustgis_engine::data::raster::Crs::LonLat))
+                };
+                if let Some(now) = now
+                    && now != app.workflow.workspace_system
+                {
+                    app.workflow.workspace_system = now;
+                    app.workflow.number.clear();
                 }
+            }
+            ui.horizontal(|ui| {
+                let hint = if degrees { tl!("cell size °") } else { tl!("cell size") };
+                let size_label = ui.label(tl!("Cell size"));
+                ui.add(egui::TextEdit::singleline(&mut app.workflow.number).hint_text(hint).desired_width(80.0))
+                    .labelled_by(size_label.id)
+                    .on_hover_text(tl!("In the coordinate system's units, or degrees without one"));
             });
+            // On a line of its own: beside the cell size, its label ran past the pane's edge.
+            if ui.button(tl!("New Workspace From Visible Rasters")).clicked() {
+                let images: Vec<String> =
+                    app.session.map().layers.iter().filter(|l| l.is_raster() && l.visible).map(|l| l.name.clone()).collect();
+                let mut p = json!({"kind": kind, "images": images});
+                if !app.workflow.workspace_crs.trim().is_empty() {
+                    p["crs"] = json!(app.workflow.workspace_crs.trim());
+                }
+                // Text that isn't a number goes as it is, for the command to say why.
+                let size = app.workflow.number.trim();
+                if !size.is_empty() {
+                    p["cellSize"] = size.parse::<f64>().ok().filter(|c| c.is_finite()).map_or_else(|| json!(size), |c| json!(c));
+                }
+                run(app, "imagery.workspace", p);
+            }
             if kind == "reality" {
                 combo(ui, "wf_mesh", "Layer", &mut app.workflow.layer, &rasters);
                 if ui.button(tl!("Export Mesh (OBJ)…")).clicked() {

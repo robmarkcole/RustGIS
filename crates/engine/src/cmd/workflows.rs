@@ -154,6 +154,13 @@ pub(crate) fn made(raster: Raster, extra: Option<Value>) -> Result<Made, String>
     Ok(made_layer(name, layer, extra, None))
 }
 
+/// [`made`], with what is done once the layer is added (`then`).
+pub(crate) fn made_then(raster: Raster, extra: Option<Value>, then: Option<Then>) -> Result<Made, String> {
+    let mut m = made(raster, extra)?;
+    m.then = then;
+    Ok(m)
+}
+
 /// A layer made (styled, say), to be added as `name`.
 pub(crate) fn made_layer(name: String, layer: rustgis_map::RasterLayer, extra: Option<Value>, then: Option<Then>) -> Made {
     Made { name, layer, extra, then, ran: None, continuation: None }

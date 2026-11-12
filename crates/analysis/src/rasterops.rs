@@ -1063,8 +1063,8 @@ pub fn class_means(r: &Raster, bands: &[usize], polygons: &[(String, Vec<Vec<Coo
     Ok(classes)
 }
 
-/// `bands` bands of `images` laid onto a north-up longitude/latitude grid of `cols` × `rows` cells
-/// of `cell` degrees from `extent`'s north-west corner: a cell takes the first image's value under
+/// `bands` bands of `images` laid onto a north-up grid in `crs` of `cols` × `rows` cells of `cell`
+/// (in its units) from `extent`'s north-west corner: a cell takes the first image's value under
 /// its centre, or with `mean` the mean of all of theirs; no-data where none has one. Rows go on
 /// several threads and count toward the run's progress, and a cancelled run stops (#1291).
 pub fn mosaic(
@@ -1074,11 +1074,20 @@ pub fn mosaic(
     (cols, rows): (usize, usize),
     bands: usize,
     mean: bool,
+    crs: Crs,
 ) -> Result<Vec<Vec<f32>>, String> {
     let mut out = (0..bands).map(|_| new_band(cols, rows, NODATA)).collect::<Result<Vec<_>, _>>()?;
     if cols == 0 {
         return Ok(out);
     }
+    // A cell of a projected grid is found in an image in the same system by its coordinates, and
+    // in any other through longitude/latitude.
+    let to = if crs == Crs::LonLat { None } else { Some(crs.transformer()?) };
+    let own = |r: &Raster, c: Coord| {
+        let (cc, rr) = r.transform.to_pixel(c);
+        let (cc, rr) = (r.wrap_col(cc).floor(), rr.floor());
+        (cc >= 0.0 && rr >= 0.0 && cc < f64::from(r.width) && rr < f64::from(r.height)).then_some((cc as i64, rr as i64))
+    };
     // Each row as a slice of every band, for one thread to fill.
     let mut by_band: Vec<_> = out.iter_mut().map(|b| b.chunks_mut(cols)).collect();
     let lines: Vec<Vec<&mut [f32]>> = (0..rows).map(|_| by_band.iter_mut().filter_map(Iterator::next).collect()).collect();
@@ -1093,9 +1102,17 @@ pub fn mosaic(
         |at: &mut Vec<Option<(i64, i64)>>, row, mut line: Vec<&mut [f32]>| {
             for col in 0..cols {
                 let c = Coord::new(extent.min_x + (col as f64 + 0.5) * cell, extent.max_y - (row as f64 + 0.5) * cell);
+                // The cell's longitude/latitude, worked out only for an image in another system.
+                let mut lonlat: Option<Option<Coord>> = None;
                 // Where the cell falls in each image, once for all bands.
                 at.clear();
-                at.extend(images.iter().map(|r| r.pixel_at(c)));
+                for r in images {
+                    at.push(match &to {
+                        Some(_) if r.crs == crs => own(r, c),
+                        Some(t) => (*lonlat.get_or_insert_with(|| t.to_lonlat(c))).and_then(|ll| r.pixel_at(ll)),
+                        None => r.pixel_at(c),
+                    });
+                }
                 for (bi, band) in line.iter_mut().enumerate() {
                     let vals = images.iter().zip(at.iter()).filter_map(|(r, a)| a.and_then(|(cc, rr)| r.value(bi, cc, rr)));
                     let v = if mean {
@@ -2001,7 +2018,7 @@ mod tests {
                 weighted_overlay(&[(r.bands[0].data.clone(), 1.0)]).map(|v| v.len()),
                 classify_min_distance(r, &[0, 1], &means).map(|v| v.len()),
                 class_means(r, &[0, 1], &polygons).map(|c| c.len()),
-                mosaic(&[r], &r.extent(), 0.001, (w as usize, h as usize), 2, true).map(|b| b.len()),
+                mosaic(&[r], &r.extent(), 0.001, (w as usize, h as usize), 2, true, Crs::LonLat).map(|b| b.len()),
             ]
         };
         let run = crate::control::Control::new();
