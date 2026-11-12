@@ -1509,7 +1509,14 @@ The Imagery tab's groups open their tools in the Workflows pane. The tab belongs
 - **Change Detection** (difference, ratio, percent), **Indices** (NDVI, NDWI, SAVI, NBR, NDBI,
   EVI), **Process** (clip to the view, to a box, or to a polygon layer's selected or all polygons,
   with the cells outside them no-data; resample) and the **Pixel Editor** (set the pixels inside a
-  polygon).
+  polygon). As in Project Raster, the cells outside the polygons are see-through instead (0, with
+  alpha 0) in an image with an alpha band, and a three-band colour image with neither alpha nor
+  no-data gains one for them, so an 8-bit image stays 8-bit when it is exported. A colour image
+  with a fourth band of data and no alpha (RGB and near-infrared) gets no-data there as before
+  (−3.4e38 when it has none). Project Raster doesn't give it an alpha band either: a colour image's
+  alpha is read from its fourth band, which holds its data. A clip that gained an alpha band has
+  four bands, so Mosaic Rasters refuses it beside three-band tiles, saying how many bands each
+  has: clip the others the same way, or mosaic first and clip the result.
 - **Mosaic Rasters** (`raster.mosaic`) merges tiles of one grid, such as the 1 km tiles of a state
   elevation model, into one raster in their own coordinate system and cell size, optionally
   written to a GeoTIFF: `{"inputs": ["dgm_1.tif", "dgm_2.tif", …], "path": "dem.tif"}`. Inputs

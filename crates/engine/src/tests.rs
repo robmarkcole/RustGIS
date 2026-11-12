@@ -42034,6 +42034,125 @@ fn a_model_trained_within_the_work_limit_says_so() {
     assert_eq!(r["epochs"], 3, "{r}");
 }
 
+/// A grey image with alpha clipped to a polygon stays 8-bit with two bands: the cells outside are
+/// see-through, 0 in both bands, and the cells inside keep their grey and alpha (#1731).
+#[test]
+fn a_clipped_grey_raster_with_alpha_stays_8_bit() {
+    use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster, geotiff};
+    let utm = Crs::from_epsg(32611).unwrap();
+    let (w, h) = (40u32, 40u32);
+    let n = (w * h) as usize;
+    let gt = GeoTransform { origin_x: 500_000.0, origin_y: 4_800_040.0, pixel_width: 1.0, pixel_height: -1.0 };
+    let grey = |i: usize| (10 + (i * 7) % 240) as f32;
+    let bands = vec![(0..n).map(grey).collect(), vec![255.0; n]];
+    let r = Raster::new("grey", w, h, bands, gt, utm, None, ColorHint::GrayAlpha, "UInt8").unwrap();
+    let mut s = Session::new(Project::default());
+    let bytes = geotiff::write(&r, 0).unwrap();
+    crate::cmd::raster::add_raster(&mut s, "grey", rustgis_map::RasterLayer::from_bytes(r, "grey.tif", bytes)).unwrap();
+    let tr = utm.transformer().unwrap();
+    let ll = |x: f64, y: f64| {
+        let c = tr.to_lonlat(rustgis_geom::Coord::new(x, y)).unwrap();
+        json!([c.x, c.y])
+    };
+    // The same triangle as in `a_clipped_colour_raster_stays_8_bit`.
+    s.run("layer.template", &json!({"template": "polygons", "name": "Boundary"})).unwrap();
+    let ring = [ll(500_005.0, 4_800_035.0), ll(500_035.0, 4_800_035.0), ll(500_035.0, 4_800_005.0), ll(500_005.0, 4_800_035.0)];
+    s.run("edit.addFeature", &json!({"layer": "Boundary", "geometry": {"type": "Polygon", "coordinates": [ring]}})).unwrap();
+    s.run(
+        "raster.process",
+        &json!({"layer": "grey", "operation": "clip", "polygon": "Boundary", "selectedOnly": false, "name": "clipped"}),
+    )
+    .unwrap();
+    let c = s.map().layer_by_name("clipped").unwrap().raster.as_ref().unwrap().data.clone().unwrap();
+    assert_eq!((c.data_type.as_str(), c.nodata, c.bands.len()), ("UInt8", None, 2));
+    assert_eq!(c.color, ColorHint::GrayAlpha);
+    let cell = |row: u32, col: u32| c.bands.iter().map(|b| b.data[(row * c.width + col) as usize]).collect::<Vec<f32>>();
+    assert_eq!(cell(c.height - 1, 0), vec![0.0, 0.0]);
+    // The window starts 5 cells in: its upper right is the source's row 5, column 34.
+    assert_eq!(cell(0, c.width - 1), vec![grey(5 * w as usize + 34), 255.0]);
+}
+
+/// An 8-bit colour orthophoto clipped to a polygon, as it is or projected (bilinear) first, stays
+/// 8-bit, and its exports too, as a COG and a plain GeoTIFF: the cells outside the polygon are
+/// see-through, 0 in every band, as Project Raster leaves the cells it has no value for. An RGB
+/// image without no-data gains an alpha band for them; one with a no-data value bytes hold keeps it
+/// and its three bands (#1731).
+#[test]
+fn a_clipped_colour_raster_stays_8_bit() {
+    use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster, geotiff};
+    let utm = Crs::from_epsg(32611).unwrap();
+    let (w, h) = (40u32, 40u32);
+    let n = (w * h) as usize;
+    let gt = GeoTransform { origin_x: 500_000.0, origin_y: 4_800_040.0, pixel_width: 1.0, pixel_height: -1.0 };
+    let dir = std::env::temp_dir().join(format!("rustgis-clip-colour-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // Colours 10–249, opaque.
+    let value = |i: usize, b: usize| if b == 3 { 255.0 } else { (10 + (i * 7 + b * 60) % 240) as f32 };
+    for (label, nb, color, nodata) in [
+        ("rgba", 4usize, ColorHint::Rgb { alpha: true }, None),
+        ("rgb", 3, ColorHint::Rgb { alpha: false }, None),
+        ("rgb with no-data", 3, ColorHint::Rgb { alpha: false }, Some(0.0)),
+    ] {
+        let bands: Vec<Vec<f32>> = (0..nb).map(|b| (0..n).map(|i| value(i, b)).collect()).collect();
+        let r = Raster::new("ortho", w, h, bands, gt, utm, nodata, color, "UInt8").unwrap();
+        let mut s = Session::new(Project::default());
+        let bytes = geotiff::write(&r, 0).unwrap();
+        crate::cmd::raster::add_raster(&mut s, "ortho", rustgis_map::RasterLayer::from_bytes(r, "ortho.tif", bytes)).unwrap();
+        let tr = utm.transformer().unwrap();
+        let ll = |x: f64, y: f64| {
+            let c = tr.to_lonlat(rustgis_geom::Coord::new(x, y)).unwrap();
+            json!([c.x, c.y])
+        };
+        // A triangle over the upper right of a 30 m square: cells on and above its diagonal.
+        s.run("layer.template", &json!({"template": "polygons", "name": "Boundary"})).unwrap();
+        let ring = [ll(500_005.0, 4_800_035.0), ll(500_035.0, 4_800_035.0), ll(500_035.0, 4_800_005.0), ll(500_005.0, 4_800_035.0)];
+        s.run("edit.addFeature", &json!({"layer": "Boundary", "geometry": {"type": "Polygon", "coordinates": [ring]}})).unwrap();
+        s.run("raster.project", &json!({"layer": "ortho", "crs": 32611, "cellSize": 0.5, "resampling": "bilinear", "name": "projected"}))
+            .unwrap();
+        for (from, to) in [("ortho", "clipped"), ("projected", "projected clipped")] {
+            s.run("raster.process", &json!({"layer": from, "operation": "clip", "polygon": "Boundary", "selectedOnly": false, "name": to}))
+                .unwrap();
+        }
+        // Project Raster adds alpha to an RGB image without no-data, as Clip now does.
+        let (bands_out, nodata_out) = if nodata.is_some() { (3, nodata) } else { (4, None) };
+        for name in ["clipped", "projected clipped"] {
+            let r = s.map().layer_by_name(name).unwrap().raster.as_ref().unwrap().data.clone().unwrap();
+            let what = format!("{label} {name}");
+            assert_eq!((r.data_type.as_str(), r.nodata, r.bands.len()), ("UInt8", nodata_out, bands_out), "{what}");
+            assert_eq!(r.color, ColorHint::Rgb { alpha: bands_out == 4 }, "{what}");
+            // The lower left corner is outside the triangle: 0 in every band. The upper right is
+            // inside: opaque.
+            let cell = |row: u32, col: u32| r.bands.iter().map(|b| b.data[(row * r.width + col) as usize]).collect::<Vec<f32>>();
+            assert_eq!(cell(r.height - 1, 0), vec![0.0; bands_out], "{what}");
+            let inside = cell(0, r.width - 1);
+            assert!(inside.iter().take(3).all(|v| (10.0..=249.0).contains(v)), "{what}: {inside:?}");
+            if bands_out == 4 {
+                assert_eq!(inside[3], 255.0, "{what}");
+            }
+            if bands_out == 4 && nb == 3 {
+                assert_eq!(r.bands[3].name, "Alpha", "{what}");
+            }
+            if name == "clipped" {
+                // The window starts 5 cells in: its upper right is the source's row 5, column 34.
+                let i = 5 * w as usize + 34;
+                assert_eq!(
+                    inside.iter().take(3).copied().collect::<Vec<f32>>(),
+                    (0..3).map(|b| value(i, b)).collect::<Vec<f32>>(),
+                    "{what}"
+                );
+            }
+            for cog in [true, false] {
+                let path = dir.join(format!("{}-{cog}.tif", what.replace(' ', "_")));
+                s.run("share.exportRaster", &json!({"layer": name, "path": path.display().to_string(), "cog": cog})).unwrap();
+                let back = geotiff::read(std::io::Cursor::new(std::fs::read(&path).unwrap()), "back").unwrap();
+                assert_eq!((back.data_type.as_str(), back.nodata, back.bands.len()), ("UInt8", nodata_out, bands_out), "{what} cog={cog}");
+                assert!(back.bands.iter().all(|b| b.data.iter().all(|v| (0.0..=255.0).contains(v))), "{what} cog={cog}");
+            }
+        }
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// A STAC search limited to a shape (`intersects`, from GeoJSON or the selected features, widened
 /// by `buffer` metres): the shape is sent in place of the bbox, what merging leaves out is said
 /// once, and clean input says nothing.

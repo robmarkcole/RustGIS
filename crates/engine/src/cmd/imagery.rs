@@ -66,7 +66,7 @@ pub fn commands() -> Vec<C> {
             r#"{"layer": raster, "index": "ndvi"|"ndwi"|"savi"|"nbr"|"ndbi"|"evi", "red"?, "green"?, "blue"?, "nir"?, "swir"?: band numbers, "name"?: output, "ran"?: (internal: a raster the app has worked out)}"#,
         ),
         C::new("raster.process", "Process", "Imagery › Imagery Tools", process).inputs(process_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
-            .params(r#"{"layer": raster, "operation": "clip"|"resample", "extent"?: [minLon, minLat, maxLon, maxLat] (clip; the view when omitted), "polygon"?: polygon layer (clip to its selected or all polygons; cells outside become no-data), "selectedOnly"?: bool (clip to selected polygons when true, all when false), "factor"?: n (resample: n×n pixels become one), "name"?: output, "ran"?: (internal: a raster the app has worked out)}"#),
+            .params(r#"{"layer": raster, "operation": "clip"|"resample", "extent"?: [minLon, minLat, maxLon, maxLat] (clip; the view when omitted), "polygon"?: polygon layer (clip to its selected or all polygons; cells outside become no-data, or see-through in a raster with alpha or a three-band colour one without no-data), "selectedOnly"?: bool (clip to selected polygons when true, all when false), "factor"?: n (resample: n×n pixels become one), "name"?: output, "ran"?: (internal: a raster the app has worked out)}"#),
         C::new("raster.mosaic", "Mosaic Rasters", "Imagery › Imagery Tools", raster_mosaic).inputs(mosaic_inputs).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).params(
             r#"{"inputs": [raster layer or file path, …] (two or more, in one coordinate system and cell size; where they overlap the first wins), "name"?: output, "path"?: GeoTIFF to write the mosaic to}"#,
         ),
@@ -1129,7 +1129,8 @@ pub(crate) fn index_work(s: &Session, p: &Value) -> Result<super::workflows::Wor
 ///     even-odd rule within each polygon. Where multiple polygons overlap, their coverage is combined
 ///     (union: any cell falling inside at least one polygon is retained).
 ///   - The raster is cropped to the tight bounding box of valid selected polygons, and cells outside the
-///     polygons receive NoData.
+///     polygons receive NoData; in a raster with alpha, or a three-band colour one without NoData (which
+///     gains an alpha band), they are see-through, 0 in every band, so its pixel type is kept.
 /// - **Partial Failure Reporting**:
 ///   - Features with invalid geometry are skipped and reported in the result messages.
 ///   - Polygon parts that cannot be projected onto the raster grid are reported separately.
@@ -1548,7 +1549,11 @@ fn mosaic_matches(first: &Raster, r: &Raster) -> Result<(), String> {
 }
 
 /// The cells of `r` in a column and row window, as a new raster on the same grid. With a mask
-/// (row-major over the window), the cells it leaves out become no-data.
+/// (row-major over the window), the cells it leaves out have no value, as Project Raster leaves
+/// the cells outside its source (`rustgis_analysis::warp`): in a raster with alpha they are
+/// see-through, 0 in every band, and a three-band colour raster with neither alpha nor no-data gains an alpha
+/// band for them, so an 8-bit image stays 8-bit (#1731). Otherwise they are its no-data, or
+/// -3.4e38 when it has none.
 fn clip_window(
     r: &Raster,
     cols: std::ops::Range<u32>,
@@ -1558,11 +1563,17 @@ fn clip_window(
 ) -> Result<Raster, String> {
     r.require_coordinates()?;
     let (w, h) = (cols.end.saturating_sub(cols.start), rows.end.saturating_sub(rows.start));
-    let nodata = if mask.is_some() { r.nodata.or(Some(NODATA as f64)) } else { r.nodata };
-    let fill = nodata.map(|v| v as f32).unwrap_or(NODATA);
+    let n = r.bands.len();
+    let has_alpha = matches!(r.color, ColorHint::Rgb { alpha: true } if n >= 4) || matches!(r.color, ColorHint::GrayAlpha if n >= 2);
+    let add_alpha = mask.is_some() && !has_alpha && matches!(r.color, ColorHint::Rgb { .. }) && n == 3 && r.nodata.is_none();
+    let clear = mask.is_some() && (has_alpha || add_alpha);
+    let nodata = if mask.is_some() && !clear { r.nodata.or(Some(NODATA as f64)) } else { r.nodata };
+    let fill = if clear { 0.0 } else { nodata.map(|v| v as f32).unwrap_or(NODATA) };
     // Each band's cells counted and cancellable, as in a run on another thread.
     let (wu, width) = (w as usize, r.width as usize);
-    let bands = r
+    let kept = |i: usize| mask.is_none_or(|m| m.get(i).copied().unwrap_or(false));
+    let at = |i: usize| (rows.start as usize + i / wu.max(1)) * width + cols.start as usize + i % wu.max(1);
+    let mut bands = r
         .bands
         .iter()
         .map(|b| {
@@ -1571,23 +1582,23 @@ fn clip_window(
                 wu,
                 1,
                 || (),
-                |_, i| match mask.map(|m| m.get(i).copied().unwrap_or(false)) {
-                    Some(false) => fill,
-                    _ => {
-                        let (row, col) = (rows.start as usize + i / wu.max(1), cols.start as usize + i % wu.max(1));
-                        b.data.get(row * width + col).copied().unwrap_or(fill)
-                    }
-                },
+                |_, i| if kept(i) { b.data.get(at(i)).copied().unwrap_or(fill) } else { fill },
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
+    if add_alpha {
+        // Opaque where the cell is kept and has a value in some band, as Project Raster's alpha.
+        let valued = |i: usize| r.bands.iter().any(|b| b.data.get(at(i)).is_some_and(|v| !v.is_nan()));
+        bands.push(rasterops::per_index(wu * h as usize, wu, n, || (), |_, i| if kept(i) && valued(i) { 255.0 } else { 0.0 })?);
+    }
     let o = r.transform.to_world(f64::from(cols.start), f64::from(rows.start));
     let gt = GeoTransform { origin_x: o.x, origin_y: o.y, ..r.transform };
-    let mut out = Raster::new(name, w, h, bands, gt, r.crs, nodata, r.color.clone(), r.data_type.clone()).map_err(|e| e.to_string())?;
-    out.bands.iter_mut().zip(&r.bands).for_each(|(o, i)| {
-        o.name = i.name.clone();
-        o.wavelength = i.wavelength;
-    });
+    let color = if add_alpha { ColorHint::Rgb { alpha: true } } else { r.color.clone() };
+    let mut out = Raster::new(name, w, h, bands, gt, r.crs, nodata, color, r.data_type.clone()).map_err(|e| e.to_string())?;
+    for (i, band) in out.bands.iter_mut().enumerate() {
+        band.name = r.bands.get(i).map_or_else(|| "Alpha".to_string(), |b| b.name.clone());
+        band.wavelength = r.bands.get(i).and_then(|b| b.wavelength);
+    }
     // Some of the values rounded when the file was read may be in the window: how many isn't known.
     out.keep_rounded_mark(r);
     Ok(out)
