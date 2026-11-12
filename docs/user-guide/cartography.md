@@ -118,7 +118,8 @@ project's `jet`, say) is renamed with ` (custom)` when the project opens; layers
 keep their colours, as each holds its own copy. Click a group's name to show or hide it. The Style tab sets the fill **Color**, the
 **Outline** width, **Transparency** and a **Visibility Range** (the scales between which the layer
 draws; a large file read in place is not read at all outside them); points can be circles, squares,
-triangles, diamonds or stars. **Data › Definition Query** draws only the features matching a SQL
+triangles, diamonds or stars. **Data › Definition Query** (the Query tab of the
+[Layer Properties pane](#layer-properties)) draws only the features matching a SQL
 clause; Unique Values, Graduated Colors and Proportional Symbols take their values, classes and
 sizes from those features when you apply them (apply the symbology again after changing the query),
 and **Full Extent** zooms to them. A layer with [subtypes](editing.md#data-design) can be symbolized
@@ -678,8 +679,14 @@ time:
   **Transparency**, **Masking**, a raster's **Layer Blend** or a feature layer's **Reference
   scale**, and the **Depth priority** that View › Scene › Raise and Lower Priority change (a
   higher one draws on top, whatever the layer order).
+- **Query**, for a feature layer: its definition query, the SQL clause the features must match to
+  draw (the grammar is in [Expressions](expressions.md)). Buttons add a field or an operator, a red
+  line says what is wrong with a clause as you type it, **Apply** (or Ctrl+Enter) sets it and
+  **Clear** draws every feature again. A clause being typed is kept while you look at another tab;
+  choosing another layer or Escape in the box drops it.
 
-Open it with Layers › right-click › **Properties…** or **View › Windows › Layer Properties**. It
+Open it with Layers › right-click › **Properties…** or **View › Windows › Layer Properties**;
+**Data › Definition Query** opens it on the Query tab. It
 follows the selected layer, as the Symbology and Labeling panes do: its header shows the layer's
 type and name, and lights up for a moment when another layer is selected, and the pane's tab names
 the layer too. A name being typed is kept when you click away, even on another layer, as Enter keeps

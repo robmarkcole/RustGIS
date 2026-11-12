@@ -1,12 +1,13 @@
 //! The Layer Properties pane (#1803): the selected layer's settings in one place, opened from a
-//! layer's right-click menu (Properties…) or View › Windows › Layer Properties. As the Labeling
-//! pane, it keeps no layer settings of its own: it reads the layer each frame and runs the same
-//! commands as the ribbon and the layer's menu, so every change undoes on its own. Only what it
-//! shows is kept, in egui's memory: the tab chosen, the header's light and a name being typed. A tab per topic shows
-//! one part at a time: General, Source and Display. The pane follows the selected layer, as the
-//! Symbology and Labeling panes do; its header (the layer's type and name, also on the pane's tab)
-//! lights up for a moment when the layer changes, so a change made next isn't made on another
-//! layer unawares.
+//! layer's right-click menu (Properties…) or View › Windows › Layer Properties, and on its Query
+//! tab from Data › Definition Query. As the Labeling pane, it keeps no layer settings of its own:
+//! it reads the layer each frame and runs the same commands as the ribbon and the layer's menu, so
+//! every change undoes on its own. Only what it shows is kept: the tab chosen
+//! (`UiState::layer_properties_tab`), and in egui's memory the header's light and a name or query
+//! being typed. A tab per topic shows one part at a time: General, Source, Display and, for a
+//! feature layer, Query. The pane follows the selected layer, as the Symbology and Labeling panes
+//! do; its header (the layer's type and name, also on the pane's tab) lights up for a moment when
+//! the layer changes, so a change made next isn't made on another layer unawares.
 
 use egui::{CornerRadius, RichText, Ui, vec2};
 use rustgis_engine::data::GeometryType;
@@ -25,18 +26,35 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         return;
     };
     let lit = layer_changed(ui, &l);
+    drop_query_when_back(ui, &l);
     header(ui, &l, lit, t);
     ui.add_space(6.0);
-    match topic(ui, t) {
+    match topic(app, ui, &l, t) {
         Topic::General => general(app, ui, &l),
         Topic::Source => source(app, ui, &l, t),
         Topic::Display => display(app, ui, &l, t),
+        Topic::Query => query(app, ui, &l, t),
     }
 }
 
+/// Drops the query being typed for `l` when the pane comes back in view (it wasn't drawn the pass
+/// before: another pane was in view, or the right side was hidden), as a name being typed is
+/// dropped, so the box shows the query the layer has.
+fn drop_query_when_back(ui: &Ui, l: &Layer) {
+    let key = egui::Id::unique("layer_properties_drawn");
+    let pass = ui.ctx().cumulative_pass_nr();
+    let back = ui.data(|d| d.get_temp::<u64>(key)).is_none_or(|at| at + 1 < pass);
+    ui.data_mut(|d| {
+        d.insert_temp(key, pass);
+        if back {
+            d.remove_temp::<(String, String)>(query_key(l.instance_id()));
+        }
+    });
+}
+
 /// How lit the header is, from 1 when the pane has just come to show another layer than it showed
-/// to 0 once [`FLASH`] has passed; 0 for the first layer it shows. A name being typed for the layer
-/// it showed is dropped, as Escape drops it.
+/// to 0 once [`FLASH`] has passed; 0 for the first layer it shows. A name or query being typed for
+/// the layer it showed is dropped, as Escape drops it.
 fn layer_changed(ui: &Ui, l: &Layer) -> f32 {
     let key = egui::Id::unique("layer_properties_shown");
     let now = ui.input(|i| i.time);
@@ -44,7 +62,10 @@ fn layer_changed(ui: &Ui, l: &Layer) -> f32 {
     let since = if shown == l.instance_id() {
         since
     } else {
-        ui.data_mut(|d| d.remove_temp::<String>(name_key(shown)));
+        ui.data_mut(|d| {
+            d.remove_temp::<String>(name_key(shown));
+            d.remove_temp::<(String, String)>(query_key(shown));
+        });
         now
     };
     ui.data_mut(|d| d.insert_temp(key, (l.instance_id(), since)));
@@ -90,30 +111,47 @@ pub(crate) fn tab_name(app: &RustGisApp) -> String {
 }
 
 /// The pane's tabs, one per topic, as the Labeling pane's.
-#[derive(Clone, Copy, PartialEq)]
-enum Topic {
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Topic {
     General,
     Source,
     Display,
+    /// A feature layer's definition query.
+    Query,
+}
+
+impl Topic {
+    /// The topic `ui.pane.layerProperties {"tab"}` names.
+    pub fn parse(code: &str) -> Option<Topic> {
+        Some(match code {
+            "general" => Topic::General,
+            "source" => Topic::Source,
+            "display" => Topic::Display,
+            "query" => Topic::Query,
+            _ => return None,
+        })
+    }
 }
 
 /// The tab row, and the tab chosen in it. It is the pane's, not a layer's: choosing another layer
-/// keeps the topic in view.
-fn topic(ui: &mut Ui, t: &Tokens) -> Topic {
-    let key = egui::Id::unique("layer_properties_topic");
-    let mut tab = ui.data(|d| d.get_temp::<Topic>(key)).unwrap_or(Topic::General);
-    crate::widgets::tabs(
-        ui,
-        t,
-        key,
-        &mut tab,
-        &[
-            crate::widgets::Tab { label: "General", icon: "identify", hover: None, value: Topic::General },
-            crate::widgets::Tab { label: "Source", icon: "add_data", hover: None, value: Topic::Source },
-            crate::widgets::Tab { label: "Display", icon: "scale_range", hover: None, value: Topic::Display },
-        ],
-    );
-    ui.data_mut(|d| d.insert_temp(key, tab));
+/// keeps the topic in view. A raster has no Query tab: it shows General, and the Query tab comes
+/// back with the next feature layer.
+fn topic(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) -> Topic {
+    let chosen = app.ui.layer_properties_tab;
+    let mut tab = if l.is_raster() && chosen == Topic::Query { Topic::General } else { chosen };
+    let shown = tab;
+    let mut tabs = vec![
+        crate::widgets::Tab { label: "General", icon: "identify", hover: None, value: Topic::General },
+        crate::widgets::Tab { label: "Source", icon: "add_data", hover: None, value: Topic::Source },
+        crate::widgets::Tab { label: "Display", icon: "scale_range", hover: None, value: Topic::Display },
+    ];
+    if !l.is_raster() {
+        tabs.push(crate::widgets::Tab { label: "Query", icon: "def_query", hover: None, value: Topic::Query });
+    }
+    crate::widgets::tabs(ui, t, egui::Id::unique("layer_properties_topic"), &mut tab, &tabs);
+    if tab != shown {
+        app.ui.layer_properties_tab = tab;
+    }
     ui.add_space(4.0);
     tab
 }
@@ -330,6 +368,70 @@ fn mask_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer) {
     });
 }
 
+/// Where the query being typed for the layer `instance` is kept, with the query it was begun from.
+fn query_key(instance: u64) -> egui::Id {
+    egui::Id::unique(("layer_properties_query", instance))
+}
+
+/// The layer's definition query (`layer.definitionQuery`): only the features matching the clause
+/// draw. The clause typed is set with Apply or Ctrl+Enter, and Clear removes the query; until then
+/// it is kept for this layer while a field or operator button is pressed or another tab is looked
+/// at. It is dropped, and the box shows the layer's query, with Escape in the box (Escape
+/// elsewhere is another control's: a map tool's, a menu's), when another layer is shown (see [`layer_changed`]), when the pane comes back in view (see [`drop_query_when_back`])
+/// and when the query changes from elsewhere (undo, a script), as a name being typed is. The box
+/// cuts nothing: a clause longer than the parser reads is said to be too long, and isn't applied.
+fn query(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
+    let key = query_key(l.instance_id());
+    let current = l.definition_query.clone().unwrap_or_default();
+    let mut text = ui
+        .data(|d| d.get_temp::<(String, String)>(key))
+        .filter(|(_, from)| *from == current)
+        .map_or_else(|| current.clone(), |(text, _)| text);
+    // Read before the box, which takes Escape to let go.
+    let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+    ui.label(RichText::new(tl!("Only the features matching this clause draw. Ctrl+Enter applies it.")).weak());
+    let input_label = ui.label(RichText::new(tl!("Where")).font(semibold(12.5)));
+    let r = ui
+        .add(
+            egui::TextEdit::multiline(&mut text)
+                .id_salt(("layer_properties_query", l.instance_id()))
+                .hint_text(tl!("e.g. continent = 'Europe'"))
+                .desired_rows(3)
+                .desired_width(f32::INFINITY)
+                .font(egui::TextStyle::Monospace),
+        )
+        .labelled_by(input_label.id);
+    if escape && r.lost_focus() {
+        text = current.clone();
+    }
+    crate::dialogs::field_chips(ui, &l.dataset.fields, &mut text);
+    let clause = text.trim();
+    let invalid = if clause.is_empty() { None } else { rustgis_engine::data::query::parse(clause, &l.dataset).err() };
+    if let Some(e) = &invalid {
+        ui.label(RichText::new(crate::i18n::fmt("Invalid: {error}", &[("error", e)])).small().color(t.red));
+    }
+    let can_apply = invalid.is_none() && clause != current;
+    let ctrl_enter = r.has_focus() && ui.input(|i| crate::sqlpane::run_pressed(&i.events));
+    let mut done = false;
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        if ui.add_enabled(can_apply, egui::Button::new(tl!("Apply"))).clicked() || (ctrl_enter && can_apply) {
+            done = run(app, "layer.definitionQuery", json!({"layer": l.id, "where": clause})).is_some();
+        }
+        if ui.add_enabled(l.definition_query.is_some(), egui::Button::new(tl!("Clear"))).on_hover_text(tl!("Draw every feature.")).clicked()
+        {
+            done = run(app, "layer.definitionQuery", json!({"layer": l.id, "where": ""})).is_some();
+        }
+    });
+    ui.data_mut(|d| {
+        if done || text == current {
+            d.remove_temp::<(String, String)>(key);
+        } else {
+            d.insert_temp(key, (text, current));
+        }
+    });
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -413,6 +515,201 @@ mod tests {
         assert!(h.query_by_role_and_label(Role::ComboBox, "Layer Blend").is_none(), "blend is a raster's");
         open_tab(&mut h, "Source");
         assert!(h.query_by_label("Geometry").is_some(), "the Details rows");
+        open_tab(&mut h, "Query");
+        assert!(h.query_by_role_and_label(Role::MultilineTextInput, "Where").is_some());
+    }
+
+    /// A raster layer of 2 × 2 cells, added to the map; its id.
+    fn add_raster(app: &mut RustGisApp) -> u32 {
+        use rustgis_engine::data::raster::{ColorHint, Crs, GeoTransform, Raster};
+        let gt = GeoTransform { origin_x: 0.0, origin_y: 1.0, pixel_width: 0.5, pixel_height: -0.5 };
+        let r = Raster::new("dem", 2, 2, vec![vec![0.0; 4]], gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
+        app.session.map_mut().add_raster("dem", rustgis_engine::map::RasterLayer::from_path(r, "dem.tif"))
+    }
+
+    fn query_box(h: &egui_kittest::Harness<'static, RustGisApp>) -> String {
+        h.get_by_role_and_label(Role::MultilineTextInput, "Where").value().unwrap_or_default()
+    }
+
+    fn type_query(h: &mut egui_kittest::Harness<'static, RustGisApp>, text: &str) {
+        h.get_by_role_and_label(Role::MultilineTextInput, "Where").click();
+        h.run();
+        h.get_by_role_and_label(Role::MultilineTextInput, "Where").type_text(text);
+        h.run();
+    }
+
+    /// `{"tab"}` shows that tab, and shows the pane even when it is already in view; the Query tab
+    /// is refused for a raster, and an unknown tab is refused.
+    #[test]
+    fn the_pane_command_opens_a_tab() {
+        let mut app = with_cities();
+        let cities = app.session.active_layer.unwrap();
+        app.run("ui.pane.layerProperties", json!({"tab": "query"})).unwrap();
+        assert_eq!((app.ui.right, app.ui.layer_properties_tab), (Some(RightPane::LayerProperties), super::Topic::Query));
+        app.run("ui.pane.layerProperties", json!({"tab": "query"})).unwrap();
+        assert_eq!(app.ui.right, Some(RightPane::LayerProperties), "asked for a tab, the pane stays in view");
+        for bad in [json!({"tab": "nope"}), json!({"tab": 3})] {
+            assert!(app.run("ui.pane.layerProperties", bad).is_err());
+        }
+        let raster = add_raster(&mut app);
+        assert!(app.run("ui.pane.layerProperties", json!({"layer": raster, "tab": "query"})).is_err(), "a raster has no query");
+        assert_eq!(app.session.active_layer, Some(cities), "a refusal doesn't select the raster");
+        app.run("ui.pane.layerProperties", json!({"layer": raster, "tab": "display"})).unwrap();
+        assert_eq!((app.session.active_layer, app.ui.layer_properties_tab), (Some(raster), super::Topic::Display));
+    }
+
+    /// A raster has no Query tab: the pane shows General instead, and the Query tab comes back
+    /// with the next feature layer.
+    #[test]
+    fn a_raster_shows_general_for_the_query_tab() {
+        let mut app = with_cities();
+        let cities = app.session.active_layer.unwrap();
+        let raster = add_raster(&mut app);
+        app.run("ui.pane.layerProperties", json!({"tab": "query"})).unwrap();
+        app.session.run("layer.select", &json!({"layer": raster})).unwrap();
+        let mut h = harness(app);
+        h.run_steps(2);
+        assert!(h.query_by_role_and_label(Role::Button, "Query").is_none(), "no Query tab");
+        assert!(h.query_by_role_and_label(Role::TextInput, "Name").is_some(), "General in view");
+        h.state_mut().session.run("layer.select", &json!({"layer": cities})).unwrap();
+        h.run_steps(2);
+        assert!(h.query_by_role_and_label(Role::MultilineTextInput, "Where").is_some(), "Query in view again");
+    }
+
+    /// Apply sets the clause typed, Clear removes it, each a step of its own; a clause the layer
+    /// can't read says why and isn't applied.
+    #[test]
+    fn the_query_tab_applies_and_clears_the_definition_query() {
+        let app = with_cities();
+        let id = app.session.active_layer.unwrap();
+        let steps = app.session.undo_depth();
+        let mut h = harness(app);
+        h.run();
+        open_tab(&mut h, "Query");
+        type_query(&mut h, "no_such_field > 1");
+        assert!(h.query_by_label_contains("Invalid:").is_some(), "the error is shown");
+        h.get_by_role_and_label(Role::Button, "Apply").click();
+        h.run();
+        assert_eq!(h.state().session.map().layer(id).unwrap().definition_query, None, "not applied");
+        h.get_by_role_and_label(Role::MultilineTextInput, "Where").click();
+        h.run();
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        h.key_press(egui::Key::Backspace);
+        h.run();
+        h.get_by_role_and_label(Role::MultilineTextInput, "Where").type_text("pop_max > 1000000");
+        h.run();
+        assert!(h.query_by_label_contains("Invalid:").is_none());
+        h.get_by_role_and_label(Role::Button, "Apply").click();
+        h.run();
+        assert_eq!(h.state().session.map().layer(id).unwrap().definition_query.as_deref(), Some("pop_max > 1000000"));
+        assert_eq!(h.state().session.undo_depth(), steps + 1, "one step");
+        assert_eq!(query_box(&h), "pop_max > 1000000", "the box shows the layer's query");
+        h.get_by_role_and_label(Role::Button, "Clear").click();
+        h.run();
+        assert_eq!(h.state().session.map().layer(id).unwrap().definition_query, None);
+        assert_eq!(h.state().session.undo_depth(), steps + 2);
+        assert_eq!(query_box(&h), "");
+    }
+
+    /// A clause longer than the parser reads is kept whole in the box, said to be too long and not
+    /// applied: nothing is cut unsaid.
+    #[test]
+    fn a_clause_too_long_is_said_not_cut() {
+        let app = with_cities();
+        let id = app.session.active_layer.unwrap();
+        let mut h = harness(app);
+        h.run();
+        open_tab(&mut h, "Query");
+        let long = format!("name = '{}'", "x".repeat(rustgis_engine::data::query::MAX_LEN));
+        type_query(&mut h, &long);
+        assert_eq!(query_box(&h).chars().count(), long.chars().count(), "nothing cut");
+        assert!(h.query_by_label_contains("too long").is_some(), "the length is said");
+        h.get_by_role_and_label(Role::Button, "Apply").click();
+        h.run();
+        assert_eq!(h.state().session.map().layer(id).unwrap().definition_query, None, "not applied");
+    }
+
+    /// A clause being typed when the pane is hidden is dropped: back in view, the box shows the
+    /// layer's query.
+    #[test]
+    fn hiding_the_pane_drops_the_query_being_typed() {
+        let app = with_cities();
+        let mut h = harness(app);
+        h.run();
+        open_tab(&mut h, "Query");
+        type_query(&mut h, "pop_max > 1");
+        h.state_mut().ui.right = Some(RightPane::Symbology);
+        h.run();
+        h.state_mut().ui.right = Some(RightPane::LayerProperties);
+        h.run();
+        assert_eq!(query_box(&h), "", "the layer's own query");
+    }
+
+    /// A field or operator button sets its word apart from a name typed just before it.
+    #[test]
+    fn the_buttons_set_their_word_apart() {
+        let app = with_cities();
+        let mut h = harness(app);
+        h.run();
+        open_tab(&mut h, "Query");
+        type_query(&mut h, "name");
+        h.get_by_role_and_label(Role::Button, "LIKE").click();
+        h.run();
+        assert_eq!(query_box(&h), "name LIKE ");
+    }
+
+    /// Ctrl+Enter applies the clause without breaking the line; Escape drops what was typed.
+    #[test]
+    fn ctrl_enter_applies_and_escape_drops_the_query() {
+        let app = with_cities();
+        let id = app.session.active_layer.unwrap();
+        let mut h = harness(app);
+        h.run();
+        open_tab(&mut h, "Query");
+        type_query(&mut h, "pop_max > 1000000");
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Enter);
+        h.run();
+        assert_eq!(h.state().session.map().layer(id).unwrap().definition_query.as_deref(), Some("pop_max > 1000000"));
+        assert_eq!(query_box(&h), "pop_max > 1000000", "no line break");
+        h.get_by_role_and_label(Role::MultilineTextInput, "Where").type_text(" AND pop_max < 5000000");
+        h.run();
+        h.key_press(egui::Key::Escape);
+        h.run();
+        assert_eq!(query_box(&h), "pop_max > 1000000", "Escape drops the clause typed");
+        assert_eq!(h.state().session.map().layer(id).unwrap().definition_query.as_deref(), Some("pop_max > 1000000"));
+    }
+
+    /// The field and operator buttons add to the clause; it is kept while another tab is looked
+    /// at, and dropped when another layer is chosen or the query changes from elsewhere.
+    #[test]
+    fn the_query_being_typed_is_the_layers_own() {
+        let app = with_cities();
+        let cities = app.session.active_layer.unwrap();
+        let countries = layer_id(&app, "Countries");
+        let mut h = harness(app);
+        h.run();
+        open_tab(&mut h, "Query");
+        h.get_by_role_and_label(Role::Button, "pop_max").click();
+        h.run();
+        h.get_by_role_and_label(Role::Button, ">").click();
+        h.run();
+        assert_eq!(query_box(&h), "pop_max > ");
+        open_tab(&mut h, "General");
+        open_tab(&mut h, "Query");
+        assert_eq!(query_box(&h), "pop_max > ", "kept while another tab was in view");
+        h.state_mut().session.run("layer.definitionQuery", &json!({"layer": cities, "where": "pop_max > 5"})).unwrap();
+        h.run();
+        assert_eq!(query_box(&h), "pop_max > 5", "a query set elsewhere shows at once");
+        h.get_by_role_and_label(Role::Button, "megacity").click();
+        h.run();
+        assert_eq!(query_box(&h), "pop_max > 5 megacity ");
+        // The header keeps repainting while it is lit, so these frames are stepped, not run.
+        h.state_mut().session.run("layer.select", &json!({"layer": countries})).unwrap();
+        h.run_steps(2);
+        assert_eq!(query_box(&h), "", "Countries' own query");
+        h.state_mut().session.run("layer.select", &json!({"layer": cities})).unwrap();
+        h.run_steps(2);
+        assert_eq!(query_box(&h), "pop_max > 5", "dropped, not back with Cities");
     }
 
     /// A new name is one rename, on Enter; Escape leaves the name as it was.

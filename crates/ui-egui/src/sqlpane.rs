@@ -281,8 +281,9 @@ fn completions(word: &str, names: &[(String, String)]) -> Vec<String> {
 }
 
 /// Whether `events` press Ctrl+Enter (⌘+Enter) to run the query: once a press, not again for each
-/// repeat of a key held down (#845), as the Script pane runs.
-fn run_pressed(events: &[egui::Event]) -> bool {
+/// repeat of a key held down (#845), as the Script pane runs. The Layer Properties pane's Query tab
+/// applies its clause with it too.
+pub(crate) fn run_pressed(events: &[egui::Event]) -> bool {
     events.iter().any(|e| {
         matches!(e, egui::Event::Key { key: egui::Key::Enter, pressed: true, repeat: false, modifiers, .. }
             if modifiers.matches_logically(egui::Modifiers::COMMAND))

@@ -2408,10 +2408,7 @@ fn layer_menu(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, reorder: bool) {
             ui.close();
         }
     } else {
-        if ui.button(tl!("Definition Query…")).clicked() {
-            let _ = app.run("ui.dialog", json!({"name": "definitionQuery"}));
-            ui.close();
-        }
+        // The definition query is on the Query tab of Properties… (#1803).
         if l.time.is_some() {
             if ui.button(tl!("Unbind From Time Slider")).clicked() {
                 let _ = app.run("time.unbind", json!({"layer": l.id}));

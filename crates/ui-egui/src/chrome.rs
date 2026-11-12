@@ -813,13 +813,15 @@ enum SearchAction {
     OpenItem(&'static str),
     SaveItem(&'static str),
     Pane(crate::RightPane),
+    /// A tab of the Layer Properties pane, by its `ui.pane.layerProperties` name.
+    PropertiesTab(&'static str),
     Workflow(&'static str),
 }
 
 /// Routes commands requiring user input to their dialogs rather than executing empty params.
 fn search_action(id: &str) -> Option<SearchAction> {
     use crate::RightPane;
-    use SearchAction::{Command, Dialog, OpenItem, Pane, SaveItem, Workflow};
+    use SearchAction::{Command, Dialog, OpenItem, Pane, PropertiesTab, SaveItem, Workflow};
     Some(match id {
         "project.open" => Command("ui.open"),
         "project.save" => Command("ui.save"),
@@ -868,7 +870,7 @@ fn search_action(id: &str) -> Option<SearchAction> {
         "layer.repairSource" => Dialog("repairSource"),
         "layer.reloadData" => Command("ui.reloadData"),
         "ui.importShapefile" => Dialog("addShapefile"),
-        "layer.definitionQuery" => Dialog("definitionQuery"),
+        "layer.definitionQuery" => PropertiesTab("query"),
         "layer.symbology" | "raster.symbology" | "layer.color" | "layer.outline" | "layer.lineStrokes" | "layer.fillLayers"
         | "layer.ramp" => Pane(RightPane::Symbology),
         "select.byAttributes" => Dialog("selectByAttributes"),
@@ -1184,6 +1186,7 @@ pub fn command_search(app: &mut RustGisApp, ctx: &egui::Context) {
                 SearchAction::Dialog(name) => app.run("ui.dialog", json!({"name": name})),
                 SearchAction::OpenItem(kind) => app.run("ui.openItem", json!({"kind": kind})),
                 SearchAction::SaveItem(kind) => app.run("ui.saveItem", json!({"kind": kind})),
+                SearchAction::PropertiesTab(tab) => app.run("ui.pane.layerProperties", json!({"tab": tab})),
                 SearchAction::Workflow(section) => app.run("ui.pane.workflows", json!({"section": section})),
                 SearchAction::Pane(pane) => {
                     app.ui.open_right(pane);
@@ -1388,6 +1391,16 @@ pub fn notices(app: &mut RustGisApp, ctx: &egui::Context) {
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// Command Search's Definition Query opens the Layer Properties pane on its Query tab (#1803),
+    /// the dialog it opened being gone.
+    #[test]
+    fn definition_query_is_found_on_the_query_tab() {
+        assert!(matches!(search_action("layer.definitionQuery"), Some(SearchAction::PropertiesTab("query"))));
+        let mut app = RustGisApp::with_sample();
+        app.session.run("layer.select", &json!({"layer": "Cities"})).unwrap();
+        assert!(super::search_disabled(&app, "layer.definitionQuery").is_none(), "offered for a feature layer");
+    }
 
     /// Past the 200 notices the session keeps, each new notice it holds still makes one toast (#1755).
     #[test]

@@ -5018,8 +5018,8 @@ fn feature_data_groups(app: &mut RustGisApp, ui: &mut Ui) {
             "def_query",
             "Definition\nQuery",
             "Limit which features draw with a SQL expression.",
-            "ui.dialog",
-            json!({"name": "definitionQuery"}),
+            "ui.pane.layerProperties",
+            json!({"tab": "query"}),
             has,
             false,
         );
@@ -5353,6 +5353,19 @@ mod tests {
         assert!(bare.contains(&("Bengali", "Bengali")), "an undrawable name falls back to English: {bare:?}");
         assert!(bare.contains(&("Français", "French")), "a drawable one doesn't: {bare:?}");
         assert!(!bare.iter().any(|n| n.0 == bn.name()));
+    }
+
+    /// Data › Definition Query shows the Layer Properties pane on its Query tab (#1803), even when
+    /// the pane is already in view on another tab.
+    #[test]
+    fn definition_query_opens_the_query_tab() {
+        let mut app = cities();
+        app.run("ui.pane.layerProperties", json!({"tab": "general"})).unwrap();
+        let mut h = tab_harness(app, feature_data_groups);
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Definition Query").click();
+        h.run();
+        assert_eq!(h.state().ui.right, Some(crate::RightPane::LayerProperties));
+        assert_eq!(h.state().ui.layer_properties_tab, crate::layerprops::Topic::Query);
     }
 
     /// The Labeling tab holds every label group (#897): a feature layer's, then the map's, which
