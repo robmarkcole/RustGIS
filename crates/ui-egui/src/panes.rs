@@ -5296,7 +5296,7 @@ fn symbol_editor(app: &mut RustGisApp, ui: &mut Ui, s: Symbol, g: GeometryType, 
 }
 
 /// The dash patterns the stroke editor offers, in stroke widths (dash, gap, …).
-const DASH_PRESETS: [(&str, Option<&[f32]>); 5] = [
+pub(crate) const DASH_PRESETS: [(&str, Option<&[f32]>); 5] = [
     ("Solid", None),
     ("Dashed", Some(&[4.0, 2.0])),
     ("Dotted", Some(&[1.0, 2.0])),

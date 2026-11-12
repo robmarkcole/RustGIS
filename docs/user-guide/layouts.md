@@ -256,6 +256,13 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   also given; when adding, it is also an extent indicator's or a grid's. `fill` is a north
   arrow's, a shape's or a scale bar's, and `outline` a north arrow's or a shape's. A legend,
   picture, table and the like take none.
+  A line and the outline of a rectangle, circle or ellipse can be dashed: **Dash** in their
+  properties offers the Symbology pane's patterns (Solid, Dashed, Dotted, Dash-dot, Long dash),
+  scaled by the width as there, for a dashed leader, a box marking a study area or an inset's
+  extent, or a dotted neatline. On an arrow only the shaft is dashed; its heads stay solid. A
+  command gives the pattern as a line layer's stroke takes it, lengths in points, dash and gap in
+  turn (at most 8, each up to 500): `layout.update={"element":7,"dash":[4,2]}`, with `[]` or
+  `null` for solid again. Every export draws it, SVG as a `stroke-dasharray`.
 - **Arrows**: **Arrow** adds an arrow pointing right. Drag the round handle above a selected arrow
   or line to turn it about its centre: it snaps to level, upright and diagonal within 3°, and
   **Shift** turns it in 15° steps. **Angle** in its properties sets it exactly (0° points right,

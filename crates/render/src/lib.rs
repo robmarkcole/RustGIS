@@ -830,6 +830,21 @@ const MITRE_LIMIT: f32 = 2.0;
 /// The most dashes a dashed stroke is cut into along one path (`Ctx::dash`).
 const MAX_DASHES: f32 = 100_000.0;
 
+/// A dash pattern in pixels for `path` at `ppp` pixels a point, or `None` to draw it solid: a
+/// pattern under a pixel a round, or one that would cut the path into more than [`MAX_DASHES`]
+/// dashes (each is a path of its own), would only cost time. The whole path counts, on screen or
+/// not: the dashing doesn't skip what's off screen.
+pub(crate) fn dash_steps(d: &rustgis_map::symbology::Dash, ppp: f32, path: &tiny_skia::Path) -> Option<Vec<f32>> {
+    let steps: Vec<f32> = d.even_steps().iter().map(|v| v * ppp).collect();
+    let period: f32 = steps.iter().sum();
+    // Each round of the pattern draws one dash per pair of steps.
+    let dashes = path_length(path) / period * (steps.len() / 2) as f32;
+    if !(period >= 1.0 && dashes <= MAX_DASHES) {
+        return None;
+    }
+    Some(steps)
+}
+
 struct Ctx<'a> {
     view: &'a View,
     ppp: f32,
@@ -1116,14 +1131,7 @@ impl Ctx<'_> {
     /// is a path of its own), would only cost time. The whole path counts, on screen or not: the
     /// dashing doesn't skip what's off screen.
     fn dash(&self, d: &rustgis_map::symbology::Dash, path: &tiny_skia::Path) -> Option<Vec<f32>> {
-        let steps: Vec<f32> = d.even_steps().iter().map(|v| v * self.ppp).collect();
-        let period: f32 = steps.iter().sum();
-        // Each round of the pattern draws one dash per pair of steps.
-        let dashes = path_length(path) / period * (steps.len() / 2) as f32;
-        if !(period >= 1.0 && dashes <= MAX_DASHES) {
-            return None;
-        }
-        Some(steps)
+        dash_steps(d, self.ppp, path)
     }
 
     /// `starts`: where along its line each of `path`'s pieces begins ([`Self::ring_path_at`]), so a

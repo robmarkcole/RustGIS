@@ -10,6 +10,7 @@ use rustgis_geom::Coord;
 use serde::{Deserialize, Serialize};
 
 use crate::raster::{Colorizer, Normalizer, RasterLayer, RasterMask, RasterRenderer, RasterStyle};
+use crate::symbology::Dash;
 use crate::{Camera, Layer, Map, Rgba};
 
 /// Logical points per millimetre (96 points per inch).
@@ -1024,9 +1025,21 @@ pub enum ElementKind {
         /// Its corners rounded by this much, in millimetres (0: square corners).
         #[serde(default, skip_serializing_if = "is_zero")]
         radius: f64,
+        /// Dashed: the pattern along the outline, in points, as a line layer's stroke takes it
+        /// ([`Dash`]); `None` is solid. Left out when solid, so layouts saved before keep their bytes.
+        #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::symbology::de_dash")]
+        dash: Option<Dash>,
     },
     /// An ellipse filling the element's box: a circle in a square one.
-    Ellipse { fill: Rgba, outline: Rgba, width: f64 },
+    Ellipse {
+        fill: Rgba,
+        outline: Rgba,
+        width: f64,
+        /// Dashed: the pattern along the outline, in points, as a line layer's stroke takes it
+        /// ([`Dash`]); `None` is solid. Left out when solid, so layouts saved before keep their bytes.
+        #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::symbology::de_dash")]
+        dash: Option<Dash>,
+    },
     /// A straight line across the element's box, `width` points wide.
     Line {
         color: Rgba,
@@ -1036,6 +1049,11 @@ pub enum ElementKind {
         /// Arrowheads: none makes it a plain line.
         #[serde(default)]
         head: LineHead,
+        /// Dashed: the pattern along the line, in points, as a line layer's stroke takes it
+        /// ([`Dash`]); `None` is solid. Only the shaft is dashed: arrowheads stay solid. Left out
+        /// when solid, so layouts saved before keep their bytes.
+        #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::symbology::de_dash")]
+        dash: Option<Dash>,
     },
 }
 
@@ -1693,11 +1711,12 @@ pub fn color_scale(rl: &RasterLayer) -> Option<ColorScale> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::symbology::MAX_DASH_STEP;
 
     #[test]
     fn elements_are_arranged_in_the_drawing_order() {
         let mut l = Layout::new("L", 100.0, 100.0);
-        let rect = || ElementKind::Rectangle { fill: Rgba::rgb(0, 0, 0), outline: Rgba::rgb(0, 0, 0), width: 0.0, radius: 0.0 };
+        let rect = || ElementKind::Rectangle { fill: Rgba::rgb(0, 0, 0), outline: Rgba::rgb(0, 0, 0), width: 0.0, radius: 0.0, dash: None };
         let ids: Vec<u32> = (0..4).map(|i| l.add(format!("E{i}"), (10.0, 10.0, 50.0, 50.0), rect())).collect();
         let order = |l: &Layout| l.elements.iter().map(|e| e.id).collect::<Vec<_>>();
         // All four overlap: the one drawn last is the one a click picks.
@@ -1821,7 +1840,7 @@ mod tests {
         let a = big.add(
             "a",
             (0.0, 0.0, 1.0, 1.0),
-            ElementKind::Rectangle { fill: Rgba::rgb(0, 0, 0), outline: Rgba::rgb(0, 0, 0), width: 1.0, radius: 0.0 },
+            ElementKind::Rectangle { fill: Rgba::rgb(0, 0, 0), outline: Rgba::rgb(0, 0, 0), width: 1.0, radius: 0.0, dash: None },
         );
         assert!(a != big.elements[0].id && a <= MAX_ID + 1);
     }
@@ -1829,7 +1848,7 @@ mod tests {
     #[test]
     fn hairline_rectangles_keep_their_height() {
         let mut l = Layout::new("Layout", 210.0, 297.0);
-        let rule = ElementKind::Rectangle { fill: Rgba::rgb(0, 0, 0), outline: Rgba::rgb(0, 0, 0), width: 0.0, radius: 0.0 };
+        let rule = ElementKind::Rectangle { fill: Rgba::rgb(0, 0, 0), outline: Rgba::rgb(0, 0, 0), width: 0.0, radius: 0.0, dash: None };
         let id = l.add("Rule", (14.0, 33.0, 182.0, 0.15), rule.clone());
         assert_eq!(l.element(id).map(|e| e.h), Some(0.15));
         // A zero height becomes the thinnest element, not a 1 mm box.
@@ -2005,6 +2024,55 @@ mod tests {
         assert_eq!(grid, Grid { step: 10.0, ..Grid::default() });
         assert_eq!(grid.edges, GridEdges { top: false, bottom: true, left: true, right: false });
         assert_eq!(grid.style, GridStyle::Lines);
+    }
+
+    /// Lines and the outlines of rectangles and ellipses keep a dash pattern through a save
+    /// (#1763); solid, nothing is written, so a layout saved before is written back byte for
+    /// byte; a pattern read from a file is brought into range as a line layer's is.
+    #[test]
+    fn dashes_round_trip_and_old_layouts_keep_their_bytes() {
+        let black = Rgba::rgb(0, 0, 0);
+        let mut l = Layout::new("L", 100.0, 100.0);
+        let line = l.add(
+            "Line",
+            (10.0, 10.0, 60.0, 6.0),
+            ElementKind::Line { color: black, width: 1.0, dir: LineDir::Horizontal, head: LineHead::End, dash: None },
+        );
+        let rect = l.add(
+            "Box",
+            (10.0, 30.0, 60.0, 30.0),
+            ElementKind::Rectangle { fill: black, outline: black, width: 1.0, radius: 0.0, dash: None },
+        );
+        let oval = l.add("Oval", (10.0, 70.0, 30.0, 20.0), ElementKind::Ellipse { fill: black, outline: black, width: 1.0, dash: None });
+        let old = serde_json::to_string(&l).unwrap();
+        assert!(!old.contains("dash"), "solid writes no pattern");
+        assert_eq!(serde_json::to_string(&serde_json::from_str::<Layout>(&old).unwrap()).unwrap(), old, "written back byte for byte");
+        let dash_of = |l: &Layout, id: u32| match l.element(id).map(|e| &e.kind) {
+            Some(ElementKind::Line { dash, .. } | ElementKind::Rectangle { dash, .. } | ElementKind::Ellipse { dash, .. }) => {
+                dash.map(|d| d.steps().to_vec())
+            }
+            _ => panic!("a line or a shape"),
+        };
+        let pattern = Dash::new(&[4.0, 2.0, 1.0, 2.0]);
+        for id in [line, rect, oval] {
+            if let Some(ElementKind::Line { dash, .. } | ElementKind::Rectangle { dash, .. } | ElementKind::Ellipse { dash, .. }) =
+                l.element_mut(id).map(|e| &mut e.kind)
+            {
+                *dash = pattern;
+            }
+        }
+        let saved = serde_json::to_string(&l).unwrap();
+        assert!(saved.contains(r#""dash":[4.0,2.0,1.0,2.0]"#), "{saved}");
+        let back: Layout = serde_json::from_str(&saved).unwrap();
+        for id in [line, rect, oval] {
+            assert_eq!(dash_of(&back, id), Some(vec![4.0, 2.0, 1.0, 2.0]));
+        }
+        // From a file, as a line layer's pattern: steps clamped, all-zero read as solid.
+        let file = saved.replacen("[4.0,2.0,1.0,2.0]", "[4,1e9,-2]", 1).replacen("[4.0,2.0,1.0,2.0]", "[0,0]", 1);
+        let read: Layout = serde_json::from_str(&file).unwrap();
+        assert_eq!(dash_of(&read, line), Some(vec![4.0, MAX_DASH_STEP, 0.0]));
+        assert_eq!(dash_of(&read, rect), None);
+        assert_eq!(dash_of(&read, oval), Some(vec![4.0, 2.0, 1.0, 2.0]));
     }
 
     /// A text turned 90° or -90° (#1763) keeps its turn through a save; one saved before reads

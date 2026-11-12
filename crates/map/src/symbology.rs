@@ -318,7 +318,7 @@ impl Dash {
 /// Reads a stroke's pattern from a project, brought into range: at most [`MAX_DASH_STEPS`] steps,
 /// each clamped to 0 to [`MAX_DASH_STEP`] (one too large for a number, infinite, the longest);
 /// one left without length is `None`, solid (a project file is hostile input).
-fn de_dash<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Dash>, D::Error> {
+pub(crate) fn de_dash<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Dash>, D::Error> {
     let Some(v) = Option::<Vec<f32>>::deserialize(d)? else { return Ok(None) };
     let steps: Vec<f32> = v.iter().take(MAX_DASH_STEPS).map(|x| if x.is_nan() { 0.0 } else { x.clamp(0.0, MAX_DASH_STEP) }).collect();
     Ok(Dash::new(&steps))

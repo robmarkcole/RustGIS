@@ -10,6 +10,7 @@ use rustgis_engine::map::layout::{
     MAX_FRAME_SCALE, MAX_GRID_WIDTH, MAX_LEGEND_COLUMNS, MAX_SCALE_DIVISIONS, MAX_TICK_MM, MIN_FRAME_SCALE, Orientation, PT_PER_MM,
     ScaleBarStyle, ScaleUnits, TickSide, frame_camera, line_angle, line_length,
 };
+use rustgis_engine::map::symbology::Dash;
 use serde_json::{Value, json};
 
 use crate::RustGisApp;
@@ -1883,7 +1884,7 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                         }
                         ui.end_row();
                     }
-                    ElementKind::Rectangle { fill, outline, width, .. } | ElementKind::Ellipse { fill, outline, width } => {
+                    ElementKind::Rectangle { fill, outline, width, dash, .. } | ElementKind::Ellipse { fill, outline, width, dash } => {
                         // A fill with no opacity leaves only the outline; an outline 0 wide, only the fill.
                         for (label, key, current) in [("Fill", "fill", *fill), ("Outline", "outline", *outline)] {
                             ui.label(tl!(label));
@@ -1912,8 +1913,13 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                             update(app, json!({"width": wd}));
                         }
                         ui.end_row();
+                        let input_label = ui.label(tl!("Dash"));
+                        if let Some(d) = dash_picked(ui, ("layout_dash", id), *dash, *width, input_label.id) {
+                            update(app, json!({"dash": d}));
+                        }
+                        ui.end_row();
                     }
-                    ElementKind::Line { color, width, dir, head } => {
+                    ElementKind::Line { color, width, dir, head, dash } => {
                         ui.label(tl!("Color"));
                         let mut c = crate::theme::c32(*color);
                         let resp = crate::widgets::color_button(ui, &mut c);
@@ -1937,6 +1943,12 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                             .labelled_by(input_label.id);
                         if drag.settled(ui, &r, &mut wd) && (wd - width).abs() > 1e-6 {
                             update(app, json!({"width": wd}));
+                        }
+                        ui.end_row();
+                        // Only the shaft is dashed: arrowheads stay solid.
+                        let input_label = ui.label(tl!("Dash"));
+                        if let Some(d) = dash_picked(ui, ("layout_dash", id), *dash, *width, input_label.id) {
+                            update(app, json!({"dash": d}));
                         }
                         ui.end_row();
                         let input_label = ui.label(tl!("Arrowheads"));
@@ -2180,6 +2192,33 @@ fn element_actions(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize
             }
         }
     });
+}
+
+/// The dash pattern of a layout line or outline `width` points wide, picked from the Symbology
+/// pane's presets (#1763), scaled by the width as that pane scales them: the pattern
+/// `layout.update` takes (`[]` for solid) when one other than `dash` is picked. A pattern set by
+/// command that isn't a preset shows as its lengths.
+fn dash_picked(ui: &mut Ui, salt: (&str, u32), dash: Option<Dash>, width: f64, label: egui::Id) -> Option<Vec<f32>> {
+    let scale = (width as f32).max(1.0);
+    let preset = |steps: Option<&[f32]>| steps.and_then(|s| Dash::new(&s.iter().map(|v| v * scale).collect::<Vec<_>>()));
+    let shown = match crate::panes::DASH_PRESETS.iter().find(|(_, steps)| preset(*steps) == dash) {
+        Some((name, _)) => tl!(name).to_string(),
+        None => dash.map(|d| d.steps().iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" ")).unwrap_or_default(),
+    };
+    let mut picked = None;
+    egui::ComboBox::from_id_salt(salt)
+        .selected_text(shown)
+        .show_ui(ui, |ui| {
+            for (name, steps) in crate::panes::DASH_PRESETS {
+                let d = preset(steps);
+                if ui.selectable_label(d == dash, tl!(name)).clicked() && d != dash {
+                    picked = Some(d.map_or_else(Vec::new, |d| d.steps().to_vec()));
+                }
+            }
+        })
+        .response
+        .labelled_by(label);
+    picked
 }
 
 /// Why a locked element, or a frame with a locked surround, isn't deleted.
@@ -2785,6 +2824,42 @@ mod tests {
         h.event(key(Key::ArrowUp, Modifiers::NONE, false));
         h.step();
         assert_eq!(at(&h), (0.0, 0.0));
+    }
+
+    /// A rectangle's outline is dashed from the Format pane's Dash list, the Symbology pane's
+    /// presets scaled by its width, and made solid again (#1763).
+    #[test]
+    fn the_format_pane_dashes_an_outline() {
+        use egui_kittest::kittest::Queryable;
+        use rustgis_engine::map::layout::ElementKind;
+        let mut app = RustGisApp::with_sample();
+        app.run("layout.new", json!({"name": "Dashes", "template": "blank"})).unwrap();
+        let li = app.session.active_layout.unwrap();
+        let p = json!({"layout": li, "kind": "rectangle", "x": 20, "y": 20, "w": 60, "h": 40, "width": 2});
+        let id = app.run("layout.addElement", p).unwrap()["element"].as_u64().unwrap() as u32;
+        app.layout.selected = Some(id);
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(420.0, 900.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                let layout = app.session.project.layouts[li].clone();
+                egui::ScrollArea::vertical().show(ui, |ui| super::properties(app, ui, &layout, li));
+            },
+            app,
+        );
+        h.run_steps(2);
+        let dash = |h: &egui_kittest::Harness<'_, RustGisApp>| match &h.state().session.project.layouts[li].element(id).unwrap().kind {
+            ElementKind::Rectangle { dash, .. } => dash.map(|d| d.steps().to_vec()),
+            k => panic!("{k:?}"),
+        };
+        h.get_by_label("Dash").click();
+        h.run_steps(2);
+        h.get_by_label("Dashed").click();
+        h.run_steps(2);
+        assert_eq!(dash(&h), Some(vec![8.0, 4.0]), "Dashed, [4, 2] at a 2-point width");
+        h.get_by_label("Dash").click();
+        h.run_steps(2);
+        h.get_by_label("Solid").click();
+        h.run_steps(2);
+        assert_eq!(dash(&h), None);
     }
 
     /// The selected element's Bring to Front and Send to Back buttons move it in the drawing
