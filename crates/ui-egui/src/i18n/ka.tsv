@@ -3,6 +3,8 @@
 "instance" must be a layer's instance number, not {value}	"instance" უნდა იყოს ფენის ეგზემპლარის ნომერი და არა {value}
 "layer" must be a layer's id or name, not {value}	"layer" უნდა იყოს ფენის id ან სახელი და არა {value}
 '{b}' isn't a bucket name	„{b}“ არ არის ბაკეტის სახელი
+'{date}' isn't a date: write it as YYYY-MM-DD	„{date}“ არ არის თარიღი: დაწერეთ YYYY-MM-DD ფორმატით
+'{size}' isn't a cell size: give a number	„{size}“ არ არის უჯრედის ზომა: მიუთითეთ რიცხვი
 '{text}' isn't a scale: type one such as 1:12,345	„{text}“ მასშტაბი არ არის: შეიყვანეთ, მაგალითად, 1:12,345
 (b4-b3)/(b4+b3)	(b4-b3)/(b4+b3)
 (expression)	(გამოსახულება)
@@ -142,6 +144,7 @@ Add a page to the presentation.	გვერდის დამატება �
 Add a PNG or JPEG picture to the page.	PNG ან JPEG სურათის დამატება გვერდზე.
 Add a presentation file.	პრეზენტაციის ფაილის დამატება.
 Add a raster and a polygon layer to calculate zonal statistics.	ზონალური სტატისტიკის გამოსათვლელად დაამატეთ რასტრული და პოლიგონური ფენა.
+Add a raster of two or more bands first, such as a Landsat or Sentinel-2 scene.	ჯერ დაამატეთ ორი ან მეტი არხის მქონე რასტრი, მაგალითად, Landsat-ის ან Sentinel-2-ის სცენა.
 Add a rectangle, to frame or highlight part of the page.	მართკუთხედის დამატება გვერდის ნაწილის ჩასაჩარჩოებლად ან გამოსაყოფად.
 Add a report file, or a report template for the selected layer.	ანგარიშის ფაილის ან არჩეული ფენის ანგარიშის შაბლონის დამატება.
 Add a scale bar for the map frame.	რუკის ჩარჩოსთვის მასშტაბის ხაზის დამატება.
@@ -207,6 +210,7 @@ Add Keyframe	საკვანძო კადრის დამატებ�
 Add Label Class	წარწერის კლასის დამატება
 Add Layer File	ფენის ფაილის დამატება
 Add Mark	ნიშნის დამატება
+Add more with plugins:	დაამატეთ მეტი დანამატებით:
 Add Open Data	ღია მონაცემების დამატება
 Add Output	გამოსავლის დამატება
 Add Overture Maps Data	Overture Maps-ის მონაცემების დამატება
@@ -223,6 +227,7 @@ Add rule	წესის დამატება
 Add sample countries	სანიმუშო ქვეყნების დამატება
 Add Sample Data	სანიმუშო მონაცემების დამატება
 Add Satellite Embeddings	სატელიტური ემბედინგების დამატება
+Add Satellite Embeddings over Time	თანამგზავრული ჩაშენებების დამატება დროში
 Add Selected ({n})	მონიშნულის დამატება ({n})
 Add Service Layer	სერვისის ფენის დამატება
 Add skill…	უნარის დამატება…
@@ -250,17 +255,20 @@ Add to Map	რუკაზე დამატება
 Add to Time Slider	დროის სლაიდერზე დამატება
 Add view	ხედის დამატება
 Add With Options…	დამატება პარამეტრებით…
+Add years	წლების დამატება
 Add Zarr Variable	Zarr ცვლადის დამატება
 Add Zarr Variable…	Zarr ცვლადის დამატება…
 Add {language}	{language}-ის დამატება
 Add {n}	{n}-ის დამატება
 Add ▾	დამატება ▾
 Added	დამატებულია
+Added Fixture	დამატებული მოწყობილობა
 Added from {start} to {end}: the time slider steps through it	დაემატა {start}-დან {end}-მდე: დროის სლაიდერი მასში ნაბიჯებით გადის
 Added Overture's {theme} as map tiles ({release}; some themes show only zoomed in): {attribution}	Overture-ის თემა {theme} დაემატა რუკის ფილებად ({release}; ზოგი თემა მხოლოდ გადიდებისას ჩანს): {attribution}
 Added {name}	დაემატა {name}
 Added {p} points, {l} lines and {g} polygons	დაემატა {p} წერტილი, {l} ხაზი და {g} პოლიგონი
 Added: {names}	დაემატა: {names}
+Adding {name}…	{name}-ის დამატება…
 Adding…	მიმდინარეობს დამატება…
 Additional surrounds.	დამატებითი გარშემომყოფი ელემენტები.
 Address	მისამართი
@@ -307,6 +315,7 @@ all of it	მთლიანად
 All Selected	ყველა მონიშნული
 All steps done.	ყველა საფეხური შესრულდა.
 All tables with geometry	ყველა ცხრილი გეომეტრიით
+All years, on the time slider	ყველა წელი, დროის სლაიდერზე
 Allow	დაშვება
 Allow ChatGPT plan use when signing in. If your workspace doesn't permit it, ask its admin or choose an API key provider.	შესვლისას დაუშვით ChatGPT გეგმის გამოყენება. თუ თქვენი სამუშაო სივრცე ამას არ უშვებს, მიმართეთ მის ადმინისტრატორს ან აირჩიეთ API გასაღებიანი პროვაიდერი.
 Allow Feature Selection	ობიექტების მონიშვნის დაშვება
@@ -331,6 +340,7 @@ An agent on this computer asks to:	ამ კომპიუტერის ა�
 An API key sent in a header must use plain ASCII characters.	სათაურში გაგზავნილი API გასაღები მხოლოდ ჩვეულებრივ ASCII სიმბოლოებს უნდა შეიცავდეს.
 An ArcGIS Online organization's or an ArcGIS Enterprise portal's address; ArcGIS Online when blank	ArcGIS Online-ის ორგანიზაციის ან ArcGIS Enterprise-ის პორტალის მისამართი; ცარიელისას ArcGIS Online
 An AWS profile	AWS პროფილი
+an enqueued add is not a success	რიგში ჩადგმული დამატება წარმატება არ არის
 Analysis	ანალიზი
 Analyze	გაანალიზება
 Analyze › AI	გაანალიზება › AI
@@ -374,6 +384,7 @@ Area of use: within {r}° of the {lon}° meridian	გამოყენები
 Area of use: within {r}° of {lon}°, {lat}°	გამოყენების არეალი: {lon}°, {lat}°-დან {r}°-ის ფარგლებში
 Area {area}   ·   Perimeter {perimeter}	ფართობი {area}   ·   პერიმეტრი {perimeter}
 Areas (name, land use, area)	არეები (სახელი, მიწის გამოყენება, ფართობი)
+Argentina	არგენტინა
 Arithmetic Progression	არითმეტიკული პროგრესია
 Arrange	დალაგება
 Arrange Element	ელემენტის დალაგება
@@ -413,8 +424,8 @@ Autofill Fields	ველების ავტომატური შევ�
 Automatic	ავტომატური
 Automatic (mm to km)	ავტომატური (მმ-დან კმ-მდე)
 Automatic (system language)	ავტომატური (სისტემის ენა)
-Automatic (system time zone and region)	ავტომატური (სისტემის დროის სარტყელი და რეგიონი)
 Automatic ({kind})	ავტომატური ({kind})
+Automatic ({n})	ავტომატური ({n})
 Autosave	ავტოშენახვა
 Autosave couldn't keep a recovery copy: {error}	ავტოშენახვამ აღდგენის ასლი ვერ შეინახა: {error}
 autosave failed unexpectedly; it goes on with the next copy	ავტოშენახვა მოულოდნელად ჩავარდა; გაგრძელდება შემდეგი ასლით
@@ -431,10 +442,13 @@ Background	ფონი
 Band	არხი
 Band Combination	არხების კომბინაცია
 Band must be a positive integer, list of bands, or 'all'.	არხი უნდა იყოს დადებითი მთელი რიცხვი, არხების სია ან 'all'.
-Band values at a point	არხის მნიშვნელობები წერტილში
 Band {n}	არხი {n}
+Band {n}: {name}	არხი {n}: {name}
+Band {n}: {name}, {wavelength} nm	არხი {n}: {name}, {wavelength} nm
 Bands	არხები
+Bands 1–{n}	არხები 1–{n}
 Bands: blue green red NIR SWIR	არხები: ლურჯი მწვანე წითელი NIR SWIR
+Bangladesh	ბანგლადეში
 Banner	ბანერი
 Bar	სვეტი
 Bar Chart	სვეტოვანი დიაგრამა
@@ -472,10 +486,12 @@ Bookmark Description	სანიშნის აღწერა
 Bookmarks	სანიშნეები
 Bookmarks Pane	სანიშნეების პანელი
 Boolean	ლოგიკური
+Borders at 1:110m, a small download (about 250 KB)	საზღვრები 1:110m-ზე, მცირე ჩამოტვირთვა (დაახლოებით 250 KB)
 Both ends	ორივე ბოლო
 Bottom	ქვედა
 Boundaries…	საზღვრები…
 Bounding\nGeometry	შემომსაზღვრელი\nგეომეტრია
+Brazil	ბრაზილია
 Brightness	სიკაშკაშე
 Brightness, contrast, saturation and sepia for the whole map.	სიკაშკაშე, კონტრასტი, ნაჯერობა და სეპია მთელი რუკისთვის.
 Bring Forward	ერთით წინ
@@ -540,6 +556,7 @@ Can't read this folder	ამ საქაღალდის წაკითხ�
 Cancel	გაუქმება
 Cancel ArcGIS Sign-In	ArcGIS-ში შესვლის გაუქმება
 Cancel Caching	ქეშირების გაუქმება
+Cancelled	გაუქმდა
 Cap	ბოლო
 Capture To Clipboard	ბუფერში გადაღება
 Cards on a light page: the map, the locator and the legend each in one.	ბარათები ღია გვერდზე: რუკა, ლოკატორი და ლეგენდა თითო ბარათში.
@@ -548,6 +565,7 @@ Cartography	კარტოგრაფია
 Case Field	ველი სიმბოლოს რეგისტრის მიხედვით
 Case Fields	დაჯგუფების ველები
 Cast Shadow	ჩრდილის დაცემა
+Cast shadows	ჩრდილების დაცემა
 Catalog	კატალოგი
 catalog is a static STAC catalog's catalog.json or collection.json	catalog არის სტატიკური STAC კატალოგის catalog.json ან collection.json
 Catalogue (CSW)	კატალოგი (CSW)
@@ -557,6 +575,7 @@ Celestial Bodies	ციური სხეულები
 Celestial Body	ციური სხეული
 Celestial body: {body}	ციური სხეული: {body}
 Cell size	უჯრედის ზომა
+cell size	უჯრედის ზომა
 cell size °	უჯრედის ზომა °
 Cells	უჯრედები
 Center	ცენტრი
@@ -574,6 +593,7 @@ Change the project (add layers, edit features, change symbology)	პროექ
 Changed rows	შეცვლილი სტრიქონები
 Character	სიმბოლო-ნიშანი
 Chart categories	დიაგრამის კატეგორიები
+Chart every band at points on the map, and compare them.	აჩვენეთ ყველა არხი რუკის წერტილებზე დიაგრამაზე და შეადარეთ.
 Chart Frame	დიაგრამის ჩარჩო
 ChatGPT (sign in)	ChatGPT (შესვლა)
 ChatGPT plan use is unavailable for this account or workspace.	ამ ანგარიშისთვის ან სამუშაო სივრცისთვის ChatGPT-ის გეგმის გამოყენება მიუწვდომელია.
@@ -635,6 +655,7 @@ Choose which layers a click identifies.	აირჩიეთ, რომელ �
 Choose which saved connection to use for this address. This choice lasts for this session.	აირჩიეთ, რომელი შენახული კავშირი გამოიყენოთ ამ მისამართისთვის. ეს არჩევანი მოქმედებს ამ სესიის განმავლობაში.
 Choose which saved connection to use for this database. This choice lasts for this session.	აირჩიეთ, რომელი შენახული კავშირი გამოიყენოთ ამ მონაცემთა ბაზისთვის. ეს არჩევანი მოქმედებს ამ სესიის განმავლობაში.
 Choose which tabs the ribbon shows.	აირჩიეთ, რომელი ჩანართები აჩვენოს ლენტმა.
+Choose…	აირჩიეთ…
 Circle	წრე
 Circle Radius (km)	წრის რადიუსი (კმ)
 Cities	ქალაქები
@@ -675,7 +696,6 @@ Clear the selection in every layer.	მონიშვნის მოხსნ�
 Clear the selection.	მონიშვნის მოხსნა.
 Clear Visibility Range	ხილვადობის დიაპაზონის გასუფთავება
 Click a feature, then drag its vertices · click an edge to add one	დააწკაპუნეთ ობიექტზე, შემდეგ გადაათრიეთ მისი წვეროები · წვეროს დასამატებლად დააწკაპუნეთ წიბოზე
-Click a pixel on the map	დააწკაპუნეთ პიქსელზე რუკაზე
 Click a point on the map	დააწკაპუნეთ წერტილზე რუკაზე
 Click a source to add it, or to open its browser connected. Right-click for favourites.	დააწკაპუნეთ წყაროზე მის დასამატებლად ან ბრაუზერში დაკავშირებულად გასახსნელად. მარჯვენა წკაპით — რჩეულები.
 Click or drag a box to select features. Shift adds, Ctrl removes.	დააწკაპუნეთ ან გაავლეთ ჩარჩო ობიექტების მოსანიშნად. Shift ამატებს, Ctrl აკლებს.
@@ -689,6 +709,7 @@ Click the map to place a point	დააწკაპუნეთ რუკაზ
 Click the map to place text	დააწკაპუნეთ რუკაზე ტექსტის განსათავსებლად
 Click the map to place text.	დააწკაპუნეთ რუკაზე ტექსტის განსათავსებლად.
 Click the map to trace a point	დააწკაპუნეთ რუკაზე წერტილის საკვლევად
+Click the map · Esc cancels	დააწკაპუნეთ რუკაზე · Esc აუქმებს
 Click the map: {n} of {total}	დააწკაპუნეთ რუკაზე: {n} / {total}
 Click the observer on the map	დააწკაპუნეთ რუკაზე დამკვირვებლის ადგილას
 Click the observer, then the target	დააწკაპუნეთ დამკვირვებელზე, შემდეგ სამიზნეზე
@@ -724,6 +745,7 @@ Close Others	დანარჩენების დახურვა
 Close Table	ცხრილის დახურვა
 Close table	ცხრილის დახურვა
 Close the connection that PostGIS layers loaded for editing save through.	იმ კავშირის დახურვა, რომლითაც რედაქტირებისთვის ჩატვირთული PostGIS ფენები ინახება.
+Close the current dialog before reloading a layer with pending edits.	დაუსრულებელი ცვლილებების მქონე ფენის გადატვირთვამდე დახურეთ მიმდინარე დიალოგი.
 Close the layout and show the map.	განლაგების დახურვა და რუკის ჩვენება.
 Close the time slider (it stays on; Time Slider opens it again).	დროის სლაიდერის დახურვა (ჩართული რჩება; „დროის სლაიდერი“ მას ხელახლა გახსნის).
 Close thread	თემის დახურვა
@@ -853,10 +875,12 @@ Corrections	შესწორებები
 Cost	ღირებულება
 could not draw the layout	განლაგების დახატვა ვერ მოხერხდა
 could not draw the map	რუკის დახატვა ვერ მოხერხდა
+Could not start service discovery: {error}	სერვისების აღმოჩენის დაწყება ვერ მოხერხდა: {error}
 could not start the keychain worker	გასაღებების საცავის დამმუშავებლის გაშვება ვერ მოხერხდა
 Couldn't check for updates: {error}	განახლებების შემოწმება ვერ მოხერხდა: {error}
 Couldn't download the font for {language}; pick the language again to retry.	{language}-ის შრიფტის ჩამოტვირთვა ვერ მოხერხდა; ხელახლა სცადეთ ენის არჩევით.
 Couldn't download the update: {error}	განახლების ჩამოტვირთვა ვერ მოხერხდა: {error}
+Couldn't download the {view} worldview ({error}); the map keeps the {current} borders	{view} მსოფლმხედველობის ჩამოტვირთვა ვერ მოხერხდა ({error}); რუკა ინარჩუნებს {current} საზღვრებს
 Couldn't install the update: {error}	განახლების ინსტალაცია ვერ მოხერხდა: {error}
 Couldn't load the plugin registry: {error}	დანამატების რეესტრის ჩატვირთვა ვერ მოხერხდა: {error}
 Counterclockwise	საათის ისრის საწინააღმდეგოდ
@@ -883,6 +907,7 @@ Creates a point inside each input feature.	თითოეულ შემავ
 Creates points at a set distance along each line, or each polygon ring.	ქმნის წერტილებს მოცემული მანძილით თითოეული ხაზის ან პოლიგონის თითოეული რგოლის გასწვრივ.
 Creates points from a table's x and y coordinate fields.	წერტილების შექმნა ცხრილის x და y კოორდინატების ველებიდან.
 Creates polygons around input features at a given distance.	შემავალი ობიექტების გარშემო პოლიგონების შექმნა მოცემულ მანძილზე.
+Credit: {credit}	ავტორი: {credit}
 Cross Section	განივი ჭრილი
 Cross Section (2 clicks)	განივი ჭრილი (2 დაწკაპუნება)
 CSV	CSV
@@ -957,6 +982,7 @@ Definition\nQuery	განსაზღვრის\nმოთხოვნა
 Definition Query	განსაზღვრის მოთხოვნა
 Definition query	განსაზღვრის მოთხოვნა
 Definition Query…	განსაზღვრის მოთხოვნა…
+Degrees	გრადუსები
 degrees, minutes and seconds	გრადუსები, წუთები და წამები
 Delete	წაშლა
 Delete (or Backspace)	Delete (ან Backspace)
@@ -989,6 +1015,7 @@ Delimited Text…	გამყოფიანი ტექსტი…
 Delimiter	გამყოფი
 Density	სიმჭიდროვე
 Depth Priority	სიღრმის პრიორიტეტი
+Depth priority	სიღრმის პრიორიტეტი
 Descending	კლებადობით
 Describing {name}	{name} აღიწერება
 Description	აღწერა
@@ -996,6 +1023,7 @@ Desktop and command line only	მხოლოდ დესკტოპ აპლ
 Destination	დანიშნულება
 Destination key	დანიშნულების გასაღები
 Destinations ({operation}): {places}	დანიშნულებები ({operation}): {places}
+Detail	დეტალურობა
 Details	დეტალები
 Details of the selected layer.	არჩეული ფენის დეტალები.
 Details…	დეტალები…
@@ -1015,7 +1043,9 @@ Directions	მარშრუტი
 Directions From Here	მარშრუტი აქედან
 Directions To Here	მარშრუტი აქამდე
 Directions use an external routing server	მარშრუტისთვის გამოიყენება გარე მარშრუტიზაციის სერვერი
+Disable Extension	გაფართოების გამორთვა
 Discard	უარყოფა
+Discard Edits and Reload	ცვლილებების გაუქმება და გადატვირთვა
 Discard GeoPackage Edits	GeoPackage-ის რედაქტირებების უარყოფა
 Discard GeoPackage Edits…	GeoPackage-ის რედაქტირებების უარყოფა…
 discard is true or false	discard არის true ან false
@@ -1049,6 +1079,7 @@ Documents	Documents
 Domains	დომენები
 Don't Save	არ შეინახო
 Done	მზადაა
+Done.	დასრულდა.
 Dotted	პუნქტირი
 Double	ორმაგი
 Double-click	ორმაგი დაწკაპუნება
@@ -1059,9 +1090,10 @@ Download and Install	ჩამოტვირთვა და ინსტალ
 Download it again and load it.	ხელახლა ჩამოტვირთეთ და ჩატვირთეთ.
 Download its features in the view (up to the server's limit)	მისი ობიექტების ჩამოტვირთვა ხედში (სერვერის ლიმიტამდე)
 Download Map	რუკის ჩამოტვირთვა
+Download offered: {name}	შემოთავაზებულია ჩამოტვირთვა: {name}
+Download offered: {name}. The browser doesn't say whether it saved the file.	შემოთავაზებულია ჩამოტვირთვა: {name}. ბრაუზერი არ აცხადებს, შეინახა თუ არა ფაილი.
 Download OpenStreetMap Data	OpenStreetMap-ის მონაცემების ჩამოტვირთვა
 Download the GeoLibre runner	GeoLibre-ის გამშვების ჩამოტვირთვა
-Downloaded {name}	ჩამოიტვირთა {name}
 Downloading {url}…	{url}-ის ჩამოტვირთვა…
 Downloading: {done} MB	ჩამოიტვირთება: {done} MB
 Downloading: {done} of {total} MB	ჩამოიტვირთება: {done} / {total} MB
@@ -1071,6 +1103,7 @@ Downloading… {name}	ჩამოიტვირთება… {name}
 DRA	DRA
 Drag / middle-drag	გადათრევა / შუა ღილაკით გადათრევა
 Drag a box	გაავლეთ ჩარჩო
+Drag a box on the map · Esc cancels	გადაათრიეთ ყუთი რუკაზე · Esc აუქმებს
 Drag a box or click to zoom in	გაავლეთ ჩარჩო ან დააწკაპუნეთ გასადიდებლად
 Drag a box to draw an ellipse.	გაავლეთ ჩარჩო ელიფსის დასახატად.
 Drag a box to zoom into.	გაავლეთ ჩარჩო გასადიდებელ არეზე.
@@ -1157,6 +1190,7 @@ e.g. continent = 'Europe'	მაგ. continent = 'Europe'
 e.g. pop_est > 100000000 AND continent = 'Asia'	მაგ. pop_est > 100000000 AND continent = 'Asia'
 e.g. pop_max > 1000000	მაგ. pop_max > 1000000
 Each class labels the features its own clause matches, so a feature can get a label from more than one.	თითოეული კლასი აწერს წარწერას იმ ობიექტებს, რომლებსაც მისი პირობა შეესაბამება, ამიტომ ობიექტმა შეიძლება წარწერა ერთზე მეტი კლასიდან მიიღოს.
+Each click on the map adds a point, until you click this again.	რუკაზე თითოეული დაწკაპუნება წერტილს ამატებს, სანამ ამას ხელახლა არ დააწკაპუნებთ.
 Each geoprocessing run becomes a step, chained by its outputs	გეოდამუშავების ყოველი გაშვება ხდება საფეხური და ერთმანეთს გამოსავლებით უკავშირდება
 Each line's whole result, to read or copy	თითოეული სტრიქონის სრული შედეგი, წასაკითხად ან დასაკოპირებლად
 Earth Index has no points in the view	Earth Index-ს ამ ხედში წერტილები არ აქვს
@@ -1204,6 +1238,7 @@ Edits since the project was saved.	ცვლილებები პროე�
 Edits the project	ცვლის პროექტს
 Edit…	რედაქტირება…
 Effects	ეფექტები
+Egypt	ეგვიპტე
 Element	ელემენტი
 Element Properties	ელემენტის თვისებები
 Elevation	სიმაღლე
@@ -1217,6 +1252,7 @@ Empty	ცარიელი
 Empty Cache	ქეშის გასუფთავება
 Empty Index Cache	ინდექსის ქეშის დაცლა
 Empty the script and its results ({keys} brings the script back)	სკრიპტისა და მისი შედეგების დაცლა ({keys} სკრიპტს დააბრუნებს)
+Enable Extension	გაფართოების ჩართვა
 Enable Lighting	განათების ჩართვა
 Enable Plugin	დანამატის ჩართვა
 Enabled	ჩართულია
@@ -1243,6 +1279,7 @@ EPSG or ESRI code	EPSG ან ESRI კოდი
 EPSG:	EPSG:
 EPSG:2263	EPSG:2263
 EPSG:25832, WKT or a PROJ string; empty: the map's when projected, else the UTM zone at the frame's centre.	EPSG:25832, WKT ან PROJ სტრიქონი; ცარიელი: რუკისა, თუ პროეცირებულია, სხვა შემთხვევაში UTM ზონა ჩარჩოს ცენტრში.
+EPSG:32616	EPSG:32616
 EPSG:4326	EPSG:4326
 Equal	Equal
 Equal Earth	Equal Earth
@@ -1260,7 +1297,6 @@ ESRI	ESRI
 ESRI:	ESRI:
 Europe Equal Area (ETRS89 LAEA)	ევროპის ტოლფართობიანი (ETRS89 LAEA)
 every	ყოველ
-Every band's value at a pixel.	ყველა არხის მნიშვნელობა პიქსელში.
 Every editing tool.	ყველა რედაქტირების ხელსაწყო.
 Every label setting of this layer, in the Labeling pane.	ამ ფენის წარწერის ყველა პარამეტრი წარწერების პანელში.
 Every layer, as FEMA draws them	ყველა ფენა, ისე როგორც FEMA ხატავს
@@ -1287,6 +1323,7 @@ Export\nFeatures	ობიექტების\nექსპორტი
 Export\nLayout	განლაგების\nექსპორტი
 Export\nMap	რუკის\nექსპორტი
 Export\nRaster	რასტრის\nექსპორტი
+Export and print the layout's map frames to PDF with their coordinates, so PDF readers can locate and measure in them.	გამოიტანეთ და დაბეჭდეთ განლაგების რუკის ჩარჩოები PDF-ში მათი კოორდინატებით, რათა PDF-ის მკითხველებმა მათში მდებარეობის დადგენა და გაზომვა შეძლონ.
 Export Animation	ანიმაციის ექსპორტი
 Export Bookmarks	სანიშნეების ექსპორტი
 Export Bookmarks…	სანიშნეების ექსპორტი…
@@ -1331,6 +1368,9 @@ Exports a styled raster layer as Web Mercator PNG tiles in a PMTiles archive.	�
 Exports a vector layer as a Web Mercator vector-tile PMTiles archive.	ვექტორულ ფენას აექსპორტებს ვებ მერკატორის ვექტორული ფილების PMTiles არქივად.
 Export…	ექსპორტი…
 Expression	გამოსახულება
+Extensions	გაფართოებები
+Extensions are optional parts of RustGIS: nothing to download. Turn one off to hide its tab and commands.	გაფართოებები RustGIS-ის არჩევითი ნაწილებია: ჩამოსატვირთი არაფერია. გამორთეთ ერთი, რომ დაიმალოს მისი ჩანართი და ბრძანებები.
+Extensions…	გაფართოებები…
 Extent	ფარგლები
 Extent Indicator	ფარგლების ინდიკატორი
 extent is [minLon, minLat, maxLon, maxLat], "view" or null	ფარგლები არის [minLon, minLat, maxLon, maxLat], "view" ან null
@@ -1402,6 +1442,7 @@ file path	ფაილის მისამართი
 Files ({n})	ფაილები ({n})
 Fill	შევსება
 Fill Cache	ქეშის შევსება
+Fill in: {fields}	შეავსეთ: {fields}
 Fill Layers	შევსების ფენები
 Fill the cache whenever the projection changes.	ქეშის შევსება ყოველ ჯერზე, როცა პროექცია იცვლება.
 Fill {n}	შევსება {n}
@@ -1416,6 +1457,7 @@ Filter rows…	სტრიქონების გაფილტვრა…
 Find a place by coordinates, name, or address.	ადგილის პოვნა კოორდინატებით, სახელით ან მისამართით.
 Find and run geoprocessing tools.	გეოდამუშავების ხელსაწყოების პოვნა და გაშვება.
 Find any command by name (Ctrl+K).	ნებისმიერი ბრძანების პოვნა სახელით (Ctrl+K).
+Find each tile's file of every year; Add years shows them as one layer that follows the time slider	პოულობს ყველა წლის თითოეული ფილის ფაილს; „წლების დამატება“ მათ აჩვენებს ერთ ფენად, რომელიც მიჰყვება დროის სლაიდერს
 Find Items	ელემენტების პოვნა
 Find Place	ადგილის პოვნა
 Find plugins in the RustGIS plugin registry.	დანამატების პოვნა RustGIS-ის დანამატების რეესტრში.
@@ -1440,6 +1482,7 @@ Fix the problems listed below first	ჯერ გამოასწორეთ 
 Fixed	ფიქსირებული
 Fixed Zoom In	ფიქსირებული გადიდება
 Fixed Zoom Out	ფიქსირებული დაპატარავება
+Fixture	მოწყობილობა
 Flat	ბრტყელი
 FlatGeobuf	FlatGeobuf
 Flip Line	ხაზის შებრუნება
@@ -1449,6 +1492,7 @@ Folder	საქაღალდე
 Folder Connections	საქაღალდის კავშირები
 folder connections need the desktop app	საქაღალდის კავშირებისთვის საჭიროა დესკტოპ აპლიკაცია
 Folders	საქაღალდეები
+Folders reload only when you choose Reload Data; they are not watched.	საქაღალდეები იტვირთება ხელახლა მხოლოდ მაშინ, როცა აირჩევთ „მონაცემების გადატვირთვას“; მათზე დაკვირვება არ ხდება.
 Folder…	საქაღალდე…
 Follow the System	სისტემის მიხედვით
 Follow the time slider	დროის სლაიდერის მიყოლა
@@ -1463,6 +1507,7 @@ Forget Saved Password	შენახული პაროლის დავ�
 Forget this plugin: the app stops trying to load it at start.	ამ დანამატის დავიწყება: აპლიკაცია აღარ შეეცდება მის ჩატვირთვას გაშვებისას.
 Format	ფორმატი
 Found: {names}. An agent works on this map through RustGIS's tools and with its own (web, scripts, files) in a folder of its own, kept in Documents › RustGIS › Agent work. It asks you before each action.	მოიძებნა: {names}. აგენტი ამ რუკაზე მუშაობს RustGIS-ის ხელსაწყოებით და საკუთარით (ვები, სკრიპტები, ფაილები), საკუთარ საქაღალდეში, რომელიც ინახება აქ: დოკუმენტები › RustGIS › Agent work. ყოველი მოქმედების წინ გეკითხებათ.
+Fr	პა
 Frame rate	კადრების სიხშირე
 Frame rate, draw time, data size and memory.	კადრების სიხშირე, ხატვის დრო, მონაცემთა ზომა და მეხსიერება.
 France	საფრანგეთი
@@ -1516,8 +1561,10 @@ GeoParquet	GeoParquet
 Geoprocessing	გეოდამუშავება
 Geoprocessing history.	გეოდამუშავების ისტორია.
 Georeference	გეორეფერენცირება
+Georeference PDF	PDF-ის გეოდამაგრება
 Geostatistical Wizard	გეოსტატისტიკური ოსტატი
 GeoTIFF	GeoTIFF
+Germany	გერმანია
 Get a key	გასაღების მიღება
 Get it	მიღება
 GitHub	GitHub
@@ -1532,6 +1579,7 @@ Give the file's web address	მიუთითეთ ფაილის ვე�
 Give the service's web address	მიუთითეთ სერვისის ვებ მისამართი
 give the text's layer and row, or the lon and lat to place one	მიუთითეთ ტექსტის ფენა და სტრიქონი, ან ახლის განსათავსებლად გრძედი და განედი
 given up before its read began: its project was closed, or more than 64 downloads started after it	მიტოვებულია წაკითხვის დაწყებამდე: მისი პროექტი დაიხურა ან მის შემდეგ 64-ზე მეტი ჩამოტვირთვა დაიწყო
+given up during its read: its project was closed, or more than 64 downloads started after it	მისი წაკითხვისას მიტოვებულია: მისი პროექტი დაიხურა ან მის შემდეგ 64-ზე მეტი ჩამოტვირთვა დაიწყო
 Global	გლობალური
 Globe	გლობუსი
 Go	გადასვლა
@@ -1559,6 +1607,7 @@ Graphics	გრაფიკა
 Graphics and Text	გრაფიკა და ტექსტი
 Graphics Layer	გრაფიკული ფენა
 Graticule	გრატიკულა
+Greece	საბერძნეთი
 Green	მწვანე
 Greys	ნაცრისფერი
 Grid	ბადე
@@ -1610,6 +1659,7 @@ Hide values outside a range	დიაპაზონის გარეთ მ�
 Hide walls facing away from you.	თქვენგან გამოსულ მიმართულებით მდებარე კედლების დამალვა.
 Hides fields scoring below this. The score is the model's mean field probability × 100, a ranking rather than a calibrated probability.	მალავს ამაზე დაბალი ქულის მქონე მინდვრებს. ქულა არის მოდელის მინდვრის საშუალო ალბათობა × 100; ეს რანჟირებაა და არა კალიბრებული ალბათობა.
 High values of the first raster and low values of the second score best.	პირველი რასტრის მაღალი და მეორეს დაბალი მნიშვნელობები ყველაზე მაღალ ქულას იღებს.
+Higher draws on top of lower, whatever the layer order	მაღალი დაიხატება დაბალზე ზემოთ, ფენების რიგის მიუხედავად
 Highways	მაგისტრალები
 Histogram Equalize	ჰისტოგრამის გათანაბრება
 Histograms and correlations	ჰისტოგრამები და კორელაციები
@@ -1630,6 +1680,8 @@ host=localhost dbname=gis user=postgres	host=localhost dbname=gis user=postgres
 host=… dbname=… user=…	host=… dbname=… user=…
 Hosted Imagery	ჰოსტინგული გამოსახულება
 Hour	საათი
+How dark the shadows the terrain casts are, from 0 (none) to 1, for the sun set above	რამდენად მუქია რელიეფით დაცემული ჩრდილები, 0-დან (არ არის) 1-მდე, დაყენებული მზისთვის
+How far the label sits from the line, to the text's nearest edge; 0 is on the line.	რამდენად შორს არის ეტიკეტი ხაზიდან, ტექსტის უახლოეს კიდემდე; 0 ხაზზეა.
 How much of each zone each class of polygons covers, with the classes' totals shared out to the zones by area.	რა ნაწილს ფარავს პოლიგონების თითოეული კლასი თითოეულ ზონაში; კლასების ჯამები ზონებზე ნაწილდება ფართობის მიხედვით.
 How often RustGIS keeps a copy of unsaved work, to offer it back after a crash.	რამდენად ხშირად ინახავს RustGIS შეუნახავი სამუშაოს ასლს, რომ ავარიის შემდეგ შემოგთავაზოთ.
 How the layer's colours combine with the tile layers and basemap beneath.	როგორ ერწყმის ფენის ფერები ქვემოთ მყოფ ფილების ფენებსა და საბაზისო რუკას.
@@ -1714,7 +1766,9 @@ Indent	შეწევა
 Indent Group	ჯგუფის შეწევა
 Indent Layer	ფენის შეწევა
 Indexes	ინდექსები
+India	ინდოეთი
 Indices	ინდექსები
+Indonesia	ინდონეზია
 Info	ინფორმაცია
 Infographics	ინფოგრაფიკები
 Information	ინფორმაცია
@@ -1733,6 +1787,7 @@ Input Table	შემავალი ცხრილი
 Input Zone Features	შემავალი ზონის ობიექტები
 Insert	ჩასმა
 Insert Dynamic Text	დინამიკური ტექსტის ჩასმა
+Inserts: {inserts}; updates: {updates}; deletes: {deletes}.	ჩამატებები: {inserts}; განახლებები: {updates}; წაშლები: {deletes}.
 Inspect	შემოწმება
 Install	ინსტალაცია
 Install a plugin	დანამატის ინსტალაცია
@@ -1779,6 +1834,7 @@ Invert color scheme	ფერთა სქემის ინვერსია
 Invert the selection.	მონიშვნის ინვერსია.
 IS	IS
 IS NULL	IS NULL
+Israel	ისრაელი
 It can't run in a script	მისი სკრიპტში გაშვება შეუძლებელია
 it changed since it was installed: install it again from the Plugin Manager	ინსტალაციის შემდეგ შეიცვალა: ხელახლა დააინსტალირეთ დანამატების მენეჯერიდან
 it connects to an address on the internet	ის უკავშირდება ინტერნეტის მისამართს
@@ -1794,19 +1850,30 @@ it replaces the open project	ის ცვლის ღია პროექტ
 it runs a plugin's command	ის უშვებს დანამატის ბრძანებას
 It runs in a sandbox with no other access to your computer or the network.	ის მუშაობს იზოლირებულ გარემოში და თქვენს კომპიუტერსა თუ ქსელზე სხვა წვდომა არ აქვს.
 It runs: {program}	ის უშვებს: {program}
+It stopped without an answer: see the notices.	შეჩერდა პასუხის გარეშე: იხილეთ შეტყობინებები.
 It was never saved: it opens unsaved, and Save asks where to write it.	ის არასოდეს შენახულა: შეუნახავად იხსნება და შენახვა იკითხავს, სად ჩაიწეროს.
 It's in the Symbology pane, open on the step's layer.	ის სიმბოლიზაციის პანელშია, რომელიც საფეხურის ფენაზეა გახსნილი.
 It's installed but turned off: turn it on in the Plugin Manager.	ის დაინსტალირებულია, მაგრამ გამორთულია: ჩართეთ დანამატების მენეჯერში.
 It's too large to keep in the browser: install it again on your next visit.	ბრაუზერში შესანახად ძალიან დიდია; შემდეგ ვიზიტზე ხელახლა დააყენეთ.
 Italic	დახრილი
+Italy	იტალია
 Item Pop-ups	ელემენტის ამომხტარი ფანჯრები
 Item {id}	ელემენტი {id}
 its copy kept in the browser is damaged: {error}	ბრაუზერში შენახული ასლი დაზიანებულია: {error}
+its data or pending edits changed; confirm Reload Data again	მისი მონაცემები ან დაუსრულებელი ცვლილებები შეიცვალა; დაადასტურეთ „მონაცემების გადატვირთვა“ ხელახლა
+its data source changed	მისი მონაცემთა წყარო შეიცვალა
 its default	მისი ნაგულისხმევი
 Its default: {default}. Its times: {times}	მისი ნაგულისხმევი: {default}. მისი დროები: {times}
 Its firewall ({firewall}) blocked RustGIS. The service may only allow some applications: contact its administrator and send them the details below.	მისმა ფაიერვოლმა ({firewall}) დაბლოკა RustGIS. სერვისი შესაძლოა მხოლოდ ზოგიერთ აპლიკაციას უშვებდეს: დაუკავშირდით მის ადმინისტრატორს და გაუგზავნეთ ქვემოთ მოცემული დეტალები.
 its layer was removed	მისი ფენა წაიშალა
+its tile archive changed or was removed	მისი ფილების არქივი შეიცვალა ან წაიშალა
 Its tool isn't available now (a plugin's, not loaded, or a suite's, not installed)	მისი ხელსაწყო ახლა მიუწვდომელია (მოდულის, რომელიც არ არის ჩატვირთული, ან ნაკრების, რომელიც არ არის დაყენებული)
+Japan	იაპონია
+JAXA Earth's catalog couldn't be read: {why}	JAXA Earth-ის კატალოგის წაკითხვა ვერ მოხერხდა: {why}
+JAXA Earth: {cubes} cubes from its catalog; {left} of its {datasets} datasets are left out (hover for why)	JAXA Earth: მისი კატალოგიდან {cubes} კუბი; მისი {datasets} მონაცემთა ნაკრებიდან {left} გამოტოვებულია (მიზეზისთვის მიიტანეთ კურსორი)
+JAXA Earth: {n} of its catalog's texts are cut or not read (hover for which)	JAXA Earth: მისი კატალოგის {n} ტექსტი შეკვეცილია ან არ არის წაკითხული (რომელი, იხილეთ კურსორის მიტანით)
+JAXA Earth: {n} of its cubes have the id of one of the list's own and are left out (hover for which)	JAXA Earth: მისი {n} კუბის id ემთხვევა სიის საკუთარი კუბებიდან ერთ-ერთს და გამოტოვებულია (რომელი, იხილეთ კურსორის მიტანით)
+JAXA's terms	JAXA-ს პირობები
 Jobs	სამუშაოები
 JOIN	JOIN
 Join	შეერთება
@@ -1895,6 +1962,9 @@ Layer Extrusion	ფენის ამოწევა
 Layer File	ფენის ფაილი
 Layer From\nSelection	ფენა\nმონიშვნიდან
 Layer not found	ფენა ვერ მოიძებნა
+Layer Properties	ფენის თვისებები
+Layer Properties Pane	ფენის თვისებების პანელი
+Layer Properties · {layer}	ფენის თვისებები · {layer}
 Layer Template	ფენის შაბლონი
 Layer Templates	ფენის შაბლონები
 layer {id}	ფენა {id}
@@ -1923,6 +1993,7 @@ Let your Agents Control RustGIS	მიეცით თქვენს აგე�
 Letter spacing	ასოებს შორის ინტერვალი
 Level	დონე
 Library	ბიბლიოთეკა
+Licence	ლიცენზია
 Light	ღია
 Light and Shadow	სინათლე და ჩრდილი
 Light the extruded shapes from the north-west.	ამოზნექილი ფორმების განათება ჩრდილო-დასავლეთიდან.
@@ -2047,6 +2118,7 @@ Manage Edits	რედაქტირებების მართვა
 Manage Templates	შაბლონების მართვა
 Mann–Kendall	მან–კენდალი
 Manual	ხელით
+Manually reread this archive from disk without changing its presentation. Undo cannot restore overwritten file contents.	ხელით ხელახლა წაიკითხეთ ეს არქივი დისკიდან მისი წარმოდგენის შეცვლის გარეშე. გაუქმებას არ შეუძლია გადაწერილი ფაილის შიგთავსის აღდგენა.
 Map	რუკა
 Map\nFrame	რუკის\nჩარჩო
 Map (the current view)	რუკა (მიმდინარე ხედი)
@@ -2117,6 +2189,7 @@ Merge	გაერთიანება
 Merge elevation rasters into a surface model and export a 3D mesh.	სიმაღლის რასტრების გაერთიანება ზედაპირის მოდელად და 3D მესის ექსპორტი.
 Merge Rules	გაერთიანების წესები
 Merges polygons that share a field value into one feature per value.	ერთი ველის მნიშვნელობის მქონე პოლიგონების გაერთიანება თითო ობიექტად თითო მნიშვნელობაზე.
+Messages	შეტყობინებები
 Messages and failed requests from this session. Oldest entries are discarded when the history is full.	ამ სესიის შეტყობინებები და წარუმატებელი მოთხოვნები. ისტორიის შევსებისას უძველესი ჩანაწერები იშლება.
 Messages appear here.	შეტყობინებები აქ გამოჩნდება.
 Meters	მეტრი
@@ -2138,6 +2211,7 @@ Minutes	წუთი
 minutes ago	წუთის წინ
 minutes is a whole number from 0 (off) to 60	minutes არის მთელი რიცხვი 0-დან (გამორთული) 60-მდე
 Miter	წვეტიანი
+Mo	ორ
 Mobile Map	მობილური რუკა
 Mod+	Mod+
 Mod+A	Mod+A
@@ -2176,6 +2250,7 @@ Months are numbers from 1 to 12 (12, 1, 2 for December to February)	თვეე
 More	მეტი
 More basemaps:	მეტი საბაზისო რუკა:
 More than one saved connection could read these buckets. Choose the one that reads each; the project's sources that read it stay closed until you do.	ამ ბაკეტების წაკითხვა ერთზე მეტ შენახულ კავშირს შეუძლია. აირჩიეთ ის, რომელიც თითოეულს კითხულობს; პროექტის წყაროები, რომლებიც მას კითხულობს, დახურული დარჩება, სანამ ამას არ გააკეთებთ.
+Morocco	მაროკო
 Mosaic images into an orthomosaic	სურათების მოზაიკა ორთომოზაიკად
 Mosaic Rasters	რასტრების მოზაიკა
 Mosaic the visible rasters into an orthomosaic.	ხილული რასტრების მოზაიკა ორთომოზაიკად.
@@ -2215,6 +2290,7 @@ MySQL/MariaDB	MySQL/MariaDB
 N/S/E/W	N/S/E/W
 Name	სახელი
 name the plugin whose panel to open: {"id": plugin id}	მიუთითეთ მოდული, რომლის პანელიც უნდა გაიხსნას: {"id": plugin id}
+Names keep up to 200 characters.	სახელები ინახავს 200 სიმბოლომდე.
 NASA Earthaccess	NASA Earthaccess
 NASA Earthaccess…	NASA Earthaccess…
 NASA Earthdata	NASA Earthdata
@@ -2226,6 +2302,7 @@ NASA's Global Imagery Browse Services (GIBS): over a thousand layers of satellit
 Natural Breaks (Jenks)	ბუნებრივი შესვენებები (ჯენკსი)
 Natural Color (1, 2, 3)	ბუნებრივი ფერები (1, 2, 3)
 Natural Earth	Natural Earth
+Natural Earth's 1:10m borders with every island, a larger download (about 3 MB, 10 MB unpacked)	Natural Earth-ის 1:10m საზღვრები ყველა კუნძულით, უფრო დიდი ჩამოტვირთვა (დაახლოებით 3 MB, გაშლილი 10 MB)
 Natural Earth's public domain map data (countries, states, coastlines, rivers, lakes, roads and more) on Source Cooperative. PMTiles are added as tile layers, other files as layers.	Natural Earth-ის საჯარო საკუთრებაში არსებული რუკის მონაცემები (ქვეყნები, შტატები, სანაპირო ზოლები, მდინარეები, ტბები, გზები და სხვა) Source Cooperative-ზე. PMTiles ემატება ფილების ფენებად, სხვა ფაილები კი ფენებად.
 Natural Earth…	Natural Earth…
 Navigate	ნავიგაცია
@@ -2242,6 +2319,8 @@ Neatline	შემომსაზღვრელი ჩარჩო
 Needs three or more bands.	საჭიროა სამი ან მეტი არხი.
 Needs two or more numeric fields.	საჭიროა ორი ან მეტი რიცხვითი ველი.
 Neighborhood Explorer	უბნის მკვლევარი
+Nepal	ნეპალი
+Netherlands	ნიდერლანდები
 Network	ქსელი
 Network Analysis	ქსელური ანალიზი
 Network failures	ქსელის შეცდომები
@@ -2286,6 +2365,7 @@ New Workspace From Visible Rasters	ახალი სამუშაო სი�
 Next	შემდეგი
 Next Coordinate Format	შემდეგი კოორდინატების ფორმატი
 Next Extent	შემდეგი ფარგლები
+Next month	შემდეგი თვე
 Next Page	შემდეგი გვერდი
 NLDI result cleared.	NLDI-ის შედეგი გასუფთავდა.
 NLDI returned no plottable navigation source.	NLDI-მ ასაგები სანავიგაციო წყარო არ დააბრუნა.
@@ -2299,6 +2379,7 @@ No catalogs below this one: Find Items lists its items	ამის ქვემ
 No COMID was returned for this point.	ამ წერტილისთვის COMID არ დაბრუნდა.
 no command	ბრძანება არ არის
 No command matches	შესაბამისი ბრძანება არ არის
+no data	მონაცემების გარეშე
 No data at the points picked.	არჩეულ წერტილებში მონაცემები არ არის.
 No data cube matches	შესაბამისი მონაცემთა კუბი არ არის
 No datasets match.	შესაბამისი მონაცემთა ნაკრებები არ არის.
@@ -2371,6 +2452,7 @@ North\nArrow	ჩრდილოეთის\nისარი
 North Polar Stereographic	ჩრდილოეთის პოლარული სტერეოგრაფიული
 NOT	NOT
 Not a GeoLibre project	არ არის GeoLibre-ის პროექტი
+Not a number: {fields}	არ არის რიცხვი: {fields}
 not a picture	სურათი არ არის
 not a RustGIS layout	ეს RustGIS-ის განლაგება არ არის
 not a RustGIS project	არ არის RustGIS-ის პროექტი
@@ -2423,9 +2505,11 @@ Ollama (local)	Ollama (ლოკალური)
 On	ჩართულია
 On Hold	შეჩერებულია
 on hold	შეჩერებულია
+On its own tab, {tab}.	საკუთარ ჩანართზე, {tab}.
 on must be true or false	on უნდა იყოს true ან false
 On the desktop, the key can also come from {vars}.	დესკტოპზე გასაღები შეიძლება მოვიდეს {vars}-იდანაც.
 On the map	რუკაზე
+On the Plugins tab.	„დანამატების“ ჩანართზე.
 On-screen compass, zoom slider and pan pad.	ეკრანზე კომპასი, გადიდების სლაიდერი და გადაწევის პანელი.
 One command per line: id {json}. Lines starting with # are comments.	თითო ბრძანება თითო ხაზზე: id {json}. # ნიშნით დაწყებული ხაზები კომენტარებია.
 One DuckDB SELECT: DuckDB Spatial's ST_ functions, files and web addresses (read_parquet('…')), and the tables of the database below. Ctrl+Enter runs it.	ერთი DuckDB SELECT: DuckDB Spatial-ის ST_ ფუნქციები, ფაილები და ვებ მისამართები (read_parquet('…')) და ქვემოთ მოცემული მონაცემთა ბაზის ცხრილები. Ctrl+Enter უშვებს მას.
@@ -2442,6 +2526,7 @@ Only cubes with data where the map is	მხოლოდ კუბები მ�
 Only features matching this expression draw in {layer}.	{layer}-ში მხოლოდ ამ გამოსახულების შესაბამისი ობიექტები იხატება.
 Only selected polygons will be included in the output.	გამოსავალში მხოლოდ მონიშნული პოლიგონები შევა.
 Only the commands run in the project open now	მხოლოდ ახლა გახსნილ პროექტში გაშვებული ბრძანებები
+Only the first {kept} of the {given} nodes the plugin gave are shown: a tree holds at most {kept}.	დანამატის მიერ მოცემული {given} კვანძიდან ნაჩვენებია მხოლოდ პირველი {kept}: ხე იტევს მაქსიმუმ {kept}-ს.
 Only the map's area	მხოლოდ რუკის არეალი
 Only where the map is	მხოლოდ რუკის არეალში
 Opacity	გამჭვირვალობა
@@ -2458,13 +2543,13 @@ Open Custom Template	მორგებული შაბლონის გა
 Open data catalogs registered with Portolan: pick a publisher's catalog, then Find Items for its collections.	Portolan-ში რეგისტრირებული ღია მონაცემების კატალოგები: აირჩიეთ გამომცემლის კატალოგი, შემდეგ „ელემენტების პოვნა“ მისი კოლექციებისთვის.
 Open data catalogues searched by text. Files are added by their address (read in place when they can be); a service opens Add From Service to pick its layer.	ღია მონაცემთა კატალოგები ტექსტით ძიებით. ფაილები ემატება მათი მისამართით (ადგილზე იკითხება, როცა შესაძლებელია); სერვისი ხსნის „დამატება სერვისიდან“-ს მისი ფენის ასარჩევად.
 Open data products on Source Cooperative. GeoParquet, FlatGeobuf, cloud-optimised GeoTIFFs and PMTiles are read in place; other files are downloaded.	ღია მონაცემთა პროდუქტები Source Cooperative-ზე. GeoParquet, FlatGeobuf, ღრუბლისთვის ოპტიმიზებული GeoTIFF-ები და PMTiles ადგილზე იკითხება; სხვა ფაილები ჩამოიტვირთება.
-Open Diagnostics	დიაგნოსტიკის გახსნა
 Open folder	საქაღალდის გახსნა
 Open In Geoprocessing…	გეოდამუშავებაში გახსნა…
 Open in ModelBuilder	ModelBuilder-ში გახსნა
 Open in Script Pane	სკრიპტის პანელში გახსნა
 Open in Tool	ხელსაწყოში გახსნა
 Open Layout	განლაგების გახსნა
+Open Messages	შეტყობინებების გახსნა
 Open ModelBuilder	ModelBuilder-ის გახსნა
 Open Notebook	რვეულის გახსნა
 Open Offline Map	ოფლაინ რუკის გახსნა
@@ -2484,6 +2569,7 @@ Open the RustGIS user guide.	RustGIS-ის მომხმარებლის
 Open the selected layer's table.	არჩეული ფენის ცხრილის გახსნა.
 Open the Symbology pane.	სიმბოლიზაციის პანელის გახსნა.
 Open the task's steps	ამოცანის საფეხურების გახსნა
+Open the {tab} tab	{tab} ჩანართის გახსნა
 Open this granule in Earthdata Search	ამ გრანულის გახსნა Earthdata Search-ში
 Open {code} on epsg.io	{code}-ის გახსნა epsg.io-ზე
 Open, save and create projects	პროექტების გახსნა, შენახვა და შექმნა
@@ -2521,6 +2607,7 @@ Ordinary Kriging	ჩვეულებრივი კრიგინგი
 Orientation	ორიენტაცია
 Origin	საწყისი
 Origin key	საწყისი გასაღები
+Original	ორიგინალი
 Ortho Mapping	ორთოგრაფიული რუკების შედგენა
 Other	სხვა
 Other copies of unsaved work will be offered at the next start ({n}).	შეუნახავი სამუშაოს სხვა ასლებს შემდეგი გაშვებისას შემოგთავაზებთ ({n}).
@@ -2573,6 +2660,8 @@ Page title	გვერდის სათაური
 Page {n} of {total}	გვერდი {n} / {total}
 Page {n} of {total}: {name}	გვერდი {n} / {total}: {name}
 Pages of maps, text, images and videos, shown one after another.	რუკების, ტექსტის, სურათებისა და ვიდეოების გვერდები, რომლებიც ერთმანეთის მიყოლებით ჩანს.
+Pakistan	პაკისტანი
+Palestine	პალესტინა
 Pan	გადაწევა
 Pan (Explore) · any tool	გადაწევა (შესწავლა) · ნებისმიერი ხელსაწყო
 Pan and Zoom Map	რუკის გადაწევა და მასშტაბირება
@@ -2609,6 +2698,7 @@ Perceptually Uniform	აღქმით თანაბარი
 Performance	წარმადობა
 Phase	ფაზა
 Photon	Photon
+Pick a date	აირჩიეთ თარიღი
 Pick a live value, such as the scale or date, then click the map to place it.	აირჩიეთ ცოცხალი მნიშვნელობა, მაგალითად მასშტაბი ან თარიღი, შემდეგ განსათავსებლად დააწკაპუნეთ რუკაზე.
 Pick a Point	წერტილის არჩევა
 Pick a point on the map to see the variable's values through time there.	აირჩიეთ წერტილი რუკაზე, რომ ნახოთ იქ ცვლადის მნიშვნელობები დროში.
@@ -2616,8 +2706,16 @@ Pick a route in the list, or click a grey route on the map.	აირჩიე�
 Pick a single layer.	აირჩიეთ ერთი ფენა.
 Pick it on the map	რუკაზე არჩევა
 Pick one…	აირჩიეთ…
+Pick Points	წერტილების არჩევა
+Pick points on the map, or click a pixel with Explore and press Spectral Profile in its pop-up, to chart every band there.	აირჩიეთ წერტილები რუკაზე ან დააწკაპუნეთ პიქსელზე „შესწავლით“ და დააჭირეთ „სპექტრულ პროფილს“ მის ამომხტარ ფანჯარაში, რომ იქ ყველა არხის დიაგრამა ნახოთ.
 Pick the GeoPackage next. Its other tables are kept.	შემდეგ აირჩიეთ GeoPackage. მისი სხვა ცხრილები შენარჩუნდება.
 Picture	სურათი
+Picture unavailable: not a picture	სურათი მიუწვდომელია: ეს არ არის სურათი
+Picture unavailable: pictures aren't fetched from this computer or the local network	სურათი მიუწვდომელია: სურათები არ მოიძიება ამ კომპიუტერიდან ან ლოკალური ქსელიდან
+Picture unavailable: that address is never fetched	სურათი მიუწვდომელია: ამ მისამართიდან არასდროს ხდება მოძიება
+Picture unavailable: {format} pictures aren't supported	სურათი მიუწვდომელია: {format} სურათები არ არის მხარდაჭერილი
+Picture unavailable: {reason}	სურათი მიუწვდომელია: {reason}
+Picture unavailable: {w} × {h} pixels is larger than {max} × {max}	სურათი მიუწვდომელია: {w} × {h} პიქსელი აღემატება {max} × {max}-ს
 Pictures	სურათები
 Pictures, attachments and chart	სურათები, დანართები და დიაგრამა
 Pie	წრიული
@@ -2629,7 +2727,6 @@ Pivot Table	კრებსითი ცხრილი
 Pixel	პიქსელი
 Pixel Editor	პიქსელის რედაქტორი
 Pixel Size	პიქსელის ზომა
-Pixel Size (°)	პიქსელის ზომა (°)
 Pixel type	პიქსელის ტიპი
 Place	ადგილი
 Place a raster on the map	რასტრის განთავსება რუკაზე
@@ -2653,6 +2750,7 @@ Plotted {n} {source} features.	აიგო {n} {source} ობიექტი.
 Plugin	მოდული
 Plugin\nManager	დანამატების\nმენეჯერი
 Plugin folder	დანამატების საქაღალდე
+plugin is required	საჭიროა დანამატი
 Plugin Manager	დანამატების მენეჯერი
 Plugin Manager…	დანამატების მენეჯერი…
 Plugin Panel State	მოდულის პანელის მდგომარეობა
@@ -2661,6 +2759,7 @@ Plugins	დანამატები
 Plugins are .rgplugin files. Install only plugins from people you trust.	დანამატები .rgplugin ფაილებია. დააყენეთ მხოლოდ იმ ადამიანების დანამატები, ვისაც ენდობით.
 Plugins marked Not sandboxed run as programs on your computer instead, and can do anything you can.	„იზოლაციის გარეშე“ მონიშნული დანამატები სამაგიეროდ მუშაობს როგორც პროგრამები თქვენს კომპიუტერზე და შეუძლია ყველაფერი, რაც თქვენ შეგიძლიათ.
 Plugins run in a sandbox: they can't reach your files or the network, and they change the project only through RustGIS's own commands, within the permissions you accept.	დანამატები იზოლირებულ გარემოში მუშაობს: ისინი ვერ წვდებიან თქვენს ფაილებსა და ქსელს. პროექტს ცვლიან მხოლოდ RustGIS-ის საკუთარი ბრძანებებით, თქვენ მიერ მიღებული ნებართვების ფარგლებში.
+Plugins › Extensions	დანამატები › გაფართოებები
 PMTiles archive	PMTiles არქივი
 PNG frames (zip)	PNG კადრები (zip)
 PNG image or GeoTIFF	PNG სურათი ან GeoTIFF
@@ -2669,6 +2768,7 @@ Point the selected layer at its file after the file moved or was renamed.	მო
 Points	წერტილები
 Points Along Lines	წერტილები ხაზების გასწვრივ
 points each	წერტილი თითოეულში
+Poland	პოლონეთი
 polar (UPS) grid references, north of 84° N or south of 80° S, aren't supported	პოლარული (UPS) ბადის მითითებები, 84° N-ის ჩრდილოეთით ან 80° S-ის სამხრეთით, არ არის მხარდაჭერილი
 Polar, conformal: Antarctica and the Southern Ocean.	პოლარული, კონფორმული: ანტარქტიდა და სამხრეთის ოკეანე.
 Polar, conformal: the Arctic and the northern lands.	პოლარული, კონფორმული: არქტიკა და ჩრდილოეთის მიწები.
@@ -2688,6 +2788,7 @@ Portal	პორტალი
 Portolan	Portolan
 Portolan…	Portolan…
 Portrait	ვერტიკალური
+Portugal	პორტუგალია
 Position	მდებარეობა
 Poster	პოსტერი
 PostGIS Connection	PostGIS კავშირი
@@ -2713,6 +2814,7 @@ Preview and set up the report.	ანგარიშის გადახედ
 Preview, edit and play the presentation.	პრეზენტაციის გადახედვა, რედაქტირება და დაკვრა.
 Previous	წინა
 Previous Extent	წინა ფარგლები
+Previous month	წინა თვე
 Previous Page	წინა გვერდი
 Primary\nSymbology	ძირითადი\nსიმბოლიზაცია
 Primary symbology	ძირითადი სიმბოლიზაცია
@@ -2739,10 +2841,12 @@ project is "sample", "blank", "last" or {"path": a project file}	project არ�
 Project Raster	რასტრის პროეცირება
 Project Template	პროექტის შაბლონი
 project's path is required	საჭიროა project-ის path
+projected system (EPSG:32616), or degrees	დაპროექტებული სისტემა (EPSG:32616) ან გრადუსები
 Projection	პროექცია
 Projections	პროექციები
 Projects and JSON data (RustGIS, QGIS, GeoLibre)	პროექტები და JSON მონაცემები (RustGIS, QGIS, GeoLibre)
 Properties	თვისებები
+Properties…	თვისებები…
 Property	თვისება
 Proportional Symbols	პროპორციული სიმბოლოები
 Provide keys to reset, or no parameters to reset all.	მიუთითეთ საწყისზე დასაბრუნებელი კლავიშები, ან ყველას დასაბრუნებლად ნუ მიუთითებთ პარამეტრებს.
@@ -2782,7 +2886,6 @@ Raise polygons by a height or a field.	პოლიგონების ამ�
 Raise Priority	პრიორიტეტის აწევა
 Random points in polygons	შემთხვევითი წერტილები პოლიგონებში
 Range	დიაპაზონი
-Range (Degrees)	რადიუსი (გრადუსი)
 range: 0, 0.9	დიაპაზონი: 0, 0.9
 Raster	რასტრი
 Raster\nAnalysis	რასტრული\nანალიზი
@@ -2798,14 +2901,17 @@ Raster layer	რასტრული ფენა
 Raster tiles (XYZ)	რასტრული ფილები (XYZ)
 Raster to PMTiles	რასტრი PMTiles-ად
 Raster · {w} × {h} · {n} bands · {renderer}	რასტრი · {w} × {h} · {n} არხი · {renderer}
+Rasters: {system}, cell size {cells}	რასტრები: {system}, უჯრედის ზომა {cells}
 Read	წაკითხვა
 Read and write files on this computer	ფაილების წაკითხვა და ჩაწერა ამ კომპიუტერში
 Read error	წაკითხვის შეცდომა
 Read the bands picked for the view (at most about 6 km a side)	ხედისთვის არჩეული არხების წაკითხვა (მაქსიმუმ დაახლოებით 6 კმ თითო მხარეზე)
 Read the map's layers and features	რუკის ფენებისა და ობიექტების წაკითხვა
 Read the points in the view, coloured by their principal components	ხედში არსებული წერტილების წაკითხვა, შეფერილი მათი მთავარი კომპონენტების მიხედვით
+Read the selected layer's local source again. Folders reload only when you choose Reload Data; they are not watched. Undo restores in-memory data and configuration, not overwritten files or historical streamed contents.	კითხულობს არჩეული ფენის ლოკალურ წყაროს ხელახლა. საქაღალდეები იტვირთება ხელახლა მხოლოდ მაშინ, როცა აირჩევთ „მონაცემების გადატვირთვას“; მათზე დაკვირვება არ ხდება. გაუქმება აღადგენს მეხსიერებაში არსებულ მონაცემებსა და კონფიგურაციას და არა გადაწერილ ფაილებს ან ნაკადის ისტორიულ შიგთავსს.
 Reading a granule's files needs an Earthdata Login token, which works for every NASA DAAC. It is kept until RustGIS closes unless you tick Remember, never in the project, and sent only to NASA's Earthdata data servers.	გრანულის ფაილების წასაკითხად საჭიროა Earthdata Login-ის ტოკენი, რომელიც ყველა NASA DAAC-ისთვის მუშაობს. ის ინახება RustGIS-ის დახურვამდე, თუ არ მონიშნავთ „დამახსოვრებას“, არასოდეს ინახება პროექტში და იგზავნება მხოლოდ NASA-ს Earthdata-ს მონაცემთა სერვერებზე.
 Reading in place…	იკითხება ადგილზე…
+Reading JAXA Earth's catalog…	JAXA Earth-ის კატალოგის წაკითხვა…
 Reading the catalog: {n} documents read, {m} items found…	კატალოგის კითხვა: წაკითხულია {n} დოკუმენტი, ნაპოვნია {m} ელემენტი…
 Reading the catalog…	კატალოგის კითხვა…
 Reading the embeddings…	ემბედინგების კითხვა…
@@ -2816,6 +2922,7 @@ Reading the tileset of {name}	იკითხება {name}-ის ფილ�
 Reading the window failed unexpectedly	ფანჯრის წაკითხვა მოულოდნელად ვერ მოხერხდა
 Reading {n} of Overture's {ty} files where the map is: {attribution}	Overture-ის {n} {ty} ფაილის კითხვა რუკის არეალში: {attribution}
 Reading {url}…	{url}-ის კითხვა…
+Reading…	კითხვა…
 Reads and writes files	კითხულობს და წერს ფაილებს
 Reads the map	კითხულობს რუკას
 Reality Mapping	რეალობის რუკების შედგენა
@@ -2855,8 +2962,13 @@ Relationship name	კავშირის სახელი
 Relationships	კავშირები
 Release	გამოშვება
 Reload	გადატვირთვა
+Reload\nData	მონაცემების\nგადატვირთვა
+Reload Data	მონაცემების გადატვირთვა
+Reload Data from local files requires the desktop app.	ლოკალური ფაილებიდან მონაცემების გადატვირთვა მოითხოვს დესკტოპ აპლიკაციას.
 Reload Themes	თემების გადატვირთვა
+Reload Tile Archive	ფილების არქივის გადატვირთვა
 Reload Web Layers	ვებ ფენების გადატვირთვა
+Reload {name} and discard its pending edits?	გადაიტვირთოს {name} და გაუქმდეს მისი დაუსრულებელი ცვლილებები?
 Remember on this computer	დამახსოვრება ამ კომპიუტერში
 Remember the key on this computer	გასაღების დამახსოვრება ამ კომპიუტერში
 Remove	ამოშლა
@@ -2946,7 +3058,10 @@ Reshape	ფორმის შეცვლა
 Resolution (0–30)	გარჩევადობა (0–30)
 Response	პასუხი
 Restore	აღდგენა
+Restore Fill	შევსების აღდგენა
 Restore From Archive	არქივიდან აღდგენა
+Restore polygon fills hidden by No Fill, keeping their colors and outlines.	აღადგენს „შევსების გარეშე“ დამალულ პოლიგონების შევსებებს, მათი ფერებისა და კონტურების შენარჩუნებით.
+Result	შედეგი
 Result name	შედეგის სახელი
 Results	შედეგები
 Resume	გაგრძელება
@@ -3002,6 +3117,7 @@ Run Tool	ხელსაწყოს გაშვება
 Run {name}	{name}-ის გაშვება
 Running the query for the map…	მოთხოვნის გაშვება რუკისთვის…
 Running…	მიმდინარეობს გაშვება…
+Russia	რუსეთი
 RustGIS	RustGIS
 RustGIS bookmarks	RustGIS-ის სანიშნეები
 RustGIS could not confirm that any previously saved key was deleted from the system keychain.	RustGIS-მა ვერ დაადასტურა, რომ ადრე შენახული გასაღები წაიშალა სისტემის გასაღებების საცავიდან.
@@ -3011,6 +3127,7 @@ RustGIS didn't close properly last time, so it started with the World Atlas inst
 RustGIS didn't close properly last time.	RustGIS ბოლოს სწორად არ დაიხურა.
 RustGIS doesn't have this tool. Install the tools it comes from, or delete the node.	RustGIS-ს ეს ხელსაწყო არ აქვს. დააინსტალირეთ ხელსაწყოები, რომლებსაც ის ეკუთვნის, ან წაშალეთ კვანძი.
 RustGIS is a free and open-source GIS written in pure Rust. It runs on the desktop and in the browser, and every action is a command you can also run from the command line.	RustGIS არის უფასო, ღია კოდის GIS, სუფთა Rust-ზე დაწერილი. ის მუშაობს დესკტოპზე და ბრაუზერში. ყოველი მოქმედება ბრძანებაა, რომლის გაშვებაც ბრძანებათა ხაზიდანაც შეიძლება.
+RustGIS is closing	RustGIS იხურება
 RustGIS layer file	RustGIS-ის ფენის ფაილი
 RustGIS layers, maps and projects	RustGIS-ის ფენები, რუკები და პროექტები
 RustGIS layout	RustGIS-ის განლაგება
@@ -3040,6 +3157,7 @@ S3	S3
 S3 Buckets	S3 ბაკეტები
 S3 Connections	S3 კავშირები
 S3…	S3…
+Sa	შა
 Sample data (Natural Earth)	სანიმუშო მონაცემები (Natural Earth)
 Sample data © Natural Earth (public domain). RustGIS is licensed under Apache-2.0.	სანიმუშო მონაცემები © Natural Earth (საჯარო დომენი). RustGIS ლიცენზირებულია Apache-2.0-ით.
 Sample data: Natural Earth (public domain). Licensed under Apache-2.0.	სანიმუშო მონაცემები: Natural Earth (საჯარო დომენი). ლიცენზია: Apache-2.0.
@@ -3048,6 +3166,7 @@ Satellite Embedding Datasets	სატელიტური ემბედი�
 Satellite Embeddings	სატელიტური ემბედინგები
 Satellite Embeddings…	სატელიტური ემბედინგები…
 Saturation	ნაჯერობა
+Saudi Arabia	საუდის არაბეთი
 Save	შენახვა
 Save a GeoPackage layer's edits to its table in the file, unless rows changed there since.	GeoPackage ფენის რედაქტირებების შენახვა მის ცხრილში ფაილში, თუ იქ სტრიქონები მას შემდეგ არ შეცვლილა.
 Save a PostGIS layer's edits to its table, unless rows changed there since.	PostGIS ფენის რედაქტირებების შენახვა მის ცხრილში, თუ იქ სტრიქონები მას შემდეგ არ შეცვლილა.
@@ -3175,6 +3294,7 @@ Search this view	ამ ხედში ძიება
 Search tools	ხელსაწყოების ძიება
 Search where the map is	რუკის არეში ძიება
 Search {name}…	ძიება {name}-ში…
+Searching all {total} layers…	ყველა {total} ფენაში ძიება…
 Searching places…	ადგილების ძიება…
 Searching the folders…	საქაღალდეებში ძიება…
 Searching works here, but NASA's data servers don't let web pages read their files (no CORS), so GeoTIFFs and downloads of protected data need the desktop app. Download opens a file in a new tab, where Earthdata Login asks you to sign in.	ძიება აქ მუშაობს, მაგრამ NASA-ს მონაცემთა სერვერები ვებ გვერდებს მათი ფაილების წაკითხვის უფლებას არ აძლევს (CORS არ არის), ამიტომ GeoTIFF-ებისა და დაცული მონაცემების ჩამოსატვირთად საჭიროა დესკტოპ აპლიკაცია. „ჩამოტვირთვა“ ხსნის ფაილს ახალ ჩანართში, სადაც Earthdata Login შესვლას მოგთხოვთ.
@@ -3204,6 +3324,7 @@ Select a layer in Layers to style it.	აირჩიეთ ფენა ფე�
 Select a layer in the Layers pane	აირჩიეთ ფენა ფენების პანელში
 select a layer in the Layers pane first	ჯერ აირჩიეთ ფენა ფენების პანელში
 Select a layer in the Layers pane.	აირჩიეთ ფენა ფენების პანელში.
+Select a layer linked to a local file or folder, or an editable GeoPackage layer.	აირჩიეთ ლოკალურ ფაილთან ან საქაღალდესთან დაკავშირებული ფენა ან რედაქტირებადი GeoPackage ფენა.
 Select a navigation method after tracing a point.	წერტილის კვლევის შემდეგ აირჩიეთ ნავიგაციის მეთოდი.
 Select a raster or tile layer in the Layers pane first	ჯერ აირჩიეთ რასტრული ან ფილების ფენა ფენების პანელში
 Select All	ყველას მონიშვნა
@@ -3260,6 +3381,7 @@ Sequential	მიმდევრობითი
 Serif	სერიფიანი
 Server	სერვერი
 Service	სერვისი
+Service discovery was cancelled	სერვისების აღმოჩენა გაუქმდა
 Service Group	სერვისის ჯგუფი
 Service group data exceeds 64 MB.	სერვისის ჯგუფის მონაცემები 64 მბ-ს აღემატება.
 Service Import Requests	სერვისის იმპორტის მოთხოვნები
@@ -3269,6 +3391,7 @@ Session log	სესიის ჟურნალი
 Session token	სესიის ტოკენი
 Set	დაყენება
 Set Cell Size	უჯრედის ზომის დაყენება
+Set Coordinate System	კოორდინატთა სისტემის დაყენება
 Set Diagram	დიაგრამის დაყენება
 Set Domain	დომენის დაყენება
 Set Filter	ფილტრის დაყენება
@@ -3340,6 +3463,7 @@ Show Layers	ფენების ჩვენება
 Show layers through time: only the features whose date falls in the slider's window, and dated imagery for its date.	ფენების ჩვენება დროში: მხოლოდ ობიექტები, რომელთა თარიღიც სლაიდერის ფანჯარაში ხვდება, და თარიღიანი გამოსახულებები მისი თარიღისთვის.
 Show legend	ლეგენდის ჩვენება
 Show legend and source layers	ლეგენდისა და წყარო ფენების ჩვენება
+Show legend in Layers	ლეგენდის ჩვენება ფენებში
 Show Map	რუკის ჩვენება
 Show Me	მაჩვენე
 Show or hide	ჩვენება ან დამალვა
@@ -3354,6 +3478,7 @@ Show or hide the Layers pane.	ფენების პანელის ჩვ
 Show or hide the Tools pane.	ხელსაწყოების პანელის ჩვენება ან დამალვა.
 Show rulers. Drag from a ruler to add a guide; drag a guide back onto it to remove it.	სახაზავების ჩვენება. დამხმარე ხაზის დასამატებლად გადაათრიეთ სახაზავიდან; ამოსაშლელად გადაათრიეთ იგი სახაზავზე უკან.
 Show source layers	წყარო ფენების ჩვენება
+Show the bands picked of every year on the time slider, read in place as the map needs them	აჩვენებს თითოეული წლის არჩეულ არხებს დროის სლაიდერზე, წაკითხული ადგილზე, როგორც რუკას სჭირდება
 Show the bands picked, read in place as the map needs them	არჩეული არხების ჩვენება, ადგილზე წაკითხული რუკის საჭიროებისამებრ
 Show the description	აღწერის ჩვენება
 Show the Labeling pane for the selected layer.	მონიშნული ფენისთვის წარწერების პანელის ჩვენება.
@@ -3364,6 +3489,7 @@ Show the map as a 3D globe, or as a flat map again.	რუკის ჩვენ
 Show the next map series page.	რუკების სერიის შემდეგი გვერდის ჩვენება.
 Show the pointer's place on the other map.	კურსორის ადგილის ჩვენება მეორე რუკაზე.
 Show the previous map series page.	რუკების სერიის წინა გვერდის ჩვენება.
+Show the selected layer's settings in one place.	აჩვენებს არჩეული ფენის პარამეტრებს ერთ ადგილას.
 Show the Symbology pane for the selected layer.	არჩეული ფენის სიმბოლიზაციის პანელის ჩვენება.
 Show the whole model	მთელი მოდელის ჩვენება
 Show these bands and stretch on the AlphaEarth layers on the map	ამ არხებისა და გაჭიმვის ჩვენება რუკაზე არსებულ AlphaEarth-ის ფენებზე
@@ -3404,6 +3530,7 @@ Signing in with ChatGPT works in the desktop app.	ChatGPT-ით შესვლ
 Signing the asset (Planetary Computer)…	რესურსის ხელმოწერა (Planetary Computer)…
 Signs this account out and forgets it on this computer, with its saved sign-in.	ამ ანგარიშიდან გადის და ამ კომპიუტერზე ივიწყებს მას, შენახულ შესვლის მონაცემებთან ერთად.
 Sill	ზღურბლი
+Simplified	გამარტივებული
 Simplify	გამარტივება
 Simulate the drive, or save the route as a layer.	მგზავრობის სიმულაცია ან მარშრუტის ფენად შენახვა.
 Simulation	სიმულაცია
@@ -3439,18 +3566,22 @@ Source Cooperative	Source Cooperative
 Source Cooperative…	Source Cooperative…
 Source coordinate system	წყაროს კოორდინატთა სისტემა
 Source coordinate system is required	წყაროს კოორდინატთა სისტემა აუცილებელია
+Source File State	წყარო ფაილის მდგომარეობა
 Source Key Field	წყაროს გასაღების ველი
 Source Table / Layer	წყარო ცხრილი / ფენა
 Source-layer Name	წყარო ფენის სახელი
 South	სამხრეთი
+South Korea	სამხრეთ კორეა
 South Polar Stereographic	სამხრეთის პოლარული სტერეოგრაფიული
 Spacing	დაშორება
 Spacing across	დაშორება განივად
 Spacing down	დაშორება ქვემოთ
+Spain	ესპანეთი
 Spatial Join	სივრცითი შეერთება
 Speaker notes	მომხსენებლის ჩანაწერები
 Spectral Analysis	სპექტრული ანალიზი
 Spectral indices	სპექტრული ინდექსები
+Spectral profile	სპექტრული პროფილი
 Speed	სიჩქარე
 Speed Display	სიჩქარის ჩვენება
 Split	გაყოფა
@@ -3555,6 +3686,7 @@ Stop drawing labels, for faster navigation.	წარწერების ხ�
 Stop filling the cache.	ქეშის შევსების შეჩერება.
 Stop MCP relay	MCP რელეს გაჩერება
 Stop Recording	ჩაწერის შეჩერება
+Stop this download; nothing is added	ამ ჩამოტვირთვის შეჩერება; არაფერი ემატება
 Stopped after {steps} steps; say "continue" to go on.	შეჩერდა {steps} ნაბიჯის შემდეგ; გასაგრძელებლად თქვით „გააგრძელე".
 Stopped.	შეჩერდა.
 Straight across, in rings from its first point, or round its first point	პირდაპირ განივად, რგოლებად პირველი წერტილიდან, ან პირველი წერტილის გარშემო
@@ -3573,6 +3705,7 @@ Style Items	სტილის ელემენტები
 Style this layer as a QGIS layer style file (.qml) does	ამ ფენის სტილიზება ისე, როგორც ამას QGIS ფენის სტილის ფაილი (.qml) აკეთებს
 Style › Drawing	სტილი › ხატვა
 Styles	სტილები
+Su	კვ
 Subreport	ქვეანგარიში
 Subreport: {name}	ქვეანგარიში: {name}
 Subtypes	ქვეტიპები
@@ -3596,6 +3729,7 @@ Surface	ზედაპირი
 Surface: {layer}	ზედაპირი: {layer}
 Swap	გაცვლა
 Swap the start and the destination	საწყისი წერტილისა და დანიშნულების ადგილის გაცვლა
+Sweden	შვედეთი
 Swipe	გადაწევა გამყოფით
 Switch	გადართვა
 Switch between GPU and CPU map rendering	GPU და CPU რუკის რენდერინგს შორის გადართვა
@@ -3619,8 +3753,10 @@ Table or layer	ცხრილი ან ფენა
 Tables	ცხრილები
 Tabulate Intersection	გადაკვეთის ცხრილად წარმოდგენა
 Tags	ტეგები
+Taiwan	ტაივანი
 Take the data in view offline, to edit and sync back later.	ხედში მოხვედრილი მონაცემების ოფლაინ წაღება რედაქტირებისთვის და მოგვიანებით უკან სინქრონიზაციისთვის.
 Take this bound out	ამ საზღვრის ამოღება
+Take this point off	ამ წერტილის მოხსნა
 Target details ({operation}): {targets}	სამიზნის დეტალები ({operation}): {targets}
 Target Features	სამიზნე ობიექტები
 Target Key Field	სამიზნე გასაღების ველი
@@ -3646,6 +3782,7 @@ Testing…	მოწმდება…
 Text	ტექსტი
 Text Symbol	ტექსტის სიმბოლო
 Text, e.g. "name" || ' (' || round("pop" / 1e6, 1) || ' M)', in place of the field; size in points, color as '#RRGGBB', angle in degrees clockwise. Empty: the field's or the class's own.	ტექსტი, მაგ. "name" || ' (' || round("pop" / 1e6, 1) || ' M)', ველის ნაცვლად; ზომა პუნქტებში, ფერი '#RRGGBB' სახით, კუთხე გრადუსებში საათის ისრის მიმართულებით. ცარიელი: ველის ან კლასის საკუთარი.
+Th	ხუ
 That connection would create a loop.	ეს კავშირი ციკლს შექმნიდა.
 the 100 km square letters aren't used in this zone	ამ ზონაში 100 კმ კვადრატის ასოები არ გამოიყენება
 The active project or map changed; reopen Define Projection for the intended layer.	აქტიური პროექტი ან რუკა შეიცვალა; ხელახლა გახსენით „პროექციის განსაზღვრა“ სასურველი ფენისთვის.
@@ -3657,12 +3794,16 @@ the answer isn't UTF-8 text	პასუხი არ არის UTF-8 ტე�
 The assistant follows a skill's instructions when it uses it. Whatever they say, its commands that need your approval still ask.	ასისტენტი უნარის გამოყენებისას მის ინსტრუქციებს მიჰყვება. რაც არ უნდა ეწეროს მათში, ბრძანებები, რომლებსაც თქვენი თანხმობა სჭირდება, მაინც გკითხავთ.
 The assistant is busy; stop it or wait for it to finish.	ასისტენტი დაკავებულია; შეაჩერეთ ან დაელოდეთ დასრულებას.
 The assistant wants to run this, and {why}:	ასისტენტს სურს ამის გაშვება და მიზეზი ასეთია: {why}:
+The background worker could not start ({error}). Retry the command.	ფონური დამმუშავებელი ვერ გაეშვა ({error}). სცადეთ ბრძანება ხელახლა.
+The basemap now shows the {view} worldview; the project's Countries layer keeps its borders	საბაზისო რუკა ახლა აჩვენებს {view} მსოფლმხედველობას; პროექტის Countries ფენა ინარჩუნებს თავის საზღვრებს
 The Basemaps plugin's tab of public basemaps.	საბაზისო რუკების დანამატის ჩანართი საჯარო საბაზისო რუკებით.
 The browser didn't give RustGIS the clipboard ({why}): paste with {keys}.	ბრაუზერმა RustGIS-ს გაცვლის ბუფერი არ მისცა ({why}): ჩასვით {keys}-ით.
 the browser kept neither a copy of it nor where to download it	ბრაუზერმა არ შეინახა არც მისი ასლი და არც ჩამოტვირთვის მისამართი
+the browser runs everything on one thread	ბრაუზერი ყველაფერს ერთ ნაკადში ასრულებს
 the capture failed unexpectedly	გადაღება მოულოდნელად ჩავარდა
 The class these label groups and the Labeling pane edit.	კლასი, რომელსაც ეს წარწერის ჯგუფები და წარწერების პანელი არედაქტირებს.
 The clipboard came after you moved on, so nothing was pasted: paste with {keys}.	გაცვლის ბუფერი თქვენი გადასვლის შემდეგ მოვიდა, ამიტომ არაფერი ჩაისვა: ჩასვით {keys}-ით.
+The collection's own licence wasn't read: {why}	კოლექციის საკუთარი ლიცენზია არ იქნა წაკითხული: {why}
 The connection failed; trying again in {seconds} s.	კავშირი ვერ დამყარდა; ხელახალი ცდა {seconds} წმ-ში.
 the connection has no id	კავშირს არ აქვს id
 The coordinate format must be decimal, dms, utm or mgrs	კოორდინატების ფორმატი უნდა იყოს decimal, dms, utm ან mgrs
@@ -3673,10 +3814,10 @@ The desktop app adds data cubes	მონაცემთა კუბებს �
 The distance between two marks along the line	მანძილი ორ ნიშანს შორის ხაზის გასწვრივ
 The environment (AWS_ACCESS_KEY_ID…)	გარემო (AWS_ACCESS_KEY_ID…)
 The features where the map is	ობიექტები რუკის არეალში
-The filter searches the first {n} of them; the service.add command adds any other by its name.	ფილტრი ეძებს მათგან პირველ {n}-ში; service.add ბრძანება ნებისმიერ სხვას მისი სახელით ამატებს.
 The first 1,000 entries; narrow it down a folder at a time.	პირველი 1,000 ჩანაწერი; დააზუსტეთ თითო საქაღალდით.
 The first {n} are listed.	ჩამოთვლილია პირველი {n}.
 The first {n} are shown: search to narrow them.	ნაჩვენებია პირველი {n}: შესამცირებლად გამოიყენეთ ძიება.
+The first {n} of them are listed; the filter searches all of them.	ჩამოთვლილია პირველი {n}; ფილტრი ეძებს ყველაში.
 The first {n} rows	პირველი {n} სტრიქონი
 The flowtrace didn't answer: the whole flowline nearest the point is shown.	Flowtrace-მა არ უპასუხა: ნაჩვენებია წერტილთან უახლოესი მთელი დინების ხაზი.
 the grid digits must be an even count of 0 to 10, half for the easting and half for the northing	ბადის ციფრების რაოდენობა უნდა იყოს ლუწი, 0-დან 10-მდე: ნახევარი აღმოსავლეთის კოორდინატისთვის, ნახევარი ჩრდილოეთისთვის
@@ -3723,6 +3864,7 @@ The model declined this request.	მოდელმა ეს მოთხოვ
 The model declined this request: {why}	მოდელმა ეს მოთხოვნა უარყო: {why}
 The model is ready to run.	მოდელი მზადაა გასაშვებად.
 The model sent an empty reply; ask again, or try another model.	მოდელმა ცარიელი პასუხი გამოგზავნა; კიდევ ერთხელ ჰკითხეთ ან სცადეთ სხვა მოდელი.
+The most threads a tool, a raster read or a map drawing uses: fewer keep cores free for other work.	ინსტრუმენტის, რასტრის წაკითხვის ან რუკის დახატვის მიერ გამოყენებული ნაკადების მაქსიმალური რაოდენობა: ნაკლები ტოვებს ბირთვებს სხვა სამუშაოსთვის თავისუფალს.
 The National Map	The National Map
 The National Map…	The National Map…
 The newest {shown} of {count} entries	უახლესი {shown} ჩანაწერი {count}-დან
@@ -3754,6 +3896,7 @@ The project downloads as this file, to the folder your browser saves downloads i
 The project's items in place of the map.	პროექტის ელემენტები რუკის ადგილას.
 The project's thumbnail, from an image.	პროექტის მინიატურა სურათიდან.
 The project's thumbnail, from the map view.	პროექტის მინიატურა რუკის ხედიდან.
+The project, map, layer or data source changed. Reopen Reload Data for the intended layer.	პროექტი, რუკა, ფენა ან მონაცემთა წყარო შეიცვალა. გახსენით „მონაცემების გადატვირთვა“ ხელახლა სასურველი ფენისთვის.
 The projection the map opens in.	პროექცია, რომელშიც რუკა იხსნება.
 The provider's content filter stopped the reply.	პროვაიდერის შინაარსის ფილტრმა პასუხი შეაჩერა.
 The public server is free and shared by many: it answers light use, and may ask you to wait.	საჯარო სერვერი უფასოა და ბევრი იყენებს: ის მსუბუქ გამოყენებას ემსახურება და შეიძლება მოგთხოვოთ მოცდა.
@@ -3775,6 +3918,9 @@ The saved favourite arrangement of publication layouts can't be used ({why}), so
 The saved password could not be used. Type a password to try again; check Remember on this computer to replace the saved password.	შენახული პაროლის გამოყენება ვერ მოხერხდა. ხელახლა საცდელად შეიყვანეთ პაროლი; შენახული პაროლის ჩასანაცვლებლად მონიშნეთ „დამახსოვრება ამ კომპიუტერში“.
 The saved S3 connection no longer matches this source.	შენახული S3 კავშირი აღარ შეესაბამება ამ წყაროს.
 The saved sign-in changed. Select your account again.	შენახული შესვლა შეიცვალა. ხელახლა აირჩიეთ თქვენი ანგარიში.
+The saved thread setting “{value}” isn't a number from 1 to 1024; RustGIS uses the default.	შენახული ნაკადების პარამეტრი „{value}“ არ არის რიცხვი 1-დან 1024-მდე; RustGIS იყენებს ნაგულისხმევს.
+The saved worldview '{code}' isn't one this version knows, so it is ignored until you choose one	შენახული მსოფლმხედველობა '{code}' ამ ვერსიისთვის უცნობია, ამიტომ იგნორირებულია, სანამ არ აირჩევთ ახალს
+The saved worldview detail '{code}' isn't one this version knows; simplified borders are used	შენახული მსოფლმხედველობის დეტალურობა '{code}' ამ ვერსიისთვის უცნობია; გამოიყენება გამარტივებული საზღვრები
 The scale the layer's symbol and label sizes are set for. At other scales they grow and shrink with the map, as on paper.	მასშტაბი, რომლისთვისაც დაყენებულია ფენის სიმბოლოებისა და წარწერების ზომები. სხვა მასშტაბებზე ისინი რუკასთან ერთად იზრდება და მცირდება, როგორც ქაღალდზე.
 The script, for the Script pane	სკრიპტი, სკრიპტის პანელისთვის
 The selected GeoPackage layer is no longer available; choose a layer	მონიშნული GeoPackage ფენა აღარ არის ხელმისაწვდომი; აირჩიეთ ფენა
@@ -3784,6 +3930,8 @@ The server refused the request.	სერვერმა მოთხოვნ�
 The server took too long to answer.	სერვერი ძალიან დიდხანს პასუხობდა.
 The service may be private or need a token.	სერვისი შესაძლოა პირადი იყოს ან ტოკენს საჭიროებდეს.
 The service needs a sign-in or a token.	სერვისს სჭირდება შესვლა ან ტოკენი.
+The service test requires a credential-free HTTP or HTTPS address at the connection's origin.	სერვისის ტესტი მოითხოვს HTTP ან HTTPS მისამართს სერტიფიკატების გარეშე კავშირის წარმოშობაზე.
+The service test requires a valid web-service connection and login.	სერვისის ტესტი მოითხოვს ვებ-სერვისის სწორ კავშირს და შესვლას.
 The service's answer isn't UTF-8 text	სერვისის პასუხი UTF-8 ტექსტი არ არის
 The session login could not be used. Enter it again.	სესიის შესვლის მონაცემები ვერ გამოიყენება. შეიყვანეთ ხელახლა.
 The Shapefile's files download as one zip.	Shapefile-ის ფაილები ერთ zip-ად ჩამოიტვირთება.
@@ -3811,6 +3959,7 @@ The title and subtitle in a band of colour across the top.	სათაური
 The title over the map, the sources and the reference in boxes under it.	სათაური რუკაზე, წყაროები და მითითება ყუთებში მის ქვემოთ.
 The token expired and was forgotten. Paste a new one.	ტოკენს ვადა გაუვიდა და დავიწყებულია. ჩასვით ახალი.
 The token expires on {date}.	ტოკენს ვადა გასდის {date}.
+the tool's own	ინსტრუმენტის საკუთარი
 The tools run on this project: saved with it, and each can run again	ამ პროექტზე გაშვებული ხელსაწყოები: ინახება მასთან ერთად და თითოეული შეიძლება ხელახლა გაეშვას
 The trend couldn't start: {error}	ტრენდის ანალიზის დაწყება ვერ მოხერხდა: {error}
 The trend failed unexpectedly	ტრენდის ანალიზი მოულოდნელად ჩაიშალა
@@ -3851,6 +4000,7 @@ This computer keeps this connection's keys: logging in reads them.	ეს კო
 This font isn't installed here, so the text is drawn in the sans-serif	ეს შრიფტი აქ დაყენებული არ არის, ამიტომ ტექსტი უსერიფო შრიფტით იხატება
 This font isn't installed here, so the text is drawn in the serif	ეს შრიფტი აქ დაყენებული არ არის, ამიტომ ტექსტი სერიფიანი შრიფტით იხატება
 This layer has no fields.	ამ ფენას ველები არ აქვს.
+This layer has pending edits. Confirm Discard Edits and Reload first.	ამ ფენას აქვს დაუსრულებელი ცვლილებები. ჯერ დაადასტურეთ „ცვლილებების გაუქმება და გადატვირთვა“.
 This layer's data is kept in the project or read from a database or web address: there's no file to repair.	ამ ფენის მონაცემები პროექტში ინახება ან მონაცემთა ბაზიდან თუ ვებ მისამართიდან იკითხება: შესაკეთებელი ფაილი არ არის.
 This map has no layers yet.	ამ რუკას ჯერ ფენები არ აქვს.
 This map's thumbnail, from an image.	ამ რუკის მინიატურა სურათიდან.
@@ -3872,6 +4022,7 @@ This service layer isn't recorded: its tile discovery crossed origins, and a tas
 This step	ეს ნაბიჯი
 This step names no tool to show.	ეს საფეხური საჩვენებელ ხელსაწყოს არ ასახელებს.
 This value cannot be shown as a list. Edit its JSON below.	ამ მნიშვნელობის სიად ჩვენება შეუძლებელია. დაარედაქტირეთ მისი JSON ქვემოთ.
+Threads	ნაკადები
 Thumbnail	მინიატურა
 Tick length	დანაყოფის სიგრძე
 Ticks	დანაყოფები
@@ -3919,7 +4070,7 @@ Tools that analyse features.	ობიექტების გასაან�
 Tools that analyse rasters.	რასტრების გასაანალიზებელი ხელსაწყოები.
 Tools you run appear here.	თქვენ მიერ გაშვებული ხელსაწყოები აქ გამოჩნდება.
 Top	ზედა
-Top visible raster	ზედა ხილული რასტრი
+Top raster with a colour scale, not drawn by classes	ზედა რასტრი ფერთა შკალით, არა კლასებით დახატული
 Topmost Layer	ყველაზე ზედა ფენა
 Topographic and Bathymetric	ტოპოგრაფიული და ბათიმეტრიული
 Topology	ტოპოლოგია
@@ -3947,17 +4098,21 @@ Trend over a series of rasters	ტრენდი რასტრების �
 Triangle	სამკუთხედი
 TRUE	TRUE
 Try Again	ხელახლა ცდა
+Try again	სცადეთ ხელახლა
 Try again in a moment.	სცადეთ ხელახლა ცოტა ხანში.
 Try again later.	სცადეთ მოგვიანებით.
 Try other places along the line	სხვა ადგილების ცდა ხაზის გასწვრივ
 Try other places round the point	წერტილის გარშემო სხვა ადგილების ცდა
 Trying again…	ხელახლა ცდა…
+Tu	სა
+Turkey	თურქეთი
 Turn each mark with the line's direction	თითო ნიშნის მობრუნება ხაზის მიმართულებით
 Turn each point's marker by the angle in a field, in degrees	თითო წერტილის მარკერის მობრუნება ველში მითითებული კუთხით, გრადუსებში
 Turn editing on or off for the map.	რუკის რედაქტირების ჩართვა ან გამორთვა.
 Turn Labels Off	წარწერების გამორთვა
 Turn labels on or off.	წარწერების ჩართვა ან გამორთვა.
 Turn Off	გამორთვა
+Turn on or off the optional parts of RustGIS, such as Imagery.	ჩართეთ ან გამორთეთ RustGIS-ის არჩევითი ნაწილები, როგორიცაა Imagery.
 Turn on the Basemaps plugin	საბაზისო რუკების დანამატის ჩართვა
 Turn the mark by the layer's rotation field, its offset with it	ნიშნის მობრუნება ფენის მობრუნების ველით, მის წანაცვლებასთან ერთად
 Turn the time slider off: every feature shows again.	დროის სლაიდერის გამორთვა: ყველა ობიექტი ისევ გამოჩნდება.
@@ -3978,6 +4133,7 @@ Type the password to remember it on this computer.	შეიყვანეთ �
 Type the password, then Save. Remember on this computer is optional.	შეიყვანეთ პაროლი, შემდეგ დააჭირეთ „შენახვას“. „დამახსოვრება ამ კომპიუტერში“ არასავალდებულოა.
 Typed below	ქვემოთ შეყვანილი
 typing must not start another lookup	typing must not start another lookup
+Ukraine	უკრაინა
 UM	UM
 Unavailable: {reason}	მიუწვდომელია: {reason}
 Unbind From Time Slider	დროის სლაიდერიდან მოხსნა
@@ -3985,6 +4141,7 @@ Unbind from Time Slider	დროის სლაიდერიდან მო
 Undo	გაუქმება
 Undo (Ctrl+Z)	გაუქმება (Ctrl+Z)
 Undo doesn't remove the recorded step: delete it in Edit Steps once you stop recording.	გაუქმება ჩაწერილ საფეხურს არ შლის: ჩაწერის შეჩერების შემდეგ წაშალეთ ის „საფეხურების რედაქტირებაში“.
+Undo restores in-memory data and configuration, not overwritten files or historical streamed contents.	გაუქმება აღადგენს მეხსიერებაში არსებულ მონაცემებსა და კონფიგურაციას და არა გადაწერილ ფაილებს ან ნაკადის ისტორიულ შიგთავსს.
 Undo the last change.	ბოლო ცვლილების გაუქმება.
 Undo {action}	გაუქმება: {action}
 Ungroup	დაჯგუფების მოხსნა
@@ -3996,6 +4153,7 @@ Union	გაერთიანება
 Union Features	გაერთიანების ობიექტები
 Unique Values	უნიკალური მნიშვნელობები
 Unit	ერთეული
+United Kingdom	გაერთიანებული სამეფო
 United States	აშშ
 Units	ერთეულები
 Units per step	ერთეული ნაბიჯზე
@@ -4013,6 +4171,7 @@ Untitled	უსახელო
 Untitled model	უსახელო მოდელი
 Up	ზემოთ
 Up a level	ერთი დონით ზემოთ
+Up to {n} points are compared: the oldest one was taken off.	შედარდება მაქსიმუმ {n} წერტილი: ყველაზე ძველი მოიხსნა.
 Update	განახლება
 Update Bookmark	სანიშნის განახლება
 Update Features	განახლების ობიექტები
@@ -4088,6 +4247,7 @@ Video file or URL	ვიდეო ფაილი ან URL
 Video Page	ვიდეოს გვერდი
 Videos	ვიდეოები
 Video…	ვიდეო…
+Vietnam	ვიეტნამი
 Vietnam national coordinate system (VN-2000) using 3-degree Transverse Mercator with a 7-parameter Helmert shift to WGS 84.	ვიეტნამის ეროვნული კოორდინატთა სისტემა (VN-2000) 3-გრადუსიანი განივი მერკატორით და ჰელმერტის 7-პარამეტრიანი გადაწევით WGS 84-ში.
 Vietnam national coordinate system (VN-2000) UTM zone 48N (102°E–108°E, central meridian 105°E).	ვიეტნამის ეროვნული კოორდინატთა სისტემა (VN-2000), UTM ზონა 48N (102°E–108°E, ცენტრალური მერიდიანი 105°E).
 Vietnam national coordinate system (VN-2000) UTM zone 49N (108°E–114°E, central meridian 111°E).	ვიეტნამის ეროვნული კოორდინატთა სისტემა (VN-2000), UTM ზონა 49N (108°E–114°E, ცენტრალური მერიდიანი 111°E).
@@ -4123,8 +4283,11 @@ Want more basemaps?	გსურთ მეტი საბაზისო რუ
 Warning	გაფრთხილება
 Warnings	გაფრთხილებები
 Wavefront OBJ…	Wavefront OBJ…
+Wavelength {from}–{to} nm	ტალღის სიგრძე {from}–{to} nm
+Wavelength {nm} nm	ტალღის სიგრძე {nm} nm
 WCS	WCS
 WCS Coverage Request	WCS დაფარვის მოთხოვნა
+We	ოთ
 Weather	ამინდი
 Weather and climate data from dynamical.org (NOAA GFS, GEFS and HRRR, ECMWF, DWD ICON…) as Zarr stores: open a dataset, pick a variable and its time steps, and add it.	ამინდისა და კლიმატის მონაცემები dynamical.org-იდან (NOAA GFS, GEFS და HRRR, ECMWF, DWD ICON…) Zarr საცავებად: გახსენით მონაცემთა ნაკრები, აირჩიეთ ცვლადი და მისი დროის ნაბიჯები და დაამატეთ.
 Web\nData	ვებ\nმონაცემები
@@ -4165,7 +4328,9 @@ Where new features get their elevation (the z field).	საიდან იღ�
 Where the font isn't installed, the text is drawn in this family	სადაც შრიფტი არ არის დაყენებული, ტექსტი ამ ოჯახით იხატება
 Where the map opens: the full extent or a view you saved.	სად იხსნება რუკა: სრულ ფარგლებში ან თქვენ მიერ შენახულ ხედში.
 Where tools work	სად მუშაობს ხელსაწყოები
+Whether the Layers pane lists the layer's classes	ჩამოთვლის თუ არა ფენების პანელი ფენის კლასებს
 Whether the Select tool picks these layers' features on the map	ირჩევს თუ არა მონიშვნის ხელსაწყო ამ ფენების ობიექტებს რუკაზე
+Whether the Select tool picks this layer's features on the map	ირჩევს თუ არა მონიშვნის ინსტრუმენტი ამ ფენის ობიექტებს რუკაზე
 Whether the service is asked for one picture of the view or for tiles.	სთხოვს თუ არა სერვისს ხედის ერთ სურათს ან ფილებს.
 Which 5 countries have the largest GDP?	რომელ 5 ქვეყანას აქვს ყველაზე დიდი მშპ?
 While drawing, click two points on a feature's edge to follow the edge between them	ხატვისას დააწკაპუნეთ ორ წერტილზე ობიექტის წიბოზე, რომ მათ შორის წიბოს გაჰყვეთ
@@ -4303,8 +4468,11 @@ Zoom: the map's zoom level, as web maps count it. Bearing: the direction the top
 ±, dequantised	±, დეკვანტებული
 — fps	— კადრი/წმ
 “{text}” isn't a {type} value: {field} is left as it was.	„{text}“ არ არის {type} მნიშვნელობა: {field} დარჩა, როგორც იყო.
+… {n} more characters not shown	… კიდევ {n} სიმბოლო არ ჩანს
 ⌘+Enter	⌘+Enter
 ⌘+Z	⌘+Z
 ⌘K	⌘K
 ▶ Simulate	▶ სიმულაცია
+● {n}  {lon}°, {lat}°  ·  pixel {col}, {row}	● {n}  {lon}°, {lat}°  ·  პიქსელი {col}, {row}
+● {n}  {v}	● {n}  {v}
 ＋ Add field	＋ ველის დამატება
