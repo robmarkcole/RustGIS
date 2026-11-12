@@ -720,7 +720,7 @@ pub static TOOLS: &[ToolSpec] = &[
                 kind: K::Text,
                 required: false,
                 default: "",
-                help: "xmin,ymin,xmax,ymax in the coordinate system's units (degrees when it is empty); the input's extent when empty.",
+                help: "xmin,ymin,xmax,ymax in the units of the system the raster is made in (see Coordinate System); the input's extent when empty.",
             },
             P {
                 name: "pixelSize",
@@ -728,7 +728,7 @@ pub static TOOLS: &[ToolSpec] = &[
                 kind: K::Number,
                 required: false,
                 default: "",
-                help: "The output cell size in the coordinate system's units (degrees when it is empty); 300 cells across the extent when empty.",
+                help: "The output cell size in the units of the system the raster is made in (see Coordinate System); 300 cells across the extent when empty.",
             },
             P {
                 name: "crs",
@@ -736,7 +736,7 @@ pub static TOOLS: &[ToolSpec] = &[
                 kind: K::Text,
                 required: false,
                 default: "",
-                help: "A projected coordinate system (e.g. EPSG:32618) to make the raster in, its units for the extent and pixel size; longitude/latitude in degrees when empty or EPSG:4326.",
+                help: "A projected coordinate system (e.g. EPSG:32618) to make the raster in, its units for the extent and pixel size; when empty, the one the layer was read in if projected, else degrees; EPSG:4326 for degrees.",
             },
             P { name: "output", label: "Output Name", kind: K::Text, required: false, default: "", help: "" },
         ],
@@ -878,7 +878,7 @@ pub static TOOLS: &[ToolSpec] = &[
                 kind: K::Number,
                 required: false,
                 default: "",
-                help: "Spatial correlation distance in the coordinate system's units, degrees when it is empty (defaults to 1/3 extent diagonal).",
+                help: "Spatial correlation distance in the units of the system the raster is made in (see Coordinate System; defaults to 1/3 extent diagonal).",
             },
             P {
                 name: "extent",
@@ -886,7 +886,7 @@ pub static TOOLS: &[ToolSpec] = &[
                 kind: K::Text,
                 required: false,
                 default: "",
-                help: "xmin,ymin,xmax,ymax in the coordinate system's units (degrees when it is empty); the input's extent when empty.",
+                help: "xmin,ymin,xmax,ymax in the units of the system the raster is made in (see Coordinate System); the input's extent when empty.",
             },
             P {
                 name: "pixelSize",
@@ -894,7 +894,7 @@ pub static TOOLS: &[ToolSpec] = &[
                 kind: K::Number,
                 required: false,
                 default: "",
-                help: "The output cell size in the coordinate system's units (degrees when it is empty); up to 250 cells across the extent when empty.",
+                help: "The output cell size in the units of the system the raster is made in (see Coordinate System); up to 250 cells across the extent when empty.",
             },
             P {
                 name: "crs",
@@ -902,7 +902,7 @@ pub static TOOLS: &[ToolSpec] = &[
                 kind: K::Text,
                 required: false,
                 default: "",
-                help: "A projected coordinate system (e.g. EPSG:32618) to make the raster in, its units for the extent, pixel size and range; longitude/latitude in degrees when empty or EPSG:4326.",
+                help: "A projected coordinate system (e.g. EPSG:32618) to make the raster in, its units for the extent, pixel size and range; when empty, the one the layer was read in if projected, else degrees; EPSG:4326 for degrees.",
             },
             P { name: "output", label: "Output Name", kind: K::Text, required: false, default: "", help: "" },
         ],
@@ -4282,6 +4282,7 @@ fn idw_interpolation(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     };
     // Defaults only when a value is not given: a bad one is refused, not replaced.
     let given = |k: &str| p.get(k).is_some_and(|v| !v.is_null() && v.as_str().is_none_or(|t| !t.trim().is_empty()));
+    let crs_note = in_its_units(p, crs, crs_note, &extent, &pts, &["extent", "pixelSize"]);
     let cell = match num(p, "pixelSize") {
         Some(c) if c > 0.0 => c,
         _ if given("pixelSize") => return Err("the pixel size must be more than zero".into()),
@@ -4293,7 +4294,8 @@ fn idw_interpolation(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
         None => 2.0,
     };
     let name = out_name(p, format!("{}_{field}_idw", ds.name));
-    let r = crate::rasterops::idw(&pts, &extent, cell, power, 0, &name, crs).map_err(|e| with_note(e, &beyond_note))?;
+    let r =
+        crate::rasterops::idw(&pts, &extent, cell, power, 0, &name, crs).map_err(|e| with_note(with_note(e, &beyond_note), &crs_note))?;
     let bytes = rustgis_data::raster::geotiff::write(&r, 0).map_err(|e| e.to_string())?;
     let msg = format!("IDW Interpolation: {} × {} cells from {} points", r.width, r.height, pts.len());
     Ok(ToolResult {
@@ -4394,6 +4396,7 @@ fn kriging_interpolation(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
         }
     };
     let given = |k: &str| p.get(k).is_some_and(|v| !v.is_null() && v.as_str().is_none_or(|t| !t.trim().is_empty()));
+    let crs_note = in_its_units(p, crs, crs_note, &extent, &pts, &["extent", "pixelSize", "range"]);
     let neighbours = match num(p, "neighbours") {
         Some(n) if n >= 2.0 => (n as usize).min(32),
         Some(_) => return Err("neighbours must be at least 2".into()),
@@ -4430,7 +4433,8 @@ fn kriging_interpolation(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
     }
 
     let name = out_name(p, format!("{}_{field}_kriging", ds.name));
-    let r = crate::kriging::kriging(&pts, &extent, cell, &params, neighbours, &name, crs).map_err(|e| with_note(e, &beyond_note))?;
+    let r = crate::kriging::kriging(&pts, &extent, cell, &params, neighbours, &name, crs)
+        .map_err(|e| with_note(with_note(e, &beyond_note), &crs_note))?;
     let pred_bytes = rustgis_data::raster::geotiff::write(&r, 0).map_err(|e| e.to_string())?;
     let var_bytes = rustgis_data::raster::geotiff::write(&r, 1).map_err(|e| e.to_string())?;
     let var_name = format!("{name}_variance");
@@ -4444,20 +4448,55 @@ fn kriging_interpolation(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
     })
 }
 
+/// The projected system an interpolation takes from a layer read in `crs` when it is given none
+/// (#1743): `None` for none or a geographic one (degrees, with nothing to say), else the system, or
+/// why it can't be used. The Geostatistical Wizard's hint shows the same choice.
+pub fn layer_raster_crs(crs: Option<Crs>) -> Option<Result<Crs, String>> {
+    let c = crs.filter(|c| !c.is_geographic())?;
+    Some(if c.is_geocentric() {
+        Err(format!("{}, which can't hold its cells", c.label()))
+    } else {
+        c.transformer().map(|_| c).map_err(|e| format!("{}, which this version can't project to ({e})", c.label()))
+    })
+}
+
 /// The coordinate system an interpolation (`tool`) makes its grid in: the projected system given as
-/// `p`'s `crs`, or longitude/latitude in degrees when it is empty or `EPSG:4326`, as before `crs`
-/// was there. The note says what the run used where that could surprise: the compatibility note on
-/// the system given, or degrees for a layer read from a projected file.
+/// `p`'s `crs`; degrees for `EPSG:4326`; else [`layer_raster_crs`], the projected system `ds` was
+/// read in, as Kernel Density uses, and degrees for a layer read in degrees. The note says what the
+/// run used where that could surprise: the system it took from the layer, or the compatibility note
+/// on the one given.
 pub fn raster_crs(ds: &Dataset, p: &Json, tool: &str) -> Result<(Crs, Option<String>), String> {
     if p.get("crs").is_some_and(|v| !v.is_null() && !v.is_string()) {
         return Err("crs must be text".into());
     }
     match s(p, "crs").trim() {
-        "" => Ok((Crs::LonLat, degrees_note(ds, tool))),
+        "" => Ok(match layer_raster_crs(ds.crs) {
+            // A system that can't hold a raster's cells (geocentric), or one this version can't
+            // project to: degrees, as before, and said why.
+            Some(Err(why)) => (
+                Crs::LonLat,
+                Some(format!(
+                    "{tool}: made in degrees of longitude and latitude, though {} was read in {why}; give a projected crs to make it in metres or feet",
+                    ds.name
+                )),
+            ),
+            Some(Ok(c)) => (
+                c,
+                Some(format!(
+                    "{tool}: made in {}, the coordinate system {} was read in, with its units for the extent and sizes; set crs to EPSG:4326 to make it in degrees",
+                    c.label(),
+                    ds.name
+                )),
+            ),
+            None => (Crs::LonLat, None),
+        }),
         // Asked for by name: degrees, with nothing to say.
         text if Crs::parse(text).is_ok_and(|c| c == Crs::LonLat) => Ok((Crs::LonLat, None)),
         text => {
-            let (crs, note) = projected_crs(text)?;
+            let (crs, note) = projected_crs(text).map_err(|e| match Crs::parse(text) {
+                Ok(c) if c.is_geographic() => format!("{e}; EPSG:4326 makes it in degrees"),
+                _ => e,
+            })?;
             Ok((crs, note.map(|note| format!("{tool}: its coordinate system: {note}"))))
         }
     }
@@ -4471,21 +4510,9 @@ pub fn projected_crs(text: &str) -> Result<(Crs, Option<String>), String> {
         return Err("crs must be a projected coordinate system, not a geocentric one (X, Y and Z from the Earth's centre)".into());
     }
     if crs.is_geographic() {
-        return Err("crs must be a projected coordinate system with linear units (such as UTM or State Plane, e.g. EPSG:32618); leave it empty to work in degrees".into());
+        return Err("crs must be a projected coordinate system with linear units (such as UTM or State Plane, e.g. EPSG:32618)".into());
     }
     Ok((crs, note))
-}
-
-/// The note `tool` gives when it makes a raster in degrees from `ds`, read from a file in a
-/// projected system: it names the system and the setting that would use it.
-fn degrees_note(ds: &Dataset, tool: &str) -> Option<String> {
-    ds.crs.filter(|c| !c.is_geographic()).map(|c| {
-        format!(
-            "{tool}: made in degrees of longitude and latitude, though {} was read in {}; set its coordinate system (crs) to make it in that system's units",
-            ds.name,
-            c.label()
-        )
-    })
 }
 
 /// `pts` (longitude/latitude) in `crs`, and a note counting those left out because the system
@@ -4523,6 +4550,30 @@ fn in_projected(crs: Crs, to: &Transformer, c: Coord) -> Option<Coord> {
     // past it through, onto the edge.
     let held = crs != Crs::WebMercator || c.y.abs() <= rustgis_geom::MAX_LAT;
     held.then(|| to.from_lonlat(c)).flatten().filter(|p| p.is_finite() && to.to_lonlat(*p).is_some_and(|back| (back.y - c.y).abs() < 1e-4))
+}
+
+/// The note on a system an interpolation took from the layer (`p`'s `crs` empty), naming the values
+/// among `keys` that `p` gives, read in its units: a script written when these tools worked in
+/// degrees is told, not answered in metres without a word (#1743). An `extent` that holds none of
+/// `pts` is said too, with how to ask for degrees; it isn't refused, as one in the system's units
+/// may lie away from the points and still be interpolated.
+pub fn in_its_units(p: &Json, crs: Crs, note: Option<String>, extent: &Extent, pts: &[(Coord, f64)], keys: &[&str]) -> Option<String> {
+    let note = note?;
+    if crs == Crs::LonLat || !s(p, "crs").trim().is_empty() {
+        return Some(note);
+    }
+    let given: Vec<&str> = keys
+        .iter()
+        .copied()
+        .filter(|k| p.get(*k).is_some_and(|v| !v.is_null() && v.as_str().is_none_or(|t| !t.trim().is_empty())))
+        .collect();
+    if given.is_empty() {
+        return Some(note);
+    }
+    // With no points left (the system holds none), the run's own error says why.
+    let outside = given.contains(&"extent") && !pts.is_empty() && !pts.iter().any(|(c, _)| extent.contains(*c));
+    let outside = if outside { "; the extent holds none of the points: if it is in degrees, set crs to EPSG:4326" } else { "" };
+    Some(format!("{note} ({} as given, in its units{outside})", given.join(", ")))
 }
 
 /// `e` with `note` after it, when there is one: what was left out can be why a run failed.
@@ -10391,7 +10442,7 @@ mod tests {
         for tool in ["idwInterpolation", "kriging"] {
             let p = serde_json::json!({"input": "wells", "field": "v", "pixelSize": 500, "crs": "EPSG:32616"});
             let r = crate::run(tool, &m, &p).unwrap_or_else(|e| panic!("{tool}: {e}"));
-            assert!(!r.messages.iter().any(|m| m.contains("made in degrees") || m.contains("beyond what")), "{tool}: {:?}", r.messages);
+            assert!(!r.messages.iter().any(|m| m.contains("was read in") || m.contains("beyond what")), "{tool}: {:?}", r.messages);
             let Output::Layers(out) = r.output else { panic!("{tool}: expected layers") };
             let Some(OutputLayer::Raster { file_name, bytes, .. }) = out.first() else { panic!("{tool}: expected a raster") };
             let g = rustgis_data::raster::read_bytes(file_name, bytes).unwrap_or_else(|e| panic!("{tool}: {e}"));
@@ -10408,10 +10459,69 @@ mod tests {
                 let p = serde_json::json!({"input": "wells", "field": "v", "crs": crs});
                 assert!(crate::run(tool, &m, &p).is_err(), "{tool}: {why}");
             }
-            // Without `crs`, a layer read in UTM is made in degrees, and the run names its system.
-            let r = crate::run(tool, &m, &serde_json::json!({"input": "wells", "field": "v"})).unwrap_or_else(|e| panic!("{tool}: {e}"));
+            // Without `crs`, a layer read in UTM is made in UTM, and the run says it took that.
+            let made_in = |p: serde_json::Value| {
+                let r = crate::run(tool, &m, &p).unwrap_or_else(|e| panic!("{tool}: {e}"));
+                let Output::Layers(out) = r.output else { panic!("{tool}: expected layers") };
+                let Some(OutputLayer::Raster { file_name, bytes, .. }) = out.first() else { panic!("{tool}: expected a raster") };
+                let g = rustgis_data::raster::read_bytes(file_name, bytes).unwrap_or_else(|e| panic!("{tool}: {e}"));
+                (g.crs, r.messages)
+            };
+            let (crs, messages) = made_in(serde_json::json!({"input": "wells", "field": "v"}));
+            assert_eq!(crs, Crs::Epsg(32616), "{tool}");
             let label = Crs::Epsg(32616).label();
-            assert!(r.messages.iter().any(|m| m.contains("made in degrees") && m.contains(&label)), "{tool}: {:?}", r.messages);
+            assert!(
+                messages.iter().any(|m| m.contains(&format!("made in {label}, the coordinate system wells was read in"))),
+                "{tool}: {messages:?}"
+            );
+            // A layer read in a system that can't hold the cells (geocentric) is made in degrees,
+            // and said.
+            let mut geocentric = m.0.get("wells").cloned().unwrap_or_else(|| panic!("wells"));
+            geocentric.crs = Some(Crs::Epsg(4978));
+            let m_geo = Map(HashMap::from([("wells".to_string(), geocentric)]));
+            let r =
+                crate::run(tool, &m_geo, &serde_json::json!({"input": "wells", "field": "v"})).unwrap_or_else(|e| panic!("{tool}: {e}"));
+            assert!(
+                r.messages.iter().any(|m| m.contains("made in degrees") && m.contains("can't hold its cells")),
+                "{tool}: {:?}",
+                r.messages
+            );
+            // So is one this version can't project to, saying so.
+            let mut unknown = m.0.get("wells").cloned().unwrap_or_else(|| panic!("wells"));
+            unknown.crs = Some(Crs::Custom(u32::MAX));
+            let m_unknown = Map(HashMap::from([("wells".to_string(), unknown)]));
+            let r = crate::run(tool, &m_unknown, &serde_json::json!({"input": "wells", "field": "v"}))
+                .unwrap_or_else(|e| panic!("{tool}: {e}"));
+            assert!(r.messages.iter().any(|m| m.contains("made in degrees") && m.contains("can't project to")), "{tool}: {:?}", r.messages);
+            // Values a script gave in degrees, read in the layer's metres, are said, not taken quietly:
+            // an extent holding no points is refused, and too many cells say the units.
+            let run = |p: serde_json::Value| crate::run(tool, &m, &p);
+            let r = run(serde_json::json!({"input": "wells", "field": "v", "extent": "-90.1,35.05,-89.9,35.25"}))
+                .unwrap_or_else(|e| panic!("{tool}: {e}"));
+            assert!(
+                r.messages.iter().any(|m| m.contains("the extent holds none of the points: if it is in degrees, set crs to EPSG:4326")),
+                "{tool}: {:?}",
+                r.messages
+            );
+            // An extent in metres away from the wells is made too, with the same word: its numbers
+            // can't say which units they were meant in.
+            let r = run(serde_json::json!({"input": "wells", "field": "v", "extent": "0,0,10000,10000"}))
+                .unwrap_or_else(|e| panic!("{tool}: {e}"));
+            assert!(
+                r.messages.iter().any(|m| m.contains("(extent as given, in its units; the extent holds none of the points")),
+                "{tool}: {:?}",
+                r.messages
+            );
+            let e = run(serde_json::json!({"input": "wells", "field": "v", "pixelSize": 0.01})).err().unwrap_or_default();
+            assert!(e.contains(&format!("made in {label}")), "{tool}: {e}");
+            let r = run(serde_json::json!({"input": "wells", "field": "v", "pixelSize": 500})).unwrap_or_else(|e| panic!("{tool}: {e}"));
+            assert!(r.messages.iter().any(|m| m.contains("(pixelSize as given, in its units)")), "{tool}: {:?}", r.messages);
+            let e = run(serde_json::json!({"input": "wells", "field": "v", "crs": "EPSG:4269"})).err().unwrap_or_default();
+            assert!(e.contains("EPSG:4326 makes it in degrees"), "{tool}: {e}");
+            // EPSG:4326 asks for degrees, with nothing to say.
+            let (crs, messages) = made_in(serde_json::json!({"input": "wells", "field": "v", "crs": "EPSG:4326"}));
+            assert_eq!(crs, Crs::LonLat, "{tool}");
+            assert!(!messages.iter().any(|m| m.contains("was read in")), "{tool}: {messages:?}");
         }
 
         // A point Web Mercator can't hold is left out and counted; the others make the raster.
@@ -10424,7 +10534,7 @@ mod tests {
             let p = serde_json::json!({"input": "polar", "field": "v", "crs": "EPSG:3857"});
             let r = crate::run(tool, &m, &p).unwrap_or_else(|e| panic!("{tool}: {e}"));
             assert!(r.messages.iter().any(|m| m.starts_with("1 point(s) beyond what")), "{tool}: {:?}", r.messages);
-            assert!(!r.messages.iter().any(|m| m.contains("made in degrees")), "{tool}: {:?}", r.messages);
+            assert!(!r.messages.iter().any(|m| m.contains("was read in")), "{tool}: {:?}", r.messages);
         }
     }
 
@@ -10478,18 +10588,23 @@ mod tests {
         assert!(crate::run("kriging", &m, &serde_json::json!({"input": "pts", "field": "v", "range": -5})).is_err());
         assert!(crate::run("kriging", &m, &serde_json::json!({"input": "pts", "field": "v", "range": "none"})).is_err());
 
-        // Source CRS metadata does not change the normalized longitude/latitude geometry.
+        // A layer read in a projected system is made in degrees when EPSG:4326 asks, as before
+        // `crs` was there: the same rasters. Left empty it takes the layer's system, and says so.
         let Some(pts_layer) = m.0.get("pts") else { panic!("missing pts") };
         let mut proj_pts = pts_layer.clone();
         proj_pts.crs = Some(rustgis_data::raster::Crs::WebMercator);
         let m_proj = Map(HashMap::from([("proj_pts".to_string(), proj_pts)]));
-        let projected =
-            crate::run("kriging", &m_proj, &serde_json::json!({"input": "proj_pts", "field": "v", "extent": "0,0,2,2", "pixelSize": 0.5}))
-                .unwrap();
-        // Without `crs` it is still made in degrees, and says so for a layer read in metres.
-        let degrees_note = |messages: &[String]| messages.iter().any(|m| m.contains("made in degrees"));
-        assert!(degrees_note(&projected.messages), "{:?}", projected.messages);
-        assert!(!degrees_note(&r.messages), "{:?}", r.messages);
+        let in_degrees = serde_json::json!({"input": "proj_pts", "field": "v", "extent": "0,0,2,2", "pixelSize": 0.5, "crs": "EPSG:4326"});
+        let projected = crate::run("kriging", &m_proj, &in_degrees).unwrap();
+        let assumed = |messages: &[String]| messages.iter().any(|m| m.contains("the coordinate system pts was read in"));
+        assert!(!assumed(&projected.messages), "{:?}", projected.messages);
+        assert!(!r.messages.iter().any(|m| m.contains("was read in")), "{:?}", r.messages);
+        let in_its_own = crate::run("kriging", &m_proj, &serde_json::json!({"input": "proj_pts", "field": "v"})).unwrap();
+        assert!(assumed(&in_its_own.messages), "{:?}", in_its_own.messages);
+        let Output::Layers(own) = in_its_own.output else { panic!("expected layers") };
+        let Some(OutputLayer::Raster { file_name, bytes, .. }) = own.first() else { panic!("expected a raster") };
+        let g = rustgis_data::raster::read_bytes(file_name, bytes).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(g.crs, rustgis_data::raster::Crs::WebMercator);
         let Output::Layers(projected_layers) = projected.output else { panic!("expected layers") };
         assert_eq!(projected_layers.len(), out.len());
         for (actual, expected) in projected_layers.iter().zip(&out) {

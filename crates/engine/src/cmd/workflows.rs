@@ -15,7 +15,7 @@ use crate::{CmdResult, CommandSpec as C, Session};
 pub fn commands() -> Vec<C> {
     vec![
         C::new("gp.env", "Environments", "Analyze › Geoprocessing", environments).inputs(environment_inputs).roles(&[]).effects(crate::policy::Effects::NONE).params(
-            r#"{"extent"?: "view"|"full"|layer name|[minLon, minLat, maxLon, maxLat]|null, "crs"?: projected coordinate system ("EPSG:32616") rasters are made in|null (degrees), "cellSize"?: in degrees, or in the units of the crs when one is set|null}"#,
+            r#"{"extent"?: "view"|"full"|layer name|[minLon, minLat, maxLon, maxLat]|null, "crs"?: projected coordinate system ("EPSG:32616") rasters are made in|null (none: the layer's projected system, else degrees), "cellSize"?: in degrees, or in the units of the crs when one is set|null}"#,
         ),
         // A setting of the whole process, not of the project: no undo step, and `Reserved`, so the
         // assistant asks first and agents, plugins and imported items can't change it.
@@ -65,7 +65,7 @@ pub fn commands() -> Vec<C> {
             r#"{"layer": elevation raster, "from": [lon, lat], "to": [lon, lat], "band"?: 1-based, "observerHeight"?: m, "targetHeight"?: m, "name"?: output}"#,
         ),
         C::new("analysis.interpolate", "Geostatistical Wizard", "Analyze › Workflows", interpolate).roles(&[]).effects(crate::policy::Effects::NONE).params(
-            r#"{"layer": points, "field": numeric field, "crs"?: projected coordinate system ("EPSG:32616") to make it in (default the environment's; degrees without one), "cellSize"?: in degrees, or in the units of the crs, "power"?: 2, "neighbors"?: 12, "name"?: output, "ran"?: (internal: a surface the app has worked out)}"#,
+            r#"{"layer": points, "field": numeric field, "crs"?: projected coordinate system ("EPSG:32616") to make it in (default the environment's, else the layer's projected system, else degrees; "EPSG:4326" for degrees), "cellSize"?: in degrees, or in the units of the crs, "power"?: 2, "neighbors"?: 12, "name"?: output, "ran"?: (internal: a surface the app has worked out)}"#,
         ),
         C::new("analysis.route", "Network Analysis", "Analyze › Workflows", route).roles(&[]).effects(crate::policy::Effects::NONE).params(
             r#"{"layer": line network, "from": [lon, lat], "to": [lon, lat], "costField"?: field, "snapDistance"?: metres, "name"?: output}"#,
@@ -1189,7 +1189,8 @@ fn interpolate_work(s: &Session, p: &Value) -> Result<Work, String> {
         pts.push((c, v));
     }
     let (layer_name, field_name) = (ds.name.clone(), field.to_string());
-    // The system: the one given, else the environment's, else degrees as before either was there.
+    // The system: the one given, else the environment's, else the projected one the layer was read
+    // in, else degrees.
     let env = &s.project.gp_env;
     // An empty `crs` is none given, as `null` is: the environment's system still applies.
     let given = p.get("crs").is_some_and(|v| !v.is_null() && v.as_str().is_none_or(|t| !t.trim().is_empty()));
@@ -1197,8 +1198,30 @@ fn interpolate_work(s: &Session, p: &Value) -> Result<Work, String> {
         Some(g) if !given => (g.crs, None),
         _ => rustgis_analysis::raster_crs(ds, p, "Geostatistical Wizard")?,
     };
+    let crs_note = rustgis_analysis::in_its_units(p, crs, crs_note, &Extent::EMPTY, &[], &["cellSize"]);
     let env_extent = env.extent;
     let given_cell = f(p, "cellSize").or(env.cell_in(crs));
+    // The environment's cell sizes this run doesn't use are said: the projected one when the run is
+    // in another system, the degree one when it isn't in degrees. Run in the environment's own
+    // system with its size, the degree size kept beside it (for older versions) goes unsaid.
+    let own = env.projected.is_some_and(|g| g.crs == crs && g.cell_size.is_some());
+    let unused: Vec<String> = [
+        env.projected.filter(|g| g.crs != crs).and_then(|g| g.cell_size.map(|c| format!("{c}, in {}'s units", g.crs.label()))),
+        env.cell_size.filter(|_| crs != Crs::LonLat && !own).map(|c| format!("{c}, in degrees")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let cell_note = (f(p, "cellSize").is_none() && !unused.is_empty()).then(|| {
+        let (what, verb) = if unused.len() > 1 { ("sizes", "weren't") } else { ("size", "wasn't") };
+        let from_extent = if given_cell.is_none() { "; the cell size was set from the extent" } else { "" };
+        format!(
+            "Geostatistical Wizard: the environment's cell {what} ({}) {verb} used for a surface made in {}{from_extent}. Give cellSize, or set the environment's cell size in {}",
+            unused.join("; "),
+            crs.label(),
+            if crs == Crs::LonLat { "degrees".to_string() } else { format!("{}'s units", crs.label()) }
+        )
+    });
     let name = out_name(p, format!("{}_{field}_idw", ds.name));
     let power = f(p, "power").unwrap_or(2.0).clamp(0.5, 10.0);
     let neighbors = p.get("neighbors").and_then(Value::as_u64).unwrap_or(12).max(1) as usize;
@@ -1228,6 +1251,10 @@ fn interpolate_work(s: &Session, p: &Value) -> Result<Work, String> {
                 why.push(format!("{no_value} whose value isn't a number"));
             }
             let e = if why.is_empty() { e } else { format!("{e} ({} left out)", why.join(", ")) };
+            // A size read in the layer's system's units, or one the environment holds that wasn't
+            // used, can be why it failed.
+            let notes: Vec<&str> = [crs_note.as_deref(), cell_note.as_deref()].into_iter().flatten().collect();
+            let e = if notes.is_empty() { e } else { format!("{e} ({})", notes.join("; ")) };
             // Points the system can't hold can be why there are too few.
             match &beyond_note {
                 Some(note) => format!("{e}; {note}"),
@@ -1235,7 +1262,7 @@ fn interpolate_work(s: &Session, p: &Value) -> Result<Work, String> {
             }
         };
         let m = made(rasterops::idw(&pts, &e, cell, power, neighbors, &name, crs).map_err(left_out)?, None)?;
-        if no_point == 0 && no_value == 0 && beyond_note.is_none() && crs_note.is_none() {
+        if no_point == 0 && no_value == 0 && beyond_note.is_none() && crs_note.is_none() && cell_note.is_none() {
             return Ok(m);
         }
         let then: Then = Box::new(move |s: &mut Session, v: &mut Value| {
@@ -1257,6 +1284,9 @@ fn interpolate_work(s: &Session, p: &Value) -> Result<Work, String> {
             }
             // It names the layer itself.
             if let Some(note) = crs_note {
+                s.notify(note, false);
+            }
+            if let Some(note) = cell_note {
                 s.notify(note, false);
             }
         });

@@ -507,7 +507,8 @@ pub struct GpEnvironment {
     #[serde(default)]
     pub cell_size: Option<f64>,
     /// The projected coordinate system the Geostatistical Wizard makes its surface in, and the cell
-    /// size in its units, when the run doesn't say; `None`: degrees, with `cell_size`. Kept apart
+    /// size in its units, when the run doesn't say; `None`: the projected system the layer was read in,
+    /// else degrees with `cell_size`. Kept apart
     /// from `cell_size` so an older RustGIS, which reads only that, still makes it in degrees rather
     /// than reading this system's units as degrees: losing it costs that version the setting, not
     /// the raster.
