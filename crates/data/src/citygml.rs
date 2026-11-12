@@ -196,6 +196,9 @@ fn read_with(file_name: &str, bytes: &[u8], given: Option<Crs>, keep_named: bool
     reading.said.repeated_geometry_ids = index.repeated;
     let (mut wrapped, mut far) = (String::new(), Vec::new());
     let mut wrap_left = text.len().saturating_mul(4).max(WRAP_BUDGET);
+    // The namespace work parsing the members and their copies takes is bounded by the file's size, as
+    // one document's is: each wrapper repeats the root's declarations, which cost their square.
+    let mut work_left = crate::xml::namespace_budget(text.len());
     // Counted a member at a time, and stopped between members when its run is cancelled (in the
     // desktop app's background read); the index before is one pass over the text, with no check.
     crate::progress::begin(index.members.len());
@@ -225,7 +228,7 @@ fn read_with(file_name: &str, bytes: &[u8], given: Option<Crs>, keep_named: bool
         wrapped.push_str(close);
         wrapped.push_str("</m>");
         reading.wrap_at = (start, wrapped.len() - member.len() - close.len() - "</m>".len());
-        let Ok(doc) = crate::xml::parse(&wrapped, options()) else {
+        let Ok(doc) = crate::xml::parse_within(&wrapped, options(), &mut work_left) else {
             reading.counts.skipped += 1;
             continue;
         };
@@ -257,7 +260,7 @@ fn read_with(file_name: &str, bytes: &[u8], given: Option<Crs>, keep_named: bool
         let far_docs: Vec<_> = far
             .iter()
             .filter_map(|(at, copy)| {
-                let doc = crate::xml::parse(copy, ParsingOptions { nodes_limit: nodes, ..options() }).ok()?;
+                let doc = crate::xml::parse_within(copy, ParsingOptions { nodes_limit: nodes, ..options() }, &mut work_left).ok()?;
                 nodes = nodes.saturating_sub(u32::try_from(doc.descendants().count()).unwrap_or(u32::MAX));
                 Some((*at, doc))
             })

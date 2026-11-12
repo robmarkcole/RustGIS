@@ -1070,21 +1070,22 @@ fn extent_of(node: Node) -> Option<[f64; 4]> {
     (e[0] < e[2] && e[1] < e[3]).then_some(e)
 }
 
-/// Parses QGIS's XML with a node limit. QGIS starts its files with `<!DOCTYPE qgis …>`, which
+/// Parses QGIS's XML with a node limit, through [`rustgis_data::xml::parse`] (which bounds its
+/// nesting and its namespaces). QGIS starts its files with `<!DOCTYPE qgis …>`, which
 /// declares nothing: the document is read from past it, and one declaring entities (`[…]`) is
 /// refused rather than expanded.
 fn parse<'a>(text: &'a str, what: &str) -> Result<Document<'a>, String> {
     let opts = ParsingOptions { allow_dtd: false, nodes_limit: MAX_NODES, ..ParsingOptions::default() };
     let doctype = text.find("<!DOCTYPE").filter(|at| text.get(..*at).is_some_and(|before| !before.contains("<q")));
     let Some(at) = doctype else {
-        return Document::parse_with_options(text, opts).map_err(|e| format!("not {what}: {e}"));
+        return rustgis_data::xml::parse(text, opts).map_err(|e| format!("not {what}: {e}"));
     };
     let end = text.get(at..).and_then(|t| t.find('>')).map(|e| at + e + 1).ok_or_else(|| format!("not {what}: an unclosed <!DOCTYPE"))?;
     if text.get(at..end).is_some_and(|d| d.contains('[')) {
         return Err(format!("not {what}: it declares entities (a DTD), which aren't read"));
     }
     let rest = text.get(end..).unwrap_or_default();
-    Document::parse_with_options(rest, opts).map_err(|e| format!("not {what}: {e}"))
+    rustgis_data::xml::parse(rest, opts).map_err(|e| format!("not {what}: {e}"))
 }
 
 /// The first child element named `tag`.

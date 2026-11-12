@@ -2511,3 +2511,16 @@ fn the_corpus_groups_read_as_qgis_wrote_them() {
     assert!(texts.iter().any(|t| t.contains("blending mode of groups drawn as one (1: Drawn as one)")), "{texts:?}");
     assert!(!texts.iter().any(|t| t.contains("group layers")), "{texts:?}");
 }
+
+/// A project nested past the limit, or whose namespaces would take too long to resolve, is refused
+/// before it is parsed, never a crash or a hang.
+#[test]
+fn a_hostile_project_is_refused_before_parsing() {
+    let deep = format!("<!DOCTYPE qgis><qgis>{}{}</qgis>", "<a>".repeat(10_000), "</a>".repeat(10_000));
+    let refused = parse(&deep, "a QGIS project").unwrap_err();
+    assert!(refused.contains("deep"), "{refused}");
+    let declarations: String = (0..20_000).map(|k| format!(r#" xmlns:n{k}="urn:{k}""#)).collect();
+    let flood = format!("<qgis{declarations}/>");
+    let refused = parse(&flood, "a QGIS project").unwrap_err();
+    assert!(refused.contains("namespace declarations"), "{refused}");
+}

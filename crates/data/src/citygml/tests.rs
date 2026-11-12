@@ -710,6 +710,48 @@ fn a_member_too_deep_is_left_out_and_the_others_read() {
     assert_eq!(out[0].0.features.len(), 1);
 }
 
+/// A member whose namespaces would take too long to resolve (an object declaring hundreds, around
+/// thousands of children that each declare one more) is left out whole and said, as one nested too
+/// deep is, and the others are read.
+#[test]
+fn a_member_flooded_with_namespaces_is_left_out_and_the_others_read() {
+    let declarations: String = (0..300).map(|k| format!(r#" xmlns:n{k}="urn:{k}""#)).collect();
+    let flooded = format!(
+        r#"<core:cityObjectMember><bldg:Building gml:id="f"{declarations}>{}</bldg:Building></core:cityObjectMember>"#,
+        r#"<x:note xmlns:x="urn:x"/>"#.repeat(8000)
+    );
+    let out = read("model.gml", &lonlat(&[flooded, building("b1", &box_surfaces("b1"))].concat()), None).unwrap();
+    assert!(says(&out, "1 city objects couldn't be read"), "{:?}", messages_of(&out));
+    assert_eq!(out[0].0.features.len(), 1);
+    // The same children, with the namespaces they need only: read, and nothing said.
+    let plain = format!(
+        r#"<core:cityObjectMember><bldg:Building gml:id="f">{}{}</bldg:Building></core:cityObjectMember>"#,
+        box_surfaces("f"),
+        r#"<x:note xmlns:x="urn:x"/>"#.repeat(8000)
+    );
+    let out = read("model.gml", &lonlat(&plain), None).unwrap();
+    assert!(!says(&out, "couldn't be read"), "{:?}", messages_of(&out));
+    assert_eq!(out[0].0.features.len(), 1);
+}
+
+/// A root declaring many namespaces around many small members: each member is parsed with the
+/// root's declarations around it, each within its own bound, but together they take what the
+/// file's size allows and no more; the members past it are left out and said.
+#[test]
+fn members_repeating_a_crowded_root_share_the_files_namespace_work() {
+    let declarations: String = (0..1000).map(|k| format!(r#" xmlns:n{k}="urn:{k}""#)).collect();
+    let members: String = (0..1000).map(|k| building(&format!("b{k}"), &box_surfaces(&format!("b{k}")))).collect();
+    let crowded = String::from_utf8(lonlat(&members)).unwrap().replacen(" xmlns:xlink=", &format!("{declarations} xmlns:xlink="), 1);
+    let out = read("model.gml", crowded.as_bytes(), None).unwrap();
+    let read_in = out[0].0.features.len();
+    assert!(read_in > 0 && read_in < 1000, "{read_in} of 1000 read");
+    assert!(says(&out, &format!("{} city objects couldn't be read", 1000 - read_in)), "{:?}", messages_of(&out));
+    // The same members under the usual root: all read, and nothing said.
+    let out = read("model.gml", &lonlat(&members), None).unwrap();
+    assert_eq!(out[0].0.features.len(), 1000);
+    assert!(!says(&out, "couldn't be read"), "{:?}", messages_of(&out));
+}
+
 /// `.gml` and `.xml` files holding a city model go to this reader; other GML stays with GML's.
 #[test]
 fn files_named_gml_or_xml_holding_a_city_model_are_read_as_one() {
@@ -2007,11 +2049,12 @@ fn rings_flattened_by_placing_are_said() {
 
 /// An element with many namespace declarations followed by many children declaring one each: past
 /// what the sets may take, a child's set is spent without looking at its parent's pairs, and what
-/// stands in it is still read.
+/// stands in it is still read. (Many more of both would be past what parsing may take, and the
+/// member left out: `a_member_flooded_with_namespaces_is_left_out_and_the_others_read`.)
 #[test]
 fn children_past_what_declarations_may_take_are_read() {
-    let many: String = (0..3_000).map(|k| format!(r#" xmlns:n{k}="urn:n{k}""#)).collect();
-    let children: String = (0..3_000).map(|k| format!(r#"<gen:stringAttribute xmlns:c{k}="urn:c{k}"></gen:stringAttribute>"#)).collect();
+    let many: String = (0..50).map(|k| format!(r#" xmlns:n{k}="urn:n{k}""#)).collect();
+    let children: String = (0..50).map(|k| format!(r#"<gen:stringAttribute xmlns:c{k}="urn:c{k}"></gen:stringAttribute>"#)).collect();
     let inner = format!(
         "<bldg:lod2MultiSurface><gml:MultiSurface><gml:surfaceMember>{}</gml:surfaceMember></gml:MultiSurface></bldg:lod2MultiSurface>",
         polygon("p", &square(0.0, 0.0, 10.0, 0.0))

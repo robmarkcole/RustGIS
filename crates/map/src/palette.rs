@@ -5,7 +5,7 @@
 //! The other formats tie colours to data values; a ramp keeps their relative spacing, from the
 //! lowest value (0) to the highest (1).
 
-use roxmltree::{Document, Node, ParsingOptions};
+use roxmltree::{Node, ParsingOptions};
 use serde_json::Value;
 
 use crate::color::{CustomRamp, MAX_RAMP_STOPS, Ramp, RampKind, Rgba};
@@ -171,7 +171,7 @@ fn read_qgis(text: &str, fallback: &str) -> Result<Vec<CustomRamp>, String> {
     // QGIS writes a bare `<!DOCTYPE qgis_style>`; drop it rather than allow DTDs.
     let text = strip_doctype(text);
     let opts = ParsingOptions { allow_dtd: false, nodes_limit: MAX_LINES as u32, ..ParsingOptions::default() };
-    let doc = Document::parse_with_options(&text, opts).map_err(|e| format!("not a QGIS style file: {e}"))?;
+    let doc = rustgis_data::xml::parse(&text, opts).map_err(|e| format!("not a QGIS style file: {e}"))?;
     let mut ramps = Vec::new();
     let mut skipped = Vec::new();
     // A style file's ramps are in <colorramps>; its symbols may hold ramps of their own.
@@ -525,6 +525,14 @@ mod tests {
 
     fn read(text: &str, file: Option<&str>) -> Result<Vec<CustomRamp>, String> {
         read_ramps(text, file, None, None, None)
+    }
+
+    /// A QGIS style file nested past the limit is refused before it is parsed, never a crash.
+    #[test]
+    fn a_deep_qgis_style_is_refused() {
+        let deep = format!("<!DOCTYPE qgis_style><qgis_style>{}{}</qgis_style>", "<a>".repeat(10_000), "</a>".repeat(10_000));
+        let refused = read(&deep, Some("deep.xml")).unwrap_err();
+        assert!(refused.contains("deep"), "{refused}");
     }
 
     #[test]
