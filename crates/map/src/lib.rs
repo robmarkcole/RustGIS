@@ -13,6 +13,7 @@ pub mod geolibre;
 mod geometry_kinds;
 pub mod globe;
 pub mod graphics;
+pub mod graticule;
 pub mod label_by;
 pub mod layout;
 pub mod lod;
@@ -1341,6 +1342,13 @@ pub struct Map {
     pub bookmarks: Vec<Bookmark>,
     #[serde(default = "yes")]
     pub graticule: bool,
+    /// What the graticule draws: latitudes and longitudes, a measured grid or the UTM zones.
+    #[serde(default, skip_serializing_if = "graticule::GraticuleType::is_degrees")]
+    pub graticule_type: graticule::GraticuleType,
+    /// A measured graticule's coordinate system (`EPSG:2056`, WKT or a PROJ string): none is the
+    /// map's own when it is projected, else the UTM zone (WGS 84) at the view's centre.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graticule_crs: Option<String>,
     /// Flat map or 3D globe.
     #[serde(default)]
     pub projection: Projection,
@@ -1478,6 +1486,8 @@ impl Map {
             camera: Camera::world(),
             bookmarks: Vec::new(),
             graticule: true,
+            graticule_type: graticule::GraticuleType::Degrees,
+            graticule_crs: None,
             projection: Projection::WebMercator,
             popup_mode: PopupMode::Topmost,
             label_display: LabelDisplay::default(),
@@ -2852,6 +2862,8 @@ impl Map {
             camera: _,
             bookmarks: _,
             graticule: _,
+            graticule_type: _,
+            graticule_crs: _,
             projection: _,
             popup_mode: _,
             label_display: _,

@@ -11,8 +11,8 @@ use serde_json::{Value, json};
 
 use crate::theme::{Tokens, regular, semibold};
 use crate::widgets::{
-    CONTENT_H, Dragged, LABEL_H, big, big_form_menu, big_menu, big_split_menu, col, group, menu_item, small, small_form_menu, small_menu,
-    submenu_row, text_w,
+    CONTENT_H, Dragged, LABEL_H, big, big_form_menu, big_menu, big_split_form_menu, big_split_menu, col, group, menu_item, small,
+    small_form_menu, small_menu, submenu_row, text_w,
 };
 use crate::{RightPane, RustGisApp, icons};
 
@@ -1802,10 +1802,64 @@ fn analysis_groups(app: &mut RustGisApp, ui: &mut Ui) {
     });
 }
 
+/// View › Display › Graticule's menu: the graticule's type (choosing one shows it), and the
+/// measured grid's coordinate system.
+fn graticule_menu(ui: &mut Ui, app: &mut RustGisApp) {
+    use rustgis_engine::map::graticule::GraticuleType;
+    let (on, kind) = (app.session.map().graticule, app.session.map().graticule_type);
+    for t in GraticuleType::ALL {
+        if ui.add(egui::Button::selectable(on && kind == t, tl!(t.label()))).clicked() {
+            if let Err(e) = app.run("map.graticule", json!({"type": t.code()})) {
+                app.session.notify(e, true);
+            }
+            ui.close();
+        }
+    }
+    ui.separator();
+    let name = ui.label(tl!("Measured grid's coordinate system"));
+    ui.horizontal(|ui| {
+        let edit = ui.add(egui::TextEdit::singleline(&mut app.ui.graticule_crs_input).hint_text("2056").desired_width(90.0)).on_hover_text(
+            tl!("An EPSG code, WKT or a PROJ string; empty: the map's own when it is projected, else the UTM zone at the view's centre"),
+        );
+        // Named by the label above it, for a screen reader (the hint is only a placeholder).
+        let edit = edit.labelled_by(name.id);
+        let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if ui.button(tl!("Use System")).clicked() || enter {
+            let typed = app.ui.graticule_crs_input.trim();
+            let crs = if typed.is_empty() { String::new() } else { crate::dialogs::typed_crs(typed) };
+            match app.run("map.graticule", json!({"type": "measured", "crs": crs})) {
+                Ok(_) => {
+                    app.ui.graticule_crs_input.clear();
+                    ui.close();
+                }
+                Err(e) => app.session.notify(e, true),
+            }
+        }
+    });
+    let shown = app.session.map().graticule_crs.as_deref().map(rustgis_engine::map::graticule::short_crs);
+    ui.label(match shown {
+        Some(c) => crate::i18n::fmt("Now: {crs}", &[("crs", &c)]),
+        None => tl!("Now: the map's own, else the UTM zone at the centre").to_string(),
+    });
+}
+
 fn view_tab(app: &mut RustGisApp, ui: &mut Ui) {
     group(ui, "Display", |ui| {
         let g = app.session.map().graticule;
-        big(ui, app, "graticule", "Graticule", "Show latitude/longitude lines on the basemap.", "map.graticule", Value::Null, g, false);
+        big_split_form_menu(
+            ui,
+            app,
+            "graticule",
+            "Graticule",
+            "Show or hide the graticule over the basemap: latitudes and longitudes, a measured grid or the UTM zones.",
+            "map.graticule",
+            Value::Null,
+            g,
+            "Graticule options",
+            "What the graticule draws: latitudes and longitudes, a measured grid or the UTM zones.",
+            true,
+            graticule_menu,
+        );
         let gpu = app.map.gpu_enabled;
         big(
             ui,
@@ -5191,6 +5245,50 @@ mod tests {
         );
         h.run();
         h
+    }
+
+    /// View › Display › Graticule: the button shows or hides it, its menu picks the type (and shows
+    /// it), and the measured grid's coordinate system typed there is used, or refused with a
+    /// notice and nothing changed.
+    #[test]
+    fn the_graticule_menu_picks_its_type_and_the_measured_grids_system() {
+        use rustgis_engine::map::graticule::GraticuleType;
+        let mut h = tab_harness(RustGisApp::with_sample(), view_tab);
+        let on = h.state().session.map().graticule;
+        h.get_by_label("Graticule").click();
+        h.run();
+        assert_eq!(h.state().session.map().graticule, !on);
+        h.get_by_label("Graticule options").click();
+        h.run();
+        h.get_by_label("UTM Zones").click();
+        h.run();
+        assert!(h.state().session.map().graticule && h.state().session.map().graticule_type == GraticuleType::Utm);
+        // A system typed as an EPSG code: clicking into the field keeps the menu open.
+        h.get_by_label("Graticule options").click();
+        h.run();
+        h.get_by_role_and_label(egui::accesskit::Role::TextInput, "Measured grid's coordinate system").click();
+        h.run();
+        h.get_by_role_and_label(egui::accesskit::Role::TextInput, "Measured grid's coordinate system").type_text("2056");
+        h.run();
+        assert_eq!(h.state().ui.graticule_crs_input, "2056", "typed into the open menu");
+        h.get_by_label("Use System").click();
+        h.run();
+        let m = h.state().session.map();
+        assert_eq!((m.graticule_type, m.graticule_crs.as_deref()), (GraticuleType::Measured, Some("EPSG:2056")));
+        assert!(h.state().ui.graticule_crs_input.is_empty());
+        // A geographic one: refused, said, and nothing changed.
+        let said = h.state().session.notices.len();
+        h.state_mut().ui.graticule_crs_input = "4326".into();
+        h.get_by_label("Graticule options").click();
+        h.run();
+        h.get_by_label("Use System").click();
+        h.run();
+        assert_eq!(h.state().session.map().graticule_crs.as_deref(), Some("EPSG:2056"));
+        assert!(
+            h.state().session.notices[said..].iter().any(|n| n.text.contains("is geographic")),
+            "{:?}",
+            h.state().session.notices.last()
+        );
     }
 
     /// The language list names every language in English while the interface is English, with the

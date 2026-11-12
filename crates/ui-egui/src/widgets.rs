@@ -367,6 +367,45 @@ pub fn big_split_menu(
     menu_enabled: bool,
     menu: impl FnOnce(&mut Ui, &mut RustGisApp),
 ) -> (Response, Response) {
+    let close = egui::PopupCloseBehavior::CloseOnClick;
+    big_split_menu_with(ui, app, icon, label, desc, id, params, checked, menu_label, menu_desc, menu_enabled, close, menu)
+}
+
+/// A [`big_split_menu`] whose menu holds editable controls (a text box): clicks inside keep it
+/// open, as in [`big_form_menu`]; its action buttons close it themselves (`ui.close()`).
+pub fn big_split_form_menu(
+    ui: &mut Ui,
+    app: &mut RustGisApp,
+    icon: &str,
+    label: &str,
+    desc: &str,
+    id: &str,
+    params: Value,
+    checked: bool,
+    menu_label: &str,
+    menu_desc: &str,
+    menu_enabled: bool,
+    menu: impl FnOnce(&mut Ui, &mut RustGisApp),
+) -> (Response, Response) {
+    let close = egui::PopupCloseBehavior::CloseOnClickOutside;
+    big_split_menu_with(ui, app, icon, label, desc, id, params, checked, menu_label, menu_desc, menu_enabled, close, menu)
+}
+
+fn big_split_menu_with(
+    ui: &mut Ui,
+    app: &mut RustGisApp,
+    icon: &str,
+    label: &str,
+    desc: &str,
+    id: &str,
+    params: Value,
+    checked: bool,
+    menu_label: &str,
+    menu_desc: &str,
+    menu_enabled: bool,
+    close: egui::PopupCloseBehavior,
+    menu: impl FnOnce(&mut Ui, &mut RustGisApp),
+) -> (Response, Response) {
     let (label, desc, menu_label, menu_desc) = (tl!(label), tl!(desc), tl!(menu_label), tl!(menu_desc));
     let t = Tokens::get(ui.ctx());
     let w = (label.split('\n').map(|l| text_w(ui, l, regular(11.5))).fold(0.0, f32::max) + 14.0).max(50.0);
@@ -406,7 +445,7 @@ pub fn big_split_menu(
     if primary.clicked() {
         let _ = app.run_by_user(id, params);
     }
-    egui::Popup::menu(&arrow).show(|ui| {
+    egui::Popup::menu(&arrow).close_behavior(close).show(|ui| {
         ui.set_min_width(200.0);
         menu(ui, app);
     });

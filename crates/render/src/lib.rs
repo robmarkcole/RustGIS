@@ -20,6 +20,7 @@ pub mod layout;
 mod line_labels;
 mod line_markers;
 pub mod logo;
+mod mapgrid;
 mod mesh;
 mod native_tiles;
 mod pattern_fill;
@@ -3841,6 +3842,8 @@ fn render_frame(
     }
     if map.graticule && grat.a() > 0 {
         let p = paint(grat, 1.0);
+        // A measured or UTM graticule's lines (#1042), else latitudes and longitudes.
+        let grid = mapgrid::lines(map, view);
         let step = if view.camera.res > 8000.0 {
             30.0
         } else if view.camera.res > 2000.0 {
@@ -3851,17 +3854,20 @@ fn render_frame(
             1.0
         };
         let (lat_max, lat_min) = if globe.is_some() { (90.0, -90.0) } else { (85.0, -85.0) };
-        let mut lines = Vec::new();
-        let mut lon = -180.0;
-        while lon <= 180.0 {
-            lines.push((0..=36).map(|i| Coord::new(lon, lat_min + (lat_max - lat_min) * i as f64 / 36.0)).collect::<Vec<_>>());
-            lon += step;
-        }
-        let mut lat = -90.0 + step;
-        while lat < 90.0 {
-            lines.push((0..=72).map(|i| Coord::new(-180.0 + i as f64 * 5.0, lat)).collect::<Vec<_>>());
-            lat += step;
-        }
+        let lines = grid.unwrap_or_else(|| {
+            let mut lines = Vec::new();
+            let mut lon = -180.0;
+            while lon <= 180.0 {
+                lines.push((0..=36).map(|i| Coord::new(lon, lat_min + (lat_max - lat_min) * i as f64 / 36.0)).collect::<Vec<_>>());
+                lon += step;
+            }
+            let mut lat = -90.0 + step;
+            while lat < 90.0 {
+                lines.push((0..=72).map(|i| Coord::new(-180.0 + i as f64 * 5.0, lat)).collect::<Vec<_>>());
+                lat += step;
+            }
+            lines
+        });
         let lines = if globe.is_some() {
             lines
         } else if custom {

@@ -1032,7 +1032,7 @@ const WIDENED_LINES: f64 = 50.0;
 
 /// A measured grid's lines over the frame whose edges are `lonlats`, in the coordinate system of
 /// `tr`: eastings (north–south) and northings, each back in longitude/latitude, with its label.
-fn measured_lines(
+pub(crate) fn measured_lines(
     g: &Grid,
     tr: &rustgis_data::raster::Transformer,
     lonlats: &[Coord],
@@ -1140,7 +1140,7 @@ pub fn measured_crs(g: &Grid, map: &Map, center: Coord) -> Option<rustgis_data::
 }
 
 /// A step that draws about eight lines across `span`: 1, 2 or 5 times a power of ten.
-fn nice_step(span: f64, smallest: f64) -> f64 {
+pub(crate) fn nice_step(span: f64, smallest: f64) -> f64 {
     let rough = (span / 8.0).max(smallest);
     let p = 10f64.powf(rough.log10().floor());
     [1.0, 2.0, 5.0, 10.0].iter().map(|k| k * p).find(|s| *s >= rough).unwrap_or(10.0 * p)

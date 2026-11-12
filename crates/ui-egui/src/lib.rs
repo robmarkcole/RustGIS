@@ -745,6 +745,8 @@ pub struct UiState {
     pub start_projection: String,
     /// The EPSG or ESRI code typed in Settings › Start-up › Projection.
     pub start_projection_input: String,
+    /// The coordinate system typed in View › Graticule's menu for the measured grid.
+    pub graticule_crs_input: String,
     /// Start-up preference: the extent the map opens on, `[minLon, minLat, maxLon, maxLat]`;
     /// `None` for the full extent.
     pub start_extent: Option<[f64; 4]>,
@@ -980,6 +982,7 @@ impl Default for UiState {
             last_project: None,
             start_projection: String::new(),
             start_projection_input: String::new(),
+            graticule_crs_input: String::new(),
             start_extent: None,
             start_view: None,
             ribbon_minimized: false,
