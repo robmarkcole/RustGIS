@@ -20530,19 +20530,43 @@ fn zipped_shapefiles_add_as_layers() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A request read whole: its head and as much body as its `Content-Length` says. A server that
+/// answers and closes with part of the request unread has its connection reset on Windows and
+/// macOS, and the client sees the reset in place of the answer.
+fn read_request(s: &mut std::net::TcpStream) -> String {
+    use std::io::Read;
+    let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+    let mut req = Vec::new();
+    let mut buf = [0u8; 4096];
+    let mut want = None;
+    while want.is_none_or(|n| req.len() < n) && req.len() < 1 << 20 {
+        let Ok(read) = s.read(&mut buf) else { break };
+        if read == 0 {
+            break;
+        }
+        req.extend_from_slice(&buf[..read]);
+        if want.is_none()
+            && let Some(end) = req.windows(4).position(|w| w == b"\r\n\r\n")
+        {
+            let head = String::from_utf8_lossy(&req[..end]).to_ascii_lowercase();
+            let body = head.lines().find_map(|l| l.strip_prefix("content-length:")).and_then(|n| n.trim().parse::<usize>().ok());
+            want = Some(end + 4 + body.unwrap_or(0));
+        }
+    }
+    String::from_utf8_lossy(&req).into_owned()
+}
+
 /// Serves each request by the first route its path starts with (`{base}` in a body becomes the
 /// server's address; other paths are 404); returns the base address.
 fn serve_routes(routes: Vec<(&'static str, String)>, n: usize) -> String {
-    use std::io::{Read, Write};
+    use std::io::Write;
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let b = base.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming().take(n) {
             let Ok(mut s) = stream else { continue };
-            let mut buf = [0u8; 4096];
-            let read = s.read(&mut buf).unwrap_or(0);
-            let req = String::from_utf8_lossy(&buf[..read]);
+            let req = read_request(&mut s);
             let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
             match routes.iter().find(|(p, _)| path.starts_with(p)) {
                 Some((_, body)) => {
@@ -42646,7 +42670,6 @@ fn stac_search_by_shape_says_what_it_leaves_out() {
     let item = r#"{"type": "Feature", "id": "S2_1", "collection": "s2", "bbox": [7, 46, 8, 47],
         "geometry": {"type": "Polygon", "coordinates": [[[7, 46], [8, 46], [8, 47], [7, 47], [7, 46]]]},
         "properties": {"datetime": "2024-06-02T10:30:00Z", "eo:cloud_cover": 3.5}, "assets": {}}"#;
-    // A POST answered before its body is read is asked again as a GET, so each search may take two.
     let base = serve_routes(vec![("/v1/search", format!(r#"{{"type": "FeatureCollection", "features": [{item}]}}"#))], 40);
     let api = format!("{base}/v1");
     let said = |s: &Session, text: &str| s.notices.iter().filter(|n| n.text.contains(text)).count();
