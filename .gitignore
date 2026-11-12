@@ -18,9 +18,17 @@ __pycache__/
 !.env.example
 
 # Editors and operating systems.
-.vscode/
-.idea/
+.vscode
+.idea
 *.swp
 *~
 .DS_Store
 Thumbs.db
+
+# Shell and git dotfiles a sandboxed tool can leave at the root (#1819).
+/.bash_profile
+/.bashrc
+/.gitconfig
+/.profile
+/.zprofile
+/.zshrc
