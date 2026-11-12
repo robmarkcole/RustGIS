@@ -15,6 +15,15 @@
 //! passes over the pixels as there are levels, where building each level from the one before
 //! would take about 1⅓ but hold a second copy.
 //!
+//! Tiles are compressed with Deflate at its fastest level, after a predictor that makes neighbouring
+//! samples alike: the floating-point one for floats, differences along the row for whole numbers.
+//! Most of the time spent writing is compressing. Against Deflate's default level without a
+//! predictor, this compresses an elevation model's tiles about four times as fast and a fifth
+//! smaller, and an aerial photograph's three times as fast and a seventh smaller. Classes (a
+//! palette's indexes, a few whole numbers) keep the default level and no predictor: their codes
+//! don't change smoothly, so differences make them no smaller, and their long runs compress quickly
+//! at any level, to half the size of the fastest.
+//!
 //! Classic TIFF is used when the file can't pass 4 GiB even with every tile left uncompressed,
 //! BigTIFF otherwise.
 
@@ -29,8 +38,11 @@ use crate::{DataError, Result};
 pub const TILE: u32 = 512;
 /// The most images (full and overviews) written; 2³¹ pixels across needs far fewer.
 const MAX_LEVELS: usize = 32;
-/// Deflate effort (GDAL's default).
-const DEFLATE_LEVEL: u8 = 6;
+/// Deflate effort for values that change smoothly: the fastest, which the predictor makes up for in
+/// size (see the module's notes).
+const DEFLATE_FAST: u8 = 1;
+/// Deflate effort for classes, which take no predictor: the default.
+const DEFLATE_CLASSES: u8 = 6;
 
 fn err(e: impl std::fmt::Display) -> DataError {
     DataError::Format(format!("COG: {e}"))
@@ -315,6 +327,68 @@ fn tile_samples(r: &Raster, plan: &Plan, lv: &Level, tx: u32, ty: u32) -> Vec<u8
     raw
 }
 
+/// The TIFF predictor `plan`'s tiles are written with: none (1) for classes, differences along the
+/// row (2) for whole numbers, the floating-point one (3) for floats.
+fn predictor(plan: &Plan) -> u16 {
+    match plan.sample {
+        _ if plan.categorical => 1,
+        Sample::Byte | Sample::Short => 2,
+        Sample::Float => 3,
+    }
+}
+
+/// Applies `plan`'s predictor to a tile's samples (as [`tile_samples`] makes them), one tile row at
+/// a time; `row` is scratch space for the floating-point predictor's reordering.
+fn predict(raw: &mut [u8], plan: &Plan, row: &mut Vec<u8>) {
+    let spp = plan.bands.len();
+    let size = plan.sample.bytes();
+    for line in raw.chunks_exact_mut(TILE as usize * spp * size) {
+        match (predictor(plan), plan.sample) {
+            (2, Sample::Byte) => differ(line, spp),
+            (2, Sample::Short) => {
+                // Each 16-bit sample less the one a pixel before it, wrapping; last first, so each
+                // takes away a value not yet changed.
+                for i in (spp..line.len() / 2).rev() {
+                    let word =
+                        |l: &[u8], j: usize| l.get(2 * j..2 * j + 2).map_or(0, |b| u16::from_le_bytes(b.try_into().unwrap_or([0; 2])));
+                    let v = word(line, i).wrapping_sub(word(line, i - spp));
+                    if let Some(b) = line.get_mut(2 * i..2 * i + 2) {
+                        b.copy_from_slice(&v.to_le_bytes());
+                    }
+                }
+            }
+            (3, _) => {
+                // The row's bytes regrouped by significance, the most significant byte of every
+                // sample first, then differenced (TIFF Technical Note 3).
+                let n = line.len() / size;
+                row.clear();
+                row.resize(line.len(), 0);
+                for (i, sample) in line.chunks_exact(size).enumerate() {
+                    // Samples are little-endian: the last byte is the most significant.
+                    for (k, b) in sample.iter().rev().enumerate() {
+                        if let Some(o) = row.get_mut(k * n + i) {
+                            *o = *b;
+                        }
+                    }
+                }
+                line.copy_from_slice(row);
+                differ(line, spp);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Each byte of `line` less the one `stride` bytes before it, wrapping.
+fn differ(line: &mut [u8], stride: usize) {
+    for i in (stride..line.len()).rev() {
+        let prev = line.get(i - stride).copied().unwrap_or(0);
+        if let Some(b) = line.get_mut(i) {
+            *b = b.wrapping_sub(prev);
+        }
+    }
+}
+
 // TIFF field types.
 const ASCII: u16 = 2;
 const SHORT: u16 = 3;
@@ -384,6 +458,7 @@ fn entries(r: &Raster, plan: &Plan, lv: &Level, first: bool, geo: &GeoKeys, big:
     ));
     e.push(shorts(277, &[spp as u16]));
     e.push(shorts(284, &[1]));
+    e.push(shorts(317, &[predictor(plan)]));
     if let Some(colors) = &plan.palette {
         // Reds, then greens, then blues, 256 of each, as 16-bit intensities.
         let map: Vec<u16> = (0..3).flat_map(|c| (0..256).map(move |i| colors.get(i).map_or(0, |rgba| u16::from(rgba[c]) * 257))).collect();
@@ -566,11 +641,15 @@ pub fn write_to<W: Write + Seek>(r: &Raster, band: usize, flavour: Flavour, out:
     // Smallest overview first, the full image last; each in row order.
     let mut places: Vec<Vec<(u64, u64)>> = vec![Vec::new(); levels.len()];
     crate::progress::begin(tiles);
+    let mut row = Vec::new();
+    let effort = if plan.categorical { DEFLATE_CLASSES } else { DEFLATE_FAST };
     for (i, lv) in levels.iter().enumerate().rev() {
         for ty in 0..lv.down {
             for tx in 0..lv.across {
                 crate::progress::step(1)?;
-                let zipped = miniz_oxide::deflate::compress_to_vec_zlib(&tile_samples(r, &plan, lv, tx, ty), DEFLATE_LEVEL);
+                let mut raw = tile_samples(r, &plan, lv, tx, ty);
+                predict(&mut raw, &plan, &mut row);
+                let zipped = miniz_oxide::deflate::compress_to_vec_zlib(&raw, effort);
                 if !big && pos + zipped.len() as u64 > u64::from(u32::MAX) {
                     return Err(err("the file is too large for classic TIFF"));
                 }
@@ -920,6 +999,33 @@ mod tests {
         // Indexes that are not bytes can't keep a colour table: refused, not invented.
         let bad = utm(2, 1, vec![vec![1.5, 300.0]], ColorHint::Palette(colors), "Float32", None);
         assert!(write(&bad, 0).is_err());
+    }
+
+    #[test]
+    fn each_kind_of_sample_reads_back_exactly_through_its_predictor() {
+        // Wider than a tile, so rows run on into a second one and end in its padding.
+        let (w, h) = (700u32, 3u32);
+        let n = (w * h) as usize;
+        let floats =
+            (0..n).map(|i| if i % 97 == 0 { f32::NAN } else { (i as f32 - 1000.0) * 3.7e-4 * if i % 5 == 0 { 1e30 } else { 1.0 } });
+        let cases = [
+            (utm(w, h, vec![floats.collect()], ColorHint::Gray, "Float32", None), 3),
+            (utm(w, h, vec![(0..n).map(|i| (i * 37 % 65_536) as f32).collect()], ColorHint::Gray, "UInt16", None), 2),
+            (utm(w, h, vec![(0..n).map(|i| (i * 7 % 256) as f32).collect()], ColorHint::Gray, "UInt8", None), 2),
+            // A few classes take no predictor.
+            (utm(w, h, vec![(0..n).map(|i| (i % 3) as f32).collect()], ColorHint::Gray, "UInt8", None), 1),
+        ];
+        for (r, predictor) in cases {
+            let bytes = write(&r, 0).unwrap();
+            let mut dec = Decoder::new(Cursor::new(bytes.as_slice())).unwrap();
+            assert_eq!(dec.find_tag_unsigned::<u16>(Tag::Predictor).unwrap(), Some(predictor), "{}", r.data_type);
+            let back = geotiff::read(Cursor::new(bytes), "back").unwrap();
+            for (i, v) in r.bands[0].data.iter().enumerate() {
+                let (x, y) = ((i % w as usize) as i64, (i / w as usize) as i64);
+                let want = if v.is_nan() { None } else { Some(*v) };
+                assert_eq!(back.value(0, x, y), want, "{} at ({x}, {y})", r.data_type);
+            }
+        }
     }
 
     #[test]
