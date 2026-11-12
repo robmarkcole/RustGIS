@@ -6468,15 +6468,23 @@ fn complete(map: &mut Map, view: &View, record: bool) -> Option<Rendered> {
     if !NO_SHADOW_WAIT.with(std::cell::Cell::get) {
         wait_for_cast_shadows(map, view);
     }
-    // Whether cast shadows were still to come is the last pass's to say (an earlier one's may
-    // have been drawn again with them); what frames before it said is kept (see `shadows_said`).
-    let before = SHADOWS_TO_COME.with(|c| c.replace(false));
+    // What it says of cast shadows (still to come, layers drawn without them) is the last pass's
+    // to say: an earlier one's may have been drawn again with them. What frames before it said
+    // is kept (see `shadows_said`).
+    let before = (SHADOWS_TO_COME.with(|c| c.replace(false)), take_shadow_notices());
     let r = complete_passes(map, view, record);
-    SHADOWS_TO_COME.with(|c| c.set(before || c.get()));
+    SHADOWS_TO_COME.with(|c| c.set(before.0 || c.get()));
+    let mut notices = before.1;
+    for e in take_shadow_notices() {
+        if !notices.contains(&e) {
+            notices.push(e);
+        }
+    }
+    SHADOW_NOTICES.with(|n| *n.borrow_mut() = notices);
     r
 }
 
-/// [`complete`]'s passes, each saying afresh whether cast shadows were still to come.
+/// [`complete`]'s passes, each saying afresh what it drew of cast shadows.
 fn complete_passes(map: &mut Map, view: &View, record: bool) -> Option<Rendered> {
     // What had come when it drew: what lands meanwhile is news to the wait.
     let mut drawn_at = rustgis_tiles::cache::generation();
@@ -6500,6 +6508,7 @@ fn complete_passes(map: &mut Map, view: &View, record: bool) -> Option<Rendered>
         }
         drawn_at = now;
         SHADOWS_TO_COME.with(|c| c.set(false));
+        take_shadow_notices();
         r = render_cpu(map, view, true, record)?;
     }
     Some(r)
@@ -8681,9 +8690,25 @@ mod tests {
             rustgis_map::RasterRenderer::ShadedRelief { band: 0, ramp: None, azimuth: 210.0, altitude: 5.0, z_factor: 1.0, shadow: 1.0 };
         // Drawn only zoomed out past a scale between the centre's and the far band's.
         l.max_scale = Some((centre + farthest) / 2.0);
-        render_complete(&mut m, &view).unwrap();
+        // Its work held before it traces: an export that waits for it can't end until it is let
+        // go, and says it waits (a copy of the layer shares its grids); one that doesn't ends.
+        let probe = m.layer(id).and_then(|l| l.raster.clone()).unwrap();
+        let hold = rustgis_map::raster::hold_cast_shadows();
+        let export = std::thread::spawn(move || {
+            render_complete(&mut m, &view).unwrap();
+            m
+        });
+        let start = std::time::Instant::now();
+        while probe.cast_shadow_waiters() == 0 && !export.is_finished() {
+            assert!(start.elapsed() < std::time::Duration::from_secs(30), "the export neither waited for the grid nor ended");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let waited = probe.cast_shadow_waiters() > 0;
+        drop(hold);
+        let m = export.join().unwrap();
+        assert!(waited, "the export waited for the far band's cast shadows");
         let rl = m.layer(id).and_then(|l| l.raster.as_ref()).unwrap();
-        assert!(matches!(rl.cast_shadows(false, (0, 0), || {}), rustgis_map::raster::CastShadows::Ready(_)), "waited for");
+        assert!(matches!(rl.cast_shadows(false, (0, 0), || {}), rustgis_map::raster::CastShadows::Ready(_)), "and drew them");
     }
 
     /// An export doesn't wait for, nor start, the cast shadows of a layer it doesn't draw: one
