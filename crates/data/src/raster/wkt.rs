@@ -151,7 +151,7 @@ impl Parser<'_> {
         let close = match self.peek() {
             Some(b'[') => b']',
             Some(b'(') => b')',
-            _ => return Err(format!("expected '[' after {name}")),
+            _ => return Err(format!("expected '[' after {}", clip(&name))),
         };
         self.at += 1;
         let mut items = Vec::new();
@@ -173,7 +173,7 @@ impl Parser<'_> {
                     self.at += 1;
                     return Ok(Node { name, items });
                 }
-                _ => return Err(format!("unexpected text in {name}")),
+                _ => return Err(format!("unexpected text in {}", clip(&name))),
             };
             items.push(item);
             match self.peek() {
@@ -182,7 +182,7 @@ impl Parser<'_> {
                     self.at += 1;
                     return Ok(Node { name, items });
                 }
-                _ => return Err(format!("expected ',' in {name}")),
+                _ => return Err(format!("expected ',' in {}", clip(&name))),
             }
         }
     }
@@ -216,7 +216,7 @@ impl Parser<'_> {
             self.at += 1;
         }
         let t = std::str::from_utf8(self.s.get(start..self.at).unwrap_or_default()).unwrap_or("");
-        t.parse().map_err(|_| format!("'{t}' isn't a number"))
+        t.parse().map_err(|_| format!("'{}' isn't a number", clip(t)))
     }
 }
 
@@ -538,7 +538,7 @@ fn read_system(root: &Node) -> Result<(Crs, Option<String>), String> {
             let note = with_projection_note(note, root, crs);
             Ok((crs, note))
         }
-        other => Err(format!("{other} coordinate systems aren't supported")),
+        other => Err(format!("{} coordinate systems aren't supported", clip(other))),
     }
 }
 
@@ -772,7 +772,7 @@ fn geographic2(g: &Node, top: bool) -> Result<Node, String> {
         && let Some(Item::Word(kind)) = cs.items.first()
         && !kind.eq_ignore_ascii_case("ellipsoidal")
     {
-        return Err(format!("{kind} coordinate systems aren't supported"));
+        return Err(format!("{} coordinate systems aren't supported", clip(kind)));
     }
     // Longitudes counted west (planetographic ones, on most bodies) would be read as east, which
     // mirrors the data. Such a system is refused here unless it is read by its EPSG code. Its
@@ -789,7 +789,7 @@ fn geographic2(g: &Node, top: bool) -> Result<Node, String> {
         let mut datum = Vec::new();
         if let Some(e) = d.child_of(&["ELLIPSOID", "SPHEROID"]) {
             let to_m = factor(e.child_of(&LENGTH_UNIT)).unwrap_or(1.0);
-            let a = e.num(0).ok_or_else(|| format!("the ellipsoid {} has no semi-major axis", e.title()))?;
+            let a = e.num(0).ok_or_else(|| format!("the ellipsoid {} has no semi-major axis", clip(e.title())))?;
             let axes = std::iter::once(a * to_m).chain(e.num(1)).map(Item::Num);
             datum.push(Item::Node(Node::new("SPHEROID", e.title(), axes)));
         }
@@ -1091,7 +1091,7 @@ fn onward_shift(target: &Node) -> Result<[f64; 7], String> {
                 "" => "the bound system's target",
                 t => t,
             };
-            return Err(format!("{name} gives a shift of zero to WGS 84 where its datum has one"));
+            return Err(format!("{} gives a shift of zero to WGS 84 where its datum has one", clip(name)));
         }
         return Ok(std::array::from_fn(|i| shift.get(i).copied().unwrap_or(0.0)));
     }
@@ -1107,7 +1107,7 @@ fn onward_shift(target: &Node) -> Result<[f64; 7], String> {
                 "" => "the bound system's target",
                 t => t,
             };
-            Err(format!("the shift from {name} to WGS 84 isn't known"))
+            Err(format!("the shift from {} to WGS 84 isn't known", clip(name)))
         }
     }
 }
@@ -1198,7 +1198,7 @@ fn geographic(g: &Node) -> Result<Crs, String> {
     if let Some(f) = g.child("UNIT").and_then(|u| u.num(0))
         && (f - 1f64.to_radians()).abs() > 1e-9
     {
-        return Err(format!("angles in {} aren't supported", g.child("UNIT").map_or("", Node::title)));
+        return Err(format!("angles in {} aren't supported", clip(g.child("UNIT").map_or("", Node::title))));
     }
     let datum = g.child("DATUM");
     let greenwich = g.child("PRIMEM").and_then(|m| m.num(0)).is_none_or(|pm| pm == 0.0);
@@ -1495,8 +1495,8 @@ fn custom(p: &Node, method: &str) -> Result<Crs, String> {
     // and PROJ alike (the Swiss case is `somerc` below), so refuse it instead of placing points
     // wrong.
     let omerc = |no_uoff: bool| -> Result<String, String> {
-        let azimuth =
-            get(&["AZIMUTH"]).ok_or_else(|| format!("the {} projection has no azimuth", p.child("PROJECTION").map_or("", Node::title)))?;
+        let azimuth = get(&["AZIMUTH"])
+            .ok_or_else(|| format!("the {} projection has no azimuth", clip(p.child("PROJECTION").map_or("", Node::title))))?;
         if (azimuth.rem_euclid(180.0) - 90.0).abs() < 1e-10 {
             return Err("a Hotine projection with its azimuth at 90° (or 270°) isn't supported".into());
         }
@@ -1616,7 +1616,7 @@ fn custom(p: &Node, method: &str) -> Result<Crs, String> {
         {
             return Err(format!(
                 "the {} projection with a parameter that isn't a finite number isn't supported",
-                p.child("PROJECTION").map_or("", Node::title)
+                clip(p.child("PROJECTION").map_or("", Node::title))
             ));
         }
         // None of the three has a scale factor, and PROJ ignores one. A definition with a scale
@@ -1625,7 +1625,7 @@ fn custom(p: &Node, method: &str) -> Result<Crs, String> {
         "NATURAL_EARTH" | "ECKERT_IV" | "WINKEL_TRIPEL" if k0 != 1.0 => {
             return Err(format!(
                 "the {} projection with a scale factor other than 1 isn't supported",
-                p.child("PROJECTION").map_or("", Node::title)
+                clip(p.child("PROJECTION").map_or("", Node::title))
             ));
         }
         "NATURAL_EARTH" => format!("+proj=natearth {at}"),
@@ -1640,7 +1640,7 @@ fn custom(p: &Node, method: &str) -> Result<Crs, String> {
         "ORTHOGRAPHIC" | "ORTHOGRAPHIC_SPHERICAL" => format!("+proj=ortho +lat_0={lat0} {at}"),
         "MILLER_CYLINDRICAL" => format!("+proj=mill {at}"),
         "" => return Err("the projection isn't named".into()),
-        _ => return Err(format!("the {} projection isn't supported", p.child("PROJECTION").map_or("", Node::title))),
+        _ => return Err(format!("the {} projection isn't supported", clip(p.child("PROJECTION").map_or("", Node::title)))),
     };
     let units = if (to_m - 1.0).abs() > 1e-12 { format!("+to_meter={to_m}") } else { "+units=m".to_string() };
     let mut flip = axis_flip(p)?;
@@ -1812,8 +1812,9 @@ fn untransformed(datum: Option<&Node>) -> Option<String> {
     mark(datum, UNTRANSFORMED)
 }
 
-/// At most 120 characters of `s`, for a notice: the names in it come from the file.
-fn clip(s: &str) -> String {
+/// At most 120 characters of `s`, for a notice: the names in it come from the file. A notice
+/// over 16 KiB isn't shown at all (`diagnostics::redact`), so a name left whole could hide it.
+pub(crate) fn clip(s: &str) -> String {
     let mut out: String = s.chars().take(120).collect();
     if out.len() < s.len() {
         out.push('…');
@@ -1848,7 +1849,7 @@ fn datum_note(geog: Option<&Node>) -> Option<String> {
     }
     Some(format!(
         "the datum {} has no conversion to WGS 84 in the file, so positions may be off by up to a few hundred metres",
-        datum.title()
+        clip(datum.title())
     ))
 }
 
@@ -4444,5 +4445,76 @@ pub(crate) mod tests {
             sampled += 1;
         }
         assert!(sampled >= 12, "{sampled}");
+    }
+
+    /// #1866: a name from the file is cut short in every notice and error it is put in. A notice
+    /// over 16 KiB isn't shown at all (`diagnostics::redact` omits it whole), so a name left whole
+    /// would hide what the notice says; cut, the notice keeps it.
+    #[test]
+    fn a_long_name_from_the_file_is_cut_short_in_what_is_said() {
+        use crate::raster::planetary;
+        let long = "x".repeat(20_000);
+        let said = |m: &str, ends: &str| {
+            let head: String = m.chars().take(200).collect();
+            assert!(m.chars().count() < 400 && m.contains('…') && m.ends_with(ends), "{head}");
+            assert!(!crate::diagnostics::Redacted::new(m).as_str().contains("omitted"), "{head}");
+        };
+        // A datum without a shift to WGS 84.
+        let datum = format!(
+            r#"GEOGCS["g",DATUM["{long}",SPHEROID["Clarke 1880",6378249.145,293.465]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]]"#
+        );
+        said(&read_wkt(&datum).unwrap().1.unwrap(), "positions may be off by up to a few hundred metres");
+        // A bound system's target whose shift isn't known, and one whose zero shift may be a
+        // placeholder.
+        let unknown = BESSEL_WKT2.replace("Local", &long);
+        said(&crs_from_wkt(&bound_crs(BESSEL_WKT2, &unknown, &BESSEL_SHIFT)).unwrap_err(), "to WGS 84 isn't known");
+        let ed50_zero = format!(
+            r#"GEOGCS["{long}",DATUM["European_Datum_1950",SPHEROID["International 1924",6378388,297],TOWGS84[0,0,0,0,0,0,0]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]]"#
+        );
+        said(&crs_from_wkt(&bound_crs(BESSEL_WKT2, &ed50_zero, &BESSEL_SHIFT)).unwrap_err(), "where its datum has one");
+        // An ellipsoid without its axis, a projection, an angle unit and a kind of system this
+        // doesn't read.
+        let no_axis = format!(
+            r#"GEOGCRS["g",DATUM["d",ELLIPSOID["{long}"]],CS[ellipsoidal,2],AXIS["lat",north],AXIS["lon",east],ANGLEUNIT["degree",0.0174532925199433]]"#
+        );
+        said(&read_wkt(&no_axis).unwrap_err(), "has no semi-major axis");
+        let projection = format!(
+            r#"PROJCS["p",GEOGCS["g",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]],PROJECTION["{long}"],UNIT["metre",1]]"#
+        );
+        said(&read_wkt(&projection).unwrap_err(), "projection isn't supported");
+        // A world projection's name with a long run of spaces in it is still read as its method,
+        // which refuses a scale factor and a parameter that isn't a finite number.
+        let natural_earth =
+            projection.replace(&format!(r#"PROJECTION["{long}"]"#), &format!(r#"PROJECTION["Natural{}Earth"]"#, " ".repeat(20_000)));
+        assert_ne!(natural_earth, projection);
+        for parameter in [r#"PARAMETER["scale_factor",0.5]"#, r#"PARAMETER["central_meridian",1e400]"#] {
+            let refused = natural_earth.replace(r#",UNIT["metre",1]]"#, &format!(r#",{parameter},UNIT["metre",1]]"#));
+            assert_ne!(refused, natural_earth);
+            said(&read_wkt(&refused).unwrap_err(), "isn't supported");
+        }
+        let unit =
+            format!(r#"GEOGCS["g",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],PRIMEM["Greenwich",0],UNIT["{long}",0.5]]"#);
+        said(&read_wkt(&unit).unwrap_err(), "aren't supported");
+        let kind = format!(
+            r#"GEOGCRS["g",DATUM["d",ELLIPSOID["WGS 84",6378137,298.257223563]],CS[{long},2],AXIS["lat",north],AXIS["lon",east],ANGLEUNIT["degree",0.0174532925199433]]"#
+        );
+        said(&read_wkt(&kind).unwrap_err(), "coordinate systems aren't supported");
+        said(&read_wkt(&format!(r#"{long}["g"]"#)).unwrap_err(), "coordinate systems aren't supported");
+        // Text that can't be parsed.
+        said(&read_wkt(&long).unwrap_err(), "…");
+        said(&read_wkt(&format!("{long}[?]")).unwrap_err(), "…");
+        said(&read_wkt(&format!(r#"{long}["a" "b"]"#)).unwrap_err(), "…");
+        said(&read_wkt(&format!(r#"GEOGCS["g",DATUM["d",SPHEROID["s",1{}]]]"#, "e".repeat(20_000))).unwrap_err(), "isn't a number");
+        // Another body's system: read, refused, kept by none, and exported. Its radius is this
+        // test's own: a custom system is shared by its definition, so one another test reads
+        // first would keep that test's name.
+        let mars = format!(
+            r#"GEOGCS["{long}",DATUM["D_Mars",SPHEROID["Mars",3396190.1866,0.0]],PRIMEM["Reference_Meridian",0.0],UNIT["Degree",0.0174532925199433]]"#
+        );
+        let (crs, note) = read_wkt(&mars).unwrap();
+        said(&note.unwrap(), "as if on the Earth");
+        said(&planetary::refused(&long, planetary::PROJECTED), "it would land in the wrong place");
+        said(&planetary::code_note(&long), "as if on the Earth");
+        said(&planetary::export_error(crs, Crs::WebMercator).unwrap(), "or as longitude/latitude");
     }
 }

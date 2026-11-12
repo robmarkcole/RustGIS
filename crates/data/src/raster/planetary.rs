@@ -109,6 +109,7 @@ pub fn ographic_name(name: &str) -> bool {
 /// The notice for data read in another body's coordinate `system`, named as the reader shows it.
 /// Its longitude/latitude are kept as they are, so the map takes them for the Earth's.
 pub fn read_note(system: &str) -> String {
+    let system = super::wkt::clip(system);
     format!("{system} belongs to another body than the Earth; it is drawn and measured as if on the Earth")
 }
 
@@ -127,6 +128,7 @@ pub fn ellipsoid_note(system: &str) -> String {
 
 /// The notice for a layer that keeps no system, `told_by` naming what said the body.
 fn unkept_note(system: &str, told_by: &str) -> String {
+    let system = super::wkt::clip(system);
     format!(
         "{system} belongs to another body than the Earth, as only {told_by} says; it is drawn, measured and exported as if on the Earth"
     )
@@ -141,6 +143,7 @@ pub fn note_of(crs: Crs) -> Option<String> {
 /// The error for data in another body's `system` that would land in the wrong place if read as
 /// longitude/latitude. `why` says what is wrong with it.
 pub fn refused(system: &str, why: &str) -> String {
+    let system = super::wkt::clip(system);
     format!("{system} belongs to another body than the Earth, and {why}; read as longitude/latitude, it would land in the wrong place")
 }
 
@@ -327,8 +330,8 @@ pub fn export_error(from: Crs, to: Crs) -> Option<String> {
     (!same).then(|| {
         format!(
             "{} belongs to another body than the Earth, and {} is on another ellipsoid, so the coordinates would be wrong; export it in its own system or as longitude/latitude",
-            from.label(),
-            to.label()
+            super::wkt::clip(&from.label()),
+            super::wkt::clip(&to.label())
         )
     })
 }
