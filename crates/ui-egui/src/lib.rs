@@ -52,6 +52,7 @@ mod keymap;
 mod labelfonts;
 mod labelpane;
 mod layerchooser;
+mod layerprops;
 mod layoutview;
 #[cfg(not(target_arch = "wasm32"))]
 mod localagents;
@@ -650,6 +651,8 @@ pub enum RightPane {
     Format,
     /// The selected feature layer's labels (#617).
     Labeling,
+    /// The selected layer's settings in one place, a tab per topic (#1803).
+    LayerProperties,
     /// A Home › Add › Web Data service: the one `UiState::web_data` names.
     WebData,
     /// A plugin's panel: the one `UiState::plugin_panel` names.
@@ -2879,6 +2882,28 @@ impl RustGisApp {
                 }
                 // A layer's menu asks for that layer's labels: shown, even when already in view.
                 if given.is_some() { self.ui.open_right(RightPane::Labeling) } else { toggle_right(&mut self.ui, RightPane::Labeling) }
+            }
+            // The Layer Properties pane (#1803), on `{"layer": id}` when given (a layer's
+            // right-click menu), as the Labeling pane is; feature and raster layers alike.
+            "ui.pane.layerProperties" => {
+                let given = match p.get("layer").filter(|l| !l.is_null()) {
+                    Some(_) => Some(self.session.layer_id(p)?),
+                    None => None,
+                };
+                // Showing its tab already open needs no layer.
+                if (given.is_some() || !self.ui.right_open.contains(&RightPane::LayerProperties))
+                    && given.or(self.session.active_layer).and_then(|id| self.session.map().layer(id)).is_none()
+                {
+                    return Err("select a layer in the Layers pane first".into());
+                }
+                if let Some(id) = given {
+                    self.session.run("layer.select", &json!({"layer": id}))?;
+                }
+                if given.is_some() {
+                    self.ui.open_right(RightPane::LayerProperties)
+                } else {
+                    toggle_right(&mut self.ui, RightPane::LayerProperties)
+                }
             }
             // A plugin's panel: `{"id": plugin}`.
             "ui.pane.plugin" => return pluginpanel::open(self, p),

@@ -1,0 +1,606 @@
+//! The Layer Properties pane (#1803): the selected layer's settings in one place, opened from a
+//! layer's right-click menu (Properties…) or View › Windows › Layer Properties. As the Labeling
+//! pane, it keeps no layer settings of its own: it reads the layer each frame and runs the same
+//! commands as the ribbon and the layer's menu, so every change undoes on its own. Only what it
+//! shows is kept, in egui's memory: the tab chosen, the header's light and a name being typed. A tab per topic shows
+//! one part at a time: General, Source and Display. The pane follows the selected layer, as the
+//! Symbology and Labeling panes do; its header (the layer's type and name, also on the pane's tab)
+//! lights up for a moment when the layer changes, so a change made next isn't made on another
+//! layer unawares.
+
+use egui::{CornerRadius, RichText, Ui, vec2};
+use rustgis_engine::data::GeometryType;
+use rustgis_engine::map::Layer;
+use serde_json::{Value, json};
+
+use crate::RustGisApp;
+use crate::theme::{Tokens, semibold};
+
+/// How long the header stays lit after the layer changes, in seconds.
+const FLASH: f64 = 1.2;
+
+pub fn show(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
+    let Some(l) = app.session.active_layer.and_then(|id| app.session.map().layer(id)).cloned() else {
+        ui.label(RichText::new(tl!("Select a layer in the Layers pane.")).color(t.text_dim));
+        return;
+    };
+    let lit = layer_changed(ui, &l);
+    header(ui, &l, lit, t);
+    ui.add_space(6.0);
+    match topic(ui, t) {
+        Topic::General => general(app, ui, &l),
+        Topic::Source => source(app, ui, &l, t),
+        Topic::Display => display(app, ui, &l, t),
+    }
+}
+
+/// How lit the header is, from 1 when the pane has just come to show another layer than it showed
+/// to 0 once [`FLASH`] has passed; 0 for the first layer it shows. A name being typed for the layer
+/// it showed is dropped, as Escape drops it.
+fn layer_changed(ui: &Ui, l: &Layer) -> f32 {
+    let key = egui::Id::unique("layer_properties_shown");
+    let now = ui.input(|i| i.time);
+    let (shown, since) = ui.data(|d| d.get_temp::<(u64, f64)>(key)).unwrap_or((l.instance_id(), f64::NEG_INFINITY));
+    let since = if shown == l.instance_id() {
+        since
+    } else {
+        ui.data_mut(|d| d.remove_temp::<String>(name_key(shown)));
+        now
+    };
+    ui.data_mut(|d| d.insert_temp(key, (l.instance_id(), since)));
+    let lit = (1.0 - (now - since) / FLASH).clamp(0.0, 1.0) as f32;
+    if lit > 0.0 {
+        ui.ctx().request_repaint();
+    }
+    lit
+}
+
+/// The layer's type and name in a card, lit by `lit` (0 to 1) after the layer changes.
+fn header(ui: &mut Ui, l: &Layer, lit: f32, t: &Tokens) {
+    let icon = if l.is_raster() {
+        "raster_layer"
+    } else {
+        match l.geometry_type() {
+            GeometryType::Point => "point_layer",
+            GeometryType::Polyline => "line_layer",
+            _ => "polygon_layer",
+        }
+    };
+    let fill = t.pane_header.lerp_to_gamma(t.selection, lit);
+    egui::Frame::NONE.fill(fill).corner_radius(CornerRadius::same(8)).inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            let (r, _) = ui.allocate_exact_size(vec2(18.0, 18.0), egui::Sense::hover());
+            crate::icons::paint(ui.painter(), r, icon, t.icon, t.accent);
+            ui.add(egui::Label::new(RichText::new(&l.name).font(semibold(14.0))).truncate());
+        });
+    });
+}
+
+/// The pane's tab: its name and the layer it shows, so the layer is in view wherever the pane is.
+pub(crate) fn tab_name(app: &RustGisApp) -> String {
+    match app.session.active_layer.and_then(|id| app.session.map().layer(id)) {
+        Some(l) => {
+            let name: String = l.name.chars().take(24).collect();
+            let cut = if name.len() < l.name.len() { "…" } else { "" };
+            crate::i18n::fmt("Layer Properties · {layer}", &[("layer", &format!("{name}{cut}"))])
+        }
+        None => tl!("Layer Properties").to_string(),
+    }
+}
+
+/// The pane's tabs, one per topic, as the Labeling pane's.
+#[derive(Clone, Copy, PartialEq)]
+enum Topic {
+    General,
+    Source,
+    Display,
+}
+
+/// The tab row, and the tab chosen in it. It is the pane's, not a layer's: choosing another layer
+/// keeps the topic in view.
+fn topic(ui: &mut Ui, t: &Tokens) -> Topic {
+    let key = egui::Id::unique("layer_properties_topic");
+    let mut tab = ui.data(|d| d.get_temp::<Topic>(key)).unwrap_or(Topic::General);
+    crate::widgets::tabs(
+        ui,
+        t,
+        key,
+        &mut tab,
+        &[
+            crate::widgets::Tab { label: "General", icon: "identify", hover: None, value: Topic::General },
+            crate::widgets::Tab { label: "Source", icon: "add_data", hover: None, value: Topic::Source },
+            crate::widgets::Tab { label: "Display", icon: "scale_range", hover: None, value: Topic::Display },
+        ],
+    );
+    ui.data_mut(|d| d.insert_temp(key, tab));
+    ui.add_space(4.0);
+    tab
+}
+
+fn run(app: &mut RustGisApp, id: &str, params: Value) -> Option<Value> {
+    app.run(id, params).map_err(|e| app.session.notify(e, true)).ok()
+}
+
+/// A topic's part heading, as the Symbology pane's.
+fn heading(ui: &mut Ui, text: &str, t: &Tokens) {
+    ui.add_space(6.0);
+    ui.label(RichText::new(tl!(text)).size(11.5).color(t.text_dim));
+}
+
+/// Name, visibility, whether a feature layer's features can be selected and whether the Layers
+/// pane shows its legend. Symbology and labels keep their own panes.
+fn general(app: &mut RustGisApp, ui: &mut Ui, l: &Layer) {
+    name_row(app, ui, l);
+    ui.add_space(4.0);
+    let mut visible = l.visible;
+    if ui.checkbox(&mut visible, tl!("Visible")).changed() {
+        run(app, "layer.visibility", json!({"layer": l.id, "visible": visible}));
+    }
+    if !l.is_raster() {
+        let mut selectable = l.selectable;
+        if ui
+            .checkbox(&mut selectable, tl!("Selectable"))
+            .on_hover_text(tl!("Whether the Select tool picks this layer's features on the map"))
+            .changed()
+        {
+            run(app, "layer.selectable", json!({"layer": l.id, "on": selectable}));
+        }
+    }
+    let mut expanded = l.expanded;
+    if ui
+        .checkbox(&mut expanded, tl!("Show legend in Layers"))
+        .on_hover_text(tl!("Whether the Layers pane lists the layer's classes"))
+        .changed()
+    {
+        run(app, "layer.expand", json!({"layer": l.id, "on": expanded}));
+    }
+}
+
+/// Where the name being typed for the layer `instance` is kept.
+fn name_key(instance: u64) -> egui::Id {
+    egui::Id::unique(("layer_properties_name", instance))
+}
+
+/// The most characters `layer.rename` keeps of a name: the box takes no more (a longer paste is
+/// cut to fit, and a note under the box says so), so the command cuts none.
+const NAME_LIMIT: usize = 200;
+
+/// The layer's name, renamed (`layer.rename`) when the box is left (a click elsewhere, another
+/// layer's included) or Enter is pressed, and put back as it was with Escape or when left empty. A
+/// press on the Layers pane lets go of the box before the pane is drawn
+/// (`widgets::let_go_on_panel_press`), so on that frame the box has lost its focus but the draft,
+/// kept the frame before, still names the layer it was typed for. A draft is kept only while the
+/// box has focus, so a rename from elsewhere (undo, a script) shows at once, and one older than the
+/// last frame (the pane was hidden mid-edit) is dropped, not shown as if it were the name. A draft
+/// begun from another name than the layer's (a script or the assistant renamed it meanwhile) is
+/// dropped too, so leaving the box never undoes that rename. The box is the layer's own: when the
+/// layer changes without the box being left (a script, the assistant), the draft is dropped (see
+/// [`layer_changed`]).
+fn name_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer) {
+    let key = name_key(l.instance_id());
+    let (kept_at, from) = (key.with("pass"), key.with("from"));
+    let pass = ui.ctx().cumulative_pass_nr();
+    let fresh = ui.data(|d| d.get_temp::<u64>(kept_at)).is_some_and(|at| at + 1 >= pass)
+        && ui.data(|d| d.get_temp::<String>(from)).is_some_and(|n| n == l.name);
+    let mut draft = ui.data(|d| d.get_temp::<String>(key)).filter(|_| fresh).unwrap_or_else(|| l.name.clone());
+    // Read before the box, which may take the key for itself.
+    let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+    let full = ui.horizontal(|ui| {
+        let input_label = ui.label(tl!("Name"));
+        let edit = egui::TextEdit::singleline(&mut draft)
+            .id_salt(("layer_properties_name", l.instance_id()))
+            .char_limit(NAME_LIMIT)
+            .desired_width(f32::INFINITY);
+        let r = ui.add(edit).labelled_by(input_label.id);
+        let full = draft.chars().count() >= NAME_LIMIT;
+        if r.has_focus() {
+            ui.data_mut(|d| {
+                d.insert_temp(key, draft);
+                d.insert_temp(kept_at, pass);
+                d.insert_temp(from, l.name.clone());
+            });
+        } else {
+            ui.data_mut(|d| {
+                d.remove_temp::<String>(key);
+                d.remove_temp::<u64>(kept_at);
+                d.remove_temp::<String>(from);
+            });
+            let name = draft.trim();
+            if r.lost_focus() && !escape && !name.is_empty() && name != l.name {
+                run(app, "layer.rename", json!({"layer": l.id, "name": name}));
+            }
+        }
+        full
+    });
+    // The box takes no more, and cuts a longer paste to fit: said, not done unseen.
+    if full.inner {
+        ui.weak(tl!("Names keep up to 200 characters."));
+    }
+}
+
+/// What the Details pane shows of the layer, and the actions on its source the layer's menu has,
+/// each where the menu shows it.
+fn source(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
+    crate::panes::source_details(ui, l, t);
+    ui.add_space(8.0);
+    ui.horizontal_wrapped(|ui| {
+        if l.is_streamed() && ui.button(tl!("Load All Features")).clicked() {
+            // Read on a thread of its own in the desktop app (see `readjob`).
+            #[cfg(not(target_arch = "wasm32"))]
+            let _ = crate::readjob::run(app, "layer.loadAll", json!({"layer": l.id}));
+            #[cfg(target_arch = "wasm32")]
+            run(app, "layer.loadAll", json!({"layer": l.id}));
+        }
+        if l.linked_file().is_some() && ui.button(tl!("Repair Data Source…")).clicked() {
+            run(app, "ui.dialog", json!({"name": "repairSource", "layer": l.id}));
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if crate::reloaddata::supported(l) && ui.button(tl!("Reload Data")).on_hover_text(tl!(crate::reloaddata::HELP)).clicked() {
+            run(app, "ui.reloadData", json!({"layer": l.id}));
+        }
+        if !l.is_raster() && ui.button(tl!("Define Projection…")).clicked() {
+            run(app, "ui.dialog", json!({"name": "defineProjection"}));
+        }
+    });
+}
+
+/// When and how the layer draws: its visibility range, transparency, masking, and a raster's
+/// blend or a feature layer's reference scale.
+fn display(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
+    heading(ui, "Visibility Range", t);
+    crate::ribbon::scale_range_rows(app, ui, l, "layer_properties_scale", 12.5);
+    if (l.min_scale.is_some() || l.max_scale.is_some())
+        && ui.button(tl!("Clear Limits")).on_hover_text(tl!("Draw the layer at every scale.")).clicked()
+    {
+        run(app, "layer.scaleRange", json!({"layer": l.id}));
+    }
+    heading(ui, "Effects", t);
+    crate::panes::transparency_row(app, ui, l);
+    if l.is_raster() {
+        blend_row(app, ui, l);
+    }
+    mask_row(app, ui, l);
+    if !l.is_raster() && !l.graphics {
+        crate::panes::reference_scale_row(app, ui, l);
+    }
+    priority_row(app, ui, l);
+}
+
+/// The layer's depth priority (`layer.priority`), as the ribbon's Raise and Lower Priority set it:
+/// a higher one draws above lower ones, whatever the layer order. A drag is one step, set when let go.
+fn priority_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer) {
+    ui.horizontal(|ui| {
+        let input_label = ui.label(tl!("Depth priority"));
+        let mut v = l.priority;
+        let drag = crate::widgets::Dragged::lend(ui, egui::Id::unique(("layer_properties_priority", l.instance_id())), &mut v);
+        let r = ui
+            .add(egui::DragValue::new(&mut v).range(-1000..=1000).speed(0.1))
+            .on_hover_text(tl!("Higher draws on top of lower, whatever the layer order"))
+            .labelled_by(input_label.id);
+        if drag.settled(ui, &r, &mut v) && v != l.priority {
+            run(app, "layer.priority", json!({"layer": l.id, "value": v}));
+        }
+    });
+}
+
+/// How a raster's colours combine with what's beneath (`layer.blend`), as the ribbon's Layer
+/// Blend menu offers it.
+fn blend_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer) {
+    ui.horizontal(|ui| {
+        let input_label = ui.label(tl!("Layer Blend"));
+        egui::ComboBox::from_id_salt("layer_properties_blend")
+            .selected_text(tl!(l.blend.label()))
+            .width(130.0)
+            .show_ui(ui, |ui| {
+                for b in rustgis_engine::map::effects::Blend::ALL {
+                    if ui.selectable_label(l.blend == b, tl!(b.label())).clicked() && l.blend != b {
+                        run(app, "layer.blend", json!({"layer": l.id, "mode": b.code()}));
+                    }
+                }
+            })
+            .response
+            .labelled_by(input_label.id);
+    });
+}
+
+/// The polygon layer the layer shows only inside (`layer.mask`), as the ribbon's Masking menu
+/// offers it.
+fn mask_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer) {
+    let choices = crate::ribbon::mask_choices(app, l);
+    ui.horizontal(|ui| {
+        let input_label = ui.label(tl!("Masking"));
+        let none = tl!("No mask").to_string();
+        egui::ComboBox::from_id_salt("layer_properties_mask")
+            .selected_text(l.mask.clone().unwrap_or_else(|| none.clone()))
+            .width(130.0)
+            .show_ui(ui, |ui| {
+                if ui.selectable_label(l.mask.is_none(), none).clicked() && l.mask.is_some() {
+                    run(app, "layer.mask", json!({"layer": l.id, "mask": null}));
+                }
+                for n in &choices {
+                    let on = l.mask.as_deref() == Some(n.as_str());
+                    if ui.selectable_label(on, n.as_str()).clicked() && !on {
+                        run(app, "layer.mask", json!({"layer": l.id, "mask": n}));
+                    }
+                }
+            })
+            .response
+            .labelled_by(input_label.id);
+    });
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use egui::accesskit::Role;
+    use egui_kittest::kittest::Queryable;
+    use serde_json::json;
+
+    use crate::{RightPane, RustGisApp};
+
+    fn layer_id(app: &RustGisApp, name: &str) -> u32 {
+        app.session.map().layers.iter().find(|l| l.name == name).unwrap().id
+    }
+
+    fn with_cities() -> RustGisApp {
+        let mut app = RustGisApp::with_sample();
+        let id = layer_id(&app, "Cities");
+        app.session.run("layer.select", &json!({"layer": id})).unwrap();
+        app
+    }
+
+    fn harness(app: RustGisApp) -> egui_kittest::Harness<'static, RustGisApp> {
+        // The pane's fonts (its semibold heading) are installed on the first frame, as the app does.
+        let mut fonts = false;
+        egui_kittest::Harness::builder().with_size(egui::vec2(360.0, 900.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                // Another pane in view: this one isn't drawn, as in the app.
+                if app.ui.right == Some(RightPane::Symbology) {
+                    return;
+                }
+                super::show(app, ui, &crate::theme::Tokens::light());
+            },
+            app,
+        )
+    }
+
+    fn open_tab(h: &mut egui_kittest::Harness<'static, RustGisApp>, topic: &str) {
+        h.get_by_role_and_label(Role::Button, topic).click();
+        h.run();
+    }
+
+    #[test]
+    fn the_pane_command_needs_a_layer() {
+        let mut app = RustGisApp::with_sample();
+        app.session.active_layer = None;
+        assert!(app.run("ui.pane.layerProperties", json!(null)).is_err(), "no layer selected");
+        let cities = layer_id(&app, "Cities");
+        app.session.run("layer.select", &json!({"layer": cities})).unwrap();
+        assert!(app.run("ui.pane.layerProperties", json!({"layer": "No Such Layer"})).is_err());
+        assert_eq!(app.session.active_layer, Some(cities), "a refusal leaves the selection as it was");
+        app.session.active_layer = None;
+        app.run("ui.pane.layerProperties", json!({"layer": cities})).unwrap();
+        assert_eq!(app.session.active_layer, Some(cities), "the layer given is selected");
+        assert_eq!(app.ui.right, Some(RightPane::LayerProperties));
+        // A raster has properties too.
+        if let Some(raster) = app.session.map().layers.iter().find(|l| l.is_raster()).map(|l| l.id) {
+            app.run("ui.pane.layerProperties", json!({"layer": raster})).unwrap();
+            assert_eq!(app.session.active_layer, Some(raster));
+        }
+        app.run("ui.pane.layerProperties", json!({"close": true})).unwrap();
+        assert!(!app.ui.right_open.contains(&RightPane::LayerProperties));
+    }
+
+    /// Each tab's inputs are reachable by their row labels.
+    #[test]
+    fn inputs_are_reachable_by_their_row_labels() {
+        let mut h = harness(with_cities());
+        h.run();
+        assert!(h.query_by_role_and_label(Role::TextInput, "Name").is_some());
+        assert!(h.query_by_role_and_label(Role::CheckBox, "Visible").is_some());
+        assert!(h.query_by_role_and_label(Role::CheckBox, "Selectable").is_some());
+        open_tab(&mut h, "Display");
+        for label in ["Out Beyond", "In Beyond", "Masking", "Reference scale"] {
+            assert!(h.query_by_role_and_label(Role::ComboBox, label).is_some(), "missing input: {label}");
+        }
+        assert!(h.query_by_role_and_label(Role::SpinButton, "Depth priority").is_some());
+        assert!(h.query_by_role_and_label(Role::ComboBox, "Layer Blend").is_none(), "blend is a raster's");
+        open_tab(&mut h, "Source");
+        assert!(h.query_by_label("Geometry").is_some(), "the Details rows");
+    }
+
+    /// A new name is one rename, on Enter; Escape leaves the name as it was.
+    #[test]
+    fn the_name_box_renames_the_layer() {
+        let app = with_cities();
+        let id = app.session.active_layer.unwrap();
+        let steps = app.session.undo_depth();
+        let mut h = harness(app);
+        h.run();
+        h.get_by_role_and_label(Role::TextInput, "Name").click();
+        h.run();
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        h.key_press(egui::Key::Backspace);
+        h.run();
+        h.get_by_role_and_label(Role::TextInput, "Name").type_text("Towns");
+        h.run();
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert_eq!(h.state().session.map().layer(id).unwrap().name, "Towns");
+        assert_eq!(h.state().session.undo_depth(), steps + 1, "one step");
+        h.get_by_role_and_label(Role::TextInput, "Name").click();
+        h.run();
+        h.get_by_role_and_label(Role::TextInput, "Name").type_text(" and villages");
+        h.run();
+        h.key_press(egui::Key::Escape);
+        h.run();
+        assert_eq!(h.state().session.map().layer(id).unwrap().name, "Towns", "Escape keeps the name");
+        assert_eq!(h.state().session.undo_depth(), steps + 1);
+        // Escape lets go of the box, so no later click away can set what was escaped.
+        assert!(!h.get_by_role_and_label(Role::TextInput, "Name").is_focused(), "Escape lets go of the box");
+    }
+
+    /// The box takes no more characters than `layer.rename` keeps, and says so once it is full, so
+    /// what doesn't fit (a paste) isn't cut unsaid.
+    #[test]
+    fn the_name_box_takes_no_more_than_the_rename_keeps() {
+        let app = with_cities();
+        let id = app.session.active_layer.unwrap();
+        let mut h = harness(app);
+        h.run();
+        h.get_by_role_and_label(Role::TextInput, "Name").click();
+        h.run();
+        assert!(h.query_by_label("Names keep up to 200 characters.").is_none(), "no note for a short name");
+        // "Cities" and as many more: the box stops at the limit.
+        h.get_by_role_and_label(Role::TextInput, "Name").type_text(&"x".repeat(super::NAME_LIMIT));
+        h.run();
+        let typed = h.get_by_role_and_label(Role::TextInput, "Name").value().unwrap_or_default();
+        assert_eq!(typed.chars().count(), super::NAME_LIMIT);
+        assert!(h.query_by_label("Names keep up to 200 characters.").is_some(), "the cut is said");
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert_eq!(h.state().session.map().layer(id).unwrap().name, typed, "nothing cut");
+    }
+
+    /// A rename from elsewhere (a script, the assistant) while a name is being typed wins: the
+    /// draft begun from the old name is dropped, and leaving the box doesn't undo the rename.
+    #[test]
+    fn a_rename_from_elsewhere_while_typing_is_kept() {
+        let app = with_cities();
+        let id = app.session.active_layer.unwrap();
+        let mut h = harness(app);
+        h.run();
+        h.get_by_role_and_label(Role::TextInput, "Name").click();
+        h.run();
+        h.get_by_role_and_label(Role::TextInput, "Name").type_text(" draft");
+        h.run();
+        h.state_mut().session.run("layer.rename", &json!({"layer": id, "name": "Towns"})).unwrap();
+        h.run();
+        assert_eq!(h.get_by_role_and_label(Role::TextInput, "Name").value().as_deref(), Some("Towns"), "the box shows the new name");
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert_eq!(h.state().session.map().layer(id).unwrap().name, "Towns");
+    }
+
+    /// A name being typed when another layer is chosen renames neither layer, and doesn't come
+    /// back with the first; the header lights up for the new layer, and the tab names it.
+    #[test]
+    fn choosing_another_layer_drops_the_name_being_typed() {
+        let app = with_cities();
+        let cities = app.session.active_layer.unwrap();
+        let countries = layer_id(&app, "Countries");
+        let steps = app.session.undo_depth();
+        let mut h = harness(app);
+        h.run();
+        h.get_by_role_and_label(Role::TextInput, "Name").click();
+        h.run();
+        h.get_by_role_and_label(Role::TextInput, "Name").type_text(" draft");
+        h.run();
+        let instance = h.state().session.map().layer(cities).unwrap().instance_id();
+        assert!(h.ctx.data(|d| d.get_temp::<String>(super::name_key(instance))).is_some(), "typing keeps a draft");
+        h.state_mut().session.run("layer.select", &json!({"layer": countries})).unwrap();
+        // The header keeps repainting while it is lit, so these frames are stepped, not run.
+        h.run_steps(2);
+        let shown = h.ctx.data(|d| d.get_temp::<(u64, f64)>(egui::Id::unique("layer_properties_shown")));
+        assert!(shown.is_some_and(|(_, since)| since.is_finite()), "the header is lit for the new layer");
+        assert!(super::tab_name(h.state()).ends_with("Countries"), "{}", super::tab_name(h.state()));
+        assert!(h.ctx.data(|d| d.get_temp::<String>(super::name_key(instance))).is_none(), "the draft is dropped");
+        h.state_mut().session.run("layer.select", &json!({"layer": cities})).unwrap();
+        h.run_steps(2);
+        let m = h.state().session.map();
+        assert_eq!((m.layer(cities).unwrap().name.as_str(), m.layer(countries).unwrap().name.as_str()), ("Cities", "Countries"));
+        assert_eq!(h.state().session.undo_depth(), steps, "nothing renamed");
+        assert!(h.ctx.data(|d| d.get_temp::<String>(super::name_key(instance))).is_none(), "nor does it come back");
+    }
+
+    /// A name typed and left by clicking another layer in the Layers pane renames the layer it was
+    /// typed for, in one step, and the pane then shows the other: the press lets go of the box
+    /// before the row picks its layer (`widgets::let_go_on_panel_press`), as in the whole app.
+    #[test]
+    fn clicking_another_layer_renames_the_layer_the_name_was_typed_for() {
+        let mut app = RustGisApp::with_sample();
+        app.run("ui.pane.layerProperties", json!({"layer": "Countries"})).unwrap();
+        let countries = app.session.active_layer.unwrap();
+        let cities = layer_id(&app, "Cities");
+        let steps = app.session.undo_depth();
+        let mut h =
+            egui_kittest::Harness::builder().with_size(egui::vec2(1400.0, 900.0)).with_max_steps(64).with_step_dt(0.25).build_ui_state(
+                |ui, app: &mut RustGisApp| {
+                    let ctx = ui.ctx().clone();
+                    app.logic(&ctx);
+                    app.ui(ui);
+                },
+                app,
+            );
+        h.run_steps(6);
+        h.get_by_role_and_label(Role::TextInput, "Name").click();
+        h.run_steps(2);
+        h.get_by_role_and_label(Role::TextInput, "Name").type_text(" 2");
+        h.run_steps(2);
+        let at = h.get_by_label("Cities").rect().center();
+        h.hover_at(at);
+        h.drag_at(at);
+        h.step();
+        h.drop_at(at);
+        h.run_steps(3);
+        let m = h.state().session.map();
+        assert_eq!((m.layer(countries).unwrap().name.as_str(), m.layer(cities).unwrap().name.as_str()), ("Countries 2", "Cities"));
+        assert_eq!(h.state().session.active_layer, Some(cities), "the click picked Cities");
+        assert_eq!(h.state().session.undo_depth(), steps + 1, "one step");
+    }
+
+    /// A name being typed when the pane is hidden is dropped: back in view, the box shows the
+    /// layer's name, and nothing was renamed.
+    #[test]
+    fn hiding_the_pane_drops_the_name_being_typed() {
+        let app = with_cities();
+        let id = app.session.active_layer.unwrap();
+        let steps = app.session.undo_depth();
+        let mut h = harness(app);
+        h.run();
+        h.get_by_role_and_label(Role::TextInput, "Name").click();
+        h.run();
+        h.get_by_role_and_label(Role::TextInput, "Name").type_text(" draft");
+        h.run();
+        let key = super::name_key(h.state().session.map().layer(id).unwrap().instance_id());
+        assert!(h.ctx.data(|d| d.get_temp::<String>(key)).is_some(), "typing keeps a draft");
+        h.state_mut().ui.right = Some(RightPane::Symbology);
+        h.run();
+        h.state_mut().ui.right = Some(RightPane::LayerProperties);
+        h.run();
+        assert!(h.ctx.data(|d| d.get_temp::<String>(key)).is_none(), "the draft is dropped");
+        assert_eq!(h.get_by_role_and_label(Role::TextInput, "Name").value().as_deref(), Some("Cities"));
+        assert_eq!(h.state().session.map().layer(id).unwrap().name, "Cities");
+        assert_eq!(h.state().session.undo_depth(), steps, "nothing renamed");
+    }
+
+    /// The checkboxes run the layer's commands, each a step of its own.
+    #[test]
+    fn visible_and_selectable_run_their_commands() {
+        let app = with_cities();
+        let id = app.session.active_layer.unwrap();
+        let mut h = harness(app);
+        h.run();
+        h.get_by_role_and_label(Role::CheckBox, "Visible").click();
+        h.run();
+        assert!(!h.state().session.map().layer(id).unwrap().visible);
+        h.get_by_role_and_label(Role::CheckBox, "Selectable").click();
+        h.run();
+        assert!(!h.state().session.map().layer(id).unwrap().selectable);
+        h.state_mut().session.run("edit.undo", &json!({})).unwrap();
+        assert!(h.state().session.map().layer(id).unwrap().selectable);
+        // The legend's fold is what the Layers pane shows, not an edit: no undo step
+        // (`layer.expand` is a view command).
+        let steps = h.state().session.undo_depth();
+        h.get_by_role_and_label(Role::CheckBox, "Show legend in Layers").click();
+        h.run();
+        assert!(!h.state().session.map().layer(id).unwrap().expanded, "the legend is folded");
+        assert_eq!(h.state().session.undo_depth(), steps, "no undo step");
+    }
+}

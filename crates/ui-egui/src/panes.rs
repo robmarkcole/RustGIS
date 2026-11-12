@@ -153,6 +153,7 @@ fn right_title(pane: RightPane) -> (&'static str, &'static str) {
         RightPane::Bookmarks => ("Bookmarks", "ui.pane.bookmarks"),
         RightPane::Format => ("Format", "ui.pane.format"),
         RightPane::Labeling => ("Labeling", "ui.pane.labeling"),
+        RightPane::LayerProperties => ("Layer Properties", "ui.pane.layerProperties"),
         // Its tab says which service it shows (see `right_name`).
         RightPane::WebData => ("Web Data", "ui.pane.webData"),
         // Its tab says whose panel it is (see `right_name`).
@@ -165,6 +166,8 @@ fn right_name(app: &RustGisApp, pane: RightPane) -> String {
     match pane {
         RightPane::Plugin => crate::pluginpanel::title(app),
         RightPane::WebData => tl!(web_data_title(app)).to_string(),
+        // Its tab names the layer it shows (#1803).
+        RightPane::LayerProperties => crate::layerprops::tab_name(app),
         _ => tl!(right_title(pane).0).to_string(),
     }
 }
@@ -214,6 +217,7 @@ fn right_pane(app: &mut RustGisApp, ui: &mut Ui, right: RightPane, t: &Tokens) {
             RightPane::Bookmarks => crate::bookmarkpane::show(app, ui, t),
             RightPane::Format => crate::graphicformat::show(app, ui, t),
             RightPane::Labeling => crate::labelpane::show(app, ui, t),
+            RightPane::LayerProperties => crate::layerprops::show(app, ui, t),
             RightPane::Plugin => crate::pluginpanel::show(app, ui, t),
             RightPane::WebData => web_data(app, ui),
         });
@@ -2388,6 +2392,14 @@ fn layer_menu(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, reorder: bool) {
         let _ = app.run("layer.remove", json!({"layer": l.id}));
         ui.close();
     }
+    // Last, as in other desktop GIS (#1803).
+    ui.separator();
+    if ui.button(tl!("Properties…")).clicked() {
+        if let Err(e) = app.run("ui.pane.layerProperties", json!({"layer": l.id})) {
+            app.session.notify(e, true);
+        }
+        ui.close();
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -4421,14 +4433,7 @@ fn symbology(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     ui.add_space(10.0);
     ui.separator();
     ui.label(egui::RichText::new(tl!("Layer")).size(11.5).color(t.text_dim));
-    let mut tr = l.transparency;
-    ui.horizontal(|ui| {
-        let input_label = ui.label(tl!("Transparency"));
-        ui.spacing_mut().slider_width = 150.0;
-        let r =
-            ui.add(egui::Slider::new(&mut tr, 0.0..=100.0).update_while_editing(false).suffix(" %").integer()).labelled_by(input_label.id);
-        transparency_drag(app, ui, &r, &l, tr);
-    });
+    transparency_row(app, ui, &l);
     if !l.graphics {
         reference_scale_row(app, ui, &l);
     }
@@ -4731,9 +4736,10 @@ fn held_drag(ui: &mut Ui, id: egui::Id, v: &mut f32, range: std::ops::RangeInclu
 /// The scales the Reference scale picker offers, besides none and the map's own.
 const REFERENCE_SCALE_CHOICES: [f64; 8] = [5_000.0, 10_000.0, 25_000.0, 50_000.0, 100_000.0, 200_000.0, 500_000.0, 1_000_000.0];
 
-/// The Symbology pane's Reference scale: the scale a layer's symbol and label sizes are set
-/// for, so they grow and shrink with the map (`layer.referenceScale`).
-fn reference_scale_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer) {
+/// The Symbology pane's Reference scale, also on the Layer Properties pane's Display tab (#1803):
+/// the scale a layer's symbol and label sizes are set for, so they grow and shrink with the map
+/// (`layer.referenceScale`).
+pub(crate) fn reference_scale_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer) {
     let current = app.session.map().scale().round();
     ui.horizontal(|ui| {
         ui.label(tl!("Reference scale")).on_hover_text(tl!(
@@ -4757,6 +4763,19 @@ fn reference_scale_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer) {
             })
             .response
             .on_hover_text(tl!("Reference scale"));
+    });
+}
+
+/// The layer's Transparency row, as the Symbology pane and the Layer Properties pane's Display tab
+/// (#1803) show it.
+pub(crate) fn transparency_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer) {
+    let mut tr = l.transparency;
+    ui.horizontal(|ui| {
+        let input_label = ui.label(tl!("Transparency"));
+        ui.spacing_mut().slider_width = 150.0;
+        let r =
+            ui.add(egui::Slider::new(&mut tr, 0.0..=100.0).update_while_editing(false).suffix(" %").integer()).labelled_by(input_label.id);
+        transparency_drag(app, ui, &r, l, tr);
     });
 }
 
@@ -6301,8 +6320,14 @@ fn details(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         ui.label(egui::RichText::new(tl!("Select a layer in the Layers pane.")).color(t.text_dim));
         return;
     };
-    let e = l.extent();
     ui.label(egui::RichText::new(&l.name).font(semibold(14.0)));
+    source_details(ui, l, t);
+}
+
+/// What the Details pane and the Layer Properties pane's Source tab (#1803) show of a layer: its
+/// geometry, counts, source, coordinate system, extent and fields, or a raster's own details.
+pub(crate) fn source_details(ui: &mut Ui, l: &Layer, t: &Tokens) {
+    let e = l.extent();
     if let Some(rl) = &l.raster {
         raster_details(ui, rl, t);
         return;
@@ -6860,14 +6885,7 @@ fn raster_symbology(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
     ui.add_space(10.0);
     ui.separator();
     ui.label(egui::RichText::new(tl!("Layer")).size(11.5).color(t.text_dim));
-    let mut tr = l.transparency;
-    ui.horizontal(|ui| {
-        let input_label = ui.label(tl!("Transparency"));
-        ui.spacing_mut().slider_width = 150.0;
-        let r =
-            ui.add(egui::Slider::new(&mut tr, 0.0..=100.0).update_while_editing(false).suffix(" %").integer()).labelled_by(input_label.id);
-        transparency_drag(app, ui, &r, l, tr);
-    });
+    transparency_row(app, ui, l);
 }
 
 /// The Masking section of a raster's symbology (#348): values drawn as no data, and a range of

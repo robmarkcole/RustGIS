@@ -889,6 +889,7 @@ fn every_tab_pane_and_dialog_renders() {
     for (id, p) in [
         ("ui.pane.symbology", json!(null)),
         ("ui.pane.labeling", json!({"layer": "Cities"})),
+        ("ui.pane.layerProperties", json!({"layer": "Cities"})),
         ("ui.pane.geoprocessing", json!(null)),
         ("ui.gp.open", json!({"tool": "buffer"})),
         ("ui.pane.history", json!(null)),

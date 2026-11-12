@@ -2180,6 +2180,16 @@ fn view_tab(app: &mut RustGisApp, ui: &mut Ui) {
                 Value::Null,
                 app.ui.right == Some(RightPane::DiagnosticLog),
             );
+            small(
+                ui,
+                app,
+                "settings",
+                "Layer Properties",
+                "Show the selected layer's settings in one place.",
+                "ui.pane.layerProperties",
+                Value::Null,
+                app.ui.right == Some(RightPane::LayerProperties),
+            );
         });
     });
     group(ui, "Navigation", |ui| {
@@ -3926,16 +3936,21 @@ fn feature_style_groups(app: &mut RustGisApp, ui: &mut Ui) {
     layer_group(app, ui, &layer);
 }
 
-/// The polygon layers that could mask `layer`.
-fn mask_menu(ui: &mut Ui, app: &mut RustGisApp, layer: &rustgis_engine::map::Layer) {
-    let polys: Vec<String> = app
-        .session
+/// The names of the polygon layers that could mask `layer`: the ribbon's Masking menu and the
+/// Layer Properties pane's Display tab (#1803) offer the same ones.
+pub(crate) fn mask_choices(app: &RustGisApp, layer: &rustgis_engine::map::Layer) -> Vec<String> {
+    app.session
         .map()
         .layers
         .iter()
         .filter(|l| l.id != layer.id && l.geometry_type() == GeometryType::Polygon)
         .map(|l| l.name.clone())
-        .collect();
+        .collect()
+}
+
+/// The polygon layers that could mask `layer`.
+fn mask_menu(ui: &mut Ui, app: &mut RustGisApp, layer: &rustgis_engine::map::Layer) {
+    let polys = mask_choices(app, layer);
     let cur = layer.mask.clone();
     small_menu(ui, app, "polygon_layer", "Masking", "Show the layer only inside another layer's polygons.", move |ui, app| {
         if ui.radio(cur.is_none(), tl!("No mask")).clicked() {
@@ -4252,36 +4267,43 @@ fn imagery_groups(app: &mut RustGisApp, ui: &mut Ui) {
     });
 }
 
+/// The layer's Out Beyond and In Beyond pickers (`layer.scaleRange`), a row each: the ribbon's
+/// Visibility Range group and the Layer Properties pane's Display tab (#1803) share them. `salt`
+/// keeps the two places' pickers apart; `size` is the labels' text size.
+pub(crate) fn scale_range_rows(app: &mut RustGisApp, ui: &mut Ui, layer: &rustgis_engine::map::Layer, salt: &str, size: f32) {
+    for (label, cur, key) in [("Out Beyond", layer.min_scale, "min"), ("In Beyond", layer.max_scale, "max")] {
+        ui.horizontal(|ui| {
+            let input_label = ui.label(egui::RichText::new(tl!(label)).size(size));
+            egui::ComboBox::from_id_salt(format!("{salt}_{key}"))
+                .selected_text(scale_label(cur))
+                .width(118.0)
+                .show_ui(ui, |ui| {
+                    let mut choices: Vec<Option<f64>> = vec![None];
+                    choices.extend(SCALES.iter().map(|s| Some(*s)));
+                    for c in choices {
+                        if ui.selectable_label(c == cur, scale_label(c)).clicked() {
+                            let (mut min, mut max) = (layer.min_scale, layer.max_scale);
+                            if key == "min" {
+                                min = c;
+                            } else {
+                                max = c;
+                            }
+                            let _ = app.run("layer.scaleRange", json!({"min": min, "max": max}));
+                        }
+                    }
+                })
+                .response
+                .labelled_by(input_label.id);
+        });
+    }
+}
+
 /// The Visibility Range and Effects groups shared by feature and raster layers.
 fn visibility_and_effects(app: &mut RustGisApp, ui: &mut Ui, layer: &rustgis_engine::map::Layer) {
     group(ui, "Visibility Range", |ui| {
         ui.vertical(|ui| {
             ui.add_space(6.0);
-            for (label, cur, key) in [("Out Beyond", layer.min_scale, "min"), ("In Beyond", layer.max_scale, "max")] {
-                ui.horizontal(|ui| {
-                    let input_label = ui.label(egui::RichText::new(tl!(label)).size(11.5));
-                    egui::ComboBox::from_id_salt(format!("scale_{key}"))
-                        .selected_text(scale_label(cur))
-                        .width(118.0)
-                        .show_ui(ui, |ui| {
-                            let mut choices: Vec<Option<f64>> = vec![None];
-                            choices.extend(SCALES.iter().map(|s| Some(*s)));
-                            for c in choices {
-                                if ui.selectable_label(c == cur, scale_label(c)).clicked() {
-                                    let (mut min, mut max) = (layer.min_scale, layer.max_scale);
-                                    if key == "min" {
-                                        min = c;
-                                    } else {
-                                        max = c;
-                                    }
-                                    let _ = app.run("layer.scaleRange", json!({"min": min, "max": max}));
-                                }
-                            }
-                        })
-                        .response
-                        .labelled_by(input_label.id);
-                });
-            }
+            scale_range_rows(app, ui, layer, "scale", 11.5);
         });
         big(ui, app, "scale_range", "Clear\nLimits", "Draw the layer at every scale.", "layer.scaleRange", json!({}), false, false);
     });
