@@ -48,6 +48,7 @@ pub const NETWORK: &[&str] = &[
     "portal.files",
     "embeddings.search",
     "embeddings.add",
+    "embeddings.addCube",
     "earthdata.collections",
     "earthdata.granules",
     "nldi.flowline",
@@ -982,9 +983,14 @@ fn set(s: &mut Session, p: &Value) -> CmdResult {
         t.name = r.chars().take(120).collect();
     }
     if let Some(url) = new_url {
-        // A dated layer keeps the look at every date: its template takes it too.
+        // A dated layer keeps the look at every date: its template takes it too, and a data
+        // cube's file of each date (the slider would bring the old look back at the next step).
+        let look = cog::split(&url).1;
         if let Some(template) = t.time_url.as_mut() {
-            *template = cog::with_look(template, &cog::split(&url).1);
+            *template = cog::with_look(template, &look);
+        }
+        for (_, u) in &mut t.time_urls {
+            *u = cog::with_look(u, &look);
         }
         t.url = url;
     }

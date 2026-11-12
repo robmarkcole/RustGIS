@@ -2,11 +2,15 @@
 //! resolution, years and links), its tiles found where the map is (footprints drawn), and one
 //! shown on the map: AlphaEarth's three chosen bands as red, green and blue with a stretch,
 //! Earth Index's points coloured by their vectors' principal components, Tessera's three bands of
-//! the view as a raster. Searches and reads go off the frame; what they read is handed to the
-//! `embeddings.*` commands, so the change is undoable like any other.
+//! the view as a raster. AlphaEarth's tiles can also be found over all its years and shown on
+//! the time slider, a year a step (`embeddings.addCube`). Searches and reads go off the frame,
+//! with Cancel; what they read is handed to the `embeddings.*` commands, so the change is
+//! undoable like any other.
+
+use std::collections::BTreeMap;
 
 use egui::vec2;
-use rustgis_engine::render::rustgis_tiles::embeddings::{self as emb, EmbeddingDataset, Found, Tile, tessera};
+use rustgis_engine::render::rustgis_tiles::embeddings::{self as emb, EmbeddingDataset, Found, SeriesFound, Tile, tessera};
 use rustgis_engine::render::rustgis_tiles::{cache, cog};
 use serde_json::json;
 
@@ -15,6 +19,8 @@ use crate::{RustGisApp, Slot};
 /// A read under way: a search, or a tile's data for the map.
 enum Read {
     Search(Slot<Result<Found, String>>),
+    /// AlphaEarth's tiles over its years.
+    Series(Slot<Result<SeriesFound, String>>),
     /// Bytes to hand to `embeddings.add` (Earth Index's points as GeoJSON, Tessera's GeoTIFF),
     /// and what they were read for, as the read began.
     Data(Slot<Result<Vec<u8>, String>>, Request),
@@ -43,11 +49,17 @@ pub struct State {
     pub tessera_bands: [usize; 3],
     /// Earth Index: a vector value kept as each point's `value` (0-based), if any.
     pub dimension: Option<usize>,
+    /// AlphaEarth: search its tiles over all its years, each added as a cube on the time slider.
+    pub all_years: bool,
     reading: Option<Read>,
     /// The search's box and dataset.
     /// The search's box and dataset, and the project it was for (`Session::opened`).
     searched: Option<([f64; 4], &'static str, u64)>,
     pub found: Vec<Tile>,
+    /// Each tile found's file a year, by `found`'s order, when the search was over the years.
+    years: Vec<BTreeMap<i32, String>>,
+    /// Whether the search over the years read the index whole (handed over as `complete`).
+    years_whole: bool,
     /// The footprints layer of the last search, and its project (`Session::opened`): layer ids
     /// are a map's own, so another project's may be the same.
     footprints: Option<(u32, u64)>,
@@ -64,9 +76,12 @@ impl Default for State {
             stretch: emb::AEF_DEFAULT_STRETCH,
             tessera_bands: tessera::DEFAULT_BANDS,
             dimension: None,
+            all_years: false,
             reading: None,
             searched: None,
             found: Vec::new(),
+            years: Vec::new(),
+            years_whole: true,
             footprints: None,
             error: None,
             info: None,
@@ -93,6 +108,7 @@ impl State {
         }
         self.dataset = d.id;
         self.found.clear();
+        self.years.clear();
         self.info = None;
         self.error = None;
         if let Some((a, b)) = d.years {
@@ -110,11 +126,34 @@ fn view_bbox(app: &RustGisApp) -> Result<[f64; 4], String> {
     emb::check_bbox([e.min_x, e.min_y, e.max_x, e.max_y])
 }
 
+/// What a search listed: its tiles, and for a search over the years each one's files and what
+/// the search left out.
+#[derive(Default)]
+struct Listed {
+    tiles: Vec<Tile>,
+    complete: bool,
+    years: Vec<BTreeMap<i32, String>>,
+    dropped: usize,
+    duplicates: usize,
+}
+
+impl Listed {
+    fn of_series(f: SeriesFound) -> Listed {
+        let (tiles, years) = f.series.into_iter().map(|s| (s.tile, s.years)).unzip();
+        Listed { tiles, complete: f.complete, years, dropped: f.dropped, duplicates: f.duplicates }
+    }
+}
+
 /// Lands a search or a read.
 pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
     let landed = match &app.ui.embeddings.reading {
         None => return,
-        Some(Read::Search(slot)) => slot.lock().unwrap_or_else(|e| e.into_inner()).take().map(Ok),
+        Some(Read::Search(slot)) => slot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .map(|r| Ok(r.map(|(tiles, complete)| Listed { tiles, complete, ..Default::default() }))),
+        Some(Read::Series(slot)) => slot.lock().unwrap_or_else(|e| e.into_inner()).take().map(|r| Ok(r.map(Listed::of_series))),
         Some(Read::Data(slot, _)) => slot.lock().unwrap_or_else(|e| e.into_inner()).take().map(Err),
     };
     let Some(landed) = landed else {
@@ -124,7 +163,7 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
     let read = app.ui.embeddings.reading.take();
     match landed {
         Ok(found) => match found {
-            Ok((tiles, complete)) => {
+            Ok(Listed { tiles, complete, years, dropped, duplicates }) => {
                 let st = &mut app.ui.embeddings;
                 // A search for a dataset no longer picked: its tiles aren't this one's.
                 // Or for a project since closed.
@@ -132,7 +171,7 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
                 if st.searched.is_some_and(|(_, d, o)| d != st.dataset || o != opened) {
                     return;
                 }
-                st.info = Some(if tiles.is_empty() {
+                let mut info = if tiles.is_empty() {
                     tl!("Nothing found where the map is").to_string()
                 } else if complete {
                     crate::i18n::fmt("{n} found where the map is", &[("n", &tiles.len().to_string())])
@@ -141,8 +180,20 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
                         "{n} found; the map holds more than one search reads: zoom in for the rest",
                         &[("n", &tiles.len().to_string())],
                     )
-                });
+                };
+                if dropped > 0 {
+                    info.push_str(&crate::i18n::fmt(" · {n} more left out: zoom in for them", &[("n", &dropped.to_string())]));
+                }
+                if duplicates > 0 {
+                    info.push_str(&crate::i18n::fmt(
+                        " · {n} tile-years had a second file; the first was taken",
+                        &[("n", &duplicates.to_string())],
+                    ));
+                }
+                st.info = Some(info);
                 st.found = tiles;
+                st.years = years;
+                st.years_whole = complete;
                 show_footprints(app);
             }
             Err(e) => app.ui.embeddings.error = Some(e),
@@ -219,7 +270,22 @@ fn search(app: &mut RustGisApp) {
     st.error = None;
     st.info = None;
     st.found.clear();
+    st.years.clear();
     st.searched = Some((bbox, st.dataset, app.session.opened));
+    if st.dataset == "alphaearth" && st.all_years {
+        let years = picked(st).years.unwrap_or((st.year, st.year));
+        let slot: Slot<Result<SeriesFound, String>> = Slot::default();
+        let land = slot.clone();
+        emb::search_aef_series(
+            bbox,
+            years,
+            Box::new(move |r| {
+                *land.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
+            }),
+        );
+        st.reading = Some(Read::Series(slot));
+        return;
+    }
     let slot: Slot<Result<Found, String>> = Slot::default();
     let land = slot.clone();
     let done: Box<dyn FnOnce(Result<Found, String>) + Send> = Box::new(move |r| {
@@ -241,8 +307,24 @@ fn add(app: &mut RustGisApp, i: usize) {
     match tile.dataset {
         "alphaearth" => {
             let st = &app.ui.embeddings;
-            let p = json!({"dataset": "alphaearth", "url": tile.url, "bands": st.aef_bands.map(|b| b + 1), "stretch": st.stretch});
-            match app.run("embeddings.add", p) {
+            let (bands, stretch) = (st.aef_bands.map(|b| b + 1), st.stretch);
+            // A tile found over the years: its files, handed over, on the time slider.
+            let (id, p) = match st.years.get(i).filter(|y| !y.is_empty()) {
+                Some(years) => {
+                    let years: serde_json::Map<String, serde_json::Value> = years.iter().map(|(y, u)| (y.to_string(), json!(u))).collect();
+                    let (first, last) = picked(st).years.unwrap_or((st.year, st.year));
+                    let found = json!([{"years": years}]);
+                    (
+                        "embeddings.addCube",
+                        json!({
+                            "dataset": "alphaearth", "found": found, "complete": st.years_whole,
+                            "start": first, "end": last, "bands": bands, "stretch": stretch,
+                        }),
+                    )
+                }
+                None => ("embeddings.add", json!({"dataset": "alphaearth", "url": tile.url, "bands": bands, "stretch": stretch})),
+            };
+            match app.run(id, p) {
                 Ok(_) => app.map.invalidate(),
                 Err(e) => app.ui.embeddings.error = Some(e),
             }
@@ -402,17 +484,27 @@ pub fn pane(app: &mut RustGisApp, ui: &mut egui::Ui) {
             && last > first
         {
             let input_label = ui.label(tl!("Year"));
-            egui::ComboBox::from_id_salt("emb_year")
-                .selected_text(st.year.to_string())
-                .width(w)
-                .show_ui(ui, |ui| {
-                    for y in (first..=last).rev() {
-                        ui.selectable_value(&mut st.year, y, y.to_string());
-                    }
-                })
-                .response
-                .labelled_by(input_label.id);
+            let all = d.id == "alphaearth" && st.all_years;
+            ui.add_enabled_ui(!all, |ui| {
+                egui::ComboBox::from_id_salt("emb_year")
+                    .selected_text(if all { format!("{first}–{last}") } else { st.year.to_string() })
+                    .width(w)
+                    .show_ui(ui, |ui| {
+                        for y in (first..=last).rev() {
+                            ui.selectable_value(&mut st.year, y, y.to_string());
+                        }
+                    })
+                    .response
+                    .labelled_by(input_label.id);
+            });
             ui.end_row();
+            if d.id == "alphaearth" {
+                ui.label("");
+                ui.checkbox(&mut st.all_years, tl!("All years, on the time slider")).on_hover_text(tl!(
+                    "Find each tile's file of every year; Add years shows them as one layer that follows the time slider"
+                ));
+                ui.end_row();
+            }
         }
         match d.id {
             "alphaearth" => {
@@ -474,15 +566,29 @@ pub fn pane(app: &mut RustGisApp, ui: &mut egui::Ui) {
         search(app);
     }
     let st = &app.ui.embeddings;
+    let mut cancel = false;
     if busy {
         ui.horizontal(|ui| {
             ui.spinner();
             ui.label(match st.reading {
-                Some(Read::Search(_)) => tl!("Searching…"),
+                Some(Read::Search(_) | Read::Series(_)) => tl!("Searching…"),
                 _ => tl!("Reading the embeddings…"),
             });
+            cancel = ui.button(tl!("Cancel")).clicked();
         });
     }
+    if cancel {
+        // What the read brings is dropped with its slot, and a data read's download released.
+        // A search's read of the index runs on to its end: it is bounded (one read, at most
+        // MAX_INDEX_ROWS rows) and the index query has no way to be told to stop yet, as for
+        // every other search here.
+        if let Some(Read::Data(_, req)) = app.ui.embeddings.reading.take() {
+            app.session.download_failed(req.id);
+        }
+        app.ui.embeddings.reading = None;
+        app.ui.embeddings.info = Some(tl!("Cancelled").to_string());
+    }
+    let st = &app.ui.embeddings;
     if let Some(e) = &st.error {
         ui.label(egui::RichText::new(e).color(t.red));
     }
@@ -491,8 +597,9 @@ pub fn pane(app: &mut RustGisApp, ui: &mut egui::Ui) {
     }
     let mut act = None;
     for (i, tile) in st.found.iter().enumerate() {
+        let years = st.years.get(i).is_some_and(|y| !y.is_empty());
         ui.push_id(i, |ui| {
-            if let Some(a) = card(ui, &t, tile, i, busy) {
+            if let Some(a) = card(ui, &t, tile, i, busy, years) {
                 act = Some(a);
             }
         });
@@ -548,7 +655,7 @@ enum Act {
 }
 
 /// A result's card: its title, what it is, and its actions (Zoom, Add, the file's address).
-fn card(ui: &mut egui::Ui, t: &crate::theme::Tokens, tile: &Tile, i: usize, busy: bool) -> Option<Act> {
+fn card(ui: &mut egui::Ui, t: &crate::theme::Tokens, tile: &Tile, i: usize, busy: bool, years: bool) -> Option<Act> {
     let mut act = None;
     egui::Frame::NONE.fill(t.input).stroke(egui::Stroke::new(1.0, t.border)).corner_radius(6).inner_margin(egui::Margin::same(8)).show(
         ui,
@@ -564,6 +671,10 @@ fn card(ui: &mut egui::Ui, t: &crate::theme::Tokens, tile: &Tile, i: usize, busy
                     act = Some(Act::Zoom(tile.bbox));
                 }
                 let (label, hint) = match tile.dataset {
+                    "alphaearth" if years => (
+                        tl!("Add years"),
+                        tl!("Show the bands picked of every year on the time slider, read in place as the map needs them"),
+                    ),
                     "alphaearth" => (tl!("Add"), tl!("Show the bands picked, read in place as the map needs them")),
                     "earth-index" => (tl!("Add points"), tl!("Read the points in the view, coloured by their principal components")),
                     _ => (tl!("Add view"), tl!("Read the bands picked for the view (at most about 6 km a side)")),

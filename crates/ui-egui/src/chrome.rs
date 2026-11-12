@@ -945,7 +945,7 @@ fn search_action(id: &str) -> Option<SearchAction> {
         "osm.download" => Dialog("osm"),
         "overture.add" => Dialog("overture"),
         "boundaries.add" => Dialog("boundaries"),
-        "embeddings.add" | "embeddings.search" => Dialog("embeddings"),
+        "embeddings.add" | "embeddings.addCube" | "embeddings.search" => Dialog("embeddings"),
         "cube.catalog" | "cube.open" => Dialog("dataCubes"),
         "nationalMap.add" => Dialog("nationalMap"),
         "fieldsOfTheWorld.add" => Dialog("fieldsOfTheWorld"),

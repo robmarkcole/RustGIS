@@ -1160,34 +1160,7 @@ fn add_cube(s: &mut Session, p: &Value) -> CmdResult {
                 }
             }
         }
-        // The slider over the cube's dates: on over them when it is off; when it is on, taking
-        // them in (its own dates and the cube's, or its span widened to theirs), so every file
-        // can be reached.
-        let slider = match s.map().time.as_ref() {
-            None => {
-                let d: Vec<Value> = dates.iter().map(|d| json!(d)).collect();
-                json!({"dates": d})
-            }
-            Some(t) if !t.dates.is_empty() => {
-                let mut all: Vec<f64> = t.dates.iter().chain(&dates).copied().collect();
-                all.sort_by(f64::total_cmp);
-                all.dedup();
-                if all.len() > rustgis_map::time::MAX_STEPS {
-                    undo(s);
-                    return Err(format!(
-                        "the time slider's dates and the cube's make {}, more than its {} steps: take a shorter period",
-                        all.len(),
-                        rustgis_map::time::MAX_STEPS
-                    ));
-                }
-                json!({"dates": all, "date": t.current})
-            }
-            Some(t) => {
-                let (first, last) = (dates.first().copied().unwrap_or(t.start), dates.last().copied().unwrap_or(t.end));
-                json!({"start": t.start.min(first), "end": t.end.max(last), "date": t.current})
-            }
-        };
-        if let Err(e) = super::time::set(s, &slider) {
+        if let Err(e) = cube_slider(s, &mut dates, &json!({})) {
             undo(s);
             return Err(e);
         }
@@ -1204,6 +1177,78 @@ fn add_cube(s: &mut Session, p: &Value) -> CmdResult {
         }
         Ok(out)
     }
+}
+
+/// Turns the time slider on over a data cube's dates (sorted and deduplicated here), or, when it
+/// is on, takes them in (its own dates and the cube's, or its span widened to theirs), so every
+/// file can be reached. `fresh`: what else a slider turned on here is set to (AlphaEarth's years
+/// shown as years). Refused, the slider unchanged, when the dates are more than its steps: a cube
+/// left with files the slider can't reach would say nothing of them.
+pub(crate) fn cube_slider(s: &mut Session, dates: &mut Vec<f64>, fresh: &Value) -> Result<(), String> {
+    dates.sort_by(f64::total_cmp);
+    dates.dedup();
+    if dates.len() > rustgis_map::time::MAX_STEPS {
+        return Err(format!("{} dates; the time slider takes {} at most", dates.len(), rustgis_map::time::MAX_STEPS));
+    }
+    let slider = match s.map().time.as_ref() {
+        None => {
+            let mut q = if fresh.is_object() { fresh.clone() } else { json!({}) };
+            q["dates"] = json!(dates);
+            q
+        }
+        Some(t) if !t.dates.is_empty() => {
+            let mut all: Vec<f64> = t.dates.iter().chain(dates.iter()).copied().collect();
+            all.sort_by(f64::total_cmp);
+            all.dedup();
+            if all.len() > rustgis_map::time::MAX_STEPS {
+                return Err(format!(
+                    "the time slider's dates and the cube's make {}, more than its {} steps: take a shorter period",
+                    all.len(),
+                    rustgis_map::time::MAX_STEPS
+                ));
+            }
+            json!({"dates": all, "date": t.current})
+        }
+        Some(t) => {
+            let (first, last) = (dates.first().copied().unwrap_or(t.start), dates.last().copied().unwrap_or(t.end));
+            let (a, z) = (t.start.min(first), t.end.max(last));
+            // Its steps over the span widened (an hourly slider over years): past what it lists,
+            // the cube's later dates couldn't be reached.
+            let n = rustgis_data::time::steps(a, z, t.unit, t.interval, rustgis_map::time::MAX_STEPS + 1).len();
+            if n > rustgis_map::time::MAX_STEPS {
+                return Err(format!(
+                    "the time slider's steps over the cube's period would be more than its {}: make its step longer (time.set unit) or take a shorter period",
+                    rustgis_map::time::MAX_STEPS
+                ));
+            }
+            // Each of the cube's dates shown at some step: a step longer than the dates' spacing
+            // (two years over yearly files) shows the later of two in one window, never the other.
+            let mut w = t.clone();
+            (w.start, w.end) = (a, z);
+            let mut shown = vec![false; dates.len()];
+            for step in w.steps() {
+                w.current = step;
+                let (from, to) = w.window();
+                let i = dates.partition_point(|d| *d < to);
+                if let Some(seen) = i.checked_sub(1).filter(|&j| dates.get(j).is_some_and(|d| *d >= from)).and_then(|j| shown.get_mut(j)) {
+                    *seen = true;
+                }
+            }
+            let unseen: Vec<String> =
+                dates.iter().zip(&shown).filter(|(_, s)| !**s).map(|(d, _)| rustgis_data::time::format(*d, "YYYY-MM-DD")).collect();
+            if !unseen.is_empty() {
+                let more = if unseen.len() > 5 { format!(" and {} more", unseen.len() - 5) } else { String::new() };
+                return Err(format!(
+                    "the time slider's step never shows {} of the cube's {} dates on their own ({}{more}): make its step shorter (time.set unit, interval) or turn it off first",
+                    unseen.len(),
+                    dates.len(),
+                    unseen.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
+                ));
+            }
+            json!({"start": a, "end": z, "date": t.current})
+        }
+    };
+    super::time::set(s, &slider).map(|_| ())
 }
 
 /// The files a cube's range is sampled from, at most, and the most pixels a side read from each.
