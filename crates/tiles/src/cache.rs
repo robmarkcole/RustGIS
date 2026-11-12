@@ -1591,11 +1591,40 @@ pub fn post_json(url: &str, body: String, done: Done) {
     }
 }
 
+/// Like [`post_json`], to an address the user named, which may be on their own network (as
+/// [`download`] is; see [`post_json_named_blocking`]). Not for addresses a document pointed to.
+/// The browser's poster is used as for [`post_json`].
+pub fn post_json_named(url: &str, body: String, done: Done) {
+    if let Err(e) = crate::address::check(url, None) {
+        done(Err(e));
+        return;
+    }
+    let p = poster().lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if p.is_some() {
+        return post_json(url, body, done);
+    }
+    IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
+    let key = url.to_string();
+    let done: Done = Box::new(move |r| {
+        done(crate::logins::check(&key).map_err(str::to_string).and(r));
+        finished();
+    });
+    native::post_named(url.to_string(), body, done);
+}
+
 /// Like [`post_json`], waiting for the answer (at most [`BLOCKING_TIMEOUT`]).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn post_json_blocking(url: &str, body: &str) -> Result<Vec<u8>, String> {
     crate::address::check(url, None)?;
     native::post_with(&native::public_agent(BLOCKING_TIMEOUT), url, body)
+}
+
+/// Like [`post_json_blocking`], to an address the user named: it may be on their own network, as
+/// a download from one is ([`download_blocking`]). Not for addresses a document pointed to.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn post_json_named_blocking(url: &str, body: &str) -> Result<Vec<u8>, String> {
+    crate::address::check(url, None)?;
+    native::post_with(&native::download_agent(BLOCKING_TIMEOUT), url, body)
 }
 
 /// What a `HEAD` request says of a file before any of it is read: the length of its TIFF header
@@ -2572,6 +2601,18 @@ mod native {
         });
     }
 
+    /// Like [`post`], to an address the user named: any address its name resolves to.
+    pub(super) fn post_named(url: String, body: String, done: Done) {
+        let capture = Capture::current();
+        let still = super::current_still();
+        std::thread::spawn(move || {
+            super::with_optional_still(still, || {
+                let _scope = capture.enter();
+                done(super::check_current().and_then(|_| post_with(&download_agent(std::time::Duration::from_secs(60)), &url, &body)));
+            });
+        });
+    }
+
     /// POSTs a JSON document and reads the answer (at most [`MAX_BYTES`]); an error status is
     /// `http status: <status>`, and a redirect isn't followed.
     pub(super) fn post_with(agent: &ureq::Agent, url: &str, body: &str) -> Result<Vec<u8>, String> {
@@ -3080,6 +3121,10 @@ mod native {
 
     pub(super) fn post(url: String, _body: String, done: Done) {
         done(Err(rustgis_data::diagnostics::message_with_address(&url, "this build has no way to send requests")));
+    }
+
+    pub(super) fn post_named(url: String, body: String, done: Done) {
+        post(url, body, done);
     }
 
     pub(super) fn head(url: String, done: super::HeadDone) {

@@ -88,6 +88,14 @@ pub fn geodesic_buffer(g: &Geometry, metres: f64) -> Option<Geometry> {
     geodesic_buffer_with_limit(g, metres, usize::MAX).ok().and_then(|b| b.geometry)
 }
 
+/// [`geodesic_buffer`], and whether an edge of the buffer was left straying more than its
+/// tolerance, for want of points to add or halvings to make (as Buffer says when it happens).
+pub fn geodesic_buffer_noted(g: &Geometry, metres: f64) -> Option<(Geometry, bool)> {
+    let b = geodesic_buffer_with_limit(g, metres, usize::MAX).ok()?;
+    let coarse = b.coarse;
+    b.geometry.map(|geometry| (geometry, coarse))
+}
+
 /// A buffered outline and its budget charge: at least the retained coordinate count, or the
 /// pre-union disc total for a multipoint, whichever is larger; and whether an edge of it was left
 /// straying more than its tolerance, for want of [`MAX_ADDED`] points or [`MAX_SPLITS`] halvings.

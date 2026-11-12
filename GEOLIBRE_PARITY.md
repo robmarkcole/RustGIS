@@ -54,7 +54,7 @@ _GeoLibre: docs/data-formats.md, docs/features.md › Adding data, SQL and datab
   the service address is sent with its requests (saved sources drop it); sign-in with OAuth to
   ArcGIS Online and Enterprise. Missing: a Portal browser (_Roadmap: add data_).
 - [ ] **STAC browser and cloud catalogs**: STAC, Planetary Computer, Earth Engine, Overture,
-  Source Cooperative, NASA Earthdata, Planet and Hugging Face. Partial: STAC Search ([#128](https://github.com/opengeos/RustGIS/issues/128)),
+  Source Cooperative, NASA Earthdata, Planet and Hugging Face. Partial: STAC Search ([#128](https://github.com/opengeos/RustGIS/issues/128)) by box, point, line, polygon, selected features or file, with a buffer in your Distance units that widens points and lines (a box or polygon is searched as drawn, with a notice),
   Planetary Computer with signed assets ([#144](https://github.com/opengeos/RustGIS/issues/144)), Overture Maps and Source Cooperative ([#158](https://github.com/opengeos/RustGIS/issues/158)), NASA
   Earthdata (desktop) and Hugging Face. Missing: Earth Engine and Planet.
 - [ ] **Open-data portal browsers**: partial. Overpass and geoBoundaries ([#139](https://github.com/opengeos/RustGIS/issues/139)), CKAN, Socrata and

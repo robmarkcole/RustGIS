@@ -3259,6 +3259,14 @@ fn with_template(app: &RustGisApp, mut p: Value) -> Value {
 
 /// Adds a graphic drawn with a tool, then returns to Explore unless the tool is kept.
 pub fn finish_graphic(app: &mut RustGisApp, shape: &str, pts: Vec<Coord>) {
+    // While the STAC search area is being drawn, the shape goes to it, not to a graphics layer.
+    if let Some(taken) = crate::stacui::take_drawn(app, shape, &pts) {
+        app.map.cancel_sketch();
+        if taken && !app.session.keep_tool {
+            app.session.tool = Tool::Explore;
+        }
+        return;
+    }
     let coords: Vec<[f64; 2]> = pts.iter().map(|c| [c.x, c.y]).collect();
     let ok = app.run("graphics.add", json!({"shape": shape, "points": coords})).is_ok();
     app.map.cancel_sketch();
@@ -3288,6 +3296,8 @@ fn overlays(app: &mut RustGisApp, ui: &mut Ui, p: &egui::Painter, rect: Rect, t:
         p.rect_filled(r, 0.0, accent.gamma_multiply(0.12));
         p.rect_stroke(r, 0.0, Stroke::new(1.5, accent), egui::StrokeKind::Middle);
     }
+    // The STAC search area, while that pane is open.
+    crate::stacui::paint_area(app, p, rect, accent);
     // Vertices of the selected features while editing.
     let editing = &app.session.map().editing;
     if editing.settings.enabled

@@ -53,6 +53,7 @@ pub mod sharing;
 pub mod sources;
 pub mod sql;
 pub mod stac;
+pub mod stac_area;
 pub mod tile_export;
 pub mod tiles;
 pub mod time;
@@ -119,6 +120,7 @@ pub fn all() -> Vec<CommandSpec> {
     v.extend(extensions::commands());
     v.extend(sharing::commands());
     v.extend(stac::commands());
+    v.extend(stac_area::commands());
     v.extend(portals::commands());
     v.extend(catalogs::commands());
     v.extend(webdata::commands());

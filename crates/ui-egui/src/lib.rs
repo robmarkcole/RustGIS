@@ -2609,6 +2609,14 @@ impl RustGisApp {
             let shared = map.layers.iter().filter(|l| l.name.eq_ignore_ascii_case(&name)).count() > 1;
             return Some((name, shared));
         }
+        // A STAC search reads the active layer only to take its selection as the search area
+        // (`intersects: "selection"`, compared as the engine does), so a bbox or GeoJSON search
+        // names none.
+        if id == "stac.search"
+            && !params.get("intersects").and_then(Value::as_str).is_some_and(|v| v.trim().eq_ignore_ascii_case("selection"))
+        {
+            return None;
+        }
         let spec = self.session.registry.get(id).filter(|c| c.mutates && params.get("layer").is_none_or(Value::is_null)).copied()?;
         if !spec.param_keys().is_some_and(|k| k.contains(&"layer")) {
             return None;
@@ -5978,6 +5986,7 @@ const MAX_STEP_BYTES: usize = 4 << 20;
 /// `record_tests::every_optional_layer_is_classified` fails until it is placed here or there.
 const DEFAULTS_TO_ACTIVE_LAYER: &[&str] = &[
     "select.byAttributes",
+    "stac.search",
     "select.rows",
     "select.layerFromSelection",
     "data.similar",
@@ -6022,6 +6031,23 @@ mod record_tests {
         let layers: Vec<Option<&serde_json::Value>> =
             steps.iter().filter(|s| s.command == "map.terrain").map(|s| s.params.get("layer")).collect();
         assert_eq!(layers, [Some(&json!(dem.1)), None]);
+    }
+
+    /// A STAC search records the active layer only when its search area is that layer's selection.
+    #[test]
+    fn a_stac_search_names_the_active_layer_only_for_its_selection() {
+        let mut app = RustGisApp::with_sample();
+        let layer = app.session.map().layers.first().map(|l| l.id);
+        app.session.active_layer = layer;
+        for (params, names) in [
+            (json!({"intersects": "selection"}), true),
+            (json!({"intersects": " Selection "}), true),
+            (json!({"bbox": [0, 0, 1, 1]}), false),
+            (json!({"intersects": {"type": "Point", "coordinates": [0, 0]}}), false),
+            (json!({}), false),
+        ] {
+            assert_eq!(app.layer_acted_on("stac.search", &params).is_some(), names, "{params}");
+        }
     }
 
     /// Every command with an optional `layer` either needs an active layer to be enabled, defaults

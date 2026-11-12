@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use super::{b, f, ps};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::render::rustgis_tiles::s3;
-use crate::render::rustgis_tiles::stac::{self, Item, Search};
+use crate::render::rustgis_tiles::stac::{self, Item, Search, area};
 use crate::{CmdResult, CommandSpec as C, Session};
 
 pub fn commands() -> Vec<C> {
@@ -15,7 +15,7 @@ pub fn commands() -> Vec<C> {
             .view()
             .params(r#"{"url"?: "a STAC API (default: Earth Search, https://earth-search.aws.element84.com/v1; Planetary Computer: https://planetarycomputer.microsoft.com/api/stac/v1), or a static catalog's catalog.json or collection.json (its child catalogs and collections are listed)", "connection"?: "as service.add: the saved web-service connection whose login the request uses"}"#),
         C::new("stac.search", "STAC Search", "Home › Add › Web Data › STAC Search", search).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network)).params(
-            r#"{"url"?: "a STAC API (default: Earth Search), or a static catalog's catalog.json or collection.json (walked from there, at most 400 documents)", "collections"?: id | [ids] (APIs), "bbox"?: [west, south, east, north] | "view" (the map's extent), "datetime"?: "2024-06-01" | "2024-06-01/2024-06-30", "limit"?: 1–200 (default 10), "maxCloud"?: percent, "sortby"?: "eo:cloud_cover" | "-datetime" (APIs that sort), "phase"?: "pre" | "post" (static catalogs of events), "properties"?: bool (every property of each item, not only its date and cloud cover; default false), "footprints"?: bool (adds the items' footprints as a layer, default true), "connection"?: "as service.add: the saved web-service connection whose login the request uses"}"#,
+            r#"{"url"?: "a STAC API (default: Earth Search), or a static catalog's catalog.json or collection.json (walked from there, at most 400 documents)", "collections"?: id | [ids] (APIs), "bbox"?: [west, south, east, north] | "view" (the map's extent), "intersects"?: GeoJSON (a geometry, a feature or a collection of features, as stac.area returns) | "selection" (the selected features of "layer"): the search area, which replaces bbox; only the highest dimension present is kept (polygons, then lines, then points) and what is left out is reported, "layer"?: the layer (name or id) whose selection "selection" uses (default the active layer), "buffer"?: the distance to widen an intersects point or line into a polygon (default 0), "unit"?: "Meters" | "Feet" | "Kilometers" | "Miles" (the buffer's unit, default Meters), "datetime"?: "2024-06-01" | "2024-06-01/2024-06-30", "limit"?: 1–200 (default 10), "maxCloud"?: percent, "sortby"?: "eo:cloud_cover" | "-datetime" (APIs that sort), "phase"?: "pre" | "post" (static catalogs of events), "properties"?: bool (every property of each item, not only its date and cloud cover; default false), "footprints"?: bool (adds the items' footprints as a layer, default true), "connection"?: "as service.add: the saved web-service connection whose login the request uses"}"#,
         ),
         C::new("stac.addFootprints", "Add STAC Footprints", "Home › Add › Web Data › STAC Search", add_footprints_cmd).roles(&[]).effects(crate::policy::Effects::NONE)
             .params(r#"{"footprints": GeoJSON FeatureCollection (items' footprints, as STAC Search finds them), "name"?: text}"#),
@@ -63,11 +63,12 @@ pub fn search_params(s: &Session, p: &Value) -> Result<Search, String> {
         limit: f(p, "limit").map(|l| l.clamp(1.0, stac::MAX_ITEMS as f64) as usize).unwrap_or(10),
         max_cloud: f(p, "maxCloud"),
         sortby: ps(p, "sortby").map(str::to_string),
+        intersects: None,
     })
 }
 
 /// The map's extent in longitude/latitude, within the globe.
-fn view(s: &Session) -> Result<[f64; 4], String> {
+pub fn view(s: &Session) -> Result<[f64; 4], String> {
     let e = super::workspace::view_extent(s);
     if e.is_empty() {
         return Err("the map's extent isn't known; give bbox".into());
@@ -144,24 +145,70 @@ pub(super) fn collections_json(api: &str, bytes: &[u8]) -> CmdResult {
     Ok(json!({"count": c.len(), "collections": c.iter().map(|c| json!({"id": c.id, "title": c.title})).collect::<Vec<_>>()}))
 }
 
+/// The search `p` describes, limited to the shape it names (`intersects`, widened by `buffer`),
+/// which replaces its bbox.
+pub fn search_with_area(s: &mut Session, p: &Value) -> Result<(Search, Option<area::Area>), String> {
+    let mut search = search_params(s, p)?;
+    let area = super::stac_area::from_params(s, p)?;
+    if let Some(a) = &area {
+        if super::stac_area::names_bbox(p) {
+            s.warn("bbox (or view) is not used: the search area replaces it");
+        }
+        search.bbox = None;
+        search.intersects = Some(a.geometry.clone());
+    } else if p.get("buffer").is_some_and(|b| !b.is_null()) {
+        s.warn("buffer is not used: it widens the search area (intersects), and none was given");
+    }
+    Ok((search, area))
+}
+
 fn search(s: &mut Session, p: &Value) -> CmdResult {
     let api = request_api(s, p)?;
     if stac::catalog::is_static(&api) {
         return search_static(s, p, &api);
     }
-    let url = stac::search_url(&api, &search_params(s, p)?)?;
+    let (search, area) = search_with_area(s, p)?;
     #[cfg(target_arch = "wasm32")]
     {
-        let _ = (s, url);
+        let _ = (s, area, search);
         Err("in the web app, search STAC with Home › Add › Web Data › STAC Search".into())
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let bytes = crate::render::rustgis_tiles::cache::download_blocking(&url)?;
+        // A shape goes in the body of a POST, which has no limit that matters; a server that
+        // refuses it is asked again in the query, when the shape is short enough for one.
+        let (bytes, url, posted) = if search.intersects.is_some() {
+            let post = stac::search_post_url(&api);
+            let body = stac::search_body(&search)?.to_string();
+            match crate::render::rustgis_tiles::cache::post_json_named_blocking(&post, &body) {
+                Ok(bytes) => (bytes, post, true),
+                Err(e) => {
+                    let url = stac::search_url(&api, &search).map_err(|_| e.clone())?;
+                    (crate::render::rustgis_tiles::cache::download_blocking(&url).map_err(|_| e)?, url, false)
+                }
+            }
+        } else {
+            let url = stac::search_url(&api, &search)?;
+            (crate::render::rustgis_tiles::cache::download_blocking(&url)?, url, false)
+        };
         let (items, next) = stac::parse_items(&bytes, &url)?;
+        // A POST's next link is a request with a body, which is not an address to give back.
+        let next = if posted {
+            // `parse_items` drops a POST link, so the answer itself says whether there are more.
+            let more = stac::has_next(&bytes) || stac::parse_matched(&bytes).is_some_and(|m| m > items.len() as u64);
+            if more {
+                s.warn(format!("more items meet the search area than the {} loaded: raise limit or narrow the search", items.len()));
+            }
+            None
+        } else {
+            next
+        };
         let all = b(p, "properties").unwrap_or(false);
         let mut out =
             json!({"count": items.len(), "items": items.iter().map(|i| stac::item_json_with(i, all)).collect::<Vec<_>>(), "next": next});
+        if let Some(a) = &area {
+            out["intersects"] = area::to_geojson(&a.geometry);
+        }
         if b(p, "footprints").unwrap_or(true)
             && let Some(id) = add_footprints(s, &items, "STAC footprints")?
         {
@@ -177,7 +224,7 @@ fn search(s: &mut Session, p: &Value) -> CmdResult {
 /// A search of a static catalog: a walk from its document, keeping the items that match.
 fn search_static(s: &mut Session, p: &Value, root: &str) -> CmdResult {
     crate::render::rustgis_tiles::address::check(root, None)?;
-    let search = search_params(s, p)?;
+    let (search, area) = search_with_area(s, p)?;
     // A static catalog has no search: it is walked in its own order, and its nodes are its
     // collections.
     let mut ignored = Vec::new();
@@ -196,7 +243,7 @@ fn search_static(s: &mut Session, p: &Value, root: &str) -> CmdResult {
     let filter = stac::catalog::Filter::from_search(&search, ps(p, "phase"))?;
     #[cfg(target_arch = "wasm32")]
     {
-        let _ = (s, filter, root, note);
+        let _ = (s, filter, root, note, area);
         Err("in the web app, search STAC with Home › Add › Web Data › STAC Search".into())
     }
     #[cfg(not(target_arch = "wasm32"))]
@@ -210,6 +257,9 @@ fn search_static(s: &mut Session, p: &Value, root: &str) -> CmdResult {
             "complete": complete, "read": read, "failed": failed});
         if let Some(n) = note {
             out["note"] = json!(n);
+        }
+        if let Some(a) = &area {
+            out["intersects"] = area::to_geojson(&a.geometry);
         }
         if b(p, "footprints").unwrap_or(true)
             && let Some(id) = add_footprints(s, &items, "STAC footprints")?

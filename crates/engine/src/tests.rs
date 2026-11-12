@@ -41595,6 +41595,118 @@ fn a_model_trained_within_the_work_limit_says_so() {
     assert_eq!(r["epochs"], 3, "{r}");
 }
 
+/// A STAC search limited to a shape (`intersects`, from GeoJSON or the selected features, widened
+/// by `buffer` metres): the shape is sent in place of the bbox, what merging leaves out is said
+/// once, and clean input says nothing.
+#[test]
+fn stac_search_by_shape_says_what_it_leaves_out() {
+    let item = r#"{"type": "Feature", "id": "S2_1", "collection": "s2", "bbox": [7, 46, 8, 47],
+        "geometry": {"type": "Polygon", "coordinates": [[[7, 46], [8, 46], [8, 47], [7, 47], [7, 46]]]},
+        "properties": {"datetime": "2024-06-02T10:30:00Z", "eo:cloud_cover": 3.5}, "assets": {}}"#;
+    // A POST answered before its body is read is asked again as a GET, so each search may take two.
+    let base = serve_routes(vec![("/v1/search", format!(r#"{{"type": "FeatureCollection", "features": [{item}]}}"#))], 40);
+    let api = format!("{base}/v1");
+    let said = |s: &Session, text: &str| s.notices.iter().filter(|n| n.text.contains(text)).count();
+    let mut s = Session::new(Project::default());
+
+    // One point: nothing is left out, so nothing is said; the shape comes back for reuse.
+    let point = json!({"type": "Point", "coordinates": [7.5, 46.5]});
+    let r = s.run("stac.search", &json!({"url": api, "intersects": point, "footprints": false})).unwrap();
+    assert_eq!(r["count"], 1, "{r}");
+    assert_eq!(r["intersects"], point);
+    assert_eq!(said(&s, "left out"), 0, "{:?}", s.notices);
+
+    // A point and a polygon: the polygon is searched, the point is counted in one notice.
+    let mixed = json!({"type": "FeatureCollection", "features": [
+        {"type": "Feature", "properties": {}, "geometry": point},
+        {"type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [[[7, 46], [8, 46], [8, 47], [7, 46]]]}}]});
+    let r = s.run("stac.search", &json!({"url": api, "intersects": mixed, "footprints": false, "bbox": [0, 0, 1, 1]})).unwrap();
+    assert_eq!(r["intersects"]["type"], "Polygon");
+    assert_eq!(said(&s, "1 part(s) of a lower dimension are left out"), 1, "{:?}", s.notices);
+    assert_eq!(said(&s, "the search area replaces it"), 1, "a bbox given with a shape is said to be unused");
+
+    // A buffer widens a point into a polygon; on a polygon it is not applied, and says so.
+    let r = s.run("stac.search", &json!({"url": api, "intersects": point, "buffer": 5000, "footprints": false})).unwrap();
+    assert_eq!(r["intersects"]["type"], "Polygon", "{r}");
+    assert_eq!(said(&s, "buffer is not applied"), 0);
+    s.run("stac.search", &json!({"url": api, "intersects": mixed, "buffer": 5000, "footprints": false})).unwrap();
+    assert_eq!(said(&s, "buffer is not applied"), 1);
+    s.run("stac.search", &json!({"url": api, "buffer": 5000, "footprints": false, "bbox": [7, 46, 8, 47]})).unwrap();
+    assert_eq!(said(&s, "buffer is not used"), 1);
+
+    // The selected features of a layer, and a layer with none selected.
+    s.run(
+        "layer.addDataText",
+        &json!({"fileName": "pts.geojson", "text": json!({"type": "FeatureCollection", "features": [
+        {"type": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [7.2, 46.2]}},
+        {"type": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [7.8, 46.8]}}]}).to_string()}),
+    )
+    .unwrap();
+    let e = s.run("stac.search", &json!({"url": api, "intersects": "selection"})).unwrap_err();
+    assert!(e.contains("select the features"), "{e}");
+    let id = s.map().layer_by_name("pts").unwrap().id;
+    s.map_mut().layer_mut(id).unwrap().selection = vec![1];
+    let r = s.run("stac.search", &json!({"url": api, "intersects": "selection", "layer": "pts", "footprints": false})).unwrap();
+    assert_eq!(r["intersects"], json!({"type": "Point", "coordinates": [7.8, 46.8]}));
+    let before = s.notices.len();
+    let area = s.run("stac.area", &json!({"layer": "pts", "buffer": 100})).unwrap();
+    assert_eq!(area["intersects"]["type"], "Polygon");
+    assert_eq!(
+        s.notices.len(),
+        before,
+        "clean input says nothing: {:?}",
+        s.notices.iter().skip(before).map(|n| &n.text).collect::<Vec<_>>()
+    );
+    // The ring reaches 100 m from the point [7.8, 46.8] on every side, in degrees of each axis.
+    let ring: Vec<(f64, f64)> =
+        area["intersects"]["coordinates"][0].as_array().unwrap().iter().map(|c| (c[0].as_f64().unwrap(), c[1].as_f64().unwrap())).collect();
+    let reach = |f: fn(&(f64, f64)) -> f64, at: f64| ring.iter().map(|c| (f(c) - at).abs()).fold(0.0, f64::max);
+    let (dlat, dlon) = (100.0 / 111_195.0, 100.0 / (111_195.0 * 46.8f64.to_radians().cos()));
+    assert!((reach(|c| c.1, 46.8) / dlat - 1.0).abs() < 0.05, "{ring:?}");
+    assert!((reach(|c| c.0, 7.8) / dlon - 1.0).abs() < 0.05, "{ring:?}");
+
+    // Hostile input is refused, with the reason, not read as no area at all or failing elsewhere.
+    for (bad, why) in [
+        (json!({"intersects": "everywhere"}), "intersects is GeoJSON"),
+        (json!({"intersects": 7}), "intersects is GeoJSON"),
+        (json!({"intersects": {"type": "Point", "coordinates": [500, 0]}}), "longitude"),
+        (json!({"intersects": {"type": "Point", "coordinates": "x"}}), "isn't GeoJSON geometry"),
+        (json!({"intersects": {"type": "FeatureCollection", "features": []}}), "no point, line or polygon"),
+        (json!({"intersects": point, "buffer": -1}), "buffer is a distance of 0 to"),
+        (json!({"intersects": point, "buffer": "far"}), "buffer is a number"),
+        (json!({"intersects": point, "buffer": 1e12}), "buffer is a distance of 0 to"),
+    ] {
+        let mut q = bad.clone();
+        q["url"] = json!(api);
+        let e = s.run("stac.search", &q).unwrap_err();
+        assert!(e.contains(why), "{bad}: {e}");
+    }
+    let e = s.run("stac.area", &json!({"path": "/no/such/file.geojson"})).unwrap_err();
+    assert!(e.contains("/no/such/file.geojson"), "{e}");
+    let e = s.run("stac.area", &json!({"layer": "nowhere"})).unwrap_err();
+    assert!(e.contains("nowhere"), "{e}");
+
+    // A selected feature without geometry is counted, once, and the rest still make the area.
+    s.run(
+        "layer.addDataText",
+        &json!({"fileName": "gaps.geojson", "text": json!({"type": "FeatureCollection", "features": [
+        {"type": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [7.5, 46.5]}},
+        {"type": "Feature", "properties": {}, "geometry": null},
+        {"type": "Feature", "properties": {}, "geometry": null}]}).to_string()}),
+    )
+    .unwrap();
+    let id = s.map().layer_by_name("gaps").unwrap().id;
+    s.map_mut().layer_mut(id).unwrap().selection = vec![0, 1, 2];
+    let r = s.run("stac.area", &json!({"layer": "gaps"})).unwrap();
+    assert_eq!(r["intersects"], json!({"type": "Point", "coordinates": [7.5, 46.5]}));
+    assert_eq!(said(&s, "2 selected feature(s) have no geometry"), 1);
+    // Only the features with geometry selected: nothing to say.
+    s.map_mut().layer_mut(id).unwrap().selection = vec![0];
+    let before = said(&s, "have no geometry");
+    s.run("stac.area", &json!({"layer": "gaps"})).unwrap();
+    assert_eq!(said(&s, "have no geometry"), before);
+}
+
 /// A layer read whole from a Shapefile or GeoJSON file remembers the files and its rows as read
 /// (#1385): `source.syncState` says when it has edits the file lacks, when the file changed
 /// since, and neither once an edit is undone. The record is saved with the project.
