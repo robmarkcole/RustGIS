@@ -262,13 +262,15 @@ pub fn pick_variable(store: &zarr::Store, sel: &mut zarr::Selection) -> Result<(
     Ok(())
 }
 
-/// Keep a typed WKT's compatibility choice with the decoded raster's other read notices.
-fn crs_lost(r: &mut raster::Raster, text: Option<&str>) {
-    if let Some(text) = text
-        && let Some(note) = raster::wkt::projection_compatibility_note(text, r.crs)
-        && !r.lost.iter().any(|existing| existing == note)
+/// Keep a typed WKT's compatibility choice, or a shift it gives that isn't applied, with the decoded
+/// raster's other read notices, when the raster is in the typed system ([`zarr::typed_crs_note`]):
+/// a store that gives its own system, or a longitude/latitude grid, doesn't use it.
+#[cfg(not(target_arch = "wasm32"))]
+fn crs_lost(r: &mut raster::Raster, text: Option<&str>, store: &zarr::Store, variable: &str) {
+    if let Some(note) = text.and_then(|t| zarr::typed_crs_note(store, variable, r, t))
+        && !r.lost.contains(&note)
     {
-        r.lost.push(note.to_string());
+        r.lost.push(note);
     }
 }
 
@@ -288,8 +290,9 @@ pub(crate) fn add(s: &mut Session, p: &Value) -> CmdResult {
     if let Some(id) = super::f(p, "ran").filter(|v| *v >= 0.0 && v.fract() == 0.0).map(|v| v as u64) {
         let i = s.downloaded.iter().position(|(d, _)| *d == id).ok_or("no such read (it was dropped when another project opened)")?;
         let (_, tif) = s.downloaded.remove(i);
+        // What reading the store said, a typed system's notes among them, is said by the app that
+        // read it, which has the store: its GeoTIFF doesn't carry it (`zarrui::poll`).
         let mut r = raster::read_bytes("zarr.tif", &tif).map_err(|e| e.to_string())?;
-        crs_lost(&mut r, crs);
         r.source = Some(root.clone());
         let name = ps(p, "name").map(str::to_string).unwrap_or_else(|| layer_name(&root, &sel, &[]));
         let mut layer = RasterLayer::from_bytes(r, format!("{}.tif", store_name(&root)), tif);
@@ -312,8 +315,8 @@ pub(crate) fn add(s: &mut Session, p: &Value) -> CmdResult {
         Source::Dir(d) => {
             let store = zarr::read_metadata(Path::new(&d)).map_err(|e| format!("{d}: {e}"))?;
             pick_variable(&store, &mut sel)?;
-            let mut r = zarr::read_dir(Path::new(&d), &sel.label(), crs).map_err(|e| format!("{d}: {e}"))?;
-            crs_lost(&mut r, crs);
+            let mut r = zarr::read_dir_in(&store, Path::new(&d), &sel.label(), crs).map_err(|e| format!("{d}: {e}"))?;
+            crs_lost(&mut r, crs, &store, &sel.variable);
             let name = ps(p, "name").map(str::to_string).unwrap_or_else(|| r.name.clone());
             // Absolute, so the project finds the store again from anywhere.
             let full = std::path::absolute(&d).map(|p| p.display().to_string()).unwrap_or(d);
@@ -336,7 +339,7 @@ pub(crate) fn add(s: &mut Session, p: &Value) -> CmdResult {
             let name = ps(p, "name").map(str::to_string).unwrap_or_else(|| layer_name(&u, &sel, &[]));
             let mut r = zarr::assemble(&store, &plan, &chunks, &name, crs_parsed)
                 .map_err(|e| crate::sources::message_with_address(&u, &e.to_string()))?;
-            crs_lost(&mut r, crs);
+            crs_lost(&mut r, crs, &store, &sel.variable);
             r.source = Some(u.clone());
             // Kept in the project as a GeoTIFF: a web store isn't fetched again when it opens.
             let tif = raster::geotiff::write(&r, 0).map_err(|e| e.to_string())?;
@@ -576,7 +579,7 @@ pub(crate) fn read_slice(zt: &ZarrTime, i: usize) -> Result<Option<raster::Raste
     }
     let sel = zt.selection(i);
     let crs = zt.crs.as_deref().map(str::trim).filter(|c| !c.is_empty());
-    let read = if is_web(&zt.store) {
+    let (read, st) = if is_web(&zt.store) {
         let st = cached_store(&zt.store)?;
         let plan = zarr::plan(&st, &zarr::Selection::parse(&sel)).map_err(|e| e.to_string())?;
         let (chunks, forbidden) = fetch(&zt.store, &plan.keys)?;
@@ -588,15 +591,16 @@ pub(crate) fn read_slice(zt: &ZarrTime, i: usize) -> Result<Option<raster::Raste
             ));
         }
         let crs = crs.map(Crs::parse).transpose()?;
-        zarr::assemble(&st, &plan, &chunks, &sel, crs)
+        (zarr::assemble(&st, &plan, &chunks, &sel, crs), st)
     } else {
-        zarr::read_dir(Path::new(&zt.store), &sel, crs)
+        let st = zarr::read_metadata(Path::new(&zt.store)).map_err(|e| e.to_string())?;
+        (zarr::read_dir_in(&st, Path::new(&zt.store), &sel, crs), std::sync::Arc::new(st))
     };
     // A step none of whose chunks is there was never written (Zarr's fill value): `None`, told
     // apart by its error kind, not its message.
     match read {
         Ok(mut r) => {
-            crs_lost(&mut r, crs);
+            crs_lost(&mut r, crs, &st, &zt.variable);
             Ok(Some(r))
         }
         Err(rustgis_data::DataError::NoChunks(_)) => Ok(None),
@@ -1323,12 +1327,21 @@ fn series(s: &mut Session, p: &Value) -> CmdResult {
         if count == 0 {
             return Err("no step to read".into());
         }
-        // The point in the grid's coordinates.
+        // The point in the grid's coordinates. A longitude/latitude grid's are read as such whatever
+        // its WKT says; a shift the WKT gives that isn't applied is still said, as its slices say it.
         let (x, y) = if zarr::is_lonlat_grid(&store, &var) {
+            if let Some((_, Some(note))) = zarr::grid_crs(&store, &var) {
+                s.warn(format!("{var}: {note}"));
+            }
             (lon, lat)
         } else {
             let crs = match zarr::grid_crs(&store, &var) {
-                Some(c) => c,
+                Some((c, note)) => {
+                    if let Some(note) = note {
+                        s.warn(format!("{var}: {note}"));
+                    }
+                    c
+                }
                 None => {
                     let given =
                         src.crs.as_deref().ok_or("the store doesn't say its coordinate system; give \"crs\" (such as EPSG:3035)")?;
@@ -1396,6 +1409,9 @@ impl ReduceRun {
         let mut totals = super::cube::Totals::new(self.stat, 0)?;
         // Steps never written (no chunk at all), read as having no value.
         let mut unwritten = 0usize;
+        // What reading the slices said (a shift the store's system doesn't apply, …), once each:
+        // the summary is in their grid, so it is said of it too.
+        let mut lost: Vec<String> = Vec::new();
         for &i in &self.steps {
             if cancel.load(Ordering::Relaxed) {
                 return Err("cancelled".into());
@@ -1415,6 +1431,11 @@ impl ReduceRun {
                     }
                 },
             };
+            for l in &r.lost {
+                if !lost.contains(l) {
+                    lost.push(l.clone());
+                }
+            }
             let vals = &r.bands.first().ok_or("the slice has no band")?.data;
             match &first {
                 None => {
@@ -1459,6 +1480,7 @@ impl ReduceRun {
             raster::Raster::new(&self.name, first.0, first.1, vec![out], first.2, first.3, None, raster::ColorHint::Gray, "Float32")
                 .map_err(|e| e.to_string())?;
         r.source = Some(self.root.clone());
+        r.lost = lost;
         Ok(r)
     }
 }

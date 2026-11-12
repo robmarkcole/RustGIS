@@ -3467,7 +3467,7 @@ fn read_sheet(p: &Value, file_name: &str, bytes: &[u8]) -> Result<(rustgis_data:
     let sheet = ps(p, "layer").map(str::trim).filter(|l| !l.is_empty());
     let (dataset, mut report) = rustgis_data::sheets::read(bytes, stem, sheet, &opts).map_err(|e| format!("{file_name}: {e}"))?;
     if let (Some(text), Some(crs)) = (ps(p, "crs"), opts.crs)
-        && let Some(note) = rustgis_data::raster::wkt::projection_compatibility_note(text, crs)
+        && let Some(note) = rustgis_data::raster::wkt::typed_crs_note(text, crs)
     {
         report.messages.push(format!("crs: {note}"));
     }
@@ -3583,7 +3583,7 @@ fn read_delimited(
     let (ds, mut report) = rustgis_data::io::read_csv_with(&text, stem, &opts).map_err(|e| format!("{name}: {e}"))?;
     report.messages.extend(note);
     if let (Some(text), Some(crs)) = (ps(p, "crs"), opts.crs)
-        && let Some(note) = rustgis_data::raster::wkt::projection_compatibility_note(text, crs)
+        && let Some(note) = rustgis_data::raster::wkt::typed_crs_note(text, crs)
     {
         report.messages.push(format!("crs: {note}"));
     }

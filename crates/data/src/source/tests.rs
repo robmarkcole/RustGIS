@@ -46,6 +46,58 @@ fn explicit_method_1028_warns_for_known_geopackage_authorities() {
     }
 }
 
+/// PROJ 9.8.1's WKT2 for EPSG:23031 (ED50 / UTM zone 31N), without its usage.
+const ED50_UTM31: &str = r#"PROJCRS["ED50 / UTM zone 31N",BASEGEOGCRS["ED50",DATUM["European Datum 1950",ELLIPSOID["International 1924",6378388,297,LENGTHUNIT["metre",1]]],PRIMEM["Greenwich",0,ANGLEUNIT["degree",0.0174532925199433]],ID["EPSG",4230]],CONVERSION["UTM zone 31N",METHOD["Transverse Mercator",ID["EPSG",9807]],PARAMETER["Latitude of natural origin",0,ANGLEUNIT["degree",0.0174532925199433],ID["EPSG",8801]],PARAMETER["Longitude of natural origin",3,ANGLEUNIT["degree",0.0174532925199433],ID["EPSG",8802]],PARAMETER["Scale factor at natural origin",0.9996,SCALEUNIT["unity",1],ID["EPSG",8805]],PARAMETER["False easting",500000,LENGTHUNIT["metre",1],ID["EPSG",8806]],PARAMETER["False northing",0,LENGTHUNIT["metre",1],ID["EPSG",8807]]],CS[Cartesian,2],AXIS["(E)",east,ORDER[1],LENGTHUNIT["metre",1]],AXIS["(N)",north,ORDER[2],LENGTHUNIT["metre",1]],ID["EPSG",23031]]"#;
+
+/// [`ED50_UTM31`] bound to WGS 84 by Spain's NTv2 grid from ED50 (PROJ reads it).
+fn ed50_utm31_bound() -> String {
+    format!(
+        r#"BOUNDCRS[SOURCECRS[{ED50_UTM31}],TARGETCRS[GEOGCRS["WGS 84",DATUM["World Geodetic System 1984",ELLIPSOID["WGS 84",6378137,298.257223563,LENGTHUNIT["metre",1]]],PRIMEM["Greenwich",0,ANGLEUNIT["degree",0.0174532925199433]],CS[ellipsoidal,2],AXIS["latitude",north,ORDER[1],ANGLEUNIT["degree",0.0174532925199433]],AXIS["longitude",east,ORDER[2],ANGLEUNIT["degree",0.0174532925199433]],ID["EPSG",4326]]],ABRIDGEDTRANSFORMATION["ED50 to WGS 84 (NTv2)",METHOD["NTv2",ID["EPSG",9615]],PARAMETERFILE["Latitude and longitude difference file","SPED2ETV2.gsb",ID["EPSG",8656]]]]"#
+    )
+}
+
+/// A GeoPackage row read by its EPSG code (ED50 / UTM zone 31N, EPSG:23031) whose definition binds
+/// it to WGS 84 by an NTv2 grid (Spain's, from ED50) is still read by the code, and says the grid
+/// isn't applied, as `read_wkt` would; with the system alone as its definition it says nothing
+/// (#1678).
+#[test]
+fn a_geopackage_row_read_by_its_code_says_its_definitions_grid() {
+    let bound = ed50_utm31_bound();
+    // Read by its code, whose own Helmert shift stands in for the grid.
+    let said = "its coordinate system (srs_id 100001): the definition's NTv2 transformation to WGS 84 (SPED2ETV2.gsb) isn't applied; EPSG:23031's own shift to WGS 84 is used in its place, so positions may be off by the difference between the two";
+    // Near Barcelona, where EPSG:23031 (and its own Helmert shift) places it.
+    let xy = Coord::new(430_000.0, 4_580_000.0);
+    let by_code = Crs::from_epsg(23031).unwrap().transformer().unwrap().to_lonlat(xy).unwrap();
+    for (definition, wkt2, notice) in [(bound.as_str(), false, true), (bound.as_str(), true, true), (ED50_UTM31, false, false)] {
+        let mut notes = Vec::new();
+        let row = GpkgSrs {
+            organization: Some("EPSG".into()),
+            code: Some(23031),
+            definition: (!wkt2).then(|| definition.into()),
+            definition_12_063: wkt2.then(|| definition.into()),
+        };
+        let read = gpkg_reproject(100001, Some(row), &mut notes).unwrap();
+        assert_eq!(notes, if notice { vec![said] } else { vec![] }, "{definition}");
+        let Geometry::Point(at) = read.geometry(Geometry::Point(xy)).unwrap() else { panic!("not a point") };
+        assert!((at.x - by_code.x).abs() < 1e-9 && (at.y - by_code.y).abs() < 1e-9, "{at:?} {by_code:?}");
+    }
+}
+
+/// A database layer's `crs` is read by its EPSG code. WKT whose system has one but binds it to WGS
+/// 84 by a grid (ED50 / UTM zone 31N, by Spain's) says the grid isn't applied; a code, or the
+/// system alone, says nothing; text without a code is refused, as before (#1678).
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_database_crs_read_by_its_code_says_its_definitions_grid() {
+    let said = "crs: the definition's NTv2 transformation to WGS 84 (SPED2ETV2.gsb) isn't applied; EPSG:23031's own shift to WGS 84 is used in its place, so positions may be off by the difference between the two";
+    assert_eq!(given_epsg(&ed50_utm31_bound()).unwrap(), (23031, Some(said.to_string())));
+    assert_eq!(given_epsg(ED50_UTM31).unwrap(), (23031, None));
+    assert_eq!(given_epsg("EPSG:23031").unwrap(), (23031, None));
+    for refused in [crate::raster::wkt::tests::BOUND_BY_A_GRID, "Mercator"] {
+        assert_eq!(given_epsg(refused).unwrap_err().to_string(), format!("'{refused}': give the coordinate system as EPSG:<code>"));
+    }
+}
+
 #[test]
 fn file_geodatabase_names() {
     assert!(is_gdb_name("/x/roads.gdb") && is_gdb_name("Roads.GDB/") && is_gdb_name(r"C:\x\roads.gdb\"));

@@ -154,25 +154,47 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
         Phase::Read(job) => {
             let (plan, sel, name) = *job;
             let got = std::mem::take(&mut st.got);
-            let crs = match st.crs.trim() {
+            let typed = st.crs.trim().to_string();
+            let crs = match typed.as_str() {
                 "" => Ok(None),
                 c => Crs::parse(c).map(Some),
             };
             let raster = crs.map_err(|e| e.to_string()).and_then(|crs| {
                 let store = st.store.as_ref().ok_or("the store is gone")?;
-                let r = zarr::assemble(store, &plan, &got, &name, crs).map_err(|e| e.to_string())?;
-                geotiff::write(&r, 0).map_err(|e| e.to_string())
+                let mut r = zarr::assemble(store, &plan, &got, &name, crs).map_err(|e| e.to_string())?;
+                // What a typed system says, when the slice is in it, as for a folder's slice.
+                let note = (!typed.is_empty()).then(|| zarr::typed_crs_note(store, &sel.variable, &r, &typed)).flatten();
+                if let Some(note) = note
+                    && !r.lost.contains(&note)
+                {
+                    r.lost.push(note);
+                }
+                // What reading the store said: its GeoTIFF doesn't carry it, so it's said here.
+                Ok::<_, String>((geotiff::write(&r, 0).map_err(|e| e.to_string())?, r.lost))
             });
             match raster {
-                Ok(tif) => {
+                Ok((tif, lost)) => {
                     let id = app.session.download_started();
                     app.session.download_landed(id, tif);
                     let index: serde_json::Map<String, Value> = sel.index.iter().map(|(d, i)| (d.clone(), json!(i))).collect();
                     let root = app.ui.zarr.root.clone();
-                    let p = json!({"url": root, "variable": sel.variable, "index": index, "ran": id, "name": name});
+                    let mut p = json!({"url": root, "variable": sel.variable, "index": index, "ran": id, "name": name});
+                    // The system typed for a store that doesn't say: the layer keeps it for its
+                    // series, as a folder's slice does.
+                    if !typed.is_empty() {
+                        p["crs"] = json!(typed);
+                    }
                     // A failure here (the read handed over, then refused) is said in the dialog.
                     match app.run("layer.addZarr", p) {
-                        Ok(_) => app.map.invalidate(),
+                        Ok(_) => {
+                            // As a layer's read notices are said (`raster::read_notices`).
+                            let added =
+                                app.session.active_layer.and_then(|id| app.session.map().layer(id)).map_or(name, |l| l.name.clone());
+                            for loss in lost {
+                                app.session.notify(i18n::fmt("{layer}: {notice}", &[("layer", &added), ("notice", &loss)]), false);
+                            }
+                            app.map.invalidate();
+                        }
                         Err(e) => app.ui.zarr.error = Some(e),
                     }
                 }
@@ -412,5 +434,75 @@ fn add(app: &mut RustGisApp, sel: zarr::Selection, labels: &[String]) {
             st.fetch(keys, Phase::Read(Box::new((plan, sel, name))));
         }
         Err(e) => st.error = Some(e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustgis_engine::{Project, Session};
+
+    /// A slice the dialog reads itself (a store by address, or any store in the web app) says what
+    /// reading the store said, which its GeoTIFF doesn't carry, and hands a system typed for it to
+    /// the layer. UTM zone 17N on NAD 27 bound to WGS 84 by the NTv2 grid `conus` says once that
+    /// the grid isn't applied: in the store, typed for a store that doesn't say, or both. Typed for
+    /// a store that gives another system (WGS 84's UTM zone 17N), it isn't used and says nothing,
+    /// and WGS 84's UTM zone 17N alone says nothing (#1678).
+    #[test]
+    fn a_read_slice_says_what_reading_its_store_said() {
+        let wgs84 = r#"GEOGCRS["WGS 84",DATUM["World Geodetic System 1984",ELLIPSOID["WGS 84",6378137,298.257223563,LENGTHUNIT["metre",1]]],PRIMEM["Greenwich",0,ANGLEUNIT["degree",0.0174532925199433]],CS[ellipsoidal,2],AXIS["latitude",north,ORDER[1],ANGLEUNIT["degree",0.0174532925199433]],AXIS["longitude",east,ORDER[2],ANGLEUNIT["degree",0.0174532925199433]],ID["EPSG",4326]]"#;
+        let utm = r#"PROJCRS["unknown",BASEGEOGCRS["unknown",DATUM["North American Datum 1927",ELLIPSOID["Clarke 1866",6378206.4,294.978698213898,LENGTHUNIT["metre",1]],ID["EPSG",6267]],PRIMEM["Greenwich",0,ANGLEUNIT["degree",0.0174532925199433],ID["EPSG",8901]]],CONVERSION["UTM zone 17N",METHOD["Transverse Mercator",ID["EPSG",9807]],PARAMETER["Latitude of natural origin",0,ANGLEUNIT["degree",0.0174532925199433],ID["EPSG",8801]],PARAMETER["Longitude of natural origin",-81,ANGLEUNIT["degree",0.0174532925199433],ID["EPSG",8802]],PARAMETER["Scale factor at natural origin",0.9996,SCALEUNIT["unity",1],ID["EPSG",8805]],PARAMETER["False easting",500000,LENGTHUNIT["metre",1],ID["EPSG",8806]],PARAMETER["False northing",0,LENGTHUNIT["metre",1],ID["EPSG",8807]],ID["EPSG",16017]],CS[Cartesian,2],AXIS["(E)",east,ORDER[1],LENGTHUNIT["metre",1,ID["EPSG",9001]]],AXIS["(N)",north,ORDER[2],LENGTHUNIT["metre",1,ID["EPSG",9001]]]]"#;
+        let bound = format!(
+            r#"BOUNDCRS[SOURCECRS[{utm}],TARGETCRS[{wgs84}],ABRIDGEDTRANSFORMATION["unknown to WGS84",METHOD["NTv2",ID["EPSG",9615]],PARAMETERFILE["Latitude and longitude difference file","conus",ID["EPSG",8656]]]]"#
+        );
+        let coords = |dim: &str| json!({"zarr_format": 3, "node_type": "array", "shape": [2], "data_type": "float64", "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [2]}}, "codecs": [{"name": "bytes", "configuration": {"endian": "little"}}], "fill_value": 0, "dimension_names": [dim]});
+        let f64s = |v: &[f64]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        // The notice, then whether it is the typed system's own ("the definition's").
+        for (attrs, typed, expected, typed_said) in [
+            (json!({"crs_wkt": bound}), "", 1, 0),
+            (json!({}), bound.as_str(), 1, 1),
+            (json!({"crs_wkt": bound}), bound.as_str(), 1, 0),
+            (json!({"epsg_code": 32617}), bound.as_str(), 0, 0),
+            (json!({"epsg_code": 32617}), "", 0, 0),
+            (json!({}), "EPSG:32617", 0, 0),
+        ] {
+            let elev = json!({
+                "zarr_format": 3, "node_type": "array", "shape": [2, 2], "data_type": "int16",
+                "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [2, 2]}},
+                "chunk_key_encoding": {"name": "default", "configuration": {"separator": "/"}},
+                "codecs": [{"name": "bytes", "configuration": {"endian": "little"}}],
+                "fill_value": 0, "dimension_names": ["y", "x"], "attributes": attrs
+            });
+            let root = json!({"zarr_format": 3, "node_type": "group", "consolidated_metadata": {"kind": "inline", "metadata": {
+                "elev": elev, "y": coords("y"), "x": coords("x"),
+            }}});
+            let store = zarr::parse_store(&[("zarr.json".into(), root.to_string().into_bytes())]).unwrap();
+            let sel = zarr::Selection { variable: "elev".into(), index: vec![] };
+            let plan = zarr::plan(&store, &sel).unwrap();
+            let mut app = RustGisApp::new(Session::new(Project::default()));
+            let st = &mut app.ui.zarr;
+            st.root = "https://example.invalid/dem.zarr".into();
+            st.web = true;
+            st.crs = typed.into();
+            st.store = Some(store);
+            st.got = HashMap::from([
+                ("elev/c/0/0".to_string(), [1i16, 2, 3, 4].iter().flat_map(|v| v.to_le_bytes()).collect()),
+                ("y/c/0".to_string(), f64s(&[4_800_100.0, 4_800_000.0])),
+                ("x/c/0".to_string(), f64s(&[500_000.0, 500_100.0])),
+            ]);
+            st.phase = Phase::Read(Box::new((plan, sel, "dem".into())));
+            let mark = app.session.notice_mark();
+            poll(&mut app, &egui::Context::default());
+            assert_eq!(app.ui.zarr.error, None, "{attrs} {typed}");
+            assert_eq!(app.session.map().layers.len(), 1, "{attrs} {typed}");
+            let notices = app.session.notices_since(mark);
+            let said = notices.iter().filter(|n| n.text.contains("(conus) isn't applied")).count();
+            let shifts = notices.iter().filter(|n| n.text.contains("isn't applied") || n.text.contains("has no conversion")).count();
+            let own = notices.iter().filter(|n| n.text.contains("the definition's")).count();
+            assert_eq!((said, shifts, own), (expected, expected, typed_said), "{attrs} {typed}: {notices:?}");
+            // The typed system goes with the layer, for its series.
+            let kept = app.session.map().layers.first().and_then(|l| l.raster.as_ref()).and_then(|r| r.crs.clone());
+            assert_eq!(kept.as_deref(), Some(typed).filter(|t| !t.is_empty()), "{attrs} {typed}");
+        }
     }
 }

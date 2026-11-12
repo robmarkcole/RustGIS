@@ -634,8 +634,7 @@ pub(crate) fn layer_work(s: &Session, p: &Value) -> Result<Work, String> {
     // Checked now, so a bad table option is refused before the export starts.
     let ext = Path::new(&path).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     let gpkg = gpkg_table(p, &ext)?;
-    let compatibility =
-        ps(p, "crs").and_then(|text| asked.and_then(|crs| rustgis_data::raster::wkt::projection_compatibility_note(text, crs)));
+    let compatibility = ps(p, "crs").and_then(|text| asked.and_then(|crs| rustgis_data::raster::wkt::typed_crs_note(text, crs)));
     Ok(Box::new(move || {
         let mut wrote = write_layer(&l, &path, asked, gpkg)?;
         if let Some(note) = compatibility {

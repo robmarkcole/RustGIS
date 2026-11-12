@@ -1456,8 +1456,9 @@ fn sidecar_crs(path: &Path) -> Result<(Option<Crs>, Option<String>)> {
     match wkt::read_wkt(&prj) {
         Ok((crs, note)) => {
             // The raster's body channel reports planetary interpretation once; datum and
-            // projection notices from this sidecar must otherwise be preserved.
-            let note = if crs.is_planetary() { wkt::projection_compatibility_note(&prj, crs).map(str::to_owned) } else { note };
+            // projection notices from this sidecar must otherwise be preserved, and so must a
+            // shift the file gives that isn't applied.
+            let note = if crs.is_planetary() { wkt::file_crs_note(&prj, crs) } else { note };
             Ok((Some(crs), note))
         }
         Err(e) => match planetary::refused_wkt(&prj, &e) {

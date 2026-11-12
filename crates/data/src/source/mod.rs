@@ -653,6 +653,17 @@ fn ext(path: &Path) -> String {
     path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase()
 }
 
+/// The EPSG code a database layer's `crs` gives its geometry when the geometry doesn't say one,
+/// with a note of a shift its WKT gives that the code doesn't apply (#1678). Text without a code is
+/// refused.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn given_epsg(given: &str) -> Result<(u16, Option<String>)> {
+    match Crs::parse(given) {
+        Ok(c) if c.epsg() > 0 => Ok((c.epsg(), crate::raster::wkt::unapplied_note(given, c).map(|note| format!("crs: {note}")))),
+        _ => Err(DataError::Format(format!("'{given}': give the coordinate system as EPSG:<code>"))),
+    }
+}
+
 /// A source's coordinate system: converts its geometry to longitude/latitude and a request's
 /// extent to its own coordinates.
 #[derive(Clone, Debug)]
@@ -843,6 +854,10 @@ pub(crate) fn gpkg_reproject(srs_id: i64, row: Option<GpkgSrs>, notes: &mut Vec<
                 "its coordinate system (srs_id {srs_id}): using EPSG:{} parameters in preference to the WKT definition; {note}",
                 crs.epsg()
             ));
+        }
+        // A grid the definition gives isn't applied by the code either (#1678).
+        if let Some(note) = named.and_then(|d| crate::raster::wkt::unapplied_note(d, crs)) {
+            notes.push(format!("its coordinate system (srs_id {srs_id}): {note}"));
         }
         return Ok(Reproject::from_crs(crs, notes));
     }

@@ -487,7 +487,9 @@ pub struct Reducing {
     pub id: u64,
     pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub done: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    pub result: std::sync::Arc<std::sync::Mutex<Option<Result<Vec<u8>, String>>>>,
+    /// The summary as a GeoTIFF, and what reading its slices said, which the GeoTIFF doesn't carry.
+    #[allow(clippy::type_complexity)]
+    pub result: std::sync::Arc<std::sync::Mutex<Option<Result<(Vec<u8>, Vec<String>), String>>>>,
 }
 
 /// The area between a profile's line and its base, as one quad (two triangles) per segment: a
@@ -522,11 +524,19 @@ pub fn land_summary(app: &mut RustGisApp) -> bool {
         // Cancelled as it finished: nothing added either.
         Ok(_) if cancelled => app.session.download_failed(id),
         // Added to the project it was run in: one opened meanwhile doesn't get it.
-        Ok(tif) => {
+        Ok((tif, lost)) => {
             if app.session.download_landed(id, tif) {
                 let key = if root.starts_with("http://") || root.starts_with("https://") { "url" } else { "path" };
                 // `run` puts any error in the pane's message.
-                let _ = run(app, "layer.addZarr", json!({key: root, "variable": variable, "ran": id, "summary": true, "name": name}));
+                let added = run(app, "layer.addZarr", json!({key: root, "variable": variable, "ran": id, "summary": true, "name": name}));
+                // What reading the slices said (a grid the store's system doesn't apply, …), as a
+                // layer's read notices are said: its GeoTIFF doesn't carry it.
+                if added.is_some() {
+                    let layer = app.session.active_layer.and_then(|id| app.session.map().layer(id)).map_or(name, |l| l.name.clone());
+                    for loss in lost {
+                        app.session.notify(crate::i18n::fmt("{layer}: {notice}", &[("layer", &layer), ("notice", &loss)]), false);
+                    }
+                }
             } else {
                 app.ws.message =
                     Some((tl!("The summary finished after another project was opened, so it wasn't added").to_string(), false));
@@ -629,7 +639,7 @@ fn summarise(app: &mut RustGisApp, ui: &mut Ui) {
                         let _diagnostics = diagnostics.enter();
                         let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             job.run(&cancel, &done)
-                                .and_then(|r| rustgis_engine::data::raster::geotiff::write(&r, 0).map_err(|e| e.to_string()))
+                                .and_then(|r| Ok((rustgis_engine::data::raster::geotiff::write(&r, 0).map_err(|e| e.to_string())?, r.lost)))
                         }))
                         .unwrap_or_else(|_| Err(tl!("The summary failed unexpectedly").to_string()));
                         if let Ok(mut g) = result.lock() {

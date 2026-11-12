@@ -747,13 +747,12 @@ impl PostgisSource {
         let given = crs.map(str::trim).filter(|c| !c.is_empty());
         let mut native = g.clone();
         if srid == 0 {
-            match given.map(Crs::parse) {
-                Some(Ok(c)) if c.epsg() > 0 => {
-                    srid = i32::from(c.epsg());
+            match given {
+                Some(given) => {
+                    let (code, note) = super::given_epsg(given)?;
+                    srid = i32::from(code);
                     native = format!("ST_SetSRID({g}, {srid})");
-                }
-                Some(Ok(_)) | Some(Err(_)) => {
-                    return Err(DataError::Format(format!("'{}': give the coordinate system as EPSG:<code>", given.unwrap_or_default())));
+                    notes.extend(note);
                 }
                 None => notes.push(
                     "the geometry doesn't say its coordinate system; read as longitude/latitude (add it again with \"crs\", such as EPSG:2263)".into(),

@@ -846,6 +846,27 @@ fn an_ascii_grid_with_a_mars_prj_is_said_or_refused() {
     );
 }
 
+/// Another body's `.prj` next to an ASCII grid, which says its body its own way, still says a grid
+/// shift it gives that isn't applied (GDAL's `PROJ4_GRIDS` on its datum); without one it says
+/// nothing of the kind.
+#[test]
+fn an_ascii_grid_with_a_mars_prj_says_a_grid_it_doesnt_apply() {
+    let dir = tempfile::tempdir().unwrap();
+    let grid = "ncols 2\nnrows 2\nxllcorner 10\nyllcorner 10\ncellsize 1\n1 2\n3 4\n";
+    let gridded = MARS_ESRI.replace("0.0]],PRIMEM", r#"0.0],EXTENSION["PROJ4_GRIDS","mars.gsb"]],PRIMEM"#);
+    assert_ne!(gridded, MARS_ESRI);
+    let said = "the .prj file: the file's grid shift (mars.gsb) isn't applied, so positions may be off by as much as that shift";
+    for (name, prj, notice) in [("gridded", gridded.as_str(), true), ("plain", MARS_ESRI, false)] {
+        std::fs::write(dir.path().join(format!("{name}.asc")), grid).unwrap();
+        std::fs::write(dir.path().join(format!("{name}.prj")), prj).unwrap();
+        let r = raster::read_path(&dir.path().join(format!("{name}.asc"))).unwrap();
+        assert!(r.crs.is_planetary(), "{name}: {:?}", r.crs);
+        assert_eq!(planetary_notes(&r.lost).len(), 1, "{name}: {:?}", r.lost);
+        assert_eq!(r.lost.iter().filter(|l| l.as_str() == said).count(), usize::from(notice), "{name}: {:?}", r.lost);
+        assert!(notice || !r.lost.iter().any(|l| l.contains("isn't applied")), "{name}: {:?}", r.lost);
+    }
+}
+
 /// An Earth `.prj` next to an ASCII grid that RustGIS can't read leaves the grid in
 /// longitude/latitude, and says so, as a Shapefile's does; one it reads, or none, says nothing.
 #[test]

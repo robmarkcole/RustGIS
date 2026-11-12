@@ -96,6 +96,22 @@ pub trait TimeCube: Send + Sync {
     fn nothing_read(&self) -> Option<String> {
         None
     }
+    /// What reading its slices said (a shift a Zarr store's system doesn't apply, …), once each,
+    /// asked once every slice is read: the outputs are on their grid, so it is said of them too.
+    /// A stack's slices are layers, whose notices were said when they were added.
+    fn lost(&self) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+/// `outputs` with what reading the cube's slices said ([`TimeCube::lost`]) on the first of them:
+/// said once for the run, not once a layer.
+fn with_lost(outputs: Result<Vec<Raster>, String>, cube: &dyn TimeCube) -> Result<Vec<Raster>, String> {
+    let mut outputs = outputs?;
+    if let Some(first) = outputs.first_mut() {
+        first.lost = cube.lost();
+    }
+    Ok(outputs)
 }
 
 /// A stack of rasters (or a raster's bands), a date each.
@@ -143,9 +159,9 @@ impl TimeCube for Stack {
     }
 }
 
-/// A Zarr variable along its time dimension.
+/// A Zarr variable along its time dimension, and what reading its slices said, once each.
 #[cfg(not(target_arch = "wasm32"))]
-struct ZarrCube(super::zarr::ZarrCube);
+struct ZarrCube(super::zarr::ZarrCube, std::sync::Mutex<Vec<String>>);
 
 #[cfg(not(target_arch = "wasm32"))]
 impl TimeCube for ZarrCube {
@@ -164,7 +180,17 @@ impl TimeCube for ZarrCube {
                 None => return Ok(None),
             },
         };
+        // A poisoned lock still holds the notices said so far.
+        let mut lost = self.1.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for l in &r.lost {
+            if !lost.contains(l) {
+                lost.push(l.clone());
+            }
+        }
         Ok(Some((r, 0)))
+    }
+    fn lost(&self) -> Vec<String> {
+        self.1.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
     fn label(&self) -> String {
         self.0.zt.variable.clone()
@@ -359,7 +385,7 @@ pub fn cube_from(s: &mut Session, p: &Value, needs: Needs) -> Result<Box<dyn Tim
                     cube.zt.variable
                 ));
             }
-            return Ok(Box::new(ZarrCube(cube)));
+            return Ok(Box::new(ZarrCube(cube, std::sync::Mutex::default())));
         }
     }
     let id = s.layer_id(p)?;
@@ -635,14 +661,15 @@ impl TrendRun {
             format!("{} p-value ({})", self.name, self.test.code()),
             format!("{} significant slope per {unit} (p < {})", self.name, self.alpha),
         ];
-        names
+        let outputs = names
             .into_iter()
             .zip(bands)
             .map(|(name, band)| {
                 Raster::new(name, grid.width, height, vec![band], grid.transform, grid.crs, None, raster::ColorHint::Gray, "Float32")
                     .map_err(|e| e.to_string())
             })
-            .collect()
+            .collect();
+        with_lost(outputs, self.cube.as_ref())
     }
 
     /// One piece's slices read into a block, cell by date: the piece's first slice (its grid), the
@@ -1683,7 +1710,8 @@ impl ReduceRun {
         }
         done.store(self.total(), Ordering::Relaxed);
         let grid = &grid;
-        self.groups
+        let outputs = self
+            .groups
             .iter()
             .zip(bands)
             .flat_map(|((name, _), columns)| {
@@ -1696,7 +1724,8 @@ impl ReduceRun {
                         .map_err(|e| e.to_string())
                 })
             })
-            .collect()
+            .collect();
+        with_lost(outputs, self.cube.as_ref())
     }
 }
 

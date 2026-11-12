@@ -1109,12 +1109,17 @@ fn geographic(c: &Array) -> bool {
         || matches!(c.name().to_ascii_lowercase().as_str(), "lat" | "lon" | "latitude" | "longitude")
 }
 
-/// The coordinate system a variable's attributes (or its grid mapping's) say.
-fn crs_of(store: &Store, a: &Array) -> Option<Crs> {
+/// The coordinate system a variable's attributes (or its grid mapping's) say, and what reading its
+/// WKT said, as for a `.prj` ([`super::wkt::read_wkt`]).
+fn crs_of(store: &Store, a: &Array) -> Option<(Crs, Option<String>)> {
+    let read = |t: &str| {
+        let t = t.trim();
+        if t.contains('[') { super::wkt::read_wkt(t).ok() } else { Crs::parse(t).ok().map(|c| (c, None)) }
+    };
     let from = |x: &Array| {
         for k in ["crs_wkt", "spatial_ref", "crs", "proj4", "proj4text", "proj4_params"] {
-            if let Some(t) = attr_str(x, k).and_then(|t| Crs::parse(t).ok()) {
-                return Some(t);
+            if let Some(read) = attr_str(x, k).and_then(read) {
+                return Some(read);
             }
         }
         for k in ["epsg_code", "epsg"] {
@@ -1124,7 +1129,7 @@ fn crs_of(store: &Store, a: &Array) -> Option<Crs> {
                 _ => None,
             };
             if let Some(c) = code.and_then(|c| u32::try_from(c).ok()).and_then(Crs::from_epsg) {
-                return Some(c);
+                return Some((c, None));
             }
         }
         None
@@ -1289,7 +1294,13 @@ pub fn assemble(store: &Store, plan: &Plan, chunks: &HashMap<String, Vec<u8>>, n
         dx = -dx;
     }
     let lonlat = geographic(yc) && geographic(xc);
-    let crs = if lonlat { Some(Crs::LonLat) } else { crs_of(store, a).or(crs) };
+    let (crs, crs_note) = if lonlat {
+        // The axes are read as longitude/latitude, whatever the WKT says; a shift it gives that
+        // isn't applied is still said.
+        (Some(Crs::LonLat), crs_of(store, a).and_then(|(_, note)| note))
+    } else {
+        crs_of(store, a).map_or((crs, None), |(crs, note)| (Some(crs), note))
+    };
     let Some(crs) = crs else {
         return Err(bad(format!("{}: the store doesn't say its coordinate system; give \"crs\" (such as EPSG:3035)", a.path)));
     };
@@ -1324,6 +1335,7 @@ pub fn assemble(store: &Store, plan: &Plan, chunks: &HashMap<String, Vec<u8>>, n
     if rounded > 0 {
         r.rounded = vec![rounded];
     }
+    r.lost.extend(crs_note);
     Ok(r)
 }
 
@@ -1422,9 +1434,22 @@ pub fn is_lonlat_grid(store: &Store, variable: &str) -> bool {
     geo(y) && geo(x)
 }
 
-/// The coordinate system `variable`'s attributes (or its grid mapping's) say, for a projected grid.
-pub fn grid_crs(store: &Store, variable: &str) -> Option<Crs> {
+/// The coordinate system `variable`'s attributes (or its grid mapping's) say, for a projected grid,
+/// with the note [`crs_of`] gives (a shift the WKT gives that isn't applied).
+pub fn grid_crs(store: &Store, variable: &str) -> Option<(Crs, Option<String>)> {
     store.array(variable).and_then(|a| crs_of(store, a))
+}
+
+/// What a coordinate system typed for a store says ([`super::wkt::typed_crs_note`]: a shift it
+/// gives that isn't applied, its projection method's formula), when `r`, read from `variable`, is
+/// in it. It is only the fallback: a store that gives its own system ([`grid_crs`]), or a
+/// longitude/latitude grid, doesn't use it, so what it says isn't the raster's (#1678).
+pub fn typed_crs_note(store: &Store, variable: &str, r: &Raster, typed: &str) -> Option<String> {
+    if grid_crs(store, variable).is_some() {
+        return None;
+    }
+    let crs = Crs::parse(typed).ok().filter(|c| *c == r.crs)?;
+    super::wkt::typed_crs_note(typed, crs)
 }
 
 /// The stored (row, column) of `variable`'s map cell holding the point (`x`, `y`), in the grid's
@@ -1861,7 +1886,12 @@ pub fn read_metadata(dir: &std::path::Path) -> Result<Store> {
 /// Reads a slice of a store in a folder (`selection` as [`Selection::label`] writes it).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn read_dir(dir: &std::path::Path, selection: &str, crs: Option<&str>) -> Result<Raster> {
-    let store = read_metadata(dir)?;
+    read_dir_in(&read_metadata(dir)?, dir, selection, crs)
+}
+
+/// [`read_dir`] with the store's metadata already read ([`read_metadata`]).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn read_dir_in(store: &Store, dir: &std::path::Path, selection: &str, crs: Option<&str>) -> Result<Raster> {
     let mut sel = Selection::parse(selection);
     if sel.variable.is_empty() {
         sel.variable = store
@@ -1871,7 +1901,7 @@ pub fn read_dir(dir: &std::path::Path, selection: &str, crs: Option<&str>) -> Re
             .map(|v| v.path.clone())
             .ok_or_else(|| bad("the store has no variable that can be read"))?;
     }
-    let p = plan(&store, &sel)?;
+    let p = plan(store, &sel)?;
     let mut chunks = HashMap::new();
     let mut total = 0u64;
     for k in &p.keys {
@@ -1885,7 +1915,7 @@ pub fn read_dir(dir: &std::path::Path, selection: &str, crs: Option<&str>) -> Re
     }
     let crs = crs.map(Crs::parse).transpose().map_err(DataError::Format)?;
     let stem = dir.file_stem().and_then(|s| s.to_str()).unwrap_or("zarr");
-    let mut r = assemble(&store, &p, &chunks, &format!("{stem} {}", sel.label()), crs)?;
+    let mut r = assemble(store, &p, &chunks, &format!("{stem} {}", sel.label()), crs)?;
     r.source = Some(dir.display().to_string());
     Ok(r)
 }
@@ -2271,6 +2301,84 @@ mod tests {
         let mut idx: Vec<u8> = index.iter().flat_map(|v| if index_little { v.to_le_bytes() } else { v.to_be_bytes() }).collect();
         idx.extend([0u8; 4]);
         if index_at_end { [body, idx].concat() } else { [idx, body].concat() }
+    }
+
+    /// A store's own WKT is read as a `.prj` is: UTM zone 17N on NAD 27, bound to WGS 84 by the
+    /// NTv2 grid `conus`, is read without the grid, which the raster says; WGS 84's UTM zone 17N,
+    /// as WKT or by its code, says nothing (#1678).
+    #[test]
+    fn a_stores_wkt_says_a_grid_it_doesnt_apply() {
+        use crate::raster::wkt::tests::{BOUND_BY_A_GRID, NAD27_UTM17};
+        let said = "the file's NTv2 transformation to WGS 84 (conus) isn't applied, so positions may be off by as much as that shift";
+        // The system alone says its datum has no shift, as from a `.prj`; WGS 84's says nothing.
+        let datum = "the datum North American Datum 1927 has no conversion to WGS 84 in the file, so positions may be off by up to a few hundred metres";
+        let utm17 = crate::raster::wkt::to_wkt(Crs::Epsg(32617)).unwrap();
+        let coords = |dim: &str, n: usize| serde_json::json!({"zarr_format": 3, "node_type": "array", "shape": [n], "data_type": "float64", "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [n]}}, "codecs": [{"name": "bytes", "configuration": {"endian": "little"}}], "fill_value": 0, "dimension_names": [dim]});
+        let bytes = |v: &[f64]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let chunks = HashMap::from([
+            ("elev/c/0/0".to_string(), [1i16, 2, 3, 4].iter().flat_map(|v| v.to_le_bytes()).collect()),
+            ("y/c/0".to_string(), bytes(&[4_800_100.0, 4_800_000.0])),
+            ("x/c/0".to_string(), bytes(&[500_000.0, 500_100.0])),
+        ]);
+        for (attrs, crs, lost) in [
+            (serde_json::json!({"crs_wkt": BOUND_BY_A_GRID}), Crs::parse(NAD27_UTM17).unwrap(), vec![said]),
+            (serde_json::json!({"spatial_ref": BOUND_BY_A_GRID}), Crs::parse(NAD27_UTM17).unwrap(), vec![said]),
+            (serde_json::json!({"crs_wkt": NAD27_UTM17}), Crs::parse(NAD27_UTM17).unwrap(), vec![datum]),
+            (serde_json::json!({"crs_wkt": utm17}), Crs::Epsg(32617), vec![]),
+            (serde_json::json!({"epsg_code": 32617}), Crs::Epsg(32617), vec![]),
+        ] {
+            let elev = serde_json::json!({
+                "zarr_format": 3, "node_type": "array", "shape": [2, 2], "data_type": "int16",
+                "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [2, 2]}},
+                "chunk_key_encoding": {"name": "default", "configuration": {"separator": "/"}},
+                "codecs": [{"name": "bytes", "configuration": {"endian": "little"}}],
+                "fill_value": 0, "dimension_names": ["y", "x"], "attributes": attrs
+            });
+            let root = serde_json::json!({"zarr_format": 3, "node_type": "group", "consolidated_metadata": {"kind": "inline", "metadata": {
+                "elev": elev, "y": coords("y", 2), "x": coords("x", 2),
+            }}});
+            let store = parse_store(&[("zarr.json".into(), root.to_string().into_bytes())]).unwrap();
+            let p = plan(&store, &Selection { variable: "elev".into(), index: vec![] }).unwrap();
+            let r = assemble(&store, &p, &chunks, "elev", None).unwrap();
+            assert_eq!(r.crs, crs, "{attrs}");
+            assert_eq!(r.lost, lost, "{attrs}");
+            // The point series reads the same system, and the same note.
+            assert_eq!(grid_crs(&store, "elev"), Some((crs, lost.first().map(|n| n.to_string()))), "{attrs}");
+        }
+    }
+
+    /// A longitude/latitude store is read as such whatever its WKT says, and a shift the WKT gives
+    /// that isn't applied is said as on a projected grid; a clean WKT says nothing.
+    #[test]
+    fn a_lonlat_stores_wkt_says_a_grid_it_doesnt_apply() {
+        use crate::raster::wkt::tests::BOUND_BY_A_GRID;
+        let said = "the file's NTv2 transformation to WGS 84 (conus) isn't applied, so positions may be off by as much as that shift";
+        let coords = |dim: &str, n: usize| serde_json::json!({"zarr_format": 3, "node_type": "array", "shape": [n], "data_type": "float64", "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [n]}}, "codecs": [{"name": "bytes", "configuration": {"endian": "little"}}], "fill_value": 0, "dimension_names": [dim]});
+        let bytes = |v: &[f64]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let chunks = HashMap::from([
+            ("elev/c/0/0".to_string(), [1i16, 2, 3, 4].iter().flat_map(|v| v.to_le_bytes()).collect()),
+            ("lat/c/0".to_string(), bytes(&[43.1, 43.0])),
+            ("lon/c/0".to_string(), bytes(&[-79.1, -79.0])),
+        ]);
+        for (attrs, lost) in
+            [(serde_json::json!({"crs_wkt": BOUND_BY_A_GRID}), vec![said]), (serde_json::json!({"crs_wkt": "EPSG:4326"}), vec![])]
+        {
+            let elev = serde_json::json!({
+                "zarr_format": 3, "node_type": "array", "shape": [2, 2], "data_type": "int16",
+                "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [2, 2]}},
+                "chunk_key_encoding": {"name": "default", "configuration": {"separator": "/"}},
+                "codecs": [{"name": "bytes", "configuration": {"endian": "little"}}],
+                "fill_value": 0, "dimension_names": ["lat", "lon"], "attributes": attrs
+            });
+            let root = serde_json::json!({"zarr_format": 3, "node_type": "group", "consolidated_metadata": {"kind": "inline", "metadata": {
+                "elev": elev, "lat": coords("lat", 2), "lon": coords("lon", 2),
+            }}});
+            let store = parse_store(&[("zarr.json".into(), root.to_string().into_bytes())]).unwrap();
+            let p = plan(&store, &Selection { variable: "elev".into(), index: vec![] }).unwrap();
+            let r = assemble(&store, &p, &chunks, "elev", None).unwrap();
+            assert_eq!(r.crs, Crs::LonLat, "{attrs}");
+            assert_eq!(r.lost, lost, "{attrs}");
+        }
     }
 
     #[test]

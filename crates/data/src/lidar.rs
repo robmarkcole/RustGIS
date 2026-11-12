@@ -142,12 +142,14 @@ fn read_vlrs<R: Read + Seek>(r: &mut R, at: u64, n: u32, extended: bool, end: Op
     Ok(out)
 }
 
-/// The coordinate system the records say: WKT, else GeoTIFF keys' EPSG code.
-fn crs_of(vlrs: &[Vlr]) -> Option<std::result::Result<Crs, String>> {
+/// The coordinate system the records say, with what its WKT's reading says
+/// ([`crate::raster::wkt::read_wkt`]): WKT, else GeoTIFF keys' EPSG code.
+fn crs_of(vlrs: &[Vlr]) -> Option<std::result::Result<(Crs, Option<String>), String>> {
     if let Some(v) = vlrs.iter().find(|v| v.record == 2112) {
         let wkt = String::from_utf8_lossy(&v.data).trim_end_matches('\0').trim().to_string();
         if !wkt.is_empty() {
-            return Some(Crs::parse(horizontal(&wkt)));
+            let text = horizontal(&wkt).trim();
+            return Some(if text.contains('[') { crate::raster::wkt::read_wkt(text) } else { Crs::parse(text).map(|c| (c, None)) });
         }
     }
     let keys = vlrs.iter().find(|v| v.user == "LASF_Projection" && v.record == 34735)?;
@@ -165,7 +167,9 @@ fn crs_of(vlrs: &[Vlr]) -> Option<std::result::Result<Crs, String>> {
         }
     }
     let code = code?;
-    Some(Crs::from_epsg(u32::from(code)).ok_or_else(|| format!("EPSG:{code} isn't a coordinate system RustGIS converts")))
+    Some(
+        Crs::from_epsg(u32::from(code)).map(|c| (c, None)).ok_or_else(|| format!("EPSG:{code} isn't a coordinate system RustGIS converts")),
+    )
 }
 
 /// The horizontal part of a compound WKT (a projected or geographic system with a vertical one,
@@ -272,7 +276,12 @@ fn read_points<R: Read + Seek + Send + Sync>(mut r: R, name: &str, crs: Option<C
     let crs = match crs {
         Some(c) => Some(c),
         None => match crs_of(&vlrs) {
-            Some(Ok(c)) => Some(c),
+            Some(Ok((c, note))) => {
+                if let Some(note) = note {
+                    report.messages.push(format!("{name}: the coordinate system: {note}"));
+                }
+                Some(c)
+            }
             Some(Err(e)) => {
                 report.messages.push(format!("{name}: {e}; coordinates are kept as they are"));
                 said = true;
@@ -550,7 +559,7 @@ mod tests {
         }
         data.extend_from_slice(&2048u16.to_le_bytes());
         let keys = Vlr { user: "LASF_Projection".into(), record: 34735, data };
-        assert!(matches!(crs_of(&[keys]), Some(Ok(c)) if c == Crs::from_epsg(32633).unwrap()));
+        assert!(matches!(crs_of(&[keys]), Some(Ok((c, None))) if c == Crs::from_epsg(32633).unwrap()));
     }
 
     #[test]
@@ -586,6 +595,22 @@ mod tests {
         let (ds, report) = read_bytes(&las(2, 0, &[(500000.0, 5_000_000.0, 1.0, 1)], None), "t", Some(Crs::Epsg(32632))).unwrap();
         assert!(report.messages.is_empty());
         assert!(matches!(ds.features[0].geometry, Some(Geometry::Point(c)) if (c.x - 9.0).abs() < 1e-6));
+    }
+
+    /// What reading a WKT record finds is said: UTM zone 17N on NAD 27 bound to WGS 84 by an NTv2
+    /// grid, as PROJ 9.8.1 writes it, is read without the grid, which is said. The WGS 84 zone of
+    /// `reprojects_and_samples` says nothing (#1678).
+    #[test]
+    fn a_wkt_records_notes_are_said() {
+        let bound = crate::raster::wkt::tests::BOUND_BY_A_GRID;
+        let (ds, report) = read_bytes(&las(2, 0, &[(500000.0, 4_800_000.0, 1.0, 1)], Some(bound)), "t", None).unwrap();
+        // On UTM zone 17N's central meridian, 81°W.
+        assert!(matches!(ds.features[0].geometry, Some(Geometry::Point(c)) if (c.x + 81.0).abs() < 1e-3), "{:?}", ds.features[0].geometry);
+        let said = "t: the coordinate system: the file's NTv2 transformation to WGS 84 (conus) isn't applied, so positions may be off by as much as that shift";
+        assert_eq!(report.messages, [said]);
+        let utm32 = r#"PROJCS["WGS 84 / UTM zone 32N",GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]],PROJECTION["Transverse_Mercator"],PARAMETER["latitude_of_origin",0],PARAMETER["central_meridian",9],PARAMETER["scale_factor",0.9996],PARAMETER["false_easting",500000],PARAMETER["false_northing",0],UNIT["metre",1],AUTHORITY["EPSG","32632"]]"#;
+        let (_, report) = read_bytes(&las(2, 0, &[(500000.0, 5_000_000.0, 1.0, 1)], Some(utm32)), "t", None).unwrap();
+        assert!(report.messages.is_empty(), "{:?}", report.messages);
     }
 
     /// Oversized legacy and LAS 1.4 counts are refused before records or LAZ metadata are needed.

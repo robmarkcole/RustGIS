@@ -5,7 +5,6 @@
 //! and keyless ids use server-side row numbers, so only the kept rows cross the network.
 
 use super::{Batch, Family, FeatureSource, Reproject, Request, SourceInfo, clamp_limit, in_request, stride};
-use crate::raster::Crs;
 use crate::{DataError, Feature, Field, FieldType, Geometry, GeometryType, Result, Value, wkb};
 use rustgis_geom::Extent;
 use std::collections::{HashMap, HashSet};
@@ -598,10 +597,11 @@ impl SqlServerSource {
         let mut srid = raw_srid;
         if srid == 0 {
             match crs.map(str::trim).filter(|c| !c.is_empty()) {
-                Some(given) => match Crs::parse(given) {
-                    Ok(c) if c.epsg() > 0 => srid = u32::from(c.epsg()),
-                    _ => return Err(DataError::Format(format!("'{given}': give the coordinate system as EPSG:<code>"))),
-                },
+                Some(given) => {
+                    let (code, note) = super::given_epsg(given)?;
+                    srid = u32::from(code);
+                    notes.extend(note);
+                }
                 None => notes.push("the geometry doesn't say its coordinate system; read as longitude/latitude (add it again with \"crs\", such as EPSG:2263)".into()),
             }
         }
@@ -874,6 +874,7 @@ impl FeatureSource for SqlServerSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::raster::Crs;
 
     #[test]
     fn source_columns_cannot_shadow_numbering_or_count() {

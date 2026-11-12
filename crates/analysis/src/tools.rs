@@ -3723,10 +3723,11 @@ pub fn holds_coordinates(ds: &Dataset, field: usize) -> bool {
     }
 }
 
-/// Typed WKT retains its explicit method warning; a code alone follows the compatibility policy.
-fn crs_with_compatibility_note(text: &str) -> Result<(Crs, Option<&'static str>), String> {
+/// Typed WKT retains its explicit method warning, and says a shift it gives that isn't applied; a
+/// code alone follows the compatibility policy.
+fn crs_with_compatibility_note(text: &str) -> Result<(Crs, Option<String>), String> {
     let crs = Crs::parse(text)?;
-    Ok((crs, rustgis_data::raster::wkt::projection_compatibility_note(text, crs)))
+    Ok((crs, rustgis_data::raster::wkt::typed_crs_note(text, crs)))
 }
 
 fn xy_table_to_point(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
@@ -4464,7 +4465,7 @@ pub fn raster_crs(ds: &Dataset, p: &Json, tool: &str) -> Result<(Crs, Option<Str
 
 /// The projected coordinate system `text` names, and its compatibility note, or an error for one
 /// in degrees: a raster's cells are measured in a projected system's units.
-pub fn projected_crs(text: &str) -> Result<(Crs, Option<&'static str>), String> {
+pub fn projected_crs(text: &str) -> Result<(Crs, Option<String>), String> {
     let (crs, note) = crs_with_compatibility_note(text)?;
     if crs.is_geocentric() {
         return Err("crs must be a projected coordinate system, not a geocentric one (X, Y and Z from the Earth's centre)".into());
