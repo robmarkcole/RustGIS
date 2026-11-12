@@ -18,7 +18,9 @@ pub const PRESETS: &[(&str, &str, &str)] = &[
     ("robinson", "Robinson", "+proj=robin +lon_0=0 +datum=WGS84 +units=m +no_defs"),
     ("equalEarth", "Equal Earth", "+proj=eqearth +lon_0=0 +datum=WGS84 +units=m +no_defs"),
     ("naturalEarth", "Natural Earth", "+proj=natearth +lon_0=0 +datum=WGS84 +units=m +no_defs"),
-    ("winkelTripel", "Winkel Tripel", "+proj=wintri +lon_0=0 +datum=WGS84 +units=m +no_defs"),
+    // At Winkel's own standard parallel, acos(2/π) (`rustgis_geom::world::winkel_parallel`):
+    // PROJ, and RustGIS's readers, take 0 for a definition without one.
+    ("winkelTripel", "Winkel Tripel", "+proj=wintri +lon_0=0 +lat_1=50.459776252189805 +datum=WGS84 +units=m +no_defs"),
     ("eckertIV", "Eckert IV (equal-area world)", "+proj=eck4 +lon_0=0 +datum=WGS84 +units=m +no_defs"),
     ("northPolar", "North Polar Stereographic", "+proj=stere +lat_0=90 +lat_ts=70 +lon_0=0 +datum=WGS84 +units=m +no_defs"),
     ("southPolar", "South Polar Stereographic", "+proj=stere +lat_0=-90 +lat_ts=-71 +lon_0=0 +datum=WGS84 +units=m +no_defs"),
@@ -616,7 +618,18 @@ impl Projector {
                 .find_map(|t| t.strip_prefix("+R=")?.parse::<f64>().ok())
                 .filter(|r| r.is_finite() && *r > 0.0)
                 .unwrap_or(rustgis_geom::MERCATOR_R);
-            let engine = Engine::World(crate::world::World { kind, lon0, radius });
+            // Winkel Tripel's standard parallel as the definition gives it (the preset gives
+            // Winkel's own), else 0, as PROJ and RustGIS's readers take it, so the map draws a
+            // definition where its data is read.
+            let lat1 = match def.split_whitespace().find_map(|t| t.strip_prefix("+lat_1=")) {
+                Some(v) => v
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|v| v.is_finite() && v.abs() < 90.0)
+                    .ok_or_else(|| format!("{code}: +lat_1={v} isn't a latitude short of a pole"))?,
+                None => 0.0,
+            };
+            let engine = Engine::World(crate::world::World { lat1, ..crate::world::World::new(kind, lon0, radius) });
             return Ok(Projector { engine, to_meter: 1.0, domain, lon0, edge: std::sync::OnceLock::new() });
         }
         let native = proj4rs::Proj::from_proj_string(&def).map_err(|e| match e {
@@ -1354,6 +1367,24 @@ mod tests {
         // 31 in crs-definitions 0.6 (Mercator, equirectangular, cylindrical equal-area, Equal Earth),
         // 6 of them Mercator from Jakarta (+pm).
         assert!(checked >= 31, "only {checked} world projections checked");
+    }
+
+    /// The world presets RustGIS computes draw where its readers place their definitions (a map
+    /// exported in one, say): Winkel Tripel at Winkel's own parallel, which its preset gives, as
+    /// PROJ 9.8.1 places it (#1701).
+    #[test]
+    fn world_presets_draw_where_their_definitions_are_read() {
+        for code in ["naturalEarth", "winkelTripel", "eckertIV", "winkelTripel +lon_0=150"] {
+            let (def, _) = lookup(code).unwrap();
+            let p = Projector::new(code).unwrap();
+            let t = rustgis_data::raster::Crs::parse(&def).unwrap().transformer().unwrap();
+            for (lon, lat) in [(10.0, 50.0), (-120.0, -35.0), (179.0, 80.0)] {
+                let (a, b) = (p.forward(Coord::new(lon, lat)).unwrap(), t.from_lonlat(Coord::new(lon, lat)).unwrap());
+                assert!((a.x - b.x).abs() < 1e-3 && (a.y - b.y).abs() < 1e-3, "{code} {lon},{lat}: {a:?} {b:?}");
+            }
+        }
+        let m = Projector::new("winkelTripel").unwrap().forward(Coord::new(10.0, 50.0)).unwrap();
+        assert!((m.x - 761_793.002_579_874_7).abs() < 1e-3 && (m.y - 5_568_704.187_526_578).abs() < 1e-3, "{m:?}");
     }
 
     #[test]

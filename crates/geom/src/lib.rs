@@ -11,6 +11,7 @@ pub mod eqc;
 pub mod sinusoidal;
 pub mod triangulate;
 pub mod utm;
+pub mod world;
 
 pub use body::{BODIES, Body};
 pub use eqc::EquidistantCylindrical;

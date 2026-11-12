@@ -132,7 +132,15 @@ produces a notice when no transformation is available. Swiss oblique Mercator, t
 Krovak East/North variant, the oblique Mercator in its azimuth forms (the two-point form, with
 no azimuth, is refused), and the Cassini-Soldner, polyconic and Equal Earth methods are
 supported from their parameters, as are sinusoidal (MODIS), Robinson, orthographic and Mercator
-(variant A), in `.prj` files and in GeoTIFF keys. Esri's orthographic is a spherical projection:
+(variant A), in `.prj` files and in GeoTIFF keys. Natural Earth, Winkel Tripel and Eckert IV are
+read from WKT as GDAL, Esri and PROJ write it, and by their ESRI codes (Natural Earth and Eckert
+IV, on WGS 84 and on a sphere: `ESRI:54077`, `53077`, `54012`, `53012`). They're computed on a
+sphere of the datum's semi-major axis, as PROJ computes them. Winkel Tripel's standard parallel
+is the file's; a definition or WKT without one is at 0, as PROJ and GDAL take a coordinate
+system without one (PROJ's `proj` program, which runs the bare projection, takes Winkel's own
+instead). The map's Winkel Tripel is at Winkel's own, acos(2/π) (about 50.46°), and its
+definition and WKT say so. A parameter that isn't a finite number, or a scale factor other than
+1, is refused rather than left out. Esri's orthographic is a spherical projection:
 on an ellipsoid it is refused, with a notice, rather than computed as EPSG's ellipsoidal one.
 The equidistant cylindrical projection (EPSG:4087, World Equidistant Cylindrical) uses a sphere of its datum's
 semi-major axis, matching legacy PROJ/GDAL coordinates (verified with PROJ 9.7.1), both for data

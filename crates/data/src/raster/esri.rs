@@ -18,8 +18,9 @@
 //!   systems are candidates to add), and the NAD27 ones whose grids proj4rs can't load: 167;
 //! - six world systems RustGIS computes on a sphere where PROJ uses the ellipsoid or other
 //!   parameters, kilometres apart: World Miller (54003), the WGS 84 Equal Earths (54035–54037)
-//!   and the Winkel Tripel NGS pair (53042, 54042), whose `lat_1` RustGIS doesn't read. The
-//!   presets, and EPSG:8857, stay the way to draw these;
+//!   and the Winkel Tripel NGS pair (53042, 54042), whose `lat_1` the map didn't read then (it
+//!   does since #1701, so they are candidates to add). The presets, and EPSG:8857, stay the way
+//!   to draw these;
 //! - 44 systems whose datum PROJ shifts to WGS 84 by something other than one Helmert step
 //!   (Molodensky–Badekas for Korean 1985, a chain of operations for NGO 1948 …), and the 11
 //!   planetary ones (Moon, Mars), whose bodies the map can't hold;

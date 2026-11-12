@@ -890,6 +890,37 @@ impl Raster {
             let (lo, hi) = (e.min_x - shift, e.max_x - shift);
             (e.min_x, e.max_x) = if lo >= -180.0 && hi <= 180.0 { (lo, hi) } else { (-180.0, 180.0) };
         }
+        // A whole world in a world projection RustGIS computes reaches the antimeridian and the
+        // poles at its outline's edge, which samples miss when the grid's edges are a little past
+        // it (its corners are off the outline): whatever of them is in the grid is in its extent
+        // (#1701).
+        if let Some(centre) = self.transformer.world_central_meridian().filter(|_| !e.is_empty()) {
+            let inside = |lon: f64, lat: f64| {
+                self.transformer.from_lonlat(Coord::new(lon, lat)).is_some_and(|m| {
+                    let (col, row) = self.transform.to_pixel(m);
+                    (-1e-6..=w + 1e-6).contains(&col) && (-1e-6..=h + 1e-6).contains(&row)
+                })
+            };
+            let along = |i: usize| -180.0 + 360.0 * i as f64 / steps as f64;
+            if (0..=steps).any(|i| inside(180.0, along(i) / 2.0)) {
+                e.max_x = 180.0;
+            }
+            if (0..=steps).any(|i| inside(-180.0, along(i) / 2.0)) {
+                e.min_x = -180.0;
+            }
+            if (0..=steps).any(|i| inside(along(i), 90.0)) {
+                e.max_y = 90.0;
+            }
+            if (0..=steps).any(|i| inside(along(i), -90.0)) {
+                e.min_y = -90.0;
+            }
+            // Centred elsewhere than on 0°, the outline's edges are another meridian than the
+            // antimeridian: the one opposite its centre, on either side of it.
+            let edge = (centre + 360.0).rem_euclid(360.0) - 180.0;
+            if edge.abs() < 180.0 - 1e-6 && (0..=steps).any(|i| [-1e-9, 1e-9].iter().any(|d| inside(edge + d, along(i) / 2.0))) {
+                (e.min_x, e.max_x) = (e.min_x.min(edge), e.max_x.max(edge));
+            }
+        }
         e
     }
 
@@ -1781,6 +1812,65 @@ pub(crate) mod tests {
         let e = grid(177.0, 2).extent();
         assert_eq!((e.min_x, e.max_x), (-180.0, 180.0));
         assert!(e.contains(Coord::new(179.9, 0.0)) && e.contains(Coord::new(-179.9, 0.0)));
+    }
+
+    /// A whole world in Natural Earth, Winkel Tripel or Eckert IV reaches both sides of the
+    /// antimeridian and both poles, with its edges on the outline or a little past it, as a warp
+    /// leaves them; its east half reaches 180° and not -180°, and Europe stays Europe (#1701).
+    #[test]
+    fn a_whole_world_in_a_world_projection_has_a_world_wide_extent() {
+        for def in [
+            "+proj=natearth +lon_0=0 +datum=WGS84 +units=m +no_defs",
+            "+proj=wintri +lon_0=0 +lat_1=50.459776252189805 +datum=WGS84 +units=m +no_defs",
+            "+proj=eck4 +lon_0=0 +datum=WGS84 +units=m +no_defs",
+        ] {
+            let crs = Crs::parse(def).unwrap();
+            let t = crs.transformer().unwrap();
+            let at = |lon: f64, lat: f64| t.from_lonlat(Coord::new(lon, lat)).unwrap();
+            let (east, north) = (at(180.0, 0.0).x, at(0.0, 90.0).y);
+            let raster = |(west, south, east, north): (f64, f64, f64, f64)| {
+                let (w, h) = (64, 32);
+                let gt = GeoTransform {
+                    origin_x: west,
+                    origin_y: north,
+                    pixel_width: (east - west) / w as f64,
+                    pixel_height: (south - north) / h as f64,
+                };
+                Raster::new("w", w, h, vec![vec![1.0; (w * h) as usize]], gt, crs, None, ColorHint::Gray, "Float32").unwrap()
+            };
+            for past in [1.0, 1.001, 1.01] {
+                let e = raster((-east * past, -north * past, east * past, north * past)).extent();
+                assert_eq!((e.min_x, e.max_x, e.min_y, e.max_y), (-180.0, 180.0, -90.0, 90.0), "{def} {past}: {e:?}");
+                // The east half: 0° to 180°.
+                let e = raster((0.0, -north * past, east * past, north * past)).extent();
+                assert!(e.min_x.abs() < 1e-6 && e.max_x == 180.0, "{def} {past}: {e:?}");
+            }
+            let (sw, ne) = (at(-10.0, 35.0), at(30.0, 70.0));
+            let e = raster((sw.x, sw.y, ne.x, ne.y)).extent();
+            assert!(e.min_x > -40.0 && e.max_x < 60.0 && e.min_y > 30.0 && e.max_y < 75.0, "{def}: {e:?}");
+            // Centred on 150°E, the outline's edges are 30°W: the west half is 30°W to 150°E, a
+            // whole world all of it, and the east half, across the antimeridian, all of it too.
+            let crs = Crs::parse(&def.replace("+lon_0=0", "+lon_0=150")).unwrap();
+            let raster = |(west, south, east, north): (f64, f64, f64, f64)| {
+                let (w, h) = (64, 32);
+                let gt = GeoTransform {
+                    origin_x: west,
+                    origin_y: north,
+                    pixel_width: (east - west) / w as f64,
+                    pixel_height: (south - north) / h as f64,
+                };
+                Raster::new("w", w, h, vec![vec![1.0; (w * h) as usize]], gt, crs, None, ColorHint::Gray, "Float32").unwrap()
+            };
+            for past in [1.0, 1.001, 1.01] {
+                let e = raster((-east * past, -north * past, 0.0, north * past)).extent();
+                assert!((e.min_x + 30.0).abs() < 1e-6 && (e.max_x - 150.0).abs() < 1e-6, "{def} at 150°E, west half, {past}: {e:?}");
+                assert_eq!((e.min_y, e.max_y), (-90.0, 90.0), "{def} at 150°E, west half, {past}: {e:?}");
+                for west in [-east * past, 0.0] {
+                    let e = raster((west, -north * past, east * past, north * past)).extent();
+                    assert_eq!((e.min_x, e.max_x), (-180.0, 180.0), "{def} at 150°E from {west}, {past}: {e:?}");
+                }
+            }
+        }
     }
 
     #[test]
