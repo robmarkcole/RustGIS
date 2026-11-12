@@ -486,6 +486,10 @@ fn picked(app: &mut RustGisApp, purpose: &str) -> Option<Vec<rustgis_engine::geo
 pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     // A section whose extension was turned off while it was open: back to the first.
     if app.workflow.section.is_empty() || !section_shown(&app.session, app.workflow.section) {
+        // Its map pick ends with it (a pick started elsewhere, with no section open, stays).
+        if !app.workflow.section.is_empty() {
+            app.workflow.pick = None;
+        }
         app.workflow.section = "rasterFunctions";
     }
     egui::ComboBox::from_id_salt("wf_section")

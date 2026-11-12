@@ -702,6 +702,10 @@ impl Session {
         // command of an extension that is off, as `Session::run` does: the one asked for, and
         // the one a completion finishes.
         if let Some(why) = self.extensions().blocks(id) {
+            // A completion's raster is let go, as `finish_raster` does.
+            if let Some(run) = params.get("ran").and_then(Value::as_u64) {
+                self.raster_results.retain(|(n, _)| *n != run);
+            }
             return Err(why);
         }
         let op = self.authorize_unchecked(id, params)?;
