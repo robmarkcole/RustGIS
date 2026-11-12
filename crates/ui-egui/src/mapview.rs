@@ -384,6 +384,12 @@ pub struct MapView {
     pub(crate) render_state: Option<egui_wgpu::RenderState>,
     /// The GPU map backend, for now gated on the RUSTGIS_GPU environment variable.
     pub gpu_enabled: bool,
+    /// What the device's error handler found since the map last looked ([`handle_gpu_errors`]).
+    pub(crate) gpu_errors: std::sync::Arc<GpuErrors>,
+    /// Whether a graphics card error other than running out of memory was said this session.
+    gpu_error_said: bool,
+    /// Whether that handler is on the device yet.
+    gpu_handler_on: bool,
     /// Rolling map-frame timestamps (for the status-bar FPS readout).
     frame_times: std::collections::VecDeque<f64>,
 }
@@ -466,6 +472,9 @@ impl Default for MapView {
             gpu_target_split: std::sync::Arc::new(std::sync::Mutex::new(None)),
             render_state: None,
             gpu_enabled: std::env::var_os("RUSTGIS_GPU").is_some(),
+            gpu_errors: std::sync::Arc::new(GpuErrors::default()),
+            gpu_error_said: false,
+            gpu_handler_on: false,
             frame_times: std::collections::VecDeque::new(),
         }
     }
@@ -634,9 +643,111 @@ fn now(ui: &Ui) -> f64 {
     ui.input(|i| i.time)
 }
 
+/// Puts a handler on the desktop device for the errors nothing else catches (#1777). wgpu's own
+/// closes the app on any of them, a graphics card running out of memory (2 GB at 2560 × 1440)
+/// too; this one logs them, and notes running out in `out_of_memory`, after which the map
+/// leaves the graphics card ([`leave_gpu_if_out_of_memory`]). In the browser none is put on:
+/// WebGPU already only logs what nothing catches, and wgpu would turn its rare internal errors
+/// into a crash once a handler is there.
+/// Puts [`handle_gpu_errors`] on the device once there is one, from the app's frame (the start
+/// page and backstage included, so egui's own uploads are covered from the first frame).
+pub(crate) fn handle_gpu_errors_once(app: &mut RustGisApp, ctx: &egui::Context) {
+    if app.map.gpu_handler_on {
+        return;
+    }
+    if let Some(rs) = &app.map.render_state {
+        handle_gpu_errors(&rs.device, app.map.gpu_errors.clone(), ctx.clone());
+        app.map.gpu_handler_on = true;
+    }
+}
+
+/// A frame is asked of `ctx` for each error, so the map leaves the card even when nothing else
+/// would draw again (an error in the last frame before the window goes idle).
+#[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
+pub(crate) fn handle_gpu_errors(device: &egui_wgpu::wgpu::Device, errors: std::sync::Arc<GpuErrors>, ctx: egui::Context) {
+    #[cfg(not(target_arch = "wasm32"))]
+    device.on_uncaptured_error(std::sync::Arc::new(move |e: egui_wgpu::wgpu::Error| {
+        errors.note(&e);
+        ctx.request_repaint();
+    }));
+}
+
+/// What the graphics card's error handler found since the map last looked.
+#[derive(Default)]
+pub(crate) struct GpuErrors {
+    /// It ran out of memory.
+    pub(crate) out_of_memory: std::sync::atomic::AtomicBool,
+    /// It reported another error (a bug: the map may be drawn wrong).
+    pub(crate) other: std::sync::atomic::AtomicBool,
+    /// Errors logged so far: after [`MAX_GPU_ERRORS_LOGGED`], no more, as one repeated each frame
+    /// would fill the log.
+    logged: std::sync::atomic::AtomicU32,
+}
+
+/// The most graphics card errors logged in a session.
+const MAX_GPU_ERRORS_LOGGED: u32 = 20;
+
+impl GpuErrors {
+    /// Notes `e`, and logs it while few have been: whether it was logged.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    fn note(&self, e: &egui_wgpu::wgpu::Error) -> bool {
+        use std::sync::atomic::Ordering;
+        let oom = matches!(e, egui_wgpu::wgpu::Error::OutOfMemory { .. });
+        if oom { &self.out_of_memory } else { &self.other }.store(true, Ordering::SeqCst);
+        let n = self.logged.fetch_add(1, Ordering::SeqCst);
+        if n < MAX_GPU_ERRORS_LOGGED {
+            log::error!("graphics card error: {e}");
+        }
+        if n + 1 == MAX_GPU_ERRORS_LOGGED {
+            log::error!("further graphics card errors are not logged");
+        }
+        n < MAX_GPU_ERRORS_LOGGED
+    }
+}
+
+/// Once the graphics card has run out of memory, the map is drawn on the CPU: the GPU map's
+/// pictures, tiles and targets are let go, and a notice says so and how to go back. Turning the
+/// GPU on again from the status bar is up to the user; running out again comes back here.
+/// Another error the card reports is said once a session, as it may leave the map drawn wrong.
+pub(crate) fn leave_gpu_if_out_of_memory(app: &mut RustGisApp) {
+    use std::sync::atomic::Ordering;
+    if app.map.gpu_errors.other.swap(false, Ordering::SeqCst) && !app.map.gpu_error_said {
+        app.map.gpu_error_said = true;
+        // (Clicking GPU helps only with the map on the GPU; otherwise it's egui's own drawing.)
+        let text = if app.map.gpu_enabled {
+            tl!(
+                "The graphics card reported an error, so the map may be drawn wrongly. Clicking GPU in the status bar draws it on the CPU instead."
+            )
+        } else {
+            tl!("The graphics card reported an error, so the window may be drawn wrongly.")
+        };
+        app.session.notify(text, true);
+    }
+    if !app.map.gpu_errors.out_of_memory.swap(false, Ordering::SeqCst) || !app.map.gpu_enabled {
+        return;
+    }
+    app.map.gpu_enabled = false;
+    app.map.gpu_renderer = None;
+    app.map.gpu_frame = None;
+    // (No live GPU scene is left to keep the tile key for.)
+    app.map.live_rev = None;
+    app.map.split_gpu = None;
+    for target in [&app.map.gpu_target, &app.map.gpu_target_split] {
+        *target.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+    app.map.invalidate();
+    app.session.notify(
+        tl!(
+            "The graphics card ran out of memory, so the map is now drawn without it (CPU), which is slower. Click CPU in the status bar to try the graphics card again, with a smaller window or fewer layers."
+        ),
+        true,
+    );
+}
+
 /// Shows the active map workspace, discarding stale node gestures after map-tab changes and
 /// before rendering their overlays or consuming pointer releases.
 pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
+    leave_gpu_if_out_of_memory(app);
     // Read before the cache was cleared (a sign-out), a picture goes with it: checked on every
     // frame, whatever is shown (a view with no map frame, a catalog or a layout included).
     app.map.pictures.forget_if_cleared(rustgis_engine::render::rustgis_tiles::cache::clears());
@@ -1579,7 +1690,8 @@ fn gpu_upload(
 
 /// Shows a GPU scene drawn for `view` as the map, with its labels, credits and tile errors:
 /// from `prepared`, its buffers already uploaded (see [`gpu_upload`]), else uploading them here.
-/// False when the scene is over the device's limits: the caller draws the frame on the CPU.
+/// False when the scene is over the device's limits, or the map has left the GPU: the caller
+/// draws the frame on the CPU.
 fn show_gpu_frame(
     app: &mut RustGisApp,
     scene: rustgis_engine::render::gpu_scene::GpuScene,
@@ -1588,6 +1700,11 @@ fn show_gpu_frame(
     key: Key,
     time: f64,
 ) -> bool {
+    // A scene a worker finished after the map left the graphics card (it ran out of memory,
+    // #1777) isn't shown: the caller draws it on the CPU, and no GPU renderer comes back.
+    if !app.map.gpu_enabled {
+        return false;
+    }
     let Some(rs) = &app.map.render_state else { return false };
     let r = app.map.gpu_renderer.get_or_insert_with(|| std::sync::Arc::new(crate::mapgpu::GpuMapRenderer::new(rs)));
     let cam = view.camera;
@@ -4897,6 +5014,67 @@ fn clear_selection_quietly(app: &mut RustGisApp) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The graphics card running out of memory doesn't close the app (#1777): it's noted, and
+    /// the map then leaves the GPU for the CPU with a notice, its GPU resources let go. Once:
+    /// turned on again, running out again falls back again. A map on the CPU only forgets it.
+    #[test]
+    fn running_out_of_gpu_memory_draws_the_map_on_the_cpu() {
+        use egui_wgpu::wgpu::Error;
+        use std::sync::atomic::Ordering;
+        let source = || -> egui_wgpu::wgpu::ErrorSource { "no room".into() };
+        let invalid = || Error::Validation { source: source(), description: "texture is invalid".into() };
+        let errors = GpuErrors::default();
+        assert!(errors.note(&invalid()));
+        assert!(errors.other.load(Ordering::SeqCst) && !errors.out_of_memory.load(Ordering::SeqCst));
+        assert!(errors.note(&Error::OutOfMemory { source: source() }));
+        assert!(errors.out_of_memory.load(Ordering::SeqCst));
+        // A flood is logged only so far: noting goes on.
+        let logged = (0..100).filter(|_| errors.note(&invalid())).count();
+        assert_eq!(logged, MAX_GPU_ERRORS_LOGGED as usize - 2, "the first two above were logged");
+        assert_eq!(errors.logged.load(Ordering::SeqCst), 102);
+        let mut app = RustGisApp::with_sample();
+        app.map.gpu_enabled = true;
+        let before = app.session.notices.len();
+        leave_gpu_if_out_of_memory(&mut app);
+        assert!(app.map.gpu_enabled, "nothing noted yet");
+        let ran_out = |app: &RustGisApp| app.map.gpu_errors.note(&Error::OutOfMemory { source: source() });
+        ran_out(&app);
+        leave_gpu_if_out_of_memory(&mut app);
+        assert!(!app.map.gpu_enabled && app.map.gpu_renderer.is_none() && app.map.gpu_frame.is_none() && app.map.split_gpu.is_none());
+        assert_eq!(app.session.notices.len(), before + 1);
+        assert!(format!("{:?}", app.session.notices.last().unwrap()).contains("ran out of memory"));
+        // Said once; on the CPU already, running out (egui's own textures) is only forgotten.
+        leave_gpu_if_out_of_memory(&mut app);
+        ran_out(&app);
+        leave_gpu_if_out_of_memory(&mut app);
+        assert_eq!(app.session.notices.len(), before + 1);
+        assert!(!app.map.gpu_errors.out_of_memory.load(Ordering::SeqCst));
+        // Turned on again, running out again falls back again.
+        app.run("ui.map.gpu", serde_json::json!({"on": true, "remember": false})).unwrap();
+        assert!(app.map.gpu_enabled);
+        ran_out(&app);
+        leave_gpu_if_out_of_memory(&mut app);
+        assert!(!app.map.gpu_enabled);
+        assert_eq!(app.session.notices.len(), before + 2);
+        // Another error is said once a session, the map left as it is.
+        app.map.gpu_enabled = true;
+        for _ in 0..2 {
+            app.map.gpu_errors.note(&invalid());
+            leave_gpu_if_out_of_memory(&mut app);
+        }
+        assert!(app.map.gpu_enabled);
+        assert_eq!(app.session.notices.len(), before + 3);
+        assert!(format!("{:?}", app.session.notices.last().unwrap()).contains("Clicking GPU"));
+        // With the map on the CPU, the notice doesn't point at the GPU switch.
+        let mut cpu = RustGisApp::with_sample();
+        let before = cpu.session.notices.len();
+        cpu.map.gpu_errors.note(&invalid());
+        leave_gpu_if_out_of_memory(&mut cpu);
+        assert_eq!(cpu.session.notices.len(), before + 1);
+        let said = format!("{:?}", cpu.session.notices.last().unwrap());
+        assert!(said.contains("window may be drawn wrongly") && !said.contains("Clicking GPU"), "{said}");
+    }
 
     /// A map whose relief casts shadows is drawn again as the tile cache's generation moves, which
     /// the shadows' landing moves, though it fetches no tiles: a map of a DEM alone gets its

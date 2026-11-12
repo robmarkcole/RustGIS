@@ -5798,6 +5798,8 @@ impl RustGisApp {
         // See `logic`.
         rustgis_engine::render::on_the_interface_thread();
         let ctx = ui.ctx().clone();
+        // The graphics card's error handler, on the first frame with a device, whatever it shows.
+        mapview::handle_gpu_errors_once(self, &ctx);
         // Fonts installed by `logic` take effect on the next frame.
         if self.fonts_frames < 2 {
             self.fonts_frames += 1;

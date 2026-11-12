@@ -57,7 +57,6 @@ pub(crate) fn marker_displace(template: [f32; 2], radius_px: f32, viewport_px: [
 use std::sync::Arc;
 
 use egui_wgpu::{CallbackResources, CallbackTrait, RenderState, wgpu};
-use wgpu::util::DeviceExt;
 
 use rustgis_engine::render::gpu_scene::{self, CmdClip, DrawCmd, GpuScene, MeshTile, SceneTilt, TileMeshVertex, TileQuad};
 use rustgis_engine::render::rustgis_tiles::cache::Payload;
@@ -330,11 +329,14 @@ impl GpuMapRenderer {
             label: Some("mapgpu_blit_uv"),
             entries: &[uniform_buf(wgpu::ShaderStages::VERTEX, 0, 16)],
         });
-        let templates = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("mapgpu_templates"),
-            contents: bytemuck::cast_slice(&marker_templates()),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
+        let templates = buffer_init(
+            device,
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("mapgpu_templates"),
+                contents: bytemuck::cast_slice(&marker_templates()),
+                usage: wgpu::BufferUsages::UNIFORM,
+            },
+        );
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("mapgpu_image"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -614,7 +616,30 @@ impl<T: Destroy> std::ops::Deref for Owned<T> {
 }
 
 fn owned_buffer(device: &wgpu::Device, desc: &wgpu::util::BufferInitDescriptor<'_>) -> Owned<wgpu::Buffer> {
-    Owned(device.create_buffer_init(desc))
+    Owned(buffer_init(device, desc))
+}
+
+/// A buffer holding `desc`'s contents, as wgpu's `create_buffer_init` makes it, but without its
+/// panic when the graphics card has no room for it (#1777): wgpu then gives an invalid buffer
+/// and reports running out of memory to the device's error handler, which moves the map to the
+/// CPU (`mapview::handle_gpu_errors`); `create_buffer_init` would first panic mapping it.
+pub(crate) fn buffer_init(device: &wgpu::Device, desc: &wgpu::util::BufferInitDescriptor<'_>) -> wgpu::Buffer {
+    if desc.contents.is_empty() {
+        return device.create_buffer(&wgpu::BufferDescriptor { label: desc.label, size: 0, usage: desc.usage, mapped_at_creation: false });
+    }
+    let len = desc.contents.len() as wgpu::BufferAddress;
+    // A multiple of COPY_BUFFER_ALIGNMENT, and at least that, as wgpu pads it.
+    let align = wgpu::COPY_BUFFER_ALIGNMENT - 1;
+    let size = ((len + align) & !align).max(wgpu::COPY_BUFFER_ALIGNMENT);
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor { label: desc.label, size, usage: desc.usage, mapped_at_creation: true });
+    // (No mapping: the buffer couldn't be made, and the handler was told.)
+    if let Ok(mut range) = buffer.get_mapped_range_mut(..) {
+        // (Within the mapping: `size` is at least the contents' length.)
+        range.slice(..desc.contents.len()).copy_from_slice(desc.contents);
+        drop(range);
+        buffer.unmap();
+    }
+    buffer
 }
 
 fn owned_texture(device: &wgpu::Device, desc: &wgpu::TextureDescriptor<'_>) -> Owned<wgpu::Texture> {
@@ -1766,6 +1791,42 @@ mod tests {
             cmd_fits(&limits, &DrawCmd::Image { pixmap: rustgis_engine::render::Pixmap::new(2, 2).expect("pixmap") }),
             "a valid 2x2 image fits"
         );
+    }
+
+    /// A buffer made with its contents holds them, padded as wgpu pads it, empty ones included
+    /// (#1777: made without `create_buffer_init`, which panics when the card has no room).
+    #[test]
+    fn buffers_are_made_with_their_contents() {
+        let _serial = one_at_a_time();
+        let Some(rs) = headless_render_state() else { return };
+        let usage = wgpu::BufferUsages::COPY_SRC;
+        let made = buffer_init(&rs.device, &wgpu::util::BufferInitDescriptor { label: None, contents: &[1, 2, 3, 4, 5], usage });
+        assert_eq!(made.size(), 8);
+        assert_eq!(buffer_init(&rs.device, &wgpu::util::BufferInitDescriptor { label: None, contents: &[], usage }).size(), 0);
+        let back = rs.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 8,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = rs.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        enc.copy_buffer_to_buffer(&made, 0, &back, 0, 8);
+        rs.queue.submit(Some(enc.finish()));
+        let slice = back.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        rs.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+        rx.recv().unwrap().unwrap();
+        assert_eq!(&slice.get_mapped_range().unwrap()[..], &[1, 2, 3, 4, 5, 0, 0, 0]);
+        // A buffer that can't be made (here a usage wgpu refuses, as it refuses one the card has
+        // no room for) comes back invalid, without the panic; its error is captured here, as the
+        // device's handler would otherwise be given it.
+        let scope = rs.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let refused = wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::VERTEX;
+        let _ = buffer_init(&rs.device, &wgpu::util::BufferInitDescriptor { label: None, contents: &[1, 2, 3, 4], usage: refused });
+        assert!(pollster::block_on(scope.pop()).is_some(), "the error is reported");
     }
 
     #[test]
