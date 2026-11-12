@@ -4,9 +4,7 @@ mod check_geometry;
 mod geometry;
 mod repair_geometry;
 
-use geo::{
-    BooleanOps, Contains, ConvexHull, CoordsIter, InteriorPoint, Intersects, MultiPolygon, Orient, Relate, Simplify, orient::Direction,
-};
+use geo::{BooleanOps, Contains, ConvexHull, CoordsIter, InteriorPoint, Intersects, MultiPolygon, Orient, Relate, orient::Direction};
 use rustgis_data::raster::{Crs, Transformer};
 use rustgis_data::{Coord, Dataset, Feature, Field, FieldType, Geometry, GeometryType, Value};
 use rustgis_geom::Extent;
@@ -1278,10 +1276,6 @@ fn out_name(p: &Json, default: String) -> String {
 /// tolerance converted with it reaches no farther on the ground than asked there (#1033).
 fn merc_scale(lat: f64) -> f64 {
     1.0 / lat.clamp(-85.0, 85.0).to_radians().cos().max(0.01)
-}
-
-fn feature_lat(g: &Geometry) -> f64 {
-    g.label_point().map(|c| c.y).unwrap_or(0.0)
 }
 
 /// A distance in `units` (one of [`UNITS`], as `resolve_params` spells it; empty for the default,
@@ -3779,8 +3773,125 @@ fn xy_table_to_point(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     Ok(ToolResult { output: Output::Layer(out), messages })
 }
 
+/// The distances a Douglas–Peucker run of `n` vertices may measure, `n` times this: far more than
+/// ordinary lines take (about `n log n`), a bound on a hostile one that would take `n²` (a spiral
+/// whose farthest vertex is always beside a chord's end), as `lod.rs`'s `DP_WORK` bounds the map's.
+const SIMPLIFY_WORK: usize = 256;
+
+/// The analysis plane's scale ([`merc_scale`]) is the sphere's; on the WGS 84 ellipsoid a ground
+/// distance is at most the polar radius of curvature over the sphere's radius longer (about 0.34%:
+/// a meter east–west at the pole, or north–south there). A tolerance taken this much smaller holds
+/// on the ellipsoid too, so no vertex moves farther than asked there either.
+const SPHERE_TO_WGS84: f64 = 6_378_137.0 / 6_399_593.625_8;
+
+/// Douglas–Peucker on a run of vertices in the analysis plane, each vertex's tolerance converted at
+/// its latitude ([`merc_scale`], at most 85°'s), so a feature spanning many latitudes isn't
+/// simplified farther than asked toward the equator (#1033). A vertex's tolerance is taken at the
+/// smallest scale of it and the chord's ends (nearest the equator), so none moves farther on the
+/// ground than asked; of the vertices beyond theirs, the one farthest from the chord on the ground
+/// (its plane distance over that scale) is kept and splits the run. The ends are kept. Worked with
+/// a stack, not recursion, within [`SIMPLIFY_WORK`]: past it, the spans still open keep their
+/// vertices, and `capped` is set. At one scale it gives what `geo`'s Douglas–Peucker gives, which
+/// Simplify used before: a tolerance of 0 or less leaves the run as it is, and of equally far
+/// vertices the last is kept. A run with a coordinate missing or infinite is left as it is.
+fn simplify_coords(pts: &[geo::Coord<f64>], tol_m: f64, capped: &std::cell::Cell<bool>) -> Vec<geo::Coord<f64>> {
+    simplify_coords_within(pts, tol_m, capped, SIMPLIFY_WORK)
+}
+
+/// [`simplify_coords`] with `work` distances a vertex allowed rather than [`SIMPLIFY_WORK`].
+fn simplify_coords_within(pts: &[geo::Coord<f64>], tol_m: f64, capped: &std::cell::Cell<bool>, work: usize) -> Vec<geo::Coord<f64>> {
+    let n = pts.len();
+    if n <= 2 || tol_m.is_nan() || tol_m <= 0.0 || pts.iter().any(|c| !c.x.is_finite() || !c.y.is_finite()) {
+        return pts.to_vec();
+    }
+    // On the ellipsoid, not the sphere ([`SPHERE_TO_WGS84`]).
+    let tol_m = tol_m * SPHERE_TO_WGS84;
+    // Each vertex's latitude and scale (plane meters per ground meter, [`merc_scale`]), worked out
+    // once.
+    let lat: Vec<f64> = pts.iter().map(|c| rustgis_geom::plane_to_lonlat(Coord::new(c.x, c.y)).y).collect();
+    let scale: Vec<f64> = lat.iter().map(|&y| merc_scale(y)).collect();
+    let mut keep = vec![false; n];
+    if let Some(k) = keep.first_mut() {
+        *k = true;
+    }
+    if let Some(k) = keep.last_mut() {
+        *k = true;
+    }
+    // A run someone can stop while it goes takes no cap (`control::uncapped`), as other tools'.
+    let mut budget = if crate::control::uncapped() { usize::MAX } else { n.saturating_mul(work) };
+    // Distances measured since Cancel was last looked at: it's looked at every 65,536, inside a
+    // span's scan too, so one large feature doesn't hold the run.
+    let mut since_check = 0usize;
+    // Out of work, or canceled (the run then stops as an error): the spans still open keep their
+    // vertices.
+    let keep_open = |keep: &mut Vec<bool>, spans: &mut dyn Iterator<Item = (usize, usize)>| {
+        for k in spans.flat_map(|(i, j)| i + 1..j) {
+            if let Some(kept) = keep.get_mut(k) {
+                *kept = true;
+            }
+        }
+    };
+    let mut stack = vec![(0, n - 1)];
+    'spans: while let Some((i, j)) = stack.pop() {
+        let span = j - i - 1;
+        if span > budget {
+            capped.set(true);
+            keep_open(&mut keep, &mut std::iter::once((i, j)).chain(stack.drain(..)));
+            break;
+        }
+        budget -= span;
+        let (Some(a), Some(b), Some(&la), Some(&lb), Some(&sa), Some(&sb)) =
+            (pts.get(i), pts.get(j), lat.get(i), lat.get(j), scale.get(i), scale.get(j))
+        else {
+            continue;
+        };
+        let (dx, dy) = (b.x - a.x, b.y - a.y);
+        let len2 = dx * dx + dy * dy;
+        // The chord's latitudes and least scale; a vertex's distance runs from it to a point on the
+        // chord, between the chord's ends.
+        let (chord_lo, chord_hi, chord_scale) = (la.min(lb), la.max(lb), sa.min(sb));
+        // The farthest vertex on the ground of those beyond their tolerance.
+        let mut far: Option<(usize, f64)> = None;
+        for k in i + 1..j {
+            since_check += 1;
+            if since_check >= 1 << 16 {
+                since_check = 0;
+                if crate::control::cancelled() {
+                    keep_open(&mut keep, &mut std::iter::once((i, j)).chain(stack.drain(..)));
+                    break 'spans;
+                }
+            }
+            let (Some(c), Some(&lk), Some(&sk)) = (pts.get(k), lat.get(k), scale.get(k)) else { continue };
+            // The smallest scale between the vertex and the chord: the equator's (1) where their
+            // latitudes straddle it, otherwise the least of theirs. There a plane meter is the most
+            // ground, so no vertex moves farther on the ground than asked, even poleward of its chord.
+            let s = if chord_lo.min(lk) <= 0.0 && chord_hi.max(lk) >= 0.0 { merc_scale(0.0) } else { sk.min(chord_scale) };
+            let t = if len2 > 0.0 { (((c.x - a.x) * dx + (c.y - a.y) * dy) / len2).clamp(0.0, 1.0) } else { 0.0 };
+            let d = (c.x - (a.x + t * dx)).hypot(c.y - (a.y + t * dy));
+            // Within its tolerance, it may go. A distance that overflowed to NaN (coordinates near
+            // f64's limits) counts as beyond, so the vertex is kept rather than lost.
+            if d <= tol_m * s {
+                continue;
+            }
+            let ground = if d.is_nan() { f64::INFINITY } else { d / s };
+            // The last of equally far vertices, as `geo`'s Douglas–Peucker takes it.
+            if far.is_none_or(|(_, g)| ground >= g) {
+                far = Some((k, ground));
+            }
+        }
+        if let Some((k, _)) = far {
+            if let Some(kept) = keep.get_mut(k) {
+                *kept = true;
+            }
+            stack.push((i, k));
+            stack.push((k, j));
+        }
+    }
+    pts.iter().zip(keep).filter(|(_, k)| *k).map(|(c, _)| *c).collect()
+}
+
 // Three fixed non-collinear anchors prevent ring collapse and keep vertex counts monotonic.
-fn simplify_ring(ring: &geo::LineString<f64>, eps: f64) -> geo::LineString<f64> {
+fn simplify_ring(ring: &geo::LineString<f64>, tol_m: f64, capped: &std::cell::Cell<bool>) -> geo::LineString<f64> {
     use geo::{Distance, Euclidean};
     if ring.0.len() <= 4 || ring.0.iter().any(|c| !c.x.is_finite() || !c.y.is_finite()) {
         return ring.clone();
@@ -3806,31 +3917,69 @@ fn simplify_ring(ring: &geo::LineString<f64>, eps: f64) -> geo::LineString<f64> 
     for bounds in stops.windows(2) {
         let [start, end] = bounds else { return ring.clone() };
         let Some(arc) = ring.0.get(*start..=*end) else { return ring.clone() };
-        let simple = geo::LineString::new(arc.to_vec()).simplify(eps);
-        corners.extend(simple.0.into_iter().skip(usize::from(!corners.is_empty())));
+        let simple = simplify_coords(arc, tol_m, capped);
+        corners.extend(simple.into_iter().skip(usize::from(!corners.is_empty())));
     }
     geo::LineString::new(corners)
 }
 
-/// A geometry simplified (Douglas–Peucker) to a tolerance in metres.
+/// A geometry simplified (Douglas–Peucker) to a tolerance in meters, converted at each vertex's
+/// latitude ([`simplify_coords`]).
 pub fn simplify_geometry(g: &Geometry, tol_m: f64) -> Geometry {
-    let eps = tol_m * merc_scale(feature_lat(g));
+    simplify_checked(g, tol_m).geometry
+}
+
+/// What [`simplify_checked`] made of a geometry, and what it said no to.
+struct Simplified {
+    geometry: Geometry,
+    /// A line or polygon left exactly as it was, a coordinate being missing or out of the analysis
+    /// plane's reach (a NaN, or a longitude so large the plane can't hold it).
+    broken: bool,
+    /// A run that would have taken more than [`SIMPLIFY_WORK`]: part of it kept its vertices.
+    capped: bool,
+}
+
+/// [`simplify_geometry`], saying what it left alone ([`Simplified`]). A line or polygon with a
+/// coordinate the plane can't hold isn't moved through the plane and back at all.
+fn simplify_checked(g: &Geometry, tol_m: f64) -> Simplified {
+    let capped = std::cell::Cell::new(false);
+    let unchanged = |broken| Simplified { geometry: g.clone(), broken, capped: false };
+    // A tolerance of 0 (or one that isn't a number) simplifies nothing: the geometry as it is, not
+    // moved through the plane and back.
+    if tol_m.is_nan() || tol_m <= 0.0 {
+        return unchanged(false);
+    }
+    if matches!(g, Geometry::Line(_) | Geometry::Polygon(_)) {
+        let mut broken = false;
+        // Beyond 1e150 plane meters (a longitude past about 1e143°), the squares in a distance
+        // overflow; no place on Earth is within a hair of it.
+        const PLANE_LIMIT: f64 = 1e150;
+        g.for_each_coord(|c| {
+            let p = rustgis_geom::lonlat_to_plane(c);
+            broken |= p.x.is_nan() || p.y.is_nan() || p.x.abs() > PLANE_LIMIT || p.y.abs() > PLANE_LIMIT;
+        });
+        if broken {
+            return unchanged(true);
+        }
+    }
     let sg = match g {
         Geometry::Polygon(_) => to_multipolygon(g).and_then(|mut m| {
             for p in &mut m.0 {
-                p.exterior_mut(|r| *r = simplify_ring(r, eps));
+                p.exterior_mut(|r| *r = simplify_ring(r, tol_m, &capped));
                 p.interiors_mut(|rings| {
                     for r in rings {
-                        *r = simplify_ring(r, eps);
+                        *r = simplify_ring(r, tol_m, &capped);
                     }
                 });
             }
             from_multipolygon(&m)
         }),
-        Geometry::Line(_) => to_multiline(g).and_then(|m| from_line(&m.simplify(eps))),
+        Geometry::Line(_) => to_multiline(g).and_then(|m| {
+            from_line(&geo::MultiLineString::new(m.0.iter().map(|l| geo::LineString::new(simplify_coords(&l.0, tol_m, &capped))).collect()))
+        }),
         _ => None,
     };
-    sg.unwrap_or_else(|| g.clone())
+    Simplified { geometry: sg.unwrap_or_else(|| g.clone()), broken: false, capped: capped.get() }
 }
 
 fn simplify(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
@@ -3854,32 +4003,87 @@ fn simplify_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result<Too
         || (),
         |_, _, &r| {
             let made = ds.features.get(r).and_then(|f| f.geometry.as_ref()).map(|g| {
-                // A line or polygon reaching beyond 85.05° has its tolerance taken east–west at the
-                // scale of its label point's latitude, at most 85° (`merc_scale`), where the ground
-                // beyond is far narrower: less is taken out there than asked (#1033). Points aren't
-                // simplified.
-                let mut beyond = false;
-                if !matches!(g, Geometry::Point(_) | Geometry::MultiPoint(_)) {
-                    g.for_each_coord(|c| beyond |= c.y.is_finite() && c.y.abs() > rustgis_geom::MAX_LAT);
+                // Each vertex's tolerance is taken at its own latitude, at most 85°'s (`merc_scale`):
+                // a line or polygon reaching beyond 85.05° has it east–west there at 85°'s, where the
+                // ground is far narrower, so less is taken out there than asked (#1033). Points
+                // aren't simplified.
+                // A line or polygon with a coordinate missing, or a longitude too far out for the
+                // analysis plane, is left exactly as it was (`simplify_checked`), and the feature is
+                // counted. Otherwise a latitude past ±90° (bad data), infinite ones included, is
+                // taken as that pole by the plane, and the vertices are counted; a line part of fewer
+                // than 2 vertices has no line to keep (`from_line`), and is counted.
+                let s = simplify_checked(g, tol);
+                let (mut beyond, mut past_pole, mut short) = (false, 0usize, 0usize);
+                // A geometry given back as it was (nothing to keep in the plane) moved nothing.
+                let changed = s.geometry != *g;
+                if tol > 0.0 && !s.broken && !matches!(g, Geometry::Point(_) | Geometry::MultiPoint(_)) {
+                    let past = |c: &Coord| !c.y.is_nan() && c.y.abs() > 90.0;
+                    g.for_each_coord(|c| beyond |= !c.y.is_nan() && c.y.abs() > rustgis_geom::MAX_LAT);
+                    // The vertices taken to a pole are those in what's kept: a line's parts of 2
+                    // vertices or more, a polygon's rings.
+                    past_pole = match g {
+                        _ if !changed => 0,
+                        Geometry::Line(parts) => parts.iter().filter(|p| p.len() >= 2).flatten().filter(|c| past(c)).count(),
+                        _ => {
+                            let mut n = 0;
+                            g.for_each_coord(|c| n += usize::from(past(&c)));
+                            n
+                        }
+                    };
+                    // A line whose parts are all that short is kept as it was (`from_line` has none
+                    // to give), so only the short parts beside a longer one go.
+                    if let Geometry::Line(parts) = g
+                        && parts.iter().any(|p| p.len() >= 2)
+                    {
+                        short = parts.iter().filter(|p| p.len() < 2).count();
+                    }
                 }
-                (g.coord_count(), beyond, simplify_geometry(g, tol))
+                (g.coord_count(), beyond, past_pole, short, s)
             });
             Ok::<_, String>(made)
         },
     )?;
+    let (mut broken, mut without, mut past_pole, mut short, mut capped) = (0usize, 0usize, 0usize, 0usize, 0usize);
     for (r, made) in input_rows.into_iter().zip(simplified) {
         let Some(f) = ds.features.get(r) else { continue };
-        let Some((count, beyond, sg)) = made else { continue };
+        // A feature without geometry has nothing to simplify: left out, and counted.
+        let Some((count, beyond, past, parts, s)) = made else {
+            without += 1;
+            continue;
+        };
         before += count;
-        polar += usize::from(beyond && tol > 0.0);
-        after += sg.coord_count();
-        out.push(Some(sg), f.attrs.clone());
+        polar += usize::from(beyond);
+        broken += usize::from(s.broken);
+        capped += usize::from(s.capped);
+        past_pole += past;
+        short += parts;
+        after += s.geometry.coord_count();
+        out.push(Some(s.geometry), f.attrs.clone());
     }
     let mut messages = vec![format!("Simplify: {before} → {after} vertices")];
     if polar > 0 {
         messages.push(format!(
-            "{polar} line or polygon feature(s) reach beyond 85.05°, where the tolerance is taken east–west at the scale of the feature's label point, at most 85°'s: less is simplified away there than asked, and parts farther equatorward than the label point can be simplified more than asked"
+            "Simplify: {polar} line or polygon feature(s) reach beyond 85.05°, where the tolerance is taken east–west at 85°'s scale: less is simplified away there than asked"
         ));
+    }
+    if broken > 0 {
+        messages.push(format!(
+            "Simplify: {broken} line or polygon feature(s) have a coordinate missing, or a longitude too far out to place: they are left as they were"
+        ));
+    }
+    if capped > 0 {
+        messages.push(format!(
+            "Simplify: {capped} feature(s) were too intricate to simplify whole within the work allowed: parts of them keep more vertices than asked"
+        ));
+    }
+    if short > 0 {
+        messages.push(format!("Simplify: {short} line part(s) of fewer than 2 vertices left out"));
+    }
+    if past_pole > 0 {
+        messages.push(format!("Simplify: {past_pole} vertex(es) with a latitude past a pole found (taken as that pole)"));
+    }
+    if without > 0 {
+        messages.push(format!("Simplify: {without} feature(s) left out: they have no geometry to simplify"));
     }
     Ok(ToolResult { output: Output::Layer(out), messages })
 }
@@ -7294,6 +7498,20 @@ mod tests {
     use rustgis_data::Feature;
     use std::collections::HashMap;
 
+    /// A feature's label point's latitude: the one scale Simplify took for a whole feature before
+    /// it took each vertex's own.
+    fn feature_lat(g: &Geometry) -> f64 {
+        g.label_point().map(|c| c.y).unwrap_or(0.0)
+    }
+
+    /// [`simplify_coords`] on its own, its work allowance asserted not to have run out.
+    fn dp(pts: &[geo::Coord<f64>], tol_m: f64) -> Vec<geo::Coord<f64>> {
+        let capped = std::cell::Cell::new(false);
+        let out = simplify_coords(pts, tol_m, &capped);
+        assert!(!capped.get(), "work allowance ran out");
+        out
+    }
+
     struct Map(HashMap<String, Dataset>);
     impl Inputs for Map {
         fn dataset(&self, layer: &str) -> Option<&Dataset> {
@@ -7385,8 +7603,12 @@ mod tests {
             let target = to_multipolygon(&simple).unwrap();
             for (a, b) in source.0.iter().zip(&target.0) {
                 for (a, b) in std::iter::once(a.exterior()).chain(a.interiors()).zip(std::iter::once(b.exterior()).chain(b.interiors())) {
-                    let deviation = a.0.iter().map(|c| Euclidean.distance(&geo::Point::from(*c), b)).fold(0.0_f64, f64::max);
-                    assert!(deviation <= tolerance * merc_scale(feature_lat(&original)) + 1e-6, "{tolerance} m: {deviation}");
+                    // Each vertex lies within its own tolerance, at its own latitude, of the result.
+                    for c in &a.0 {
+                        let deviation = Euclidean.distance(&geo::Point::from(*c), b);
+                        let own = tolerance * merc_scale(rustgis_geom::plane_to_lonlat(Coord::new(c.x, c.y)).y);
+                        assert!(deviation <= own + 1e-6, "{tolerance} m: {deviation} > {own}");
+                    }
                 }
             }
             let out =
@@ -7394,6 +7616,256 @@ mod tests {
             assert_eq!(out.features[0].geometry.as_ref(), Some(&simple));
         }
         assert_eq!(previous, 12, "three closed triangle rings at a very large tolerance");
+    }
+
+    #[test]
+    fn simplify_takes_each_vertex_tolerance_at_its_own_latitude() {
+        // A polygon from 60°N to 89°N with a bump north along 60°N: at 3 km, a 5 km bump lies
+        // farther than the tolerance on the ground and stays, as it would in a polygon at 60°N
+        // alone; a 1 km bump goes. Taken at the feature's middle (about 75°N), the 3 km would have
+        // reached some 6 km on the ground at 60°N and taken the 5 km bump too.
+        let kept = |bump_km: f64| {
+            let dy = bump_km / 111.32;
+            let ring = [(-30.0, 60.0), (0.0, 60.0 + dy), (30.0, 60.0), (30.0, 89.0), (0.0, 89.0), (-30.0, 89.0), (-30.0, 60.0)]
+                .map(|(x, y)| Coord::new(x, y))
+                .to_vec();
+            let g = simplify_geometry(&Geometry::Polygon(vec![vec![ring]]), 3_000.0);
+            let Geometry::Polygon(p) = g else { return false };
+            p.iter().flatten().flatten().any(|c| c.x.abs() < 1e-9 && c.y < 61.0)
+        };
+        assert!(kept(5.0), "the 5 km bump went");
+        assert!(!kept(1.0), "the 1 km bump stayed");
+        // One tolerance for the feature, at its label point, would hold the 5 km bump (its offset
+        // in the plane) within it: the bump would have gone.
+        let ring = [(-30.0, 60.0), (30.0, 60.0), (30.0, 89.0), (-30.0, 89.0), (-30.0, 60.0)].map(|(x, y)| Coord::new(x, y)).to_vec();
+        let whole = 3_000.0 * merc_scale(feature_lat(&Geometry::Polygon(vec![vec![ring]])));
+        let offset =
+            rustgis_geom::lonlat_to_plane(Coord::new(0.0, 60.0 + 5.0 / 111.32)).y - rustgis_geom::lonlat_to_plane(Coord::new(0.0, 60.0)).y;
+        assert!(whole > offset, "{whole} {offset}");
+    }
+
+    /// No vertex moves farther on the ground than asked, even poleward of its chord: along the 80th
+    /// parallel at 25 km, a vertex 25.15 km north stays. Taken at its own latitude alone, its
+    /// tolerance (about 1% wider in the plane there) would have let it go. One 24.5 km north goes.
+    #[test]
+    fn simplify_moves_no_vertex_farther_than_asked_poleward_of_its_chord() {
+        let km_north = |km: f64| (km * 1000.0 / 6_378_137.0).to_degrees();
+        let kept = |km: f64| {
+            let line = [(-10.0, 80.0), (0.0, 80.0 + km_north(km)), (10.0, 80.0)]
+                .map(|(x, y)| {
+                    let c = rustgis_geom::lonlat_to_plane(Coord::new(x, y));
+                    geo::coord! { x: c.x, y: c.y }
+                })
+                .to_vec();
+            dp(&line, 25_000.0).len() == 3
+        };
+        assert!(kept(25.15), "25.15 km north went");
+        assert!(!kept(24.5), "24.5 km north stayed");
+    }
+
+    /// A run whose work runs out keeps the vertices of the spans still open and says so: never a
+    /// vertex beyond its tolerance lost, only more kept than asked. With the work allowed, the same
+    /// run is simplified whole.
+    #[test]
+    fn simplify_coords_keeps_vertices_when_its_work_runs_out() {
+        // Teeth of 55 m every tenth vertex, of 5.5 m between: at 20 m the big ones stay, the small
+        // ones go, which takes many splits.
+        let zigzag: Vec<geo::Coord<f64>> = (0..2_000)
+            .map(|i| {
+                let y = if i % 10 == 5 {
+                    0.0005
+                } else if i % 2 == 1 {
+                    0.00005
+                } else {
+                    0.0
+                };
+                let c = rustgis_geom::lonlat_to_plane(Coord::new(i as f64 * 0.001, y));
+                geo::coord! { x: c.x, y: c.y }
+            })
+            .collect();
+        let whole = dp(&zigzag, 20.0);
+        let big: Vec<geo::Coord<f64>> = zigzag.iter().enumerate().filter(|(i, _)| i % 10 == 5).map(|(_, c)| *c).collect();
+        assert!(big.iter().all(|c| whole.contains(c)));
+        assert!(whole.len() < 1_000, "{}", whole.len());
+        let capped = std::cell::Cell::new(false);
+        let short = simplify_coords_within(&zigzag, 20.0, &capped, 1);
+        assert!(capped.get());
+        assert!(short.len() > whole.len(), "{} {}", short.len(), whole.len());
+        // The ends and every big tooth (beyond its tolerance) are among those kept, all original.
+        assert_eq!(short.first(), zigzag.first());
+        assert_eq!(short.last(), zigzag.last());
+        assert!(big.iter().all(|c| short.contains(c)));
+        assert!(short.iter().all(|c| zigzag.contains(c)));
+    }
+
+    /// A run looks at Cancel inside one feature: canceled, a 200,000-vertex line that would be
+    /// simplified to a few vertices stops in its first span's scan and keeps them all (the run then
+    /// ends as canceled), without calling it a work cap. A run someone can stop takes no cap.
+    #[test]
+    fn simplify_coords_looks_at_cancel_inside_a_feature() {
+        let zigzag: Vec<geo::Coord<f64>> = (0..200_000)
+            .map(|i| {
+                let c = rustgis_geom::lonlat_to_plane(Coord::new(i as f64 * 1e-5, if i % 2 == 0 { 0.0 } else { 1e-7 }));
+                geo::coord! { x: c.x, y: c.y }
+            })
+            .collect();
+        assert_eq!(dp(&zigzag, 100.0).len(), 2);
+        let control = crate::control::Control::new();
+        control.cancel();
+        let canceled = {
+            let _installed = crate::control::install(Some(control));
+            let capped = std::cell::Cell::new(false);
+            let out = simplify_coords(&zigzag, 100.0, &capped);
+            assert!(!capped.get(), "a cancel isn't a work cap");
+            out
+        };
+        assert_eq!(canceled.len(), zigzag.len());
+        // Stoppable: no cap, however little work is allowed, and the whole run simplified.
+        let _installed = crate::control::install(Some(crate::control::Control::stoppable()));
+        let capped = std::cell::Cell::new(false);
+        assert_eq!(simplify_coords_within(&zigzag, 100.0, &capped, 1).len(), 2);
+        assert!(!capped.get());
+    }
+
+    /// The bound holds on WGS 84, not only on the sphere: at 60°N, a vertex 0.01795° east of a
+    /// chord along the meridian is 999.1 m off on the sphere but about 1,001.6 m on the ellipsoid,
+    /// beyond a 1 km tolerance, and stays.
+    #[test]
+    fn simplify_holds_its_bound_on_wgs84() {
+        let line: Vec<geo::Coord<f64>> = [(0.0, 59.99999), (0.01795, 60.0), (0.0, 60.00001)]
+            .map(|(x, y)| {
+                let c = rustgis_geom::lonlat_to_plane(Coord::new(x, y));
+                geo::coord! { x: c.x, y: c.y }
+            })
+            .to_vec();
+        assert_eq!(dp(&line, 1_000.0).len(), 3);
+    }
+
+    /// Simplify says how many line parts of fewer than 2 vertices it left out beside longer ones.
+    #[test]
+    fn simplify_says_how_many_short_line_parts_it_left_out() {
+        let mut lines = Dataset::new("lines", GeometryType::Polyline, vec![]);
+        let long: Vec<Coord> = (0..5).map(|i| Coord::new(i as f64, 0.0)).collect();
+        lines.push(Some(Geometry::Line(vec![long.clone(), vec![Coord::new(9.0, 9.0)], vec![]])), vec![]);
+        lines.push(Some(Geometry::Line(vec![long])), vec![]);
+        let m = Map(HashMap::from([("lines".to_string(), lines)]));
+        let res = crate::run("simplify", &m, &serde_json::json!({"input": "lines", "tolerance": 1.0})).unwrap();
+        assert!(res.messages.iter().any(|m| m == "Simplify: 2 line part(s) of fewer than 2 vertices left out"), "{:?}", res.messages);
+        // A line of nothing but a one-vertex part past the pole is kept as it was: nothing is taken
+        // to the pole, nothing left out, and neither is said.
+        let mut lone = Dataset::new("lone", GeometryType::Polyline, vec![]);
+        lone.push(Some(Geometry::Line(vec![vec![Coord::new(0.0, 95.0)]])), vec![]);
+        let m = Map(HashMap::from([("lone".to_string(), lone)]));
+        let res = crate::run("simplify", &m, &serde_json::json!({"input": "lone", "tolerance": 1.0})).unwrap();
+        let messages = res.messages.clone();
+        let out = layer(res);
+        assert_eq!(out.features[0].geometry, Some(Geometry::Line(vec![vec![Coord::new(0.0, 95.0)]])));
+        assert!(!messages.iter().any(|m| m.contains("past a pole") || m.contains("left out")), "{messages:?}");
+    }
+
+    /// Where every vertex has the same scale (all beyond 85°, where it stops at 85°'s), the
+    /// per-vertex Douglas–Peucker gives exactly `geo`'s, the one Simplify used before: on a
+    /// zigzag at several tolerances; on two peaks exactly as far from the chord, where which one
+    /// stays depends on the tie; and at a tolerance of 0, which leaves the run as it is, collinear
+    /// and repeated vertices included.
+    #[test]
+    fn simplify_coords_matches_douglas_peucker_at_one_scale() {
+        use geo::Simplify;
+        let geo_dp =
+            |pts: &[geo::Coord<f64>], tol: f64| geo::LineString::new(pts.to_vec()).simplify(tol * SPHERE_TO_WGS84 * merc_scale(86.0)).0;
+        let zigzag: Vec<geo::Coord<f64>> = (0..40)
+            .map(|i| {
+                let y = 86.0 + (i % 5) as f64 * 0.2 + if i % 2 == 0 { 0.01 } else { 0.0 };
+                let c = rustgis_geom::lonlat_to_plane(Coord::new(i as f64 * 0.5, y));
+                geo::coord! { x: c.x, y: c.y }
+            })
+            .collect();
+        for tol in [0.0, 50.0, 500.0, 3_000.0, 20_000.0] {
+            assert_eq!(dp(&zigzag, tol), geo_dp(&zigzag, tol), "{tol} m");
+        }
+        // Two peaks 1,000 plane meters off the chord, beyond 85°: at 50 m (about 573 plane meters
+        // there) both are out, the one taken first splits the run, and the other, 447 m from the
+        // new chord, goes. Which stays is the tie-break's: the same as geo's.
+        let y0 = rustgis_geom::lonlat_to_plane(Coord::new(0.0, 87.0)).y;
+        let peaks = [(0.0, 0.0), (1000.0, 1000.0), (2000.0, 1000.0), (3000.0, 0.0)].map(|(x, y)| geo::coord! { x: x, y: y0 + y }).to_vec();
+        let ours = dp(&peaks, 50.0);
+        assert_eq!(ours.len(), 3, "{ours:?}");
+        // The second peak stays: of equally far vertices, the last is taken.
+        assert_eq!(ours.get(1), peaks.get(2));
+        assert_eq!(ours, geo_dp(&peaks, 50.0));
+        // A tolerance of 0 leaves a run as it is, as geo does: a vertex on the line between its
+        // neighbors, and a repeated one, stay.
+        let line = [(0.0, 0.0), (1.0, 0.0), (2.0, 0.0), (2.0, 0.0), (2.0, 1.0)].map(|(x, y)| geo::coord! { x: x, y: y }).to_vec();
+        assert_eq!(dp(&line, 0.0), line);
+        assert_eq!(dp(&line, 0.0), geo_dp(&line, 0.0));
+    }
+
+    /// Simplify leaves a line with a coordinate missing or infinite as it was, and says how many
+    /// such features there were; a feature without geometry is left out and counted. A clean layer
+    /// says neither.
+    #[test]
+    fn simplify_says_what_it_leaves_alone_and_out() {
+        let run = |with_bad: bool, tolerance: f64| {
+            let mut lines = Dataset::new("lines", GeometryType::Polyline, vec![]);
+            let zig: Vec<Coord> = (0..10).map(|i| Coord::new(i as f64 * 0.1, if i % 2 == 0 { 0.0 } else { 0.001 })).collect();
+            lines.push(Some(Geometry::Line(vec![zig.clone()])), vec![]);
+            if with_bad {
+                let mut bad = zig.clone();
+                if let Some(c) = bad.get_mut(4) {
+                    c.x = f64::NAN;
+                }
+                lines.push(Some(Geometry::Line(vec![bad])), vec![]);
+                // A longitude that is a number, but infinite on the analysis plane.
+                let mut far = zig.clone();
+                if let Some(c) = far.get_mut(4) {
+                    c.x = 1e308;
+                }
+                lines.push(Some(Geometry::Line(vec![far])), vec![]);
+                // One finite on the plane, but whose squares there would overflow.
+                let mut huge = zig.clone();
+                if let Some(c) = huge.get_mut(4) {
+                    c.x = 1e200;
+                }
+                lines.push(Some(Geometry::Line(vec![huge])), vec![]);
+                // A latitude past the pole, taken as the pole.
+                lines.push(Some(Geometry::Line(vec![vec![Coord::new(0.0, 80.0), Coord::new(1.0, 95.0), Coord::new(2.0, 80.0)]])), vec![]);
+                lines.push(None, vec![]);
+            }
+            let input: Vec<String> = lines.features.iter().map(|f| format!("{:?}", f.geometry)).collect();
+            let m = Map(HashMap::from([("lines".to_string(), lines)]));
+            let res = crate::run("simplify", &m, &serde_json::json!({"input": "lines", "tolerance": tolerance})).unwrap();
+            let messages = res.messages.clone();
+            (layer(res), messages, input)
+        };
+        let (out, messages, input) = run(true, 1.0);
+        assert_eq!(out.features.len(), 5);
+        // The clean line is simplified to its ends; the broken ones are exactly as they were, the
+        // NaN and the 1e308 included (compared as text, as NaN equals nothing).
+        assert_eq!(out.features[0].geometry.as_ref().map(Geometry::coord_count), Some(2));
+        for k in [1, 2, 3] {
+            assert_eq!(format!("{:?}", out.features[k].geometry), input[k], "feature {k}");
+        }
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Simplify: 3 line or polygon feature(s) have a coordinate missing, or a longitude too far out to place: they are left as they were"),
+            "{messages:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m == "Simplify: 1 vertex(es) with a latitude past a pole found (taken as that pole)"),
+            "{messages:?}"
+        );
+        // With a tolerance of 0 nothing is simplified, so the broken lines aren't blamed for it.
+        // At 0 every feature is as it was, the 1e308 and the 95° included, and nothing is said of them.
+        let (out0, at_zero, input0) = run(true, 0.0);
+        assert_eq!(out0.features.len(), 5);
+        for (k, (f, before)) in out0.features.iter().zip(&input0).enumerate() {
+            assert_eq!(&format!("{:?}", f.geometry), before, "feature {k} at 0");
+        }
+        assert!(!at_zero.iter().any(|m| m.contains("missing or infinite") || m.contains("past a pole")), "{at_zero:?}");
+        assert!(messages.iter().any(|m| m == "Simplify: 1 feature(s) left out: they have no geometry to simplify"), "{messages:?}");
+        let (_, clean, _) = run(false, 1.0);
+        assert_eq!(clean.len(), 1, "{clean:?}");
     }
 
     #[test]
@@ -7426,16 +7898,16 @@ mod tests {
         let line = Geometry::Line(vec![vec![Coord::new(10.0, 46.0), Coord::new(10.1, 46.0), Coord::new(10.2, 46.0)]]);
         assert_eq!(simplify_geometry(&line, 1e6).coord_count(), 2);
         let repeated = geo::LineString::new(vec![geo::Coord { x: 1.0, y: 1.0 }; 6]);
-        assert_eq!(simplify_ring(&repeated, 1e6), repeated);
+        assert_eq!(simplify_ring(&repeated, 1e6, &std::cell::Cell::new(false)), repeated);
         let collinear = geo::LineString::from(vec![(0.0, 0.0), (1.0, 0.0), (2.0, 0.0), (3.0, 0.0), (0.0, 0.0)]);
-        assert_eq!(simplify_ring(&collinear, 1e6), collinear);
+        assert_eq!(simplify_ring(&collinear, 1e6, &std::cell::Cell::new(false)), collinear);
         let both_sides = geo::LineString::from(vec![(0.0, 0.0), (3.0, 0.0), (-3.0, 0.0), (0.0, 0.0), (1.0, 0.0), (0.0, 0.0)]);
-        assert_eq!(simplify_ring(&both_sides, 1e6), both_sides);
+        assert_eq!(simplify_ring(&both_sides, 1e6, &std::cell::Cell::new(false)), both_sides);
         let concave = geo::LineString::from(vec![(0.0, 0.0), (3.0, 0.0), (2.0, 1.0), (-2.0, 1.0), (-3.0, 0.0), (-2.0, -1.0), (0.0, 0.0)]);
         let mut previous = concave.0.len();
         for tolerance in [0.1, 1.1, 2.5, 1e6] {
             use geo::{Distance, Euclidean};
-            let reduced = simplify_ring(&concave, tolerance);
+            let reduced = simplify_ring(&concave, tolerance, &std::cell::Cell::new(false));
             assert!((4..=previous).contains(&reduced.0.len()));
             previous = reduced.0.len();
             let deviation = concave.0.iter().map(|c| Euclidean.distance(&geo::Point::from(*c), &reduced)).fold(0.0_f64, f64::max);
@@ -7444,9 +7916,9 @@ mod tests {
         }
         assert_eq!(previous, 4);
         let triangle = geo::LineString::from(vec![(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (0.0, 0.0)]);
-        assert_eq!(simplify_ring(&triangle, 1e6), triangle);
+        assert_eq!(simplify_ring(&triangle, 1e6, &std::cell::Cell::new(false)), triangle);
         let nonfinite = geo::LineString::from(vec![(0.0, 0.0), (f64::INFINITY, 0.0), (1.0, 1.0), (0.0, 1.0), (0.0, 0.0)]);
-        assert_eq!(simplify_ring(&nonfinite, 1e6), nonfinite);
+        assert_eq!(simplify_ring(&nonfinite, 1e6, &std::cell::Cell::new(false)), nonfinite);
     }
 
     /// Feature To Point, Minimum Bounding Geometry without grouping and Calculate Geometry make
