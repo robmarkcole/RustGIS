@@ -229,14 +229,7 @@ fn class(
     if by.color.is_some() && opacity < 1.0 {
         report.approximated(layer, "see-through labels coloured by expression, drawn opaque");
     }
-    let style = text.attribute("namedStyle").unwrap_or_default().to_ascii_lowercase();
-    let weight = num(text, "fontWeight").unwrap_or(50.0);
-    let bold = style.contains("bold")
-        || style.contains("black")
-        || style.contains("heavy")
-        || weight >= 63.0
-        || text.attribute("fontBold") == Some("1");
-    let italic = style.contains("italic") || style.contains("oblique") || text.attribute("fontItalic") == Some("1");
+    let (bold, italic) = bold_italic(text);
     // QGIS's font family: drawn in it where it is installed, else in RustGIS's label font.
     let font = text.attribute("fontFamily").and_then(crate::symbology::font_name);
     let spacing =
@@ -533,8 +526,21 @@ fn offset(p: Node, geometry: Option<&str>, layer: &str, report: &mut Report) -> 
     }
 }
 
+/// Whether a `<text-style>`'s font is bold, and italic: by its named style, weight or flags.
+pub(super) fn bold_italic(text: Node) -> (bool, bool) {
+    let style = text.attribute("namedStyle").unwrap_or_default().to_ascii_lowercase();
+    let weight = text.attribute("fontWeight").and_then(|v| v.trim().parse::<f64>().ok()).filter(|v| v.is_finite()).unwrap_or(50.0);
+    // Qt 5 weighs fonts from 0 to 99 (normal 50, demibold 63); Qt 6, which QGIS 4 is built on,
+    // from 100 to 1000 (normal 400, demibold 600).
+    let heavy = if weight > 99.0 { weight >= 600.0 } else { weight >= 63.0 };
+    let bold =
+        style.contains("bold") || style.contains("black") || style.contains("heavy") || heavy || text.attribute("fontBold") == Some("1");
+    let italic = style.contains("italic") || style.contains("oblique") || text.attribute("fontItalic") == Some("1");
+    (bold, italic)
+}
+
 /// A QGIS length (`what`'s, for the report) in typographic points: map units taken at 1:25,000.
-fn points(v: f64, unit: &str, what: &str, layer: &str, report: &mut Report) -> f64 {
+pub(super) fn points(v: f64, unit: &str, what: &str, layer: &str, report: &mut Report) -> f64 {
     match unit {
         "Point" => v,
         "MM" => v * 72.0 / 25.4,

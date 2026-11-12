@@ -174,7 +174,7 @@ fn table_of(s: &str) -> Option<String> {
 }
 
 /// `path` from the project's folder `dir`, unless it is absolute or a web address.
-fn absolute(path: &str, dir: &str) -> String {
+pub(super) fn absolute(path: &str, dir: &str) -> String {
     let path = path.trim();
     if path.is_empty() || !is_relative(path) || dir.is_empty() {
         return path.to_string();

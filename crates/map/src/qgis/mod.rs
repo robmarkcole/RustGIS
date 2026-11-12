@@ -9,6 +9,7 @@
 //! writing a symbol layer's settings are read: the `<Option type="Map">` of QGIS 3.26 and later,
 //! and the `<prop k="…" v="…">` before it.
 
+mod annotation;
 mod diagram;
 mod expr;
 mod labels;
@@ -27,6 +28,7 @@ use serde::Serialize;
 use crate::Rgba;
 use crate::effects::Blend;
 use crate::symbology::{Labeling, LineStroke, MarkerRotation, Renderer};
+pub use annotation::{Annotation, MAX_ITEMS as MAX_ANNOTATIONS};
 pub use expr::{reads_measure, to_sql};
 pub use source::{Source, is_drive_relative, is_relative};
 
@@ -402,6 +404,8 @@ pub struct Project {
     pub extent: Option<[f64; 4]>,
     /// Its layers, top first, as its layer tree orders them.
     pub layers: Vec<ProjectLayer>,
+    /// Its main annotation layer, drawn over its layers, when it holds any annotation.
+    pub main_annotations: Option<ProjectLayer>,
 }
 
 /// One layer of a QGIS project.
@@ -423,6 +427,9 @@ pub struct ProjectLayer {
     /// Its subset string, as a RustGIS definition query when it reads as one.
     pub definition_query: Option<String>,
     pub style: Style,
+    /// An annotation layer's annotations, bottom first, in its coordinates (`crs`, else the
+    /// project's).
+    pub annotations: Vec<Annotation>,
 }
 
 /// Reads a QGIS project. `dir` is the folder the project is in, which its relative paths start
@@ -447,6 +454,7 @@ pub fn read_project(text: &str, dir: &str, report: &mut Report) -> Result<Projec
         crs,
         extent: canvas.and_then(|c| child(c, "extent")).and_then(extent_of),
         layers: Vec::new(),
+        main_annotations: None,
     };
     // The layer tree (QGIS 2's legend before it): the order layers draw in (top first) and which
     // are checked.
@@ -491,6 +499,7 @@ pub fn read_project(text: &str, dir: &str, report: &mut Report) -> Result<Projec
             _ => None,
         };
         let style = read_style_node(ml, &name, report);
+        let annotations = if kind == "annotation" { annotation::read(ml, dir, &name, report) } else { Vec::new() };
         layers.push((
             at,
             ProjectLayer {
@@ -504,9 +513,11 @@ pub fn read_project(text: &str, dir: &str, report: &mut Report) -> Result<Projec
                 visible: checked,
                 definition_query,
                 style,
+                annotations,
             },
         ));
     }
+    project.main_annotations = child(root, "main-annotation-layer").and_then(|m| main_annotations(m, dir, report));
     // In the layer tree's order; layers it doesn't hold go below.
     layers.sort_by_key(|(at, _)| at.unwrap_or(usize::MAX));
     project.layers = layers.into_iter().map(|(_, l)| l).collect();
@@ -625,11 +636,11 @@ fn project_notes(root: Node, report: &mut Report) {
     if layouts > 0 {
         report.skipped("", format!("its print layouts ({layouts})"));
     }
-    let items = child(root, "main-annotation-layer")
-        .and_then(|a| child(a, "items"))
-        .map_or(0, |i| i.children().filter(|c| c.has_tag_name("item")).count());
-    if items > 0 {
-        report.skipped("", format!("its annotations ({items}: text, shapes and pictures on the map)"));
+    // QGIS 3's older annotations, kept beside the annotation layers (form, HTML, SVG and text
+    // balloons).
+    let balloons = child(root, "Annotations").map_or(0, |a| a.children().filter(Node::is_element).count());
+    if balloons > 0 {
+        report.skipped("", format!("its annotations of QGIS's older kind ({balloons}: text, HTML, SVG and form balloons)"));
     }
     let bookmarks = count("Bookmarks", "Bookmark");
     if bookmarks > 0 {
@@ -643,6 +654,29 @@ fn project_notes(root: Node, report: &mut Report) {
     if relations > 0 {
         report.skipped("", format!("its relations between layers ({relations})"));
     }
+}
+
+/// The project's main annotation layer (`<main-annotation-layer>`), drawn over its layers, as a
+/// layer named "Annotations": `None` when it holds no annotation to draw.
+fn main_annotations(node: Node, dir: &str, report: &mut Report) -> Option<ProjectLayer> {
+    const NAME: &str = "Annotations";
+    let annotations = annotation::read(node, dir, NAME, report);
+    if annotations.is_empty() {
+        return None;
+    }
+    Some(ProjectLayer {
+        id: child(node, "id").and_then(|n| n.text()).unwrap_or_default().trim().to_string(),
+        name: NAME.to_string(),
+        provider: String::new(),
+        source: Source::Other { provider: String::new() },
+        crs: child(node, "srs").and_then(crs_of),
+        kind: "annotation".to_string(),
+        vector: false,
+        visible: true,
+        definition_query: None,
+        style: read_style_node(node, NAME, report),
+        annotations,
+    })
 }
 
 /// Whether `node` (a symbol layer, a renderer) has a draw effect on: a shadow, glow, blur or the

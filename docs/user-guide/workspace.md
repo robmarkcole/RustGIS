@@ -264,6 +264,19 @@ Each layer keeps its look:
   field the layer hasn't, is left out, noted. Histograms, stacked bars and text diagrams are
   left out (RustGIS's bar diagrams draw each category's share, QGIS's histograms its value), and
   scale ranges, distances from the feature and data-defined diagram settings noted.
+- **Annotations**: each annotation layer, and the project's main one (on top, as "Annotations"),
+  as a [graphics layer](cartography.md#graphics): markers, lines and polygons in their symbol's colours, sizes and widths;
+  point text, rectangle text and text along a line as text graphics, with their font size,
+  colour, weight, slant, letter spacing and alignment; pictures (PNG and JPEG) fitted in their box;
+  a rectangle text's or picture's background and frame as a rectangle. They are taken from the
+  layer's coordinate system to the map's and drawn in their z order. RustGIS centres a text
+  graphic on its point, draws it level and with its own halo, and draws text along a line level
+  at the line's middle, all noted. RustGIS draws a graphics layer's texts after all layers, so a
+  text QGIS draws under a shape, or under a layer above, comes out over it (noted). A picture
+  whose aspect is locked keeps it on the map, as QGIS does; an import keeps at most 64 MiB of
+  pictures as stored (base64, about 48 MiB of PNG or JPEG files), and those past it are left out
+  (noted). SVG pictures, callouts and annotations QGIS
+  keeps switched off are left out, noted.
 - **Rasters**: singleband grey as a stretch from black to white, singleband pseudocolour as a
   stretch along its colour map (interpolated), as Classify (discrete) or as Unique Values (exact),
   paletted as Unique Values, multiband colour as RGB and hillshade as Shaded Relief; with the
@@ -316,7 +329,7 @@ such as `layerid` that RustGIS doesn't read) and what was skipped (arrow lines, 
 settings, draw effects, label callouts, contours and other raster
 renderers RustGIS has no match for, PostGIS, WFS
 and other sources RustGIS doesn't read, histogram, stacked bar and text diagrams, joins, virtual fields, a layer's other styles,
-and the project's print layouts, annotations, bookmarks, map themes and relations). A database
+and the project's print layouts, QGIS 3's older annotation balloons, bookmarks, map themes and relations). A database
 password in a project never reaches the notes.
 
 A QGIS layer style (`.qml`) styles the selected layer the same way, a feature layer or a raster:
