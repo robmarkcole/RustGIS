@@ -1704,7 +1704,15 @@ impl RustGisApp {
         let georeference = self.ui.pdf_georeference;
         let session = &mut self.session;
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            rustgis_engine::cmd::layout::layout_bytes_with(session, li, pdf, dpi, true, georeference)
+            rustgis_engine::cmd::layout::layout_bytes_with(
+                session,
+                li,
+                pdf,
+                dpi,
+                true,
+                georeference,
+                rustgis_engine::render::pdf::Options::default(),
+            )
         }))
         .unwrap_or_else(|_| Err("the layout export failed unexpectedly".into()));
         if let Err(e) = &r {

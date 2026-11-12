@@ -1,6 +1,7 @@
 //! A [`Drawing`](crate::vector::Drawing)'s items as a page's content stream: paths, glyph runs
 //! (in the document's [`Fonts`]), pictures, gradients (shadings, their transparency a soft mask)
-//! and groups (clipped, or transparency groups for an opacity or blend mode).
+//! and groups (clipped, or transparency groups for an opacity or blend mode; a layer's, marked
+//! content in its optional content group, from the document's [`Layers`]).
 //!
 //! The drawing's pixels (y down) are mapped onto the page once, at the start; every item is
 //! written in them. Colour, transparency and line settings are written only when they change.
@@ -12,15 +13,22 @@ use std::io::Write as _;
 use rustgis_map::effects::Blend;
 use tiny_skia::{Color, FillRule, LineCap, LineJoin, Path, PathSegment, Transform};
 
-use super::Doc;
 use super::fonts::Fonts;
+use super::{Doc, Layers};
 use crate::vector::{Brush, Clip, GlyphRun, Group, Image, Item, Stroke};
 
 /// Writes the content of a page `size` (drawing pixels) shown at `page` (points); its content
 /// stream's and resource dictionary's object numbers.
-pub(super) fn page(doc: &mut Doc, fonts: &mut Fonts, size: (f32, f32), page: (f64, f64), items: &[Item]) -> (usize, usize) {
+pub(super) fn page(
+    doc: &mut Doc,
+    fonts: &mut Fonts,
+    layers: &mut Layers,
+    size: (f32, f32),
+    page: (f64, f64),
+    items: &[Item],
+) -> (usize, usize) {
     let (contents, resources) = (doc.reserve(), doc.reserve());
-    let mut w = Writer { doc, fonts, res: Resources::default(), resources };
+    let mut w = Writer { doc, fonts, layers, res: Resources::default(), resources, parent: None, siblings: HashMap::new() };
     let mut out = Vec::new();
     // Drawing pixels, y down from the top, to points, y up from the bottom.
     let (sx, sy) = (page.0 / f64::from(size.0), page.1 / f64::from(size.1));
@@ -41,6 +49,8 @@ struct Resources {
     state_list: Vec<String>,
     xobjects: Vec<usize>,
     shadings: Vec<String>,
+    /// Optional content groups, by object number.
+    properties: Vec<usize>,
 }
 
 impl Resources {
@@ -65,6 +75,13 @@ impl Resources {
             s.push_str(" /XObject <<");
             for id in &self.xobjects {
                 let _ = write!(s, " /X{id} {id} 0 R");
+            }
+            s.push_str(" >>");
+        }
+        if !self.properties.is_empty() {
+            s.push_str(" /Properties <<");
+            for id in &self.properties {
+                let _ = write!(s, " /OC{id} {id} 0 R");
             }
             s.push_str(" >>");
         }
@@ -106,8 +123,13 @@ struct State {
 struct Writer<'a> {
     doc: &'a mut Doc,
     fonts: &'a mut Fonts,
+    layers: &'a mut Layers,
     res: Resources,
     resources: usize,
+    /// The layer being written in (its place in `layers`), and how many layers of each name it
+    /// has had on this page so far: the second of two elements named alike is a layer of its own.
+    parent: Option<usize>,
+    siblings: HashMap<(Option<usize>, String), usize>,
 }
 
 impl Writer<'_> {
@@ -312,50 +334,111 @@ impl Writer<'_> {
     }
 
     /// Writes a group inside its clip, moved by its transform: as a transparency group when it has
-    /// an opacity or a blend mode, else straight into the content.
+    /// an opacity or a blend mode, else straight into the content. A layer's items are marked as
+    /// its optional content group's (#1815). The layers inside a group that only clips and moves
+    /// (a map frame's map layers and labels) are marked outside its clip, each run of its items
+    /// clipped and moved on its own, which draws the same: a vector editor can't put a layer
+    /// inside a clipping group, so it would flatten them.
     fn group(&mut self, out: &mut Vec<u8>, st: &mut State, g: &Group) {
+        let outer = self.open_layer(out, g);
+        let composite = g.opacity < 0.999 || g.blend != Blend::Normal;
+        let is_layer = |i: &Item| matches!(i, Item::Group(c) if c.layer.is_some());
+        if self.layers.on && !composite && g.items.iter().any(is_layer) {
+            for run in g.items.chunk_by(|a, b| !is_layer(a) && !is_layer(b)) {
+                match run {
+                    [Item::Group(c)] if c.layer.is_some() => {
+                        let inner = self.open_layer(out, c);
+                        self.clipped(out, st, g, |w, out, st| w.items(out, st, &c.items));
+                        self.close_layer(out, inner);
+                    }
+                    _ => self.clipped(out, st, g, |w, out, st| w.items(out, st, run)),
+                }
+            }
+        } else {
+            self.clipped(out, st, g, |w, out, st| {
+                if composite {
+                    w.transparency_group(out, g);
+                } else {
+                    w.items(out, st, &g.items);
+                }
+            });
+        }
+        self.close_layer(out, outer);
+    }
+
+    /// Writes what `f` writes inside `g`'s clip, moved by its transform; nothing when the
+    /// transform folds it flat.
+    fn clipped(&mut self, out: &mut Vec<u8>, st: &mut State, g: &Group, f: impl FnOnce(&mut Self, &mut Vec<u8>, &mut State)) {
         let saved = st.clone();
         out.extend_from_slice(b"q\n");
         if let Some(clip) = &g.clip {
             clip_ops(out, clip);
         }
         // A transform that folds its items flat leaves nothing to see.
-        if g.transform.invert().is_none() {
-            out.extend_from_slice(b"Q\n");
-            return;
-        }
-        if !g.transform.is_identity() {
-            write_matrix(out, g.transform);
-            out.extend_from_slice(b" cm\n");
-        }
-        let composite = g.opacity < 0.999 || g.blend != Blend::Normal;
-        if composite {
-            // A transparency group, isolated (drawn on transparency, as the renderer draws a
-            // layer offscreen), composited with the group's opacity and blend mode.
-            let form = self.doc.reserve();
-            let mut inner = Vec::new();
-            self.items(&mut inner, &mut State::default(), &g.items);
-            // Room for anything the group's items can draw, in their own space: the page seen
-            // through every transform above the group is not known here.
-            let dict = format!(
-                "/Type /XObject /Subtype /Form /BBox [-1000000 -1000000 1000000 1000000] /Group << /S /Transparency /CS /DeviceRGB /I true >> /Resources {} 0 R",
-                self.resources
-            );
-            self.doc.stream(form, &dict, &inner, false);
-            self.res.xobjects.push(form);
-            let mut entries = String::new();
-            let a = fnum(g.opacity);
-            let _ = write!(entries, "/ca {a} /CA {a}");
-            if g.blend != Blend::Normal {
-                let _ = write!(entries, " /BM /{}", blend_name(g.blend));
+        if g.transform.invert().is_some() {
+            if !g.transform.is_identity() {
+                write_matrix(out, g.transform);
+                out.extend_from_slice(b" cm\n");
             }
-            let gs = self.res.state(entries);
-            let _ = writeln!(out, "/G{gs} gs /X{form} Do");
-        } else {
-            self.items(out, st, &g.items);
+            f(self, out, st);
         }
         out.extend_from_slice(b"Q\n");
         *st = saved;
+    }
+
+    /// `g`'s items as a transparency group, isolated (drawn on transparency, as the renderer
+    /// draws a layer offscreen), composited with its opacity and blend mode.
+    fn transparency_group(&mut self, out: &mut Vec<u8>, g: &Group) {
+        let form = self.doc.reserve();
+        let mut inner = Vec::new();
+        self.items(&mut inner, &mut State::default(), &g.items);
+        // Room for anything the group's items can draw, in their own space: the page seen
+        // through every transform above the group is not known here.
+        let dict = format!(
+            "/Type /XObject /Subtype /Form /BBox [-1000000 -1000000 1000000 1000000] /Group << /S /Transparency /CS /DeviceRGB /I true >> /Resources {} 0 R",
+            self.resources
+        );
+        self.doc.stream(form, &dict, &inner, false);
+        self.res.xobjects.push(form);
+        let mut entries = String::new();
+        let a = fnum(g.opacity);
+        let _ = write!(entries, "/ca {a} /CA {a}");
+        if g.blend != Blend::Normal {
+            let _ = write!(entries, " /BM /{}", blend_name(g.blend));
+        }
+        let gs = self.res.state(entries);
+        let _ = writeln!(out, "/G{gs} gs /X{form} Do");
+    }
+
+    /// Begins marking `g`'s layer, if it is one (and the document writes layers): the layer
+    /// written in before, for [`Writer::close_layer`].
+    fn open_layer(&mut self, out: &mut Vec<u8>, g: &Group) -> Option<Option<usize>> {
+        let name = g.layer.as_deref().filter(|_| self.layers.on)?;
+        let outer = self.parent;
+        // Without an id, the second of two layers named alike is another layer.
+        let n = match g.layer_id {
+            Some(_) => 0,
+            None => {
+                let n = self.siblings.entry((outer, name.to_string())).or_insert(0);
+                *n += 1;
+                *n - 1
+            }
+        };
+        let (at, id) = self.layers.group(self.doc, outer, name, g.layer_id, n);
+        if !self.res.properties.contains(&id) {
+            self.res.properties.push(id);
+        }
+        let _ = writeln!(out, "/OC /OC{id} BDC");
+        self.parent = Some(at);
+        Some(outer)
+    }
+
+    /// Ends the layer [`Writer::open_layer`] began, if it did.
+    fn close_layer(&mut self, out: &mut Vec<u8>, outer: Option<Option<usize>>) {
+        if let Some(outer) = outer {
+            out.extend_from_slice(b"EMC\n");
+            self.parent = outer;
+        }
     }
 
     /// Sets the fill and stroke alpha to `a` where it isn't already.

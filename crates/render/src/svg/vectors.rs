@@ -273,6 +273,12 @@ fn picture(out: &mut String, image: &Image) -> Option<()> {
 /// A group: inside its clip (in the outer space), moved by its transform, composited with its
 /// opacity and blend mode as one isolated layer; `None` as [`items`] gives it.
 fn group(out: &mut String, defs: &mut Defs, g: &Group) -> Option<()> {
+    // A layer (a PDF's optional content, #1815) only names its items, with no clip, opacity or
+    // transform: they are written in place, so a blended layer among them still reaches the
+    // layers beneath it, as on the page.
+    if g.layer.is_some() {
+        return items(out, defs, &g.items);
+    }
     let mut open = 0;
     if let Some(clip) = &g.clip {
         let id = defs.id("clip");
@@ -407,6 +413,37 @@ mod tests {
             "{svg}"
         );
         assert!(defs.text.contains(r#"<clipPath id="clip2" clipPathUnits="userSpaceOnUse"><path d="M100 10"#));
+    }
+
+    /// A blended map layer over another, each in a layer (#1815), blends with the one beneath in
+    /// the SVG as before: a layer's items are written in place, not in an isolated group.
+    #[test]
+    fn a_blended_layer_over_another_still_blends_with_it() {
+        let rect = |x: f32| PathBuilder::from_rect(tiny_skia::Rect::from_xywh(x, 0.0, 10.0, 10.0).unwrap());
+        let draw = |layered: bool| {
+            let mut d = Drawing::new(40.0, 40.0);
+            let mut frame = Drawing::new(40.0, 40.0);
+            for (x, blend) in [(0.0, Blend::Normal), (5.0, Blend::Multiply)] {
+                if layered {
+                    frame.begin_layer(if x == 0.0 { "Land" } else { "Shade" }, None);
+                }
+                let mut layer = Drawing::new(40.0, 40.0);
+                layer.fill(rect(x), Brush::Solid(Color::from_rgba8(200, 0, 0, 255)), FillRule::Winding, Transform::identity());
+                frame.place(layer, Transform::identity(), 1.0, blend, None);
+                if layered {
+                    frame.end_group();
+                }
+            }
+            d.place(frame, Transform::identity(), 1.0, Blend::Normal, None);
+            let (_, _, list) = d.finish();
+            let (mut svg, mut defs) = (String::new(), Defs::default());
+            items(&mut svg, &mut defs, &list).unwrap();
+            svg
+        };
+        let svg = draw(true);
+        assert!(svg.contains(r#"style="mix-blend-mode:multiply;isolation:isolate""#), "{svg}");
+        // The multiply's group sits right beside the layer beneath, in the frame's group.
+        assert_eq!(svg, draw(false));
     }
 
     #[test]

@@ -2,7 +2,8 @@
 //! [`Drawing`] kept as vectors: its paths, text and pictures become the page's content, its text
 //! set in fonts whose glyphs are their outlines (Type 3), searchable and copyable through each
 //! font's map back to Unicode. A page's map frames can be georeferenced ([`Viewport`]), which
-//! makes the document a GeoPDF.
+//! makes the document a GeoPDF. A drawing's layers (layout elements, map layers, their labels)
+//! become optional content groups, which vector editors open as layers ([`Options::layers`]).
 
 use tiny_skia::Pixmap;
 
@@ -224,15 +225,108 @@ impl Doc {
     }
 }
 
-/// Writes the pages as a PDF document.
+/// How a document is written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Options {
+    /// The drawings' layers as optional content groups (#1815): each layout element, and in a
+    /// map frame each map layer and each layer's labels, a layer named after it, nested as drawn,
+    /// so a vector editor that reads optional content (VectorCraft, where it was checked) opens
+    /// the page with them as its layers. Off, the page is the same, without them.
+    pub layers: bool,
+}
+
+impl Default for Options {
+    fn default() -> Options {
+        Options { layers: true }
+    }
+}
+
+/// The document's optional content groups, one for each layer drawn, in the order first drawn:
+/// a layer is the same group on every page it is on (a map series' title, page after page), by
+/// its name, the group it is in, and its id, or without one which of the layers so named there
+/// it is.
+#[derive(Default)]
+pub(crate) struct Layers {
+    /// Whether layers are written at all ([`Options::layers`]).
+    pub(crate) on: bool,
+    /// Each group's object number, name, and the group it is in (its place here).
+    list: Vec<(usize, String, Option<usize>)>,
+    by_key: std::collections::HashMap<(Option<usize>, String, Option<u64>, usize), usize>,
+}
+
+impl Layers {
+    /// The group named `name` with `id` inside group `parent`, or without an id the `n`th so
+    /// named there: its place here and object number, numbered the first time.
+    pub(crate) fn group(&mut self, doc: &mut Doc, parent: Option<usize>, name: &str, id: Option<u64>, n: usize) -> (usize, usize) {
+        let key = (parent, name.to_string(), id, if id.is_some() { 0 } else { n });
+        if let Some(&at) = self.by_key.get(&key)
+            && let Some(&(id, ..)) = self.list.get(at)
+        {
+            return (at, id);
+        }
+        let id = doc.reserve();
+        self.list.push((id, name.to_string(), parent));
+        self.by_key.insert(key, self.list.len() - 1);
+        (self.list.len() - 1, id)
+    }
+
+    /// Writes the groups, and the catalog's `/OCProperties` entry naming them, every one on and
+    /// listed as drawn, each inside the one it is in (`/Order`); empty for none.
+    fn write(&self, doc: &mut Doc) -> String {
+        if self.list.is_empty() {
+            return String::new();
+        }
+        for (id, name, _) in &self.list {
+            doc.put(*id, format!("<< /Type /OCG /Name {} >>", text_string(name)).as_bytes());
+        }
+        let ids: Vec<String> = self.list.iter().map(|(id, ..)| format!("{id} 0 R")).collect();
+        format!(" /OCProperties << /OCGs [{}] /D << /Name (Layers) /BaseState /ON /Order [{}] >> >>", ids.join(" "), self.order(None))
+    }
+
+    /// The groups inside `parent`, in order, each followed by the array of those inside it.
+    fn order(&self, parent: Option<usize>) -> String {
+        let mut out = Vec::new();
+        for (at, (id, _, p)) in self.list.iter().enumerate() {
+            if *p == parent {
+                out.push(format!("{id} 0 R"));
+                let inner = self.order(Some(at));
+                if !inner.is_empty() {
+                    out.push(format!("[{inner}]"));
+                }
+            }
+        }
+        out.join(" ")
+    }
+}
+
+/// Whether `items` hold a layer.
+fn has_layer(items: &[Item]) -> bool {
+    items.iter().any(|i| matches!(i, Item::Group(g) if g.layer.is_some() || has_layer(&g.items)))
+}
+
+/// Writes the pages as a PDF document, with their layers ([`Options::default`]).
 pub fn write(pages: &[Page], title: &str) -> Vec<u8> {
+    write_with(pages, title, Options::default())
+}
+
+/// Writes the pages as a PDF document, as `options` say.
+pub fn write_with(pages: &[Page], title: &str, options: Options) -> Vec<u8> {
     // Georeferenced frames make the document PDF 1.7 with Adobe's extension level 3, where
-    // geospatial measures are defined (since taken into ISO 32000-2); what else it holds is 1.4.
+    // geospatial measures are defined (since taken into ISO 32000-2); layers (optional content)
+    // make it 1.5; what else it holds is 1.4.
     let geo = pages.iter().any(|p| !p.viewports.is_empty());
-    let mut doc = if geo { Doc::of_version("1.7") } else { Doc::new() };
+    let layered = options.layers && pages.iter().any(|p| matches!(&p.content, Content::Vector { items, .. } if has_layer(items)));
+    let mut doc = if geo {
+        Doc::of_version("1.7")
+    } else if layered {
+        Doc::of_version("1.5")
+    } else {
+        Doc::new()
+    };
     let (catalog, tree, info) = (doc.reserve(), doc.reserve(), doc.reserve());
     let ids: Vec<usize> = pages.iter().map(|_| doc.reserve()).collect();
     let mut fonts = fonts::Fonts::default();
+    let mut layers = Layers { on: layered, ..Layers::default() };
     for (p, &page) in pages.iter().zip(&ids) {
         let (pw, ph) = (p.width_mm * 72.0 / 25.4, p.height_mm * 72.0 / 25.4);
         let (contents, resources) = match &p.content {
@@ -249,7 +343,7 @@ pub fn write(pages: &[Page], title: &str) -> Vec<u8> {
                 (contents, format!("<< /XObject << /Im0 {image} 0 R >> >>"))
             }
             Content::Vector { width, height, items, .. } => {
-                let resources = content::page(&mut doc, &mut fonts, (*width, *height), (pw, ph), items);
+                let resources = content::page(&mut doc, &mut fonts, &mut layers, (*width, *height), (pw, ph), items);
                 (resources.0, format!("{} 0 R", resources.1))
             }
         };
@@ -268,8 +362,9 @@ pub fn write(pages: &[Page], title: &str) -> Vec<u8> {
         );
     }
     fonts.write(&mut doc);
+    let optional = layers.write(&mut doc);
     let extensions = if geo { " /Extensions << /ADBE << /BaseVersion /1.7 /ExtensionLevel 3 >> >>" } else { "" };
-    doc.put(catalog, format!("<< /Type /Catalog /Pages {tree} 0 R{extensions} >>").as_bytes());
+    doc.put(catalog, format!("<< /Type /Catalog /Pages {tree} 0 R{extensions}{optional} >>").as_bytes());
     let kids: Vec<String> = ids.iter().map(|i| format!("{i} 0 R")).collect();
     doc.put(tree, format!("<< /Type /Pages /Kids [{}] /Count {} >>", kids.join(" "), pages.len()).as_bytes());
     doc.put(info, format!("<< /Title {} /Producer (RustGIS) >>", text_string(title)).as_bytes());
@@ -425,6 +520,120 @@ pub(crate) mod tests {
         // At 254 dpi, ten pixels to the millimetre, it is the frame's own box.
         let geo = crate::layout::frame_viewports(&layout, &maps, 254.0);
         assert!((geo.viewports[0].rect_mm[0] - 10.0).abs() < 1e-6, "{:?}", geo.viewports[0].rect_mm);
+    }
+
+    /// A page of layers as a layout draws them: a title, a map frame (placed, clipped) holding
+    /// a map layer and its labels, and two elements named alike, each square in its own colour.
+    fn layered_page() -> Page {
+        use crate::vector::{Brush, Drawing};
+        let square = |d: &mut Drawing, c: u8| {
+            let r = tiny_skia::Rect::from_xywh(1.0, 1.0, 4.0, 4.0).unwrap();
+            let fill = Brush::Solid(tiny_skia::Color::from_rgba8(c, 0, 0, 255));
+            d.fill(tiny_skia::PathBuilder::from_rect(r), fill, tiny_skia::FillRule::Winding, tiny_skia::Transform::identity());
+        };
+        let mut d = Drawing::new(20.0, 20.0);
+        d.begin_layer("Título (rascunho)", None);
+        square(&mut d, 1);
+        d.end_group();
+        d.begin_layer("Mapa", None);
+        let mut frame = Drawing::new(20.0, 20.0);
+        frame.begin_layer("Países", Some(7));
+        square(&mut frame, 2);
+        frame.end_group();
+        frame.begin_layer("Labels: Países", Some(7));
+        square(&mut frame, 3);
+        frame.end_group();
+        d.place(frame, tiny_skia::Transform::from_translate(2.0, 2.0), 1.0, rustgis_map::effects::Blend::Normal, None);
+        d.end_group();
+        for c in [4, 5] {
+            d.begin_layer("Texto", None);
+            square(&mut d, c);
+            d.end_group();
+        }
+        Page::drawing(d, 20.0, 20.0)
+    }
+
+    /// A drawing's layers are optional content groups (#1815): named, nested in `/Order` as
+    /// drawn, each one's content marked inside its BDC/EMC; two elements named alike are two
+    /// groups, and a map series' pages share theirs. Without layers, the same page unmarked.
+    #[test]
+    fn layers_are_optional_content_groups() {
+        let pdf = write(&[layered_page(), layered_page()], "Layers");
+        let text = String::from_utf8_lossy(&pdf);
+        assert!(text.starts_with("%PDF-1.5"), "optional content is PDF 1.5");
+        let objs = objects(&pdf);
+        let ocg = |name: &str| {
+            let want = format!("<< /Type /OCG /Name {} >>", text_string(name));
+            objs.iter()
+                .position(|o| o.0 == want)
+                .map(|i| i + 1)
+                .unwrap_or_else(|| panic!("{name}: {objs:?}", objs = objs.iter().map(|o| &o.0).collect::<Vec<_>>()))
+        };
+        let (title, map, layer, labels) = (ocg("Título (rascunho)"), ocg("Mapa"), ocg("Países"), ocg("Labels: Países"));
+        let texts: Vec<usize> = objs.iter().enumerate().filter(|o| o.1.0.contains("/Name (Texto)")).map(|o| o.0 + 1).collect();
+        assert_eq!(texts.len(), 2, "two elements named alike, two groups");
+        assert_eq!(objs.iter().filter(|o| o.0.contains("/Type /OCG")).count(), 6, "the second page reuses the first's");
+        let catalog = &objs[0].0;
+        let order = format!("/Order [{title} 0 R {map} 0 R [{layer} 0 R {labels} 0 R] {} 0 R {} 0 R]", texts[0], texts[1]);
+        assert!(
+            catalog.contains("/OCProperties << /OCGs [") && catalog.contains(&order) && catalog.contains("/BaseState /ON"),
+            "{catalog}"
+        );
+        // Each square inside its own group's marks, the map's inside the frame's.
+        let content = objs.iter().map(|o| String::from_utf8_lossy(&o.1).into_owned()).find(|c| c.contains(" BDC")).unwrap();
+        let inside = |id: usize, colour: &str| {
+            let start = content.find(&format!("/OC /OC{id} BDC")).unwrap_or_else(|| panic!("{id}: {content}"));
+            let mut depth = 0;
+            let mut end = start;
+            for (i, line) in content[start..].lines().scan(start, |at, l| {
+                let here = *at;
+                *at += l.len() + 1;
+                Some((here, l))
+            }) {
+                if line.ends_with(" BDC") {
+                    depth += 1;
+                } else if line == "EMC" {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i;
+                        break;
+                    }
+                }
+            }
+            assert!(content[start..end].contains(colour), "{id} holds {colour}: {}", &content[start..end]);
+        };
+        inside(title, "0.004 0 0 rg");
+        inside(map, "0.008 0 0 rg");
+        inside(layer, "0.008 0 0 rg");
+        inside(labels, "0.012 0 0 rg");
+        inside(texts[1], "0.02 0 0 rg");
+        assert_eq!(content.matches(" BDC").count(), content.matches("EMC\n").count());
+        let page = objs.iter().find(|o| o.0.contains("/Properties <<")).map(|o| &o.0).unwrap();
+        assert!(page.contains(&format!("/OC{title} {title} 0 R")), "{page}");
+        // Without layers: no groups, no marks, and the same drawing.
+        let plain = write_with(&[layered_page()], "Layers", Options { layers: false });
+        let plain_text = String::from_utf8_lossy(&plain);
+        assert!(plain_text.starts_with("%PDF-1.4") && !plain_text.contains("/OCProperties") && !plain_text.contains("/Type /OCG"));
+        let plain_content =
+            objects(&plain).into_iter().map(|o| String::from_utf8_lossy(&o.1).into_owned()).find(|c| c.contains(" rg")).unwrap();
+        // The same things painted in the same order: only the marks and the frame's clip and
+        // transform, set again for each of its layers, differ.
+        let paints = |c: &str| -> String {
+            c.lines()
+                .filter(|l| !(l.ends_with(" BDC") || *l == "EMC" || *l == "q" || *l == "Q" || l.ends_with(" cm")))
+                .map(|l| format!("{l}\n"))
+                .collect()
+        };
+        assert_eq!(paints(&content), paints(&plain_content));
+        // The frame's layers are marked outside its transform, each moved on its own: an editor
+        // can't put a layer inside a clipping group.
+        for id in [layer, labels] {
+            assert!(content.contains(&format!("/OC /OC{id} BDC\nq\n1 0 0 1 2 2 cm\n")), "{id}: {content}");
+        }
+        // A page with no layers is written as before.
+        let mut a = Pixmap::new(2, 2).unwrap();
+        a.fill(tiny_skia::Color::WHITE);
+        assert!(!String::from_utf8_lossy(&write(&[Page::new(&a, 10.0, 10.0)], "Picture")).contains("/OCProperties"));
     }
 
     #[test]

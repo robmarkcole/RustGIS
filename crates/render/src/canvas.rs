@@ -29,6 +29,8 @@ struct Recording {
     dirty: bool,
     /// Applied to what is kept ([`Canvas::with_transform`]).
     ts: Transform,
+    /// A layer is open ([`Canvas::layer`]).
+    layer: bool,
 }
 
 impl Canvas {
@@ -46,7 +48,7 @@ impl Canvas {
     pub fn recording(width: u32, height: u32) -> Option<Canvas> {
         let pm = Pixmap::new(width, height)?;
         let drawing = Drawing::new(width as f32, height as f32);
-        Some(Canvas { pm, rec: Some(Box::new(Recording { drawing, dirty: false, ts: Transform::identity() })) })
+        Some(Canvas { pm, rec: Some(Box::new(Recording { drawing, dirty: false, ts: Transform::identity(), layer: false })) })
     }
 
     /// Whether it records.
@@ -232,6 +234,32 @@ impl Canvas {
         self.keep(|r| r.drawing.begin_group(opacity, Blend::Normal, None));
         f(self);
         self.keep(|r| r.drawing.end_group());
+    }
+
+    /// Ends the layer set before, if any, and keeps what is drawn from now on in a layer named
+    /// `name` (none for `None`): a layout element, a map layer, its labels (#1815). Only a
+    /// recording keeps layers; they change nothing drawn. Layers set this way don't nest: each
+    /// ends the one before, so a caller can set one at the top of a loop that may `continue`.
+    pub fn layer(&mut self, name: Option<&str>) {
+        self.set_layer(name.map(|n| (n, None)));
+    }
+
+    /// [`Canvas::layer`] for a layer identified by `id` as well as named (see
+    /// [`vector::Group::layer_id`]): a map layer's, or its labels', whose runs make one layer.
+    pub fn layer_with_id(&mut self, name: &str, id: u64) {
+        self.set_layer(Some((name, Some(id))));
+    }
+
+    fn set_layer(&mut self, layer: Option<(&str, Option<u64>)>) {
+        self.keep(|r| {
+            if std::mem::take(&mut r.layer) {
+                r.drawing.end_group();
+            }
+            if let Some((name, id)) = layer {
+                r.drawing.begin_layer(name, id);
+                r.layer = true;
+            }
+        });
     }
 
     /// Places `child` on this one as a group: moved by `transform`, composited with `opacity` and

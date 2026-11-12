@@ -38194,6 +38194,73 @@ fn a_pdf_says_which_frames_and_pages_it_draws_as_pictures() {
     );
 }
 
+/// A layout's PDF has layers (#1815): each element an optional content group named after it,
+/// its map frame's map layers and their labels inside the frame's; the GeoPDF viewports stay.
+/// `"pdf": {"layers": false}` leaves them out, a bad value is refused, and a layout with no map
+/// has its elements' layers alone.
+#[test]
+fn a_layout_pdf_has_its_elements_and_map_layers_as_layers() {
+    let mut s = world();
+    s.run("labels.field", &json!({"layer": "Countries", "field": "name"})).unwrap();
+    s.run("layout.new", &json!({"page": "a4", "orientation": "landscape", "template": "map"})).unwrap();
+    s.run("layout.addElement", &json!({"kind": "text", "text": "Uso (rascunho)"})).unwrap();
+    let path = std::env::temp_dir().join(format!("rustgis-layers-{}.pdf", std::process::id()));
+    let export = |s: &mut Session, extra: Value| {
+        let mut p = json!({"path": path, "dpi": 72});
+        if let (Some(p), Some(extra)) = (p.as_object_mut(), extra.as_object()) {
+            p.extend(extra.clone());
+        }
+        s.run("layout.export", &p).map(|_| String::from_utf8_lossy(&std::fs::read(&path).unwrap()).into_owned())
+    };
+    let pdf = export(&mut s, json!({})).unwrap();
+    let name = |n: &str| format!("<< /Type /OCG /Name {} >>", literal_pdf(n));
+    let id = |pdf: &str, n: &str| {
+        let at = pdf.find(&name(n)).unwrap_or_else(|| panic!("no layer {n}"));
+        pdf[..at].rsplit("endobj\n").next().and_then(|o| o.split(' ').next()).map(str::to_string).unwrap()
+    };
+    let layout = s.project.layouts[0].clone();
+    for e in layout.elements.iter().filter(|e| e.visible) {
+        let n = if e.name.trim().is_empty() { e.kind.code().to_string() } else { e.name.clone() };
+        assert!(pdf.contains(&name(&n)), "element {n}");
+    }
+    let frame = layout.elements.iter().find(|e| e.kind.code() == "mapFrame").unwrap();
+    let (f, countries, labels) = (id(&pdf, &frame.name), id(&pdf, "Countries"), id(&pdf, "Labels: Countries"));
+    let order = pdf.split("/Order [").nth(1).unwrap();
+    let inner = order.split(&format!("{f} 0 R [")).nth(1).unwrap_or_else(|| panic!("the frame's layers nest in it: {order}"));
+    let inner = inner.split(']').next().unwrap();
+    assert!(inner.contains(&format!("{countries} 0 R")) && inner.contains(&format!("{labels} 0 R")), "{inner}");
+    assert!(pdf.contains("/VP [<< /Type /Viewport"), "still a GeoPDF");
+    // Without layers, and refused values.
+    let plain = export(&mut s, json!({"pdf": {"layers": false}})).unwrap();
+    assert!(!plain.contains("/OCProperties") && !plain.contains("/Type /OCG") && plain.contains("/VP [<< /Type /Viewport"));
+    for bad in [json!({"pdf": {"layers": "no"}}), json!({"pdf": false}), json!({"pdf": {"layer": false}})] {
+        let err = export(&mut s, bad.clone()).unwrap_err();
+        assert!(err.contains("pdf"), "{bad}: {err}");
+    }
+    // A layout with no map: its elements' layers, one each.
+    let mut s = Session::new(Project::default());
+    s.run("layout.new", &json!({"page": "a4"})).unwrap();
+    s.project.layouts[0].elements.retain(|e| e.kind.code() != "mapFrame");
+    s.run("layout.addElement", &json!({"kind": "text", "text": "Só texto"})).unwrap();
+    let added = s.project.layouts[0].elements.last().map(|e| e.name.clone()).unwrap();
+    let pdf = export(&mut s, json!({})).unwrap();
+    let drawn = s.project.layouts[0].elements.iter().filter(|e| e.visible).count();
+    assert!(pdf.contains(&name(&added)) && pdf.contains("/OCProperties") && !pdf.contains("/VP ["), "{added}");
+    assert!(pdf.matches("/Type /OCG").count() <= drawn && !pdf.contains("Labels:"), "{drawn}");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// `s` as a PDF text string, as the PDF writer writes names: ASCII in parentheses, its
+/// parentheses and backslashes escaped, anything else UTF-16BE hex.
+fn literal_pdf(s: &str) -> String {
+    if s.is_ascii() {
+        let escaped: String = s.chars().flat_map(|c| if matches!(c, '(' | ')' | '\\') { vec!['\\', c] } else { vec![c] }).collect();
+        format!("({escaped})")
+    } else {
+        format!("<FEFF{}>", s.encode_utf16().map(|u| format!("{u:04X}")).collect::<String>())
+    }
+}
+
 /// A layout's PDF georeferences its map frames (#1191): each as an ISO 32000 viewport with its
 /// corners and its map's coordinate system, so that the frame's corners, taken back to the map,
 /// make the frame's rectangle. A tilted frame is left out, and said.
@@ -38231,7 +38298,8 @@ fn a_layout_pdf_georeferences_its_map_frames() {
     // Tilted, it shows no flat map to measure on: left out, and said.
     s.run("layout.update", &json!({"element": frame.id, "pitch": 30})).unwrap();
     let (pdf, said) = export(&mut s);
-    assert!(pdf.starts_with("%PDF-1.4") && !pdf.contains("/VP ["));
+    // (PDF 1.5 for its layers, #1815.)
+    assert!(pdf.starts_with("%PDF-1.5") && !pdf.contains("/VP ["));
     assert!(said.iter().any(|t| t == &format!("The PDF doesn't georeference 1 map frame ({}: it is tilted)", frame.name)), "{said:?}");
     // A world projection RustGIS computes itself (Winkel Tripel) is written as WKT too.
     s.run("layout.update", &json!({"element": frame.id, "pitch": 0})).unwrap();
@@ -38260,7 +38328,7 @@ fn a_layout_pdf_georeferences_its_map_frames() {
     let mark = s.notice_mark();
     s.run("layout.export", &json!({"path": path, "dpi": 72, "georeference": false})).unwrap();
     let plain = String::from_utf8_lossy(&std::fs::read(&path).unwrap()).into_owned();
-    assert!(plain.starts_with("%PDF-1.4") && !plain.contains("/VP ["));
+    assert!(plain.starts_with("%PDF-1.5") && !plain.contains("/VP ["), "1.5 for its layers (#1815)");
     assert!(!s.notices_since(mark).iter().any(|n| n.text.contains("georeference")));
     // On SAD69 (shifted from WGS 84) the corners are on SAD69, tens of metres from WGS 84's, and
     // moved as PROJ moves them: EPSG:4326 to EPSG:4618 takes this corner (-46.888358 E,
