@@ -11,7 +11,7 @@
 //! rustgis-cli run … --use-saved-secrets            # use what the desktop app saved in the system keychain
 //! rustgis-cli run … --threads 4                    # the most threads one piece of work uses (default: the cores, up to 16)
 //! rustgis-cli ask [--sample | --project p.rgis | --data f.geojson …] "Which cities have over 10 million people?" \
-//!     [--provider anthropic|openai|chatgpt|gemini|openrouter|ollama|custom|requesty|trustedrouter] [--model M] [--base-url URL] [--yes] [--save out.rgis] [--trace log.txt]
+//!     [--provider anthropic|openai|chatgpt|gemini|openrouter|ollama|custom|requesty|trustedrouter|opper] [--model M] [--base-url URL] [--yes] [--save out.rgis] [--trace log.txt]
 //! rustgis-cli ask --models [--provider P]                # list the provider's models
 //! rustgis-cli ask --accounts | --account CLIENT_ID       # list or select a saved registration
 //! rustgis-cli ask --remove-account CLIENT_ID             # sign out and forget a saved registration
