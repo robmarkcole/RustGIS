@@ -60,6 +60,10 @@ pub(super) fn declared(spec: &CommandSpec, params: &Value) -> Effects {
     if spec.id == "cube.open" && crate::cmd::cube_catalog::opens_zarr(params) {
         effects = effects.with(Effect::Files).with(Effect::Network);
     }
+    // A publication layout writes its coverage grid where it is asked to (#1379).
+    if spec.id == "layout.publication" && params.get("coverage").is_some_and(|v| !v.is_null()) {
+        effects = effects.with(Effect::Files);
+    }
     if spec.id == "map.addTiles" {
         effects = effects.union(crate::cmd::tiles::add_reach(params));
     }

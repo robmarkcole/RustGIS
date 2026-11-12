@@ -32,7 +32,7 @@ pub fn commands() -> Vec<C> {
             r#"{"name"?: string, "page"?: "letter"|"legal"|"tabloid"|"a5"|"a4"|"a3"|"a2"|"a1"|"a0", "orientation"?: "landscape"|"portrait", "width"?: mm, "height"?: mm, "template"?: "map" (frame, title, legend, north arrow, scale bar; the default)|"blank"}"#,
         ),
         C::new("layout.publication", "New Publication Layout", "Publish › Layout", publication).inputs(publication_inputs).roles(&[]).effects(crate::policy::Effects::NONE).params(
-            r#"{"profile"?: "a4" (the default) | "a3" | "a2" (a sheet turned to portrait or landscape, whichever the area's map comes out larger on: its extent east to west against north to south, on the map's projection) | "a4-portrait"|"a4-landscape"|"a3-portrait"|"a3-landscape"|"a2-portrait"|"a2-landscape" (a sheet: frame, title, subtitle, the map, a boxed footer)|"figure-1col" (90 mm)|"figure-1.5col" (140 mm)|"figure-2col" (190 mm)|"thesis-full" (160 × 225 mm)|"thesis-half" (160 × 110 mm) (a figure: the map edge to edge, its title and sources left to the caption), "extent"?: [west, south, east, north] in degrees that must fit (default: the map view), "name"?: string, "title"?: text, "subtitle"?: text, "sources"?: text | [texts], "reference"?: text | [texts] (default: the projection, datum and graticule), "note"?: text, "author"?: text (default: "Made with RustGIS · {date}"; "" or [] for none), "headings"?: [the sources' heading, the reference's heading, an editorial column's heading], "locator"?: "globe" (a globe with the area outlined; the default on sheets) | "inset" (the surrounding region, the area outlined) | "none" (the default on figures), "decimal"?: "." (the default) | "," (graticule, scale bar and colorbar numbers and {scale} with a decimal comma: 0,05 and 1:6.300.000), "colorbar"?: "auto" (the default: the top visible raster with a colour scale, not drawn by classes, gets one, under the legend in its box; a raster drawn by classes has them in the legend's rows instead) | "none" (no colorbar, and the legend's box has no room for one), "veil"?: true (the default: when no shape of the legend fits, a map that runs on past the extent, with a long legend, has what is outside the extent veiled and its surrounds grouped there, at up to half the scale on a sheet) | false (never veiled, and drawn at its scale; the map may still move aside), "style"?: "classic" (the default: the title over the map, the footer under it) | "banner" (the title and subtitle in a band of the accent colour across the top) | "panel" (the map at the left, a panel at the right with the title, locator, legend, sources and reference) | "editorial" (the title large in serif, a column at the right with the note, the locator and the legend) | "modular" (cards on a light page: the map, the locator and the legend each in one, the sources and reference in tinted ones) | "poster" (the page in the accent colour, the title in light text, the map in a light card, the footer in darker blocks) (a sheet's arrangement; figures leave it to the caption), "accent"?: a colour as #RRGGBB (the style's colour: its band, panel tint, headings and rules, a poster's page), "arrangement"?: "best" (the default: the favourite and each arrangement by name laid out, the one moving the least area off its corners kept, then the one leaving the least over the data, the favourite on a tie) | "favourite" (layout.arrangement's) | an arrangement by name or corner by corner, as layout.arrangement takes (the corners the locator, north arrow, legend and scale bar are at home in; one covering what the map draws there still moves)} → a new layout of the active map at a round scale, its texts wrapped to their boxes; {projection}, {datum} and {grid} in the texts are filled from the map"#,
+            r#"{"profile"?: "a4" (the default) | "a3" | "a2" (a sheet turned to portrait or landscape, whichever the area's map comes out larger on: its extent east to west against north to south, on the map's projection) | "a4-portrait"|"a4-landscape"|"a3-portrait"|"a3-landscape"|"a2-portrait"|"a2-landscape" (a sheet: frame, title, subtitle, the map, a boxed footer)|"figure-1col" (90 mm)|"figure-1.5col" (140 mm)|"figure-2col" (190 mm)|"thesis-full" (160 × 225 mm)|"thesis-half" (160 × 110 mm) (a figure: the map edge to edge, its title and sources left to the caption), "extent"?: [west, south, east, north] in degrees that must fit (default: the map view), "name"?: string, "title"?: text, "subtitle"?: text, "sources"?: text | [texts], "reference"?: text | [texts] (default: the projection, datum and graticule), "note"?: text, "author"?: text (default: "Made with RustGIS · {date}"; "" or [] for none), "headings"?: [the sources' heading, the reference's heading, an editorial column's heading], "locator"?: "globe" (a globe with the area outlined; the default on sheets) | "inset" (the surrounding region, the area outlined) | "none" (the default on figures), "decimal"?: "." (the default) | "," (graticule, scale bar and colorbar numbers and {scale} with a decimal comma: 0,05 and 1:6.300.000), "colorbar"?: "auto" (the default: the top visible raster with a colour scale, not drawn by classes, gets one, under the legend in its box; a raster drawn by classes has them in the legend's rows instead) | "none" (no colorbar, and the legend's box has no room for one), "veil"?: true (the default: when no shape of the legend fits, a map that runs on past the extent, with a long legend, has what is outside the extent veiled and its surrounds grouped there, at up to half the scale on a sheet) | false (never veiled, and drawn at its scale; the map may still move aside), "style"?: "classic" (the default: the title over the map, the footer under it) | "banner" (the title and subtitle in a band of the accent colour across the top) | "panel" (the map at the left, a panel at the right with the title, locator, legend, sources and reference) | "editorial" (the title large in serif, a column at the right with the note, the locator and the legend) | "modular" (cards on a light page: the map, the locator and the legend each in one, the sources and reference in tinted ones) | "poster" (the page in the accent colour, the title in light text, the map in a light card, the footer in darker blocks) (a sheet's arrangement; figures leave it to the caption), "accent"?: a colour as #RRGGBB (the style's colour: its band, panel tint, headings and rules, a poster's page), "arrangement"?: "best" (the default: the favourite and each arrangement by name laid out, the one moving the least area off its corners kept, then the one leaving the least over the data, the favourite on a tie) | "favourite" (layout.arrangement's) | an arrangement by name or corner by corner, as layout.arrangement takes (the corners the locator, north arrow, legend and scale bar are at home in; one covering what the map draws there still moves), "coverage"?: "*.png" (writes the coverage grid the placement searched, as it settled on it, three pixels a cell: what the map draws dark, the free cells white, both tinted blue in the strips the graticule's labels keep, the surrounds placed over the map outlined in red; the answer gives its path)} → a new layout of the active map at a round scale, its texts wrapped to their boxes; {projection}, {datum} and {grid} in the texts are filled from the map"#,
         ),
         C::new("layout.arrangement", "Favourite Arrangement", "Publish › Layout", arrangement).roles(&[]).effects(crate::policy::Effects::NONE).view().params(
             r#"{"favourite"?: "classic" (the locator top left, the north arrow top right, the legend bottom left, the scale bar bottom right) | "mirrored" | "legendRight" | "legendTop" | {"locator", "northArrow", "legend", "scaleBar": "top-left"|"top-right"|"bottom-left"|"bottom-right", each a corner of its own}} → the favourite arrangement of publication layouts (kept with the app's preferences), its corners and the arrangements by name; with no favourite given, it is only shown"#,
@@ -1050,6 +1050,12 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
     if accent.a() != 255 {
         return Err("accent is an opaque colour as #RRGGBB".into());
     }
+    // Where the coverage grid the placement searches is written as an image (#1379).
+    let coverage_path = match p.get("coverage") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(path)) if path.trim().to_ascii_lowercase().ends_with(".png") => Some(path.trim().to_string()),
+        Some(_) => return Err("coverage is the path of a .png file to write the coverage grid to".into()),
+    };
     // No orientation asked: the one the area's map comes out larger on, from its extents east to
     // west and north to south on the map's projection and the room the style leaves the map.
     let profile = match &auto {
@@ -2467,18 +2473,79 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
     for (n, r, kind) in around {
         l.add(&n, r, kind);
     }
-    // Every element by name and id, for `layout.update`.
-    let elements: Vec<Value> = l.elements.iter().map(|e| json!({"element": e.id, "name": e.name, "kind": e.kind.code()})).collect();
     if s.project.layouts.len() >= crate::project::MAX_LAYOUTS {
         return Err(format!("a project holds at most {} layouts; remove one first", crate::project::MAX_LAYOUTS));
     }
+    // The coverage grid as the placement searched it, with what was placed on it, for a look at
+    // why a surround moved (#1379). The layout is made by then (nothing below refuses it): a file
+    // that can't be written is said, and the layout kept.
+    let mut coverage_written = Value::Null;
+    if let Some(path) = &coverage_path {
+        let rects: Vec<Rect> = placed.iter().map(|(_, r)| *r).collect();
+        let png = coverage
+            .as_ref()
+            .ok_or_else(|| "the map couldn't be drawn for it".to_string())
+            .and_then(|grid| coverage_png(grid, (fx, fy, fw, fh), area, &rects));
+        match png.and_then(|bytes| rustgis_data::io::write_atomic(Path::new(path), &bytes).map_err(|e| format!("{path}: {e}"))) {
+            Ok(()) => coverage_written = json!(path),
+            Err(why) => warnings.push(format!("the coverage image isn't written: {why}")),
+        }
+    }
+    // Every element by name and id, for `layout.update`.
+    let elements: Vec<Value> = l.elements.iter().map(|e| json!({"element": e.id, "name": e.name, "kind": e.kind.code()})).collect();
     s.project.layouts.push(l);
     let i = s.project.layouts.len() - 1;
     s.active_layout = Some(i);
     let locator = locator_map.map(|(map, ..)| map);
     Ok(
-        json!({"layout": i, "name": name, "profile": profile.id, "page": [w, h], "scale": scale, "grid": step, "locator": locator, "style": style.code(), "arrangement": arrangement_used, "legendColumns": legend_cols, "mapShift": [map_shift.0, map_shift.1], "veiled": veiled.is_some(), "elements": elements, "moved": moved, "warnings": warnings}),
+        json!({"layout": i, "name": name, "profile": profile.id, "page": [w, h], "scale": scale, "grid": step, "locator": locator, "style": style.code(), "arrangement": arrangement_used, "legendColumns": legend_cols, "mapShift": [map_shift.0, map_shift.1], "veiled": veiled.is_some(), "elements": elements, "moved": moved, "coverage": coverage_written, "warnings": warnings}),
     )
+}
+
+/// The coverage grid of a publication's frame (`frame`, page mm) as a PNG, three pixels a cell
+/// (#1379): a cell the map draws dark, a free one white, both tinted blue outside `area` (the
+/// strips the grid's labels keep, which the search leaves out), and each surround placed over the
+/// map (`placed`, page mm) outlined in red.
+fn coverage_png(
+    (gw, gh, cells): &(u32, u32, Vec<bool>),
+    frame: Rect,
+    area: (f64, f64, f64, f64),
+    placed: &[Rect],
+) -> Result<Vec<u8>, String> {
+    const CELL_PX: u32 = 3;
+    let (fx, fy, fw, fh) = frame;
+    let mut pm = tiny_skia::Pixmap::new(gw * CELL_PX, gh * CELL_PX).ok_or("the coverage grid is empty")?;
+    let paint = |r: u8, g: u8, b: u8| {
+        let mut paint = tiny_skia::Paint::default();
+        paint.set_color_rgba8(r, g, b, 255);
+        paint
+    };
+    let (dark, free, dark_band, free_band) =
+        (paint(0x33, 0x33, 0x33), paint(0xFF, 0xFF, 0xFF), paint(0x2E, 0x4A, 0x7A), paint(0xC9, 0xDD, 0xF2));
+    for (i, drawn) in cells.iter().enumerate() {
+        let (col, row) = ((i % *gw as usize) as f64, (i / *gw as usize) as f64);
+        let (x, y) = (fx + (col + 0.5) / f64::from(*gw) * fw, fy + (row + 0.5) / f64::from(*gh) * fh);
+        let band = x < area.0 || x > area.2 || y < area.1 || y > area.3;
+        let colour = match (*drawn, band) {
+            (true, false) => &dark,
+            (false, false) => &free,
+            (true, true) => &dark_band,
+            (false, true) => &free_band,
+        };
+        let px = CELL_PX as f32;
+        if let Some(cell) = tiny_skia::Rect::from_xywh(col as f32 * px, row as f32 * px, px, px) {
+            pm.fill_rect(cell, colour, tiny_skia::Transform::identity(), None);
+        }
+    }
+    let (sx, sy) = (f64::from(pm.width()) / fw, f64::from(pm.height()) / fh);
+    let line = tiny_skia::Stroke { width: 2.0, ..tiny_skia::Stroke::default() };
+    for (x, y, w, h) in placed {
+        let r = tiny_skia::Rect::from_xywh(((x - fx) * sx) as f32, ((y - fy) * sy) as f32, (w * sx) as f32, (h * sy) as f32);
+        if let Some(r) = r {
+            pm.stroke_path(&tiny_skia::PathBuilder::from_rect(r), &paint(0xD6, 0x27, 0x28), &line, tiny_skia::Transform::identity(), None);
+        }
+    }
+    pm.encode_png().map_err(|e| e.to_string())
 }
 
 fn page(s: &mut Session, p: &Value) -> CmdResult {

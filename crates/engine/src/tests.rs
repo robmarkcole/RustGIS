@@ -42880,3 +42880,58 @@ fn a_layer_read_from_a_file_says_whether_it_and_the_file_are_in_step() {
     assert!(s.run("source.syncState", &json!({"layer": "Cities"})).is_err());
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// `"coverage"` (#1379) writes the grid the placement searched as a PNG, three pixels a cell: dark
+/// where the map draws, white where it is free, tinted in the graticule's label strips, the placed
+/// surrounds outlined in red; the answer names it, and asking for it reaches files. A path that
+/// isn't a .png is refused with nothing changed; one that can't be written is said, the layout
+/// made all the same.
+#[test]
+fn publication_writes_its_coverage_grid() {
+    use crate::policy::{Effect, command_effects};
+    let dir = std::env::temp_dir().join(format!("rustgis-coverage-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut s = world();
+    let piaui = json!([-46.8, -11.6, -38.5, -2.2]);
+    let path = dir.join("coverage.png").display().to_string();
+    let asked = json!({"extent": piaui, "coverage": path});
+    let spec = s.registry.get("layout.publication").unwrap();
+    assert!(command_effects(spec, &asked).contains(Effect::Files));
+    assert!(!command_effects(spec, &json!({"extent": piaui})).contains(Effect::Files));
+    let r = s.run("layout.publication", &asked).unwrap();
+    assert_eq!(r["coverage"], json!(path), "{r}");
+    let img = image::open(&path).unwrap().to_rgba8();
+    assert_eq!(img.width().max(img.height()), 384 * 3);
+    let count = |keep: &dyn Fn([u8; 3]) -> bool| img.pixels().filter(|p| keep([p.0[0], p.0[1], p.0[2]])).count();
+    let (dark, white) = (count(&|c| c == [0x33; 3] || c == [0x2E, 0x4A, 0x7A]), count(&|c| c == [0xFF; 3] || c == [0xC9, 0xDD, 0xF2]));
+    let strips = count(&|c| c == [0xC9, 0xDD, 0xF2] || c == [0x2E, 0x4A, 0x7A]);
+    let red = count(&|[r, g, b]| r > 180 && g < 90 && b < 90);
+    assert!(dark > 0 && white > 0 && strips > 0 && red > 0, "dark {dark}, white {white}, strips {strips}, outlines {red}");
+    // Refused before anything changes.
+    let layouts = s.project.layouts.len();
+    for bad in [json!("coverage.jpg"), json!(3)] {
+        let e = s.run("layout.publication", &json!({"extent": piaui, "coverage": bad})).unwrap_err();
+        assert!(e.contains("coverage is the path of a .png file"), "{e}");
+    }
+    assert_eq!(s.project.layouts.len(), layouts);
+    // A folder that isn't there: said, the layout made, no path in the answer.
+    let nowhere = dir.join("missing").join("coverage.png").display().to_string();
+    let r = s.run("layout.publication", &json!({"extent": piaui, "coverage": nowhere})).unwrap();
+    assert!(r["coverage"].is_null(), "{r}");
+    assert!(r["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains("the coverage image isn't written")), "{r}");
+    assert_eq!(s.project.layouts.len(), layouts + 1);
+    // A project holding all the layouts it can is refused before the file is written.
+    let full = dir.join("full.png");
+    // One a run before left behind would pass for not written.
+    let _ = std::fs::remove_file(&full);
+    let blank = s.project.layouts[0].clone();
+    s.project.layouts.resize(crate::project::MAX_LAYOUTS, blank);
+    let e = s.run("layout.publication", &json!({"extent": piaui, "coverage": full.display().to_string()})).unwrap_err();
+    assert!(e.contains("at most"), "{e}");
+    assert!(!full.exists());
+    s.project.layouts.truncate(layouts + 1);
+    // Without it, no file and no warning about one.
+    let r = s.run("layout.publication", &json!({"extent": piaui})).unwrap();
+    assert!(r["coverage"].is_null() && !r["warnings"].to_string().contains("coverage"), "{r}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
