@@ -1318,6 +1318,12 @@ impl RasterRenderer {
         RasterRenderer::KINDS.iter().find(|(c, _)| *c == self.code()).map(|(_, l)| *l).unwrap_or("Stretch")
     }
 
+    /// Whether it draws classes (a colour table, unique values, class breaks), which a legend lists
+    /// as the Layers pane does (#1679), rather than a ramp or bands.
+    pub fn draws_classes(&self) -> bool {
+        matches!(self, RasterRenderer::Classify { .. } | RasterRenderer::UniqueValues { .. } | RasterRenderer::Colormap)
+    }
+
     /// The bands it reads.
     pub fn bands(&self) -> Vec<usize> {
         match self {
@@ -1957,11 +1963,146 @@ impl RasterLayer {
             RasterRenderer::Colormap => {
                 let ColorHint::Palette(p) = &r.color else { return Vec::new() };
                 let cats = r.bands.first().and_then(|b| b.stats.categories.clone()).unwrap_or_default();
+                // A negative value has no entry in the table, and the map draws none for it, nor
+                // for an entry that is fully transparent (a background value).
                 cats.iter()
-                    .filter(|v| !mask.hides(**v as f32))
-                    .filter_map(|v| p.get(*v as usize).map(|c| RasterLegend::Class { color: Rgba(*c), label: class_label(0, *v) }))
+                    .filter(|v| **v >= 0.0 && !mask.hides(**v as f32))
+                    .filter_map(|v| {
+                        p.get(*v as usize).filter(|c| c[3] > 0).map(|c| RasterLegend::Class { color: Rgba(*c), label: class_label(0, *v) })
+                    })
                     .collect()
             }
+        }
+    }
+
+    /// Whether it is drawn by its colour table over values its statistics don't list (over 256
+    /// distinct values, or values that aren't whole): [`RasterLayer::legend_classes`] then has no
+    /// class to give, and a colorbar none either (#1679).
+    pub fn classes_unknown(&self) -> bool {
+        let Some(r) = self.data.as_ref().filter(|_| matches!(self.style.renderer, RasterRenderer::Colormap)) else { return false };
+        // Under a mask, the values it leaves may be few enough to list.
+        let masked = self.masked_stats();
+        let stats = masked.as_ref().and_then(|m| m.first()).or_else(|| r.bands.first().map(|b| &b.stats));
+        stats.is_some_and(|s| s.count > 0 && s.categories.is_none())
+    }
+
+    /// Whether its mask hides every pixel its masked statistics read: a legend then lists no class
+    /// the raster holds, so none can be missing from a sample or an overview (#1679).
+    fn mask_hides_all(&self) -> bool {
+        self.masked_stats().is_some_and(|m| m.first().is_some_and(|s| s.count == 0))
+    }
+
+    /// Whether the classes a legend lists for it ([`RasterLayer::legend_classes`]) come from a
+    /// sample of its pixels: under a mask, a band of more than [`MASK_STATS_SAMPLE`] cells has its
+    /// statistics read from every few cells ([`RasterMask::stats`]), so a class too rare for the
+    /// sample can be missing (#1679). Not with `all_classes` for Unique Values or Classify, nor when
+    /// no class can be listed (a mask hiding every pixel included); a colour table's come from the sample only when its own statistics,
+    /// read whole, can't list its values.
+    pub fn classes_from_sample(&self, all_classes: bool) -> bool {
+        let Some(r) = &self.data else { return false };
+        if !self.style.renderer.draws_classes() || self.style.mask.is_empty() || self.classes_unknown() || self.mask_hides_all() {
+            return false;
+        }
+        let band = self.style.renderer.bands().first().copied().unwrap_or(0);
+        let sampled = r.bands.get(band).is_some_and(|b| b.data.len() > MASK_STATS_SAMPLE);
+        let from_sample = match &self.style.renderer {
+            RasterRenderer::Colormap => r.bands.first().is_some_and(|b| b.stats.categories.is_none()),
+            _ => !all_classes,
+        };
+        sampled && from_sample
+    }
+
+    /// Whether the classes a legend lists for it ([`RasterLayer::legend_classes`]) come from the
+    /// statistics of an overview (a cloud-optimised GeoTIFF read in place, or pixels read reduced)
+    /// while the map draws the full resolution: a class too rare for the overview can be missing
+    /// (#1679). Not with `all_classes` for Unique Values or Classify, whose every class is listed
+    /// whatever the statistics, nor when no class can be listed ([`RasterLayer::classes_unknown`],
+    /// or a mask hiding every pixel).
+    pub fn classes_from_overview(&self, all_classes: bool) -> bool {
+        let Some(r) = &self.data else { return false };
+        let every = all_classes && !matches!(self.style.renderer, RasterRenderer::Colormap);
+        self.style.renderer.draws_classes()
+            && (self.in_place || r.overview.is_some())
+            && !every
+            && !self.classes_unknown()
+            && !self.mask_hides_all()
+    }
+
+    /// The classes a layout's legend lists for this raster (#1679): the Layers pane's class rows
+    /// ([`RasterLayer::legend`]), a colour and a label each, in the renderer's order. `None` for a
+    /// renderer that draws no classes (a stretch, a hillshade, RGB bands), which a colorbar keys.
+    /// Without `all_classes`, the classes the raster holds: those of the values in its statistics
+    /// (without the masked pixels). A raster with too many values to list (over 256, or not whole)
+    /// gives every Unique Values class, for Classify the classes from its lowest value's to its
+    /// highest's, and for a colour table those a mask leaves, when they are few enough, else none
+    /// ([`RasterLayer::classes_unknown`]). With `all_classes`, every class of a Unique Values or
+    /// Classify renderer. A colour table's 256 entries have no meaningful "all": it lists the
+    /// values the raster holds either way, as the Layers pane does.
+    pub fn legend_classes(&self, all_classes: bool) -> Option<Vec<(Rgba, String)>> {
+        let classes = || {
+            self.legend().into_iter().filter_map(|row| match row {
+                RasterLegend::Class { color, label } => Some((color, label)),
+                _ => None,
+            })
+        };
+        if !self.style.renderer.draws_classes() {
+            return None;
+        }
+        // Not read (yet): no class known.
+        let Some(r) = self.data.as_ref() else { return Some(Vec::new()) };
+        let masked = self.masked_stats();
+        let stats = |band: usize| masked.as_ref().and_then(|m| m.first()).or_else(|| r.bands.get(band).map(|b| &b.stats));
+        match &self.style.renderer {
+            RasterRenderer::Colormap => {
+                // The pane lists the values in the band's own statistics. With too many there, a
+                // mask may leave few enough: those, coloured and named as the pane does.
+                let own = r.bands.first().is_some_and(|b| b.stats.categories.is_some());
+                match (&r.color, stats(0).and_then(|s| s.categories.as_ref())) {
+                    (ColorHint::Palette(p), Some(left)) if !own => {
+                        let label = |v: f64| r.bands.first().and_then(|b| b.class_name(v)).map_or_else(|| fmt_num(v), str::to_owned);
+                        let shown = left.iter().filter(|v| **v >= 0.0 && !self.style.mask.hides(**v as f32));
+                        Some(shown.filter_map(|v| p.get(*v as usize).filter(|c| c[3] > 0).map(|c| (Rgba(*c), label(*v)))).collect())
+                    }
+                    _ => Some(classes().collect()),
+                }
+            }
+            RasterRenderer::UniqueValues { band, values, .. } => {
+                // A mask that hides every pixel leaves nothing drawn, so nothing to list.
+                if !all_classes && stats(*band).is_some_and(|s| s.count == 0) {
+                    return Some(Vec::new());
+                }
+                let held = stats(*band).and_then(|s| s.categories.as_ref()).filter(|_| !all_classes);
+                // The pane's rows are the values its mask doesn't hide, one each, in order.
+                let shown = values.iter().filter(|(v, _)| !self.style.mask.hides(*v as f32));
+                Some(shown.zip(classes()).filter(|((v, _), _)| held.is_none_or(|held| held.contains(v))).map(|(_, class)| class).collect())
+            }
+            RasterRenderer::Classify { band, breaks, .. } => {
+                // The class a value is drawn in, as the map draws it: the first break at or above
+                // it, else the last class.
+                let class_of = |v: f64| breaks.iter().position(|b| v <= *b).unwrap_or(breaks.len().saturating_sub(1));
+                let held: Option<Vec<usize>> = match stats(*band) {
+                    _ if all_classes => None,
+                    Some(s) if s.count == 0 => Some(Vec::new()),
+                    Some(s) => Some(match &s.categories {
+                        Some(values) => values.iter().map(|v| class_of(*v)).collect(),
+                        None => (class_of(s.min)..=class_of(s.max)).collect(),
+                    }),
+                    None => None,
+                };
+                // A flag per class, so a file with very many breaks costs one pass, not one per row.
+                let keep = held.map(|held| {
+                    let mut keep = vec![false; breaks.len()];
+                    for i in held {
+                        if let Some(k) = keep.get_mut(i) {
+                            *k = true;
+                        }
+                    }
+                    keep
+                });
+                let kept = |i: usize| keep.as_ref().is_none_or(|keep| keep.get(i).copied().unwrap_or(false));
+                Some(classes().enumerate().filter(|(i, _)| kept(*i)).map(|(_, c)| c).collect())
+            }
+            RasterRenderer::Stretch { .. } | RasterRenderer::Rgb { .. } | RasterRenderer::ShadedRelief { .. } => None,
         }
     }
 }
@@ -2083,6 +2224,176 @@ mod tests {
         r.bands[0].classes.clear();
         rl.data = Some(Arc::new(r));
         assert_eq!(labels(&rl), ["1", "2", "3"], "no names: the values, as before");
+    }
+
+    /// A layout's legend lists a classified raster's classes as the Layers pane draws them (#1679):
+    /// those the raster holds, or every class of a Unique Values or Classify renderer with
+    /// `all_classes`; a colour table the values it holds either way; a ramp or bands none.
+    #[test]
+    fn legend_classes_are_the_panes_rows_the_raster_holds() {
+        let gt = GeoTransform { origin_x: 10.0, origin_y: 50.0, pixel_width: 0.5, pixel_height: -0.5 };
+        let mut palette = vec![[0, 0, 0, 0]; 256];
+        for v in 1..=7u8 {
+            palette[usize::from(v)] = [v * 30, 100, 200 - v * 20, 255];
+        }
+        // Five classes held (1 to 5), two named in the file.
+        let values: Vec<f32> = (1..=5).map(|v| v as f32).collect();
+        let mut r = Raster::new("lc", 5, 1, vec![values], gt, Crs::LonLat, None, ColorHint::Palette(palette), "UInt8").unwrap();
+        r.bands[0].classes = vec![String::new(), "Forest".into(), String::new(), "Pasture".into()];
+        let mut rl = RasterLayer::from_path(r, "lc.tif");
+        let labels = |rl: &RasterLayer, all: bool| -> Vec<String> { rl.legend_classes(all).unwrap().into_iter().map(|(_, l)| l).collect() };
+        let pane = |rl: &RasterLayer| -> Vec<(Rgba, String)> {
+            rl.legend()
+                .into_iter()
+                .filter_map(|e| match e {
+                    RasterLegend::Class { color, label } => Some((color, label)),
+                    _ => None,
+                })
+                .collect()
+        };
+        rl.style.renderer = RasterRenderer::Colormap;
+        assert_eq!(labels(&rl, false), ["Forest", "2", "Pasture", "4", "5"]);
+        assert_eq!(rl.legend_classes(true), rl.legend_classes(false), "a colour table: the values held either way");
+        assert_eq!(rl.legend_classes(false).unwrap(), pane(&rl), "the pane's colours and labels");
+        // Unique values for 1 to 7: the raster holds five.
+        let unique = (1..=7u8).map(|v| (f64::from(v), Rgba::rgb(v * 30, 0, 0))).collect();
+        rl.style.renderer = RasterRenderer::UniqueValues { band: 0, ramp: Ramp::Harbour, values: unique };
+        assert_eq!(labels(&rl, false), ["Forest", "2", "Pasture", "4", "5"]);
+        assert_eq!(labels(&rl, true), ["Forest", "2", "Pasture", "4", "5", "6", "7"]);
+        assert_eq!(rl.legend_classes(true).unwrap(), pane(&rl), "every class: the pane's rows");
+        assert_eq!(rl.legend_classes(false).unwrap()[0].0, Rgba::rgb(30, 0, 0));
+        // A value its mask hides is left out, held or not.
+        rl.style.mask = RasterMask { values: vec![2.0, 6.0], ..RasterMask::default() };
+        assert_eq!(labels(&rl, false), ["Forest", "Pasture", "4", "5"]);
+        assert_eq!(labels(&rl, true), ["Forest", "Pasture", "4", "5", "7"]);
+        rl.style.mask = RasterMask::default();
+        // Class breaks: values 1 to 5 fall in the first three of four classes.
+        let breaks = vec![2.0, 4.0, 10.0, 20.0];
+        rl.style.renderer =
+            RasterRenderer::Classify { band: 0, method: ClassMethod::EqualInterval, ramp: Ramp::Harbour, breaks, classes: 4 };
+        assert_eq!(labels(&rl, false), ["1 – 2", "2 – 4", "4 – 10"]);
+        assert_eq!(labels(&rl, true), ["1 – 2", "2 – 4", "4 – 10", "10 – 20"]);
+        assert!(!rl.classes_unknown(), "breaks, not a colour table");
+        // Read whole: its statistics are its own. Read in place: an overview's, said unless every
+        // class of its breaks is listed.
+        assert!(!rl.classes_from_overview(false));
+        rl.in_place = true;
+        assert!(rl.classes_from_overview(false) && !rl.classes_from_overview(true));
+        rl.style.renderer = RasterRenderer::Colormap;
+        assert!(rl.classes_from_overview(true), "a colour table lists what the overview holds either way");
+        rl.in_place = false;
+        assert!(!rl.classes_unknown(), "its values are known");
+        // A ramp and bands have no classes: a colorbar keys them, or nothing does.
+        rl.style.renderer = RasterRenderer::Stretch { band: 0, ramp: Ramp::Harbour, invert: false };
+        assert_eq!(rl.legend_classes(false), None);
+        rl.style.renderer = RasterRenderer::Rgb { red: 0, green: 0, blue: 0 };
+        assert_eq!(rl.legend_classes(true), None);
+    }
+
+    /// A colour table has no entry for a negative value, and the map draws none: neither the
+    /// Layers pane nor a legend lists it (#1679), where `as usize` would have taken entry 0.
+    #[test]
+    fn a_colour_table_lists_no_negative_value() {
+        let gt = GeoTransform { origin_x: 0.0, origin_y: 1.0, pixel_width: 0.01, pixel_height: -0.01 };
+        let mut palette = vec![[0, 0, 0, 0]; 256];
+        palette[0] = [10, 20, 30, 255];
+        palette[1] = [200, 0, 0, 255];
+        palette[2] = [0, 200, 0, 255];
+        let values = vec![-1.0, 1.0, 2.0];
+        let r = Raster::new("change", 3, 1, vec![values], gt, Crs::LonLat, None, ColorHint::Palette(palette), "Int16").unwrap();
+        assert_eq!(r.bands[0].stats.categories.as_deref(), Some(&[-1.0, 1.0, 2.0][..]));
+        let mut rl = RasterLayer::from_path(r, "change.tif");
+        rl.style.renderer = RasterRenderer::Colormap;
+        let labels: Vec<String> = rl.legend_classes(false).unwrap().into_iter().map(|(_, l)| l).collect();
+        assert_eq!(labels, ["1", "2"]);
+        assert_eq!(rl.legend().len(), 2, "the Layers pane alike");
+    }
+
+    /// A fully transparent entry of a colour table (a background value) draws nothing on the map:
+    /// neither the Layers pane nor a legend lists it, as a colorbar leaves it out (#1679).
+    #[test]
+    fn a_colour_table_lists_no_transparent_entry() {
+        let gt = GeoTransform { origin_x: 0.0, origin_y: 1.0, pixel_width: 0.01, pixel_height: -0.01 };
+        let mut palette = vec![[0, 0, 0, 0]; 256];
+        palette[1] = [200, 0, 0, 255];
+        palette[2] = [0, 200, 0, 255];
+        let values = vec![0.0, 1.0, 2.0];
+        let r = Raster::new("clip", 3, 1, vec![values], gt, Crs::LonLat, None, ColorHint::Palette(palette), "UInt8").unwrap();
+        let mut rl = RasterLayer::from_path(r, "clip.tif");
+        rl.style.renderer = RasterRenderer::Colormap;
+        let labels: Vec<String> = rl.legend_classes(false).unwrap().into_iter().map(|(_, l)| l).collect();
+        assert_eq!(labels, ["1", "2"], "0 is transparent: not a class the map draws");
+        assert_eq!(rl.legend().len(), 2, "the Layers pane alike");
+    }
+
+    /// A mask decides what a legend lists (#1679): one hiding every pixel leaves no Unique Values
+    /// class, unless every class is asked for; a colour table over 300 values that a mask brings
+    /// down to five lists those five; a mask over more cells than its statistics read is a sample.
+    #[test]
+    fn legend_classes_follow_the_mask() {
+        let gt = GeoTransform { origin_x: 0.0, origin_y: 1.0, pixel_width: 0.01, pixel_height: -0.01 };
+        let r = Raster::new("lc", 3, 1, vec![vec![1.0, 2.0, 3.0]], gt, Crs::LonLat, None, ColorHint::Gray, "UInt8").unwrap();
+        let mut rl = RasterLayer::from_path(r, "lc.tif");
+        let unique = (1..=4u8).map(|v| (f64::from(v), Rgba::rgb(v * 30, 0, 0))).collect();
+        rl.style.renderer = RasterRenderer::UniqueValues { band: 0, ramp: Ramp::Harbour, values: unique };
+        // Every pixel hidden; the class for 4, which the raster doesn't hold, isn't.
+        rl.style.mask = RasterMask { values: vec![1.0, 2.0, 3.0], ..RasterMask::default() };
+        assert_eq!(rl.legend_classes(false), Some(Vec::new()), "nothing drawn, nothing listed");
+        assert_eq!(rl.legend_classes(true).map(|c| c.len()), Some(1), "every class asked for: those the mask doesn't hide");
+        assert!(!rl.classes_from_sample(false), "three cells, read whole");
+        // A colour table over 300 values: none listed, unless a mask leaves few.
+        let mut palette = vec![[0, 0, 0, 0]; 256];
+        for (i, c) in palette.iter_mut().enumerate() {
+            *c = [i as u8, 100, 255 - i as u8, 255];
+        }
+        let values: Vec<f32> = (0..300).map(|v| v as f32).collect();
+        let mut r = Raster::new("many", 300, 1, vec![values], gt, Crs::LonLat, None, ColorHint::Palette(palette), "UInt16").unwrap();
+        r.bands[0].classes = vec![String::new(), "Forest".into()];
+        let mut rl = RasterLayer::from_path(r, "many.tif");
+        rl.style.renderer = RasterRenderer::Colormap;
+        assert!(rl.classes_unknown() && rl.legend_classes(false) == Some(Vec::new()));
+        rl.style.mask = RasterMask { min: Some(1.0), max: Some(5.0), ..RasterMask::default() };
+        let labels: Vec<String> = rl.legend_classes(false).unwrap().into_iter().map(|(_, l)| l).collect();
+        assert_eq!(labels, ["Forest", "2", "3", "4", "5"]);
+        assert!(!rl.classes_unknown());
+        assert_eq!(rl.legend_classes(false).unwrap()[0].0, Rgba([1, 100, 254, 255]), "its colour in the table");
+        // Past the cells a mask's statistics read: a sample, said unless every class is listed.
+        let side = 2049u32;
+        let cells: Vec<f32> = (0..side * side).map(|i| (i % 4 + 1) as f32).collect();
+        let r = Raster::new("big", side, side, vec![cells], gt, Crs::LonLat, None, ColorHint::Gray, "UInt8").unwrap();
+        let mut rl = RasterLayer::from_path(r, "big.tif");
+        let unique = (1..=4u8).map(|v| (f64::from(v), Rgba::rgb(v * 30, 0, 0))).collect();
+        rl.style.renderer = RasterRenderer::UniqueValues { band: 0, ramp: Ramp::Harbour, values: unique };
+        assert!(!rl.classes_from_sample(false), "no mask: the band's own statistics");
+        rl.style.mask = RasterMask { values: vec![4.0], ..RasterMask::default() };
+        assert!(rl.classes_from_sample(false) && !rl.classes_from_sample(true));
+        // A mask hiding every pixel: no class listed, so none missing from a sample or an overview.
+        rl.in_place = true;
+        assert!(rl.classes_from_overview(false), "read in place, a class can be missing");
+        rl.style.mask = RasterMask { values: vec![1.0, 2.0, 3.0, 4.0], ..RasterMask::default() };
+        assert_eq!(rl.legend_classes(false), Some(Vec::new()));
+        assert!(!rl.classes_from_sample(false) && !rl.classes_from_overview(false));
+    }
+
+    /// Class breaks over a raster with too many values to list them: the classes from its lowest
+    /// value's to its highest's (#1679).
+    #[test]
+    fn legend_classes_of_breaks_over_many_values_follow_the_range() {
+        let gt = GeoTransform { origin_x: 0.0, origin_y: 1.0, pixel_width: 0.01, pixel_height: -0.01 };
+        // 1,000 distinct values from 100 to 199.9: no categories.
+        let values: Vec<f32> = (0..1000).map(|i| 100.0 + i as f32 / 10.0).collect();
+        let r = Raster::new("dem", 1000, 1, vec![values], gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
+        assert!(r.bands[0].stats.categories.is_none());
+        let mut rl = RasterLayer::from_path(r, "dem.tif");
+        let breaks = vec![50.0, 120.0, 150.0, 200.0, 300.0];
+        rl.style.renderer =
+            RasterRenderer::Classify { band: 0, method: ClassMethod::EqualInterval, ramp: Ramp::Harbour, breaks, classes: 5 };
+        let n = |all| rl.legend_classes(all).unwrap().len();
+        assert_eq!((n(false), n(true)), (3, 5), "120, 150 and 200: the classes 100 to 199.9 fall in");
+        // By a colour table, over values it can't list: no class, said by `classes_unknown`.
+        rl.style.renderer = RasterRenderer::Colormap;
+        assert_eq!(rl.legend_classes(false), Some(Vec::new()));
+        assert!(rl.classes_unknown());
     }
 
     /// A following layer's dates are its steps from `offset` on, one each: repair keeps them as

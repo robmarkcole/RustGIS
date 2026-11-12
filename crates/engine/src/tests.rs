@@ -7971,14 +7971,15 @@ fn a_publication_legend_takes_the_columns_that_fit_the_free_rectangle() {
 fn a_publication_without_a_colorbar_sizes_the_legend_box_to_the_legend() {
     use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster, geotiff};
     let mut s = Session::new(Project::default());
-    // A classified raster (four values, each a class), over a polygon layer the legend lists.
+    // A raster on a ramp (a classified one has its classes in the legend instead, #1679), over a
+    // polygon layer the legend lists.
     let (w, h) = (20u32, 20u32);
     let z: Vec<f32> = (0..w * h).map(|i| (i % 4) as f32 + 1.0).collect();
     let gt = GeoTransform { origin_x: 0.0, origin_y: 10.0, pixel_width: 0.5, pixel_height: -0.5 };
     let r = Raster::new("classes", w, h, vec![z], gt, Crs::LonLat, None, ColorHint::Gray, "Byte").unwrap();
     let bytes = geotiff::write(&r, 0).unwrap();
     crate::cmd::raster::add_raster(&mut s, "classes", rustgis_map::RasterLayer::from_bytes(r, "classes.tif".to_string(), bytes)).unwrap();
-    s.run("raster.symbology", &json!({"type": "unique"})).unwrap();
+    s.run("raster.symbology", &json!({"type": "stretch"})).unwrap();
     let path = std::env::temp_dir().join(format!("rustgis-1680-{}.geojson", std::process::id()));
     std::fs::write(
         &path,
@@ -8008,6 +8009,324 @@ fn a_publication_without_a_colorbar_sizes_the_legend_box_to_the_legend() {
     bad["colorbar"] = json!("hidden");
     assert!(s.run("layout.publication", &bad).unwrap_err().contains("colorbar is"));
     let _ = std::fs::remove_file(&path);
+}
+
+/// Adds a land cover raster over 0–10° east and north drawn by its colour table: `classes`'
+/// values, each a run of cells, named as the file names them (an empty name shows the value).
+fn add_land_cover(s: &mut Session, name: &str, classes: &[(u8, &str)]) {
+    use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster, geotiff};
+    let (w, h) = (40usize, 40usize);
+    let z: Vec<f32> = (0..w * h).map(|i| f32::from(classes[i * classes.len() / (w * h)].0)).collect();
+    let gt = GeoTransform { origin_x: 0.0, origin_y: 10.0, pixel_width: 0.25, pixel_height: -0.25 };
+    let mut palette = vec![[0, 0, 0, 0]; 256];
+    let mut names = vec![String::new(); 256];
+    for (v, n) in classes {
+        palette[usize::from(*v)] = [v.wrapping_mul(37), v.wrapping_mul(91), 255 - v, 255];
+        names[usize::from(*v)] = (*n).to_string();
+    }
+    let mut r = Raster::new(name, w as u32, h as u32, vec![z], gt, Crs::LonLat, None, ColorHint::Palette(palette), "Byte").unwrap();
+    r.bands[0].classes = names;
+    let bytes = geotiff::write(&r, 0).unwrap();
+    let mut rl = rustgis_map::RasterLayer::from_bytes(r, format!("{name}.tif"), bytes);
+    rl.style.renderer = rustgis_map::raster::RasterRenderer::Colormap;
+    crate::cmd::raster::add_raster(s, name, rl).unwrap();
+}
+
+/// A publication of a land cover (MapBiomas clipped to a municipality: 11 classes in its colour
+/// table) lists its classes in the legend instead of a colorbar, and sizes the box to them (#1679).
+/// A raster on a ramp under it still gets the colorbar.
+#[test]
+fn a_publication_lists_a_land_covers_classes_instead_of_a_colorbar() {
+    let mapbiomas = [
+        (3, "Formação Florestal"),
+        (4, "Formação Savânica"),
+        (9, "Silvicultura"),
+        (12, "Formação Campestre"),
+        (15, "Pastagem"),
+        (21, "Mosaico de Usos"),
+        (24, "Área Urbanizada"),
+        (33, "Rio, Lago e Oceano"),
+        (39, "Soja"),
+        (41, "Outras Lavouras Temporárias"),
+        (46, "Café"),
+    ];
+    let mut s = Session::new(Project::default());
+    add_land_cover(&mut s, "Uso do solo", &mapbiomas);
+    let p = json!({"profile": "a4-portrait", "extent": [0, 0, 10, 10], "author": "", "locator": "none"});
+    let r = s.run("layout.publication", &p).unwrap();
+    let l = s.project.layouts.last().unwrap();
+    let el = |name: &str| l.elements.iter().find(|e| e.name == name);
+    assert!(el("Colorbar").is_none(), "the classes are the key: {r}");
+    let (bx, legend) = (el("Legend Box").unwrap().h, el("Legend").unwrap().h);
+    assert!((bx - legend - 4.0).abs() < 1e-6, "{bx} {legend}: {r}");
+    // Its name and 11 classes, in the columns it took.
+    let row = 15.0 * 25.4 / 96.0;
+    let columns = r["legendColumns"].as_f64().unwrap_or(1.0);
+    assert!(legend >= (12.0 / columns).floor() * row - 1e-6, "{legend} mm in {columns}: {r}");
+    assert!(!r["warnings"].to_string().contains("more than fits"), "{r}");
+    let map = s.map_mut();
+    let sizes = crate::render::layout::legend_sizes_mm(map, 1e6, false, false, (&[], &Default::default())).unwrap();
+    assert!((sizes[0].1 - 12.0 * row).abs() < 1e-6, "{sizes:?}");
+    // A stretched raster under it: its colorbar stays, and the classes too.
+    {
+        use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster};
+        let gt = GeoTransform { origin_x: 0.0, origin_y: 10.0, pixel_width: 0.5, pixel_height: -0.5 };
+        let z: Vec<f32> = (0..400).map(|i| i as f32 * 1.5).collect();
+        let dem = Raster::new("dem", 20, 20, vec![z], gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
+        let bytes = rustgis_data::raster::geotiff::write(&dem, 0).unwrap();
+        crate::cmd::raster::add_raster(&mut s, "Altitude", rustgis_map::RasterLayer::from_bytes(dem, "dem.tif".to_string(), bytes))
+            .unwrap();
+    }
+    s.run("layer.move", &json!({"layer": "Altitude", "to": 99})).unwrap();
+    // A colorbar added with the DEM to show says nothing of a placeholder.
+    let mark = s.notice_mark();
+    s.run("layout.addElement", &json!({"kind": "colorbar"})).unwrap();
+    assert!(s.notices_since(mark).iter().all(|n| !n.text.contains("empty placeholder")));
+    let r = s.run("layout.publication", &p).unwrap();
+    let l = s.project.layouts.last().unwrap();
+    let bar = l.elements.iter().find_map(|e| match &e.kind {
+        rustgis_map::layout::ElementKind::Colorbar { layer, .. } => Some(layer.clone()),
+        _ => None,
+    });
+    assert_eq!(bar, Some(Some("Altitude".to_string())), "{r}");
+    assert!(l.elements.iter().any(|e| e.name == "Legend"), "{r}");
+}
+
+/// The colorbar goes to the topmost visible raster with a colour scale: an RGB composite over a
+/// stretched DEM leaves it to the DEM. A colour table over more values than a legend lists gives
+/// neither classes nor a colorbar, and the publication says so; one with its classes known says
+/// nothing (#1679).
+#[test]
+fn a_publication_keys_the_raster_under_an_rgb_and_says_an_unlisted_colour_table() {
+    use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster, geotiff};
+    use rustgis_map::layout::ElementKind;
+    let gt = GeoTransform { origin_x: 0.0, origin_y: 10.0, pixel_width: 0.5, pixel_height: -0.5 };
+    let add = |s: &mut Session, name: &str, r: Raster| {
+        let bytes = geotiff::write(&r, 0).unwrap();
+        crate::cmd::raster::add_raster(s, name, rustgis_map::RasterLayer::from_bytes(r, format!("{name}.tif"), bytes)).unwrap();
+    };
+    let p = json!({"profile": "a4-portrait", "extent": [0, 0, 10, 10], "author": "", "locator": "none"});
+    let bar_of = |s: &Session| {
+        s.project.layouts.last().unwrap().elements.iter().find_map(|e| match &e.kind {
+            ElementKind::Colorbar { layer, .. } => Some(layer.clone()),
+            _ => None,
+        })
+    };
+    // A stretched DEM under an RGB composite.
+    let mut s = Session::new(Project::default());
+    let z: Vec<f32> = (0..400).map(|i| i as f32 * 1.5).collect();
+    add(&mut s, "Altitude", Raster::new("dem", 20, 20, vec![z], gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap());
+    let band = |k: f32| (0..400).map(|i| (i as f32 * k) % 255.0).collect::<Vec<f32>>();
+    let rgb =
+        Raster::new("rgb", 20, 20, vec![band(1.0), band(2.0), band(3.0)], gt, Crs::LonLat, None, ColorHint::Rgb { alpha: false }, "Byte");
+    add(&mut s, "Imagem", rgb.unwrap());
+    assert!(s.map().layers[0].raster.as_ref().is_some_and(|r| matches!(r.style.renderer, rustgis_map::RasterRenderer::Rgb { .. })));
+    let r = s.run("layout.publication", &p).unwrap();
+    assert_eq!(bar_of(&s), Some(Some("Altitude".to_string())), "{r}");
+    // A colour table over 300 values: no class to list, no colorbar, and a warning.
+    let mut s = Session::new(Project::default());
+    let mut palette = vec![[0, 0, 0, 0]; 256];
+    for (i, c) in palette.iter_mut().enumerate() {
+        *c = [i as u8, 100, 255 - i as u8, 255];
+    }
+    let z: Vec<f32> = (0..400).map(|i| (i % 300) as f32).collect();
+    let many = Raster::new("many", 20, 20, vec![z], gt, Crs::LonLat, None, ColorHint::Palette(palette), "UInt16").unwrap();
+    assert!(many.bands[0].stats.categories.is_none());
+    for name in ["Classes", "Mais classes"] {
+        let mut rl = rustgis_map::RasterLayer::from_path(many.clone(), "many.tif");
+        rl.style.renderer = rustgis_map::RasterRenderer::Colormap;
+        crate::cmd::raster::add_raster(&mut s, name, rl).unwrap();
+    }
+    let said = "2 raster(s) drawn by a colour table over more values than a legend can list (over 256, or not whole numbers) have no key in the legend: Mais classes, Classes";
+    let r = s.run("layout.publication", &p).unwrap();
+    assert_eq!(bar_of(&s), None, "{r}");
+    let warnings: Vec<String> = serde_json::from_value(r["warnings"].clone()).unwrap();
+    assert_eq!(
+        warnings.iter().filter(|w| w.contains("over more values than a legend")).collect::<Vec<_>>(),
+        [said],
+        "one, with the count: {r}"
+    );
+    // A colorbar with no layer has nothing to show either, and doesn't promise the legend.
+    let mark = s.notice_mark();
+    s.run("layout.addElement", &json!({"kind": "colorbar"})).unwrap();
+    let empty: Vec<String> =
+        s.notices_since(mark).iter().filter(|n| n.text.contains("empty placeholder")).map(|n| n.text.clone()).collect();
+    assert_eq!(
+        empty,
+        [
+            "the colorbar has no raster with a colour scale to show, so it draws an empty placeholder: Mais classes, Classes draws a colour table over more values than a legend or a colorbar can list (over 256, or not whole numbers), so nothing keys it"
+        ]
+    );
+    // A legend added says it too, once; told to leave one out, it names the other.
+    let mark = s.notice_mark();
+    let id = s.run("layout.addElement", &json!({"kind": "legend"})).unwrap()["element"].as_u64().unwrap();
+    let notices = |s: &Session, mark| -> Vec<String> {
+        s.notices_since(mark).iter().filter(|n| n.text.contains("over more values than a legend")).map(|n| n.text.clone()).collect()
+    };
+    assert_eq!(notices(&s, mark), [said]);
+    let mark = s.notice_mark();
+    s.run("layout.update", &json!({"element": id, "exclude": ["classes"]})).unwrap();
+    assert_eq!(notices(&s, mark), [said.replace("2 raster(s)", "1 raster(s)").replace(": Mais classes, Classes", ": Mais classes")]);
+    let mark = s.notice_mark();
+    s.run("layout.update", &json!({"element": id, "exclude": ["Classes", "Mais classes"]})).unwrap();
+    assert!(notices(&s, mark).is_empty(), "both left out: nothing to say");
+    // Its classes known: nothing said.
+    let mut s = Session::new(Project::default());
+    add_land_cover(&mut s, "Uso do solo", &[(3, "Floresta"), (15, "Pastagem")]);
+    let r = s.run("layout.publication", &p).unwrap();
+    assert!(!r["warnings"].to_string().contains("more values than a legend"), "{r}");
+    assert!(!r["warnings"].to_string().contains("through an overview"), "{r}");
+    let mark = s.notice_mark();
+    s.run("layout.addElement", &json!({"kind": "legend"})).unwrap();
+    assert!(s.notices_since(mark).iter().all(|n| !n.text.contains("more values than a legend") && !n.text.contains("through an overview")));
+    // A colorbar added by hand with no layer: none of the land cover's codes.
+    let r = s.run("layout.addElement", &json!({"kind": "colorbar"})).unwrap();
+    let colorbar = r["element"].as_u64().unwrap() as u32;
+    let l = s.project.layouts.last().unwrap();
+    let shown = |l: &rustgis_map::layout::Layout| match l.element(colorbar).map(|e| &e.kind) {
+        Some(ElementKind::Colorbar { frame, layer, .. }) => match l.element(*frame).map(|f| &f.kind) {
+            Some(ElementKind::MapFrame { map, .. }) => {
+                let m = s.project.maps.iter().find(|m| m.name.eq_ignore_ascii_case(map)).unwrap();
+                rustgis_map::layout::colorbar_layer(m, layer.as_deref()).map(|l| l.name.clone())
+            }
+            _ => panic!("no frame"),
+        },
+        _ => panic!("no colorbar"),
+    };
+    assert_eq!(shown(l), None, "the land cover's classes are in the legend, not on a colorbar");
+    // It says so, once; one naming the land cover shows it, and says nothing.
+    let placeholder = |s: &Session, mark| -> Vec<String> {
+        s.notices_since(mark).iter().filter(|n| n.text.contains("empty placeholder")).map(|n| n.text.clone()).collect()
+    };
+    let mark = s.notice_mark();
+    s.run("layout.addElement", &json!({"kind": "colorbar"})).unwrap();
+    assert_eq!(
+        placeholder(&s, mark),
+        [
+            "the colorbar has no raster with a colour scale to show, so it draws an empty placeholder: Uso do solo is drawn by classes, which a legend lists rather than a colorbar (give \"layer\" to show its colours on one anyway)"
+        ]
+    );
+    let mark = s.notice_mark();
+    let named = s.run("layout.addElement", &json!({"kind": "colorbar", "layer": "Uso do solo"})).unwrap()["element"].clone();
+    assert!(placeholder(&s, mark).is_empty());
+    // Set back to no layer, it says so again.
+    let mark = s.notice_mark();
+    s.run("layout.update", &json!({"element": named, "layer": ""})).unwrap();
+    assert_eq!(placeholder(&s, mark).len(), 1, "{:?}", s.notices_since(mark));
+    // Its classes read through an overview: said once, by the publication and the legend, unless the
+    // land cover is left out.
+    if let Some(r) = s.map_mut().layers[0].raster.as_mut().and_then(|r| r.data.as_mut()) {
+        std::sync::Arc::make_mut(r).overview = Some((10, 10));
+    }
+    let r = s.run("layout.publication", &p).unwrap();
+    let warnings: Vec<String> = serde_json::from_value(r["warnings"].clone()).unwrap();
+    let reduced = "1 raster(s) drawn by classes were read through an overview, so the legend lists the classes found there and may miss a rare one the map draws: Uso do solo";
+    assert_eq!(warnings.iter().filter(|w| w.contains("through an overview")).collect::<Vec<_>>(), [reduced], "{r}");
+    let mark = s.notice_mark();
+    let id = s.run("layout.addElement", &json!({"kind": "legend"})).unwrap()["element"].as_u64().unwrap();
+    let said: Vec<String> =
+        s.notices_since(mark).iter().filter(|n| n.text.contains("through an overview")).map(|n| n.text.clone()).collect();
+    assert_eq!(said, [reduced]);
+    let mark = s.notice_mark();
+    s.run("layout.update", &json!({"element": id, "exclude": ["Uso do solo"]})).unwrap();
+    assert!(s.notices_since(mark).iter().all(|n| !n.text.contains("through an overview")), "left out");
+}
+
+/// A stretched raster on top still reading keeps its place: the publication gives no colorbar and
+/// says why, rather than the scale of the stretched raster under it under its name; once read, it
+/// gets the colorbar (#1679).
+#[test]
+fn a_publication_gives_no_colorbar_for_a_raster_still_reading() {
+    use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster};
+    let mut s = Session::new(Project::default());
+    for (name, k) in [("Profundidade", 2.0), ("Altitude", 1.5)] {
+        let gt = GeoTransform { origin_x: 0.0, origin_y: 10.0, pixel_width: 0.5, pixel_height: -0.5 };
+        let z: Vec<f32> = (0..400).map(|i| i as f32 * k).collect();
+        let r = Raster::new(name, 20, 20, vec![z], gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
+        let bytes = rustgis_data::raster::geotiff::write(&r, 0).unwrap();
+        crate::cmd::raster::add_raster(&mut s, name, rustgis_map::RasterLayer::from_bytes(r, format!("{name}.tif"), bytes)).unwrap();
+    }
+    s.run("layer.move", &json!({"layer": "Altitude", "to": 99})).unwrap();
+    let p = json!({"profile": "a4-portrait", "extent": [0, 0, 10, 10], "author": "", "locator": "none"});
+    let bar = |s: &Session| {
+        s.project.layouts.last().unwrap().elements.iter().find_map(|e| match &e.kind {
+            rustgis_map::layout::ElementKind::Colorbar { layer, .. } => Some(layer.clone()),
+            _ => None,
+        })
+    };
+    fn top(s: &mut Session) -> &mut rustgis_map::RasterLayer {
+        s.map_mut().layers.iter_mut().find(|l| l.name == "Profundidade").and_then(|l| l.raster.as_mut()).unwrap()
+    }
+    let read = top(&mut s).data.take();
+    let r = s.run("layout.publication", &p).unwrap();
+    assert_eq!(bar(&s), None, "not the DEM's scale under its name: {r}");
+    let still = "Profundidade is still reading, so its colour scale isn't known and the layout has no colorbar for it; add one with layout.addElement once it has read";
+    assert!(r["warnings"].as_array().unwrap().iter().any(|w| w == still), "{r}");
+    // Read: its colorbar, and nothing said.
+    top(&mut s).data = read;
+    let r = s.run("layout.publication", &p).unwrap();
+    assert_eq!(bar(&s), Some(Some("Profundidade".to_string())), "{r}");
+    assert!(!r["warnings"].to_string().contains("still reading"), "{r}");
+}
+
+/// A raster drawn by classes under a mask, with more cells than its masked statistics read: the
+/// publication and a legend say its classes come from a sample; every class asked for (nothing
+/// to sample) or no mask (the band's own statistics, read whole) says nothing (#1679).
+#[test]
+fn a_masked_raster_too_large_to_read_whole_says_its_classes_are_sampled() {
+    use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster};
+    use rustgis_map::raster::{RasterMask, RasterRenderer};
+    // 2049 × 2049 cells, over the 4,194,304 its masked statistics read whole.
+    let n = 2049usize;
+    let z: Vec<f32> = (0..n * n).map(|i| (1 + i * 4 / (n * n)) as f32).collect();
+    let gt = GeoTransform { origin_x: 0.0, origin_y: 10.0, pixel_width: 10.0 / n as f64, pixel_height: -10.0 / n as f64 };
+    let r = Raster::new("lc", n as u32, n as u32, vec![z], gt, Crs::LonLat, None, ColorHint::Gray, "UInt8").unwrap();
+    let mut rl = rustgis_map::RasterLayer::from_path(r, "lc.tif");
+    let values = (1..=4u8).map(|v| (f64::from(v), rustgis_map::Rgba::rgb(v * 50, 120, 200))).collect();
+    rl.style.renderer = RasterRenderer::UniqueValues { band: 0, ramp: rustgis_map::Ramp::Harbour, values };
+    rl.style.mask = RasterMask { values: vec![1.0], ..RasterMask::default() };
+    let mut s = Session::new(Project::default());
+    crate::cmd::raster::add_raster(&mut s, "Classes", rl).unwrap();
+    let sampled = "1 raster(s) drawn by classes under a mask have more cells than their masked statistics read, so the legend lists the classes of a sample and may miss a rare one the map draws: Classes";
+    let said = |s: &Session, mark| -> Vec<String> {
+        s.notices_since(mark).iter().filter(|n| n.text.contains("classes of a sample")).map(|n| n.text.clone()).collect()
+    };
+    let p = json!({"profile": "a4-portrait", "extent": [0, 0, 10, 10], "author": "", "locator": "none"});
+    let r = s.run("layout.publication", &p).unwrap();
+    let warnings: Vec<String> = serde_json::from_value(r["warnings"].clone()).unwrap();
+    assert_eq!(warnings.iter().filter(|w| w.contains("classes of a sample")).collect::<Vec<_>>(), [sampled], "{r}");
+    let mark = s.notice_mark();
+    let id = s.run("layout.addElement", &json!({"kind": "legend"})).unwrap()["element"].as_u64().unwrap();
+    assert_eq!(said(&s, mark), [sampled]);
+    // Every class asked for: the renderer's classes, not a sample's.
+    let mark = s.notice_mark();
+    s.run("layout.update", &json!({"element": id, "allClasses": true})).unwrap();
+    assert!(said(&s, mark).is_empty(), "{:?}", s.notices_since(mark));
+    // No mask: the band's own statistics, read whole.
+    s.map_mut().layers[0].raster.as_mut().unwrap().style.mask = RasterMask::default();
+    let r = s.run("layout.publication", &p).unwrap();
+    assert!(!r["warnings"].to_string().contains("classes of a sample"), "{r}");
+}
+
+/// A land cover with more classes than its legend's box holds: the publication says it leaves the
+/// last out, and so does a legend added in a small box; five classes fit, and nothing is said
+/// (#1679).
+#[test]
+fn a_legend_with_too_many_raster_classes_says_it_leaves_some_out() {
+    let names: Vec<String> = (1..=200).map(|v| format!("Classe {v}")).collect();
+    let classes: Vec<(u8, &str)> = names.iter().enumerate().map(|(i, n)| (i as u8 + 1, n.as_str())).collect();
+    let publication = json!({"profile": "a4-portrait", "extent": [0, 0, 10, 10], "author": "", "locator": "none"});
+    let legend = json!({"kind": "legend", "x": 10, "y": 10, "w": 60, "h": 60, "columns": 2});
+    for (n, cut) in [(200, true), (5, false)] {
+        let mut s = Session::new(Project::default());
+        add_land_cover(&mut s, "Uso do solo", &classes[..n]);
+        let r = s.run("layout.publication", &publication).unwrap();
+        assert_eq!(r["warnings"].to_string().contains("more than fits its box"), cut, "{n} classes: {r}");
+        let mark = s.notice_mark();
+        s.run("layout.addElement", &legend).unwrap();
+        let said = s.notices_since(mark).iter().any(|n| n.text.contains("more than fits its box"));
+        assert_eq!(said, cut, "{n} classes: {:?}", s.notices_since(mark));
+    }
 }
 
 /// A smaller scale whose legend can't be measured (a streamed layer shown only there, whose file is

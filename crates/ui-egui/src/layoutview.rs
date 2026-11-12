@@ -1719,7 +1719,7 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                                 .unwrap_or_default(),
                             _ => Vec::new(),
                         };
-                        let top = tl!("Top visible raster");
+                        let top = tl!("Top raster with a colour scale, not drawn by classes");
                         egui::ComboBox::from_id_salt(("colorbar_layer", id))
                             .selected_text(layer.as_deref().unwrap_or(top))
                             .show_ui(ui, |ui| {
@@ -2076,9 +2076,9 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
             update(app, font);
         }
     }
-    // The layers a legend lists: a checkbox for each vector layer of its frame's map and each
-    // WMS or WMTS layer with a legend, ticked when listed. Names gone from the map drop out of
-    // the list as it's written back.
+    // The layers a legend lists: a checkbox for each vector layer of its frame's map, each raster
+    // drawn by classes (#1679) and each WMS or WMTS layer with a legend, ticked when listed. Names
+    // gone from the map drop out of the list as it's written back.
     if let ElementKind::Legend { frame, exclude, .. } = &e.kind {
         let map = layout.element(*frame).and_then(|f| match &f.kind {
             ElementKind::MapFrame { map, .. } => app.session.project.maps.iter().find(|m| m.name.eq_ignore_ascii_case(map)),
@@ -2088,7 +2088,7 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
             .map(|m| {
                 // Once each: layers may share a name, and the legend leaves names out.
                 let mut names: Vec<String> = Vec::new();
-                let listed = m.layers.iter().filter(|l| !l.graphics && !l.is_raster()).map(|l| &l.name);
+                let listed = m.layers.iter().filter(|l| rustgis_engine::render::layout::legend_lists(l)).map(|l| &l.name);
                 for name in listed.chain(m.tiles.iter().filter(|t| !t.legends.is_empty()).map(|t| &t.name)) {
                     if !names.iter().any(|n| n.eq_ignore_ascii_case(name)) {
                         names.push(name.clone());
@@ -2097,7 +2097,8 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                 names
             })
             .unwrap_or_default();
-        // The names left out that the map still has, those not listed here (a raster's) too.
+        // The names left out that the map still has, those not listed here (a raster's on a ramp)
+        // too.
         let kept: Vec<String> = exclude
             .iter()
             .filter(|x| {
