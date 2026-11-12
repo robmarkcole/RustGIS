@@ -818,8 +818,11 @@ pub(crate) struct GpkgSrs {
 
 /// A GeoPackage table's coordinate system, decided the same way on the desktop and in the browser
 /// (#1476): by its EPSG code when its organization is EPSG and the code is known, else by its WKT
-/// definition, else longitude/latitude, with a note. With no row for `srs_id`, it is taken as an
-/// EPSG code only for WGS 84 and Web Mercator, the ids writers commonly use without defining.
+/// definition, else longitude/latitude, with a note. The definition comes before the code when it
+/// gives another shift to WGS 84 than the code's, or is another body's system, as a `.prj` comes
+/// before its own `AUTHORITY` ([`read_wkt_over_code`](crate::raster::wkt::read_wkt_over_code)).
+/// With no row for `srs_id`, it is taken as an EPSG code only for WGS 84 and Web Mercator, the ids
+/// writers commonly use without defining.
 /// Another body's system ([`Reproject::planetary`]) is said, or an error when its coordinates
 /// would be in the wrong place as longitude/latitude.
 pub(crate) fn gpkg_reproject(srs_id: i64, row: Option<GpkgSrs>, notes: &mut Vec<String>) -> Result<Reproject> {
@@ -846,22 +849,49 @@ pub(crate) fn gpkg_reproject(srs_id: i64, row: Option<GpkgSrs>, notes: &mut Vec<
         None => u32::try_from(srs_id).ok().filter(|c| matches!(c, 4326 | 3857)),
         Some(_) => None,
     };
-    if let Some(crs) = epsg.and_then(Crs::from_epsg) {
-        // The method is the WKT2's, or the WKT1's when the WKT2 can't be parsed.
-        let named = wkt2.filter(|d| crate::raster::wkt::parses(d)).or(wkt1).or(wkt2);
-        if let Some(note) = named.and_then(|d| crate::raster::wkt::projection_compatibility_note(d, crs)) {
-            notes.push(format!(
-                "its coordinate system (srs_id {srs_id}): using EPSG:{} parameters in preference to the WKT definition; {note}",
-                crs.epsg()
-            ));
-        }
-        // A grid the definition gives isn't applied by the code either (#1678).
-        if let Some(note) = named.and_then(|d| crate::raster::wkt::unapplied_note(d, crs)) {
-            notes.push(format!("its coordinate system (srs_id {srs_id}): {note}"));
-        }
-        return Ok(Reproject::from_crs(crs, notes));
-    }
     let what = format!("its coordinate system (srs_id {srs_id})");
+    if let Some(code) = epsg
+        && let Some(crs) = Crs::from_epsg(code)
+    {
+        // The method is the WKT2's, or the WKT1's when the WKT2 can't be parsed. Another body's
+        // WKT2 is used even then, so its system is caught as it is without a code (below).
+        let wkt2_named = wkt2.filter(|d| crate::raster::wkt::parses(d) || crate::raster::wkt::planetary_datum(d).is_some());
+        let named = wkt2_named.or(wkt1).or(wkt2);
+        // The definition that counts (the WKT2 when there is one) is said when it can't be parsed,
+        // as it is without a code (below), with what is `used` in its place. One that parses has
+        // its shift compared with the code's, and the code names its system.
+        let which = if wkt2.is_some() { "WKT2 definition" } else { "definition" };
+        let passed_over = |used: &str| {
+            let e = definition.filter(|d| !crate::raster::wkt::parses(d)).and_then(|d| crate::raster::wkt::read_wkt(d).err())?;
+            Some(format!("{what}: its {which} can't be read ({e}), so {used} is used"))
+        };
+        // The definition is read in place of the code when it gives another shift to WGS 84, or is
+        // another body's system, as a `.prj` is read in place of its own `AUTHORITY` (#1677).
+        match named.and_then(|d| crate::raster::wkt::read_wkt_over_code(d, code)) {
+            Some(Ok((crs, note))) => {
+                // Read from the WKT1, in place of a WKT2 that can't be parsed.
+                if wkt2.is_some() && named != wkt2 {
+                    notes.extend(passed_over("its WKT1 definition"));
+                }
+                notes.extend(note.map(|n| format!("{what}: {n}")));
+                return Ok(Reproject::from_crs(crs, notes));
+            }
+            // Another body's system that can't be read: not returned here, as the definition path
+            // below refuses it, and says a WKT2 it passes over.
+            Some(Err(_)) => {}
+            None => {
+                notes.extend(passed_over(&format!("EPSG:{code}")));
+                if let Some(note) = named.and_then(|d| crate::raster::wkt::projection_compatibility_note(d, crs)) {
+                    notes.push(format!("{what}: using EPSG:{} parameters in preference to the WKT definition; {note}", crs.epsg()));
+                }
+                // A grid the definition gives isn't applied by the code either (#1678).
+                if let Some(note) = named.and_then(|d| crate::raster::wkt::unapplied_note(d, crs)) {
+                    notes.push(format!("{what}: {note}"));
+                }
+                return Ok(Reproject::from_crs(crs, notes));
+            }
+        }
+    }
     // Another body's system that can't be converted is told by its definition, or without one by
     // its organization and code (an IAU one). Its longitude/latitude are read with a notice. Other
     // coordinates are refused, because they would land in the wrong place. A planetary definition

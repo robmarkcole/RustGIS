@@ -210,22 +210,28 @@ fn wkids(t: &[u8], x: &[u8]) -> Vec<(String, u32)> {
 }
 
 /// The coordinate system Esri data names: by its EPSG or Esri `code` (a WKID), else from its `wkt`,
-/// with the transformer to longitude/latitude. `(None, None)` for longitude/latitude, and for a
-/// system that can't be read, which `report` says; coordinates are then read as longitude/latitude.
-/// Another body's system that can't be read is an error instead, because its coordinates would
-/// land in the wrong place as longitude/latitude. The File Geodatabase and ArcGIS protocol buffer
-/// readers share it.
+/// with the transformer to longitude/latitude. The WKT comes before the code when it gives another
+/// shift to WGS 84 than an EPSG code's, or is another body's system ([`esri_wkt_over_code`]).
+/// `(None, None)` for longitude/latitude, and for a system that can't be read, which `report`
+/// says; coordinates are then read as longitude/latitude. Another body's system that can't be read
+/// is an error instead, because its coordinates would land in the wrong place as
+/// longitude/latitude. The File Geodatabase and ArcGIS protocol buffer readers share it.
 pub(crate) fn esri_crs(code: Option<u32>, wkt: Option<&str>, report: &mut ReadReport) -> Result<(Option<Crs>, Option<Transformer>)> {
     use crate::raster::planetary;
-    // By its code, else from the WKT.
-    let by_code = code.and_then(crs_of_code).and_then(|c| match c.transformer() {
-        Ok(t) if c != Crs::LonLat => Some((Some(c), Some(t))),
-        Ok(_) => Some((None, None)),
-        Err(_) => None,
-    });
+    // By its code, unless the WKT is read in its place ([`esri_wkt_over_code`]); else from the WKT.
+    let over_code = esri_wkt_over_code(code, wkt);
+    let by_code = if over_code.is_some() {
+        None
+    } else {
+        code.and_then(crs_of_code).and_then(|c| match c.transformer() {
+            Ok(t) if c != Crs::LonLat => Some((Some(c), Some(t))),
+            Ok(_) => Some((None, None)),
+            Err(_) => None,
+        })
+    };
     Ok(match (by_code, wkt) {
         (Some(by_code), _) => by_code,
-        (None, Some(wkt)) => match crate::raster::wkt::read_wkt(wkt) {
+        (None, Some(wkt)) => match over_code.unwrap_or_else(|| crate::raster::wkt::read_wkt(wkt)) {
             Ok((c, note)) => {
                 if let Some(n) = note {
                     report.messages.push(format!("coordinate system: {n}"));
@@ -249,6 +255,21 @@ pub(crate) fn esri_crs(code: Option<u32>, wkt: Option<&str>, report: &mut ReadRe
         },
         (None, None) => (None, None),
     })
+}
+
+/// Esri data's `wkt` read in place of its `code`, as a `.prj` is read in place of its own
+/// `AUTHORITY` ([`read_wkt_over_code`](crate::raster::wkt::read_wkt_over_code), which gives the
+/// three cases): when it gives another shift to WGS 84 than an EPSG code's, or is another body's
+/// system. For an Esri (non-EPSG) code the WKT's shift is ignored, as ArcGIS keeps
+/// transformations apart from the system. Only another body's WKT replaces an Esri code, as
+/// Esri's codes are the Earth's too.
+pub(crate) fn esri_wkt_over_code(code: Option<u32>, wkt: Option<&str>) -> Option<std::result::Result<(Crs, Option<String>), String>> {
+    let (code, wkt) = (code?, wkt?);
+    if Crs::from_epsg(code).is_some() {
+        crate::raster::wkt::read_wkt_over_code(wkt, code)
+    } else {
+        crate::raster::wkt::planetary_datum(wkt).map(|_| crate::raster::wkt::read_wkt(wkt))
+    }
 }
 
 /// A coordinate system by its EPSG or Esri code.

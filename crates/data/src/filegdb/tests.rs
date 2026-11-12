@@ -685,6 +685,72 @@ fn planetary_systems_are_said_or_refused() {
     assert!(report.messages.iter().any(|m| m.contains("Bonne")) && !report.messages.iter().any(body), "{:?}", report.messages);
 }
 
+/// #1677: an EPSG code is used as a `.prj`'s own `AUTHORITY` is: when the WKT gives no shift to WGS
+/// 84, as Esri's doesn't, or the code's own. Another shift is read from the WKT. An Esri code is
+/// used whatever shift its WKT gives. Neither kind of code, both the Earth's, is used for another
+/// body's WKT.
+#[test]
+fn a_code_gives_way_to_its_wkts_shift_or_body() {
+    let bng = crate::raster::wkt::to_wkt(Crs::Epsg(27700)).unwrap();
+    let own = "TOWGS84[446.448,-125.157,542.06,0.15,0.247,0.842,-20.489]";
+    let other = bng.replace(own, "TOWGS84[375,-111,431,0,0,0,0]");
+    assert_ne!(other, bng);
+    let esri_bng = r#"PROJCS["British_National_Grid",GEOGCS["GCS_OSGB_1936",DATUM["D_OSGB_1936",SPHEROID["Airy_1830",6377563.396,299.3249646]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]],PROJECTION["Transverse_Mercator"],PARAMETER["False_Easting",400000.0],PARAMETER["False_Northing",-100000.0],PARAMETER["Central_Meridian",-2.0],PARAMETER["Scale_Factor",0.9996012717],PARAMETER["Latitude_Of_Origin",49.0],UNIT["Meter",1.0]]"#;
+    for wkt in [esri_bng, &bng] {
+        let mut report = ReadReport::default();
+        let (crs, t) = esri_crs(Some(27700), Some(wkt), &mut report).unwrap();
+        assert_eq!(crs, Some(Crs::Epsg(27700)));
+        assert!(t.is_some() && report.messages.is_empty(), "{:?}", report.messages);
+    }
+    let mut report = ReadReport::default();
+    let (crs, t) = esri_crs(Some(27700), Some(&other), &mut report).unwrap();
+    assert_eq!(crs, crate::raster::wkt::crs_from_wkt(&other).ok());
+    assert!(crs.is_some_and(|c| c.custom_def().is_some_and(|d| d.proj4.contains("+towgs84=375,-111,431"))), "{crs:?}");
+    assert!(t.is_some() && report.messages.is_empty(), "{:?}", report.messages);
+    // A shift of zero where the code has one is the WKT's, said.
+    let mut report = ReadReport::default();
+    let (crs, _) = esri_crs(Some(27700), Some(&bng.replace(own, "TOWGS84[0,0,0,0,0,0,0]")), &mut report).unwrap();
+    assert!(matches!(crs, Some(Crs::Custom(_))), "{crs:?}");
+    assert_eq!(
+        report.messages,
+        ["coordinate system: the file gives a shift of zero to WGS 84, which is used in place of EPSG:27700's transformation"]
+    );
+    // A WKT bound to a system whose shift to WGS 84 isn't known (NAD 27's is a grid) can't be
+    // read: the code, and the WKT's shift is said to be set aside.
+    let nad27 = r#"GEOGCS["NAD27",DATUM["North_American_Datum_1927",SPHEROID["Clarke 1866",6378206.4,294.978698213898]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433],AUTHORITY["EPSG","4267"]]"#;
+    let unknown = crate::raster::wkt::tests::bound_crs(&bng, nad27, &[375.0, -111.0, 431.0]);
+    let mut report = ReadReport::default();
+    let (crs, t) = esri_crs(Some(27700), Some(&unknown), &mut report).unwrap();
+    assert_eq!(crs, Some(Crs::Epsg(27700)));
+    assert!(t.is_some());
+    assert_eq!(
+        report.messages,
+        [
+            "coordinate system: the file's own shift to WGS 84 is set aside for EPSG:27700's, because the shift from NAD27 to WGS 84 isn't known"
+        ]
+    );
+    // An Esri code (South America Albers) with a WKT giving a shift: the code.
+    let albers = crs_of_code(102033).unwrap();
+    let shifted = r#"PROJCS["South_America_Albers_Equal_Area_Conic",GEOGCS["GCS_South_American_1969",DATUM["D_South_American_1969",SPHEROID["GRS_1967_Truncated",6378160.0,298.25],TOWGS84[1,2,3,0,0,0,0]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]],PROJECTION["Albers"],PARAMETER["False_Easting",0.0],PARAMETER["False_Northing",0.0],PARAMETER["Central_Meridian",-60.0],PARAMETER["Standard_Parallel_1",-5.0],PARAMETER["Standard_Parallel_2",-42.0],PARAMETER["Latitude_Of_Origin",-32.0],UNIT["Meter",1.0]]"#;
+    let mut report = ReadReport::default();
+    assert_eq!(esri_crs(Some(102033), Some(shifted), &mut report).unwrap().0, Some(albers));
+    assert!(report.messages.is_empty(), "{:?}", report.messages);
+    // Mars, under an EPSG code and an Esri one: read as Mars, said, or refused.
+    let mars = r#"GEOGCS["GCS_Mars_2015_-_Sphere_Ocentric",DATUM["D_Mars_2015_-_Sphere",SPHEROID["Mars_2015_-_Sphere",3396190.0,0.0]],PRIMEM["Reference_Meridian",0.0],UNIT["Degree",0.0174532925199433]]"#;
+    let body = |m: &String| m.contains("belongs to another body than the Earth");
+    for code in [4326, 102033] {
+        let mut report = ReadReport::default();
+        let (crs, _) = esri_crs(Some(code), Some(mars), &mut report).unwrap();
+        assert!(crs.is_some_and(Crs::is_planetary), "{code}: {crs:?}");
+        assert_eq!(report.messages.iter().filter(|m| body(m)).count(), 1, "{code}: {:?}", report.messages);
+        let bonne = format!(
+            r#"PROJCS["Bonne",{mars},PROJECTION["Bonne"],PARAMETER["Central_Meridian",0.0],PARAMETER["Standard_Parallel_1",30.0],UNIT["Meter",1.0]]"#
+        );
+        let e = esri_crs(Some(code), Some(&bonne), &mut ReadReport::default()).err().unwrap().to_string();
+        assert!(e.contains("belongs to another body than the Earth") && e.contains("Bonne"), "{code}: {e}");
+    }
+}
+
 /// #1486: the projected placement cases, as a feature class's WKT. (A File Geodatabase holds Esri
 /// WKT1, which has no bound systems.)
 #[test]

@@ -482,6 +482,53 @@ fn geopackage_iau_systems_are_read_said_or_refused() {
     assert!(planetary_notes(&mem(&path).unwrap().info().notes).is_empty());
 }
 
+/// #1677: a GeoPackage row naming an Earth system by its EPSG code while its definition is Mars's
+/// is read from its definition, or refused, on the desktop and in the browser. It isn't read as
+/// the code's Earth system.
+#[test]
+fn a_geopackage_rows_epsg_code_is_ignored_for_another_bodys_system() {
+    let dir = tempfile::tempdir().unwrap();
+    let mem =
+        |path: &Path| source::gpkg_mem::GpkgMemSource::open_shared(source::Shared(std::sync::Arc::new(std::fs::read(path).unwrap())), None);
+    let with_wkt2 = |path: &Path, wkt2: &str| {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute("ALTER TABLE gpkg_spatial_ref_sys ADD COLUMN definition_12_063 TEXT", []).unwrap();
+        conn.execute("UPDATE gpkg_spatial_ref_sys SET definition_12_063 = ?1 WHERE srs_id = 990001", [wkt2]).unwrap();
+    };
+    // Longitudes counted west, in the WKT2, beside an Earth WKT1 or none: refused.
+    let wgs84 = r#"GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]]"#;
+    for (name, wkt1) in [("west_wkt1_earth", wgs84), ("west_alone", "undefined")] {
+        let path = geopackage(dir.path(), name, LONLAT, ("EPSG", 4326, wkt1));
+        with_wkt2(&path, MARS_WEST);
+        let e = io::read_path(&path).unwrap_err().to_string();
+        assert!(e.contains(ANOTHER_BODY) && e.contains("srs_id 990001"), "{name}: {e}");
+        let e = mem(&path).err().unwrap().to_string();
+        assert!(e.contains(ANOTHER_BODY), "{name}: {e}");
+    }
+    // Planetocentric, in either definition: the body's longitude/latitude, said once.
+    for (name, wkt1, wkt2) in [("ocentric_wkt2", "undefined", Some(MARS_WKT2)), ("ocentric_wkt1", MARS_ESRI, None)] {
+        let path = geopackage(dir.path(), name, LONLAT, ("EPSG", 4326, wkt1));
+        if let Some(wkt2) = wkt2 {
+            with_wkt2(&path, wkt2);
+        }
+        let (ds, report) = io::read_path(&path).unwrap();
+        assert_eq!(points(&ds), LONLAT.map(|(x, y)| Coord::new(x, y)).to_vec(), "{name}");
+        assert_eq!(planetary_notes(&report.messages).len(), 1, "{name}: {:?}", report.messages);
+        assert!(ds.crs.is_some_and(Crs::is_planetary), "{name}: {:?}", ds.crs);
+        assert_eq!(planetary_notes(&mem(&path).unwrap().info().notes).len(), 1, "{name}");
+    }
+    // Mars metres under Web Mercator's code are unprojected on Mars's sphere.
+    let r = 3_396_190.0f64;
+    let metres = LONLAT.map(|(lon, lat)| (r * lon.to_radians(), r * lat.to_radians()));
+    let path = geopackage(dir.path(), "eqc_3857", metres, ("EPSG", 3857, MARS_EQC));
+    let (ds, report) = io::read_path(&path).unwrap();
+    for (got, (lon, lat)) in points(&ds).into_iter().zip(LONLAT) {
+        assert!((got.x - lon).abs() < 1e-9 && (got.y - lat).abs() < 1e-9, "{got:?}");
+    }
+    assert_eq!(planetary_notes(&report.messages).len(), 1, "{:?}", report.messages);
+    assert_eq!(planetary_notes(&mem(&path).unwrap().info().notes).len(), 1);
+}
+
 /// A FlatGeobuf of `native` points whose header names its system by `org` and `code`, with `wkt`,
 /// as GDAL writes an IAU one.
 fn flatgeobuf(path: &Path, native: [(f64, f64); 2], org: Option<&str>, code: i32, wkt: Option<&str>) {

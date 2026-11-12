@@ -446,6 +446,59 @@ fn a_wkt_that_isnt_utf8_is_said() {
     assert!(report.messages.is_empty(), "{:?}", report.messages);
 }
 
+/// #1677: a page's WKID 27700 with a WKT giving another shift to WGS 84 places its point as the
+/// WKT does, not as the code alone would. A WKT read in place of a code says that it isn't UTF-8.
+#[test]
+fn a_wkts_own_shift_wins_over_its_wkid() {
+    let bng = crate::raster::wkt::to_wkt(Crs::Epsg(27700)).unwrap();
+    let other = bng.replace("TOWGS84[446.448,-125.157,542.06,0.15,0.247,0.842,-20.489]", "TOWGS84[375,-111,431,0,0,0,0]");
+    assert_ne!(other, bng);
+    let xy = c(450_000.0, 250_000.0);
+    let page =
+        |reference: Vec<u8>| answer(&[message(8, &reference), transform(false, 1.0, xy.x, xy.y), feature(&[geometry(&[], &[0, 0])])]);
+    let at = |bytes: &[u8]| {
+        let (ds, report) = read(bytes, "t").unwrap();
+        match &ds.features[0].geometry {
+            Some(Geometry::Point(p)) => (*p, report.messages),
+            g => panic!("{g:?}"),
+        }
+    };
+    let by_wkt = crate::raster::wkt::crs_from_wkt(&other).unwrap().transformer().unwrap().to_lonlat(xy).unwrap();
+    let by_code = Crs::Epsg(27700).transformer().unwrap().to_lonlat(xy).unwrap();
+    let (p, messages) = at(&page([number(1, 27700), message(5, other.as_bytes())].concat()));
+    assert!((p.x - by_wkt.x).abs() < 1e-9 && (p.y - by_wkt.y).abs() < 1e-9, "{p:?} {by_wkt:?}");
+    assert!((p.x - by_code.x).abs() > 1e-6 || (p.y - by_code.y).abs() > 1e-6, "{p:?} {by_code:?}");
+    assert!(messages.is_empty(), "{messages:?}");
+    let (p, messages) = at(&page([number(1, 27700), message(5, bng.as_bytes())].concat()));
+    assert!((p.x - by_code.x).abs() < 1e-9 && (p.y - by_code.y).abs() < 1e-9, "{p:?} {by_code:?}");
+    assert!(messages.is_empty(), "{messages:?}");
+    // A byte that isn't UTF-8 in the system's name.
+    let not_utf8 = [b"PROJCS[\"\xff", other.strip_prefix("PROJCS[\"").unwrap().as_bytes()].concat();
+    let (_, messages) = at(&page([number(1, 27700), message(5, &not_utf8)].concat()));
+    assert!(messages.iter().any(|m| m.contains("isn't valid UTF-8")), "{messages:?}");
+    // The same byte in the code's own WKT gives no other shift: the code is read, nothing to say.
+    let not_utf8 = [b"PROJCS[\"\xff", bng.strip_prefix("PROJCS[\"").unwrap().as_bytes()].concat();
+    let (p, messages) = at(&page([number(1, 27700), message(5, &not_utf8)].concat()));
+    assert!((p.x - by_code.x).abs() < 1e-9 && (p.y - by_code.y).abs() < 1e-9, "{p:?} {by_code:?}");
+    assert!(messages.is_empty(), "{messages:?}");
+    // A byte that breaks the WKT: the code is read, and it's said, as the WKT might have won.
+    let broken = [b"PROJCS\xff\"", other.strip_prefix("PROJCS[\"").unwrap().as_bytes()].concat();
+    assert!(!crate::raster::wkt::parses(&String::from_utf8_lossy(&broken)));
+    let (p, messages) = at(&page([number(1, 27700), message(5, &broken)].concat()));
+    assert!((p.x - by_code.x).abs() < 1e-9 && (p.y - by_code.y).abs() < 1e-9, "{p:?} {by_code:?}");
+    assert_eq!(messages, ["the coordinate system's WKT isn't valid UTF-8; the bytes that can't be read are replaced with U+FFFD"]);
+    // A non-EPSG Esri code: its WKT is read only for another body's system, so a byte that
+    // breaks the WKT is said, and a byte in a name is not.
+    assert!(Crs::from_epsg(102033).is_none() && crate::filegdb::crs_of_code(102033).is_some());
+    let albers = crate::filegdb::crs_of_code(102033).unwrap().transformer().unwrap().to_lonlat(xy).unwrap();
+    let (p, messages) = at(&page([number(1, 102033), message(5, &broken)].concat()));
+    assert!((p.x - albers.x).abs() < 1e-9 && (p.y - albers.y).abs() < 1e-9, "{p:?} {albers:?}");
+    assert_eq!(messages, ["the coordinate system's WKT isn't valid UTF-8; the bytes that can't be read are replaced with U+FFFD"]);
+    let (p, messages) = at(&page([number(1, 102033), message(5, &not_utf8)].concat()));
+    assert!((p.x - albers.x).abs() < 1e-9 && (p.y - albers.y).abs() < 1e-9, "{p:?} {albers:?}");
+    assert!(messages.is_empty(), "{messages:?}");
+}
+
 #[test]
 fn cut_or_corrupted_answers_never_panic() {
     let whole = points();
