@@ -620,14 +620,15 @@ impl Projector {
                 .unwrap_or(rustgis_geom::MERCATOR_R);
             // Winkel Tripel's standard parallel as the definition gives it (the preset gives
             // Winkel's own), else 0, as PROJ and RustGIS's readers take it, so the map draws a
-            // definition where its data is read.
+            // definition where its data is read. The other projections have no standard parallel
+            // and ignore one, as the reader and PROJ do.
             let lat1 = match def.split_whitespace().find_map(|t| t.strip_prefix("+lat_1=")) {
-                Some(v) => v
+                Some(v) if kind == crate::world::Kind::WinkelTripel => v
                     .parse::<f64>()
                     .ok()
                     .filter(|v| v.is_finite() && v.abs() < 90.0)
                     .ok_or_else(|| format!("{code}: +lat_1={v} isn't a latitude short of a pole"))?,
-                None => 0.0,
+                _ => 0.0,
             };
             let engine = Engine::World(crate::world::World { lat1, ..crate::world::World::new(kind, lon0, radius) });
             return Ok(Projector { engine, to_meter: 1.0, domain, lon0, edge: std::sync::OnceLock::new() });
