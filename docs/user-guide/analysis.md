@@ -104,12 +104,17 @@ can take up to about twice as long as a one-thread run at its own (measured on o
 Silver 4114; it can be longer on others); in the web app, on one thread, the limits stay as they
 are. The error names the limit on this computer and the threads it counted. The limits on memory
 (the cells a grid may have, and those on the following pages) hold everywhere. Viewshed has no limit
-on its window (a radius past the raster's diagonal is taken as the diagonal), only on its ray steps:
-with no radius it covers the whole raster, so on a large one it can be refused where nobody can stop
-the run (the web app, a script, the assistant). A smaller radius, or a run from its pane on the
-desktop or with `rustgis-cli run`, gets it through. A
-tool's own default cell size still follows the one-thread limit, so it makes the same grid on any
-computer and from any caller; a finer cell size given is what a larger limit, or none, lets through.
+on its window (a radius past the raster's diagonal is taken as the diagonal), only on its ray steps,
+counted before it starts as the most it can take: each cell within the radius a step per cell
+between it and the observer (two with bilinear heights), though a ray stops where the ground first
+hides its cell and a cell with no data walks none. With no radius it covers the whole raster, so
+on a large one it can be refused where a run can't be stopped (listed above); a smaller radius, or
+a run from its pane on the desktop or with `rustgis-cli run` typed at a terminal, gets it through.
+Nothing caps it there, so a whole-raster viewshed of a large DEM can take long: its steps are at
+most its cells times the raster's longer side (counted twice with bilinear heights). Its progress
+shows, and **Cancel** stops it. A tool's own default cell size still follows the one-thread limit,
+so it makes the same grid on any computer and from any caller; a finer cell size given is what a
+larger limit, or none, lets through.
 
 From the command line or a script (`gp.run`), a built-in tool's parameter with a list of choices, such as Buffer's
 units, takes one of them in any letter case (`"meters"` for `Meters`); any other value is an error
