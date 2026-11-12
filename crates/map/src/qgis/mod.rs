@@ -16,6 +16,7 @@ mod labels;
 mod raster;
 mod renderer;
 mod source;
+mod structure;
 mod symbol;
 #[cfg(test)]
 mod tests;
@@ -31,6 +32,7 @@ use crate::symbology::{Labeling, LineStroke, MarkerRotation, Renderer};
 pub use annotation::{Annotation, MAX_ITEMS as MAX_ANNOTATIONS};
 pub use expr::{reads_measure, to_sql};
 pub use source::{Source, is_drive_relative, is_relative};
+pub use structure::{MAX_BOOKMARKS, MAX_RELATIONS, ProjectBookmark, ProjectRelation};
 
 /// The most XML nodes a project or style is read with (a large project's file is some hundred
 /// thousand).
@@ -120,6 +122,9 @@ pub struct Style {
     pub diagram: Option<crate::DiagramSettings>,
     /// 0 opaque to 100 invisible.
     pub transparency: Option<f32>,
+    /// The field whose dates the time slider reads (QGIS's time settings). Not applied by
+    /// [`Style::apply`]: the importer binds the layer once its fields are checked.
+    pub time: Option<String>,
     pub blend: Option<Blend>,
     /// A raster's colouring, stretch, resampling, brightness, contrast and mask.
     pub raster: Option<crate::raster::RasterStyle>,
@@ -408,6 +413,12 @@ pub struct Project {
     pub main_annotations: Option<ProjectLayer>,
     /// The groups of its layer tree (of QGIS 2's legend before it), each before the groups in it.
     pub groups: Vec<ProjectGroup>,
+    /// The map's rotation when it was saved, in degrees: QGIS turns the map this far clockwise.
+    pub rotation: f64,
+    /// Its spatial bookmarks, in the order QGIS lists them.
+    pub bookmarks: Vec<ProjectBookmark>,
+    /// Its relations between layers.
+    pub relations: Vec<ProjectRelation>,
 }
 
 /// A group of a QGIS project's layer tree.
@@ -482,11 +493,27 @@ pub fn read_project(text: &str, dir: &str, report: &mut Report) -> Result<Projec
         layers: Vec::new(),
         main_annotations: None,
         groups: Vec::new(),
+        rotation: 0.0,
+        bookmarks: Vec::new(),
+        relations: Vec::new(),
     };
     // The layer tree (QGIS 2's legend before it): the order layers draw in (top first), which
     // are checked, and their groups.
     let mut tree = Tree::read(root);
     project_notes(root, report);
+    // The map's rotation: one that doesn't read faces north, noted.
+    if let Some(r) = canvas.and_then(|c| child(c, "rotation")).and_then(|r| r.text()).map(str::trim).filter(|r| !r.is_empty()) {
+        match r.parse::<f64>().ok().filter(|r| r.is_finite()) {
+            Some(r) => project.rotation = r,
+            None => {
+                let r: String = r.chars().take(40).collect();
+                report.approximated("", format!("the map's rotation `{r}`, which doesn't read: facing north"));
+            }
+        }
+    }
+    project.bookmarks = structure::bookmarks(root, report);
+    project.relations = structure::relations(root, report);
+    structure::project_time(root, report);
     let maplayers: Vec<Node> =
         child(root, "projectlayers").map(|p| p.children().filter(|c| c.has_tag_name("maplayer")).collect()).unwrap_or_default();
     if maplayers.len() > MAX_LAYERS {
@@ -645,6 +672,7 @@ fn read_style_node(node: Node, layer: &str, report: &mut Report) -> Style {
         style.max_scale = Some(inside.map(|s| s * QGIS_SCALE));
     }
     layer_notes(node, layer, report);
+    style.time = structure::layer_time(node, layer, report);
     if let Some(r) = child(node, "renderer-v2") {
         renderer::read(r, layer, &mut style, report);
     }
@@ -681,9 +709,6 @@ fn old_labels(node: Node) -> bool {
 
 /// Notes a layer's settings RustGIS has no place for (a project's `<maplayer>` or a style's root).
 fn layer_notes(node: Node, layer: &str, report: &mut Report) {
-    if child(node, "temporal").is_some_and(|t| t.attribute("enabled") == Some("1")) {
-        report.skipped(layer, "its time settings");
-    }
     if let Some(m) = child(node, "map-layer-style-manager") {
         let current = m.attribute("current").unwrap_or_default();
         let others: Vec<&str> = m
@@ -709,8 +734,8 @@ fn layer_notes(node: Node, layer: &str, report: &mut Report) {
     }
 }
 
-/// Notes the project's parts RustGIS has no place for: print layouts, annotations, bookmarks,
-/// map themes and relations.
+/// Notes the project's parts RustGIS has no place for: print layouts, annotations of QGIS's
+/// older kind and map themes.
 fn project_notes(root: Node, report: &mut Report) {
     let count = |list: &str, item: &str| child(root, list).map_or(0, |l| l.children().filter(|c| c.has_tag_name(item)).count());
     let layouts = count("Layouts", "Layout") + root.children().filter(|c| c.has_tag_name("Composer")).count();
@@ -723,17 +748,9 @@ fn project_notes(root: Node, report: &mut Report) {
     if balloons > 0 {
         report.skipped("", format!("its annotations of QGIS's older kind ({balloons}: text, HTML, SVG and form balloons)"));
     }
-    let bookmarks = count("Bookmarks", "Bookmark");
-    if bookmarks > 0 {
-        report.skipped("", format!("its bookmarks ({bookmarks})"));
-    }
     let themes = count("visibility-presets", "visibility-preset");
     if themes > 0 {
         report.skipped("", format!("its map themes ({themes})"));
-    }
-    let relations = count("relations", "relation");
-    if relations > 0 {
-        report.skipped("", format!("its relations between layers ({relations})"));
     }
 }
 

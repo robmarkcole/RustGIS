@@ -27,7 +27,7 @@ pub fn commands() -> Vec<C> {
     vec![
         C::new("time.bind", "Bind to Time Slider", "View › Time", bind).roles(&[]).effects(crate::policy::Effects::NONE)
             .when(need_feature_layer)
-            .params(r#"{"layer"?, "field"?: date field (default: the one most of whose values read as dates), "start"?, "end"?: dates (default: the field's span, when the slider is new), "unit"?: "hour"|"day"|"month"|"year", "interval"?: number, "show"?: "step"|"wide"|"wider"|"cumulative"}"#),
+            .params(r#"{"layer"?, "field"?: date field (default: the one it is bound to, else the one most of whose values read as dates), "start"?, "end"?: dates (default: the field's span, when the slider is new), "unit"?: "hour"|"day"|"month"|"year", "interval"?: number, "show"?: "step"|"wide"|"wider"|"cumulative"}"#),
         C::new("time.unbind", "Unbind from Time Slider", "View › Time", |s, p| {
             let id = s.layer_id(p)?;
             let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
@@ -142,7 +142,12 @@ fn bind(s: &mut Session, p: &Value) -> CmdResult {
             l.dataset.field_index(fname).ok_or_else(|| format!("no field '{fname}'"))?;
             fname.to_string()
         }
-        None => time_fields(&l.dataset).into_iter().next().map(|(n, _)| n).ok_or("no field of this layer holds dates")?,
+        // A layer already bound keeps its field (one an import bound, say), while its values read as
+        // dates.
+        None => match l.time.as_ref().map(|t| t.field.as_str()).filter(|f| field_span(&l.dataset, f).is_some()) {
+            Some(bound) => bound.to_string(),
+            None => time_fields(&l.dataset).into_iter().next().map(|(n, _)| n).ok_or("no field of this layer holds dates")?,
+        },
     };
     let span = field_span(&l.dataset, &field).ok_or_else(|| format!("no value of '{field}' reads as a date"))?;
     let name = l.name.clone();

@@ -728,17 +728,20 @@ fn what_rustgis_has_no_place_for_is_noted() {
     </qgis>"#
     );
     let mut report = Report::default();
-    read_project(&qgs, "", &mut report).unwrap();
+    let p = read_project(&qgs, "", &mut report).unwrap();
     let said = |layer: &str, part: &str| report.notes.iter().any(|n| n.layer == layer && n.text.contains(part));
-    for part in
-        ["print layouts (1)", "annotations of QGIS's older kind (1", "bookmarks (1)", "map themes (1)", "relations between layers (1)"]
-    {
+    for part in [
+        "print layouts (1)",
+        "annotations of QGIS's older kind (1",
+        "bookmarks whose place doesn't read (1: Here)",
+        "map themes (1)",
+        "relations that name no layers or fields (1: r)",
+    ] {
         assert!(said("", part), "{part}: {:?}", report.notes);
     }
     // The main annotation layer's items, placed nowhere, are noted on it.
     assert!(said("Annotations", "2 annotations whose geometry doesn't read"), "{:?}", report.notes);
     for part in [
-        "time settings",
         "other styles (night)",
         "joins",
         "virtual fields",
@@ -756,6 +759,9 @@ fn what_rustgis_has_no_place_for_is_noted() {
     assert_eq!(report.notes.iter().find(|n| n.text.contains("draw effects")).map(|n| n.count), Some(1));
     // Wrapping and repeats along lines are read now, not noted.
     assert!(!said("A", "wrapped") && !said("A", "repeated"), "{:?}", report.notes);
+    // Its time by a date field is read now, not noted.
+    assert!(!said("A", "time settings"), "{:?}", report.notes);
+    assert_eq!(p.layers.iter().find(|l| l.name == "A").and_then(|l| l.style.time.as_deref()), Some("day"));
 }
 
 /// A raster style file with `renderer` as its renderer and `pipe` after it in the pipe.
@@ -1067,7 +1073,7 @@ fn every_corpus_file_reads() {
         read_style(&text, "layer", &mut report).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     }
     let projects = files("generated/qgs", &["qgs", "qgz"]);
-    assert_eq!(projects.len(), 23, "project corpus changed: {projects:?}");
+    assert_eq!(projects.len(), 24, "project corpus changed: {projects:?}");
     for path in &projects {
         let bytes = std::fs::read(path).unwrap();
         let text = if path.extension().is_some_and(|e| e == "qgz") {
@@ -2510,6 +2516,249 @@ fn the_corpus_groups_read_as_qgis_wrote_them() {
     let texts: Vec<&str> = report.notes.iter().map(|n| n.text.as_str()).collect();
     assert!(texts.iter().any(|t| t.contains("blending mode of groups drawn as one (1: Drawn as one)")), "{texts:?}");
     assert!(!texts.iter().any(|t| t.contains("group layers")), "{texts:?}");
+}
+
+/// A temporal element as QGIS 4.2 saves a vector layer's time settings (measured), `set`
+/// taking the place of its defaults.
+fn temporal(mode: &str, set: &[(&str, &str)]) -> String {
+    let defaults = [
+        ("accumulate", "0"),
+        ("durationField", ""),
+        ("durationUnit", "min"),
+        ("endExpression", ""),
+        ("endField", ""),
+        ("fixedDuration", "0"),
+        ("limitMode", "0"),
+        ("startExpression", ""),
+        ("startField", ""),
+    ];
+    let attrs: String =
+        defaults.iter().map(|(k, v)| format!(r#" {k}="{}""#, set.iter().find(|(s, _)| s == k).map_or(*v, |(_, v)| *v))).collect();
+    format!(r#"<temporal enabled="1" mode="{mode}"{attrs}><fixedRange><start></start><end></end></fixedRange></temporal>"#)
+}
+
+/// Bookmarks, relations, the map's rotation and time settings, in the shapes QGIS 4.2 saves
+/// them (measured): each read, and what RustGIS has no place for noted.
+#[test]
+fn bookmarks_relations_and_time_read_as_qgis_saves_them() {
+    let layer = |id: &str, t: &str| {
+        format!(
+            r#"<maplayer type="vector" geometry="Point"><id>{id}</id><datasource>./{id}.gpkg</datasource><layername>{id}</layername><provider>ogr</provider>{t}</maplayer>"#
+        )
+    };
+    let layers = [
+        layer("instant", &temporal("1", &[("startField", "when"), ("accumulate", "1")])),
+        layer("span", &temporal("2", &[("startField", "t0"), ("endField", "t1")])),
+        layer("lasting", &temporal("3", &[("startField", "t0"), ("durationField", "d")])),
+        layer("by_field", &temporal("4", &[("startExpression", "&quot;t0&quot;"), ("endExpression", "&quot;t1&quot;")])),
+        layer("by_expr", &temporal("4", &[("startExpression", "&quot;t&quot; + make_interval(days:=1)")])),
+        layer("fixed", &temporal("0", &[])),
+        layer("redraw", &temporal("5", &[])),
+        layer("closed", &temporal("1", &[("startField", "when"), ("limitMode", "1")])),
+        layer("lasting_events", &temporal("1", &[("startField", "when"), ("fixedDuration", "3"), ("durationUnit", "h")])),
+        layer("piling", &temporal("1", &[("startField", "when"), ("fixedDuration", "3"), ("accumulate", "1")])),
+        layer("unnamed", &temporal("1", &[])),
+        r#"<maplayer type="raster"><id>dem</id><datasource>./dem.tif</datasource><layername>dem</layername><provider>gdal</provider><temporal enabled="1" mode="0"/></maplayer>"#.to_string(),
+    ]
+    .concat();
+    // A ring of 10,001 points: not read in part.
+    let long = vec!["1 2"; 10_001].join(", ");
+    let wgs84 =
+        "<spatialrefsys nativeFormat=\"Wkt\"><proj4>+proj=longlat +datum=WGS84 +no_defs</proj4><authid>EPSG:4326</authid></spatialrefsys>";
+    let qgs = format!(
+        r#"<qgis version="4.2.3-Belém do Pará">
+      <projectCrs><spatialrefsys><authid>EPSG:3857</authid></spatialrefsys></projectCrs>
+      <mapcanvas annotationsVisible="1" name="theMapCanvas"><units>meters</units><extent><xmin>0</xmin><ymin>0</ymin><xmax>10</xmax><ymax>10</ymax></extent><rotation>15</rotation></mapcanvas>
+      <mapcanvas name="mapCanvas2"><rotation>x</rotation></mapcanvas>
+      <projectlayers>{layers}</projectlayers>
+      <relations>
+        <relation id="own" name="Owners of parcel" referencedLayer="parcels_1" referencingLayer="owners_1" strength="Composition"><fieldRef referencedField="id" referencingField="pid"/></relation>
+        <relation id="two" name="two keys" referencedLayer="parcels_1" referencingLayer="owners_1" strength="Association"><fieldRef referencedField="id" referencingField="pid"/><fieldRef referencedField="k2" referencingField="pk2"/></relation>
+        <relation id="none" name="" referencedLayer="parcels_1" referencingLayer="owners_1" strength="Association"/>
+        <relation id="nameless" name="" referencedLayer="parcels_1" referencingLayer="owners_1" strength="Association"><fieldRef referencedField="id" referencingField="pid"/></relation>
+        <relation id="half" name="half pair" referencedLayer="parcels_1" referencingLayer="owners_1" strength="Association"><fieldRef referencedField="id" referencingField="pid"/><fieldRef referencedField="k2"/></relation>
+      </relations>
+      <polymorphicRelations><relation id="poly" name="poly" referencedLayerExpression="@layer_name" referencedLayerField="y" referencedLayerIds="a,b" referencingLayer="events" relationStrength="Association"><fieldRef referencedField="id" referencingField="y"/></relation></polymorphicRelations>
+      <Bookmarks>
+        <Bookmark extent="Polygon ((8.40000000000000036 47.29999999999999716, 8.59999999999999964 47.29999999999999716, 8.59999999999999964 47.45000000000000284, 8.40000000000000036 47.45000000000000284, 8.40000000000000036 47.29999999999999716))" group="Swiss" id="{{0ac0}}" name="Zurich" rotation="0">{wgs84}</Bookmark>
+        <Bookmark extent="Polygon ((900000 5900000, 1000000 5900000, 1000000 6000000, 900000 6000000, 900000 5900000))" group="" id="{{0072}}" name="Web" rotation="30"/>
+        <Bookmark extent="Point (1 2)" group="" id="x" name="Nowhere" rotation="0"/>
+        <Bookmark extent="Polygon ((1 2, 3 2, 3 4, 1 4, 1 2))" group="" id="y" name="Askew" rotation="abc"/>
+        <Bookmark extent="Polygon (({long}))" group="" id="z" name="Long" rotation="0"/>
+        <Bookmark extent="Polygon ((1 2 9, 3 2 9, 3 4 9, 1 4 9, 1 2 9))" group="" id="h" name="High" rotation="0"/>
+        <Bookmark extent="Polygon ((1 2, 3 2, 3 4, 1 4, 1 2))" group="" id="n" name=" " rotation="0"/>
+        <Bookmark extent="Polygon ((1 2, 3 2, 3 4, 1 4, 1 2))" group="Lost" id="u" name="Blank" rotation="x"><spatialrefsys><authid></authid></spatialrefsys></Bookmark>
+      </Bookmarks>
+      <ProjectTimeSettings cumulativeTemporalRange="1" frameRate="5" timeStep="2" timeStepUnit="wk" totalMovieFrames="100">
+        <TemporalRange><start>2020-01-01T00:00:00Z</start><end>2020-12-31T00:00:00Z</end></TemporalRange>
+      </ProjectTimeSettings>
+    </qgis>"#
+    );
+    let mut report = Report::default();
+    let p = read_project(&qgs, "/p", &mut report).unwrap();
+    // The main canvas's (another canvas's unreadable one isn't read).
+    assert_eq!(p.rotation, 15.0);
+    let marks: Vec<(&str, [f64; 4], Option<&str>, f64)> =
+        p.bookmarks.iter().map(|b| (b.name.as_str(), b.extent, b.crs.as_deref(), b.rotation)).collect();
+    assert_eq!(
+        marks,
+        [
+            ("Zurich", [8.4, 47.3, 8.6, 47.45], Some("EPSG:4326"), 0.0),
+            ("Web", [900000.0, 5900000.0, 1000000.0, 6000000.0], None, 30.0),
+            ("Askew", [1.0, 2.0, 3.0, 4.0], None, 0.0),
+            ("Bookmark", [1.0, 2.0, 3.0, 4.0], None, 0.0)
+        ]
+    );
+    let rels: Vec<(&str, &str, &str, &str, &str)> = p
+        .relations
+        .iter()
+        .map(|r| {
+            (r.name.as_str(), r.referenced.as_str(), r.referenced_field.as_str(), r.referencing.as_str(), r.referencing_field.as_str())
+        })
+        .collect();
+    assert_eq!(
+        rels,
+        [
+            ("Owners of parcel", "parcels_1", "id", "owners_1", "pid"),
+            ("two keys", "parcels_1", "id", "owners_1", "pid"),
+            ("nameless", "parcels_1", "id", "owners_1", "pid"),
+            ("half pair", "parcels_1", "id", "owners_1", "pid")
+        ]
+    );
+    let time = |name: &str| p.layers.iter().find(|l| l.name == name).and_then(|l| l.style.time.as_deref());
+    for (name, field) in [
+        ("instant", Some("when")),
+        ("span", Some("t0")),
+        ("lasting", Some("t0")),
+        ("by_field", Some("t0")),
+        ("by_expr", None),
+        ("fixed", None),
+        ("redraw", None),
+        ("closed", Some("when")),
+        ("unnamed", None),
+        ("dem", None),
+    ] {
+        assert_eq!(time(name), field, "{name}");
+    }
+    let said =
+        |layer: &str, kind: NoteKind, part: &str| report.notes.iter().any(|n| n.layer == layer && n.kind == kind && n.text.contains(part));
+    use NoteKind::{Approximated as A, Skipped as S};
+    for (layer, kind, part) in [
+        ("", S, "the groups of its bookmarks (1: Swiss)"),
+        ("", S, "its bookmarks whose place doesn't read (3: Nowhere, Long, High)"),
+        ("", S, "its relation half pair's pairs of fields that don't name both (1)"),
+        ("", A, "its bookmarks with no name, named Bookmark (1)"),
+        ("", S, "its bookmarks whose coordinate system doesn't read (1: Blank)"),
+        ("", A, "its relations with no name, named by their id, else Relation (1: nameless)"),
+        ("", A, "its bookmarks whose rotation doesn't read, facing north (1: Askew)"),
+        ("lasting_events", A, "its features lasting 3 hours each: each shown at its date alone"),
+        ("", S, "its relation Owners of parcel's composition"),
+        ("", A, "its relation two keys on 2 pairs of fields: related by the first (pid = id) alone"),
+        ("", S, "its relations that name no layers or fields (1: none)"),
+        ("", S, "its polymorphic relations (1"),
+        ("", S, "its time span and steps (2020-01-01 to 2020-12-31, steps of 2 weeks, cumulative): the time slider is left off"),
+        ("instant", A, "its features accumulating over time"),
+        ("span", A, "its features' end dates (the field t1): each shown at its start date alone"),
+        ("lasting", A, "its features' durations (the field d)"),
+        ("by_field", A, "its features' end dates (`\"t1\"`)"),
+        ("by_expr", S, "its time, from the expression `\"t\" + make_interval(days:=1)`"),
+        ("fixed", S, "its fixed time range"),
+        ("redraw", S, "its redrawing as the map's time changes"),
+        ("closed", A, "a feature at the very end of a time step"),
+        ("unnamed", S, "its time settings, which name no field"),
+        ("dem", S, "its time settings"),
+    ] {
+        assert!(said(layer, kind, part), "{layer}: {part}: {:#?}", report.notes);
+    }
+    // Accumulating, an event has no duration of its own.
+    assert!(!said("piling", A, "lasting"), "{:#?}", report.notes);
+    assert!(!report.notes.iter().any(|n| n.text.contains("the map's rotation")), "{:#?}", report.notes);
+    // Each layer's time noted once.
+    assert_eq!(report.notes.iter().filter(|n| n.layer == "by_expr").count(), 1, "{:#?}", report.notes);
+}
+
+/// A project whose bookmarks, relation and time settings carry over whole gives no note on them:
+/// QGIS's default time settings (no span) included.
+#[test]
+fn bookmarks_relations_and_time_that_carry_over_whole_are_not_noted() {
+    let qgs = format!(
+        r#"<qgis version="4.2.3">
+      <projectlayers><maplayer type="vector" geometry="Point"><id>a</id><datasource>./a.gpkg</datasource><layername>a</layername><provider>ogr</provider>{}</maplayer></projectlayers>
+      <relations><relation id="r" name="r" referencedLayer="a" referencingLayer="b" strength="Association"><fieldRef referencedField="id" referencingField="aid"/></relation></relations>
+      <Bookmarks><Bookmark extent="Polygon ((1 2, 3 2, 3 4, 1 4, 1 2))" group="" id="b" name="Here" rotation="0"/></Bookmarks>
+      <ProjectTimeSettings cumulativeTemporalRange="0" frameRate="1" timeStep="1" timeStepUnit="h" totalMovieFrames="100"/>
+    </qgis>"#,
+        temporal("1", &[("startField", "day")])
+    );
+    let mut report = Report::default();
+    let p = read_project(&qgs, "/p", &mut report).unwrap();
+    assert_eq!((p.bookmarks.len(), p.relations.len(), p.rotation), (1, 1, 0.0));
+    assert_eq!(p.layers.first().and_then(|l| l.style.time.as_deref()), Some("day"));
+    assert!(report.notes.is_empty(), "{:#?}", report.notes);
+}
+
+/// The corpus's project structure, as QGIS wrote it: its bookmark, relation and a layer's time
+/// by a date field.
+#[test]
+fn the_corpus_bookmarks_relations_and_time_read_as_qgis_wrote_them() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/qgis/generated/qgs");
+    let text = std::fs::read_to_string(root.join("structure-groups-themes-bookmarks-variables-relations-joins-time.qgs")).unwrap();
+    let mut report = Report::default();
+    let p = read_project(&text, "/p/qgs", &mut report).unwrap();
+    let marks: Vec<(&str, [f64; 4], Option<&str>)> = p.bookmarks.iter().map(|b| (b.name.as_str(), b.extent, b.crs.as_deref())).collect();
+    assert_eq!(marks, [("Old town", [2696400.0, 1261250.0, 2698200.0, 1262350.0], Some("EPSG:2056"))]);
+    let rels: Vec<(&str, &str, &str)> =
+        p.relations.iter().map(|r| (r.name.as_str(), r.referenced_field.as_str(), r.referencing_field.as_str())).collect();
+    assert_eq!(rels, [("lines to points", "id", "id")]);
+    let points = p.layers.iter().find(|l| l.name == "points").unwrap();
+    assert_eq!(points.style.time.as_deref(), Some("day"));
+    let texts: Vec<&str> = report.notes.iter().map(|n| n.text.as_str()).collect();
+    assert!(!texts.iter().any(|t| t.contains("bookmark") || t.contains("relation") || t.contains("time settings")), "{texts:?}");
+}
+
+/// The corpus's bookmarks, relations and time settings as QGIS 4.2 wrote them: a bookmark turned
+/// and in a group, one in degrees; relations on one pair of fields, on two, a composition and a
+/// polymorphic one; a span of months, and each layer's time read or noted.
+#[test]
+fn the_corpus_bookmarks_relations_and_time_settings_read_as_qgis_wrote_them() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/qgis/generated/qgs");
+    let text = std::fs::read_to_string(root.join("bookmarks-relations-time.qgs")).unwrap();
+    let mut report = Report::default();
+    let p = read_project(&text, "/p/qgs", &mut report).unwrap();
+    let marks: Vec<(&str, Option<&str>, f64)> = p.bookmarks.iter().map(|b| (b.name.as_str(), b.crs.as_deref(), b.rotation)).collect();
+    assert_eq!(marks, [("Old town", Some("EPSG:2056"), 30.0), ("Region", Some("EPSG:4326"), 0.0)]);
+    assert_eq!(p.bookmarks[0].extent, [2696400.0, 1261250.0, 2698200.0, 1262350.0]);
+    let rels: Vec<&str> = p.relations.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(rels, ["lines to points", "lines to points by kind", "polygons of points"]);
+    let time = |name: &str| p.layers.iter().find(|l| l.name == name).and_then(|l| l.style.time.as_deref());
+    assert_eq!((time("points"), time("lines"), time("polygons")), (Some("day"), Some("day"), None));
+    let said = |layer: &str, part: &str| report.notes.iter().any(|n| n.layer == layer && n.text.contains(part));
+    for (layer, part) in [
+        ("", "the groups of its bookmarks (1: Places)"),
+        ("", "its relation lines to points by kind on 2 pairs of fields"),
+        ("", "its relation polygons of points's composition"),
+        ("", "its polymorphic relations (1"),
+        ("", "its time span and steps (2024-01-01 to 2024-12-31, steps of 1 month, cumulative)"),
+        ("points", "accumulating over time"),
+        ("lines", "its features' durations (the field value)"),
+        ("polygons", "its fixed time range"),
+    ] {
+        assert!(said(layer, part), "{layer}: {part}: {:#?}", report.notes);
+    }
+}
+
+/// The map's rotation that doesn't read faces north, noted.
+#[test]
+fn a_map_rotation_that_does_not_read_is_noted() {
+    let qgs = r#"<qgis version="4.2.3"><mapcanvas name="theMapCanvas"><rotation>sideways</rotation></mapcanvas></qgis>"#;
+    let mut report = Report::default();
+    let p = read_project(qgs, "/p", &mut report).unwrap();
+    assert_eq!(p.rotation, 0.0);
+    assert!(
+        report.notes.iter().any(|n| n.text == "the map's rotation `sideways`, which doesn't read: facing north"),
+        "{:#?}",
+        report.notes
+    );
 }
 
 /// A project nested past the limit, or whose namespaces would take too long to resolve, is refused

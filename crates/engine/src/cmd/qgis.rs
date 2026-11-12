@@ -137,7 +137,9 @@ fn import_project(s: &mut Session, p: &Value) -> CmdResult {
     }
     note_texts_under_layers_above(&drawn, &mut report);
     add_groups(s, &project, &came_in, &mut report);
+    add_relations(s, &project, &came_in, &mut report);
     go_to_view(s, &project, degrees);
+    add_bookmarks(s, &project, &mut report);
     let notes: Vec<Value> = report.notes.iter().map(note_json).collect();
     if !report.notes.is_empty() {
         let left = report.notes.iter().filter(|n| n.kind == NoteKind::Skipped).count();
@@ -357,6 +359,7 @@ fn add_layer(s: &mut Session, layer: &qgis::ProjectLayer, has_dir: bool, report:
     if layer.style.diagram.is_some() {
         check_diagram(l, name, report);
     }
+    bind_time(l, name, layer.style.time.as_deref(), report);
     Ok(Some(added_name))
 }
 
@@ -1000,6 +1003,289 @@ fn go_to_view(s: &mut Session, project: &qgis::Project, degrees: Option<Geograph
     if !target.is_empty() {
         s.zoom_to(&target);
     }
+    // QGIS turns the map clockwise; a bearing faces the top of the view east of north.
+    if project.rotation != 0.0 {
+        s.map_mut().camera.set_bearing(-project.rotation);
+    }
+}
+
+/// Binds `l` to the time slider on `field` (from a QGIS layer's time settings), when it has the
+/// field and its values read as dates; noted when not. A streamed layer's rows aren't read yet,
+/// so it is bound on the field alone, its dates read as its features are. Whether it was bound.
+fn bind_time(l: &mut rustgis_map::Layer, name: &str, field: Option<&str>, report: &mut Report) -> bool {
+    let Some(field) = field else { return false };
+    match l.dataset.field_index(field).and_then(|i| l.dataset.fields.get(i)) {
+        Some(f) if l.is_streamed() || rustgis_map::time::field_span(&l.dataset, &f.name).is_some() => {
+            if l.is_streamed() {
+                report.approximated(
+                    name,
+                    format!("its time settings, by the field {field}, bound before its features are read: one whose value isn't a date is hidden while the slider is on, or every one shows when none reads as one"),
+                );
+            }
+            l.time = Some(rustgis_map::time::TimeBinding::new(f.name.clone()));
+            true
+        }
+        Some(_) => {
+            report.skipped(name, format!("its time settings, by the field {field}, none of whose values read as dates"));
+            false
+        }
+        None => {
+            report.skipped(name, format!("its time settings, by the field {field}, which the layer hasn't"));
+            false
+        }
+    }
+}
+
+/// Adds the project's relations between layers that came in as RustGIS relationships (origin:
+/// the referenced, parent layer; destination: the referencing, child layer). A relation whose
+/// layers didn't come in, or haven't its fields, is noted; one whose name is taken is numbered.
+fn add_relations(s: &mut Session, project: &qgis::Project, came_in: &[CameIn], report: &mut Report) {
+    // The map layer a project layer came in as, with the field. A file of several layers (one
+    // QGIS names by `layerid`, which isn't read) adds them all: when more than one has the field,
+    // which the relation means isn't known (`Err`), rather than taking the first.
+    let find = |s: &Session, id: &str, field: &str| -> Option<Result<(String, String), ()>> {
+        let index = project.layers.iter().position(|l| l.id == id)?;
+        let c = came_in.iter().find(|c| c.index == index)?;
+        let mut with: Vec<(String, String)> = c
+            .ids
+            .iter()
+            .filter_map(|lid| {
+                let l = s.map().layer(*lid).filter(|l| !l.is_raster())?;
+                let f = l.dataset.field_index(field).and_then(|i| l.dataset.fields.get(i))?;
+                Some((l.name.clone(), f.name.clone()))
+            })
+            .collect();
+        match with.len() {
+            0 => None,
+            1 => with.pop().map(Ok),
+            _ => Some(Err(())),
+        }
+    };
+    let mut missing = Vec::new();
+    // Those between layers that came in as several, either of which could be meant.
+    let mut ambiguous = Vec::new();
+    let mut names = Names::new(s.map().editing.relationships.iter().map(|r| r.name.as_str()), MAX_RELATION_NAME);
+    for r in &project.relations {
+        let (origin, destination) = (find(s, &r.referenced, &r.referenced_field), find(s, &r.referencing, &r.referencing_field));
+        let (Some(Ok((origin, origin_key))), Some(Ok((destination, destination_key)))) = (&origin, &destination) else {
+            // (A layer that didn't come in, or hasn't the field, is the reason first.)
+            if origin.is_none() || destination.is_none() {
+                missing.push(r.name.as_str());
+            } else {
+                ambiguous.push(r.name.as_str());
+            }
+            continue;
+        };
+        let (origin, origin_key, destination, destination_key) =
+            (origin.clone(), origin_key.clone(), destination.clone(), destination_key.clone());
+        // A relationship names its layers: their names are unique (a layer added under a taken
+        // name, ignoring case, is numbered), so it relates the ones that came in.
+        let name = names.take(&r.name);
+        s.map_mut().editing.relationships.push(rustgis_map::design::Relationship {
+            name,
+            origin,
+            origin_key,
+            destination,
+            destination_key,
+        });
+    }
+    let listed = |names: &[&str]| {
+        let mut text = names.iter().take(8).copied().collect::<Vec<_>>().join(", ");
+        if names.len() > 8 {
+            text.push_str(", …");
+        }
+        format!("{}: {text}", names.len())
+    };
+    if !missing.is_empty() {
+        report.skipped("", format!("its relations between layers that didn't come in or haven't the fields ({})", listed(&missing)));
+    }
+    if !ambiguous.is_empty() {
+        report.skipped(
+            "",
+            format!(
+                "its relations to a layer that came in as several tables with the field, any of which it could mean ({})",
+                listed(&ambiguous)
+            ),
+        );
+    }
+    if names.cut > 0 {
+        report.approximated("", format!("relation names cut to {MAX_RELATION_NAME} characters ({})", names.cut));
+    }
+}
+
+/// The longest relationship name an import keeps.
+const MAX_RELATION_NAME: usize = 200;
+
+/// Names made unique as they are taken, ignoring case: a taken one numbered (`Name 2`, `Name 3`,
+/// …), kept to `max` characters. Each name's next number is remembered, so many alike don't
+/// count up from 2 every time.
+struct Names {
+    taken: std::collections::HashSet<String>,
+    next: std::collections::HashMap<String, u64>,
+    max: usize,
+    /// Names taken that were cut to `max`.
+    cut: usize,
+}
+
+impl Names {
+    fn new<'a>(taken: impl Iterator<Item = &'a str>, max: usize) -> Names {
+        Names { taken: taken.map(str::to_lowercase).collect(), next: std::collections::HashMap::new(), max, cut: 0 }
+    }
+
+    fn take(&mut self, base: &str) -> String {
+        let mut cut = base.chars().nth(self.max).is_some();
+        let base: String = base.chars().take(self.max).collect();
+        let key = base.to_lowercase();
+        let mut k = self.next.get(&key).copied().unwrap_or(1);
+        let name = loop {
+            let name = if k <= 1 {
+                base.clone()
+            } else {
+                let suffix = format!(" {k}");
+                let room = self.max.saturating_sub(suffix.len());
+                // (A name shortened to make room for its number is cut too.)
+                cut |= base.chars().nth(room).is_some();
+                base.chars().take(room).chain(suffix.chars()).collect()
+            };
+            if self.taken.insert(name.to_lowercase()) {
+                if cut {
+                    self.cut += 1;
+                }
+                break name;
+            }
+            k = k.saturating_add(1);
+        };
+        self.next.insert(key, k.saturating_add(1));
+        name
+    }
+}
+
+/// The most coordinate systems an import's bookmarks are read in: each is parsed, and a PROJ
+/// string stays in the run's table of systems.
+const MAX_BOOKMARK_CRS: usize = 100;
+
+/// Adds the project's bookmarks, each the place its extent shows (in its own coordinate system,
+/// else the project's), turned as QGIS turns it. One whose coordinate system doesn't read, or
+/// past the bookmarks a map keeps, is noted.
+///
+/// On the UI thread, with the rest of `project.importQgis`, which replaces the session's map: the
+/// work is bounded (at most 10,000 bookmarks, in at most [`MAX_BOOKMARK_CRS`] coordinate systems,
+/// each parsed once), well under a second.
+fn add_bookmarks(s: &mut Session, project: &qgis::Project, report: &mut Report) {
+    if project.bookmarks.is_empty() {
+        return;
+    }
+    let (w, h) = s.view_size;
+    let m = s.map_mut();
+    let view = m.camera;
+    // Names compare ignoring case, as a map's bookmarks do; a taken one is numbered.
+    let mut names = Names::new(m.bookmarks.iter().map(|b| b.name.as_str()), super::navigate::MAX_BOOKMARK_NAME);
+    // Those with no coordinate system, in one RustGIS can't read, and those whose place
+    // doesn't all lie in theirs.
+    let (mut none, mut unread, mut outside) = (Vec::new(), Vec::new(), Vec::new());
+    // Those the map's projection doesn't reach.
+    let mut beyond = Vec::new();
+    // Those in coordinate systems past the first `MAX_BOOKMARK_CRS`.
+    let mut many = Vec::new();
+    // Those read in the project's coordinate system, having none of their own.
+    let mut assumed = Vec::new();
+    // Those reaching past the latitudes a Web Mercator map shows (about 85°), fitted to the part
+    // it does.
+    let mut polar = Vec::new();
+    let mercator = matches!(m.flat(), rustgis_map::projection::Flat::Mercator);
+    let mut over = 0usize;
+    // One transformer per coordinate system.
+    let mut transformers: std::collections::HashMap<&str, Option<rustgis_data::raster::crs::Transformer>> =
+        std::collections::HashMap::new();
+    for b in &project.bookmarks {
+        let Some(crs) = b.crs.as_deref().or(project.crs.as_deref()) else {
+            none.push(b.name.as_str());
+            continue;
+        };
+        let own_crs = b.crs.is_some();
+        if !transformers.contains_key(crs) && transformers.len() >= MAX_BOOKMARK_CRS {
+            many.push(b.name.as_str());
+            continue;
+        }
+        let t = transformers.entry(crs).or_insert_with(|| rustgis_data::raster::crs::Crs::parse(crs).and_then(|c| c.transformer()).ok());
+        let Some(t) = t.as_ref() else {
+            unread.push(b.name.as_str());
+            continue;
+        };
+        let [x0, y0, x1, y1] = b.extent;
+        let corners: Vec<Coord> = [(x0, y0), (x1, y0), (x0, y1), (x1, y1)]
+            .into_iter()
+            .filter_map(|(x, y)| t.to_lonlat(Coord::new(x, y)))
+            .filter(|c| (-180.0..=180.0).contains(&c.x) && (-90.0..=90.0).contains(&c.y))
+            .collect();
+        let e = corners.iter().fold(Extent::EMPTY, |e, c| e.union(&Extent::new(c.x, c.y, c.x, c.y)));
+        if corners.len() < 4 || e.is_empty() {
+            outside.push(b.name.as_str());
+            continue;
+        }
+        if m.bookmarks.len() >= super::navigate::MAX_BOOKMARKS {
+            over += 1;
+            continue;
+        }
+        // QGIS's extent is the view's own rectangle, turned with it (measured: turning the map
+        // keeps its scale): fitted facing north, then turned.
+        m.camera.set_bearing(0.0);
+        // (Not one wholly past a Web Mercator map's 85°, nor one its projection doesn't reach.)
+        if !m.fit_lonlat(&e, w, h) {
+            beyond.push(b.name.as_str());
+            continue;
+        }
+        m.camera.set_bearing(-b.rotation);
+        if !own_crs {
+            assumed.push(b.name.as_str());
+        }
+        if mercator && (e.max_y > rustgis_geom::MAX_LAT || e.min_y < -rustgis_geom::MAX_LAT) {
+            polar.push(b.name.as_str());
+        }
+        let name = names.take(&b.name);
+        m.bookmarks.push(rustgis_map::Bookmark::new(name, m.camera));
+    }
+    m.camera = view;
+    let listed = |names: &[&str]| {
+        let mut text = names.iter().take(8).copied().collect::<Vec<_>>().join(", ");
+        if names.len() > 8 {
+            text.push_str(", …");
+        }
+        format!("{}: {text}", names.len())
+    };
+    if !none.is_empty() {
+        report.skipped("", format!("its bookmarks with no coordinate system, in a project without one ({})", listed(&none)));
+    }
+    if !unread.is_empty() {
+        report.skipped("", format!("its bookmarks in a coordinate system RustGIS can't read ({})", listed(&unread)));
+    }
+    if !assumed.is_empty() {
+        report.approximated(
+            "",
+            format!("its bookmarks with no coordinate system of their own, read in the project's ({})", listed(&assumed)),
+        );
+    }
+    if !polar.is_empty() {
+        report.approximated(
+            "",
+            format!("its bookmarks reaching past the 85° a Web Mercator map shows, fitted to the part it does ({})", listed(&polar)),
+        );
+    }
+    if !many.is_empty() {
+        report.skipped("", format!("its bookmarks in coordinate systems past the first {MAX_BOOKMARK_CRS} ({})", listed(&many)));
+    }
+    if !outside.is_empty() {
+        report.skipped("", format!("its bookmarks whose place lies outside their coordinate system's area ({})", listed(&outside)));
+    }
+    if !beyond.is_empty() {
+        report.skipped("", format!("its bookmarks whose place the map's projection doesn't reach ({})", listed(&beyond)));
+    }
+    if names.cut > 0 {
+        report.approximated("", format!("bookmark names cut to {} characters ({})", super::navigate::MAX_BOOKMARK_NAME, names.cut));
+    }
+    if over > 0 {
+        report.skipped("", format!("its bookmarks past those a map keeps ({over})"));
+    }
 }
 
 /// A coordinate system in degrees (EPSG:4326, ETRS89, NAD83, …), which QGIS draws as plate carrée.
@@ -1079,6 +1365,10 @@ fn import_style(s: &mut Session, p: &Value) -> CmdResult {
         check_fields(l, &name, &style.rules, style.categories_by.as_ref(), &style.bool_classes, &mut report);
         if style.diagram.is_some() {
             check_diagram(l, &name, &mut report);
+        }
+        // Bound: the layer shows the slider's window at once (nothing changes while it is off).
+        if bind_time(l, &name, style.time.as_deref(), &mut report) {
+            s.map_mut().apply_time();
         }
         // Last: `l` borrows `s`, so the notice waits until the layer's last use.
         if let Some(notice) = no_fill_dropped {

@@ -701,11 +701,11 @@ pub fn new_bookmark_name(map: &Map) -> String {
 }
 
 /// The longest bookmark name and description kept.
-const MAX_BOOKMARK_NAME: usize = 120;
+pub(crate) const MAX_BOOKMARK_NAME: usize = 120;
 const MAX_DESCRIPTION: usize = 2_000;
 
 /// Most bookmarks a map keeps.
-const MAX_BOOKMARKS: usize = 10_000;
+pub(crate) const MAX_BOOKMARKS: usize = 10_000;
 
 /// The map's bookmarks as a bookmarks file. Places are lon/lat and metres per pixel, so they
 /// open in the same place on a map in any projection.

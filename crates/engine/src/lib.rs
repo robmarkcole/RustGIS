@@ -2740,7 +2740,8 @@ impl Session {
         if m.projection.is_globe() {
             rustgis_map::Globe::fit(&mut m.camera, e, w, h);
         } else {
-            m.fit_lonlat(e, w, h);
+            // An extent the projection doesn't reach leaves the view where it is.
+            let _ = m.fit_lonlat(e, w, h);
         }
         self.record_extent();
     }

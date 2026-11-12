@@ -2666,22 +2666,29 @@ impl Map {
         self.camera.clamp();
     }
 
-    /// Points the flat map at a longitude/latitude extent with a margin.
-    pub fn fit_lonlat(&mut self, e: &Extent, w: f64, h: f64) {
+    /// Points the flat map at a longitude/latitude extent with a margin. Whether it did: not for
+    /// an empty extent or view, nor one the map's projection doesn't reach (the view unmoved).
+    pub fn fit_lonlat(&mut self, e: &Extent, w: f64, h: f64) -> bool {
+        if e.is_empty() || w <= 1.0 || h <= 1.0 {
+            return false;
+        }
         let flat = self.flat();
         if let projection::Flat::Mercator = flat {
+            // Web Mercator fits any extent clamped to its 85°: one wholly past them would be a
+            // strip along the edge, so isn't fitted.
+            if e.min_y >= rustgis_geom::MAX_LAT || e.max_y <= -rustgis_geom::MAX_LAT {
+                return false;
+            }
             self.camera.fit_lonlat(e, w, h);
-            return;
-        }
-        if e.is_empty() || w <= 1.0 || h <= 1.0 {
-            return;
+            return true;
         }
         let min_pad = if e.width() > 0.0 || e.height() > 0.0 { 1e-6 } else { 0.02 };
         let m = flat.extent(&e.padded(0.06, min_pad));
         if m.is_empty() {
-            return;
+            return false;
         }
         self.camera.fit_extent(&m, w, h);
+        true
     }
 
     /// Switches projection, keeping the centre and the ground scale.
@@ -3927,5 +3934,19 @@ mod tests {
         l.min_scale = None;
         l.dataset.features.clear();
         assert_eq!(labels(l, 1e6), None);
+    }
+
+    /// A Web Mercator map fits an extent reaching past its 85°, clamped, but not one wholly past
+    /// them (the view unmoved).
+    #[test]
+    fn web_mercator_doesnt_fit_an_extent_wholly_past_its_latitudes() {
+        let mut m = Map::new("m");
+        let view = m.camera;
+        assert!(!m.fit_lonlat(&Extent::new(-10.0, 86.0, 10.0, 89.0), 800.0, 600.0));
+        assert!(!m.fit_lonlat(&Extent::new(-10.0, -89.0, 10.0, -86.0), 800.0, 600.0));
+        assert_eq!(m.camera.center, view.center);
+        assert_eq!(m.camera.res, view.res);
+        assert!(m.fit_lonlat(&Extent::new(-10.0, 80.0, 10.0, 89.0), 800.0, 600.0));
+        assert_ne!(m.camera.center, view.center);
     }
 }

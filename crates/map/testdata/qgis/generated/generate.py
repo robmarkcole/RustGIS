@@ -42,7 +42,7 @@ from qgis.core import (
     QgsDateTimeRange, QgsStyle, QgsGradientColorRamp, QgsLayerTreeLayer,
     QgsDiagramSettings, QgsDiagramLayerSettings, QgsSingleCategoryDiagramRenderer,
     QgsLinearlyInterpolatedDiagramRenderer, QgsPieDiagram, QgsHistogramDiagram,
-    QgsStackedBarDiagram, QgsTextDiagram, QgsGroupLayer,
+    QgsStackedBarDiagram, QgsTextDiagram, QgsGroupLayer, QgsPolymorphicRelation,
 )
 from qgis.PyQt.QtCore import QVariant, QMetaType, QDateTime, QDate, QTime, QSizeF
 from qgis.PyQt.QtGui import QColor, QPainter
@@ -912,6 +912,80 @@ def groups():
 
 
 attempt("groups", groups)
+
+
+# Bookmarks (in two coordinate systems, one turned, one in a group), relations (on one pair of
+# fields, a composition, on two pairs, polymorphic) and time settings (a span with steps, each
+# way a layer takes its time).
+def bookmarks_relations_time():
+    p = new_project()
+    # In UTC, so the file is the same wherever it is written.
+    UTC = __import__("qgis.PyQt.QtCore", fromlist=["Qt"]).Qt.TimeSpec.UTC
+    pts, lines, polys = layer("points"), layer("lines"), layer("polygons")
+    for lyr in (pts, lines, polys):
+        p.addMapLayer(lyr)
+    bm = p.bookmarkManager()
+    old = QgsBookmark()
+    old.setId("old-town")
+    old.setName("Old town")
+    old.setGroup("Places")
+    old.setExtent(QgsReferencedRectangle(QgsRectangle(2696400, 1261250, 2698200, 1262350), CRS))
+    old.setRotation(30)
+    bm.addBookmark(old)
+    wide = QgsBookmark()
+    wide.setId("region")
+    wide.setName("Region")
+    wide.setExtent(QgsReferencedRectangle(QgsRectangle(8.6, 47.4, 8.9, 47.6), QgsCoordinateReferenceSystem("EPSG:4326")))
+    bm.addBookmark(wide)
+    rm = p.relationManager()
+    for rid, name, strength, pairs in [
+        ("lines_points", "lines to points", Qgis.RelationshipStrength.Association, [("id", "id")]),
+        ("polygons_points", "polygons of points", Qgis.RelationshipStrength.Composition, [("id", "id")]),
+        ("lines_points_kind", "lines to points by kind", Qgis.RelationshipStrength.Association, [("id", "id"), ("kind", "kind")]),
+    ]:
+        rel = QgsRelation()
+        rel.setId(rid)
+        rel.setName(name)
+        rel.setReferencingLayer(lines.id() if rid.startswith("lines") else polys.id())
+        rel.setReferencedLayer(pts.id())
+        for referencing, referenced in pairs:
+            rel.addFieldPair(referencing, referenced)
+        rel.setStrength(strength)
+        rm.addRelation(rel)
+    poly = QgsPolymorphicRelation()
+    poly.setId("by_layer")
+    poly.setName("by layer")
+    poly.setReferencingLayer(polys.id())
+    poly.addFieldPair("id", "id")
+    poly.setReferencedLayerField("name")
+    poly.setReferencedLayerExpression("@layer_name")
+    poly.setReferencedLayerIds([pts.id(), lines.id()])
+    rm.addPolymorphicRelation(poly)
+    ts = p.timeSettings()
+    ts.setTemporalRange(QgsDateTimeRange(QDateTime(QDate(2024, 1, 1), QTime(0, 0), UTC), QDateTime(QDate(2024, 12, 31), QTime(0, 0), UTC)))
+    ts.setTimeStep(1)
+    ts.setTimeStepUnit(Qgis.TemporalUnit.Months)
+    ts.setIsTemporalRangeCumulative(True)
+    ts.setFramesPerSecond(2)
+    tp = pts.temporalProperties()
+    tp.setIsActive(True)
+    tp.setMode(Qgis.VectorTemporalMode.FeatureDateTimeInstantFromField)
+    tp.setStartField("day")
+    tp.setAccumulateFeatures(True)
+    tl = lines.temporalProperties()
+    tl.setIsActive(True)
+    tl.setMode(Qgis.VectorTemporalMode.FeatureDateTimeStartAndDurationFromFields)
+    tl.setStartField("day")
+    tl.setDurationField("value")
+    tl.setDurationUnits(Qgis.TemporalUnit.Days)
+    tg = polys.temporalProperties()
+    tg.setIsActive(True)
+    tg.setMode(Qgis.VectorTemporalMode.FixedTemporalRange)
+    tg.setFixedTemporalRange(QgsDateTimeRange(QDateTime(QDate(2024, 3, 1), QTime(0, 0), UTC), QDateTime(QDate(2024, 6, 1), QTime(0, 0), UTC)))
+    save_project(p, "bookmarks-relations-time")
+
+
+attempt("bookmarks relations time", bookmarks_relations_time)
 
 
 # Every style above as one project, each on its own layer: a single file covering them all.
