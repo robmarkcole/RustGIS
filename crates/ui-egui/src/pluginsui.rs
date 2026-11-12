@@ -567,6 +567,11 @@ fn download(app: &mut RustGisApp, e: &Entry, ctx: &egui::Context) {
         app.plugins.message = Some((false, msg));
         return;
     }
+    if !e.available() {
+        let lang = crate::i18n::current().code();
+        app.plugins.message = Some((false, elsewhere(e, e.translate(lang, &e.name))));
+        return;
+    }
     let slot = fetch(app, &e.package, rp::package::MAX_PACKAGE, Some(ctx.clone()));
     app.plugins.message = None;
     app.plugins.jobs.push(Job::Download { entry: Box::new(e.clone()), slot });
@@ -612,7 +617,12 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
             Job::Registry { url, slot } => match take(&slot) {
                 None => waiting.push(Job::Registry { url, slot }),
                 Some(r) => {
-                    app.plugins.set_registry(Some(r.and_then(|b| rp::registry::parse(&String::from_utf8_lossy(&b), &url))));
+                    let read = r.and_then(|b| rp::registry::parse_with_notice(&String::from_utf8_lossy(&b), &url));
+                    // A platform's package the registry listed and RustGIS skipped is said.
+                    if let Ok((_, Some(skipped))) = &read {
+                        app.session.notify(skipped.clone(), false);
+                    }
+                    app.plugins.set_registry(Some(read.map(|(entries, _)| entries)));
                     let slot = fetch(app, &rp::registry::blocklist_url(&url), 4 << 20, Some(ctx.clone()));
                     waiting.push(Job::Blocklist { registry: url, slot });
                 }
@@ -681,6 +691,22 @@ fn chip(ui: &mut egui::Ui, t: &Tokens, text: &str, color: egui::Color32) -> egui
             ui.label(egui::RichText::new(text).size(10.5).color(if t.dark { color.gamma_multiply(1.3) } else { color }));
         })
         .response
+}
+
+/// This platform's name, as the Browse list shows it.
+fn here() -> String {
+    match rp::registry::this_platform() {
+        Some(key) => rp::registry::platform_name(key).to_string(),
+        None => tl!("the web app").to_string(),
+    }
+}
+
+/// Why `e` (shown as `name`) can't be installed here: its packages are for other platforms.
+fn elsewhere(e: &Entry, name: &str) -> String {
+    crate::i18n::fmt(
+        "{name} has no package for {platform}. It is available for: {platforms}.",
+        &[("name", name), ("platform", &here()), ("platforms", &e.platforms().join(", "))],
+    )
 }
 
 /// Whether a plugin that runs as `runtime` can be installed here: the browser can't start
@@ -940,6 +966,10 @@ fn browse_row(ui: &mut egui::Ui, t: &Tokens, e: &Entry, web: bool) -> bool {
                     "{name} runs as a program on your computer: it needs the desktop app or rustgis-cli.",
                     &[("name", e.translate(lang, &e.name))],
                 ));
+            } else if !e.available() {
+                // Listed for the same reason: its packages are for other platforms.
+                ui.label(egui::RichText::new(crate::i18n::fmt("Not available for {platform}", &[("platform", &here())])).color(t.text_dim))
+                    .on_hover_text(elsewhere(e, e.translate(lang, &e.name)));
             } else {
                 let label = if newer { tl!("Update") } else { tl!("Install") };
                 clicked = crate::widgets::primary_button(ui, label, true, vec2(84.0, 24.0)).clicked();

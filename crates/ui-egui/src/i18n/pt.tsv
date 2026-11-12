@@ -2462,6 +2462,7 @@ Not applied yet.	Ainda não aplicado.
 Not for texts: a text is edited in the Format pane.	Não para textos: um texto é editado no painel Formato.
 Not loaded	Não carregado
 not needed	não é necessária
+Not available for {platform}	Não disponível para {platform}
 Not sandboxed	Fora da sandbox
 Not saved yet	Ainda não salvo
 Not searched, as they didn't load: {folders}	Não pesquisadas, pois não carregaram: {folders}
@@ -3973,6 +3974,7 @@ The web app can't link to files on this computer: add the file again with Add Da
 The whole log, as CSV or JSON Lines (.jsonl): it may name files and addresses, so look at it before sharing it	O log inteiro, como CSV ou JSON Lines (.jsonl): ele pode citar arquivos e endereços, então confira-o antes de compartilhar
 the window's screenshot didn't come back in time, so the map was drawn offscreen	a captura de tela da janela não voltou a tempo, então o mapa foi desenhado fora da tela
 the window's screenshot didn't hold the map, so it was drawn offscreen	a captura de tela da janela não continha o mapa, então ele foi desenhado fora da tela
+the web app	o aplicativo web
 The {n} waiting after it were left too	As {n} que esperavam depois dela também foram abandonadas
 Theme	Tema
 Theme {name} loaded and kept at {path}	Tema {name} carregado e guardado em {path}
@@ -4453,6 +4455,7 @@ Zoom: the map's zoom level, as web maps count it. Bearing: the direction the top
 {agent} was stopped by you.	Você interrompeu o {agent}.
 {names}: needs Node.js (npx) for its ACP adapter.	{names}: precisa do Node.js (npx) para o adaptador ACP.
 {name} is larger than {mb} MB	{name} tem mais de {mb} MB
+{name} has no package for {platform}. It is available for: {platforms}.	{name} não tem pacote para {platform}. Está disponível para: {platforms}.
 {name} runs as a program on your computer: it needs the desktop app or rustgis-cli.	{name} é executado como um programa no seu computador: requer o aplicativo desktop ou o rustgis-cli.
 {name} was withdrawn from the plugin registry and has been turned off.	{name} foi retirado do registro de plugins e foi desativado.
 {name} was withdrawn from the plugin registry: {reason}	{name} foi retirado do registro de plugins: {reason}

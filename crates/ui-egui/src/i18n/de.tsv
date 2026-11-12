@@ -2462,6 +2462,7 @@ Not applied yet.	Noch nicht angewendet.
 Not for texts: a text is edited in the Format pane.	Nicht für Texte: Ein Text wird im Formatbereich bearbeitet.
 Not loaded	Nicht geladen
 not needed	nicht erforderlich
+Not available for {platform}	Nicht verfügbar für {platform}
 Not sandboxed	Nicht in der Sandbox
 Not saved yet	Noch nicht gespeichert
 Not searched, as they didn't load: {folders}	Nicht durchsucht, da sie nicht geladen wurden: {folders}
@@ -3973,6 +3974,7 @@ The web app can't link to files on this computer: add the file again with Add Da
 The whole log, as CSV or JSON Lines (.jsonl): it may name files and addresses, so look at it before sharing it	Das gesamte Protokoll als CSV oder JSON Lines (.jsonl): Es kann Dateien und Adressen nennen, prüfen Sie es also vor dem Teilen
 the window's screenshot didn't come back in time, so the map was drawn offscreen	Der Screenshot des Fensters kam nicht rechtzeitig zurück, daher wurde die Karte außerhalb des Bildschirms gezeichnet
 the window's screenshot didn't hold the map, so it was drawn offscreen	Der Screenshot des Fensters enthielt die Karte nicht, daher wurde sie außerhalb des Bildschirms gezeichnet
+the web app	die Web-App
 The {n} waiting after it were left too	Auch die {n} danach wartenden Vorgänge wurden verworfen
 Theme	Thema
 Theme {name} loaded and kept at {path}	Thema {name} geladen und unter {path} gespeichert
@@ -4453,6 +4455,7 @@ Zoom: the map's zoom level, as web maps count it. Bearing: the direction the top
 {agent} was stopped by you.	{agent} wurde von Ihnen gestoppt.
 {names}: needs Node.js (npx) for its ACP adapter.	{names}: braucht Node.js (npx) für seinen ACP-Adapter.
 {name} is larger than {mb} MB	{name} ist größer als {mb} MB
+{name} has no package for {platform}. It is available for: {platforms}.	{name} hat kein Paket für {platform}. Verfügbar für: {platforms}.
 {name} runs as a program on your computer: it needs the desktop app or rustgis-cli.	{name} läuft als Programm auf Ihrem Computer: Es benötigt die Desktop-App oder rustgis-cli.
 {name} was withdrawn from the plugin registry and has been turned off.	{name} wurde aus dem Plugin-Verzeichnis zurückgezogen und deaktiviert.
 {name} was withdrawn from the plugin registry: {reason}	{name} wurde aus dem Plugin-Verzeichnis zurückgezogen: {reason}

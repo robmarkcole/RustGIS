@@ -2462,6 +2462,7 @@ Not applied yet.	ຍັງບໍ່ທັນນຳໃຊ້ເທື່ອ.
 Not for texts: a text is edited in the Format pane.	ບໍ່ສາມາດໃຊ້ກັບຂໍ້ຄວາມ: ຂໍ້ຄວາມຕ້ອງແກ້ໄຂໃນຊ່ອງຮູບແບບ.
 Not loaded	ບໍ່ໄດ້ໂຫຼດ
 not needed	ບໍ່ຈຳເປັນ
+Not available for {platform}	ບໍ່ມີສຳລັບ {platform}
 Not sandboxed	ຢູ່ນອກ Sandbox
 Not saved yet	ຍັງບໍ່ໄດ້ບັນທຶກເທື່ອ
 Not searched, as they didn't load: {folders}	ບໍ່ໄດ້ຄົ້ນຫາ ເນື່ອງຈາກບໍ່ສາມາດໂຫຼດໄດ້: {folders}
@@ -3973,6 +3974,7 @@ The web app can't link to files on this computer: add the file again with Add Da
 The whole log, as CSV or JSON Lines (.jsonl): it may name files and addresses, so look at it before sharing it	ບັນທຶກທັງໝົດ, ເປັນ CSV ຫຼື JSON Lines (.jsonl): ມັນອາດລະບຸໄຟລ໌ ແລະ ທີ່ຢູ່, ສະນັ້ນກວດເບິ່ງກ່ອນແບ່ງປັນ
 the window's screenshot didn't come back in time, so the map was drawn offscreen	ພາບໜ້າຈໍຂອງປ່ອງຢ້ຽມບໍ່ຕອບສະໜອງທັນເວລາ ຈຶ່ງແຕ້ມແຜນທີ່ຢູ່ນອກໜ້າຈໍ
 the window's screenshot didn't hold the map, so it was drawn offscreen	ພາບໜ້າຈໍຂອງປ່ອງຢ້ຽມບໍ່ມີຮູບແຜນທີ່ ຈຶ່ງແຕ້ມຢູ່ນອກໜ້າຈໍ
+the web app	ເວັບແອັບ
 The {n} waiting after it were left too	{n} ອັນທີ່ລໍຖ້າຢູ່ຫຼັງມັນກໍຖືກປະໄວ້ເຊັ່ນກັນ
 Theme	ຮູບແບບສີສັນ
 Theme {name} loaded and kept at {path}	ໂຫຼດຮູບແບບສີສັນ {name} ແລ້ວ ແລະ ເກັບໄວ້ທີ່ {path}
@@ -4453,6 +4455,7 @@ Zoom: the map's zoom level, as web maps count it. Bearing: the direction the top
 {agent} was stopped by you.	{agent} ຖືກຢຸດໂດຍທ່ານ.
 {names}: needs Node.js (npx) for its ACP adapter.	{names}: ຕ້ອງການ Node.js (npx) ສຳລັບຕົວແປງ ACP.
 {name} is larger than {mb} MB	{name} ໃຫຍ່ກວ່າ {mb} MB
+{name} has no package for {platform}. It is available for: {platforms}.	{name} ບໍ່ມີແພັກເກັດສຳລັບ {platform}. ມີສຳລັບ: {platforms}.
 {name} runs as a program on your computer: it needs the desktop app or rustgis-cli.	{name} ເຮັດວຽກເປັນໂປຣແກຣມໃນຄອມພິວເຕີຂອງທ່ານ: ມັນຕ້ອງການແອັບເດັສທັອບ ຫຼື rustgis-cli.
 {name} was withdrawn from the plugin registry and has been turned off.	{name} ຖືກຖອນອອກຈາກຄັງລົງທະບຽນປລັກອິນ ແລະ ຖືກປິດການໃຊ້ງານແລ້ວ.
 {name} was withdrawn from the plugin registry: {reason}	{name} ຖືກຖອນອອກຈາກຄັງລົງທະບຽນປລັກອິນ: {reason}

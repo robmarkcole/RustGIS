@@ -12445,6 +12445,7 @@ fn registry_downloads_are_checked() {
         package: "https://example.com/x.rgplugin".into(),
         sha256: "0".repeat(64),
         size: 0,
+        packages: Default::default(),
         min_rustgis_version: String::new(),
         permissions: Vec::new(),
         i18n: Default::default(),
@@ -12457,6 +12458,29 @@ fn registry_downloads_are_checked() {
     e.id = "other".into();
     assert!(crate::cmd::plugins::install_checked(&e, &bytes).unwrap_err().contains("not 'other'"));
     e.id = "eng-reg".into();
+    // A plugin with packages for other platforms only has nothing to install here (#1821).
+    let elsewhere = rustgis_plugins::registry::Entry {
+        package: String::new(),
+        sha256: String::new(),
+        packages: [(
+            if cfg!(windows) { "linux" } else { "windows" }.to_string(),
+            rustgis_plugins::registry::PlatformPackage {
+                package: "https://example.com/x.rgplugin".into(),
+                sha256: e.sha256.clone(),
+                size: 0,
+            },
+        )]
+        .into(),
+        ..e.clone()
+    };
+    let err = crate::cmd::plugins::install_checked(&elsewhere, &bytes).unwrap_err();
+    let other = if cfg!(windows) { "Linux" } else { "Windows" };
+    assert!(
+        err.starts_with("Reg has no package for ") && err.ends_with(&format!("(it is available for {other}); it wasn't installed")),
+        "{err}"
+    );
+    assert_eq!(crate::cmd::plugins::entry_status(&elsewhere)["available"], json!(false));
+    assert_eq!(crate::cmd::plugins::entry_status(&e)["available"], json!(true));
     // What the registry said about how it runs (shown before installing) must be so.
     e.runtime = rustgis_plugins::manifest::Runtime::Process;
     let err = crate::cmd::plugins::install_checked(&e, &bytes).unwrap_err();
@@ -14876,6 +14900,30 @@ fn serve_files(files: Vec<(String, Vec<u8>)>) -> (String, std::sync::Arc<std::sy
         }
     });
     (base, asked)
+}
+
+/// A registry that lists a platform's package RustGIS can't use (#1821) says so, with which;
+/// one read whole says nothing.
+#[test]
+fn a_skipped_platform_package_is_said() {
+    let sha = "a".repeat(64);
+    let said = |linux: Value| {
+        let registry = json!({"plugins": [{"id": "globe", "name": "Globe", "version": "1.0.0", "packages": {
+            "windows": {"package": "globe-windows.rgplugin", "sha256": sha}, "linux": linux}}]});
+        let (base, _) = serve_files(vec![
+            ("/registry.json".into(), registry.to_string().into_bytes()),
+            ("/blocklist.json".into(), br#"{"blocked": []}"#.to_vec()),
+        ]);
+        let mut s = Session::new(Project::default());
+        let mark = s.notices_given();
+        let listed = s.run("plugin.registry", &json!({"url": format!("{base}/registry.json")})).unwrap();
+        assert_eq!(listed[0]["id"], "globe");
+        s.notices_since(mark).iter().filter(|n| n.text.contains("were skipped")).map(|n| n.text.clone()).collect::<Vec<_>>()
+    };
+    let lossy = said(json!({"package": "globe-linux.rgplugin", "sha256": "abc"}));
+    assert_eq!(lossy.len(), 1, "{lossy:?}");
+    assert!(lossy[0].starts_with("1 package(s) for a platform") && lossy[0].ends_with(": globe (Linux)"), "{lossy:?}");
+    assert_eq!(said(json!({"package": "globe-linux.rgplugin", "sha256": sha})), Vec::<String>::new());
 }
 
 /// A registry whose blocklist can't be read warns that the last blocklist read stays in force;

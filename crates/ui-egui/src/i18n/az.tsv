@@ -2462,6 +2462,7 @@ Not applied yet.	Hələ tətbiq olunmayıb.
 Not for texts: a text is edited in the Format pane.	Mətnlər üçün deyil: mətn Format panelində redaktə edilir.
 Not loaded	Yüklənməyib
 not needed	lazım deyil
+Not available for {platform}	{platform} üçün mövcud deyil
 Not sandboxed	Qum qutusundan kənar
 Not saved yet	Hələ saxlanmayıb
 Not searched, as they didn't load: {folders}	Yüklənmədikləri üçün axtarılmadı: {folders}
@@ -3973,6 +3974,7 @@ The web app can't link to files on this computer: add the file again with Add Da
 The whole log, as CSV or JSON Lines (.jsonl): it may name files and addresses, so look at it before sharing it	Bütün jurnal, CSV və ya JSON Lines (.jsonl) kimi: fayl və ünvan adları ola bilər, ona görə paylaşmazdan əvvəl ona baxın
 the window's screenshot didn't come back in time, so the map was drawn offscreen	pəncərənin ekran görüntüsü vaxtında gəlmədi, ona görə xəritə ekrandan kənarda çəkildi
 the window's screenshot didn't hold the map, so it was drawn offscreen	pəncərənin ekran görüntüsündə xəritə yox idi, ona görə ekrandan kənarda çəkildi
+the web app	veb tətbiq
 The {n} waiting after it were left too	Ondan sonra gözləyən {n} qeyd də buraxıldı
 Theme	Mövzu
 Theme {name} loaded and kept at {path}	{name} mövzusu yükləndi və {path} ünvanında saxlanıldı
@@ -4453,6 +4455,7 @@ Zoom: the map's zoom level, as web maps count it. Bearing: the direction the top
 {agent} was stopped by you.	{agent} sizin tərəfinizdən dayandırıldı.
 {names}: needs Node.js (npx) for its ACP adapter.	{names}: ACP adapteri üçün Node.js (npx) lazımdır.
 {name} is larger than {mb} MB	{name} {mb} MB-dan böyükdür
+{name} has no package for {platform}. It is available for: {platforms}.	{name} üçün {platform} paketi yoxdur. Bunlar üçün mövcuddur: {platforms}.
 {name} runs as a program on your computer: it needs the desktop app or rustgis-cli.	{name} kompüterinizdə proqram kimi işləyir: masaüstü tətbiq və ya rustgis-cli tələb edir.
 {name} was withdrawn from the plugin registry and has been turned off.	{name} plagin reyestrindən geri çəkilib və söndürülüb.
 {name} was withdrawn from the plugin registry: {reason}	{name} plagin reyestrindən geri çəkilib: {reason}

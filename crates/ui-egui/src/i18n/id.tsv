@@ -2462,6 +2462,7 @@ Not applied yet.	Belum diterapkan.
 Not for texts: a text is edited in the Format pane.	Bukan untuk teks: teks diedit di panel Format.
 Not loaded	Tidak dimuat
 not needed	tidak diperlukan
+Not available for {platform}	Tidak tersedia untuk {platform}
 Not sandboxed	Tanpa sandbox
 Not saved yet	Belum disimpan
 Not searched, as they didn't load: {folders}	Tidak dicari karena tidak dapat dimuat: {folders}
@@ -3973,6 +3974,7 @@ The web app can't link to files on this computer: add the file again with Add Da
 The whole log, as CSV or JSON Lines (.jsonl): it may name files and addresses, so look at it before sharing it	Seluruh log, sebagai CSV atau JSON Lines (.jsonl): log mungkin menyebut file dan alamat, jadi periksa sebelum membagikannya
 the window's screenshot didn't come back in time, so the map was drawn offscreen	tangkapan layar jendela tidak kembali tepat waktu, sehingga peta digambar di luar layar
 the window's screenshot didn't hold the map, so it was drawn offscreen	tangkapan layar jendela tidak memuat peta, sehingga peta digambar di luar layar
+the web app	aplikasi web
 The {n} waiting after it were left too	{n} yang menunggu setelahnya juga ditinggalkan
 Theme	Tema
 Theme {name} loaded and kept at {path}	Tema {name} dimuat dan disimpan di {path}
@@ -4453,6 +4455,7 @@ Zoom: the map's zoom level, as web maps count it. Bearing: the direction the top
 {agent} was stopped by you.	{agent} dihentikan oleh Anda.
 {names}: needs Node.js (npx) for its ACP adapter.	{names}: memerlukan Node.js (npx) untuk adaptor ACP-nya.
 {name} is larger than {mb} MB	{name} lebih besar dari {mb} MB
+{name} has no package for {platform}. It is available for: {platforms}.	{name} tidak memiliki paket untuk {platform}. Tersedia untuk: {platforms}.
 {name} runs as a program on your computer: it needs the desktop app or rustgis-cli.	{name} berjalan sebagai program di komputer Anda: memerlukan aplikasi desktop atau rustgis-cli.
 {name} was withdrawn from the plugin registry and has been turned off.	{name} ditarik dari registri plugin dan telah dinonaktifkan.
 {name} was withdrawn from the plugin registry: {reason}	{name} ditarik dari registri plugin: {reason}

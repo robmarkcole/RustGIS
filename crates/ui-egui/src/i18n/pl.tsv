@@ -2462,6 +2462,7 @@ Not applied yet.	Jeszcze nie zastosowano.
 Not for texts: a text is edited in the Format pane.	Nie dotyczy tekstów: tekst edytuje się w panelu Format.
 Not loaded	Nie wczytano
 not needed	niepotrzebne
+Not available for {platform}	Niedostępne dla {platform}
 Not sandboxed	Bez piaskownicy
 Not saved yet	Jeszcze nie zapisano
 Not searched, as they didn't load: {folders}	Nie przeszukano, bo się nie wczytały: {folders}
@@ -3973,6 +3974,7 @@ The web app can't link to files on this computer: add the file again with Add Da
 The whole log, as CSV or JSON Lines (.jsonl): it may name files and addresses, so look at it before sharing it	Cały dziennik jako CSV lub JSON Lines (.jsonl): może zawierać nazwy plików i adresy, więc przejrzyj go przed udostępnieniem
 the window's screenshot didn't come back in time, so the map was drawn offscreen	zrzut okna nie wrócił na czas, więc mapę narysowano poza ekranem
 the window's screenshot didn't hold the map, so it was drawn offscreen	zrzut okna nie zawierał mapy, więc narysowano ją poza ekranem
+the web app	aplikacji internetowej
 The {n} waiting after it were left too	Oczekujące po nim odczyty ({n}) także zostały pominięte
 Theme	Motyw
 Theme {name} loaded and kept at {path}	Wczytano motyw {name} i zachowano go w {path}
@@ -4453,6 +4455,7 @@ Zoom: the map's zoom level, as web maps count it. Bearing: the direction the top
 {agent} was stopped by you.	Zatrzymano agenta {agent}.
 {names}: needs Node.js (npx) for its ACP adapter.	{names}: wymaga Node.js (npx) dla swojego adaptera ACP.
 {name} is larger than {mb} MB	{name} jest większy niż {mb} MB
+{name} has no package for {platform}. It is available for: {platforms}.	{name} nie ma pakietu dla {platform}. Dostępne dla: {platforms}.
 {name} runs as a program on your computer: it needs the desktop app or rustgis-cli.	{name} działa jako program na Twoim komputerze: wymaga aplikacji desktopowej albo rustgis-cli.
 {name} was withdrawn from the plugin registry and has been turned off.	Wtyczkę {name} wycofano z rejestru wtyczek i została wyłączona.
 {name} was withdrawn from the plugin registry: {reason}	Wtyczkę {name} wycofano z rejestru wtyczek: {reason}

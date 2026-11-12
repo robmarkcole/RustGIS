@@ -2462,6 +2462,7 @@ Not applied yet.	ჯერ არ არის გამოყენებულ
 Not for texts: a text is edited in the Format pane.	არა ტექსტებისთვის: ტექსტი ფორმატის პანელში რედაქტირდება.
 Not loaded	არ არის ჩატვირთული
 not needed	საჭირო არ არის
+Not available for {platform}	მიუწვდომელია {platform}-ისთვის
 Not sandboxed	იზოლაციის გარეშე
 Not saved yet	ჯერ არ არის შენახული
 Not searched, as they didn't load: {folders}	არ მოიძებნა, რადგან არ ჩაიტვირთა: {folders}
@@ -3973,6 +3974,7 @@ The web app can't link to files on this computer: add the file again with Add Da
 The whole log, as CSV or JSON Lines (.jsonl): it may name files and addresses, so look at it before sharing it	მთელი ჟურნალი, CSV ან JSON Lines (.jsonl) ფორმატში: შეიძლება შეიცავდეს ფაილებისა და მისამართების სახელებს, ამიტომ გაზიარებამდე გადახედეთ
 the window's screenshot didn't come back in time, so the map was drawn offscreen	ფანჯრის ეკრანის ანაბეჭდი დროულად არ დაბრუნდა, ამიტომ რუკა ეკრანის გარეთ დაიხატა
 the window's screenshot didn't hold the map, so it was drawn offscreen	ფანჯრის ეკრანის ანაბეჭდი რუკას არ შეიცავდა, ამიტომ ის ეკრანის გარეთ დაიხატა
+the web app	ვებაპლიკაცია
 The {n} waiting after it were left too	მის შემდეგ მომლოდინე {n} ასევე მიტოვებულია
 Theme	თემა
 Theme {name} loaded and kept at {path}	თემა {name} ჩაიტვირთა და შენახულია მისამართზე {path}
@@ -4453,6 +4455,7 @@ Zoom: the map's zoom level, as web maps count it. Bearing: the direction the top
 {agent} was stopped by you.	{agent} თქვენ შეაჩერეთ.
 {names}: needs Node.js (npx) for its ACP adapter.	{names}: მის ACP ადაპტერს Node.js (npx) სჭირდება.
 {name} is larger than {mb} MB	{name} {mb} მბ-ზე დიდია
+{name} has no package for {platform}. It is available for: {platforms}.	{name}-ს არ აქვს პაკეტი {platform}-ისთვის. ხელმისაწვდომია: {platforms}.
 {name} runs as a program on your computer: it needs the desktop app or rustgis-cli.	{name} მუშაობს როგორც პროგრამა თქვენს კომპიუტერზე: საჭიროა დესკტოპ აპლიკაცია ან rustgis-cli.
 {name} was withdrawn from the plugin registry and has been turned off.	{name} დანამატების რეესტრიდან გაუქმდა და გამორთულია.
 {name} was withdrawn from the plugin registry: {reason}	{name} დანამატების რეესტრიდან გაუქმდა: {reason}

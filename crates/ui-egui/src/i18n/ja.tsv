@@ -2462,6 +2462,7 @@ Not applied yet.	まだ適用されていません。
 Not for texts: a text is edited in the Format pane.	テキストには使用できません: テキストは書式ウィンドウで編集します。
 Not loaded	未読み込み
 not needed	不要
+Not available for {platform}	{platform} では利用できません
 Not sandboxed	サンドボックス外
 Not saved yet	未保存
 Not searched, as they didn't load: {folders}	読み込めなかったため検索していません: {folders}
@@ -3973,6 +3974,7 @@ The web app can't link to files on this computer: add the file again with Add Da
 The whole log, as CSV or JSON Lines (.jsonl): it may name files and addresses, so look at it before sharing it	ログ全体 (CSV または JSON Lines (.jsonl)): ファイルやアドレスが含まれる場合があるため、共有する前に確認してください
 the window's screenshot didn't come back in time, so the map was drawn offscreen	ウィンドウのスクリーンショットが時間内に返されなかったため、オフスクリーンでマップを描画しました
 the window's screenshot didn't hold the map, so it was drawn offscreen	ウィンドウのスクリーンショットにマップが含まれていなかったため、オフスクリーンで描画しました
+the web app	Web アプリ
 The {n} waiting after it were left too	その後に待機していた {n} 件も中止されました
 Theme	テーマ
 Theme {name} loaded and kept at {path}	テーマ {name} を読み込み、{path} に保存しました
@@ -4453,6 +4455,7 @@ Zoom: the map's zoom level, as web maps count it. Bearing: the direction the top
 {agent} was stopped by you.	{agent} を停止しました。
 {names}: needs Node.js (npx) for its ACP adapter.	{names}: ACP アダプターに Node.js (npx) が必要です。
 {name} is larger than {mb} MB	{name} は {mb} MB を超えています
+{name} has no package for {platform}. It is available for: {platforms}.	{name} には {platform} 用のパッケージがありません。利用できるプラットフォーム: {platforms}。
 {name} runs as a program on your computer: it needs the desktop app or rustgis-cli.	{name} はコンピューター上のプログラムとして実行されます。デスクトップ アプリまたは rustgis-cli が必要です。
 {name} was withdrawn from the plugin registry and has been turned off.	{name} はプラグイン レジストリから取り下げられたため、無効にしました。
 {name} was withdrawn from the plugin registry: {reason}	{name} はプラグイン レジストリから取り下げられました: {reason}

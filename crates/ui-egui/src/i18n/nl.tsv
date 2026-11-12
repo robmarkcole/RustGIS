@@ -2462,6 +2462,7 @@ Not applied yet.	Nog niet toegepast.
 Not for texts: a text is edited in the Format pane.	Niet voor teksten: een tekst wordt bewerkt in het opmaakvenster.
 Not loaded	Niet geladen
 not needed	niet nodig
+Not available for {platform}	Niet beschikbaar voor {platform}
 Not sandboxed	Niet in sandbox
 Not saved yet	Nog niet opgeslagen
 Not searched, as they didn't load: {folders}	Niet doorzocht, omdat ze niet laadden: {folders}
@@ -3973,6 +3974,7 @@ The web app can't link to files on this computer: add the file again with Add Da
 The whole log, as CSV or JSON Lines (.jsonl): it may name files and addresses, so look at it before sharing it	Het hele logboek, als CSV of JSON Lines (.jsonl): het kan bestanden en adressen noemen, dus bekijk het voordat je het deelt
 the window's screenshot didn't come back in time, so the map was drawn offscreen	de schermafbeelding van het venster kwam niet op tijd terug, dus is de kaart buiten beeld getekend
 the window's screenshot didn't hold the map, so it was drawn offscreen	de schermafbeelding van het venster bevatte de kaart niet, dus is ze buiten beeld getekend
+the web app	de webapp
 The {n} waiting after it were left too	Ook de {n} die erna wachtten, zijn overgeslagen
 Theme	Thema
 Theme {name} loaded and kept at {path}	Thema {name} geladen en bewaard in {path}
@@ -4453,6 +4455,7 @@ Zoom: the map's zoom level, as web maps count it. Bearing: the direction the top
 {agent} was stopped by you.	Je hebt {agent} gestopt.
 {names}: needs Node.js (npx) for its ACP adapter.	{names}: heeft Node.js (npx) nodig voor de ACP-adapter.
 {name} is larger than {mb} MB	{name} is groter dan {mb} MB
+{name} has no package for {platform}. It is available for: {platforms}.	{name} heeft geen pakket voor {platform}. Beschikbaar voor: {platforms}.
 {name} runs as a program on your computer: it needs the desktop app or rustgis-cli.	{name} draait als programma op je computer: daarvoor is de desktopapp of rustgis-cli nodig.
 {name} was withdrawn from the plugin registry and has been turned off.	{name} is uit het pluginregister teruggetrokken en is uitgeschakeld.
 {name} was withdrawn from the plugin registry: {reason}	{name} is uit het pluginregister teruggetrokken: {reason}

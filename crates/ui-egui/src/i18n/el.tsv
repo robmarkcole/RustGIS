@@ -2461,6 +2461,7 @@ Not applied yet.	Δεν έχει εφαρμοστεί ακόμη.
 Not for texts: a text is edited in the Format pane.	Όχι για κείμενα: τα κείμενα επεξεργάζονται στο πλαίσιο μορφοποίησης.
 Not loaded	Δεν φορτώθηκε
 not needed	δεν απαιτείται
+Not available for {platform}	Μη διαθέσιμο για {platform}
 Not sandboxed	Χωρίς sandbox
 Not saved yet	Δεν έχει αποθηκευτεί ακόμη
 Not searched, as they didn't load: {folders}	Δεν έγινε αναζήτηση, καθώς δεν φορτώθηκαν: {folders}
@@ -3972,6 +3973,7 @@ The web app can't link to files on this computer: add the file again with Add Da
 The whole log, as CSV or JSON Lines (.jsonl): it may name files and addresses, so look at it before sharing it	Ολόκληρο το αρχείο καταγραφής, ως CSV ή JSON Lines (.jsonl): μπορεί να αναφέρει αρχεία και διευθύνσεις, οπότε ελέγξτε το πριν το μοιραστείτε
 the window's screenshot didn't come back in time, so the map was drawn offscreen	το στιγμιότυπο του παραθύρου δεν επέστρεψε εγκαίρως, οπότε ο χάρτης σχεδιάστηκε εκτός οθόνης
 the window's screenshot didn't hold the map, so it was drawn offscreen	το στιγμιότυπο του παραθύρου δεν περιείχε τον χάρτη, οπότε σχεδιάστηκε εκτός οθόνης
+the web app	την εφαρμογή web
 The {n} waiting after it were left too	Εγκαταλείφθηκαν και τα {n} που περίμεναν μετά από αυτό
 Theme	Θέμα
 Theme {name} loaded and kept at {path}	Το θέμα {name} φορτώθηκε και διατηρήθηκε στο {path}
@@ -4452,6 +4454,7 @@ Zoom: the map's zoom level, as web maps count it. Bearing: the direction the top
 {agent} was stopped by you.	Διακόψατε το {agent}.
 {names}: needs Node.js (npx) for its ACP adapter.	{names}: απαιτεί Node.js (npx) για τον προσαρμογέα ACP.
 {name} is larger than {mb} MB	Το {name} είναι μεγαλύτερο από {mb} MB
+{name} has no package for {platform}. It is available for: {platforms}.	Το {name} δεν έχει πακέτο για {platform}. Είναι διαθέσιμο για: {platforms}.
 {name} runs as a program on your computer: it needs the desktop app or rustgis-cli.	Το {name} εκτελείται ως πρόγραμμα στον υπολογιστή σας: χρειάζεται την εφαρμογή για υπολογιστή ή το rustgis-cli.
 {name} was withdrawn from the plugin registry and has been turned off.	Το {name} αποσύρθηκε από το μητρώο πρόσθετων και απενεργοποιήθηκε.
 {name} was withdrawn from the plugin registry: {reason}	Το {name} αποσύρθηκε από το μητρώο πρόσθετων: {reason}

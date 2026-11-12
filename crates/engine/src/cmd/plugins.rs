@@ -265,7 +265,10 @@ fn enable(_: &mut Session, p: &Value) -> CmdResult {
 fn fetch_registry(s: &mut Session, url: &str) -> Result<Vec<rustgis_plugins::registry::Entry>, String> {
     use rustgis_plugins::registry;
     let text = registry::fetch(url, registry::MAX_REGISTRY_BYTES)?;
-    let entries = registry::parse(&String::from_utf8_lossy(&text), url)?;
+    let (entries, skipped) = registry::parse_with_notice(&String::from_utf8_lossy(&text), url)?;
+    if let Some(skipped) = skipped {
+        s.warn(skipped);
+    }
     // A blocklist that can't be fetched or read (one that isn't text included: a replaced byte in
     // an id would match nothing) leaves the list in force, with a warning. Another registry may
     // have no blocklist (it blocks nothing); the hosted one always has one.
@@ -300,6 +303,9 @@ pub fn entry_status(e: &rustgis_plugins::registry::Entry) -> Value {
         // Said for every plugin (the registry leaves it out for WebAssembly ones): a process
         // plugin isn't sandboxed.
         o.insert("runtime".into(), json!(e.runtime));
+        // Whether it has a package for this platform (one listed with packages for other
+        // platforms has none to install here).
+        o.insert("available".into(), json!(e.available()));
     }
     v
 }
@@ -321,6 +327,9 @@ fn browse(s: &mut Session, p: &Value) -> CmdResult {
 
 /// Checks a downloaded package against its registry entry, then installs it.
 pub fn install_checked(e: &rustgis_plugins::registry::Entry, bytes: &[u8]) -> Result<Arc<Plugin>, String> {
+    if !e.available() {
+        return Err(format!("{}; it wasn't installed", e.unavailable()));
+    }
     let got = rustgis_plugins::package::sha256_hex(bytes);
     if !got.eq_ignore_ascii_case(&e.sha256) {
         return Err(format!("{}: the download doesn't match the registry (SHA-256 {got}); it wasn't installed", e.name));
@@ -357,6 +366,10 @@ fn install_from_registry(s: &mut Session, p: &Value) -> CmdResult {
     {
         let entries = fetch_registry(s, url)?;
         let e = entries.iter().find(|e| e.id == id).ok_or_else(|| format!("the registry has no plugin '{id}'"))?;
+        // Not downloaded only to be refused: its packages are for other platforms.
+        if !e.available() {
+            return Err(e.unavailable());
+        }
         let bytes = rustgis_plugins::registry::fetch(&e.package, rustgis_plugins::package::MAX_PACKAGE)?;
         Ok(install_checked(e, &bytes)?.info())
     }

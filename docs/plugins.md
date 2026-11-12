@@ -1017,3 +1017,24 @@ skills packages with `"runtime": "skills"`. The Plugin Manager checks the packag
 and id before installing; `rustgis-cli plugins get` also checks its runtime.
 `rustgis-cli plugins browse` prints `runtime` for every entry (`wasm` when the registry leaves
 it out).
+
+A plugin that ships a program for each platform can be published as one package per platform,
+so that nobody downloads the other platforms' programs. Its registry entry then has `packages`:
+
+```json
+"packages": {
+  "windows": {"package": "…/globe-1.0.0-windows.rgplugin", "sha256": "…", "size": 16000000},
+  "macos":   {"package": "…/globe-1.0.0-macos.rgplugin",   "sha256": "…", "size": 30000000},
+  "linux":   {"package": "…/globe-1.0.0-linux.rgplugin",   "sha256": "…", "size": 17000000}
+}
+```
+
+The keys are those of a manifest's `run` (`windows`, `macos`, `linux`); other keys are ignored.
+Each package holds the same `plugin.json` (id, version, permissions) with the `run` of its
+platform, and is checked like any other: its hash, its id and its runtime. RustGIS downloads the
+one for the platform it runs on. The entry's own `package` and `sha256` are then optional: when
+given, they are the package for the platforms `packages` doesn't name (and the only one the web
+app installs). A plugin with no package for your platform stays in the list, marked
+*Not available for* your platform with the platforms it has; `rustgis-cli plugins browse` prints
+`"available": false` for it, and `rustgis-cli plugins get` refuses it with the same reason. A
+RustGIS older than this feature skips an entry that has `packages` only.
