@@ -1055,7 +1055,7 @@ pub(crate) fn tls_provider() {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub mod chunk_memory;
 #[cfg(not(target_arch = "wasm32"))]

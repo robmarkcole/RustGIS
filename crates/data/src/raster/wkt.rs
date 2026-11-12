@@ -303,6 +303,37 @@ pub fn read_wkt_over_code(text: &str, code: u32) -> Option<Result<(Crs, Option<S
     Some(read_tree(&root, Some(code)))
 }
 
+/// What is said when WKT `text` gives a shift to WGS 84 other than PROJ definition `def`'s, and
+/// the system is read by `def` (named `name`) all the same, because of `why`. `None` when the
+/// text gives no shift, or `def`'s, as [`read_wkt_over_code`] tells them apart.
+///
+/// A definition that gives no shift counts as a shift of zero only on WGS 84 or GRS 1980
+/// ([`bundled_shift`]). On another ellipsoid it matches no shift the text gives, not even zero:
+/// proj4rs then changes no datum, not even the ellipsoid, which any shift, zero too, would change.
+/// The note then says the ellipsoid beside the shift.
+pub(crate) fn set_aside_shift_note(text: &str, name: &str, def: &str, why: &str) -> Option<String> {
+    let defs_shift = bundled_shift(def);
+    let (another, zero) = match tree(text) {
+        Ok(root) => {
+            let shift = towgs84(geogcs(&root).and_then(|g| g.child("DATUM")));
+            (shift.as_ref().is_some_and(|s| !matches_shift(defs_shift, s)), shift.is_some_and(|s| s.iter().all(|v| *v == 0.0)))
+        }
+        // A bound system that can't be read still gives a transformation.
+        Err(_) => (parse(text).is_ok_and(|n| has_bound_transformation(&n, 0)), false),
+    };
+    let codes_shift = defs_shift.is_some_and(|s| s.iter().any(|v| *v != 0.0));
+    let ellipsoid = "is read on its own ellipsoid without it, so positions may be off by";
+    another.then(|| match (defs_shift, zero) {
+        (None, true) => format!(
+            "the file's shift of zero to WGS 84 is set aside, because {why}, and {name} {ellipsoid} the difference between that ellipsoid and WGS 84's"
+        ),
+        (None, false) => format!(
+            "the file's own shift to WGS 84 is set aside, because {why}, and {name} {ellipsoid} as much as that shift and the difference between that ellipsoid and WGS 84's"
+        ),
+        _ => set_aside_wording(name, codes_shift, why),
+    })
+}
+
 /// Whether a parsed WKT2 text holds a `BOUNDCRS` with a transformation of its own, whether or not
 /// [`bound`] can read it. The bound system may be nested: a compound system's horizontal part,
 /// or another bound system's source. A transformation outside a `BOUNDCRS` shifts no system.
@@ -367,14 +398,20 @@ fn code_with_shift(crs: Crs) -> Option<u16> {
 /// ([`unapplied`]), or of a bound system without a transformation ([`untransformed`]); `whose`
 /// says whose it is (`the file's`), and `crs` is the system it is read as.
 fn dropped_note(root: &Node, whose: &str, crs: Crs) -> Option<String> {
+    dropped_note_by(root, whose, code_with_shift(crs).map(|code| format!("EPSG:{code}")).as_deref())
+}
+
+/// [`dropped_note`] for a system read by `by`, a code whose own shift to WGS 84 is used in place
+/// of one the file gives that isn't applied, or by none.
+fn dropped_note_by(root: &Node, whose: &str, by: Option<&str>) -> Option<String> {
     let datum = geogcs(root).and_then(|g| g.child("DATUM"));
     // On the source's datum, or on the source itself when it has none ([`put_mark`]).
     if let Some(what) = unapplied(datum).or_else(|| mark(Some(root), UNAPPLIED)) {
         let what = clip(&what);
-        // Read by an EPSG code whose own shift is applied in its place: off by the difference.
-        return Some(match code_with_shift(crs) {
+        // Read by a code whose own shift is applied in its place: off by the difference.
+        return Some(match by {
             Some(code) => format!(
-                "{whose} {what} isn't applied; EPSG:{code}'s own shift to WGS 84 is used in its place, so positions may be off by the difference between the two"
+                "{whose} {what} isn't applied; {code}'s own shift to WGS 84 is used in its place, so positions may be off by the difference between the two"
             ),
             None => format!("{whose} {what} isn't applied, so positions may be off by as much as that shift"),
         });
@@ -388,6 +425,13 @@ fn dropped_note(root: &Node, whose: &str, crs: Crs) -> Option<String> {
 /// note. `None` for text that isn't WKT.
 pub fn unapplied_note(text: &str, crs: Crs) -> Option<String> {
     dropped_note(&tree(text).ok()?, "the definition's", crs)
+}
+
+/// [`unapplied_note`] for a system read by PROJ definition `def`, named `name` (an Esri code), whose
+/// own shift to WGS 84, when it has one, is used in place of the one the text gives.
+pub(crate) fn unapplied_note_beside(text: &str, name: &str, def: &str) -> Option<String> {
+    let by = bundled_shift(def).is_some_and(|s| s.iter().any(|v| *v != 0.0)).then_some(name);
+    dropped_note_by(&tree(text).ok()?, "the definition's", by)
 }
 
 /// The notes a coordinate system given as text keeps when [`Crs::parse`] reads it as `crs`: its
@@ -443,11 +487,16 @@ fn set_aside_note(code: u32, by_code: Crs, why: &str) -> String {
     // either.
     let codes_shift = !matches!(by_code, Crs::LonLat | Crs::WebMercator)
         && u16::try_from(code).ok().and_then(epsg_proj4).and_then(bundled_shift).is_some_and(|s| s.iter().any(|v| *v != 0.0));
+    set_aside_wording(&format!("EPSG:{code}"), codes_shift, why)
+}
+
+/// [`set_aside_note`] for the system `name`, which has a shift of its own (`codes_shift`) or none.
+fn set_aside_wording(name: &str, codes_shift: bool, why: &str) -> String {
     if codes_shift {
-        format!("the file's own shift to WGS 84 is set aside for EPSG:{code}'s, because {why}")
+        format!("the file's own shift to WGS 84 is set aside for {name}'s, because {why}")
     } else {
         format!(
-            "the file's own shift to WGS 84 is set aside, because {why}, and EPSG:{code} is read without it, so positions may be off by as much as that shift"
+            "the file's own shift to WGS 84 is set aside, because {why}, and {name} is read without it, so positions may be off by as much as that shift"
         )
     }
 }
@@ -1098,10 +1147,6 @@ fn compose(first: &[f64], second: [f64; 7]) -> Result<Vec<f64>, String> {
 /// the datums taken for it and Web Mercator. A datum with no bundled shift (NAD 27's is a grid)
 /// matches none.
 fn matches_bundled_shift(code: u32, shift: &[f64]) -> bool {
-    // Writers round the last digit differently: GDAL writes Hong Kong 1980's rotations as
-    // -2.243648″ and -1.158828″, the bundled shift has -2.243649″ and -1.158827″. Differences
-    // under 1e-5 (metres, arc-seconds or parts per million) move a point less than a millimetre.
-    const ROUNDING: f64 = 1e-5;
     // Web Mercator's datum is WGS 84, so its shift is none. (It projects as if on a sphere, which
     // EPSG:3785 gives as its datum's ellipsoid.)
     let bundled = if Crs::from_epsg(code) == Some(Crs::WebMercator) {
@@ -1109,6 +1154,16 @@ fn matches_bundled_shift(code: u32, shift: &[f64]) -> bool {
     } else {
         u16::try_from(code).ok().and_then(epsg_proj4).and_then(bundled_shift)
     };
+    matches_shift(bundled, shift)
+}
+
+/// Whether `shift` (three or seven parameters) is `bundled`, a definition's shift
+/// ([`bundled_shift`]). `None` matches none.
+fn matches_shift(bundled: Option<[f64; 7]>, shift: &[f64]) -> bool {
+    // Writers round the last digit differently: GDAL writes Hong Kong 1980's rotations as
+    // -2.243648″ and -1.158828″, the bundled shift has -2.243649″ and -1.158827″. Differences
+    // under 1e-5 (metres, arc-seconds or parts per million) move a point less than a millimetre.
+    const ROUNDING: f64 = 1e-5;
     let Some(bundled) = bundled else { return false };
     bundled.iter().enumerate().all(|(i, b)| (shift.get(i).copied().unwrap_or(0.0) - b).abs() < ROUNDING)
 }

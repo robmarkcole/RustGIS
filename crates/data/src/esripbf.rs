@@ -312,11 +312,13 @@ pub fn read_page_within(bytes: &[u8], name: &str, limit: usize) -> Result<Page> 
     };
     // Only when the WKT may name the system: a code RustGIS knows goes first, unless the WKT is
     // read in its place. If the replaced bytes break the WKT, it can't be told whether the WKT
-    // would have won, so that's said too.
-    let wkt_names_system = code.and_then(crs_of_code).is_none()
-        || esri_wkt_over_code(code, wkt.as_deref()).is_some()
-        || !wkt.as_deref().is_some_and(crate::raster::wkt::parses);
-    if !wkt_utf8 && wkt_names_system {
+    // would have won, so that's said too. The WKT is looked at only when it isn't UTF-8, as this
+    // runs for every page.
+    if !wkt_utf8
+        && (code.and_then(crs_of_code).is_none()
+            || esri_wkt_over_code(code, wkt.as_deref()).is_some()
+            || !wkt.as_deref().is_some_and(crate::raster::wkt::parses))
+    {
         report.messages.push("the coordinate system's WKT isn't valid UTF-8; the bytes that can't be read are replaced with U+FFFD".into());
     }
     let (crs, to_lonlat) = crate::filegdb::esri_crs(code, wkt.as_deref(), &mut report)?;

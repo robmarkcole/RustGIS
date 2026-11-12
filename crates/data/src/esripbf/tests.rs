@@ -488,7 +488,8 @@ fn a_wkts_own_shift_wins_over_its_wkid() {
     assert!((p.x - by_code.x).abs() < 1e-9 && (p.y - by_code.y).abs() < 1e-9, "{p:?} {by_code:?}");
     assert_eq!(messages, ["the coordinate system's WKT isn't valid UTF-8; the bytes that can't be read are replaced with U+FFFD"]);
     // A non-EPSG Esri code: its WKT is read only for another body's system, so a byte that
-    // breaks the WKT is said, and a byte in a name is not.
+    // breaks the WKT is said, and a byte in a name is not. The WKT's shift (OSGB 1936's) is set
+    // aside for the code's, which is said.
     assert!(Crs::from_epsg(102033).is_none() && crate::filegdb::crs_of_code(102033).is_some());
     let albers = crate::filegdb::crs_of_code(102033).unwrap().transformer().unwrap().to_lonlat(xy).unwrap();
     let (p, messages) = at(&page([number(1, 102033), message(5, &broken)].concat()));
@@ -496,7 +497,30 @@ fn a_wkts_own_shift_wins_over_its_wkid() {
     assert_eq!(messages, ["the coordinate system's WKT isn't valid UTF-8; the bytes that can't be read are replaced with U+FFFD"]);
     let (p, messages) = at(&page([number(1, 102033), message(5, &not_utf8)].concat()));
     assert!((p.x - albers.x).abs() < 1e-9 && (p.y - albers.y).abs() < 1e-9, "{p:?} {albers:?}");
+    assert_eq!(
+        messages,
+        [
+            "coordinate system: the file's own shift to WGS 84 is set aside for ESRI:102033's, because ArcGIS keeps transformations apart from the system"
+        ]
+    );
+    // Without a shift, as ArcGIS writes it, nothing is said.
+    let unshifted = bng.replace(",TOWGS84[446.448,-125.157,542.06,0.15,0.247,0.842,-20.489]", "");
+    assert_ne!(unshifted, bng);
+    let (p, messages) = at(&page([number(1, 102033), message(5, unshifted.as_bytes())].concat()));
+    assert!((p.x - albers.x).abs() < 1e-9 && (p.y - albers.y).abs() < 1e-9, "{p:?} {albers:?}");
     assert!(messages.is_empty(), "{messages:?}");
+    // An EPSG code (ED50 / UTM zone 31N) with a WKT bound by a grid: the code, and the grid it
+    // doesn't apply is said (#1678).
+    let ed50 = Crs::Epsg(23031).transformer().unwrap().to_lonlat(xy).unwrap();
+    let bound = crate::source::tests::ed50_utm31_bound();
+    let (p, messages) = at(&page([number(1, 23031), message(5, bound.as_bytes())].concat()));
+    assert!((p.x - ed50.x).abs() < 1e-9 && (p.y - ed50.y).abs() < 1e-9, "{p:?} {ed50:?}");
+    assert_eq!(
+        messages,
+        [
+            "coordinate system: the definition's NTv2 transformation to WGS 84 (SPED2ETV2.gsb) isn't applied; EPSG:23031's own shift to WGS 84 is used in its place, so positions may be off by the difference between the two"
+        ]
+    );
 }
 
 #[test]

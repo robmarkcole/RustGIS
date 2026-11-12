@@ -687,7 +687,7 @@ fn planetary_systems_are_said_or_refused() {
 
 /// #1677: an EPSG code is used as a `.prj`'s own `AUTHORITY` is: when the WKT gives no shift to WGS
 /// 84, as Esri's doesn't, or the code's own. Another shift is read from the WKT. An Esri code is
-/// used whatever shift its WKT gives. Neither kind of code, both the Earth's, is used for another
+/// used whatever shift its WKT gives, and another shift is said to be set aside. Neither kind of code, both the Earth's, is used for another
 /// body's WKT.
 #[test]
 fn a_code_gives_way_to_its_wkts_shift_or_body() {
@@ -729,11 +729,74 @@ fn a_code_gives_way_to_its_wkts_shift_or_body() {
             "coordinate system: the file's own shift to WGS 84 is set aside for EPSG:27700's, because the shift from NAD27 to WGS 84 isn't known"
         ]
     );
-    // An Esri code (South America Albers) with a WKT giving a shift: the code.
+    // An Esri code (South America Albers) with a WKT giving another shift: the code, and the
+    // WKT's shift is said to be set aside. With no shift, or the code's own, nothing is said.
     let albers = crs_of_code(102033).unwrap();
     let shifted = r#"PROJCS["South_America_Albers_Equal_Area_Conic",GEOGCS["GCS_South_American_1969",DATUM["D_South_American_1969",SPHEROID["GRS_1967_Truncated",6378160.0,298.25],TOWGS84[1,2,3,0,0,0,0]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]],PROJECTION["Albers"],PARAMETER["False_Easting",0.0],PARAMETER["False_Northing",0.0],PARAMETER["Central_Meridian",-60.0],PARAMETER["Standard_Parallel_1",-5.0],PARAMETER["Standard_Parallel_2",-42.0],PARAMETER["Latitude_Of_Origin",-32.0],UNIT["Meter",1.0]]"#;
+    let set_aside = "coordinate system: the file's own shift to WGS 84 is set aside for ESRI:102033's, because ArcGIS keeps transformations apart from the system";
+    for (wkt, said) in [
+        (shifted.to_string(), Some(set_aside)),
+        (shifted.replace("TOWGS84[1,2,3,0,0,0,0]", "TOWGS84[0,0,0]"), Some(set_aside)),
+        // A bound system's transformation, even one that can't be read.
+        (crate::raster::wkt::tests::bound_crs(&shifted.replace(",TOWGS84[1,2,3,0,0,0,0]", ""), nad27, &[1.0, 2.0, 3.0]), Some(set_aside)),
+        (shifted.replace(",TOWGS84[1,2,3,0,0,0,0]", ""), None),
+        (shifted.replace("TOWGS84[1,2,3,0,0,0,0]", "TOWGS84[-57,1,-41,0,0,0,0]"), None),
+    ] {
+        let mut report = ReadReport::default();
+        assert_eq!(esri_crs(Some(102033), Some(&wkt), &mut report).unwrap().0, Some(albers), "{wkt}");
+        assert_eq!(report.messages, Vec::from_iter(said), "{wkt}");
+    }
+    // A code whose datum is taken for WGS 84 (USA Contiguous Albers, on NAD 83) has no shift: the
+    // WKT's is said to be left out, and a shift of zero is the code's own.
+    let usa = r#"PROJCS["USA_Contiguous_Albers_Equal_Area_Conic",GEOGCS["GCS_North_American_1983",DATUM["D_North_American_1983",SPHEROID["GRS_1980",6378137.0,298.257222101],TOWGS84[0,0,0]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]],PROJECTION["Albers"],PARAMETER["False_Easting",0.0],PARAMETER["False_Northing",0.0],PARAMETER["Central_Meridian",-96.0],PARAMETER["Standard_Parallel_1",29.5],PARAMETER["Standard_Parallel_2",45.5],PARAMETER["Latitude_Of_Origin",37.5],UNIT["Meter",1.0]]"#;
+    for (wkt, said) in [
+        (usa.to_string(), None),
+        (
+            usa.replace("TOWGS84[0,0,0]", "TOWGS84[1,2,3]"),
+            Some(
+                "coordinate system: the file's own shift to WGS 84 is set aside, because ArcGIS keeps transformations apart from the system, and ESRI:102003 is read without it, so positions may be off by as much as that shift",
+            ),
+        ),
+    ] {
+        let mut report = ReadReport::default();
+        assert_eq!(esri_crs(Some(102003), Some(&wkt), &mut report).unwrap().0, crs_of_code(102003), "{wkt}");
+        assert_eq!(report.messages, Vec::from_iter(said), "{wkt}");
+    }
+    // On a sphere, a code without a shift changes no datum, not even the ellipsoid, which any shift
+    // would: the notice says the ellipsoid, and the shift when it isn't zero, also one that can't be
+    // read.
+    let mollweide = r#"PROJCS["Sphere_Mollweide",GEOGCS["GCS_Sphere",DATUM["D_Sphere",SPHEROID["Sphere",6371000.0,0.0],TOWGS84[0,0,0]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]],PROJECTION["Mollweide"],PARAMETER["False_Easting",0.0],PARAMETER["False_Northing",0.0],PARAMETER["Central_Meridian",0.0],UNIT["Meter",1.0]]"#;
     let mut report = ReadReport::default();
-    assert_eq!(esri_crs(Some(102033), Some(shifted), &mut report).unwrap().0, Some(albers));
+    assert_eq!(esri_crs(Some(53009), Some(mollweide), &mut report).unwrap().0, crs_of_code(53009));
+    assert_eq!(
+        report.messages,
+        [
+            "coordinate system: the file's shift of zero to WGS 84 is set aside, because ArcGIS keeps transformations apart from the system, and ESRI:53009 is read on its own ellipsoid without it, so positions may be off by the difference between that ellipsoid and WGS 84's"
+        ]
+    );
+    let unshifted_mollweide = mollweide.replace(",TOWGS84[0,0,0]", "");
+    for wkt in [
+        mollweide.replace("TOWGS84[0,0,0]", "TOWGS84[1,2,3]"),
+        crate::raster::wkt::tests::bound_crs(&unshifted_mollweide, nad27, &[1.0, 2.0, 3.0]),
+    ] {
+        let mut report = ReadReport::default();
+        assert_eq!(esri_crs(Some(53009), Some(&wkt), &mut report).unwrap().0, crs_of_code(53009), "{wkt}");
+        assert_eq!(
+            report.messages,
+            [
+                "coordinate system: the file's own shift to WGS 84 is set aside, because ArcGIS keeps transformations apart from the system, and ESRI:53009 is read on its own ellipsoid without it, so positions may be off by as much as that shift and the difference between that ellipsoid and WGS 84's"
+            ],
+            "{wkt}"
+        );
+    }
+    let mut report = ReadReport::default();
+    esri_crs(Some(53009), Some(&unshifted_mollweide), &mut report).unwrap();
+    assert!(report.messages.is_empty(), "{:?}", report.messages);
+    // Esri's Web Mercator code is EPSG's too, whose shift is none: a shift of zero is its own.
+    let web_mercator = r#"PROJCS["WGS_1984_Web_Mercator_Auxiliary_Sphere",GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137.0,298.257223563],TOWGS84[0,0,0,0,0,0,0]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]],PROJECTION["Mercator_Auxiliary_Sphere"],PARAMETER["False_Easting",0.0],PARAMETER["False_Northing",0.0],PARAMETER["Central_Meridian",0.0],PARAMETER["Standard_Parallel_1",0.0],PARAMETER["Auxiliary_Sphere_Type",0.0],UNIT["Meter",1.0]]"#;
+    assert!(crate::raster::crs::esri_proj4(102100).is_some());
+    let mut report = ReadReport::default();
+    assert_eq!(esri_crs(Some(102100), Some(web_mercator), &mut report).unwrap().0, Some(Crs::WebMercator));
     assert!(report.messages.is_empty(), "{:?}", report.messages);
     // Mars, under an EPSG code and an Esri one: read as Mars, said, or refused.
     let mars = r#"GEOGCS["GCS_Mars_2015_-_Sphere_Ocentric",DATUM["D_Mars_2015_-_Sphere",SPHEROID["Mars_2015_-_Sphere",3396190.0,0.0]],PRIMEM["Reference_Meridian",0.0],UNIT["Degree",0.0174532925199433]]"#;
@@ -748,6 +811,55 @@ fn a_code_gives_way_to_its_wkts_shift_or_body() {
         );
         let e = esri_crs(Some(code), Some(&bonne), &mut ReadReport::default()).err().unwrap().to_string();
         assert!(e.contains("belongs to another body than the Earth") && e.contains("Bonne"), "{code}: {e}");
+    }
+}
+
+/// #1678: a grid shift the WKT gives (a WKT2 `BOUNDCRS`'s NTv2 file, or GDAL's WKT1
+/// `PROJ4_GRIDS`) isn't applied when the code is read, for an EPSG code, longitude/latitude's and
+/// an Esri one alike, and is said once, with the code's own shift used in its place when it has
+/// one. Without the grid nothing is said. (An EPSG code without a shift of its own, such as
+/// NAD 27's, gives way to the WKT, whose grid `read_wkt` says.)
+#[test]
+fn a_code_says_a_grid_its_wkt_gives() {
+    use crate::raster::wkt::tests::BOUND_BY_A_GRID;
+    use crate::source::tests::{ED50_UTM31, ed50_utm31_bound};
+    let conus = "coordinate system: the definition's NTv2 transformation to WGS 84 (conus) isn't applied; ESRI:102033's own shift to WGS 84 is used in its place, so positions may be off by the difference between the two";
+    let spain = "coordinate system: the definition's NTv2 transformation to WGS 84 (SPED2ETV2.gsb) isn't applied; EPSG:23031's own shift to WGS 84 is used in its place, so positions may be off by the difference between the two";
+    let ntv2 = "coordinate system: the definition's grid shift (ntv2_0.gsb) isn't applied; ESRI:102033's own shift to WGS 84 is used in its place, so positions may be off by the difference between the two";
+    let unshifted =
+        "coordinate system: the definition's grid shift (ntv2_0.gsb) isn't applied, so positions may be off by as much as that shift";
+    // South America Albers (an Esri code), plain and with GDAL's WKT1 grid on its datum; with a
+    // Helmert shift beside the grid only the grid is said.
+    let albers = r#"PROJCS["South_America_Albers_Equal_Area_Conic",GEOGCS["GCS_South_American_1969",DATUM["D_South_American_1969",SPHEROID["GRS_1967_Truncated",6378160.0,298.25]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]],PROJECTION["Albers"],PARAMETER["False_Easting",0.0],PARAMETER["False_Northing",0.0],PARAMETER["Central_Meridian",-60.0],PARAMETER["Standard_Parallel_1",-5.0],PARAMETER["Standard_Parallel_2",-42.0],PARAMETER["Latitude_Of_Origin",-32.0],UNIT["Meter",1.0]]"#;
+    let gridded = albers.replace("298.25]]", r#"298.25],EXTENSION["PROJ4_GRIDS","ntv2_0.gsb"]]"#);
+    let both = albers.replace("298.25]]", r#"298.25],TOWGS84[1,2,3,0,0,0,0],EXTENSION["PROJ4_GRIDS","ntv2_0.gsb"]]"#);
+    assert!(gridded != albers && both != albers);
+    // USA Contiguous Albers (an Esri code on NAD 83, without a shift of its own) and
+    // longitude/latitude (EPSG:4326) with a grid on their datum.
+    let usa = r#"PROJCS["USA_Contiguous_Albers_Equal_Area_Conic",GEOGCS["GCS_North_American_1983",DATUM["D_North_American_1983",SPHEROID["GRS_1980",6378137.0,298.257222101]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]],PROJECTION["Albers"],PARAMETER["False_Easting",0.0],PARAMETER["False_Northing",0.0],PARAMETER["Central_Meridian",-96.0],PARAMETER["Standard_Parallel_1",29.5],PARAMETER["Standard_Parallel_2",45.5],PARAMETER["Latitude_Of_Origin",37.5],UNIT["Meter",1.0]]"#;
+    let usa_gridded = usa.replace("298.257222101]]", r#"298.257222101],EXTENSION["PROJ4_GRIDS","ntv2_0.gsb"]]"#);
+    let wgs84 = r#"GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137.0,298.257223563]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]]"#;
+    let wgs84_gridded = wgs84.replace("298.257223563]]", r#"298.257223563],EXTENSION["PROJ4_GRIDS","ntv2_0.gsb"]]"#);
+    assert!(usa_gridded != usa && wgs84_gridded != wgs84);
+    for (code, wkt, said) in [
+        // ED50 / UTM zone 31N, an EPSG code with a Helmert shift of its own, bound by Spain's
+        // grid from ED50.
+        (23031, ed50_utm31_bound().as_str(), Some(spain)),
+        (23031, ED50_UTM31, None),
+        (102033, BOUND_BY_A_GRID, Some(conus)),
+        (102033, gridded.as_str(), Some(ntv2)),
+        (102033, both.as_str(), Some(ntv2)),
+        (102033, albers, None),
+        (102003, usa_gridded.as_str(), Some(unshifted)),
+        (102003, usa, None),
+        (4326, wgs84_gridded.as_str(), Some(unshifted)),
+        (4326, wgs84, None),
+    ] {
+        let mut report = ReadReport::default();
+        // Longitude/latitude is `None`.
+        let read = crs_of_code(code).filter(|c| *c != Crs::LonLat);
+        assert_eq!(esri_crs(Some(code), Some(wkt), &mut report).unwrap().0, read, "{code} {wkt}");
+        assert_eq!(report.messages, Vec::from_iter(said), "{code} {wkt}");
     }
 }
 
