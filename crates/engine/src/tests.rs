@@ -1610,6 +1610,70 @@ fn qgis_annotation_texts_under_layers_above_are_noted() {
     assert!(!texts.iter().any(|t| t.contains("layers above draw over in QGIS")), "{texts:?}");
 }
 
+/// A project's layer tree comes in as nested layer groups: each layer in its group with its own
+/// box, the groups' boxes, open state and a group layer's opacity on the groups, the drawing
+/// order kept (a group's own layers above and below a subgroup stay there). A web tile layer in a
+/// group comes in outside it, noted.
+#[test]
+fn qgis_layer_tree_groups_import_as_layer_groups() {
+    let dir = std::env::temp_dir().join(format!("rustgis-qgis-groups-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let point = r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[8.7,47.5]}}]}"#;
+    let layer = |id: &str| {
+        std::fs::write(dir.join(format!("{id}.geojson")), point).unwrap();
+        format!(
+            r#"<maplayer type="vector"><id>{id}</id><datasource>./{id}.geojson</datasource><layername>{id}</layername><provider>ogr</provider></maplayer>"#
+        )
+    };
+    let layers: String = ["e", "a", "b", "c", "d"].iter().map(|id| layer(id)).collect();
+    let qgs = format!(
+        r#"<qgis version="4.2.3"><layer-tree-group>
+      <layer-tree-group checked="Qt::Checked" expanded="0" name="Outer">
+        <layer-tree-layer checked="Qt::Checked" id="e"/>
+        <layer-tree-group checked="Qt::Unchecked" expanded="1" name="Inner"><layer-tree-layer checked="Qt::Checked" id="a"/></layer-tree-group>
+        <layer-tree-layer checked="Qt::Unchecked" id="b"/>
+        <layer-tree-layer checked="Qt::Checked" id="t"/>
+      </layer-tree-group>
+      <layer-tree-layer checked="Qt::Checked" id="c"/>
+      <layer-tree-group checked="Qt::Checked" expanded="1" groupLayer="gl" name="Drawn as one"><layer-tree-layer checked="Qt::Checked" id="d"/><layer-tree-layer checked="Qt::Checked" id="t2"/></layer-tree-group>
+      <layer-tree-group checked="Qt::Checked" expanded="1" name="Empty"/>
+    </layer-tree-group><projectlayers>{layers}
+      <maplayer type="group" hasScaleBasedVisibilityFlag="1" minScale="50000" maxScale="1000"><id>gl</id><layername>Drawn as one</layername><layerOpacity>0.25</layerOpacity><blendMode>0</blendMode></maplayer>
+      <maplayer type="raster"><id>t2</id><datasource>type=xyz&amp;url=https://tiles2.example/%7Bz%7D/%7Bx%7D/%7By%7D.png</datasource><layername>Tiles 2</layername><provider>wms</provider></maplayer>
+      <maplayer type="raster"><id>t</id><datasource>type=xyz&amp;url=https://tiles.example/%7Bz%7D/%7Bx%7D/%7By%7D.png</datasource><layername>Tiles</layername><provider>wms</provider></maplayer>
+    </projectlayers></qgis>"#
+    );
+    let mut s = world();
+    let out = s.run("project.importQgis", &json!({"text": qgs, "dir": dir.display().to_string()})).unwrap();
+    let m = s.map();
+    let names: Vec<&str> = m.layers.iter().map(|l| l.name.as_str()).collect();
+    assert_eq!(names, ["e", "a", "b", "c", "d"], "the tree's order, top first: {out}");
+    let group = |name: &str| m.groups.iter().find(|g| g.name == name).unwrap_or_else(|| panic!("{name}: {out}"));
+    let (outer, inner, one, empty) = (group("Outer"), group("Inner"), group("Drawn as one"), group("Empty"));
+    assert_eq!((outer.visible, outer.expanded, outer.parent), (true, false, None));
+    assert_eq!((inner.visible, inner.parent), (false, Some(outer.id)));
+    assert_eq!((one.transparency, one.parent), (75.0, None));
+    // Its visibility range, in RustGIS's scales.
+    let q = rustgis_map::qgis::QGIS_SCALE;
+    assert_eq!((one.min_scale, one.max_scale), (Some(50_000.0 * q), Some(1000.0 * q)));
+    assert!(empty.children.is_empty(), "kept, as QGIS keeps it");
+    let id = |name: &str| m.layer_by_name(name).unwrap().id;
+    let visible = |name: &str| m.layer_by_name(name).unwrap().visible;
+    assert_eq!(m.group_of(id("a")).map(|g| g.id), Some(inner.id));
+    assert_eq!(m.group_of(id("b")).map(|g| g.id), Some(outer.id));
+    assert_eq!(m.group_of(id("e")).map(|g| g.id), Some(outer.id));
+    assert_eq!(m.group_of(id("c")).map(|g| g.id), None);
+    assert_eq!(m.group_of(id("d")).map(|g| g.id), Some(one.id));
+    // Its own box: a is checked in its unchecked group (the group hides it), b is unchecked.
+    assert_eq!([visible("a"), visible("b"), visible("c"), visible("d")], [true, false, true, true]);
+    let notes = serde_json::to_string(&out["notes"]).unwrap();
+    assert!(notes.contains("its place in the group Outer: a web tile layer, added outside the group"), "{notes}");
+    assert!(notes.contains("its place in the group Drawn as one and the opacity of a group drawn as one holding it"), "{notes}");
+    assert!(notes.contains("opacity of groups drawn as one (1: Drawn as one)"), "{notes}");
+    assert!(!notes.contains("RustGIS doesn't read QGIS's group layers"), "{notes}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// A picture whose aspect is locked keeps it on the map, as QGIS fits it on its canvas: in a
 /// project in degrees (drawn as plate carrée) its box in degrees, in a Web Mercator one its box in
 /// Mercator metres, has the picture's 2:1 aspect, the layer being in degrees either way.
@@ -2565,7 +2629,7 @@ fn a_qgis_project_opens_as_a_map_and_a_qgis_style_styles_a_layer() {
     let qgs = r#"<qgis version="3.42.0"><title>Web</title>
   <layer-tree-group><layer-tree-layer id="x" checked="Qt::Unchecked"/></layer-tree-group>
   <projectlayers><maplayer type="raster" hasScaleBasedVisibilityFlag="1" minScale="100000" maxScale="1000"><id>x</id><datasource>type=xyz&amp;url=https://tiles.example/%7Bz%7D/%7Bx%7D/%7By%7D.png&amp;zmax=19&amp;zmin=0</datasource><layername>Tiles</layername><provider>wms</provider>
-    <pipe><rasterrenderer opacity="0.25" type="singlebandcolordata"/></pipe><blendMode>13</blendMode></maplayer></projectlayers></qgis>"#;
+    <pipe><rasterrenderer opacity="0.25" type="singlebandcolordata"/></pipe><blendMode>6</blendMode></maplayer></projectlayers></qgis>"#;
     let out = s.run("project.importQgis", &json!({"text": qgs})).unwrap();
     let t = s.map().tiles.iter().find(|t| t.name == "Tiles").expect("the web layer is added");
     assert!(!t.visible, "unchecked in the layer tree");
@@ -2603,7 +2667,7 @@ fn a_qgis_project_opens_as_a_map_and_a_qgis_style_styles_a_layer() {
     // the QGIS layer's visibility, opacity, blending and scale range.
     let web = r#"<qgis version="3.42.0"><layer-tree-group><layer-tree-layer id="w" checked="Qt::Unchecked"/></layer-tree-group><projectlayers>
         <maplayer type="raster" hasScaleBasedVisibilityFlag="1" minScale="100000" maxScale="1000"><id>w</id><datasource>url=https://wms.example/wms&amp;layers=a</datasource><layername>Web</layername><provider>wms</provider>
-        <pipe><rasterrenderer opacity="0.5" type="singlebandcolordata"/></pipe><blendMode>13</blendMode></maplayer></projectlayers></qgis>"#;
+        <pipe><rasterrenderer opacity="0.5" type="singlebandcolordata"/></pipe><blendMode>6</blendMode></maplayer></projectlayers></qgis>"#;
     let mut report = rustgis_map::qgis::Report::default();
     let project = rustgis_map::qgis::read_project(web, "", &mut report).unwrap();
     let mut w = world();

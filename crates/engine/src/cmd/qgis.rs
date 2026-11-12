@@ -110,7 +110,12 @@ fn import_project(s: &mut Session, p: &Value) -> CmdResult {
     // Each layer added, bottom first: whether it is drawn, and, for an annotation layer, its
     // texts over all its other graphics and whether it has any such.
     let mut drawn: Vec<(String, bool, Option<Drawn>)> = Vec::new();
-    for layer in project.layers.iter().rev().chain(project.main_annotations.as_ref()) {
+    // What each of the project's layers came in as, by its index in `project.layers`.
+    let mut came_in: Vec<CameIn> = Vec::new();
+    let tree_layers = project.layers.iter().enumerate().rev().map(|(i, l)| (Some(i), l));
+    for (index, layer) in tree_layers.chain(project.main_annotations.iter().map(|l| (None, l))) {
+        let before: std::collections::HashSet<u32> = s.map().layers.iter().map(|l| l.id).collect();
+        let tiles = s.map().tiles.len();
         let result = if layer.kind == "annotation" {
             add_annotations(s, layer, crs, canvas.as_ref(), dir.is_some(), &mut pictures, &mut report)
                 .map(|(name, d)| Some((name, Some(d))))
@@ -121,12 +126,17 @@ fn import_project(s: &mut Session, p: &Value) -> CmdResult {
             Ok(Some((name, d))) => {
                 drawn.push((layer.name.clone(), layer.visible, d));
                 added.push(name);
+                if let Some(index) = index {
+                    let ids = s.map().layers.iter().map(|l| l.id).filter(|id| !before.contains(id)).collect();
+                    came_in.push(CameIn { index, ids, tile: s.map().tiles.len() > tiles });
+                }
             }
             Ok(None) => {}
             Err(e) => report.skipped(&layer.name, format!("the layer: {e}")),
         }
     }
     note_texts_under_layers_above(&drawn, &mut report);
+    add_groups(s, &project, &came_in, &mut report);
     go_to_view(s, &project, degrees);
     let notes: Vec<Value> = report.notes.iter().map(note_json).collect();
     if !report.notes.is_empty() {
@@ -142,6 +152,79 @@ fn import_project(s: &mut Session, p: &Value) -> CmdResult {
         );
     }
     Ok(json!({"map": name, "layers": added, "notes": notes}))
+}
+
+/// What one of a project's layers came in as.
+struct CameIn {
+    /// Its index in [`qgis::Project::layers`].
+    index: usize,
+    /// The map layers added for it (a file of several layers adds them all).
+    ids: Vec<u32>,
+    /// A web tile layer was added for it.
+    tile: bool,
+}
+
+/// Makes the project's layer tree groups as layer groups, nested as in QGIS, and puts each layer
+/// added in its own (`came_in`), its box checked as its own is in QGIS (the groups' apply on
+/// top). A group is made even when none of its layers came in, as QGIS keeps empty groups. A
+/// web tile layer can't be in a group: one that was in a group is noted, added outside it (shown
+/// as the groups holding it showed it).
+fn add_groups(s: &mut Session, project: &qgis::Project, came_in: &[CameIn], report: &mut Report) {
+    if project.groups.is_empty() {
+        return;
+    }
+    let m = s.map_mut();
+    // Every group made first, empty (parents before the groups in them, so each finds its
+    // parent), then given its layers and gathered once: the layers came in in the tree's order,
+    // so gathering moves none of them. Giving a group its layers as it is made would gather them
+    // before its subgroups exist, moving a layer under a subgroup above that subgroup's layers.
+    let mut made: Vec<u32> = Vec::with_capacity(project.groups.len());
+    for g in &project.groups {
+        let mut group = rustgis_map::LayerGroup::new(g.name.as_str());
+        group.visible = g.checked;
+        group.expanded = g.expanded;
+        group.transparency = g.transparency.unwrap_or(0.0).clamp(0.0, 100.0);
+        group.min_scale = g.min_scale;
+        group.max_scale = g.max_scale;
+        group.parent = g.parent.and_then(|p| made.get(p).copied());
+        made.push(m.add_group(group));
+    }
+    for c in came_in {
+        let Some(id) = project.layers.get(c.index).and_then(|l| l.group).and_then(|g| made.get(g).copied()) else { continue };
+        if let Some(group) = m.groups.iter_mut().find(|g| g.id == id) {
+            group.children.extend(c.ids.iter().copied());
+        }
+    }
+    let mut outside = Vec::new();
+    for c in came_in {
+        let Some(layer) = project.layers.get(c.index) else { continue };
+        let Some(group) = layer.group.and_then(|g| project.groups.get(g)) else { continue };
+        if c.tile && c.ids.is_empty() {
+            // The opacity of a group drawn as one holding it, which the tile goes without.
+            let mut chain = layer.group;
+            let mut faded = false;
+            for _ in 0..project.groups.len() {
+                let Some(g) = chain.and_then(|g| project.groups.get(g)) else { break };
+                faded |= g.transparency.is_some();
+                chain = g.parent;
+            }
+            outside.push((layer.name.as_str(), group.name.as_str(), faded));
+        }
+        for id in &c.ids {
+            if let Some(l) = m.layer_mut(*id) {
+                l.visible = layer.checked;
+            }
+        }
+    }
+    // Parents come before the groups in them, so no link should be dropped; said if one is.
+    let dropped = m.tidy_groups();
+    if dropped > 0 {
+        report.approximated("", format!("groups whose place in another couldn't be kept ({dropped}), put at the top level"));
+    }
+    for (name, group, faded) in outside {
+        let opacity = if faded { " and the opacity of a group drawn as one holding it" } else { "" };
+        report.approximated(name, format!("its place in the group {group}{opacity}: a web tile layer, added outside the group"));
+    }
 }
 
 /// What an annotation layer draws, as placed (bottom first): the texts over all its other

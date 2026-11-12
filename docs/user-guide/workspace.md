@@ -210,7 +210,13 @@ on the desktop, or **Project › New › QGIS Project…** (`project.importQgis=
 The QGIS Project picker filters for `.qgs` and `.qgz` files on both desktop and web.
 Its layers come in the layer tree's order, each from its file (GeoPackage, Shapefile, GeoJSON,
 GeoTIFF and the other formats RustGIS reads), a CSV of
-points, XYZ tiles or a WMS layer, unchecked layers and groups hidden. The map takes the project's
+points, XYZ tiles or a WMS layer, unchecked layers and groups hidden. The layer tree's groups come in
+as [layer groups](index.md), nested as in QGIS (to eight levels and 2,000 groups; the layers of
+groups past that go in the group holding them), open or closed, each layer in its group with its
+own box; a group drawn as one (a QGIS group layer) takes its visibility range and its
+opacity, the opacity applied to each of its layers. Web tile layers (XYZ, and WMS layers drawn as tiles) can't be in a group and come in
+outside it. The layers draw in the layer tree's order, also when the project sets an order of
+its own (noted). The map takes the project's
 coordinate system and its saved view (or its layers' extent, when that view shows none of them),
 with no basemap and no graticule, as QGIS draws it. A project in degrees (EPSG:4326 and other supported
 longitude/latitude systems) opens in the Equirectangular projection, the plate carrée QGIS draws
@@ -325,7 +331,8 @@ dashed polygon outlines solid, label halos with sharp corners drawn round and bl
 over the map, label backgrounds of other shapes drawn as rectangles, label distances from lines
 and polygons, a distance around points moved straight up, labels wrapped at a shortest line
 length or justified, values outside a graduated renderer's ranges in its first or last class, file options
-such as `layerid` that RustGIS doesn't read) and what was skipped (arrow lines, other data-defined
+such as `layerid` that RustGIS doesn't read, groups showing one layer at a time as ordinary groups,
+a group layer's opacity applied to each of its layers and its blending mode drawn as Normal) and what was skipped (arrow lines, group layers' draw effects, other data-defined
 settings, draw effects, label callouts, contours and other raster
 renderers RustGIS has no match for, PostGIS, WFS
 and other sources RustGIS doesn't read, histogram, stacked bar and text diagrams, joins, virtual fields, a layer's other styles,

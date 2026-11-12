@@ -42,10 +42,10 @@ from qgis.core import (
     QgsDateTimeRange, QgsStyle, QgsGradientColorRamp, QgsLayerTreeLayer,
     QgsDiagramSettings, QgsDiagramLayerSettings, QgsSingleCategoryDiagramRenderer,
     QgsLinearlyInterpolatedDiagramRenderer, QgsPieDiagram, QgsHistogramDiagram,
-    QgsStackedBarDiagram, QgsTextDiagram,
+    QgsStackedBarDiagram, QgsTextDiagram, QgsGroupLayer,
 )
 from qgis.PyQt.QtCore import QVariant, QMetaType, QDateTime, QDate, QTime, QSizeF
-from qgis.PyQt.QtGui import QColor
+from qgis.PyQt.QtGui import QColor, QPainter
 
 OUT = os.path.abspath(sys.argv[1])
 LOG = []
@@ -883,6 +883,35 @@ def annotations_styled():
 
 
 attempt("annotations styled", annotations_styled)
+
+
+# Groups: nested, hidden, collapsed, a layer unchecked in a shown group, and a group drawn as one
+# (a group layer) with its opacity and blending.
+def groups():
+    p = new_project()
+    pts, lines, polys, dem = layer("points"), layer("lines"), layer("polygons"), raster()
+    for lyr in (pts, lines, polys, dem):
+        p.addMapLayer(lyr, False)
+    root = p.layerTreeRoot()
+    outer = root.addGroup("Outer")
+    inner = outer.addGroup("Inner")
+    inner.addLayer(pts)
+    outer.addLayer(lines).setItemVisibilityChecked(False)
+    hidden = root.addGroup("Hidden")
+    hidden.setItemVisibilityChecked(False)
+    hidden.addLayer(dem)
+    collapsed = root.addGroup("Drawn as one")
+    collapsed.setExpanded(False)
+    collapsed.addLayer(polys)
+    gl = collapsed.convertToGroupLayer(QgsGroupLayer.LayerOptions(p.transformContext()))
+    p.addMapLayer(gl, False)
+    gl.setOpacity(0.6)
+    gl.setBlendMode(QPainter.CompositionMode.CompositionMode_Multiply)
+    root.addGroup("Empty")
+    save_project(p, "groups-nested-hidden-collapsed-drawn-as-one")
+
+
+attempt("groups", groups)
 
 
 # Every style above as one project, each on its own layer: a single file covering them all.

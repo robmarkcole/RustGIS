@@ -42,7 +42,7 @@ const PROJECT: &str = r#"<!DOCTYPE qgis PUBLIC 'http://mrcc.com/qgis.dtd' 'SYSTE
         </symbols>
       </renderer-v2>
       <layerOpacity>0.75</layerOpacity>
-      <blendMode>13</blendMode>
+      <blendMode>6</blendMode>
       <labeling type="simple">
         <settings><text-style fieldName="name" fontSize="12" fontSizeUnit="Point" textColor="20,40,60,255" namedStyle="Bold Italic" fontFamily="Liberation Sans Narrow">
           <text-buffer bufferDraw="1"/></text-style><placement placement="1" quadOffset="2"/></settings>
@@ -664,6 +664,17 @@ fn files_of_qgis_1_and_2_read_by_their_old_names() {
     assert_eq!(p.crs.as_deref(), Some("EPSG:21781"), "the canvas's");
     let names: Vec<(&str, bool)> = p.layers.iter().map(|l| (l.name.as_str(), l.visible)).collect();
     assert_eq!(names, [("roads", true), ("land", false)], "the legend's order; land's group is unchecked");
+    assert!(!report.notes.iter().any(|n| n.text.contains("layer order")), "the legend's own order: {:?}", report.notes);
+    // A legend keeping a drawing order of its own: noted, as it isn't read.
+    let own = qgs
+        .replace(r#"<legend updateDrawingOrder="true">"#, r#"<legend updateDrawingOrder="false">"#)
+        .replace(r#"name="land">"#, r#"name="land" drawingOrder="0">"#);
+    let mut own_report = Report::default();
+    read_project(&own, "", &mut own_report).unwrap();
+    assert!(own_report.notes.iter().any(|n| n.text.contains("set apart from the legend")), "{:?}", own_report.notes);
+    let base = p.groups.iter().map(|g| (g.name.as_str(), g.checked, g.expanded)).collect::<Vec<_>>();
+    assert_eq!(base, [("base", false, true)], "the legend's group");
+    assert_eq!((p.layers[1].group, p.layers[1].checked), (Some(0), true));
     let (roads, land) = (&p.layers[0].style, &p.layers[1].style);
     // maximumScale was the out-beyond limit, minimumScale the in-beyond.
     let (min, max) = (land.min_scale.flatten().unwrap(), land.max_scale.flatten().unwrap());
@@ -1056,7 +1067,7 @@ fn every_corpus_file_reads() {
         read_style(&text, "layer", &mut report).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     }
     let projects = files("generated/qgs", &["qgs", "qgz"]);
-    assert_eq!(projects.len(), 22, "project corpus changed: {projects:?}");
+    assert_eq!(projects.len(), 23, "project corpus changed: {projects:?}");
     for path in &projects {
         let bytes = std::fs::read(path).unwrap();
         let text = if path.extension().is_some_and(|e| e == "qgz") {
@@ -2258,4 +2269,245 @@ fn diagrams_carry_over_as_pie_diagrams() {
         report.notes
     );
     assert!(pie("").2.notes.is_empty());
+}
+
+/// A project's layer tree, as QGIS 4.2 writes it (measured): groups nested, a hidden one, a
+/// collapsed one, one showing a layer at a time, one drawn as one (a group layer, with its
+/// opacity and blending in a `<maplayer type="group">`), and an empty one.
+const GROUPS: &str = r#"<qgis version="4.2.3-Firenze">
+  <layer-tree-group>
+    <layer-tree-group checked="Qt::Checked" expanded="1" groupLayer="" name="Outer">
+      <layer-tree-group checked="Qt::Checked" expanded="1" groupLayer="" name="Inner">
+        <layer-tree-layer checked="Qt::Checked" expanded="1" id="p1" name="pts1"/>
+      </layer-tree-group>
+      <layer-tree-layer checked="Qt::Checked" expanded="1" id="p2" name="pts2"/>
+    </layer-tree-group>
+    <layer-tree-group checked="Qt::Unchecked" expanded="1" groupLayer="" name="Hidden">
+      <layer-tree-layer checked="Qt::Checked" expanded="1" id="p3" name="pts3"/>
+    </layer-tree-group>
+    <layer-tree-group checked="Qt::Checked" expanded="0" groupLayer="" name="Collapsed">
+      <layer-tree-layer checked="Qt::Unchecked" expanded="1" id="p4" name="pts4"/>
+    </layer-tree-group>
+    <layer-tree-group checked="Qt::Checked" expanded="1" groupLayer="" mutually-exclusive="1" mutually-exclusive-child="0" name="Exclusive">
+      <layer-tree-layer checked="Qt::Checked" expanded="1" id="e1" name="ex1"/>
+      <layer-tree-layer checked="Qt::Unchecked" expanded="1" id="e2" name="ex2"/>
+    </layer-tree-group>
+    <layer-tree-group checked="Qt::Checked" expanded="1" groupLayer="AsGroup_1" name="AsGroup">
+      <layer-tree-layer checked="Qt::Checked" expanded="1" id="g1" name="gl1"/>
+    </layer-tree-group>
+    <layer-tree-layer checked="Qt::Checked" expanded="1" id="top" name="top"/>
+    <layer-tree-group checked="Qt::Checked" expanded="1" groupLayer="" name="Empty"/>
+  </layer-tree-group>
+  <projectlayers>
+    <maplayer type="group"><id>AsGroup_1</id><datasource></datasource><layername>AsGroup</layername>
+      <childLayers><child layerid="g1"/></childLayers><layerOpacity>0.5</layerOpacity><blendMode>6</blendMode></maplayer>
+    {LAYERS}
+  </projectlayers>
+</qgis>"#;
+
+fn groups_project() -> String {
+    let layers: String = ["p1", "p2", "p3", "p4", "e1", "e2", "g1", "top"]
+        .iter()
+        .map(|id| format!(r#"<maplayer type="vector"><id>{id}</id><datasource>/d/{id}.shp</datasource><layername>{id}</layername><provider>ogr</provider></maplayer>"#))
+        .collect();
+    GROUPS.replace("{LAYERS}", &layers)
+}
+
+#[test]
+fn layer_tree_groups_carry_over() {
+    let mut report = Report::default();
+    let p = read_project(&groups_project(), "", &mut report).unwrap();
+    let groups: Vec<(&str, bool, bool, Option<usize>, Option<f32>)> =
+        p.groups.iter().map(|g| (g.name.as_str(), g.checked, g.expanded, g.parent, g.transparency)).collect();
+    assert_eq!(
+        groups,
+        [
+            ("Outer", true, true, None, None),
+            ("Inner", true, true, Some(0), None),
+            ("Hidden", false, true, None, None),
+            ("Collapsed", true, false, None, None),
+            ("Exclusive", true, true, None, None),
+            ("AsGroup", true, true, None, Some(50.0)),
+            ("Empty", true, true, None, None),
+        ]
+    );
+    // The group layer is its group's opacity, not a layer.
+    let layers: Vec<(&str, Option<usize>, bool, bool)> =
+        p.layers.iter().map(|l| (l.name.as_str(), l.group, l.checked, l.visible)).collect();
+    assert_eq!(
+        layers,
+        [
+            ("p1", Some(1), true, true),
+            ("p2", Some(0), true, true),
+            ("p3", Some(2), true, false),
+            ("p4", Some(3), false, false),
+            ("e1", Some(4), true, true),
+            ("e2", Some(4), false, false),
+            ("g1", Some(5), true, true),
+            ("top", None, true, true),
+        ],
+        "each in its group, its own box apart from what the groups above add"
+    );
+    let texts: Vec<&str> = report.notes.iter().map(|n| n.text.as_str()).collect();
+    for part in [
+        "one layer at a time (1: Exclusive)",
+        "opacity of groups drawn as one (1: AsGroup)",
+        "blending mode of groups drawn as one (1: AsGroup)",
+    ] {
+        assert!(texts.iter().any(|t| t.contains(part)), "{part}: {texts:?}");
+    }
+    assert!(!texts.iter().any(|t| t.contains("group layers")), "{texts:?}");
+
+    // A group layer's draw effect is noted; a layer order of its own, when it differs from the
+    // tree's, is noted (the tree's is drawn).
+    let effect = r#"<paintEffect><effect enabled="1" type="effectStack"><effect type="dropShadow"><Option type="Map"><Option name="enabled" type="QString" value="1"/></Option></effect><effect type="drawSource"/></effect></paintEffect>"#;
+    let order = r#"<custom-order enabled="1"><item>top</item><item>p1</item></custom-order></layer-tree-group>
+  <projectlayers>"#;
+    let qgs = groups_project().replace("<blendMode>6</blendMode>", effect).replacen("</layer-tree-group>\n  <projectlayers>", order, 1);
+    let mut report = Report::default();
+    read_project(&qgs, "", &mut report).unwrap();
+    let texts: Vec<&str> = report.notes.iter().map(|n| n.text.as_str()).collect();
+    for part in ["draw effects of groups drawn as one (1: AsGroup)", "its layer order (set apart from the layer tree)"] {
+        assert!(texts.iter().any(|t| t.contains(part)), "{part}: {texts:?}");
+    }
+    // The same order as the tree's: nothing to note.
+    let same = groups_project().replacen(
+        "</layer-tree-group>\n  <projectlayers>",
+        &order.replace("<item>top</item><item>p1</item>", "<item>p1</item><item>top</item>"),
+        1,
+    );
+    let mut report = Report::default();
+    read_project(&same, "", &mut report).unwrap();
+    assert!(!report.notes.iter().any(|n| n.text.contains("layer order")), "{:?}", report.notes);
+
+    // A tree of plain groups, all shown, carries over without a note.
+    let mut report = Report::default();
+    let plain = r#"<qgis><layer-tree-group><layer-tree-group checked="Qt::Checked" expanded="1" name="A"><layer-tree-layer checked="Qt::Checked" id="a"/></layer-tree-group></layer-tree-group>
+      <projectlayers><maplayer type="vector"><id>a</id><datasource>/d/a.shp</datasource><layername>a</layername><provider>ogr</provider></maplayer></projectlayers></qgis>"#;
+    let p = read_project(plain, "", &mut report).unwrap();
+    assert_eq!((p.groups.len(), p.layers[0].group), (1, Some(0)));
+    assert!(report.notes.is_empty(), "{:?}", report.notes);
+}
+
+#[test]
+fn groups_past_the_limits_put_their_layers_in_the_group_holding_them() {
+    // Ten levels: the ninth and tenth aren't kept. The tenth is unchecked, so its layer comes in
+    // unchecked in the eighth.
+    let mut tree = String::new();
+    for level in 1..=10 {
+        let checked = if level == 10 { "Qt::Unchecked" } else { "Qt::Checked" };
+        tree.push_str(&format!(r#"<layer-tree-group checked="{checked}" name="L{level}">"#));
+    }
+    tree.push_str(r#"<layer-tree-layer checked="Qt::Checked" id="a"/>"#);
+    tree.push_str(&"</layer-tree-group>".repeat(10));
+    let qgs = format!(
+        r#"<qgis><layer-tree-group>{tree}</layer-tree-group><projectlayers><maplayer type="vector"><id>a</id><datasource>/d/a.shp</datasource><layername>a</layername><provider>ogr</provider></maplayer></projectlayers></qgis>"#
+    );
+    let mut report = Report::default();
+    let p = read_project(&qgs, "", &mut report).unwrap();
+    assert_eq!(p.groups.len(), crate::MAX_GROUP_DEPTH);
+    assert_eq!((p.layers[0].group, p.layers[0].checked, p.layers[0].visible), (Some(crate::MAX_GROUP_DEPTH - 1), false, false));
+    assert!(report.notes.iter().any(|n| n.text.contains("groups past RustGIS's 8 levels") && n.text.contains("(2)")), "{:?}", report.notes);
+
+    // The ninth group drawn as one: its group layer isn't a layer, and its opacity is noted as
+    // left out (its layer went in the eighth group).
+    let drawn = qgs.replace(r#"name="L9">"#, r#"name="L9" groupLayer="gl9">"#).replace(
+        "</projectlayers>",
+        r#"<maplayer type="group"><id>gl9</id><layername>L9</layername><layerOpacity>0.5</layerOpacity></maplayer></projectlayers>"#,
+    );
+    let mut report = Report::default();
+    let p = read_project(&drawn, "", &mut report).unwrap();
+    assert_eq!(p.layers.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["a"]);
+    assert!(
+        report.notes.iter().any(|n| n.text.contains("drawn as one past RustGIS's group limits give their layers (1: L9 (opacity))")),
+        "{:?}",
+        report.notes
+    );
+    // One that gives its layers nothing: no note.
+    let mut report = Report::default();
+    read_project(&drawn.replace("<layerOpacity>0.5</layerOpacity>", "<layerOpacity>1</layerOpacity>"), "", &mut report).unwrap();
+    assert!(!report.notes.iter().any(|n| n.text.contains("drawn as one")), "{:?}", report.notes);
+
+    // A tree deeper than it is walked (64 levels): the layers further in are still read, in the
+    // eighth group, with the boxes of the groups between; noted. The 70th group is unchecked.
+    let mut tree = String::new();
+    for level in 1..=70 {
+        let checked = if level == 70 { "Qt::Unchecked" } else { "Qt::Checked" };
+        tree.push_str(&format!(r#"<layer-tree-group checked="{checked}" name="L{level}">"#));
+    }
+    // An empty group beside it, below 64 levels, counted with the groups not kept.
+    tree.push_str(r#"<layer-tree-layer checked="Qt::Checked" id="a"/><layer-tree-group checked="Qt::Checked" name="E"/>"#);
+    tree.push_str(&"</layer-tree-group>".repeat(70));
+    let qgs = format!(
+        r#"<qgis><layer-tree-group>{tree}<layer-tree-layer checked="Qt::Checked" id="b"/></layer-tree-group><projectlayers><maplayer type="vector"><id>a</id><datasource>/d/a.shp</datasource><layername>a</layername><provider>ogr</provider></maplayer><maplayer type="vector"><id>b</id><datasource>/d/b.shp</datasource><layername>b</layername><provider>ogr</provider></maplayer></projectlayers></qgis>"#
+    );
+    let mut report = Report::default();
+    let p = read_project(&qgs, "", &mut report).unwrap();
+    let layers: Vec<(&str, Option<usize>, bool, bool)> =
+        p.layers.iter().map(|l| (l.name.as_str(), l.group, l.checked, l.visible)).collect();
+    assert_eq!(layers, [("a", Some(crate::MAX_GROUP_DEPTH - 1), false, false), ("b", None, true, true)], "a hidden by its 70th group");
+    assert!(report.notes.iter().any(|n| n.text.contains("layers below 64 levels of groups (1)")), "{:?}", report.notes);
+    // Levels 9 to 70 and the empty group: 63 groups not kept.
+    assert!(report.notes.iter().any(|n| n.text.contains("2000 groups (63)")), "{:?}", report.notes);
+
+    // Layer entries past those read (4000) are noted.
+    let entries: String = (0..TREE_LAYERS + 2).map(|i| format!(r#"<layer-tree-layer checked="Qt::Checked" id="x{i}"/>"#)).collect();
+    let mut report = Report::default();
+    read_project(&format!("<qgis><layer-tree-group>{entries}</layer-tree-group></qgis>"), "", &mut report).unwrap();
+    let cut = report.notes.iter().find(|n| n.text.contains("entries past the first 4000 (2)"));
+    assert_eq!(cut.map(|n| n.kind), Some(NoteKind::Approximated), "their layers come in: {:?}", report.notes);
+
+    // Past the most groups a map keeps: the rest aren't kept.
+    let many = r#"<layer-tree-group checked="Qt::Checked" name="G"/>"#.repeat(crate::MAX_GROUPS + 3);
+    let p = read_project(&format!("<qgis><layer-tree-group>{many}</layer-tree-group></qgis>"), "", &mut Report::default()).unwrap();
+    assert_eq!(p.groups.len(), crate::MAX_GROUPS);
+}
+
+#[test]
+fn blending_modes_read_by_the_numbers_qgis_saves() {
+    // QGIS saves its own numbers (measured, QGIS 4.2): 6 is Multiply; Qt's 13 is not one of
+    // RustGIS's modes in them (it is QGIS's "Source"), so it is drawn as Normal with a note.
+    for (number, blend, noted) in [
+        (0, Blend::Normal, false),
+        (1, Blend::Lighten, false),
+        (2, Blend::Screen, false),
+        (5, Blend::Darken, false),
+        (6, Blend::Multiply, false),
+        (8, Blend::Overlay, false),
+        (11, Blend::Difference, false),
+        (13, Blend::Normal, true),
+        (10, Blend::Normal, true),
+    ] {
+        let mut report = Report::default();
+        let s = read_style(&format!("<qgis><blendMode>{number}</blendMode></qgis>"), "L", &mut report).unwrap();
+        assert_eq!(s.blend, Some(blend), "{number}");
+        assert_eq!(report.notes.iter().any(|n| n.text.contains("blending mode")), noted, "{number}");
+    }
+}
+
+/// The corpus's groups, as QGIS wrote them: the tree as groups, the group layer's opacity on its
+/// group (Multiply noted), each layer in its group with its own box.
+#[test]
+fn the_corpus_groups_read_as_qgis_wrote_them() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/qgis/generated/qgs");
+    let text = std::fs::read_to_string(root.join("groups-nested-hidden-collapsed-drawn-as-one.qgs")).unwrap();
+    let mut report = Report::default();
+    let p = read_project(&text, "/p/qgs", &mut report).unwrap();
+    let groups: Vec<(&str, bool, bool, Option<usize>, Option<f32>)> =
+        p.groups.iter().map(|g| (g.name.as_str(), g.checked, g.expanded, g.parent, g.transparency)).collect();
+    assert_eq!(
+        groups,
+        [
+            ("Outer", true, true, None, None),
+            ("Inner", true, true, Some(0), None),
+            ("Hidden", false, true, None, None),
+            ("Drawn as one", true, false, None, Some(40.0)),
+            ("Empty", true, true, None, None),
+        ]
+    );
+    let layers: Vec<(&str, Option<usize>, bool)> = p.layers.iter().map(|l| (l.name.as_str(), l.group, l.checked)).collect();
+    assert_eq!(layers, [("points", Some(1), true), ("lines", Some(0), false), ("dem", Some(2), true), ("polygons", Some(3), true)]);
+    let texts: Vec<&str> = report.notes.iter().map(|n| n.text.as_str()).collect();
+    assert!(texts.iter().any(|t| t.contains("blending mode of groups drawn as one (1: Drawn as one)")), "{texts:?}");
+    assert!(!texts.iter().any(|t| t.contains("group layers")), "{texts:?}");
 }

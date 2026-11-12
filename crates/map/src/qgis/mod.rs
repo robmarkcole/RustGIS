@@ -406,6 +406,27 @@ pub struct Project {
     pub layers: Vec<ProjectLayer>,
     /// Its main annotation layer, drawn over its layers, when it holds any annotation.
     pub main_annotations: Option<ProjectLayer>,
+    /// The groups of its layer tree (of QGIS 2's legend before it), each before the groups in it.
+    pub groups: Vec<ProjectGroup>,
+}
+
+/// A group of a QGIS project's layer tree.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProjectGroup {
+    pub name: String,
+    /// Its own box checked in the layer tree (the groups holding it apply on top).
+    pub checked: bool,
+    /// Open in the layer tree.
+    pub expanded: bool,
+    /// The group it is in, as an index into [`Project::groups`]: `None` at the top level.
+    pub parent: Option<usize>,
+    /// 0 = opaque, 100 = invisible: the opacity of a QGIS group layer (a group drawn as one).
+    pub transparency: Option<f32>,
+    /// A group layer's visibility range (RustGIS's scales, see [`QGIS_SCALE`]): its layers draw
+    /// only when zoomed in beyond 1:`min_scale` and out beyond 1:`max_scale`. QGIS 4.2 doesn't
+    /// save one for a group layer (measured), but a file may have one.
+    pub min_scale: Option<f64>,
+    pub max_scale: Option<f64>,
 }
 
 /// One layer of a QGIS project.
@@ -424,6 +445,11 @@ pub struct ProjectLayer {
     pub vector: bool,
     /// Checked in the layer tree, and every group holding it too.
     pub visible: bool,
+    /// The group it is in, as an index into [`Project::groups`]: `None` at the top level.
+    pub group: Option<usize>,
+    /// Its own box checked, and those of any groups between it and `group` that weren't kept
+    /// (nested too deep): what it takes inside its group, which applies on top.
+    pub checked: bool,
     /// Its subset string, as a RustGIS definition query when it reads as one.
     pub definition_query: Option<String>,
     pub style: Style,
@@ -455,15 +481,11 @@ pub fn read_project(text: &str, dir: &str, report: &mut Report) -> Result<Projec
         extent: canvas.and_then(|c| child(c, "extent")).and_then(extent_of),
         layers: Vec::new(),
         main_annotations: None,
+        groups: Vec::new(),
     };
-    // The layer tree (QGIS 2's legend before it): the order layers draw in (top first) and which
-    // are checked.
-    let mut order: Vec<(String, bool)> = Vec::new();
-    if let Some(t) = child(root, "layer-tree-group") {
-        tree_layers(t, true, &mut order, 0);
-    } else if let Some(l) = child(root, "legend") {
-        legend_layers(l, true, &mut order, 0);
-    }
+    // The layer tree (QGIS 2's legend before it): the order layers draw in (top first), which
+    // are checked, and their groups.
+    let mut tree = Tree::read(root);
     project_notes(root, report);
     let maplayers: Vec<Node> =
         child(root, "projectlayers").map(|p| p.children().filter(|c| c.has_tag_name("maplayer")).collect()).unwrap_or_default();
@@ -471,12 +493,59 @@ pub fn read_project(text: &str, dir: &str, report: &mut Report) -> Result<Projec
         report.skipped("", format!("layers past the first {MAX_LAYERS}"));
     }
     let mut layers: Vec<(Option<usize>, ProjectLayer)> = Vec::new();
+    // QGIS group layers (a group drawn as one) whose blending mode RustGIS's groups don't have,
+    // and those with a draw effect.
+    let (mut blended, mut effects) = (Vec::new(), Vec::new());
+    // Groups drawn as one past RustGIS's limits whose opacity, blending or effect is left out.
+    let mut unkept = Vec::new();
     for ml in maplayers.into_iter().take(MAX_LAYERS) {
         let id = child(ml, "id").and_then(|n| n.text()).unwrap_or_default().trim().to_string();
         let name = child(ml, "layername").and_then(|n| n.text()).unwrap_or_default().trim().to_string();
         let name = if name.is_empty() { id.clone() } else { name };
-        let at = order.iter().position(|(i, _)| *i == id);
-        let checked = at.and_then(|i| order.get(i)).is_none_or(|(_, c)| *c);
+        // A group layer is its group's opacity and blending, not a layer of its own.
+        if ml.attribute("type") == Some("group")
+            && let Some(g) = tree.groups.iter_mut().find(|g| g.layer.as_deref() == Some(id.as_str()))
+        {
+            // Its notes (a blending mode RustGIS hasn't, say) go under its name.
+            let style = read_style_node(ml, &name, report);
+            g.group.transparency = style.transparency.filter(|t| *t > 0.0);
+            g.group.min_scale = style.min_scale.flatten();
+            g.group.max_scale = style.max_scale.flatten();
+            if style.blend.is_some_and(|b| b != Blend::Normal) {
+                blended.push(g.group.name.clone());
+            }
+            if child(ml, "paintEffect").is_some_and(has_effect) {
+                effects.push(g.group.name.clone());
+            }
+            continue;
+        }
+        // A group layer of a group not kept: its layers went in the group holding it, so what it
+        // gives them is left out, when it gives them anything.
+        // Each id once (removed as it's taken), so a repeated one isn't counted twice; its own
+        // notes aren't given, as it draws nothing of its own.
+        if ml.attribute("type") == Some("group") && tree.folded_layers.remove(&id) {
+            let style = read_style_node(ml, &name, &mut Report::default());
+            let blended = child(ml, "blendMode").and_then(|n| n.text()).and_then(|t| t.trim().parse::<i32>().ok()).is_some_and(|m| m != 0);
+            let effect = child(ml, "paintEffect").is_some_and(has_effect);
+            let ranged = style.min_scale.flatten().is_some() || style.max_scale.flatten().is_some();
+            let parts: Vec<&str> = [
+                (style.transparency.is_some_and(|t| t > 0.0), "opacity"),
+                (blended, "blending"),
+                (effect, "draw effect"),
+                (ranged, "visibility range"),
+            ]
+            .into_iter()
+            .filter(|(on, _)| *on)
+            .map(|(_, part)| part)
+            .collect();
+            if !parts.is_empty() {
+                unkept.push(format!("{name} ({})", parts.join(", ")));
+            }
+            continue;
+        }
+        let at = tree.layers.iter().position(|l| l.id == id);
+        let place = at.and_then(|i| tree.layers.get(i));
+        let (visible, checked, group) = place.map_or((true, true, None), |l| (l.visible, l.checked, l.group));
         let provider = child(ml, "provider").and_then(|n| n.text()).unwrap_or_default().trim().to_string();
         let datasource = child(ml, "datasource").and_then(|n| n.text()).unwrap_or_default().trim().to_string();
         let source = source::read(&provider, &datasource, dir);
@@ -510,7 +579,9 @@ pub fn read_project(text: &str, dir: &str, report: &mut Report) -> Result<Projec
                 crs: child(ml, "srs").and_then(crs_of),
                 kind,
                 vector,
-                visible: checked,
+                visible,
+                group,
+                checked,
                 definition_query,
                 style,
                 annotations,
@@ -521,6 +592,16 @@ pub fn read_project(text: &str, dir: &str, report: &mut Report) -> Result<Projec
     // In the layer tree's order; layers it doesn't hold go below.
     layers.sort_by_key(|(at, _)| at.unwrap_or(usize::MAX));
     project.layers = layers.into_iter().map(|(_, l)| l).collect();
+    group_notes(&tree, &blended, &effects, report);
+    if !unkept.is_empty() {
+        let names = unkept.iter().take(8).map(String::as_str).collect::<Vec<_>>().join(", ");
+        let more = if unkept.len() > 8 { ", …" } else { "" };
+        report.skipped(
+            "",
+            format!("what groups drawn as one past RustGIS's group limits give their layers ({}: {names}{more})", unkept.len()),
+        );
+    }
+    project.groups = tree.groups.into_iter().map(|g| g.group).collect();
     Ok(project)
 }
 
@@ -656,6 +737,71 @@ fn project_notes(root: Node, report: &mut Report) {
     }
 }
 
+/// Notes what the layer tree's groups carry over only in part: groups past RustGIS's limits,
+/// groups showing one layer at a time, group layers' opacity, blending and effects (`blended`,
+/// `effects`: the groups whose blending mode, draw effect is left out), and a drawing order of
+/// its own.
+fn group_notes(tree: &Tree, blended: &[String], effects: &[String], report: &mut Report) {
+    let listed = |names: &[&str]| {
+        let mut text = names.iter().take(8).copied().collect::<Vec<_>>().join(", ");
+        if names.len() > 8 {
+            text.push_str(", …");
+        }
+        format!("{}: {text}", names.len())
+    };
+    if tree.folded > 0 {
+        report.approximated(
+            "",
+            format!(
+                "groups past RustGIS's {} levels or {} groups ({}): their layers put in the group holding them",
+                crate::MAX_GROUP_DEPTH,
+                crate::MAX_GROUPS,
+                tree.folded
+            ),
+        );
+    }
+    let exclusive: Vec<&str> = tree.groups.iter().filter(|g| g.exclusive).map(|g| g.group.name.as_str()).collect();
+    if !exclusive.is_empty() {
+        report.approximated("", format!("groups showing one layer at a time ({}), carried over as ordinary groups", listed(&exclusive)));
+    }
+    let opaque: Vec<&str> = tree.groups.iter().filter(|g| g.group.transparency.is_some()).map(|g| g.group.name.as_str()).collect();
+    if !opaque.is_empty() {
+        report.approximated(
+            "",
+            format!(
+                "the opacity of groups drawn as one ({}), applied to each of their layers rather than to them drawn together",
+                listed(&opaque)
+            ),
+        );
+    }
+    if !blended.is_empty() {
+        let names: Vec<&str> = blended.iter().map(String::as_str).collect();
+        report.approximated("", format!("the blending mode of groups drawn as one ({}), drawn as Normal", listed(&names)));
+    }
+    if !effects.is_empty() {
+        let names: Vec<&str> = effects.iter().map(String::as_str).collect();
+        report.skipped("", format!("the draw effects of groups drawn as one ({})", listed(&names)));
+    }
+    if tree.custom_order {
+        report.approximated("", "its layer order (set apart from the layer tree): drawn in the layer tree's order");
+    }
+    if tree.legend_order {
+        report.approximated("", "its layer order (set apart from the legend), not read: drawn in the legend's order");
+    }
+    if tree.deep > 0 {
+        report.approximated(
+            "",
+            format!("layers below {TREE_DEPTH} levels of groups ({}): put in the group holding them, with their groups' boxes", tree.deep),
+        );
+    }
+    if tree.cut > 0 {
+        report.approximated(
+            "",
+            format!("the layer tree's entries past the first {TREE_LAYERS} ({}): their layers come in at the top level, shown", tree.cut),
+        );
+    }
+}
+
 /// The project's main annotation layer (`<main-annotation-layer>`), drawn over its layers, as a
 /// layer named "Annotations": `None` when it holds no annotation to draw.
 fn main_annotations(node: Node, dir: &str, report: &mut Report) -> Option<ProjectLayer> {
@@ -673,6 +819,8 @@ fn main_annotations(node: Node, dir: &str, report: &mut Report) -> Option<Projec
         kind: "annotation".to_string(),
         vector: false,
         visible: true,
+        group: None,
+        checked: true,
         definition_query: None,
         style: read_style_node(node, NAME, report),
         annotations,
@@ -700,54 +848,210 @@ pub(crate) fn data_defined_on(node: Node) -> bool {
     })
 }
 
-/// The layers in a layer tree group, top first, each with whether it is checked (and every
-/// group above it). Groups are walked to a bounded depth.
-fn tree_layers(group: Node, checked: bool, out: &mut Vec<(String, bool)>, depth: usize) {
-    if depth > 64 || out.len() > MAX_LAYERS * 4 {
-        return;
-    }
-    let on = |n: Node| n.attribute("checked").is_none_or(|c| c == "Qt::Checked" || c == "Qt::PartiallyChecked");
-    for c in group.children().filter(Node::is_element) {
-        if c.has_tag_name("layer-tree-layer") {
-            if let Some(id) = c.attribute("id") {
-                out.push((id.to_string(), checked && on(c)));
+/// A layer of the layer tree, top first.
+struct TreeLayer {
+    id: String,
+    /// Checked, and every group holding it too.
+    visible: bool,
+    /// Its own box, and those of the groups between it and `group` that weren't kept.
+    checked: bool,
+    group: Option<usize>,
+}
+
+/// A group of the layer tree.
+struct TreeGroup {
+    group: ProjectGroup,
+    /// The id of its QGIS group layer (`groupLayer`), drawn as one, if it is one.
+    layer: Option<String>,
+    /// Its layers show one at a time (QGIS's mutually exclusive group).
+    exclusive: bool,
+}
+
+/// Where in the layer tree a walk is: what applies to the children of a group.
+#[derive(Clone, Copy)]
+struct Place {
+    /// Every group above checked.
+    visible: bool,
+    /// The boxes of the groups since `kept` that weren't kept.
+    checked: bool,
+    /// The group its layers go in (an index into [`Tree::groups`]).
+    kept: Option<usize>,
+    /// The level of a group made here (1 at the top).
+    level: usize,
+}
+
+/// A project's layer tree (QGIS 2's legend before it): its layers, top first, and its groups.
+/// Groups past RustGIS's limits ([`crate::MAX_GROUP_DEPTH`] levels, [`crate::MAX_GROUPS`]
+/// groups) aren't kept: their layers go in the group holding them, with their boxes.
+#[derive(Default)]
+struct Tree {
+    layers: Vec<TreeLayer>,
+    groups: Vec<TreeGroup>,
+    /// The groups not kept.
+    folded: usize,
+    /// Layers below [`TREE_DEPTH`] levels of groups, read without walking further in.
+    deep: usize,
+    /// The group layers (by id) of groups drawn as one that weren't kept.
+    folded_layers: std::collections::HashSet<String>,
+    /// Layer entries past [`TREE_LAYERS`], not read.
+    cut: usize,
+    /// A drawing order of its own is on (QGIS's Layer Order panel) and differs from the tree's.
+    custom_order: bool,
+    /// QGIS 2's legend keeps a drawing order of its own (`updateDrawingOrder="false"`).
+    legend_order: bool,
+}
+
+/// The most levels of groups the layer tree is walked into; the layers further in are read
+/// without walking (see [`Tree::flatten`]).
+const TREE_DEPTH: usize = 64;
+/// The most layer entries read from the layer tree.
+const TREE_LAYERS: usize = MAX_LAYERS * 4;
+
+/// Whether a layer tree or legend entry's box is checked.
+fn checked_box(n: Node) -> bool {
+    n.attribute("checked").is_none_or(|c| c == "Qt::Checked" || c == "Qt::PartiallyChecked")
+}
+
+impl Tree {
+    fn read(root: Node) -> Tree {
+        let mut tree = Tree::default();
+        let top = Place { visible: true, checked: true, kept: None, level: 1 };
+        if let Some(t) = child(root, "layer-tree-group") {
+            tree.walk(t, false, top, 0);
+            // The custom order, top first, of the layers in the tree.
+            if let Some(c) = child(t, "custom-order").filter(|c| c.attribute("enabled") == Some("1")) {
+                let known: std::collections::HashSet<&str> = tree.layers.iter().map(|l| l.id.as_str()).collect();
+                let ids: Vec<&str> = c
+                    .children()
+                    .filter(|i| i.has_tag_name("item"))
+                    .take(TREE_LAYERS)
+                    .filter_map(|i| i.text())
+                    .map(str::trim)
+                    .filter(|id| known.contains(id))
+                    .collect();
+                let listed: std::collections::HashSet<&str> = ids.iter().copied().collect();
+                let order: Vec<&str> = tree.layers.iter().map(|l| l.id.as_str()).filter(|id| listed.contains(id)).collect();
+                tree.custom_order = ids != order;
             }
-        } else if c.has_tag_name("layer-tree-group") {
-            tree_layers(c, checked && on(c), out, depth + 1);
+        } else if let Some(l) = child(root, "legend") {
+            tree.walk(l, true, top, 0);
+            // Each legend layer's place in it (`drawingOrder`, -1 when it follows the legend).
+            tree.legend_order = l.attribute("updateDrawingOrder") == Some("false")
+                && l.descendants()
+                    .filter(|n| n.has_tag_name("legendlayer"))
+                    .any(|n| n.attribute("drawingOrder").and_then(|o| o.trim().parse::<i64>().ok()).is_some_and(|o| o >= 0));
+        }
+        tree
+    }
+
+    /// Keeps the id of the group layer of a group not kept (`groupLayer`), if it is one.
+    fn fold_group_layer(&mut self, group: Node) {
+        if let Some(id) = group.attribute("groupLayer").map(str::trim).filter(|l| !l.is_empty()) {
+            self.folded_layers.insert(id.to_string());
+        }
+    }
+
+    /// The tags of a layer and of a group (`legend`: QGIS 2's `<legend>`).
+    fn tags(legend: bool) -> (&'static str, &'static str) {
+        if legend { ("legendlayer", "legendgroup") } else { ("layer-tree-layer", "layer-tree-group") }
+    }
+
+    /// Adds a layer entry's layers (a QGIS 2 legend layer may list several), up to
+    /// [`TREE_LAYERS`]; past that they are counted in `cut`.
+    fn add(&mut self, c: Node, legend: bool, visible: bool, checked: bool, group: Option<usize>) {
+        let ids: Vec<&str> = if legend {
+            c.descendants().filter(|f| f.has_tag_name("legendlayerfile")).filter_map(|f| f.attribute("layerid")).collect()
+        } else {
+            c.attribute("id").into_iter().collect()
+        };
+        for id in ids {
+            if self.layers.len() >= TREE_LAYERS {
+                self.cut += 1;
+            } else {
+                self.layers.push(TreeLayer { id: id.to_string(), visible, checked, group });
+            }
+        }
+    }
+
+    /// Reads a group's children (`legend`: QGIS 2's `<legend>`), walking into the groups in it
+    /// [`TREE_DEPTH`] levels deep; further in, [`Tree::flatten`] reads the layers.
+    fn walk(&mut self, group: Node, legend: bool, at: Place, depth: usize) {
+        if depth > TREE_DEPTH {
+            self.flatten(group, legend, at);
+            return;
+        }
+        let on = checked_box;
+        let (layer_tag, group_tag) = Tree::tags(legend);
+        for c in group.children().filter(Node::is_element) {
+            if c.has_tag_name(layer_tag) {
+                self.add(c, legend, at.visible && on(c), at.checked && on(c), at.kept);
+            } else if c.has_tag_name(group_tag) {
+                let visible = at.visible && on(c);
+                let inside = if at.level <= crate::MAX_GROUP_DEPTH && self.groups.len() < crate::MAX_GROUPS {
+                    let name = c.attribute("name").map(str::trim).filter(|n| !n.is_empty()).unwrap_or("Group");
+                    let expanded = if legend { c.attribute("open") != Some("false") } else { c.attribute("expanded") != Some("0") };
+                    self.groups.push(TreeGroup {
+                        group: ProjectGroup {
+                            name: name.to_string(),
+                            checked: on(c),
+                            expanded,
+                            parent: at.kept,
+                            transparency: None,
+                            min_scale: None,
+                            max_scale: None,
+                        },
+                        layer: c.attribute("groupLayer").map(str::trim).filter(|l| !l.is_empty()).map(str::to_string),
+                        exclusive: c.attribute("mutually-exclusive") == Some("1"),
+                    });
+                    Place { visible, checked: true, kept: Some(self.groups.len() - 1), level: at.level + 1 }
+                } else {
+                    self.folded += 1;
+                    self.fold_group_layer(c);
+                    Place { visible, checked: at.checked && on(c), kept: at.kept, level: at.level + 1 }
+                };
+                self.walk(c, legend, inside, depth + 1);
+            }
+        }
+    }
+
+    /// Reads the layers in a group too deep to walk into, in order, without recursing: each in
+    /// the group holding them all (`at`), with its box and those of the groups between (counted
+    /// in `deep`).
+    fn flatten(&mut self, group: Node, legend: bool, at: Place) {
+        let (layer_tag, group_tag) = Tree::tags(legend);
+        // Entries to read, the next on top, each with the boxes of the groups above it.
+        let mut stack: Vec<(Node, bool)> = group.children().filter(Node::is_element).rev().map(|c| (c, true)).collect();
+        while let Some((c, boxes)) = stack.pop() {
+            if c.has_tag_name(layer_tag) {
+                let on = boxes && checked_box(c);
+                // Only those read: the ones past the budget are counted in `cut`.
+                let before = self.layers.len();
+                self.add(c, legend, at.visible && on, at.checked && on, at.kept);
+                self.deep += self.layers.len() - before;
+            } else if c.has_tag_name(group_tag) {
+                self.folded += 1;
+                self.fold_group_layer(c);
+                let inside = boxes && checked_box(c);
+                stack.extend(c.children().filter(Node::is_element).rev().map(|n| (n, inside)));
+            }
         }
     }
 }
 
-/// The layers in QGIS 2's legend (`<legend>`, before the layer tree), top first, each with
-/// whether it is checked (and its group). Groups are walked to a bounded depth.
-fn legend_layers(group: Node, checked: bool, out: &mut Vec<(String, bool)>, depth: usize) {
-    if depth > 64 || out.len() > MAX_LAYERS * 4 {
-        return;
-    }
-    let on = |n: Node| n.attribute("checked").is_none_or(|c| c == "Qt::Checked" || c == "Qt::PartiallyChecked");
-    for c in group.children().filter(Node::is_element) {
-        if c.has_tag_name("legendlayer") {
-            for f in c.descendants().filter(|f| f.has_tag_name("legendlayerfile")) {
-                if let Some(id) = f.attribute("layerid") {
-                    out.push((id.to_string(), checked && on(c)));
-                }
-            }
-        } else if c.has_tag_name("legendgroup") {
-            legend_layers(c, checked && on(c), out, depth + 1);
-        }
-    }
-}
-
-/// QGIS's blending modes (`QPainter::CompositionMode`) RustGIS has.
+/// QGIS's blending modes RustGIS has, by the number QGIS saves a layer's (`<blendMode>`): its
+/// own numbering, not Qt's composition modes (measured: QGIS 4.2 saves Multiply as 6). Older
+/// QGIS does too: a QGIS 3.10 project saves 6 and a QGIS 2.2 style 10, which in Qt's numbers
+/// are modes QGIS doesn't offer (DestinationIn, DestinationAtop), in QGIS's Multiply and Hard
+/// Light.
 fn blend_of(mode: i32) -> Option<Blend> {
     Some(match mode {
         0 => Blend::Normal,
-        13 => Blend::Multiply,
-        14 => Blend::Screen,
-        15 => Blend::Overlay,
-        16 => Blend::Darken,
-        17 => Blend::Lighten,
-        22 => Blend::Difference,
+        1 => Blend::Lighten,
+        2 => Blend::Screen,
+        5 => Blend::Darken,
+        6 => Blend::Multiply,
+        8 => Blend::Overlay,
+        11 => Blend::Difference,
         _ => return None,
     })
 }
