@@ -52,6 +52,7 @@ pub fn commands() -> Vec<C> {
             if matches!(ext.as_str(), "parquet" | "geoparquet") {
                 dbf_notes.extend(rustgis_data::source::parquet::values_note(&t.dataset, path));
             }
+            dbf_notes.extend(rustgis_data::io::dates_as_text_note(&t.dataset.fields, path));
             let (left_out, table) =
                 rustgis_data::io::write_path_to(&t.dataset, Path::new(path), Crs::LonLat, &gpkg).map_err(|e| e.to_string())?;
             s.check_continuation(&owner).map_err(|why| super::exports::completion_refused(Some(path), why))?;
@@ -696,6 +697,7 @@ fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, gpkg: Gpk
         dbf_notes.extend(rustgis_data::io::shapefile_values_notes(ds, path));
         dbf_notes.extend(rustgis_data::io::shapefile_geometry_notes(ds, path, crs));
     }
+    dbf_notes.extend(rustgis_data::io::dates_as_text_note(&ds.fields, path));
     // FlatGeobuf, KML, GPX and Shapefile hold features with geometry only (a Shapefile, only
     // geometry it can draw, of the layer's kind).
     let mut said = Vec::new();

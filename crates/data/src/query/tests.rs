@@ -549,3 +549,111 @@ fn ambiguous_polar_area_is_a_counted_expression_error() {
     let expression = parse("$area", &clean).unwrap();
     assert!(value(&expression, &clean, 0, &Env::default()).as_f64().is_some_and(|area| area > 5e14));
 }
+
+#[test]
+fn where_clauses_compare_dates() {
+    let mut d = Dataset::new("t", GeometryType::None, vec![Field::new("issued", FieldType::Date), Field::new("ts", FieldType::DateTime)]);
+    for (day, at) in
+        [("2025-12-31", "2026-03-05T00:00:00"), ("2026-01-01", "2026-03-05T09:00:00+02:00"), ("2026-06-30", "2026-03-04T23:00:00-05:00")]
+    {
+        d.push(None, vec![Value::parse(day, FieldType::Date), Value::parse(at, FieldType::DateTime)]);
+    }
+    d.push(None, vec![Value::Null, Value::Null]);
+    assert_eq!(select("issued >= '2026-01-01'", &d).unwrap(), vec![1, 2]);
+    assert_eq!(select("issued BETWEEN '2026-01-01' AND '2026-03-31'", &d).unwrap(), vec![1]);
+    assert_eq!(select("issued IN ('2026-06-30', '2025-12-31')", &d).unwrap(), vec![0, 2]);
+    // A date-time equals a date's midnight; offsets compare by instant (09:00+02:00 is 07:00Z).
+    assert_eq!(select("ts = '2026-03-05'", &d).unwrap(), vec![0]);
+    assert_eq!(select("ts < '2026-03-05T08:00Z'", &d).unwrap(), vec![0, 1, 2]);
+    assert_eq!(select("ts > '2026-03-05T04:00:00Z'", &d).unwrap(), vec![1]);
+    assert_eq!(select("ts > issued", &d).unwrap(), vec![0, 1]);
+    // Text that isn't a full date still compares as text, as saved clauses did.
+    assert_eq!(select("issued > '2026'", &d).unwrap(), vec![1, 2]);
+    assert_eq!(select("issued LIKE '2026-%'", &d).unwrap(), vec![1, 2]);
+    // Arithmetic on dates is an error, not a column of nulls.
+    assert_eq!(parse("issued + 30", &d).err().unwrap_or_default(), "'issued' holds dates, and arithmetic on dates isn't supported yet");
+    // Also a date reached through a function or CASE, or given to a number's function: each
+    // would be null for every row.
+    for e in ["coalesce(issued) + 1", "-nullif(issued, '2026-01-01')", "CASE WHEN 1 = 1 THEN issued END * 2", "if(true, 1, issued) + 1"] {
+        assert_eq!(parse(e, &d).err().unwrap_or_default(), "'issued' holds dates, and arithmetic on dates isn't supported yet", "{e}");
+    }
+    assert_eq!(parse("abs(issued)", &d).err().unwrap_or_default(), "'issued' holds dates, and abs on dates isn't supported yet");
+    // A date against anything that gives a number would compare text with digits: an error.
+    for e in [
+        "issued >= 20260101",
+        "20260101 < issued",
+        "issued = 20260305",
+        "ts IN (1, 2)",
+        "issued BETWEEN 20260101 AND 20261231",
+        "issued >= 2026 * 10000 + 101",
+        "issued > @row_number",
+        "nullif(issued, 20260101) IS NULL",
+        "CASE issued WHEN 20260101 THEN 1 ELSE 0 END = 1",
+        "20260101 = if(true, issued, 1)",
+        "nullif(20260101, if(true, issued, 1)) IS NULL",
+        "CASE 20260101 WHEN if(true, issued, 1) THEN 1 ELSE 0 END = 1",
+        "issued < pi()",
+        "issued >= if(true, 20260101, 20250101)",
+        "issued = CASE WHEN true THEN 20260305 END",
+        "issued = coalesce(20260305, 1)",
+        "issued = (1 = 1)",
+    ] {
+        assert!(parse(e, &d).err().unwrap_or_default().contains("not a number"), "{e}");
+    }
+    // Also a number a field holds or a function gives; text still compares.
+    let n = Dataset::new(
+        "t",
+        GeometryType::None,
+        vec![Field::new("issued", FieldType::Date), Field::new("n", FieldType::Integer), Field::new("s", FieldType::Text)],
+    );
+    // Also every branch of if, coalesce and CASE, and arithmetic, which reads text that is a number
+    // as one.
+    for e in [
+        "issued > n",
+        "issued = abs(n)",
+        "n < issued",
+        "issued >= if(n > 0, n * 10000 + 101, issued)",
+        "issued = coalesce(n, issued)",
+        "issued = CASE WHEN n > 0 THEN n ELSE issued END",
+        "issued > s + 1",
+        "issued = s + 'x'",
+    ] {
+        assert!(parse(e, &n).err().unwrap_or_default().contains("not a number"), "{e}");
+    }
+    for e in ["issued > s", "issued >= '2026-' || '01-01'", "issued = coalesce(s, '2026-01-01')", "issued >= upper(s)", "issued = NULL"] {
+        assert!(parse(e, &n).is_ok(), "{e}");
+    }
+    assert!(parse("issued > ts", &d).is_ok(), "two dates compare");
+    // A date without dashes is text no date reads as: an error asking for YYYY-MM-DD. A shorter
+    // partial date still compares as text.
+    for e in [
+        "issued >= '20260101'",
+        "issued = '20260305'",
+        "'20260101' < issued",
+        "issued IN ('2026-01-01', '20260101')",
+        "issued >= '2026/03/05'",
+        "issued >= '2026-1-1'",
+        "issued = '05.03.2026'",
+        "ts >= '2026/03/05 14:30'",
+    ] {
+        assert!(parse(e, &d).err().unwrap_or_default().contains("write the date as YYYY-MM-DD"), "{e}");
+    }
+    for e in [
+        "issued > '2026'",
+        "issued >= '2026-03'",
+        "issued LIKE '2026-%'",
+        "ts >= '2026-03-05 14:30'",
+        "issued < '2026-03-05 revision 2'",
+        "issued < '2026-03-05 14:30 revision 2'",
+        "issued < '2026 report 03 page 05'",
+        "issued < '2026-03/05'",
+    ] {
+        assert!(parse(e, &d).is_ok(), "{e}");
+    }
+    for e in ["to_int(issued)", "to_real(ts)", "color_rgb(issued, 0, 0)"] {
+        assert!(parse(e, &d).err().unwrap_or_default().contains("on dates isn't supported yet"), "{e}");
+    }
+    assert!(parse("coalesce(issued, '2026-01-01')", &d).is_ok(), "a date passed through is no arithmetic");
+    assert!(parse("-ts", &d).is_err());
+    assert_eq!(value(&parse("issued || ''", &d).unwrap(), &d, 0, &Env::default()), Value::Text("2025-12-31".into()));
+}

@@ -167,7 +167,8 @@ pub fn export(dataset: &Dataset, rows: &[usize], min_zoom: u8, max_zoom: u8, sou
         .map(|f| {
             let ty = match f.ty {
                 FieldType::Integer | FieldType::Double => "Number",
-                FieldType::Text => "String",
+                // Vector tiles have no dates: they are ISO text.
+                FieldType::Text | FieldType::Date | FieldType::DateTime => "String",
                 FieldType::Boolean => "Boolean",
             };
             (f.name.clone(), serde_json::Value::String(ty.into()))
@@ -318,6 +319,7 @@ fn properties(ds: &Dataset, attrs: &[Value]) -> Result<Vec<(String, mvt::Value)>
             Value::Float(f) => mvt::Value::Number(*f),
             Value::Text(s) => mvt::Value::String(s.clone()),
             Value::Bool(b) => mvt::Value::Bool(*b),
+            Value::Date(_) | Value::DateTime(_) => mvt::Value::String(value.to_string()),
         };
         out.push((field.name.clone(), value));
     }

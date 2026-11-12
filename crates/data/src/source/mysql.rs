@@ -892,7 +892,8 @@ impl MysqlSource {
                     FieldType::Integer => int_of(v).map(Value::Int).or_else(|| float_of(v).map(Value::Float)),
                     FieldType::Double => float_of(v).map(Value::Float),
                     FieldType::Boolean => int_of(v).map(|i| Value::Bool(i != 0)),
-                    FieldType::Text => text_of(v).map(Value::Text),
+                    // This reader gives no date fields yet: their values come as text.
+                    FieldType::Text | FieldType::Date | FieldType::DateTime => text_of(v).map(Value::Text),
                 }
                 .unwrap_or(Value::Null)
             })

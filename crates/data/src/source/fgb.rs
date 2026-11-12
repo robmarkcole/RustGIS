@@ -761,7 +761,8 @@ fn write_run(
             FieldType::Integer => ColumnType::Long,
             FieldType::Double => ColumnType::Double,
             FieldType::Boolean => ColumnType::Bool,
-            FieldType::Text => ColumnType::String,
+            // Dates are ISO text until FlatGeobuf's own date-times are written.
+            FieldType::Text | FieldType::Date | FieldType::DateTime => ColumnType::String,
         };
         w.add_column(&f.name, t, |_, c| c.nullable = true);
     }
@@ -804,6 +805,7 @@ fn write_run(
                         Value::Float(x) => out.property(i, &f.name, &ColumnValue::Double(*x)),
                         Value::Bool(x) => out.property(i, &f.name, &ColumnValue::Bool(*x)),
                         Value::Text(x) => out.property(i, &f.name, &ColumnValue::String(x)),
+                        Value::Date(_) | Value::DateTime(_) => out.property(i, &f.name, &ColumnValue::String(&v.to_string())),
                     };
                     if let Err(e) = r {
                         failed = Some(e.to_string());

@@ -396,7 +396,7 @@ fn number(v: &Value) -> Option<Value> {
         Value::Int(_) | Value::Float(_) => Some(v.clone()),
         Value::Bool(b) => Some(Value::Int(i64::from(*b))),
         Value::Text(t) => crate::stats::text_i64(t).map(Value::Int).or_else(|| v.as_f64().map(Value::Float)),
-        Value::Null => None,
+        Value::Null | Value::Date(_) | Value::DateTime(_) => None,
     }
 }
 

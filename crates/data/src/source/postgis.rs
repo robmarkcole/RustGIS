@@ -952,7 +952,10 @@ impl PostgisSource {
                     FieldType::Integer => r.try_get::<_, Option<i64>>(i).ok().flatten().map(Value::Int),
                     FieldType::Double => r.try_get::<_, Option<f64>>(i).ok().flatten().map(Value::Float),
                     FieldType::Boolean => r.try_get::<_, Option<bool>>(i).ok().flatten().map(Value::Bool),
-                    FieldType::Text => r.try_get::<_, Option<String>>(i).ok().flatten().map(Value::Text),
+                    // This reader gives no date fields yet: their values come as text.
+                    FieldType::Text | FieldType::Date | FieldType::DateTime => {
+                        r.try_get::<_, Option<String>>(i).ok().flatten().map(Value::Text)
+                    }
                 }
                 .unwrap_or(Value::Null)
             })
@@ -1131,6 +1134,7 @@ fn text_value(v: &Value) -> Option<String> {
         Value::Float(x) => Some(x.to_string()),
         Value::Text(t) => Some(t.clone()),
         Value::Bool(b) => Some(b.to_string()),
+        Value::Date(_) | Value::DateTime(_) => Some(v.to_string()),
     }
 }
 

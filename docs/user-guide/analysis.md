@@ -725,7 +725,10 @@ into a `target` table or layer based on matching key values:
   full (`"47157000100"` matches `47157000100`), so an all-digit ID typed as a number in one table and
   as text in the other (Census GEOIDs, FIPS codes, ZIP codes) joins when the codes match exactly as
   written. Leading zeros stay meaningful: a number that lost its zero (`1001` for `"01001"`) leaves its
-  record unmatched, and a warning says how many records missed this way, with the first pair. Other
+  record unmatched, and a warning says how many records missed this way, with the first pair. A date
+  key matches a text key holding its ISO 8601 text (`2026-03-05`), and a date-time key the text
+  as RustGIS writes it (`2026-03-05T14:30:00`, or `2026-03-05T14:30:00+02:00` with its offset). Two
+  date-time keys match by instant, so the same moment at different offsets matches. Other
   incompatible key data types (e.g. text vs floating point or boolean) are rejected, and the message
   suggests converting one key with Add Field and Calculate Field.
 - **Transferred fields:** `fields` selects specific source fields to transfer (a comma-separated list
@@ -788,7 +791,8 @@ input produced by another tool, type its field names before running the model.
 
 Every statistic but `NULLS` leaves out empty values. A text field takes `COUNT`, `MIN`, `MAX`,
 `FIRST`, `LAST`, `UNIQUE`, `CONCATENATE`, `MODE`, `MINORITY` and `NULLS`; the rest need a numeric
-field. A group with no values gets empty statistics, except a `COUNT` and `UNIQUE` of 0 (its
+field. A date or date-time field takes the same ones as text; its `MIN`, `MAX`, `FIRST`, `LAST`,
+`MODE` and `MINORITY` are dates, with `MIN` and `MAX` by instant. A group with no values gets empty statistics, except a `COUNT` and `UNIQUE` of 0 (its
 `NULLS` is its `FREQUENCY`). Two output fields can't share a name, so a case field can't be called
 `FREQUENCY` or `<STAT>_<field>` for a statistic asked for. Counts are whole numbers, `CONCATENATE`
 and the statistics of a text field are text, and the others are decimal. A decimal holds whole

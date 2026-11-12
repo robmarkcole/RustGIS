@@ -730,7 +730,8 @@ impl SqlServerSource {
                     FieldType::Integer => int_of(v).map(Value::Int),
                     FieldType::Double => float_of(v).map(Value::Float),
                     FieldType::Boolean => bool_of(v).map(Value::Bool),
-                    FieldType::Text => text_of(v).map(Value::Text),
+                    // This reader gives no date fields yet: their values come as text.
+                    FieldType::Text | FieldType::Date | FieldType::DateTime => text_of(v).map(Value::Text),
                 }
                 .unwrap_or(Value::Null)
             })

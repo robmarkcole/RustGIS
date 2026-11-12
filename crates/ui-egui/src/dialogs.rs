@@ -473,9 +473,13 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                     ui.add(egui::TextEdit::singleline(&mut app.dialogs.a).desired_width(220.0)).labelled_by(input_label.id);
                     ui.end_row();
                     let input_label = ui.label(tl!("Data type"));
-                    egui::ComboBox::from_id_salt("af_type").selected_text(app.dialogs.b.clone()).show_ui(ui, |ui| {
-                        for ty in ["Long", "Double", "Text", "Boolean"] {
-                            ui.selectable_value(&mut app.dialogs.b, ty.to_string(), ty);
+                    // Each type as the command names it, and as the interface shows it.
+                    let types =
+                        [("Long", tl!("Long")), ("Double", tl!("Double")), ("Text", tl!("Text")), ("Boolean", tl!("Boolean")), ("Date", tl!("Date")), ("DateTime", tl!("Date and time"))];
+                    let shown = types.iter().find(|(ty, _)| *ty == app.dialogs.b).map_or_else(|| app.dialogs.b.clone(), |(_, label)| label.to_string());
+                    egui::ComboBox::from_id_salt("af_type").selected_text(shown).show_ui(ui, |ui| {
+                        for (ty, label) in &types {
+                            ui.selectable_value(&mut app.dialogs.b, ty.to_string(), label.to_string());
                         }
                     }).response.labelled_by(input_label.id);
                     ui.end_row();

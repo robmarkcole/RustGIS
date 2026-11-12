@@ -1,5 +1,6 @@
 //! Attribute values and field definitions.
 
+use crate::date::{Date, DateTime};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -8,6 +9,10 @@ pub enum FieldType {
     Double,
     Text,
     Boolean,
+    /// A calendar day.
+    Date,
+    /// A moment: a date and time, with or without a zone.
+    DateTime,
 }
 
 impl FieldType {
@@ -17,10 +22,16 @@ impl FieldType {
             FieldType::Double => "Double",
             FieldType::Text => "Text",
             FieldType::Boolean => "Boolean",
+            FieldType::Date => "Date",
+            FieldType::DateTime => "DateTime",
         }
     }
     pub fn is_numeric(self) -> bool {
         matches!(self, FieldType::Integer | FieldType::Double)
+    }
+    /// Whether it holds dates or date-times.
+    pub fn is_temporal(self) -> bool {
+        matches!(self, FieldType::Date | FieldType::DateTime)
     }
 }
 
@@ -50,6 +61,8 @@ pub enum Value {
     Float(f64),
     Text(String),
     Bool(bool),
+    Date(Date),
+    DateTime(DateTime),
 }
 
 impl Serialize for Value {
@@ -65,6 +78,8 @@ impl Serialize for Value {
             Value::Float(f) => s.serialize_newtype_variant("Value", 2, "Float", f),
             Value::Text(t) => s.serialize_newtype_variant("Value", 3, "Text", t),
             Value::Bool(b) => s.serialize_newtype_variant("Value", 4, "Bool", b),
+            Value::Date(d) => s.serialize_newtype_variant("Value", 5, "Date", d),
+            Value::DateTime(t) => s.serialize_newtype_variant("Value", 6, "DateTime", t),
         }
     }
 }
@@ -111,6 +126,29 @@ impl Value {
             other => other.to_string(),
         }
     }
+    /// How a date or date-time compares: microseconds since 1970, a date at its midnight and a
+    /// time without a zone as if it were UTC. `None` for other values.
+    pub fn temporal_key(&self) -> Option<i64> {
+        match self {
+            Value::Date(d) => Some(d.sort_key()),
+            Value::DateTime(t) => Some(t.sort_key()),
+            _ => None,
+        }
+    }
+    /// The comparison keys of two values when one is a date or date-time and the other is one
+    /// too, or text that reads as one (`'2026-01-01'`, `'2026-01-01T12:00Z'`): how
+    /// `issued >= '2026-01-01'` compares dates. `None` otherwise, so text that isn't a full date
+    /// (`'2026'`, `''`) compares as text.
+    pub fn temporal_keys(&self, other: &Value) -> Option<(i64, i64)> {
+        let key = |v: &Value| match v {
+            Value::Text(s) => DateTime::parse(s).map(DateTime::sort_key),
+            v => v.temporal_key(),
+        };
+        if self.temporal_key().is_none() && other.temporal_key().is_none() {
+            return None;
+        }
+        Some((key(self)?, key(other)?))
+    }
     /// Converts a JSON value to an attribute value.
     pub fn from_json(v: &serde_json::Value) -> Value {
         match v {
@@ -131,10 +169,22 @@ impl Value {
             Value::Float(f) => serde_json::Number::from_f64(*f).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null),
             Value::Text(s) => s.clone().into(),
             Value::Bool(b) => (*b).into(),
+            Value::Date(_) | Value::DateTime(_) => self.to_string().into(),
+        }
+    }
+    /// Whether it asks for null: null itself, or text that is empty or `<null>`, as
+    /// [`parse`](Value::parse) and the table take it. Such a value becoming null is no loss, so
+    /// nothing reports or refuses it.
+    pub fn asks_null(&self) -> bool {
+        match self {
+            Value::Null => true,
+            Value::Text(t) => t.trim().is_empty() || t.trim().eq_ignore_ascii_case("<null>"),
+            _ => false,
         }
     }
     /// Parses user text into a value of `ty` (empty → Null). Text a number field can't hold,
-    /// including a non-finite Double (`NaN`, `inf`), is Null.
+    /// including a non-finite Double (`NaN`, `inf`), is Null. Dates are ISO 8601: `YYYY-MM-DD`
+    /// for a date; that, a time and an optional zone for a date-time. Text that isn't one is Null.
     pub fn parse(text: &str, ty: FieldType) -> Value {
         let t = text.trim();
         if t.is_empty() || t.eq_ignore_ascii_case("<null>") {
@@ -149,6 +199,8 @@ impl Value {
             FieldType::Double => t.parse::<f64>().ok().filter(|f| f.is_finite()).map_or(Value::Null, Value::Float),
             FieldType::Boolean => Value::Bool(matches!(t.to_ascii_lowercase().as_str(), "true" | "yes" | "1" | "y")),
             FieldType::Text => Value::Text(t.to_string()),
+            FieldType::Date => Date::parse(t).map(Value::Date).unwrap_or(Value::Null),
+            FieldType::DateTime => DateTime::parse(t).map(Value::DateTime).unwrap_or(Value::Null),
         }
     }
 }
@@ -167,13 +219,21 @@ impl std::fmt::Display for Value {
             }
             Value::Text(s) => write!(f, "{s}"),
             Value::Bool(b) => write!(f, "{}", if *b { "True" } else { "False" }),
+            Value::Date(d) => write!(f, "{d}"),
+            Value::DateTime(t) => write!(f, "{t}"),
         }
     }
 }
 
 impl PartialOrd for Value {
+    /// Dates by instant (also against date text), numbers as numbers, nulls first, then text
+    /// ignoring case. Two date-times at one instant with different offsets are `Equal` here but
+    /// not `==`, which compares what is stored (see [`DateTime`]).
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         use std::cmp::Ordering;
+        if let Some((a, b)) = self.temporal_keys(other) {
+            return Some(a.cmp(&b));
+        }
         match (self.as_f64(), other.as_f64()) {
             (Some(a), Some(b)) if !matches!(self, Value::Text(_)) || !matches!(other, Value::Text(_)) => a.partial_cmp(&b),
             _ => match (self, other) {
@@ -435,6 +495,36 @@ pub fn sort_class_values(values: &mut Vec<String>) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn values_stay_small() {
+        assert_eq!(std::mem::size_of::<Value>(), 24);
+    }
+
+    #[test]
+    fn dates_compare_with_dates_and_date_text() {
+        let d = Value::parse("2026-03-05", FieldType::Date);
+        let t = Value::parse("2026-03-05T00:00:00+01:00", FieldType::DateTime);
+        assert_eq!(d.to_string(), "2026-03-05");
+        assert!(t < d, "an hour before UTC midnight");
+        assert!(d > Value::Text("2026-01-01".into()));
+        assert!(d < Value::Text("2026-03-05T00:00:01".into()));
+        // Text that isn't a full date compares as text.
+        assert_eq!(d.temporal_keys(&Value::Text("2026".into())), None);
+        assert!(d > Value::Text("2026".into()));
+        assert!(d > Value::Null);
+        assert_eq!(Value::parse("2026-02-30", FieldType::Date), Value::Null);
+        assert_eq!(d.to_json(), serde_json::json!("2026-03-05"));
+    }
+
+    #[test]
+    fn project_files_hold_dates_as_iso_text() {
+        let vals = vec![Value::parse("2026-03-05", FieldType::Date), Value::parse("2026-03-05T14:30:00+02:00", FieldType::DateTime)];
+        let json = serde_json::to_string(&vals).unwrap_or_default();
+        assert_eq!(json, r#"[{"Date":"2026-03-05"},{"DateTime":"2026-03-05T14:30:00+02:00"}]"#);
+        assert_eq!(serde_json::from_str::<Vec<Value>>(&json).ok(), Some(vals));
+        assert!(serde_json::from_str::<Value>(r#"{"Date":"2026-02-30"}"#).is_err());
+    }
+
     /// Interactive Double text rejects non-finite numbers, while source parsing preserves them
     /// for the counted output notice. Exact integer text stays integer; source decimals stay real.
     #[test]
@@ -465,7 +555,9 @@ mod tests {
             assert_eq!(serde_json::from_str::<Value>(&text).ok(), Some(v.clone()), "{text}");
         }
         assert_eq!(serde_json::to_string(&Value::Float(0.1)).ok().as_deref(), Some(r#"{"Float":0.1}"#), "the format is unchanged");
-        assert!(serde_json::from_str::<Value>(r#"{"Date":"2026-01-01"}"#).is_err_and(|e| e.to_string().contains("unknown variant")));
+        // A variant this version doesn't know is refused by name, which is how a release before
+        // dates refuses a project holding them.
+        assert!(serde_json::from_str::<Value>(r#"{"Time":"12:00"}"#).is_err_and(|e| e.to_string().contains("unknown variant")));
     }
 
     fn sorted(values: &[&str]) -> Vec<String> {

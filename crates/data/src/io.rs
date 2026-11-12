@@ -2499,6 +2499,26 @@ pub fn shapefile_names_note(fields: &[Field], target: &str) -> Option<String> {
     Some(format!("{target}: {count} changed to fit a Shapefile (10 bytes at most, unique ignoring case): {}{more}", listed.join(", ")))
 }
 
+/// What an export to `target` says of its date fields: Shapefile, GeoPackage, GeoParquet and
+/// FlatGeobuf have date columns, which this version doesn't write yet, so their dates go in as ISO
+/// 8601 text and the field type is lost. `None` for other formats, whose dates are text anyway, or
+/// without date fields.
+pub fn dates_as_text_note(fields: &[Field], target: &str) -> Option<String> {
+    let ext = Path::new(target).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    if !matches!(ext.as_str(), "shp" | "zip" | "gpkg" | "parquet" | "geoparquet" | "fgb") {
+        return None;
+    }
+    let dates: Vec<String> = fields.iter().filter(|f| f.ty.is_temporal()).map(|f| format!("'{}'", dbf_notice_name(&f.name))).collect();
+    if dates.is_empty() {
+        return None;
+    }
+    let target: String = target.chars().map(dbf_notice_char).collect();
+    let listed: Vec<&str> = dates.iter().take(5).map(String::as_str).collect();
+    let more = if dates.len() > 5 { format!(" and {} more", dates.len() - 5) } else { String::new() };
+    let count = if dates.len() == 1 { "1 date field was".to_string() } else { format!("{} date fields were", dates.len()) };
+    Some(format!("{target}: {count} written as text (ISO 8601), not as dates: {}{more}", listed.join(", ")))
+}
+
 /// Keeps a diagnostic on one line and prevents field names from reordering its text.
 pub(crate) fn dbf_notice_char(c: char) -> char {
     let reorders = matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
@@ -2541,7 +2561,8 @@ pub fn shapefile_values_notes(ds: &Dataset, target: &str) -> Vec<String> {
             }
             let Some(loss) = counts.get_mut(k) else { continue };
             match field.ty {
-                FieldType::Text if value.to_string().len() > 254 => loss.text += 1,
+                // A date field is written as its text too, so text held in one is cut the same way.
+                FieldType::Text | FieldType::Date | FieldType::DateTime if value.to_string().len() > 254 => loss.text += 1,
                 FieldType::Integer | FieldType::Double => {
                     let d = decimals.get(k).copied().unwrap_or(0);
                     match dbf_number(value, field.ty, d) {
@@ -2811,7 +2832,8 @@ pub fn shapefile_parts_in(ds: &Dataset, crs: Crs) -> Result<(Vec<(&'static str, 
                 table.add_numeric_field(dbf_name(n)?, 24, u8::try_from(d).unwrap_or(15))
             }
             FieldType::Boolean => table.add_logical_field(dbf_name(n)?),
-            FieldType::Text => {
+            // Dates are ISO text until Shapefile's own date fields are written.
+            FieldType::Text | FieldType::Date | FieldType::DateTime => {
                 let longest = ds.features.iter().filter_map(|r| r.attrs.get(k)).map(|v| v.to_string().len()).max().unwrap_or(0);
                 table.add_character_field(dbf_name(n)?, u8::try_from(longest.clamp(1, 254)).unwrap_or(254))
             }
@@ -2824,7 +2846,9 @@ pub fn shapefile_parts_in(ds: &Dataset, crs: Crs) -> Result<(Vec<(&'static str, 
             let value = match f.ty {
                 FieldType::Integer | FieldType::Double => FieldValue::Numeric(dbf_number(v, f.ty, decimals.get(k).copied().unwrap_or(0))),
                 FieldType::Boolean => FieldValue::Logical(dbf_boolean(v)),
-                FieldType::Text => FieldValue::Character((!v.is_null()).then(|| cut(&v.to_string(), 254).to_string())),
+                FieldType::Text | FieldType::Date | FieldType::DateTime => {
+                    FieldValue::Character((!v.is_null()).then(|| cut(&v.to_string(), 254).to_string()))
+                }
             };
             rec.insert(n.clone(), value);
         }
@@ -4383,6 +4407,26 @@ mod tests {
             assert!(shapefile_values_notes(&ds, "cells.zip").is_empty(), "clean: {name}");
         }
         assert!(missing.is_empty(), "losses without notices: {missing:?}");
+    }
+
+    #[test]
+    fn dates_written_as_text_are_said() {
+        let fields = [Field::new("id", FieldType::Integer), Field::new("issued", FieldType::Date), Field::new("ts", FieldType::DateTime)];
+        for target in ["a.shp", "a.zip", "a.gpkg", "a.parquet", "a.fgb"] {
+            assert_eq!(
+                dates_as_text_note(&fields, target).as_deref(),
+                Some(format!("{target}: 2 date fields were written as text (ISO 8601), not as dates: 'issued', 'ts'").as_str())
+            );
+        }
+        // Formats without date columns, and layers without dates, say nothing.
+        for target in ["a.geojson", "a.csv", "a.kml"] {
+            assert_eq!(dates_as_text_note(&fields, target), None, "{target}");
+        }
+        assert_eq!(dates_as_text_note(&fields[..1], "a.gpkg"), None);
+        // Text held in a date field is cut to a Shapefile's 254 bytes like any text, and said.
+        let mut ds = Dataset::new("d", GeometryType::Point, vec![Field::new("issued", FieldType::Date)]);
+        ds.push(Some(Geometry::Point(Coord::new(0.0, 0.0))), vec![Value::Text("x".repeat(300))]);
+        assert_eq!(shapefile_values_notes(&ds, "a.shp"), ["a.shp: 1 text value was cut to at most 254 bytes, in 'issued'"]);
     }
 
     /// The notice for field names a Shapefile can't hold names each change as the file has it,

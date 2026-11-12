@@ -533,6 +533,9 @@ fn fits(text: &str, ty: rustgis_engine::data::FieldType) -> bool {
             }
             T::Double => t.parse::<f64>().is_ok_and(f64::is_finite),
             T::Boolean => matches!(t.to_ascii_lowercase().as_str(), "true" | "false" | "yes" | "no" | "1" | "0" | "y" | "n"),
+            // ISO 8601: `2026-03-05`; for a date-time, that and `14:30`, with or without a zone.
+            T::Date => rustgis_engine::data::Date::parse(t).is_some(),
+            T::DateTime => rustgis_engine::data::DateTime::parse(t).is_some(),
         }
 }
 

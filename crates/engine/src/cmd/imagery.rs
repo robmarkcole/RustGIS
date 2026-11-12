@@ -482,21 +482,33 @@ fn rasterize(s: &mut Session, p: &Value) -> CmdResult {
         };
         burns.push((parts, v));
     }
-    // A text field's values become codes 1 to n, in sorted order.
-    let text = field.is_some_and(|(_, ty)| ty == FieldType::Text);
-    let classes: Vec<String> = if text {
-        let set: std::collections::BTreeSet<String> = burns.iter().filter_map(|(_, v)| text_of(v)).collect();
-        set.into_iter().collect()
-    } else {
-        Vec::new()
-    };
+    // A text or date field's values become codes 1 to n, in sorted order: text by its text, dates
+    // and date-times by instant (one moment at two offsets is one class, labelled as first seen).
+    let text = field.is_some_and(|(_, ty)| ty == FieldType::Text || ty.is_temporal());
+    let temporal = field.is_some_and(|(_, ty)| ty.is_temporal());
+    #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+    enum ClassKey {
+        Instant(i64),
+        Text(String),
+    }
+    let key = |v: &rustgis_data::Value| if temporal { v.temporal_key().map(ClassKey::Instant) } else { text_of(v).map(ClassKey::Text) };
+    let mut labels = std::collections::BTreeMap::new();
+    if text {
+        for (_, v) in &burns {
+            if let (Some(k), Some(label)) = (key(v), text_of(v)) {
+                labels.entry(k).or_insert(label);
+            }
+        }
+    }
+    let keys: Vec<ClassKey> = labels.keys().cloned().collect();
+    let classes: Vec<String> = labels.into_values().collect();
     // Whole numbers: codes, one value, or a field that isn't a floating-point one.
     let whole_field = field.is_none_or(|(_, ty)| ty != FieldType::Double);
     let what = field.and_then(|(i, _)| ds.fields.get(i)).map_or("value", |f| f.name.as_str()).to_string();
     let mut shapes = Vec::with_capacity(burns.len());
     let mut rounded = 0;
     for (parts, v) in burns {
-        let x = if text { text_of(&v).and_then(|t| classes.binary_search(&t).ok()).map(|i| i as f64 + 1.0) } else { v.as_f64() };
+        let x = if text { key(&v).and_then(|k| keys.binary_search(&k).ok()).map(|i| i as f64 + 1.0) } else { v.as_f64() };
         let Some(x) = x else {
             no_value += 1;
             continue;
@@ -611,6 +623,7 @@ fn text_of(v: &rustgis_data::Value) -> Option<String> {
         rustgis_data::Value::Int(i) => i.to_string(),
         rustgis_data::Value::Float(f) => f.to_string(),
         rustgis_data::Value::Bool(b) => b.to_string(),
+        rustgis_data::Value::Date(_) | rustgis_data::Value::DateTime(_) => v.to_string(),
     };
     (!t.trim().is_empty()).then_some(t)
 }

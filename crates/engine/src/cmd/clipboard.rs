@@ -6,6 +6,7 @@
 use rustgis_data::{Dataset, Feature, FieldType, GeometryType, Value as Attr};
 use serde_json::{Value, json};
 
+use super::edit::{Cut, Cuts};
 use super::{need_layer, need_selection, ps};
 use crate::{CmdResult, CommandSpec as C, Session};
 
@@ -110,11 +111,14 @@ fn clip(s: &Session, p: &Value) -> Result<Dataset, String> {
     }
 }
 
-fn coerce(v: &Attr, ty: FieldType) -> Attr {
+/// A pasted value in a field of type `ty`, and what that took from it, as `edit.setValue` and
+/// Calculate Field convert: a fraction or a number past the range of a whole-number field, a
+/// date-time's time in a date field.
+fn coerce(v: &Attr, ty: FieldType) -> (Attr, Cut) {
     match v {
-        Attr::Null => Attr::Null,
-        Attr::Text(t) => Attr::parse(t, ty),
-        other => Attr::parse(&other.to_string(), ty),
+        // Text into a text field is kept as it is, `<null>` and empty text too: it was a value.
+        Attr::Text(t) if ty == FieldType::Text => (Attr::Text(t.clone()), Cut::None),
+        v => super::edit::coerce_cut(v.clone(), ty),
     }
 }
 
@@ -150,6 +154,9 @@ fn paste(s: &mut Session, p: &Value) -> CmdResult {
     let map: Vec<Option<usize>> = l.dataset.fields.iter().map(|f| src.field_index(&f.name)).collect();
     let mut next = l.dataset.features.iter().map(|f| f.id).max().unwrap_or(0);
     let first = l.dataset.features.len();
+    // Per field, what converting the pasted values cut, and the values that aren't null but that
+    // the field can't hold.
+    let mut unfit = vec![(Cuts::default(), 0usize); l.dataset.fields.len()];
     for ft in src.features {
         if ft.geometry.as_ref().is_some_and(|g| want != GeometryType::None && g.kind() != want) {
             continue;
@@ -160,7 +167,16 @@ fn paste(s: &mut Session, p: &Value) -> CmdResult {
             .fields
             .iter()
             .zip(&map)
-            .map(|(f, i)| i.and_then(|i| ft.attrs.get(i)).map(|v| coerce(v, f.ty)).unwrap_or(Attr::Null))
+            .zip(unfit.iter_mut())
+            .map(|((f, i), (cuts, unfit))| match i.and_then(|i| ft.attrs.get(i)) {
+                Some(v) => {
+                    let (out, cut) = coerce(v, f.ty);
+                    cuts.add(cut);
+                    *unfit += usize::from(out.is_null() && cut == Cut::None && !v.asks_null());
+                    out
+                }
+                None => Attr::Null,
+            })
             .collect();
         l.dataset.features.push(Feature { id: next, geometry: ft.geometry, attrs });
     }
@@ -168,9 +184,20 @@ fn paste(s: &mut Session, p: &Value) -> CmdResult {
     l.touch_geometry();
     l.selection = (first..first + n).collect();
     let name = l.name.clone();
+    let features = |n: usize| if n == 1 { "1 feature".to_string() } else { format!("{n} features") };
+    let mut notices = Vec::new();
+    for (f, (cuts, n)) in l.dataset.fields.iter().zip(unfit) {
+        notices.extend(cuts.notices("Paste", &f.name));
+        if n > 0 {
+            notices.push(format!("Paste: '{}' is null in {}, whose value isn't a {} value", f.name, features(n), f.ty.label()));
+        }
+    }
     super::design::apply(s, id, (first..first + n).map(|r| super::design::Change { before: None, row: Some(r) }).collect())?;
     s.map_mut().layers.iter_mut().filter(|o| o.id != id).for_each(|o| o.selection.clear());
     s.notify(format!("Pasted {n} features into {name}"), false);
+    for notice in notices {
+        s.notify(notice, false);
+    }
     Ok(json!({"pasted": n, "layer": id}))
 }
 
@@ -200,4 +227,32 @@ fn copy_path(s: &mut Session, p: &Value) -> CmdResult {
         s.notify("The copied address leaves out part of the layer's address (keys, tokens, a password, a login or a fragment), so it may not work as it is", false);
     }
     Ok(json!({"text": text}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_moment_pasted_into_a_date_field_keeps_its_day() {
+        // 00:30 at +02:00 is the evening before in UTC: the day shown is kept.
+        let t = rustgis_data::DateTime::parse("2026-03-05T00:30:00+02:00").unwrap();
+        assert_eq!(coerce(&Attr::DateTime(t), FieldType::Date), (Attr::Date(t.date()), Cut::Time));
+        assert_eq!(t.date().to_string(), "2026-03-05");
+        assert_eq!(coerce(&Attr::Text("2026-03-05".into()), FieldType::Date).0.to_string(), "2026-03-05");
+        assert!(coerce(&Attr::Text("soon".into()), FieldType::Date).0.is_null());
+        assert_eq!(coerce(&Attr::Text("<null>".into()), FieldType::Text), (Attr::Text("<null>".into()), Cut::None));
+        // A date is no yes/no or number: null, which paste counts and says.
+        for ty in [FieldType::Boolean, FieldType::Integer, FieldType::Double] {
+            assert_eq!(coerce(&Attr::DateTime(t), ty), (Attr::Null, Cut::None), "{ty:?}");
+        }
+    }
+
+    #[test]
+    fn a_number_pasted_into_a_whole_number_field_says_what_it_cut() {
+        assert_eq!(coerce(&Attr::Text("2".into()), FieldType::Integer), (Attr::Int(2), Cut::None));
+        assert_eq!(coerce(&Attr::Text("2.5".into()), FieldType::Integer), (Attr::Int(2), Cut::Fraction));
+        assert_eq!(coerce(&Attr::Float(2.5), FieldType::Integer), (Attr::Int(2), Cut::Fraction));
+        assert_eq!(coerce(&Attr::Text("1e30".into()), FieldType::Integer), (Attr::Null, Cut::Range));
+    }
 }

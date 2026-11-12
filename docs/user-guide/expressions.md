@@ -100,6 +100,21 @@ Rules shared by all of them:
 - **Comparing numbers and text.** A number and text that reads as a number compare as numbers
   (`'12' = 12` is true). Two texts compare as text, ignoring letter case, even when both read
   as numbers (`name = 'paris'` matches `Paris`; `'10' < '9'`; `LIKE` ignores case too).
+- **Comparing dates.** A date or date-time field compares with text that is a full ISO 8601
+  date (`issued >= '2026-01-01'`, `seen < '2026-03-05T08:00Z'`) as a date. A date is its
+  midnight, so `seen = '2026-03-05'` matches midnight only: use a range for the whole day.
+  Date-times with different offsets compare by instant, and one without a zone as if it were
+  UTC; a date is its UTC midnight, so `2026-03-05T01:00+02:00` (2026-03-04 at 23:00 UTC) falls
+  before `'2026-03-05'`. Converting that date-time into a date field keeps the day it shows,
+  2026-03-05. Text that isn't a full date (`'2026'`) compares as text, against the date's ISO text.
+  A date compares only with text or another date: against a number (`issued >= 20260101`,
+  `issued > year`, arithmetic) it's an error, so put the date in quotes, as `YYYY-MM-DD`. A
+  date written without dashes in quotes (`issued >= '20260101'`) is an error too; one that
+  comes from a function or a text field (`coalesce('20260101')`, a `YYYYMMDD` column) compares
+  as text, so write dates with dashes. Use `||` to join text.
+  Arithmetic on a date is an error for now, also on one reached through `coalesce`, `nullif`,
+  `if` or `CASE` (`coalesce(issued) + 1`), and so are the number functions (`abs`, `round`,
+  `min`, …) given a date.
 - **Arithmetic** reads text as a number when it is one (`'12' + 1` is 13). `+` joins text that
   isn't (`name + ' km'`); `-`, `*`, `/` on such text give null.
 - **Nulls.** Arithmetic with a null gives null. A comparison with a null is *unknown*: it

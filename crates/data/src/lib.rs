@@ -9,6 +9,7 @@ pub mod citygml;
 pub mod cityjson;
 mod citymodel;
 pub mod color;
+pub mod date;
 mod dbf;
 pub mod diagnostics;
 pub mod dirs;
@@ -53,6 +54,7 @@ pub mod wkb;
 pub mod xml;
 pub mod zip;
 
+pub use date::{Date, DateTime};
 pub use geometry::{Geometry, GeometryType, Measure, VertexId, ambiguous_area_message};
 pub use rustgis_geom::{Coord, Extent};
 pub use value::{Field, FieldType, Value};

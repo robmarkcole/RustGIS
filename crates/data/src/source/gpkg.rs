@@ -975,7 +975,8 @@ fn create_table(conn: &Connection, layout: &Layout) -> Result<()> {
             FieldType::Integer => "INTEGER",
             FieldType::Double => "REAL",
             FieldType::Boolean => "BOOLEAN",
-            FieldType::Text => "TEXT",
+            // Dates are ISO text until GeoPackage's own DATE and DATETIME are written.
+            FieldType::Text | FieldType::Date | FieldType::DateTime => "TEXT",
         };
         cols.push(format!("{} {ty}", quote(col)));
     }
@@ -1151,6 +1152,9 @@ fn sql_value(v: &Value, ty: FieldType) -> rusqlite::types::Value {
         (Value::Float(_), _) => Sql::Null,
         (Value::Bool(b), _) => Sql::Integer(i64::from(*b)),
         (Value::Text(s), FieldType::Text) => Sql::Text(s.clone()),
+        // A date or date-time as its ISO 8601 text, in the TEXT column its field is written as.
+        (Value::Date(_) | Value::DateTime(_), _) => Sql::Text(v.to_string()),
+        (Value::Text(s), FieldType::Date | FieldType::DateTime) => Sql::Text(s.clone()),
         (v, ty) => match Value::parse_source(&v.to_string(), ty) {
             Value::Int(x) => Sql::Integer(x),
             Value::Float(x) if x.is_finite() => Sql::Real(x),

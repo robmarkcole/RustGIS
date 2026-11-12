@@ -799,21 +799,22 @@ fn read_features(s: &Session, a: &Value) -> Result<Value, String> {
             (by, a.get("descending").and_then(Value::as_bool) == Some(true))
         };
         let fi = ds.fields.iter().position(|f| f.name.eq_ignore_ascii_case(&by)).ok_or_else(|| format!("{name} has no field '{by}'"))?;
-        // A total order (a partial one can make `sort_by` panic): numbers, then text, then empty
-        // values.
-        let key = |r: usize| -> (u8, f64, String) {
+        // A total order (a partial one can make `sort_by` panic): numbers and dates (by instant),
+        // then text, then empty values.
+        let key = |r: usize| -> (u8, f64, i64, String) {
             match ds.features.get(r).and_then(|f| f.attrs.get(fi)) {
-                Some(rustgis_engine::data::Value::Null) | None => (2, 0.0, String::new()),
-                Some(v) => match v.as_f64() {
-                    Some(x) => (0, x, String::new()),
-                    None => (1, 0.0, v.to_string().to_lowercase()),
+                Some(rustgis_engine::data::Value::Null) | None => (2, 0.0, 0, String::new()),
+                Some(v) => match (v.as_f64(), v.temporal_key()) {
+                    (Some(x), _) => (0, x, 0, String::new()),
+                    (None, Some(k)) => (0, 0.0, k, String::new()),
+                    (None, None) => (1, 0.0, 0, v.to_string().to_lowercase()),
                 },
             }
         };
-        let mut keyed: Vec<(usize, (u8, f64, String))> = rows.iter().map(|&r| (r, key(r))).collect();
+        let mut keyed: Vec<(usize, (u8, f64, i64, String))> = rows.iter().map(|&r| (r, key(r))).collect();
         // Descending reverses within numbers and within text; empty values stay last.
         keyed.sort_by(|(_, a), (_, b)| {
-            let within = a.1.total_cmp(&b.1).then_with(|| a.2.cmp(&b.2));
+            let within = a.1.total_cmp(&b.1).then(a.2.cmp(&b.2)).then_with(|| a.3.cmp(&b.3));
             a.0.cmp(&b.0).then(if desc { within.reverse() } else { within })
         });
         rows = keyed.into_iter().map(|(r, _)| r).collect();
@@ -842,6 +843,7 @@ fn read_features(s: &Session, a: &Value) -> Result<Value, String> {
                     rustgis_engine::data::Value::Float(x) => json!(x),
                     rustgis_engine::data::Value::Bool(b) => json!(b),
                     rustgis_engine::data::Value::Text(t) => json!(clip(t, 200)),
+                    d @ (rustgis_engine::data::Value::Date(_) | rustgis_engine::data::Value::DateTime(_)) => json!(d.to_string()),
                 };
                 o.insert(field.name.clone(), v);
             }

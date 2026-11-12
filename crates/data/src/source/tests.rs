@@ -2919,6 +2919,20 @@ fn gpkg_tables(path: &Path) -> Vec<String> {
     st.query_map([], |r| r.get(0)).unwrap().collect::<std::result::Result<_, _>>().unwrap()
 }
 
+/// A GeoPackage export writes dates and date-times as their ISO 8601 text, not as null.
+#[test]
+fn geopackage_export_writes_dates_as_iso_text() {
+    let workspace = tempfile::tempdir().unwrap();
+    let path = workspace.path().join("permits.gpkg");
+    let fields = vec![Field::new("issued", FieldType::Date), Field::new("seen", FieldType::DateTime)];
+    let mut permits = Dataset::new("permits", GeometryType::Point, fields);
+    let row = vec![Value::parse("2026-03-05", FieldType::Date), Value::parse("2026-03-05T14:30:00+02:00", FieldType::DateTime)];
+    permits.push(Some(Geometry::Point(Coord::new(1.0, 2.0))), row);
+    crate::io::write_path(&permits, &path).unwrap();
+    let back = open_path(&path, None).unwrap().read(&Request { extent: None, limit: 10 }).unwrap().features;
+    assert_eq!(back[0].attrs, [Value::Text("2026-03-05".into()), Value::Text("2026-03-05T14:30:00+02:00".into())]);
+}
+
 /// An export into an existing GeoPackage adds a table beside the others, refuses one whose name
 /// is taken, and replaces a feature or attribute table (its spatial index too) when asked; the
 /// other tables, an attribute table among them, are as they were.
