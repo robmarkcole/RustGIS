@@ -600,6 +600,48 @@ impl Highest<(P3, bool)> {
     }
 }
 
+/// The fewest bytes a 3D point written out takes (`1 2 3 `), as a city model's points are: the points implicit geometries place, all
+/// their instances together, are at most a file's size over it, as many as it could write out, so a
+/// large prototype placed many times can't make reading grow as their product.
+pub(crate) const POINT_BYTES: usize = 6;
+
+/// Where an implicit geometry (CityGML's `ImplicitGeometry`, CityJSON's `GeometryInstance`) puts its
+/// prototype: a 4×4 matrix written row by row, multiplied with each point of the prototype in
+/// homogeneous coordinates `(x, y, z, 1)`, and the reference point added to the result (OGC 12-019
+/// §8.3; CityJSON 1.1 §3.4). The prototype's points are in its own local system; the reference point
+/// is in the file's.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Placement {
+    /// The first three rows; the fourth is `0 0 0 1`.
+    rows: [[f64; 4]; 3],
+    at: P3,
+}
+
+impl Placement {
+    /// A placement from the matrix's 16 numbers, row by row. None unless they are 16 finite numbers
+    /// whose last row is `0 0 0 1`: a matrix that projects (one the standard allows) isn't read.
+    pub(crate) fn new(matrix: &[f64], at: P3) -> Option<Placement> {
+        if matrix.len() != 16 || !matrix.iter().chain(&at).all(|v| v.is_finite()) || matrix.get(12..) != Some(&[0.0, 0.0, 0.0, 1.0][..]) {
+            return None;
+        }
+        let row = |k: usize| -> Option<[f64; 4]> { matrix.get(k * 4..k * 4 + 4)?.try_into().ok() };
+        Some(Placement { rows: [row(0)?, row(1)?, row(2)?], at })
+    }
+
+    /// The reference point.
+    pub(crate) fn reference(&self) -> P3 {
+        self.at
+    }
+
+    /// A prototype's point where it is placed; None when that isn't a finite number.
+    pub(crate) fn place(&self, p: &P3) -> Option<P3> {
+        let [x, y, z] = *p;
+        let out = self.rows.map(|r| r[0] * x + r[1] * y + r[2] * z + r[3]);
+        let placed = [out[0] + self.at[0], out[1] + self.at[1], out[2] + self.at[2]];
+        placed.iter().all(|v| v.is_finite()).then_some(placed)
+    }
+}
+
 /// An object's lowest and highest Z, and whether some height wasn't a finite number.
 #[derive(Default)]
 pub(crate) struct Heights {
@@ -623,7 +665,7 @@ impl Heights {
 /// What a reader finds in one object's geometries: its surfaces, its lines and points at their
 /// highest level of detail (points with whether each is a geometry instance's), its heights, and
 /// whether it has solids. The heights are those of every point, line and ring the reader keeps, but
-/// not a geometry instance's: they are in its template, which isn't read.
+/// not the reference point of a geometry instance whose shape isn't placed (a point flagged so).
 #[derive(Default)]
 pub(crate) struct ObjectParts {
     pub(crate) surfaces: Vec<Surface>,
@@ -934,7 +976,13 @@ fn messages(c: &Counts) -> Vec<String> {
     say(c.bad_attributes, format!("{} city objects have attributes that aren't names and values, which are left out", c.bad_attributes));
     say(c.addresses, format!("the addresses of {} city objects are left out", c.addresses));
     say(c.dropped_rings, format!("{} rings with fewer than three different points are left out", c.dropped_rings));
-    say(c.instances, format!("{} geometry instances are drawn as a point at their reference point, with no height", c.instances));
+    say(
+        c.instances,
+        format!(
+            "{} geometry instances are drawn as a point at their reference point, with no height: their shape isn't placed (it is in another file, it or its matrix can't be read, or placing every instance would cost many times the file)",
+            c.instances
+        ),
+    );
     say(c.tin_reliefs, format!("{} TINRelief objects aren't drawn and are left out", c.tin_reliefs));
     say(
         c.unconverted,

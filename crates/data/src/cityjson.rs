@@ -4,10 +4,17 @@
 //! `height`, as every city model is read (see [`crate::citymodel`]). Written from the
 //! specifications: <https://www.cityjson.org/specs/>.
 //!
-//! The file is hostile: vertex indexes are checked, the nesting is fixed by the geometry types, and
-//! the faces merged are bounded. Each object's geometry is parsed on its own and dropped once its rows
-//! are built; its attributes and the root metadata are kept as JSON values until the layers are
-//! written.
+//! A geometry instance (`GeometryInstance`) is its template from `geometry-templates`, placed by its
+//! matrix at its reference point as CityGML's implicit geometries are (see
+//! [`crate::citymodel::Placement`]); one whose template or matrix can't be read is drawn at its
+//! reference point, and said.
+//!
+//! The file is hostile: vertex indexes are checked, the nesting is fixed by the geometry types, the
+//! faces merged are bounded, and so are the points instances place, by the file's size. Each
+//! object's geometry is parsed on its own and dropped once its rows are built; its attributes and
+//! the root metadata are kept as JSON values until the layers are written. The geometry templates,
+//! which every instance may place, are parsed once and kept for the whole read, as the vertices
+//! are: bounded by the file's size.
 
 use std::collections::BTreeMap;
 
@@ -52,6 +59,9 @@ struct Doc<'a> {
     metadata: Option<Json>,
     #[serde(borrow)]
     appearance: Option<&'a RawValue>,
+    /// The shapes geometry instances place, read apart so a malformed one costs only the instances.
+    #[serde(rename = "geometry-templates", borrow)]
+    templates: Option<&'a RawValue>,
 }
 
 #[derive(Deserialize)]
@@ -81,16 +91,103 @@ struct RawGeometry {
     #[serde(default)]
     boundaries: Json,
     semantics: Option<Json>,
+    /// A geometry instance's: its template's place in `geometry-templates`, and its matrix.
+    template: Option<Json>,
+    #[serde(rename = "transformationMatrix")]
+    matrix: Option<Json>,
+}
+
+/// The shapes geometry instances place: each template with the vertices placing it reads, or none
+/// when it can't be read (said once, not for each instance), and their vertices, in the templates'
+/// own system (the file's `transform` doesn't apply to them).
+struct Templates {
+    /// Each with how many vertex indexes placing it reads, and how many rings of no area reading it
+    /// left out (said then, once, not again for each instance).
+    shapes: Vec<Option<(RawGeometry, usize, usize)>>,
+    vertices: Vec<P3>,
+}
+
+impl Templates {
+    /// A file's `geometry-templates`, none when they can't be read: each of its instances is then
+    /// drawn at its reference point, and said so.
+    fn of(raw: Option<&RawValue>, counts: &mut Counts) -> Option<Templates> {
+        #[derive(Deserialize)]
+        struct Raw {
+            #[serde(default)]
+            templates: Vec<Json>,
+            #[serde(rename = "vertices-templates", default)]
+            vertices: Vec<P3>,
+        }
+        // A block that can't be read leaves every instance at its reference point, said with them;
+        // the block itself is said as a geometry that can't be read.
+        let Ok(raw) = serde_json::from_str::<Raw>(raw?.get()) else {
+            counts.bad_geometries += 1;
+            return None;
+        };
+        let vertex = |k: usize| raw.vertices.get(k).copied();
+        let shapes = raw
+            .templates
+            .into_iter()
+            .map(|t| {
+                // A template that can't be read is said here, once; one that is an instance itself
+                // places nothing.
+                let shape = serde_json::from_value::<RawGeometry>(t).ok().filter(|g| g.ty != "GeometryInstance");
+                let dropped = counts.dropped_rings;
+                let read = shape.as_ref().and_then(|g| geometry(&mut ObjectParts::default(), g, &vertex, counts));
+                if read.is_none() {
+                    counts.bad_geometries += 1;
+                }
+                let dropped = counts.dropped_rings - dropped;
+                // One with no vertex at all (`"boundaries": []`) places nothing: its instances are
+                // their reference points, and said.
+                shape.filter(|g| read.is_some() && has_vertex(&g.boundaries)).map(|g| {
+                    let size = indexes(&g.boundaries);
+                    (g, size, dropped)
+                })
+            })
+            .collect();
+        Some(Templates { shapes, vertices: raw.vertices })
+    }
+}
+
+/// Whether boundaries hold a vertex index anywhere.
+fn has_vertex(boundaries: &Json) -> bool {
+    let mut stack = vec![boundaries];
+    while let Some(j) = stack.pop() {
+        match j {
+            Json::Array(items) => stack.extend(items),
+            Json::Number(_) => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// How many vertex indexes boundaries hold, which is what placing them reads; an empty array counts
+/// as one, as placing it still makes and drops a ring or a face.
+fn indexes(boundaries: &Json) -> usize {
+    match boundaries {
+        Json::Array(parts) if parts.is_empty() => 1,
+        Json::Array(parts) => parts.iter().map(indexes).sum(),
+        _ => 1,
+    }
 }
 
 /// The points of a ring or line, `None` for an index that isn't one.
-fn at(indexes: &Json, vertices: &[P3]) -> Option<Vec<P3>> {
-    indexes.as_array()?.iter().map(|i| vertices.get(usize::try_from(i.as_u64()?).ok()?).copied()).collect()
+fn at(indexes: &Json, vertex: &impl Fn(usize) -> Option<P3>) -> Option<Vec<P3>> {
+    indexes.as_array()?.iter().map(|i| vertex(usize::try_from(i.as_u64()?).ok()?)).collect()
 }
 
 /// `boundaries`, surfaces nested `depth` levels deep, with their semantic `values` alongside, into
 /// `faces`.
-fn walk(faces: &mut Faces, boundaries: &Json, values: Option<&Json>, depth: usize, marks: &[Json], vertices: &[P3]) -> Option<()> {
+fn walk(
+    faces: &mut Faces,
+    boundaries: &Json,
+    values: Option<&Json>,
+    depth: usize,
+    marks: &[Json],
+    vertices: &impl Fn(usize) -> Option<P3>,
+) -> Option<()> {
     for (i, part) in boundaries.as_array()?.iter().enumerate() {
         let value = values.and_then(|v| v.get(i));
         // At this depth the parts are a solid's shells: past the first they are cavities, whose
@@ -105,7 +202,7 @@ fn walk(faces: &mut Faces, boundaries: &Json, values: Option<&Json>, depth: usiz
     Some(())
 }
 
-fn surface(faces: &mut Faces, rings: &Json, value: Option<&Json>, marks: &[Json], vertices: &[P3]) -> Option<()> {
+fn surface(faces: &mut Faces, rings: &Json, value: Option<&Json>, marks: &[Json], vertices: &impl Fn(usize) -> Option<P3>) -> Option<()> {
     let rings = rings.as_array()?.iter().map(|ring| at(ring, vertices)).collect::<Option<Vec<_>>>()?;
     let ground =
         value.and_then(Json::as_u64).and_then(|m| marks.get(usize::try_from(m).ok()?)).and_then(|m| m.get("type")).and_then(Json::as_str)
@@ -219,6 +316,10 @@ fn read_with(file_name: &str, bytes: &[u8], given: Option<Crs>, keep_named: bool
     };
 
     let mut counts = Counts::default();
+    let templates = Templates::of(doc.templates, &mut counts);
+    // Placing an instance reads its template's vertices again: all of them together are as many as
+    // the file could write out ([`POINT_BYTES`]).
+    let mut placing = text.len() / POINT_BYTES;
     let mut budget = MAX_FILE_FACES;
     let mut built: Vec<Built> = Vec::with_capacity(objects.len());
     let mut rows: Vec<Row> = Vec::new();
@@ -245,7 +346,7 @@ fn read_with(file_name: &str, bytes: &[u8], given: Option<Crs>, keep_named: bool
                 Vec::new()
             }
         };
-        let parts = object_parts(&object.geometry, &vertices, &mut counts);
+        let parts = object_parts(&object.geometry, &vertices, templates.as_ref(), &mut placing, &mut counts);
         let made = object_rows(parts, at_row, &mut counts, &mut budget);
         if made.rows.is_empty() {
             // Its attributes stay: its children, in their own rows, are where it is drawn.
@@ -265,71 +366,111 @@ fn read_with(file_name: &str, bytes: &[u8], given: Option<Crs>, keep_named: bool
     finish(file_name, stem, rows, built, counts, notes, crs)
 }
 
-/// An object's surfaces, lines, points and heights, from its geometries. An instance adds none of
-/// its heights: they are in its template, which isn't read.
-fn object_parts(geometries: &[RawGeometry], vertices: &[P3], counts: &mut Counts) -> ObjectParts {
+/// An object's surfaces, lines, points and heights, from its geometries. An instance is its
+/// template placed by its matrix at its reference point, or, when that can't be done, its reference
+/// point, which adds no height.
+fn object_parts(
+    geometries: &[RawGeometry],
+    vertices: &[P3],
+    templates: Option<&Templates>,
+    placing: &mut usize,
+    counts: &mut Counts,
+) -> ObjectParts {
     let mut parts = ObjectParts::default();
+    let vertex = |k: usize| vertices.get(k).copied();
     for g in geometries {
-        let depth = match g.ty.as_str() {
-            "MultiSurface" | "CompositeSurface" => 0,
-            "Solid" => 1,
-            "MultiSolid" | "CompositeSolid" => 2,
-            "MultiPoint" => {
-                match at(&g.boundaries, vertices) {
-                    Some(p) if p.is_empty() => {}
-                    Some(p) => {
-                        parts.heights.add(&p);
-                        let (rank, lod) = level(g);
-                        parts.points.add_points(rank, lod, p.into_iter().map(|p| (p, false)).collect());
-                    }
-                    None => counts.bad_geometries += 1,
-                }
-                continue;
+        if g.ty != "GeometryInstance" {
+            if geometry(&mut parts, g, &vertex, counts).is_none() {
+                counts.bad_geometries += 1;
             }
-            "GeometryInstance" => {
-                // Its template isn't placed: it is drawn at its reference point.
-                match at(&g.boundaries, vertices).as_deref() {
-                    Some([p, ..]) => {
-                        let (rank, lod) = level(g);
-                        parts.points.add_points(rank, lod, vec![(*p, true)]);
-                    }
-                    _ => counts.bad_geometries += 1,
-                }
-                continue;
-            }
-            "MultiLineString" => {
-                let lines: Option<Vec<Vec<P3>>> = g.boundaries.as_array().and_then(|l| l.iter().map(|line| at(line, vertices)).collect());
-                match lines {
-                    Some(lines) => {
-                        let lines: Vec<Vec<P3>> = lines.into_iter().filter(|p| !p.is_empty()).collect();
-                        lines.iter().for_each(|p| parts.heights.add(p));
-                        if !lines.is_empty() {
-                            let (rank, lod) = level(g);
-                            parts.lines.add_lines(rank, lod, lines);
-                        }
-                    }
-                    None => counts.bad_geometries += 1,
-                }
-                continue;
-            }
-            other => {
-                counts.unknown.insert(other.chars().take(64).collect());
-                continue;
-            }
-        };
-        let semantics = g.semantics.as_ref();
-        let marks = semantics.and_then(|s| s.get("surfaces")).and_then(Json::as_array).map_or(&[][..], Vec::as_slice);
-        let mut faces = Faces::default();
-        if walk(&mut faces, &g.boundaries, semantics.and_then(|s| s.get("values")), depth, marks, vertices).is_none() {
-            counts.bad_geometries += 1;
             continue;
         }
-        counts.dropped_rings += faces.dropped_rings;
-        faces.rings().for_each(|p| parts.heights.add(p));
-        parts.solid |= depth > 0;
-        parts.surfaces.push(Surface { lod: lod_text(g.lod.as_ref()), rank: lod_number(g.lod.as_ref()), faces });
+        let Some(reference) = at(&g.boundaries, &vertex).and_then(|p| p.first().copied()) else {
+            counts.bad_geometries += 1;
+            continue;
+        };
+        if !place(&mut parts, g, reference, templates, placing, counts) {
+            let (rank, lod) = level(g);
+            parts.points.add_points(rank, lod, vec![(reference, true)]);
+        }
     }
     parts
+}
+
+/// Places an instance's template into the object's parts; false when it isn't placed: its
+/// template is missing, can't be read or draws nothing, its matrix is missing (CityJSON 1.1 §3.4
+/// requires one) or isn't 16 numbers with `0 0 0 1` last, or the file's placing is spent. The level of detail is its template's: an instance has none of its own
+/// (CityJSON 1.1 §3.4).
+fn place(
+    parts: &mut ObjectParts,
+    g: &RawGeometry,
+    reference: P3,
+    templates: Option<&Templates>,
+    placing: &mut usize,
+    counts: &mut Counts,
+) -> bool {
+    let Some(t) = templates else { return false };
+    let shape = g.template.as_ref().and_then(Json::as_u64).and_then(|i| usize::try_from(i).ok()).and_then(|i| t.shapes.get(i));
+    let Some(Some((shape, size, template_dropped))) = shape else { return false };
+    let placement = g.matrix.as_ref().and_then(Json::as_array).and_then(|v| v.iter().map(Json::as_f64).collect::<Option<Vec<f64>>>());
+    let Some(placement) = placement.and_then(|v| Placement::new(&v, reference)) else { return false };
+    if *size > *placing {
+        return false;
+    }
+    *placing -= size;
+    let vertex = |k: usize| t.vertices.get(k).and_then(|v| placement.place(v));
+    // The template was read once already, and its rings of no area said then: not again for each
+    // instance. Placing may flatten others (a matrix that scales an axis to nothing): those are said
+    // for each instance. A ring of no area keeps none once placed, so the placed rings left out are
+    // the template's and the new ones. What fails is a point placed past what a number holds.
+    let mut placed = Counts::default();
+    let done = geometry(parts, shape, &vertex, &mut placed) == Some(true);
+    counts.dropped_rings += placed.dropped_rings.saturating_sub(*template_dropped);
+    done
+}
+
+/// One geometry into an object's parts, its points from `vertex`: whether it added something, or
+/// none when it can't be read.
+fn geometry(parts: &mut ObjectParts, g: &RawGeometry, vertex: &impl Fn(usize) -> Option<P3>, counts: &mut Counts) -> Option<bool> {
+    let depth = match g.ty.as_str() {
+        "MultiSurface" | "CompositeSurface" => 0,
+        "Solid" => 1,
+        "MultiSolid" | "CompositeSolid" => 2,
+        "MultiPoint" => {
+            let p = at(&g.boundaries, vertex)?;
+            if p.is_empty() {
+                return Some(false);
+            }
+            parts.heights.add(&p);
+            let (rank, lod) = level(g);
+            parts.points.add_points(rank, lod, p.into_iter().map(|p| (p, false)).collect());
+            return Some(true);
+        }
+        "MultiLineString" => {
+            let lines: Vec<Vec<P3>> = g.boundaries.as_array()?.iter().map(|line| at(line, vertex)).collect::<Option<_>>()?;
+            let lines: Vec<Vec<P3>> = lines.into_iter().filter(|p| !p.is_empty()).collect();
+            lines.iter().for_each(|p| parts.heights.add(p));
+            if lines.is_empty() {
+                return Some(false);
+            }
+            let (rank, lod) = level(g);
+            parts.lines.add_lines(rank, lod, lines);
+            return Some(true);
+        }
+        other => {
+            counts.unknown.insert(other.chars().take(64).collect());
+            return Some(false);
+        }
+    };
+    let semantics = g.semantics.as_ref();
+    let marks = semantics.and_then(|s| s.get("surfaces")).and_then(Json::as_array).map_or(&[][..], Vec::as_slice);
+    let mut faces = Faces::default();
+    walk(&mut faces, &g.boundaries, semantics.and_then(|s| s.get("values")), depth, marks, vertex)?;
+    counts.dropped_rings += faces.dropped_rings;
+    faces.rings().for_each(|p| parts.heights.add(p));
+    parts.solid |= depth > 0;
+    parts.surfaces.push(Surface { lod: lod_text(g.lod.as_ref()), rank: lod_number(g.lod.as_ref()), faces });
+    Some(true)
 }
 
 #[cfg(test)]

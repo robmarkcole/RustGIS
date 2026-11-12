@@ -277,7 +277,8 @@ fn links_are_said_and_what_is_written_out_is_drawn() {
         box_surfaces("b1")
     );
     let out = read("model.gml", &lonlat(&building("b1", &inner)), None).unwrap();
-    assert!(says(&out, "4 geometries or objects are given only by a link"), "{:?}", messages_of(&out));
+    assert!(says(&out, "3 geometries or objects are given only by a link"), "{:?}", messages_of(&out));
+    assert!(says(&out, "1 links between city objects"), "{:?}", messages_of(&out));
     assert!(!says(&out, "can't be read"), "{:?}", messages_of(&out));
     assert_eq!(value(&out[0].0, 0, "consistsOfBuildingPart"), Value::Text("#p".into()));
 }
@@ -381,7 +382,7 @@ fn links_read_a_member_only_so_many_times_over() {
     let drawn = part.features.iter().filter(|f| f.geometry.is_some()).count();
     assert!((1..20).contains(&drawn), "some read, then the rest refused: {drawn}");
     let refused = format!(
-        "{} links (xlink:href) to geometries aren't followed, as they would read their city object member over many times",
+        "{} links (xlink:href) to geometries aren't followed, as they would read their city object member, or the file, over many times",
         2 * (20 - drawn)
     );
     assert!(says(&out, &refused), "{refused}: {:?}", messages_of(&out));
@@ -467,8 +468,8 @@ fn a_geometry_left_out_doesnt_say_its_parts_for_each_link() {
         polygon("a", &square(0.0, 0.0, 10.0, 0.0))
     );
     let out = read("model.gml", &lonlat(&building("b1", &inner)), None).unwrap();
-    // Once at LoD 1 where it is written, once at LoD 2 where it is linked.
-    assert!(says(&out, "2 geometries of city objects have coordinates that can't be read"), "{:?}", messages_of(&out));
+    // Once, where it is written, whatever links to it.
+    assert!(says(&out, "1 geometries of city objects have coordinates that can't be read"), "{:?}", messages_of(&out));
     assert!(!says(&out, "given only by a link"), "{:?}", messages_of(&out));
 
     // A solid whose exterior links to a geometry left out is left out with its cavities, and said.
@@ -1459,4 +1460,648 @@ fn gml_ids_come_from_gml_namespaces_only() {
     assert_eq!(gml_id(&doc.root_element()), Some("right"));
     let doc = roxmltree::Document::parse(r#"<b xmlns:x="http://www.opengis.net/gmlfoo" x:id="wrong"/>"#).unwrap();
     assert_eq!(gml_id(&doc.root_element()), None);
+}
+
+/// The one layer of a file whose objects are all of one type, named after the file alone.
+fn only(out: &[(Dataset, ReadReport)]) -> &Dataset {
+    assert_eq!(out.len(), 1, "{:?}", out.iter().map(|(ds, _)| &ds.name).collect::<Vec<_>>());
+    &out[0].0
+}
+
+/// The row of the object with `id` in a layer.
+fn row_of(ds: &Dataset, id: &str) -> usize {
+    (0..ds.features.len()).find(|&r| value(ds, r, "id") == Value::Text(id.into())).unwrap_or_else(|| panic!("no row {id}"))
+}
+
+/// The first layer of a geometry type.
+fn of_type(out: &[(Dataset, ReadReport)], ty: GeometryType) -> &Dataset {
+    &out.iter().find(|(ds, _)| ds.geometry_type == ty).unwrap_or_else(|| panic!("no {ty:?} layer")).0
+}
+
+/// A link to a geometry written in another member reads it, whichever member comes first.
+#[test]
+fn a_link_to_another_members_geometry_reads_it() {
+    let solid = r##"<bldg:lod2Solid><gml:Solid><gml:exterior><gml:CompositeSurface><gml:surfaceMember xlink:href="#a-g"/><gml:surfaceMember xlink:href="#a-r"/></gml:CompositeSurface></gml:exterior></gml:Solid></bldg:lod2Solid>"##;
+    let (a, b) = (building("a", &box_surfaces("a")), building("b", solid));
+    for members in [[a.clone(), b.clone()], [b, a]] {
+        let out = read("model.gml", &lonlat(&members.concat()), None).unwrap();
+        let ds = only(&out);
+        let row = row_of(ds, "b");
+        assert!((area(ds.features[row].geometry.as_ref()) - 100.0).abs() < 1e-6, "{:?}", messages_of(&out));
+        assert_eq!(value(ds, row, "z_max"), Value::Float(5.0));
+        assert!(!says(&out, "link"), "{:?}", messages_of(&out));
+    }
+}
+
+/// What a geometry's text alone loses of where it stands in its member is kept when another
+/// member's link reads it: a prefix its member declares, and the dimension an ancestor gives.
+#[test]
+fn a_geometry_read_from_another_member_keeps_its_namespaces_and_dimension() {
+    let written = r#"<core:cityObjectMember xmlns:g2="http://www.opengis.net/gml"><bldg:Building gml:id="c"><bldg:lod2MultiSurface><gml:MultiSurface srsDimension="2"><gml:surfaceMember><gml:Polygon gml:id="flat"><g2:exterior><g2:LinearRing><g2:posList>0 0 10 0 10 10 0 10 0 0</g2:posList></g2:LinearRing></g2:exterior></gml:Polygon></gml:surfaceMember></gml:MultiSurface></bldg:lod2MultiSurface></bldg:Building></core:cityObjectMember>"#;
+    let linking = building(
+        "d",
+        r##"<bldg:lod2MultiSurface><gml:MultiSurface><gml:surfaceMember xlink:href="#flat"/></gml:MultiSurface></bldg:lod2MultiSurface>"##,
+    );
+    let out = read("model.gml", &lonlat(&[linking.as_str(), written].concat()), None).unwrap();
+    let ds = only(&out);
+    for id in ["c", "d"] {
+        assert!((area(ds.features[row_of(ds, id)].geometry.as_ref()) - 100.0).abs() < 1e-6, "{id}: {:?}", messages_of(&out));
+    }
+    assert!(!says(&out, "link"), "{:?}", messages_of(&out));
+    assert!(!says(&out, "can't be read"), "{:?}", messages_of(&out));
+}
+
+/// A `gml:id` under a prefix its member binds to GML is found by a link from another member; one
+/// bound to another namespace is no `gml:id`.
+#[test]
+fn a_gml_id_under_a_members_own_prefix_is_found() {
+    let written = |prefix_ns: &str| {
+        format!(
+            r#"<core:cityObjectMember xmlns:g2="{prefix_ns}"><bldg:Building gml:id="c"><bldg:lod2MultiSurface><gml:MultiSurface><gml:surfaceMember><gml:Polygon g2:id="flat"><gml:exterior><gml:LinearRing><gml:posList>{}</gml:posList></gml:LinearRing></gml:exterior></gml:Polygon></gml:surfaceMember></gml:MultiSurface></bldg:lod2MultiSurface></bldg:Building></core:cityObjectMember>"#,
+            square(0.0, 0.0, 10.0, 0.0)
+        )
+    };
+    let linking = building(
+        "d",
+        r##"<bldg:lod2MultiSurface><gml:MultiSurface><gml:surfaceMember xlink:href="#flat"/></gml:MultiSurface></bldg:lod2MultiSurface>"##,
+    );
+    let out = read("model.gml", &lonlat(&[linking.as_str(), &written("http://www.opengis.net/gml")].concat()), None).unwrap();
+    let ds = only(&out);
+    assert!((area(ds.features[row_of(ds, "d")].geometry.as_ref()) - 100.0).abs() < 1e-6, "{:?}", messages_of(&out));
+    assert!(!says(&out, "link"), "{:?}", messages_of(&out));
+    let out = read("model.gml", &lonlat(&[linking.as_str(), &written("urn:other")].concat()), None).unwrap();
+    assert!(says(&out, "1 geometries or objects are given only by a link"), "{:?}", messages_of(&out));
+}
+
+/// Namespaces declared deep inside a member can't make indexing grow as their number times their
+/// size: past what the file's size allows, a link to what stands in them finds nothing, and is said.
+#[test]
+fn declarations_nested_past_the_files_size_arent_copied() {
+    let long = "x".repeat(200);
+    let opens: String = (0..30).map(|k| format!(r#"<gen:stringAttribute xmlns:n{k}="urn:{long}">"#)).collect();
+    let closes = "</gen:stringAttribute>".repeat(30);
+    let written = format!(
+        "<core:cityObjectMember><bldg:Building gml:id=\"c\">{opens}{}{closes}</bldg:Building></core:cityObjectMember>",
+        polygon("deep", &square(0.0, 0.0, 10.0, 0.0))
+    );
+    let linking = building(
+        "d",
+        r##"<bldg:lod2MultiSurface><gml:MultiSurface><gml:surfaceMember xlink:href="#deep"/></gml:MultiSurface></bldg:lod2MultiSurface>"##,
+    );
+    let out = read("model.gml", &lonlat(&[linking, written].concat()), None).unwrap();
+    assert!(says(&out, "1 geometries or objects are given only by a link"), "{:?}", messages_of(&out));
+}
+
+/// A geometry that can't be read is said once, whether a link in another member or its own object
+/// reads it first; a solid whose exterior is a link to one is said too.
+#[test]
+fn a_geometry_that_cant_be_read_is_said_once_in_the_file() {
+    let bad = r#"<gml:Polygon gml:id="p"><gml:exterior><gml:LinearRing><gml:posList>1 2 abc</gml:posList></gml:LinearRing></gml:exterior></gml:Polygon>"#;
+    let written = building(
+        "c",
+        &format!(
+            "<bldg:lod2MultiSurface><gml:MultiSurface><gml:surfaceMember>{bad}</gml:surfaceMember></gml:MultiSurface></bldg:lod2MultiSurface>"
+        ),
+    );
+    let linking = building(
+        "d",
+        r##"<bldg:lod2MultiSurface><gml:MultiSurface><gml:surfaceMember xlink:href="#p"/></gml:MultiSurface></bldg:lod2MultiSurface>"##,
+    );
+    for members in [[written.clone(), linking.clone()], [linking.clone(), written.clone()]] {
+        let out = read("model.gml", &lonlat(&members.concat()), None).unwrap();
+        assert!(says(&out, "1 geometries of city objects have coordinates that can't be read"), "{:?}", messages_of(&out));
+    }
+    // A solid with no cavities whose exterior links to it is lost with it, and said.
+    let solid = building("e", r##"<bldg:lod2Solid><gml:Solid><gml:exterior xlink:href="#p"/></gml:Solid></bldg:lod2Solid>"##);
+    let out = read("model.gml", &lonlat(&[written.as_str(), &solid].concat()), None).unwrap();
+    assert!(says(&out, "2 geometries of city objects have coordinates that can't be read"), "{:?}", messages_of(&out));
+}
+
+/// A composite with an id holding a geometry that can't be read is said once, however many links
+/// read the composite or the geometry; and a link read before the object that writes the geometry
+/// doesn't make it said twice.
+#[test]
+fn a_composite_holding_what_cant_be_read_is_said_once() {
+    let bad = r#"<gml:Polygon gml:id="p"><gml:exterior><gml:LinearRing><gml:posList>1 2 abc</gml:posList></gml:LinearRing></gml:exterior></gml:Polygon>"#;
+    let inner = format!(
+        r##"<bldg:lod1MultiSurface><gml:MultiSurface><gml:surfaceMember><gml:CompositeSurface gml:id="e"><gml:surfaceMember>{bad}</gml:surfaceMember></gml:CompositeSurface></gml:surfaceMember></gml:MultiSurface></bldg:lod1MultiSurface>
+        <bldg:lod2MultiSurface><gml:MultiSurface><gml:surfaceMember xlink:href="#e"/><gml:surfaceMember xlink:href="#p"/></gml:MultiSurface></bldg:lod2MultiSurface>
+        <bldg:lod3MultiSurface><gml:MultiSurface><gml:surfaceMember xlink:href="#e"/></gml:MultiSurface></bldg:lod3MultiSurface>"##
+    );
+    let out = read("model.gml", &lonlat(&building("b1", &inner)), None).unwrap();
+    assert!(says(&out, "1 geometries of city objects have coordinates that can't be read"), "{:?}", messages_of(&out));
+    // The parent's link is followed before its part, where the geometry is written, is read.
+    let inner = format!(
+        r##"<bldg:lod2MultiSurface><gml:MultiSurface><gml:surfaceMember xlink:href="#p"/></gml:MultiSurface></bldg:lod2MultiSurface>
+        <bldg:consistsOfBuildingPart><bldg:BuildingPart gml:id="p1"><bldg:lod2MultiSurface><gml:MultiSurface><gml:surfaceMember>{bad}</gml:surfaceMember></gml:MultiSurface></bldg:lod2MultiSurface></bldg:BuildingPart></bldg:consistsOfBuildingPart>"##
+    );
+    let out = read("model.gml", &lonlat(&building("b2", &inner)), None).unwrap();
+    assert!(says(&out, "1 geometries of city objects have coordinates that can't be read"), "{:?}", messages_of(&out));
+}
+
+/// A geometry given only by a link stands for what it points to: a link to it that isn't followed
+/// is said for each link, whichever is followed first.
+#[test]
+fn a_link_to_a_link_is_said_as_that_link() {
+    let inner = r##"<bldg:lod2MultiSurface><gml:MultiSurface>
+        <gml:surfaceMember><gml:Polygon gml:id="q" xlink:href="#nowhere"/></gml:surfaceMember>
+        <gml:surfaceMember xlink:href="#q"/>
+        </gml:MultiSurface></bldg:lod2MultiSurface>"##;
+    let out = read("model.gml", &lonlat(&building("b1", inner)), None).unwrap();
+    assert!(says(&out, "2 geometries or objects are given only by a link"), "{:?}", messages_of(&out));
+}
+
+/// A link where a geometry belongs to another member's object, or to a geometry where nothing is
+/// drawn (a terrain intersection), isn't followed, and is said.
+#[test]
+fn a_link_to_what_isnt_drawn_there_is_said() {
+    let written = building(
+        "c",
+        r#"<bldg:lod2TerrainIntersection><gml:MultiCurve gml:id="ti"><gml:curveMember><gml:LineString><gml:posList>0 0 0 10 0 0</gml:posList></gml:LineString></gml:curveMember></gml:MultiCurve></bldg:lod2TerrainIntersection>"#,
+    );
+    let linking = building(
+        "d",
+        r##"<bldg:lod2MultiCurve xlink:href="#ti"/><bldg:lod2MultiSurface><gml:MultiSurface><gml:surfaceMember xlink:href="#c"/></gml:MultiSurface></bldg:lod2MultiSurface>"##,
+    );
+    let out = read("model.gml", &lonlat(&[written, linking].concat()), None).unwrap();
+    assert!(
+        says(&out, "2 links (xlink:href) where a geometry belongs point to an element that isn't a geometry"),
+        "{:?}",
+        messages_of(&out)
+    );
+}
+
+/// A geometry id given twice in a file with links is said, and a link from a third member reads the
+/// first.
+#[test]
+fn a_geometry_id_given_twice_in_the_file_is_said() {
+    let members = [
+        building("a", &format!("<bldg:lod2MultiSurface><gml:MultiSurface><gml:surfaceMember>{}</gml:surfaceMember></gml:MultiSurface></bldg:lod2MultiSurface>", polygon("x", &square(0.0, 0.0, 10.0, 0.0)))),
+        building("b", &format!("<bldg:lod2MultiSurface><gml:MultiSurface><gml:surfaceMember>{}</gml:surfaceMember></gml:MultiSurface></bldg:lod2MultiSurface>", polygon("x", &square(20.0, 0.0, 5.0, 0.0)))),
+        building("c", r##"<bldg:lod2MultiSurface><gml:MultiSurface><gml:surfaceMember xlink:href="#x"/></gml:MultiSurface></bldg:lod2MultiSurface>"##),
+    ]
+    .concat();
+    let out = read("model.gml", &lonlat(&members), None).unwrap();
+    assert!(says(&out, "1 geometries have a gml:id an earlier element of the file has too"), "{:?}", messages_of(&out));
+    let ds = only(&out);
+    assert!((area(ds.features[row_of(ds, "c")].geometry.as_ref()) - 100.0).abs() < 1e-6, "the first");
+}
+
+/// A part given by a link is its building's child, wherever it is written: the building takes its
+/// heights. A link to nothing, or to the building itself, is said, and kept as an attribute.
+#[test]
+fn a_part_given_by_a_link_is_a_child() {
+    let hall = r##"<core:cityObjectMember><bldg:Building gml:id="hall"><gml:name>Hall</gml:name>
+        <bldg:consistsOfBuildingPart xlink:href="#p1"/><bldg:consistsOfBuildingPart xlink:href="#gone"/><bldg:consistsOfBuildingPart xlink:href="#hall"/>
+        </bldg:Building></core:cityObjectMember>"##;
+    let part = format!(
+        r#"<core:cityObjectMember><bldg:BuildingPart gml:id="p1">{}</bldg:BuildingPart></core:cityObjectMember>"#,
+        box_surfaces("p1")
+    );
+    let out = read("model.gml", &lonlat(&[hall, &part].concat()), None).unwrap();
+    let parts = layer(&out, "model BuildingPart");
+    assert_eq!(value(parts, 0, "parent"), Value::Text("hall".into()));
+    let buildings = layer(&out, "model Building");
+    assert_eq!(value(buildings, 0, "z_max"), Value::Float(5.0), "raised by its part");
+    assert!(says(&out, "2 links between city objects"), "{:?}", messages_of(&out));
+    assert!(!says(&out, "given only by a link"), "{:?}", messages_of(&out));
+}
+
+/// A group is its members' parent, as in CityJSON, and its own parent (`grp:parent`) is the
+/// group's; a member's role isn't kept, and is said.
+#[test]
+fn a_group_is_its_members_parent() {
+    let members = [
+        r##"<core:cityObjectMember><grp:CityObjectGroup gml:id="g"><grp:groupMember role="main" xlink:href="#b1"/><grp:parent xlink:href="#site"/></grp:CityObjectGroup></core:cityObjectMember>"##.to_string(),
+        building("b1", &box_surfaces("b1")),
+        r#"<core:cityObjectMember><bldg:Building gml:id="site"><gml:name>Site</gml:name></bldg:Building></core:cityObjectMember>"#.to_string(),
+    ]
+    .concat();
+    let out = read("model.gml", &lonlat(&members), None).unwrap();
+    let buildings = layer(&out, "model Building");
+    assert_eq!(value(buildings, row_of(buildings, "b1"), "parent"), Value::Text("g".into()));
+    assert_eq!(value(buildings, row_of(buildings, "site"), "z_max"), Value::Float(5.0), "raised through the group");
+    let groups = layer(&out, "model CityObjectGroup");
+    assert_eq!(value(groups, 0, "parent"), Value::Text("site".into()));
+    assert!(says(&out, "1 members of groups (groupMember) have a role"), "{:?}", messages_of(&out));
+    assert!(!says(&out, "links between city objects"), "{:?}", messages_of(&out));
+}
+
+/// A city furniture whose implicit geometry is `implicit`.
+fn furniture(id: &str, implicit: &str) -> String {
+    format!(
+        r#"<core:cityObjectMember><frn:CityFurniture gml:id="{id}"><frn:lod2ImplicitRepresentation><core:ImplicitGeometry>{implicit}</core:ImplicitGeometry></frn:lod2ImplicitRepresentation></frn:CityFurniture></core:cityObjectMember>"#
+    )
+}
+
+fn reference(x: f64, y: f64, z: f64) -> String {
+    format!("<core:referencePoint><gml:Point><gml:pos>{x} {y} {z}</gml:pos></gml:Point></core:referencePoint>")
+}
+
+/// An implicit geometry is its prototype placed by its matrix at its reference point, with its
+/// heights: written in place (its own `srsName`, a local system, refuses nothing) or linked from
+/// another member. One whose matrix can't be read is its reference point, and said.
+#[test]
+fn an_implicit_geometry_is_its_prototype_placed() {
+    let prototype = format!(
+        r#"<core:relativeGMLGeometry><gml:MultiSurface gml:id="proto" srsName="local"><gml:surfaceMember>{}</gml:surfaceMember><gml:surfaceMember>{}</gml:surfaceMember></gml:MultiSurface></core:relativeGMLGeometry>"#,
+        polygon("proto-f", &square(0.0, 0.0, 1.0, 0.0)),
+        polygon("proto-r", &square(0.0, 0.0, 1.0, 1.0))
+    );
+    let members = [
+        furniture(
+            "t1",
+            &format!(
+                "<core:transformationMatrix>2 0 0 0 0 2 0 0 0 0 2 0 0 0 0 1</core:transformationMatrix>{prototype}{}",
+                reference(5.0, 5.0, 1.0)
+            ),
+        ),
+        furniture("t2", &format!(r##"<core:relativeGMLGeometry xlink:href="#proto"/>{}"##, reference(20.0, 20.0, 0.0))),
+        furniture(
+            "t3",
+            &format!(
+                r##"<core:transformationMatrix>1 0 0</core:transformationMatrix><core:relativeGMLGeometry xlink:href="#proto"/>{}"##,
+                reference(30.0, 30.0, 0.0)
+            ),
+        ),
+    ]
+    .concat();
+    let out = read("model.gml", &lonlat(&members), None).unwrap();
+    let placed = of_type(&out, GeometryType::Polygon);
+    let t1 = row_of(placed, "t1");
+    assert!((area(placed.features[t1].geometry.as_ref()) - 4.0).abs() < 1e-9, "{:?}", placed.features[t1].geometry);
+    assert_eq!((value(placed, t1, "z_min"), value(placed, t1, "z_max")), (Value::Float(1.0), Value::Float(3.0)));
+    let t2 = row_of(placed, "t2");
+    assert!((area(placed.features[t2].geometry.as_ref()) - 1.0).abs() < 1e-9, "{:?}", placed.features[t2].geometry);
+    let Some(Geometry::Polygon(polys)) = placed.features[t2].geometry.as_ref() else { panic!("a polygon") };
+    assert!(polys[0][0].iter().all(|c| (20.0..=21.0).contains(&c.x) && (20.0..=21.0).contains(&c.y)), "{polys:?}");
+    assert!(says(&out, "1 geometry instances are drawn as a point"), "{:?}", messages_of(&out));
+    assert!(!says(&out, "link"), "{:?}", messages_of(&out));
+    assert!(!says(&out, "have coordinates that can't be read"), "{:?}", messages_of(&out));
+}
+
+/// A prototype's coordinates are in its own system, placed in the file's axis order: in a file read
+/// latitude first, its first axis is the latitude, as its reference point's first coordinate is.
+#[test]
+fn a_prototype_is_placed_in_the_files_axis_order() {
+    let prototype = format!(
+        "<core:relativeGMLGeometry><gml:MultiSurface><gml:surfaceMember>{}</gml:surfaceMember></gml:MultiSurface></core:relativeGMLGeometry>",
+        polygon("wide", "0 0 0 2 0 0 2 1 0 0 1 0 0 0 0")
+    );
+    let min = |v: &[f64]| {
+        let (lo, hi) = v.iter().fold((f64::MAX, f64::MIN), |(lo, hi), &x| (lo.min(x), hi.max(x)));
+        (lo, hi - lo)
+    };
+    for (matrix, (lon_span, lat_span)) in
+        [("", (1.0, 2.0)), ("<core:transformationMatrix>1 0 0 0 0 3 0 0 0 0 1 0 0 0 0 1</core:transformationMatrix>", (3.0, 2.0))]
+    {
+        let furniture = furniture("t", &format!("{matrix}{prototype}{}", reference(5.0, 10.0, 0.0)));
+        let out = read("model.gml", &model("urn:ogc:def:crs:EPSG::4326", &furniture), None).unwrap();
+        let Some(Geometry::Polygon(polys)) = of_type(&out, GeometryType::Polygon).features[0].geometry.as_ref() else {
+            panic!("a polygon")
+        };
+        let ring = &polys[0][0];
+        let (xs, ys): (Vec<f64>, Vec<f64>) = ring.iter().map(|c| (c.x, c.y)).unzip();
+        let ((x0, dx), (y0, dy)) = (min(&xs), min(&ys));
+        assert!((x0 - 10.0).abs() < 1e-9 && (dx - lon_span).abs() < 1e-9, "{matrix}: {ring:?}");
+        assert!((y0 - 5.0).abs() < 1e-9 && (dy - lat_span).abs() < 1e-9, "{matrix}: {ring:?}");
+    }
+}
+
+/// A prototype that can't be read is said once, however many instances place it: each is drawn at
+/// its reference point.
+#[test]
+fn a_prototype_that_cant_be_read_is_said_once() {
+    let bad = r#"<core:relativeGMLGeometry><gml:Polygon gml:id="proto"><gml:exterior><gml:LinearRing><gml:posList>1 2 abc</gml:posList></gml:LinearRing></gml:exterior></gml:Polygon></core:relativeGMLGeometry>"#;
+    let members = [
+        furniture("t1", &format!("{bad}{}", reference(5.0, 5.0, 0.0))),
+        furniture("t2", &format!(r##"<core:relativeGMLGeometry xlink:href="#proto"/>{}"##, reference(6.0, 6.0, 0.0))),
+    ]
+    .concat();
+    let out = read("model.gml", &lonlat(&members), None).unwrap();
+    assert!(says(&out, "1 geometries of city objects have coordinates that can't be read"), "{:?}", messages_of(&out));
+    assert!(says(&out, "2 geometry instances are drawn as a point"), "{:?}", messages_of(&out));
+}
+
+/// A prototype's geometry linked from outside an implicit geometry isn't read as the file's.
+#[test]
+fn a_prototype_linked_from_outside_is_said() {
+    let prototype = format!(
+        "<core:relativeGMLGeometry><gml:MultiSurface gml:id=\"proto\"><gml:surfaceMember>{}</gml:surfaceMember></gml:MultiSurface></core:relativeGMLGeometry>",
+        polygon("proto-f", &square(0.0, 0.0, 1.0, 0.0))
+    );
+    let members = [
+        furniture("t", &format!("{prototype}{}", reference(5.0, 5.0, 0.0))),
+        building("b", r##"<bldg:lod2MultiSurface xlink:href="#proto"/>"##),
+    ]
+    .concat();
+    let out = read("model.gml", &lonlat(&members), None).unwrap();
+    assert!(
+        says(&out, "1 links (xlink:href) where a geometry belongs point to an element that isn't a geometry"),
+        "{:?}",
+        messages_of(&out)
+    );
+}
+
+/// Two geometries given one id are two: each that can't be read is said, and one that can't be read
+/// doesn't keep a link from reading the other.
+#[test]
+fn geometries_given_one_id_are_told_apart() {
+    let bad = |object: &str| {
+        building(
+            object,
+            r#"<bldg:lod2MultiSurface><gml:MultiSurface><gml:surfaceMember><gml:Polygon gml:id="p"><gml:exterior><gml:LinearRing><gml:posList>1 2 abc</gml:posList></gml:LinearRing></gml:exterior></gml:Polygon></gml:surfaceMember></gml:MultiSurface></bldg:lod2MultiSurface>"#,
+        )
+    };
+    let out = read("model.gml", &lonlat(&[bad("a"), bad("b")].concat()), None).unwrap();
+    assert!(says(&out, "2 geometries of city objects have coordinates that can't be read"), "{:?}", messages_of(&out));
+    // The first `p` in the file is whole; the second can't be read; a link from a third member reads
+    // the first, whatever the second did.
+    let good = building(
+        "a",
+        &format!(
+            "<bldg:lod2MultiSurface><gml:MultiSurface><gml:surfaceMember>{}</gml:surfaceMember></gml:MultiSurface></bldg:lod2MultiSurface>",
+            polygon("p", &square(0.0, 0.0, 10.0, 0.0))
+        ),
+    );
+    let linking = building(
+        "c",
+        r##"<bldg:lod2MultiSurface><gml:MultiSurface><gml:surfaceMember xlink:href="#p"/></gml:MultiSurface></bldg:lod2MultiSurface>"##,
+    );
+    let out = read("model.gml", &lonlat(&[good, bad("b"), linking].concat()), None).unwrap();
+    let ds = only(&out);
+    assert!((area(ds.features[row_of(ds, "c")].geometry.as_ref()) - 100.0).abs() < 1e-6, "{:?}", messages_of(&out));
+    assert!(says(&out, "1 geometries of city objects have coordinates that can't be read"), "{:?}", messages_of(&out));
+}
+
+/// Two prototypes given one id are two: each instance places its own.
+#[test]
+fn prototypes_given_one_id_are_told_apart() {
+    let prototype = |side: f64| {
+        format!(
+            r#"<core:relativeGMLGeometry><gml:MultiSurface gml:id="proto"><gml:surfaceMember>{}</gml:surfaceMember></gml:MultiSurface></core:relativeGMLGeometry>"#,
+            polygon(&format!("f{side}"), &square(0.0, 0.0, side, 0.0))
+        )
+    };
+    let members = [
+        furniture("small", &format!("{}{}", prototype(1.0), reference(0.0, 0.0, 0.0))),
+        furniture("large", &format!("{}{}", prototype(10.0), reference(50.0, 50.0, 0.0))),
+    ]
+    .concat();
+    let out = read("model.gml", &lonlat(&members), None).unwrap();
+    let placed = of_type(&out, GeometryType::Polygon);
+    for (id, expected) in [("small", 1.0), ("large", 100.0)] {
+        let got = area(placed.features[row_of(placed, id)].geometry.as_ref());
+        assert!((got - expected).abs() < 1e-9, "{id}: {got}");
+    }
+}
+
+/// Another member's geometry that can't be parsed costs only the links to it: the member's other
+/// links to other members still read theirs.
+#[test]
+fn a_copy_that_cant_be_parsed_costs_only_its_links() {
+    let broken = r#"<core:cityObjectMember><bldg:Building gml:id="a"><bldg:lod2MultiSurface><gml:MultiSurface><gml:surfaceMember><gml:Polygon gml:id="a1"><gml:exterior><gml:LinearRing><gml:posList>0 0 0 &bogus; 1 1 0 0 0 0</gml:posList></gml:LinearRing></gml:exterior></gml:Polygon></gml:surfaceMember></gml:MultiSurface></bldg:lod2MultiSurface></bldg:Building></core:cityObjectMember>"#;
+    let whole = building(
+        "c",
+        &format!(
+            "<bldg:lod2MultiSurface><gml:MultiSurface><gml:surfaceMember>{}</gml:surfaceMember></gml:MultiSurface></bldg:lod2MultiSurface>",
+            polygon("c1", &square(0.0, 0.0, 10.0, 0.0))
+        ),
+    );
+    let linking = building(
+        "b",
+        r##"<bldg:lod2MultiSurface><gml:MultiSurface><gml:surfaceMember xlink:href="#a1"/><gml:surfaceMember xlink:href="#c1"/></gml:MultiSurface></bldg:lod2MultiSurface>"##,
+    );
+    let out = read("model.gml", &lonlat(&[broken, &whole, &linking].concat()), None).unwrap();
+    let ds = only(&out);
+    assert!((area(ds.features[row_of(ds, "b")].geometry.as_ref()) - 100.0).abs() < 1e-6, "{:?}", messages_of(&out));
+    assert!(says(&out, "1 geometries or objects are given only by a link"), "{:?}", messages_of(&out));
+}
+
+/// A part linked twice, or linked and written in its building, has that building as its parent once.
+#[test]
+fn a_parent_given_twice_is_one() {
+    let hall = format!(
+        r##"<core:cityObjectMember><bldg:Building gml:id="hall"><bldg:consistsOfBuildingPart xlink:href="#p1"/><bldg:consistsOfBuildingPart xlink:href="#p1"/><bldg:consistsOfBuildingPart xlink:href="#p2"/><bldg:consistsOfBuildingPart><bldg:BuildingPart gml:id="p2">{}</bldg:BuildingPart></bldg:consistsOfBuildingPart></bldg:Building></core:cityObjectMember>"##,
+        box_surfaces("p2")
+    );
+    let part = format!(
+        r#"<core:cityObjectMember><bldg:BuildingPart gml:id="p1">{}</bldg:BuildingPart></core:cityObjectMember>"#,
+        box_surfaces("p1")
+    );
+    let out = read("model.gml", &lonlat(&[hall, part].concat()), None).unwrap();
+    let parts = layer(&out, "model BuildingPart");
+    for id in ["p1", "p2"] {
+        assert_eq!(value(parts, row_of(parts, id), "parent"), Value::Text("hall".into()), "{id}");
+    }
+    assert!(!says(&out, "links between city objects"), "{:?}", messages_of(&out));
+}
+
+/// A long chain of geometries each given only by a link to the next is followed once for each, so
+/// it costs its length, not its square; each link it couldn't follow is said.
+#[test]
+fn a_long_chain_of_links_costs_its_length() {
+    let chain: String = (0..20_000)
+        .map(|k| format!(r##"<gml:surfaceMember><gml:Polygon gml:id="q{k}" xlink:href="#q{}"/></gml:surfaceMember>"##, k + 1))
+        .collect();
+    let inner = format!("<bldg:lod2MultiSurface><gml:MultiSurface>{chain}</gml:MultiSurface></bldg:lod2MultiSurface>");
+    let out = read("model.gml", &lonlat(&building("b1", &inner)), None).unwrap();
+    assert!(says(&out, "20000 geometries or objects are given only by a link"), "{:?}", messages_of(&out));
+}
+
+/// Only ids a link names are indexed: an id given twice that no link names isn't said.
+#[test]
+fn an_id_no_link_names_isnt_indexed() {
+    let polygon_in = |object: &str, id: &str| {
+        building(
+            object,
+            &format!(
+                "<bldg:lod2MultiSurface><gml:MultiSurface><gml:surfaceMember>{}</gml:surfaceMember></gml:MultiSurface></bldg:lod2MultiSurface>",
+                polygon(id, &square(0.0, 0.0, 10.0, 0.0))
+            ),
+        )
+    };
+    let linking = building(
+        "c",
+        r##"<bldg:lod2MultiSurface><gml:MultiSurface><gml:surfaceMember xlink:href="#y"/></gml:MultiSurface></bldg:lod2MultiSurface>"##,
+    );
+    let out =
+        read("model.gml", &lonlat(&[polygon_in("a", "x"), polygon_in("b", "x"), polygon_in("d", "y"), linking].concat()), None).unwrap();
+    let ds = only(&out);
+    assert!((area(ds.features[row_of(ds, "c")].geometry.as_ref()) - 100.0).abs() < 1e-6, "{:?}", messages_of(&out));
+    assert!(!says(&out, "earlier element of the file"), "{:?}", messages_of(&out));
+}
+
+/// A prototype in another member, read once, is placed for every instance that links to it,
+/// without being copied again for each: many small instances of a large prototype aren't held back
+/// by what copies may cost.
+#[test]
+fn a_shared_prototype_is_read_once_for_every_member() {
+    // Large in bytes, few in points.
+    let padding = " ".repeat(20_000);
+    let prototype = format!(
+        r#"<core:relativeGMLGeometry><gml:MultiSurface gml:id="proto"><gml:surfaceMember><gml:Polygon><gml:exterior><gml:LinearRing><gml:posList>0 0 0 1 0 0 1 1 0 0 1 0 0 0 0{padding}</gml:posList></gml:LinearRing></gml:exterior></gml:Polygon></gml:surfaceMember></gml:MultiSurface></core:relativeGMLGeometry>"#
+    );
+    let mut members = furniture("t0", &format!("{prototype}{}", reference(0.0, 0.0, 0.0)));
+    for k in 1..100 {
+        let at = f64::from(k) * 2.0;
+        members.push_str(&furniture(
+            &format!("t{k}"),
+            &format!(r##"<core:relativeGMLGeometry xlink:href="#proto"/>{}"##, reference(at, 0.0, 0.0)),
+        ));
+    }
+    let out = read("model.gml", &lonlat(&members), None).unwrap();
+    assert_eq!(of_type(&out, GeometryType::Polygon).features.len(), 100, "{:?}", messages_of(&out));
+    assert!(!says(&out, "geometry instances"), "{:?}", messages_of(&out));
+    assert!(!says(&out, "link"), "{:?}", messages_of(&out));
+}
+
+/// A link to an id several elements have reads the first in the file (when its member has none),
+/// whatever order the member's links come in, even when another is inside a geometry it also links.
+#[test]
+fn a_link_reads_the_first_of_an_id_whatever_the_order_of_links() {
+    let first = building(
+        "a",
+        &format!(
+            "<bldg:lod2MultiSurface><gml:MultiSurface><gml:surfaceMember>{}</gml:surfaceMember></gml:MultiSurface></bldg:lod2MultiSurface>",
+            polygon("x", &square(0.0, 0.0, 10.0, 0.0))
+        ),
+    );
+    let holding = building(
+        "c",
+        &format!(
+            r#"<bldg:lod1MultiSurface><gml:MultiSurface><gml:surfaceMember><gml:CompositeSurface gml:id="g"><gml:surfaceMember>{}</gml:surfaceMember></gml:CompositeSurface></gml:surfaceMember></gml:MultiSurface></bldg:lod1MultiSurface>"#,
+            polygon("x", &square(20.0, 0.0, 5.0, 0.0))
+        ),
+    );
+    for links in [
+        r##"<gml:surfaceMember xlink:href="#g"/><gml:surfaceMember xlink:href="#x"/>"##,
+        r##"<gml:surfaceMember xlink:href="#x"/><gml:surfaceMember xlink:href="#g"/>"##,
+    ] {
+        let linking =
+            building("b", &format!("<bldg:lod2MultiSurface><gml:MultiSurface>{links}</gml:MultiSurface></bldg:lod2MultiSurface>"));
+        let out = read("model.gml", &lonlat(&[first.clone(), holding.clone(), linking].concat()), None).unwrap();
+        let ds = only(&out);
+        let got = area(ds.features[row_of(ds, "b")].geometry.as_ref());
+        assert!((got - 125.0).abs() < 1e-6, "{links}: {got} {:?}", messages_of(&out));
+    }
+}
+
+/// Rings a matrix flattens when it places a prototype are left out and said for each instance; a
+/// matrix that flattens nothing says nothing.
+#[test]
+fn rings_flattened_by_placing_are_said() {
+    let prototype = format!(
+        r#"<core:relativeGMLGeometry><gml:MultiSurface gml:id="proto"><gml:surfaceMember>{}</gml:surfaceMember><gml:surfaceMember>{}</gml:surfaceMember></gml:MultiSurface></core:relativeGMLGeometry>"#,
+        polygon("proto-f", &square(0.0, 0.0, 1.0, 0.0)),
+        polygon("proto-r", &square(0.0, 0.0, 1.0, 1.0))
+    );
+    let placed = |matrix: &str| {
+        furniture("t", &format!("<core:transformationMatrix>{matrix}</core:transformationMatrix>{prototype}{}", reference(5.0, 5.0, 1.0)))
+    };
+    let out = read("model.gml", &lonlat(&placed("0 0 0 0 0 0 0 0 0 0 1 0 0 0 0 1")), None).unwrap();
+    assert!(says(&out, "2 rings with fewer than three different points are left out"), "{:?}", messages_of(&out));
+    let out = read("model.gml", &lonlat(&placed("2 0 0 0 0 2 0 0 0 0 2 0 0 0 0 1")), None).unwrap();
+    assert!(!says(&out, "fewer than three different points"), "{:?}", messages_of(&out));
+}
+
+/// An element with many namespace declarations followed by many children declaring one each: past
+/// what the sets may take, a child's set is spent without looking at its parent's pairs, and what
+/// stands in it is still read.
+#[test]
+fn children_past_what_declarations_may_take_are_read() {
+    let many: String = (0..3_000).map(|k| format!(r#" xmlns:n{k}="urn:n{k}""#)).collect();
+    let children: String = (0..3_000).map(|k| format!(r#"<gen:stringAttribute xmlns:c{k}="urn:c{k}"></gen:stringAttribute>"#)).collect();
+    let inner = format!(
+        "<bldg:lod2MultiSurface><gml:MultiSurface><gml:surfaceMember>{}</gml:surfaceMember></gml:MultiSurface></bldg:lod2MultiSurface>",
+        polygon("p", &square(0.0, 0.0, 10.0, 0.0))
+    );
+    let written =
+        format!(r#"<core:cityObjectMember><bldg:Building gml:id="c"{many}>{children}{inner}</bldg:Building></core:cityObjectMember>"#);
+    // A link, so the file is indexed and every declaration is looked at.
+    let linking = building(
+        "d",
+        r##"<bldg:lod2MultiSurface><gml:MultiSurface><gml:surfaceMember xlink:href="#p"/></gml:MultiSurface></bldg:lod2MultiSurface>"##,
+    );
+    let out = read("model.gml", &lonlat(&[written, linking].concat()), None).unwrap();
+    let ds = only(&out);
+    assert!((area(ds.features[row_of(ds, "c")].geometry.as_ref()) - 100.0).abs() < 1e-6, "{:?}", messages_of(&out));
+}
+
+/// A solid whose exterior links to what is itself only a link keeps its cavities for the end of
+/// that chain: read with the shell it ends at, left out with the solid when it ends in nothing,
+/// whether that link stands at another level of detail or at the solid's own (read already there).
+#[test]
+fn cavities_wait_for_the_end_of_an_exterior_chain() {
+    let cavity = format!(
+        "<gml:interior><gml:CompositeSurface><gml:surfaceMember>{}</gml:surfaceMember></gml:CompositeSurface></gml:interior>",
+        polygon("c", &square(2.0, 2.0, 2.0, 0.0))
+    );
+    let model = |end: &str, alias_lod: u8| {
+        let alias = format!(r##"<gml:surfaceMember><gml:CompositeSurface gml:id="l" xlink:href="#{end}"/></gml:surfaceMember>"##);
+        let (at_1, at_2) = if alias_lod == 1 { (alias.as_str(), "") } else { ("", alias.as_str()) };
+        let inner = format!(
+            r##"<bldg:lod1MultiSurface><gml:MultiSurface><gml:surfaceMember><gml:CompositeSurface gml:id="s"><gml:surfaceMember>{}</gml:surfaceMember></gml:CompositeSurface></gml:surfaceMember>{at_1}</gml:MultiSurface></bldg:lod1MultiSurface>
+            <bldg:lod2Solid><gml:Solid><gml:exterior xlink:href="#l"/>{cavity}</gml:Solid></bldg:lod2Solid>"##,
+            polygon("a", &square(0.0, 0.0, 10.0, 0.0))
+        );
+        let inner = if at_2.is_empty() {
+            inner
+        } else {
+            format!("{inner}<bldg:lod2MultiSurface><gml:MultiSurface>{at_2}</gml:MultiSurface></bldg:lod2MultiSurface>")
+        };
+        read("model.gml", &lonlat(&building("b", &inner)), None).unwrap()
+    };
+    let lod = |out: &[(Dataset, ReadReport)]| value(only(out), 0, "lod");
+    for alias_lod in [1, 2] {
+        // Ends at a shell: the solid is read, at LoD 2.
+        let out = model("s", alias_lod);
+        assert_eq!(lod(&out), Value::Text("2".into()), "alias at LoD {alias_lod}: {:?}", messages_of(&out));
+        // Ends in nothing: the solid is left out with its cavity, and the links said; LoD 1 draws.
+        let out = model("nothing", alias_lod);
+        assert_eq!(lod(&out), Value::Text("1".into()), "alias at LoD {alias_lod}: {:?}", messages_of(&out));
+        assert!(says(&out, "are given only by a link"), "{:?}", messages_of(&out));
+    }
+}
+
+/// A group's parent written in place, not linked, is the group's parent all the same: the group is
+/// its child, and raises it, and the object written there isn't the group's child.
+#[test]
+fn a_groups_parent_written_in_place_is_its_parent() {
+    let members = [
+        r##"<core:cityObjectMember><grp:CityObjectGroup gml:id="g"><grp:groupMember xlink:href="#b1"/><grp:parent><bldg:Building gml:id="site"><gml:name>Site</gml:name></bldg:Building></grp:parent></grp:CityObjectGroup></core:cityObjectMember>"##.to_string(),
+        building("b1", &box_surfaces("b1")),
+    ]
+    .concat();
+    let out = read("model.gml", &lonlat(&members), None).unwrap();
+    let groups = layer(&out, "model CityObjectGroup");
+    assert_eq!(value(groups, 0, "parent"), Value::Text("site".into()));
+    let buildings = layer(&out, "model Building");
+    let site = row_of(buildings, "site");
+    assert_ne!(value(buildings, site, "parent"), Value::Text("g".into()));
+    assert_eq!(value(buildings, site, "z_max"), Value::Float(5.0), "raised through the group");
+}
+
+/// A prototype with nothing to place (its surfaces all links, which it doesn't follow) leaves its
+/// instance at its reference point, and said.
+#[test]
+fn a_prototype_with_nothing_to_place_is_its_reference_point() {
+    let prototype = r##"<core:relativeGMLGeometry><gml:MultiSurface gml:id="proto"><gml:surfaceMember xlink:href="#elsewhere"/></gml:MultiSurface></core:relativeGMLGeometry>"##;
+    let member = furniture(
+        "t",
+        &format!(
+            "<core:transformationMatrix>1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1</core:transformationMatrix>{prototype}{}",
+            reference(5.0, 5.0, 1.0)
+        ),
+    );
+    let out = read("model.gml", &lonlat(&member), None).unwrap();
+    assert!(says(&out, "1 geometry instances are drawn as a point"), "{:?}", messages_of(&out));
+}
+
+/// Geometries given only by links to each other, in a cycle, draw nothing, and the links are said.
+#[test]
+fn a_cycle_of_links_is_said() {
+    let inner = r##"<bldg:lod2MultiSurface><gml:MultiSurface><gml:surfaceMember><gml:CompositeSurface gml:id="a" xlink:href="#b"/></gml:surfaceMember><gml:surfaceMember><gml:CompositeSurface gml:id="b" xlink:href="#a"/></gml:surfaceMember></gml:MultiSurface></bldg:lod2MultiSurface>"##;
+    let out = read("model.gml", &lonlat(&building("c", inner)), None).unwrap();
+    assert!(says(&out, "are given only by a link"), "{:?}", messages_of(&out));
 }
