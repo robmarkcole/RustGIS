@@ -124,10 +124,10 @@ fn read_overview(info: Arc<Info>, url: String, done: Box<dyn FnOnce(Result<Raste
                 if let Some(table) = &i.layout.palette {
                     r.color = ColorHint::Palette(table.clone());
                 }
+                r.lost = i.layout.lost.clone();
                 if let Some(described) = &i.layout.described {
                     r.apply_pam(described, rustgis_data::raster::pam::GDAL_METADATA);
                 }
-                r.lost = i.layout.lost.clone();
                 r.source = Some(url.clone());
                 Ok(r)
             }))

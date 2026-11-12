@@ -23115,6 +23115,37 @@ fn a_project_an_older_rustgis_saved_again_reads_its_cog_in_place() {
     assert_eq!(rl.data.as_ref().map(|d| d.width), Some(512));
 }
 
+/// In-place COGs retain header losses and what applying GDAL metadata leaves out (#1812).
+#[test]
+fn in_place_cog_metadata_losses_are_preserved_and_said_once() {
+    use rustgis_data::raster::cog::{Example, example_with};
+    let clean = example_with(&Example { size: 64, tile: 16, classes: true, ..Example::default() });
+    let lossy = example_with(&Example { size: 64, tile: 16, classes: true, lossy: true, ..Example::default() });
+    let mut outside = example_with(&Example { size: 64, tile: 16, wavelengths: true, ..Example::default() });
+    let sample = b"sample=\"0\"";
+    let at = outside.windows(sample.len()).position(|w| w == sample).unwrap();
+    outside[at + 8] = b'9'; // Same tag length, but band 10 does not exist.
+    for (file, expected) in [
+        (clean, Vec::new()),
+        (lossy, vec!["384 entries, short of the 768", "1 CLASS_ item(s)"]),
+        (outside, vec!["names or wavelengths for 1 band(s) it doesn't have"]),
+    ] {
+        let (base, _) = serve_ranges(file);
+        let mut s = Session::new(Project::default());
+        s.run("layer.addUrl", &json!({"url": format!("{base}/metadata.tif")})).unwrap();
+        let data = s.map().layers.iter().find_map(|l| l.raster.as_ref()?.data.as_ref()).unwrap();
+        assert_eq!(data.lost.len(), expected.len(), "{:?}", data.lost);
+        for message in expected {
+            assert!(data.lost.iter().any(|l| l.contains(message)), "{:?}", data.lost);
+            assert_eq!(s.notices.iter().filter(|n| n.text.contains(message)).count(), 1, "{:?}", s.notices);
+        }
+        let mark = s.notice_mark();
+        s.notice_landed_rasters();
+        s.notice_landed_rasters();
+        assert!(s.notices_since(mark).is_empty());
+    }
+}
+
 /// A palette COG without its colour table is drawn in grey and says so, also when its pixels land
 /// after the layer is added (a project opened, as in the browser and an import): once, and not for
 /// one with its table.
