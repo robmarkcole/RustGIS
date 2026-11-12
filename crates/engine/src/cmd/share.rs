@@ -222,13 +222,14 @@ pub(crate) fn saying_shadows<T>(s: &mut Session, what: &str, draw: impl FnOnce(&
 }
 
 /// What frames said of their cast shadows, as warnings about `what`: layers drawn without them,
-/// and, drawn on the interface's thread (which doesn't wait for them), that some were still
-/// being worked out. What was drawn is written all the same.
+/// and, drawn on the interface's thread (which doesn't wait for them: an image, a print, or a
+/// file exported there, by a script or while a style's view loads), that some were still being
+/// worked out. What was drawn is written all the same.
 pub(crate) fn shadow_warnings(what: &str, said: &rustgis_render::ShadowsSaid) -> Vec<String> {
     let mut out: Vec<String> = said.notices.iter().map(|e| format!("{what}: {e}")).collect();
     if said.to_come {
         out.push(format!(
-            "{what}: some layers are drawn without their cast shadows, still being worked out: draw it again once the map shows them"
+            "{what}: made without the cast shadows still being worked out, as the window doesn't wait for them: once the map shows them, draw or export it again"
         ));
     }
     out

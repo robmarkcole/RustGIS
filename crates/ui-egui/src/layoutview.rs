@@ -66,11 +66,12 @@ pub(crate) fn say_frame_shadows(app: &mut RustGisApp, said: &rustgis_engine::ren
     }
 }
 
-/// The key a preview drawn for `base` is kept under: with the tile cache's generation when its
-/// frames drew without cast shadows still being worked out (on the interface's thread, which
-/// doesn't wait for them), so it is drawn again as they land (see [`preview_current`]).
-pub(crate) fn preview_key(base: &str, said: &rustgis_engine::render::ShadowsSaid) -> String {
-    if said.to_come { format!("{base}#shadows@{}", rustgis_engine::render::rustgis_tiles::cache::generation()) } else { base.to_string() }
+/// The key a preview drawn for `base` is kept under: with the tile cache's generation read before
+/// it was drawn (`drawn_at`) when its frames drew without cast shadows still being worked out (on
+/// the interface's thread, which doesn't wait for them), so it is drawn again as they land, even
+/// while it was drawn (see [`preview_current`]).
+pub(crate) fn preview_key(base: &str, said: &rustgis_engine::render::ShadowsSaid, drawn_at: u64) -> String {
+    if said.to_come { format!("{base}#shadows@{drawn_at}") } else { base.to_string() }
 }
 
 /// Whether a preview kept under `kept` (see [`preview_key`]) is still the one `base` asks for:

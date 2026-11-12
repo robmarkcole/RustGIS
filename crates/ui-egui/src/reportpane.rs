@@ -328,6 +328,7 @@ fn preview(app: &mut RustGisApp, ui: &mut Ui, i: usize, t: &Tokens) {
             None => return,
         };
         let (s, page) = (&mut app.session, app.reports.page);
+        let drawn_at = rustgis_engine::render::rustgis_tiles::cache::generation();
         let (drawn, said) = rustgis_engine::render::shadows_said(|| {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<_, String> {
                 let page = page.min(pages.len().saturating_sub(1));
@@ -344,7 +345,7 @@ fn preview(app: &mut RustGisApp, ui: &mut Ui, i: usize, t: &Tokens) {
                 let img = egui::ColorImage::from_rgba_premultiplied([pm.width() as usize, pm.height() as usize], pm.data());
                 let tex = ui.ctx().load_texture("report_preview", img, egui::TextureOptions::LINEAR);
                 let key = format!("{i}#{page}#{}", app.session.revision);
-                app.reports.preview = Some((crate::layoutview::preview_key(&key, &said), tex, total));
+                app.reports.preview = Some((crate::layoutview::preview_key(&key, &said, drawn_at), tex, total));
             }
             Err(e) => {
                 ui.label(egui::RichText::new(e).small().color(Color32::from_rgb(0xC0, 0x30, 0x30)));

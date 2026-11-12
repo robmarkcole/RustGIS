@@ -966,8 +966,19 @@ const KEPT_LIGHTS: usize = 3;
 
 /// Works out a light grid: natively on a thread of its own (here if the system refuses one),
 /// in the browser here.
+/// Held by [`hold_cast_shadows`]: light work waits for it before it traces.
+static LIGHT_HOLD: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// Holds every light grid's work before it traces, until the guard is dropped: for tests of what
+/// is drawn, and said, while cast shadows are still to come, whatever the computer's speed.
+#[doc(hidden)]
+pub fn hold_cast_shadows() -> std::sync::RwLockWriteGuard<'static, ()> {
+    LIGHT_HOLD.write().unwrap_or_else(|e| e.into_inner())
+}
+
 fn start_light(r: Arc<Raster>, key: LightKey, work: Arc<LightWork>) {
     let run = move || {
+        drop(LIGHT_HOLD.read().unwrap_or_else(|e| e.into_inner()));
         let threads = rustgis_data::threads::max();
         let traced = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             crate::shadow::light(&r, key.band, &key.mask, key.azimuth, key.altitude, key.z_factor, threads, &work.stop)
@@ -2807,16 +2818,16 @@ mod tests {
                 let _ = tx.send(who);
             }
         };
+        // Joined while under way (held before it traces), both are told.
+        let hold = hold_cast_shadows();
         let first = rl.cast_shadows(false, (0, 1), told("starter"));
         let joined = rl.cast_shadows(false, (5, 1), told("joiner"));
-        // Joined while under way (it traces far under a 3° sun), both are told; done already, the
-        // joiner has the grid and needs no call.
-        if first == CastShadows::Pending && joined == CastShadows::Pending {
-            let mut heard = vec![landings.recv_timeout(std::time::Duration::from_secs(120)).unwrap()];
-            heard.push(landings.recv_timeout(std::time::Duration::from_secs(120)).unwrap());
-            heard.sort_unstable();
-            assert_eq!(heard, ["joiner", "starter"]);
-        }
+        drop(hold);
+        assert!(first == CastShadows::Pending && joined == CastShadows::Pending, "joined while under way");
+        let mut heard = vec![landings.recv_timeout(std::time::Duration::from_secs(120)).unwrap()];
+        heard.push(landings.recv_timeout(std::time::Duration::from_secs(120)).unwrap());
+        heard.sort_unstable();
+        assert_eq!(heard, ["joiner", "starter"]);
         assert!(matches!(rl.cast_shadows(true, (0, 1), || {}), CastShadows::Ready(_)));
     }
 

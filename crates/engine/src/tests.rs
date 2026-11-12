@@ -3201,9 +3201,16 @@ fn every_drawing_of_the_map_says_a_layer_drawn_without_its_cast_shadows() {
     r.overview = Some((800, 600));
     rl.data = Some(std::sync::Arc::new(r));
     let said = |s: &Session| s.notices.iter().filter(|n| n.text.contains("scene: its cast shadows aren't drawn")).count();
-    let dir = std::env::temp_dir().join(format!("rustgis-cast-every-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = |name: &str| dir.join(name).display().to_string();
+    /// Removed however the test ends.
+    struct Dir(std::path::PathBuf);
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+    let dir = Dir(std::env::temp_dir().join(format!("rustgis-cast-every-{}", std::process::id())));
+    std::fs::create_dir_all(&dir.0).unwrap();
+    let path = |name: &str| dir.0.join(name).display().to_string();
     let draws: Vec<(&str, Box<dyn Fn(&mut Session)>)> = vec![
         ("map image", Box::new(|s| drop(crate::cmd::share::map_png(s, Some(200.0), Some(150.0), None).unwrap()))),
         ("map PDF", Box::new(|s| drop(crate::cmd::share::map_pdf(s, 72.0).unwrap()))),
@@ -3227,18 +3234,30 @@ fn every_drawing_of_the_map_says_a_layer_drawn_without_its_cast_shadows() {
         draw(&mut s);
         assert!(said(&s) > 0, "{what}: {:?}", s.notices.iter().map(|n| &n.text).collect::<Vec<_>>());
     }
-    std::fs::remove_dir_all(&dir).ok();
     // On the interface's thread a new sun's shadows aren't waited for: the image says so.
     let mut s = with_raster();
     s.run("layer.zoomTo", &json!({"layer": "scene"})).unwrap();
     s.run("raster.symbology", &json!({"type": "shadedRelief", "azimuth": 123, "shadow": 1})).unwrap();
     crate::render::on_the_interface_thread();
+    // Held before they trace, the shadows are still to come whatever the computer's speed.
+    let hold = crate::map::raster::hold_cast_shadows();
     crate::cmd::share::map_png(&mut s, Some(200.0), Some(150.0), None).unwrap();
     assert!(
         s.notices.iter().any(|n| n.text.contains("still being worked out")),
         "{:?}",
         s.notices.iter().map(|n| &n.text).collect::<Vec<_>>()
     );
+    // A file exported there (a script's, or while a style's view loads) says it was written
+    // without them, a GeoTIFF too.
+    for (azimuth, name) in [(124, "here.png"), (125, "here.tif")] {
+        s.run("raster.symbology", &json!({"type": "shadedRelief", "azimuth": azimuth, "shadow": 1})).unwrap();
+        s.notices.clear();
+        let path = path(name);
+        s.run("share.exportMap", &json!({"path": path, "width": 200, "height": 150})).unwrap();
+        let texts: Vec<&String> = s.notices.iter().map(|n| &n.text).collect();
+        assert!(texts.iter().any(|t| t.starts_with(&path) && t.contains("still being worked out")), "{name}: {texts:?}");
+    }
+    drop(hold);
 }
 
 #[test]
