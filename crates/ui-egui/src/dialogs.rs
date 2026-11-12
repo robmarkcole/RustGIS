@@ -866,13 +866,9 @@ fn filter_key(filter: &str) -> String {
 /// (`listedNote`) and typing has paused for [`SEARCH_PAUSE`]: `service.layers` again on the
 /// documents the dialog keeps, with `filter`, so nothing is downloaded. A listing that holds them
 /// all is filtered in the dialog, as before. Gives how long until a search is due, to draw again
-/// then. One read of the documents on the UI thread per pause in typing, as for each document
-/// that arrives (`poll_service`): the parsed layers aren't kept, which would hold up to 100,000
-/// of them. It stays on the frame because `service.layers` binds a saved connection's login to
-/// the addresses its rows carry, in this session: a session of its own off the frame would leave
-/// that out, and adding a row would go without it. Nothing is fetched (the documents are
-/// kept, and no search starts while one is `pending`); IBGE's WFS, 12 MB and 10,186 layers,
-/// takes about 0.3 s in a dev build.
+/// then. On the desktop, admitted read-ahead binds the saved login here and parses off the
+/// frame, as for document arrivals (`poll_service`). The result retains its original filter;
+/// continued typing cannot replace a newer filter's rows with an earlier search.
 fn search_all(app: &mut RustGisApp) -> Option<web_time::Duration> {
     let conn = app.ui.service.as_mut()?;
     let key = filter_key(&app.ui.service_browse.filter);
@@ -899,6 +895,17 @@ fn search_all(app: &mut RustGisApp) -> Option<web_time::Duration> {
     }
     if let Some(connection) = &conn.connection {
         p["connection"] = json!(connection);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    if app.reads_off_frame {
+        match crate::serviceui::ListingRead::start(&mut app.session, &p) {
+            Ok(reading) => {
+                conn.reading = Some(reading);
+                conn.pending = Some(conn.url.clone());
+            }
+            Err(error) => conn.search = Some(crate::ServiceSearch { filter: key, listing: Err(error) }),
+        }
+        return None;
     }
     // Not `app.run`: an error belongs in the dialog, as the listing's does.
     let listing = app.session.run("service.layers", &p);
@@ -1325,6 +1332,11 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
             ui.horizontal(|ui| {
                 ui.spinner();
                 ui.label(crate::i18n::fmt("Connecting to {url}…", &[("url", pending)]));
+                if let Some(reading) = &conn.reading
+                    && ui.button(tl!("Cancel")).clicked()
+                {
+                    reading.control.cancel();
+                }
             });
         }
     }
@@ -2579,6 +2591,7 @@ mod tests {
             connection: None,
             kind: "wms",
             slot: Default::default(),
+            reading: None,
             text: None,
             documents: Vec::new(),
             pending: None,
@@ -2632,6 +2645,7 @@ mod tests {
             connection: None,
             kind: "wfs",
             slot: Default::default(),
+            reading: None,
             text: None,
             documents: Vec::new(),
             pending: None,
@@ -2690,6 +2704,7 @@ mod tests {
             connection: None,
             kind: "wcs",
             slot: Default::default(),
+            reading: None,
             text: None,
             documents: Vec::new(),
             pending: None,
@@ -2751,6 +2766,7 @@ mod tests {
             connection: None,
             kind: "ogcapi",
             slot: Default::default(),
+            reading: None,
             text: None,
             documents: Vec::new(),
             pending: None,

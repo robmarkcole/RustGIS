@@ -66,14 +66,19 @@ mod tests {
         assert!(script_line("script.run {}").unwrap().is_err());
     }
 
-    /// Supplied documents and an explicitly supplied final template keep this command test
-    /// network-free while exercising the real Session notice boundary.
+    /// A landing page with collections retains the constructed map-template fallback. Supplied
+    /// collections and an explicit final template keep its Session notice checks network-free.
     #[test]
     fn service_discovery_reports_withheld_destinations_and_clean_input_is_silent() {
         for (path, count) in [("tiles", 0), ("%252e/tiles", 1)] {
             let href = format!("https://h.invalid/svc/{path}?token=RGSYNTH_notice_20261103");
-            let document = json!({"title": "roads", "links": [{"rel": "tilesets-map", "href": href}]}).to_string();
-            let mut params = json!({"url": "https://h.invalid/svc", "type": "ogcapi", "text": document});
+            let document = json!({"title": "roads", "links": [
+                {"rel": "tilesets-map", "href": href},
+                {"rel": "data", "type":"application/json", "href":"https://h.invalid/svc/collections"}
+            ]})
+            .to_string();
+            let mut params = json!({"url": "https://h.invalid/svc", "type": "ogcapi", "text": document,
+                "documents":[{"url":"https://h.invalid/svc/collections", "text":"{\"collections\":[]}"}]});
             let mut session = crate::Session::new(crate::Project::default());
             session.run("service.layers", &params).unwrap();
             let notices = std::mem::take(&mut session.notices);

@@ -75,6 +75,11 @@ pub(crate) fn take_origin_key(params: &mut Value) -> Option<String> {
 
 /// Runs a command that adds a dataset now, noting it in Recent under the connection's name.
 pub(crate) fn run_named(app: &mut RustGisApp, id: &str, params: Value, origin: Option<&str>) -> Result<Value, String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    if id == "service.add" && app.reads_off_frame && params.get("text").and_then(Value::as_str).is_some() {
+        let name = params.get("name").or_else(|| params.get("layer")).and_then(Value::as_str).unwrap_or_default().to_string();
+        return crate::readjob::run_service(app, params, &name, origin);
+    }
     let before = app.session.sources.generation;
     let r = app.run(id, params);
     if r.is_ok() {

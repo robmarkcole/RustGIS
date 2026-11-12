@@ -445,6 +445,8 @@ pub struct ServiceConn {
     /// `wms`, `wmts`, `wfs`, `ogcapi`, `arcgis`, or `auto`.
     pub kind: &'static str,
     pub slot: Slot<Result<Vec<u8>, Failure>>,
+    /// Supplied-document parsing on a desktop worker, owned by this connection alone.
+    pub reading: Option<serviceui::ListingRead>,
     /// The capabilities document, once it has arrived.
     pub text: Option<String>,
     /// Additional capabilities documents, keyed by their requested address.
@@ -2362,6 +2364,12 @@ impl RustGisApp {
     pub fn run(&mut self, id: &str, params: Value) -> Result<Value, String> {
         #[cfg(not(target_arch = "wasm32"))]
         if self.reads_off_frame {
+            if id == "service.layers" {
+                return readjob::run(self, "service.layers", params);
+            }
+            if id == "service.add" && params.get("text").and_then(Value::as_str).is_some() {
+                return readjob::run(self, "service.add", params);
+            }
             let archive = match id {
                 "map.reloadTiles" => Some("map.reloadTiles"),
                 "map.repairTiles" => Some("map.repairTiles"),
@@ -3490,6 +3498,7 @@ impl RustGisApp {
                     connection: resolved_connection,
                     kind,
                     slot,
+                    reading: None,
                     text: None,
                     documents: Vec::new(),
                     pending: Some(caps),
@@ -5246,6 +5255,20 @@ impl RustGisApp {
     fn poll_service(&mut self) {
         self.poll_service_steps();
         let Some(conn) = &mut self.ui.service else { return };
+        if let Some(reading) = &conn.reading {
+            let done = reading.slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+            let Some(done) = done else { return };
+            let cancelled = reading.control.is_cancelled();
+            let filter = reading.filter.clone();
+            conn.reading = None;
+            let result = if cancelled {
+                Err(tl!("Service discovery was cancelled").to_string())
+            } else {
+                done.and_then(|read| rustgis_engine::cmd::reads::read_land(&mut self.session, read))
+            };
+            serviceui::listed(conn, result, filter);
+            return;
+        }
         let Some(r) = conn.slot.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
         let document = conn.pending.take().unwrap_or_else(|| conn.url.clone());
         match r {
@@ -5269,19 +5292,20 @@ impl RustGisApp {
                 if let Some(connection) = &conn.connection {
                     p["connection"] = json!(connection);
                 }
-                // Not `self.run`: an error belongs in the dialog, not the notices.
-                match self.session.run("service.layers", &p) {
-                    Ok(v) => {
-                        conn.pending = v.get("next").and_then(Value::as_str).map(str::to_string);
-                        if let Some(next) = &conn.pending {
-                            conn.slot = fetch_detailed_into(next);
+                #[cfg(not(target_arch = "wasm32"))]
+                if self.reads_off_frame {
+                    match serviceui::ListingRead::start(&mut self.session, &p) {
+                        Ok(reading) => {
+                            conn.reading = Some(reading);
+                            conn.pending = Some(document);
                         }
-                        conn.listing = Some(v);
-                        conn.added = None;
-                        conn.search = None;
+                        Err(error) => conn.error = Some(error),
                     }
-                    Err(e) => conn.error = Some(e),
+                    return;
                 }
+                // Not `self.run`: an error belongs in the dialog, not the notices.
+                let result = self.session.run("service.layers", &p);
+                serviceui::listed(conn, result, None);
             }
             Err(f) => conn.failure = Some(f),
         }
@@ -6836,6 +6860,7 @@ mod download_service_tests {
 
     /// Real UI discovery never restores a login after a foreign hop, while a public saved
     /// connection on a same-origin chain can still gain its legitimate login later.
+    /// Empty supplied collections retain the legacy map offer and its UI tile-resolver path.
     #[test]
     fn tile_discovery_keeps_foreign_lineage_and_same_origin_connections() {
         use rustgis_engine::render::rustgis_tiles::{cache, logins};
@@ -6881,9 +6906,18 @@ mod download_service_tests {
                     connection = c["id"].as_str().unwrap().to_string();
                 }
             }
-            let text = json!({"title":"Lineage","links":[{"rel":"tilesets-map","href":format!("{a}/list")}]}).to_string();
-            let source = crate::serviceui::ServiceSource { url: a.into(), kind: "ogcapi", text: text.clone(), documents: Vec::new() };
-            let listing = app.session.run("service.layers", &json!({"url":a,"type":"ogcapi","text":text,"connection":connection})).unwrap();
+            let text = json!({"title":"Lineage","links":[
+                {"rel":"tilesets-map","href":format!("{a}/list")},
+                {"rel":"data","type":"application/json","href":format!("{a}/collections")}
+            ]})
+            .to_string();
+            let documents = vec![json!({"url":format!("{a}/collections"),"text":"{\"collections\":[]}"})];
+            let source =
+                crate::serviceui::ServiceSource { url: a.into(), kind: "ogcapi", text: text.clone(), documents: documents.clone() };
+            let listing = app
+                .session
+                .run("service.layers", &json!({"url":a,"type":"ogcapi","text":text,"documents":documents,"connection":connection}))
+                .unwrap();
             crate::serviceui::add_layer_from(&mut app, &source, &listing["layers"][0], "", None, false, None, Some(&connection)).unwrap();
             app.ws.recording = Some(Vec::new());
             for _ in 0..3 {
@@ -6930,6 +6964,81 @@ mod download_service_tests {
                 Some(&(logins::inner(&url).to_string(), !foreign)),
                 "render fetch preserves lineage after reload"
             );
+        }
+    }
+
+    /// The dialog schedules supplied-document parsing and polls its result on a later frame.
+    /// Cancel also wins over a completed result that has not yet been installed.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn ogc_dataset_dialog_listing_runs_off_frame_and_cancels() {
+        let wait = |app: &mut RustGisApp| {
+            let started = std::time::Instant::now();
+            while app.ui.service.as_ref().unwrap().reading.is_some() && started.elapsed() < std::time::Duration::from_secs(5) {
+                app.poll_service();
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(app.ui.service.as_ref().unwrap().reading.is_none());
+        };
+        let text = br#"{"collections":[{"id":"roads"},{"id":"water"}]}"#;
+        for cancel in [false, true] {
+            let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+            app.reads_off_frame = true;
+            app.ui.service = Some(super::ServiceConn {
+                url: "https://maps.example.org/dataset".into(),
+                connection: None,
+                kind: "ogcapi",
+                slot: std::sync::Arc::new(std::sync::Mutex::new(Some(Ok(text.to_vec())))),
+                reading: None,
+                text: None,
+                documents: Vec::new(),
+                pending: None,
+                listing: None,
+                added: None,
+                typed: None,
+                search: None,
+                error: None,
+                failure: None,
+            });
+            app.poll_service();
+            let conn = app.ui.service.as_ref().unwrap();
+            assert!(conn.reading.is_some(), "parsing is scheduled, not run on this frame");
+            assert!(conn.listing.is_none());
+            if cancel {
+                let started = std::time::Instant::now();
+                let reading = conn.reading.as_ref().unwrap();
+                while reading.slot.lock().unwrap().is_none() && started.elapsed() < std::time::Duration::from_secs(5) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                assert!(reading.slot.lock().unwrap().is_some(), "the result is ready but has not landed");
+                conn.reading.as_ref().unwrap().control.cancel();
+            }
+            wait(&mut app);
+            let conn = app.ui.service.as_ref().unwrap();
+            assert!(conn.reading.is_none());
+            assert!(conn.pending.is_none());
+            if cancel {
+                assert!(conn.error.as_ref().is_some_and(|e| e.contains("cancelled")));
+                assert!(conn.listing.is_none());
+                let conn = app.ui.service.as_mut().unwrap();
+                super::serviceui::listed(conn, Ok(json!({"count":0,"layers":[]})), None);
+                assert!(conn.error.is_none(), "a successful retry clears the cancellation error");
+            } else {
+                assert!(conn.error.is_none(), "{:?}", conn.error);
+                assert_eq!(conn.listing.as_ref().unwrap()["count"], 2);
+                let params = json!({"url":conn.url,"type":"ogcapi","text":String::from_utf8_lossy(text),"filter":"roads"});
+                let reading = super::serviceui::ListingRead::start(&mut app.session, &params).unwrap();
+                let conn = app.ui.service.as_mut().unwrap();
+                conn.reading = Some(reading);
+                conn.pending = Some(conn.url.clone());
+                app.ui.service_browse.filter = "water".into();
+                wait(&mut app);
+                let conn = app.ui.service.as_ref().unwrap();
+                let search = conn.search.as_ref().unwrap();
+                assert_eq!(search.filter, "roads", "an earlier search retains its own key");
+                assert_eq!(search.listing.as_ref().unwrap()["count"], 1);
+                assert_eq!(conn.listing.as_ref().unwrap()["count"], 2, "a search never replaces the root listing");
+            }
         }
     }
 

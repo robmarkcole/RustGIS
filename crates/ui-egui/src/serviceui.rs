@@ -7,6 +7,66 @@ use rustgis_engine::data::ogc::{self, Pages, Step};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 
+/// A dialog-owned read-ahead job. Replacing or dropping its connection cancels parsing;
+/// its result cannot be applied to a different connection's listing.
+pub struct ListingRead {
+    pub control: std::sync::Arc<rustgis_engine::analysis::control::Control>,
+    pub slot: Slot<Result<rustgis_engine::cmd::reads::Read, String>>,
+    /// A search result belongs to its original filter, even if typing continues meanwhile.
+    pub filter: Option<String>,
+}
+
+impl Drop for ListingRead {
+    fn drop(&mut self) {
+        self.control.cancel();
+    }
+}
+
+impl ListingRead {
+    /// Runs the already admitted supplied-document read on its own desktop thread. Completion
+    /// is polled by the owning connection; thread refusal is an ordinary dialog error.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn start(s: &mut rustgis_engine::Session, p: &Value) -> Result<Self, String> {
+        let read = rustgis_engine::cmd::reads::read_ahead(s, "service.layers", p)?;
+        let control = rustgis_engine::analysis::control::Control::stoppable();
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let (work_control, done) = (control.clone(), slot.clone());
+        std::thread::Builder::new()
+            .name("service-listing".into())
+            .spawn(move || {
+                let result = read.run(&work_control);
+                *done.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result);
+            })
+            .map_err(|error| i18n::fmt("Could not start service discovery: {error}", &[("error", &error.to_string())]))?;
+        Ok(Self { control, slot, filter: p.get("filter").and_then(Value::as_str).map(str::to_string) })
+    }
+}
+
+/// Installs a listing only on the connection that owns its completed read, or starts its next
+/// advertised fetch. Failed and cancelled reads clear the busy state beside their error.
+pub fn listed(conn: &mut crate::ServiceConn, result: rustgis_engine::CmdResult, filter: Option<String>) {
+    conn.pending = None;
+    if let Some(filter) = filter {
+        conn.search = Some(crate::ServiceSearch { filter, listing: result });
+        conn.added = None;
+        return;
+    }
+    match result {
+        Ok(value) => {
+            conn.error = None;
+            conn.failure = None;
+            conn.pending = value.get("next").and_then(Value::as_str).map(str::to_string);
+            if let Some(next) = &conn.pending {
+                conn.slot = crate::fetch_detailed_into(next);
+            }
+            conn.listing = Some(value);
+            conn.added = None;
+            conn.search = None;
+        }
+        Err(error) => conn.error = Some(error),
+    }
+}
+
 pub struct Import {
     params: Value,
     refresh: bool,
@@ -37,6 +97,12 @@ pub struct ServiceSource {
 /// Uses the same translated tileset progress text when discovery starts and when it retires.
 pub(crate) fn reading_tileset(name: &str) -> String {
     i18n::fmt("Reading the tileset of {name}", &[("name", name)])
+}
+
+/// The line a queued add owns until it succeeds, fails or is cancelled.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn adding(name: &str) -> String {
+    i18n::fmt("Adding {name}…", &[("name", name)])
 }
 
 /// Uses the same translated coverage progress text when discovery starts and when it retires.
@@ -208,7 +274,13 @@ pub(crate) fn add_layer_from(
             app.ui.service_steps.push(crate::ServiceStep::Tiles { resolve, dialog, origin, opened: app.session.opened });
             Ok(reading_tileset(&title))
         }
-        None => crate::connectiontree::run_named(app, "service.add", p, origin.as_deref()).map(|_| added(&title)),
+        None => {
+            #[cfg(not(target_arch = "wasm32"))]
+            if app.reads_off_frame {
+                return crate::readjob::run_service(app, p, &title, origin.as_deref()).map(|_| adding(&title));
+            }
+            crate::connectiontree::run_named(app, "service.add", p, origin.as_deref()).map(|_| added(&title))
+        }
     }
 }
 

@@ -148,11 +148,28 @@ fn poll(app: &mut RustGisApp) {
                 if dated {
                     p["time"] = json!(date);
                 }
-                let r = app.run("service.add", p);
-                done(app, r.map(|v| v.get("name").and_then(Value::as_str).unwrap_or(&name).to_string()));
+                app.ui.web_services.note = None;
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let _ = crate::readjob::run_then(app, "service.add", p, Some(service_added));
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let r = app.run("service.add", p);
+                    service_added(app, crate::Landed::Ran(r));
+                }
             }
         }
     }
+}
+
+/// Reports the command's actual completion, including a queued add that never ran.
+fn service_added(app: &mut RustGisApp, result: crate::Landed) {
+    let result = match result {
+        crate::Landed::Ran(result) => result,
+        crate::Landed::NotRun(why) => Err(why),
+    };
+    done(app, result.map(|v| text(&v, "name").to_string()));
 }
 
 /// Notes what an Add did.
@@ -770,4 +787,48 @@ pub fn fields_of_the_world(app: &mut RustGisApp, ui: &mut egui::Ui) {
         done(app, r);
     }
     status(app, ui, None);
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ogc_dataset_web_data_waits_for_add_completion() {
+        let url = "https://maps.example.org/MapServer";
+        let doc = json!({"mapName":"Fixture","layers":[]}).to_string();
+        for outcome in ["success", "failure", "cancel"] {
+            let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+            let listing = app.session.run("service.layers", &json!({"url":url,"type":"arcgis","text":doc})).unwrap();
+            assert_eq!(listing["layers"][0]["name"], "map");
+            app.ui.web_services.docs.insert(url.into(), Doc::Ready(Arc::new(doc.clone()), Arc::new(listing)));
+            app.reads_off_frame = true;
+            add_layer(&mut app, url, "arcgis", if outcome == "failure" { "absent" } else { "map" }, "Fixture");
+            assert!(crate::readjob::showing(&app));
+            assert!(app.session.map().tiles.is_empty());
+            assert!(
+                app.ui.web_services.note.as_ref().is_none_or(|(_, note)| !note.starts_with("Added")),
+                "an enqueued add is not a success"
+            );
+            if outcome == "cancel" {
+                app.reads.cancel_for_tests();
+            }
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while crate::readjob::land(&mut app) {
+                assert!(std::time::Instant::now() < until);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let (ok, note) = app.ui.web_services.note.as_ref().unwrap();
+            assert_eq!(*ok, outcome == "success", "{note}");
+            assert_eq!(app.session.map().tiles.len(), usize::from(*ok));
+            if *ok {
+                assert_eq!(note, "Added Fixture");
+            } else if outcome == "cancel" {
+                assert!(note.contains("cancelled"), "{note}");
+            } else {
+                assert!(note.contains("absent"), "{note}");
+            }
+        }
+    }
 }

@@ -389,11 +389,18 @@ The layer holds the features of the area it was added for: moving the map doesn'
 
 For callers that fetch documents themselves (including the web app), `service.layers` accepts
 `text` for the initial document and `documents: [{"url": "…", "text": "…"}]` for subsequent
-responses. It returns `next` while another collections document is needed; supplied documents
+responses (at most 31 additional documents). It returns `next` while another discovery document is needed; supplied documents
 never cause a blocking capabilities fetch. Each listed layer includes `source_url`; pass it
 and the same documents to `service.add` to distinguish layers with the same name. Discovery
-follows at most four documents and rejects loops and disallowed addresses. Collection lists
+follows at most 32 documents and rejects loops and disallowed addresses. Collection lists
 aren't paged. On the desktop, feature downloads follow their `next` pages (see the table above).
+
+An OGC API landing page without collections can advertise dataset tilesets and a style
+catalogue. Dataset discovery reads at most 64 MiB of linked metadata. RustGIS reads the
+advertised Web Mercator tilesets, offering map tiles and vector
+tiles with named layer metadata. It checks at most 16 MapLibre styles, matching every source
+against the advertised tiles before listing a style. Other projections, missing vector layer
+names and offers left out by the discovery bounds are reported in the service notes.
 
 ### One picture of the view, or tiles
 

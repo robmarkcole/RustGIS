@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use std::rc::Rc;
 
+mod dataset;
+pub use dataset::DatasetDiscovery;
+
 #[path = "ogc_info.rs"]
 mod info;
 #[path = "ogc_warp.rs"]
@@ -26,7 +29,7 @@ pub enum Offer {
     Tiles { template: String },
     /// Features: an address answering GeoJSON.
     Features { url: String },
-    /// A MapLibre style document (an ArcGIS vector tile service's).
+    /// A MapLibre style document.
     Style { url: String },
     /// Vector tiles (`{z}/{x}/{y}`, Mapbox Vector Tiles) and the names of their layers, as an OGC
     /// API Tiles collection gives them.
@@ -449,6 +452,8 @@ pub struct Service {
     pub notes: Vec<String>,
     /// An OGC API landing page's advertised JSON collections document, resolved against it.
     pub collections_url: Option<String>,
+    /// Advertised dataset tiles and styles, read through the shared discovery document budget.
+    pub dataset: Option<DatasetDiscovery>,
     /// How many of `layers` a listing shows, when not all of them: the others are read only to be
     /// added by name.
     pub listed: Option<usize>,
@@ -605,13 +610,28 @@ fn is_data_link(link: &serde_json::Value) -> bool {
 
 /// Chooses JSON before an untyped data link, without guessing an endpoint or copying credentials.
 fn collections_link(address: &str, links: &[serde_json::Value]) -> Option<(String, bool)> {
+    discovery_link(address, links, is_data_link)
+}
+
+/// Chooses an advertised JSON representation without guessing paths or forwarding query keys.
+fn discovery_link(address: &str, links: &[serde_json::Value], relation: impl Fn(&serde_json::Value) -> bool) -> Option<(String, bool)> {
+    representation_link(address, links, relation, "application/json")
+}
+
+/// Selects a declared representation, retaining the advertised query and login policy.
+fn representation_link(
+    address: &str,
+    links: &[serde_json::Value],
+    relation: impl Fn(&serde_json::Value) -> bool,
+    media: &str,
+) -> Option<(String, bool)> {
     let base = url::Url::parse(crate::login_address::inner(address)).ok()?;
     links
         .iter()
-        .filter(|l| is_data_link(l))
+        .filter(|l| relation(l))
         .filter_map(|l| {
             let priority = match l.get("type").and_then(|v| v.as_str()) {
-                Some(t) if t.split(';').next().is_some_and(|t| t.trim().eq_ignore_ascii_case("application/json")) => 0,
+                Some(t) if t.split(';').next().is_some_and(|t| t.trim().eq_ignore_ascii_case(media)) => 0,
                 None => 1,
                 _ => return None,
             };
@@ -2603,8 +2623,14 @@ fn arcgis_directory(b: &str, v: &serde_json::Value) -> Service {
 // ---------------------------------------------------------------------------------------------
 // OGC API Features
 
+/// Reads collections or starts dataset discovery only from advertised links.
 fn ogc_api(url: &str, v: &serde_json::Value) -> Result<Service, String> {
-    let collections = v.get("collections").and_then(|c| c.as_array());
+    let collections = v.get("collections").and_then(|c| c.as_array()).filter(|collections| {
+        !collections.is_empty()
+            || !v.get("links").and_then(serde_json::Value::as_array).is_some_and(|links| {
+                links.iter().any(|link| dataset::relation(link, "tilesets-map") || dataset::relation(link, "tilesets-vector"))
+            })
+    });
     let Some(collections) = collections else {
         // A landing page can offer both dataset tiles and a collections document to discover.
         let title = v.get("title").and_then(|t| t.as_str()).unwrap_or_default().to_string();
@@ -2614,9 +2640,22 @@ fn ogc_api(url: &str, v: &serde_json::Value) -> Result<Service, String> {
             service.collections_url = Some(next);
             service.withheld_addresses = u32::from(withheld);
         }
+        let dataset = DatasetDiscovery::landing(url, &links, &mut service.withheld_addresses);
+        let map_url = dataset.as_ref().and_then(DatasetDiscovery::map_url).map(str::to_string);
+        if service.collections_url.is_none() {
+            service.dataset = dataset;
+        } else if let Some(dataset) = dataset {
+            let notes = dataset.collections_notes();
+            service.incomplete |= !notes.is_empty();
+            service.notes.extend(notes);
+        }
         let name = if title.is_empty() { "tiles".to_string() } else { title };
-        // The dataset's layers aren't listed here, so its vector tiles can't be styled: map tiles only.
-        if let Some((t, list, withheld)) = tileset(url, &links, TileRel::Map) {
+        // Collections discovery keeps its existing map resolver, enabled only by a usable
+        // JSON metadata link. Dataset-only landings use the validated plan instead.
+        if service.dataset.is_none()
+            && let Some(map_url) = map_url
+            && let Some((t, list, withheld)) = tileset(url, &[serde_json::json!({"rel":"tilesets-map","href":map_url})], TileRel::Map)
+        {
             service.withheld_addresses = service.withheld_addresses.saturating_add(u32::from(withheld));
             service.layers.push(ServiceLayer {
                 zooms: None,
@@ -2630,8 +2669,8 @@ fn ogc_api(url: &str, v: &serde_json::Value) -> Result<Service, String> {
                 legends: Vec::new(),
             });
         }
-        if !service.layers.is_empty() || service.collections_url.is_some() {
-            if service.layers.is_empty() {
+        if !service.layers.is_empty() || service.collections_url.is_some() || service.dataset.is_some() {
+            if service.layers.is_empty() && service.dataset.is_none() {
                 service.kind = "OGC API Features".into();
             }
             return Ok(service);
@@ -2897,28 +2936,12 @@ pub fn resolve_tiles(list: &str, doc: &str, body: &[u8], vector: bool) -> Option
     let links = |v: &serde_json::Value| v.get("links").and_then(|l| l.as_array()).cloned().unwrap_or_default();
     let Some(sets) = v.get("tilesets").and_then(|t| t.as_array()) else {
         // A tileset: its tile template.
+        if !tile_data_type(&v, vector) {
+            return None;
+        }
         return item_template(doc, &links(&v), vector).map(|t| advertised_tiles(list, &t, false));
     };
-    let mercator = |t: &serde_json::Value| {
-        let tiling = links(t);
-        let named: Vec<String> = ["tileMatrixSetURI", "tileMatrixSetId", "tileMatrixSet", "id"]
-            .iter()
-            .filter_map(|k| t.get(*k).and_then(|x| x.as_str()))
-            .chain(
-                tiling
-                    .iter()
-                    .filter(|l| l.get("rel").and_then(|r| r.as_str()).is_some_and(|r| r.contains("tiling-scheme")))
-                    .filter_map(|l| l.get("href").and_then(|h| h.as_str())),
-            )
-            .map(|n| base(n).trim_end_matches('/').to_ascii_lowercase())
-            .collect();
-        named.iter().any(|n| n.ends_with("webmercatorquad") || n.ends_with("googlemapscompatible"))
-    };
-    let kind_fits = |t: &serde_json::Value| match t.get("dataType").and_then(|d| d.as_str()) {
-        Some(d) => (d == "vector") == vector,
-        None => true,
-    };
-    let t = sets.iter().take(200).find(|t| mercator(t) && kind_fits(t))?;
+    let t = sets.iter().take(200).find(|t| web_mercator_tileset(t) && tile_data_type(t, vector))?;
     let ls = links(t);
     if let Some(template) = item_template(doc, &ls, vector) {
         return Some(advertised_tiles(list, &template, false));
@@ -2928,6 +2951,54 @@ pub fn resolve_tiles(list: &str, doc: &str, body: &[u8], vector: bool) -> Option
         .find(|l| l.get("rel").and_then(|r| r.as_str()).is_some_and(|r| r == "self" || r.ends_with("/tileset")))
         .and_then(|l| resolve(doc, l.get("href")?.as_str()?))?;
     Some(advertised_tiles(list, &next, true))
+}
+
+/// Keeps an absent declaration compatible with older services, but never treats coverage or
+/// an unknown declared type as a map. OGC API Tiles 1.0 distinguishes map, vector and coverage.
+fn tile_data_type(t: &serde_json::Value, vector: bool) -> bool {
+    match t.get("dataType") {
+        None => true,
+        Some(declared) => match declared.as_str() {
+            Some("map") => !vector,
+            Some("vector") => vector,
+            _ => false,
+        },
+    }
+}
+
+/// Recognizes the supported global tile pyramid from declared tileset metadata. A canonical
+/// declaration identifies the grid; a tiling-scheme link locates a definition and may use an
+/// arbitrary server path (OGC API Tiles 1.0, section 5.2).
+fn web_mercator_tileset(t: &serde_json::Value) -> bool {
+    let links = t.get("links").and_then(|l| l.as_array());
+    let mut named: Vec<&str> =
+        ["tileMatrixSetURI", "tileMatrixSetId", "tileMatrixSet"].iter().filter_map(|k| t.get(*k).and_then(|x| x.as_str())).collect();
+    if named.is_empty() {
+        named.extend(
+            links
+                .into_iter()
+                .flatten()
+                .filter(|l| {
+                    l.get("rel")
+                        .and_then(|r| r.as_str())
+                        .is_some_and(|r| r == "tiling-scheme" || r == "http://www.opengis.net/def/rel/ogc/1.0/tiling-scheme")
+                })
+                .filter_map(|l| l.get("href").and_then(|h| h.as_str())),
+        );
+    }
+    if named.is_empty()
+        && let Some(id) = t.get("id").and_then(|id| id.as_str())
+    {
+        named.push(id);
+    }
+    !named.is_empty()
+        && named.iter().all(|n| {
+            base(n)
+                .trim_end_matches('/')
+                .rsplit(['/', ':'])
+                .next()
+                .is_some_and(|n| n.eq_ignore_ascii_case("WebMercatorQuad") || n.eq_ignore_ascii_case("GoogleMapsCompatible"))
+        })
 }
 
 /// A tileset's advertised tile template (its `item` link, `{tileMatrix}/{tileRow}/{tileCol}`) as
@@ -2948,7 +3019,7 @@ fn item_template(from: &str, links: &[serde_json::Value], vector: bool) -> Optio
     } else {
         items.iter().find(|l| ty(l) == "image/png").or_else(|| items.iter().find(|l| ty(l).starts_with("image/")))
     }
-    .or_else(|| items.first())?;
+    .or_else(|| items.iter().find(|link| link.get("type").is_none()))?;
     let href = pick.get("href")?.as_str()?;
     if href.len() > 2000 {
         return None;
@@ -6704,7 +6775,8 @@ mod tests {
             {"rel": "http://www.opengis.net/def/rel/ogc/1.0/tilesets-map", "href": "https://x.org/night/map/tiles"}]}"#;
         let s = parse("https://x.org/night/", landing).unwrap();
         assert_eq!(s.kind, "OGC API Tiles");
-        assert_eq!(s.layers[0].offer, Offer::Tiles { template: "https://x.org/night/map/tiles/WebMercatorQuad/{z}/{y}/{x}".into() });
+        assert!(s.layers.is_empty(), "dataset tiles need advertised metadata rather than a guessed path");
+        assert_eq!(s.dataset.as_ref().and_then(|d| d.next()), Some(("https://x.org/night/", "https://x.org/night/map/tiles?f=json")));
         // A landing page advertises the collections document instead of rejecting it.
         assert_eq!(
             parse("https://x.org/a/", br#"{"links": [{"rel": "data", "href": "https://x.org/a/collections"}]}"#)
@@ -6772,6 +6844,22 @@ mod tests {
             resolve_tiles(list, doc, tileset, false).map(|r| r.step),
             Some(TilesStep::Template("https://x.org/c/roads/tiles/smerc/{z}/{y}/{x}.png".into()))
         );
+        // A PNG link cannot turn a declared coverage (or unknown type) into a map offer.
+        for kind in ["map", "vector", "coverage", "unknown"] {
+            let mut declared: serde_json::Value = serde_json::from_slice(tileset).unwrap();
+            declared["dataType"] = serde_json::json!(kind);
+            declared["tileMatrixSetId"] = serde_json::json!("WebMercatorQuad");
+            for document in [declared.clone(), serde_json::json!({"tilesets":[declared]})] {
+                let body = document.to_string();
+                for vector in [false, true] {
+                    assert_eq!(
+                        resolve_tiles(list, doc, body.as_bytes(), vector).is_some(),
+                        kind == if vector { "vector" } else { "map" },
+                        "{kind}, vector={vector}: {document}"
+                    );
+                }
+            }
+        }
         // A list that carries its tilesets' item links needs no second document.
         let inline = br#"{"tilesets": [{"tileMatrixSetId": "WebMercatorQuad", "links": [
             {"rel": "item", "type": "image/png", "href": "https://x.org/t/{tileMatrix}/{tileRow}/{tileCol}"}]}]}"#;
