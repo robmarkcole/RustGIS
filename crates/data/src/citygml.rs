@@ -1039,7 +1039,8 @@ fn value(p: &Node) -> Option<Json> {
 #[derive(Default, Clone)]
 struct Said {
     /// Geometries whose coordinates can't be read, or that lack a part they need: each written one
-    /// once, whichever object or link reads it first, and a solid whose exterior is a link to one.
+    /// once, whichever object or link reads it first, a solid whose exterior is a link to one, and
+    /// a solid with cavities whose exterior has nothing read and no notice says why.
     bad_coordinates: usize,
     /// Geometries and objects given only by a link that isn't followed: a geometry's to another
     /// file, nothing, or a member that can't be parsed; a thematic surface's or opening's, a ring's,
@@ -1086,6 +1087,13 @@ struct Said {
 }
 
 impl Said {
+    /// The notices that say why a geometry is left out: what can't be read, and links not followed.
+    /// Counted before and after reading a solid's exterior, or following a link of it, to know
+    /// whether its loss is said.
+    fn noticed(&self) -> usize {
+        self.bad_coordinates + self.links + self.not_geometry_links + self.links_past_limit
+    }
+
     /// The notices, and whether the file ends inside a member.
     fn notes(&self, cut: bool) -> Vec<String> {
         let mut out = Vec::new();
@@ -1399,10 +1407,8 @@ enum To<'a, 'i> {
 /// are read.
 struct Pending<'a, 'i> {
     to: To<'a, 'i>,
-    /// What is read only when the link is found: a solid's cavities, when its exterior is a link,
-    /// in the `srsDimension` where the link stands (`dim`).
-    then: Vec<Node<'a, 'i>>,
-    dim: Option<usize>,
+    /// The solid whose exterior it stands in, when that solid has cavities ([`Links::waiting`]).
+    wait: Option<usize>,
     at: At,
     /// It is a solid's exterior: the solid is lost with what it points to.
     solid: bool,
@@ -1425,6 +1431,18 @@ enum Unread {
     NotGeometry,
 }
 
+/// A solid's cavities, kept until its exterior has something read: read alone they would be drawn
+/// as its faces.
+enum Wait<'a, 'i> {
+    /// Waiting, with the `srsDimension` the solid is written in, and whether a notice says why its
+    /// exterior has nothing read yet (a link of it to nothing, or to what can't be read).
+    Cavities(Vec<Node<'a, 'i>>, Option<usize>, bool),
+    /// Taken to read with its exterior.
+    Taken,
+    /// A cavity can't be read: the solid is left out whole, its exterior's other links too.
+    Lost,
+}
+
 /// One object's links: the geometries it has read, each with whether it was read as the ground, and
 /// the links left to follow, the ground's apart.
 #[derive(Default)]
@@ -1435,9 +1453,63 @@ struct Links<'a, 'i> {
     marked: Vec<(Key, Option<bool>)>,
     ground: Vec<Pending<'a, 'i>>,
     others: Vec<Pending<'a, 'i>>,
+    /// The solids whose exterior has had nothing read yet, each with its cavities: the links in that
+    /// exterior name it ([`Pending::wait`]), and the first that reads something reads them. One still
+    /// waiting once the object's links are followed is left out with its cavities, and said: by the
+    /// notices of its links (to nothing, or to what can't be read; in a prototype, where they aren't
+    /// followed), else as a solid that lacks the part it needs.
+    waiting: Vec<Wait<'a, 'i>>,
 }
 
 impl<'a, 'i> Links<'a, 'i> {
+    /// Keeps a solid's cavities, written in `dim`, until its exterior has something read.
+    fn wait(&mut self, cavities: Vec<Node<'a, 'i>>, dim: Option<usize>) -> usize {
+        self.waiting.push(Wait::Cavities(cavities, dim, false));
+        self.waiting.len() - 1
+    }
+
+    /// Whether the solid `wait` names still waits for its exterior.
+    fn waits(&self, wait: Option<usize>) -> bool {
+        wait.and_then(|w| self.waiting.get(w)).is_some_and(|w| matches!(w, Wait::Cavities(..)))
+    }
+
+    /// Whether the solid `wait` names is left out.
+    fn lost(&self, wait: Option<usize>) -> bool {
+        wait.and_then(|w| self.waiting.get(w)).is_some_and(|w| matches!(w, Wait::Lost))
+    }
+
+    /// The cavities the solid `wait` names waits with, taken to read: none when it doesn't wait.
+    fn take(&mut self, wait: Option<usize>) -> Option<(Vec<Node<'a, 'i>>, Option<usize>)> {
+        let w = self.waiting.get_mut(wait?)?;
+        match std::mem::replace(w, Wait::Taken) {
+            Wait::Cavities(cavities, dim, _) => Some((cavities, dim)),
+            other => {
+                *w = other;
+                None
+            }
+        }
+    }
+
+    /// Notes that a notice says why the exterior of the solid `wait` names has nothing read yet.
+    fn explained(&mut self, wait: Option<usize>) {
+        if let Some(Wait::Cavities(_, _, said)) = wait.and_then(|w| self.waiting.get_mut(w)) {
+            *said = true;
+        }
+    }
+
+    /// The solids still waiting that no notice explains: their exterior has nothing read and says
+    /// nothing of why (an empty shell, written in place or linked).
+    fn unexplained(&self) -> usize {
+        self.waiting.iter().filter(|w| matches!(w, Wait::Cavities(_, _, false))).count()
+    }
+
+    /// Leaves out the solid `wait` names.
+    fn lose(&mut self, wait: Option<usize>) {
+        if let Some(w) = wait.and_then(|w| self.waiting.get_mut(w)) {
+            *w = Wait::Lost;
+        }
+    }
+
     /// Whether a geometry needn't be read for `ground`: read already, and as the ground if that is
     /// what it is read for now.
     fn read(&self, key: Key, ground: bool) -> bool {
@@ -1629,8 +1701,15 @@ impl Reading {
         // Links last, once what the object writes out is read: a link to that adds nothing, and a
         // ground face stays the ground's though a solid links to it first.
         while let Some(link) = links.next() {
+            let (wait, before) = (link.wait, self.said.noticed());
             self.follow(link, targets, &mut parts, &mut links);
+            if self.said.noticed() > before {
+                links.explained(wait);
+            }
         }
+        // A solid whose exterior has nothing read, and no notice says why: it lacks the part it
+        // needs, and is left out with its cavities.
+        self.said.bad_coordinates += links.unexplained();
         self.counts.addresses += usize::from(address);
         let at_row = self.built.len();
         let made = object_rows(parts, at_row, &mut self.counts, &mut self.budget);
@@ -1705,7 +1784,12 @@ impl Reading {
             self.instance(link, place, targets, parts, links);
             return;
         }
-        let Pending { to: To::Href(href), then, dim: at_link, at, solid, .. } = link else { return };
+        let Pending { to: To::Href(href), wait, at, solid, .. } = link else { return };
+        // In the exterior of a solid left out (a cavity can't be read): it goes with the solid,
+        // said once.
+        if links.lost(wait) {
+            return;
+        }
         let (id, target, far) = match Self::find(href, targets) {
             Ok(found) => found,
             Err(why) => return self.unread(why),
@@ -1718,8 +1802,10 @@ impl Reading {
         let place = self.place_of(&target);
         if self.failed.contains(&place) {
             // Said where it failed. A solid whose exterior it is lacks the part it needs, and is left
-            // out with its cavities: said too.
+            // out with its cavities: said too. One whose surface it is is said by it, however many
+            // links read it.
             self.said.bad_coordinates += usize::from(solid);
+            links.explained(wait);
             return;
         }
         // Read already in this object at this level of detail, written out or by another link:
@@ -1728,49 +1814,63 @@ impl Reading {
         // whose chain comes back on itself.
         let key = (place, at.lod);
         let read = links.read(key, at.ground);
-        if read && then.is_empty() {
-            if only_link(&target) {
-                match targets.end_of(id) {
-                    Some(end) => links.push(Pending { to: To::Href(end), then, dim: at_link, at, solid, place: None }),
-                    None => self.unread(Unread::Missing),
-                }
+        let waits = links.waits(wait);
+        // A link in the exterior of a solid whose cavities wait, to what is itself only a link:
+        // they wait for the end of that chain, so a chain that ends in nothing leaves the solid out
+        // with them, as an exterior link to nothing does. So too when the link was read already at
+        // this level (a surface holds it): that read was the link's, not the shell's.
+        if (read || waits) && only_link(&target) {
+            match targets.end_of(id) {
+                Some(end) => links.push(Pending { to: To::Href(end), wait, at, solid, place: None }),
+                None => self.unread(Unread::Missing),
             }
             return;
         }
-        // A solid's exterior given by a link to what is itself only a link: its cavities wait for
-        // the end of that chain, so a chain that ends in nothing leaves the solid out with them, as
-        // an exterior link to nothing does. So too when the link was read already at this level
-        // (a surface holds it): that read was the link's, not the shell's.
-        if !then.is_empty() && only_link(&target) {
-            match targets.end_of(id) {
-                Some(end) => links.push(Pending { to: To::Href(end), then, dim: at_link, at, solid, place: None }),
-                None => self.unread(Unread::Missing),
-            }
+        if read && !waits {
             return;
         }
         // Its bytes: what reading it parses, its elements and its coordinates' text.
         if !self.pay(targets, far, if read { 0 } else { target.range().len() }) {
             return;
         }
+        // Whether the solid's cavities were taken to read in this walk: when it fails, that solid is
+        // left out.
+        let mut took = false;
         let got = self.read(
             |w| {
                 // Marks are made as it is read, inside the walk, so a walk that fails (a cavity that
                 // can't be read) takes them back, and the target is read again by its next link.
                 w.following = true;
+                // What it holds given by links stands in the same exterior.
+                w.wait = wait;
                 if !read {
                     w.where_written(&target)?;
                     w.geometry(&target)?;
                 }
-                // The cavities are written where the link stands, in its dimension.
-                w.dim = at_link;
-                then.iter().try_for_each(|cavity| w.member(cavity))
+                // The exterior has something read (or read already): its solid's cavities are read
+                // with it, written where the solid is, in its dimension. One that holds only links
+                // leaves them to those links. Read already means marked at this level, not that it
+                // drew: a composite of links to nothing that another exterior of the object read
+                // first takes them too (those links are said), as does one whose links come back to
+                // it in a cycle with nothing drawn (not said). Only broken files make that so.
+                if (read || w.drawn > 0)
+                    && let Some((cavities, dim)) = w.links.take(wait)
+                {
+                    took = true;
+                    w.wait = None;
+                    w.dim = dim;
+                    cavities.iter().try_for_each(|cavity| w.member(cavity))?;
+                }
+                Some(())
             },
             at,
             links,
             Root { id: Some(place), linked: true, solid },
         );
-        if let Some(got) = got {
-            self.add(parts, at, got);
+        match got {
+            Some(got) => self.add(parts, at, got),
+            None if took => links.lose(wait),
+            None => {}
         }
     }
 
@@ -1887,7 +1987,7 @@ impl Reading {
     /// property given by a link is followed with the object's other links.
     fn geometry<'a, 'i>(&mut self, p: &Node<'a, 'i>, at: At, parts: &mut ObjectParts, links: &mut Links<'a, 'i>) {
         if let Some(href) = attribute(p, "href").filter(|_| only_link(p)) {
-            links.push(Pending { to: To::Href(href), then: Vec::new(), dim: None, at, solid: false, place: None });
+            links.push(Pending { to: To::Href(href), wait: None, at, solid: false, place: None });
             return;
         }
         let Some(g) = elements(*p).next() else { return };
@@ -1909,7 +2009,8 @@ impl Reading {
         links: &mut Links<'a, 'i>,
         root: Root,
     ) -> Option<Got> {
-        let (reach, ground, others, marked) = (self.reach, links.ground.len(), links.others.len(), links.marked.len());
+        let (reach, ground, others, marked, waiting) =
+            (self.reach, links.ground.len(), links.others.len(), links.marked.len(), links.waiting.len());
         // What it says of its parts: a geometry left out is said as one, so a link that reads it
         // again doesn't say its parts again.
         let said = self.said.clone();
@@ -1923,6 +2024,8 @@ impl Reading {
             instance: false,
             following: false,
             local: false,
+            wait: None,
+            drawn: 0,
             failed: Vec::new(),
             wrap_at: self.wrap_at,
             copies: &self.copies,
@@ -1938,6 +2041,8 @@ impl Reading {
         self.reach = reach;
         links.ground.truncate(ground);
         links.others.truncate(others);
+        // And the solids it held, which only its links waited on.
+        links.waiting.truncate(waiting);
         // Its geometries weren't read: a link to one of them still reads it.
         links.unmark(marked);
         // Said once. What a link points to failed: the geometry that can't be read is the innermost
@@ -2117,6 +2222,12 @@ struct Walk<'r, 'a, 'i> {
     /// Reading a prototype in its own system: its coordinates aren't the file's (not turned
     /// latitude first, not in its reach), no mark is made, and its links aren't followed.
     local: bool,
+    /// The solid whose exterior is being read, when its cavities wait ([`Links::waiting`]): the
+    /// links met there name it.
+    wait: Option<usize>,
+    /// The faces, lines and points read, and the geometries met read already: whether what it
+    /// read has something of its own, not only links.
+    drawn: usize,
     /// The geometries with a `gml:id` a failure ran through, from the innermost out: each is lost.
     failed: Vec<Node<'a, 'i>>,
     got: Got,
@@ -2136,11 +2247,12 @@ impl<'a, 'i> Walk<'_, 'a, 'i> {
             && !self.links.mark((place_in(g, self.wrap_at, self.copies), self.at.lod), self.at.ground)
             && self.following
         {
+            self.drawn += 1;
             return Some(());
         }
         // A geometry given by a link is followed once its object's own are read.
         if only_link(g) {
-            self.link(g, Vec::new(), false);
+            self.link(g, false);
             return Some(());
         }
         // A geometry's `srsDimension` holds for what it holds.
@@ -2175,15 +2287,15 @@ impl<'a, 'i> Walk<'_, 'a, 'i> {
         Some(())
     }
 
-    /// Keeps a link to a geometry to follow, and what is read only when it is found (a solid's
-    /// cavities, when `solid`). In a prototype, links aren't followed, and are said.
-    fn link(&mut self, n: &Node<'a, 'i>, then: Vec<Node<'a, 'i>>, solid: bool) {
+    /// Keeps a link to a geometry to follow, in the exterior of the solid whose cavities wait, if
+    /// any; `solid` when it is that exterior. In a prototype, links aren't followed, and are said.
+    fn link(&mut self, n: &Node<'a, 'i>, solid: bool) {
         let Some(href) = attribute(n, "href") else { return };
         if self.local {
             self.said.links += 1;
             return;
         }
-        self.links.push(Pending { to: To::Href(href), then, dim: self.dim, at: self.at, solid, place: None });
+        self.links.push(Pending { to: To::Href(href), wait: self.wait, at: self.at, solid, place: None });
     }
 
     fn shape(&mut self, g: &Node<'a, 'i>) -> Option<()> {
@@ -2203,6 +2315,7 @@ impl<'a, 'i> Walk<'_, 'a, 'i> {
                     self.got.heights.push(first);
                 }
                 self.got.points.push((first, false));
+                self.drawn += 1;
             }
             "MultiPoint" => self.members(g, &["pointMember"], "pointMembers")?,
             name @ ("LineString" | "Curve" | "LinearRing") => {
@@ -2216,6 +2329,7 @@ impl<'a, 'i> Walk<'_, 'a, 'i> {
                 }
                 let line = self.positions(g)?;
                 self.got.lines.push(line);
+                self.drawn += 1;
             }
             "MultiCurve" | "CompositeCurve" => self.members(g, &["curveMember"], "curveMembers")?,
             "OrientableCurve" => {
@@ -2233,6 +2347,7 @@ impl<'a, 'i> Walk<'_, 'a, 'i> {
                     line.reverse();
                 }
                 self.got.lines.push(line);
+                self.drawn += 1;
             }
             "Polygon" | "Triangle" | "Rectangle" | "PolygonPatch" => self.face(g)?,
             name @ ("Surface" | "PolyhedralSurface" | "TriangulatedSurface" | "Tin") => {
@@ -2255,14 +2370,35 @@ impl<'a, 'i> Walk<'_, 'a, 'i> {
                 // A solid with no exterior shell (its cavities only) lacks the part it needs.
                 let exterior = elements(*g).find(|c| local(c) == "exterior")?;
                 self.got.solid = true;
-                if only_link(&exterior) {
-                    // Its cavities are taken off that shell: read alone they would be drawn as
-                    // footprints, so they are read only once the shell is found.
-                    let cavities = elements(*g).filter(|c| local(c) == "interior").collect();
-                    self.link(&exterior, cavities, true);
+                // Its cavities are read once its exterior has something read: read alone they
+                // would be drawn as its faces. An exterior given by links (the shell, or each of its
+                // surfaces) leaves them to the first of those links that reads something; when none
+                // does, the solid is left out with them, and the links are said.
+                let cavities: Vec<Node> = elements(*g).filter(|c| local(c) == "interior").collect();
+                let outer = self.wait;
+                let own = (!cavities.is_empty()).then(|| self.links.wait(cavities, self.dim));
+                self.wait = own.or(outer);
+                let (drawn, before) = (self.drawn, self.said.noticed());
+                let done = if only_link(&exterior) {
+                    self.link(&exterior, true);
+                    Some(())
                 } else {
-                    self.member(&exterior)?;
-                    self.members(g, &["interior"], "")?;
+                    self.member(&exterior)
+                };
+                self.wait = outer;
+                done?;
+                if self.drawn > drawn {
+                    if let Some((cavities, _)) = self.links.take(own) {
+                        // Its cavities aren't the outer solid's exterior, as where a link reads them.
+                        let held = self.wait.take();
+                        let read = cavities.iter().try_for_each(|cavity| self.member(cavity));
+                        self.wait = held;
+                        read?;
+                    }
+                } else if self.said.noticed() > before {
+                    // Nothing read, and a link of it said (a ring's, or any in a prototype, which
+                    // aren't followed): that notice says why the solid is left out.
+                    self.links.explained(own);
                 }
             }
             "CompositeSolid" | "MultiSolid" => self.members(g, &["solidMember"], "solidMembers")?,
@@ -2311,9 +2447,7 @@ impl<'a, 'i> Walk<'_, 'a, 'i> {
             None => None,
         };
         match (place, to) {
-            (Some(place), Some(to)) => {
-                self.links.push(Pending { to, then: Vec::new(), dim: None, at: self.at, solid: false, place: Some(place) })
-            }
+            (Some(place), Some(to)) => self.links.push(Pending { to, wait: None, at: self.at, solid: false, place: Some(place) }),
             _ => self.got.points.push((reference, true)),
         }
         Some(())
@@ -2322,7 +2456,7 @@ impl<'a, 'i> Walk<'_, 'a, 'i> {
     /// The geometry a member property holds: written in place, or a link, followed later.
     fn member(&mut self, m: &Node<'a, 'i>) -> Option<()> {
         if only_link(m) {
-            self.link(m, Vec::new(), false);
+            self.link(m, false);
             return Some(());
         }
         elements(*m).try_for_each(|g| self.geometry(&g))
@@ -2377,6 +2511,7 @@ impl<'a, 'i> Walk<'_, 'a, 'i> {
         }
         self.got.surface = true;
         self.got.faces.face(rings, self.at.ground);
+        self.drawn += 1;
         Some(())
     }
 
