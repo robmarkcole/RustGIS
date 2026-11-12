@@ -1613,7 +1613,11 @@ fn visibility_box(ui: &Ui, cb: Rect, visible: bool, t: &Tokens) {
 /// shows or hides it; right-click zooms to it (known bounds, an archive or GeoTIFF), sets its
 /// opacity, moves it up or down (not with `reorder` off: the list is filtered), or removes it.
 fn tile_row(app: &mut RustGisApp, ui: &mut Ui, i: usize, moves: [bool; 2], reorder: bool, tile: &TileLayer, t: &Tokens) -> Rect {
-    let shown = if tile.overlay { format!("{} · {}", tile.name, tl!("overlay")) } else { tile.name.clone() };
+    let mut shown = if tile.overlay { format!("{} · {}", tile.name, tl!("overlay")) } else { tile.name.clone() };
+    let disk = disk_note(app, None, Some(i));
+    if let Some((note, _, _)) = disk.as_ref().filter(|(note, _, _)| !note.is_empty()) {
+        shown = format!("{shown}  {note}");
+    }
     let name = row_name(ui, shown.clone(), regular(12.5), ui.available_width() - NAME_X - 8.0);
     let sense = if reorder { Sense::click_and_drag() } else { Sense::click() };
     let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), name.row_h), sense);
@@ -1665,8 +1669,10 @@ fn tile_row(app: &mut RustGisApp, ui: &mut Ui, i: usize, moves: [bool; 2], reord
     x += 24.0;
     // Unavailable archives are red; otherwise grey when hidden, transparent, or outside the
     // slider's step (the box still shows the choice to show it).
-    let color = if tile.error.is_some() {
+    let color = if tile.error.is_some() || disk.as_ref().is_some_and(|(_, _, tint)| *tint == Some(true)) {
         t.red
+    } else if disk.as_ref().is_some_and(|(_, _, tint)| *tint == Some(false)) {
+        t.amber
     } else if tile.draws() && tile.opacity > 0.0 {
         t.text
     } else {
@@ -1686,6 +1692,10 @@ fn tile_row(app: &mut RustGisApp, ui: &mut Ui, i: usize, moves: [bool; 2], reord
     if let Some(error) = &tile.error {
         hover.push('\n');
         hover.push_str(error);
+    }
+    if let Some((_, detail, _)) = &disk {
+        hover.push('\n');
+        hover.push_str(detail);
     }
     let resp = resp.on_hover_text(hover);
     resp.context_menu(|ui| {
@@ -1871,6 +1881,30 @@ impl RowName {
     }
 }
 
+/// The changed-on-disk note for a layer or tile layer `tile` of the active map (the desktop app
+/// watches linked files: see `diskwatch`), as `diskwatch::row_note` words it.
+fn disk_note(app: &RustGisApp, layer: Option<&Layer>, tile: Option<usize>) -> Option<(String, String, Option<bool>)> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if !app.watch_files {
+            return None;
+        }
+        // As the notification decides it: a layer with no linked file (an editable GeoPackage
+        // table) can't be relinked.
+        let (status, repairable) = match (layer, tile) {
+            (Some(l), _) => (crate::diskwatch::layer_status(app, l), l.linked_file().is_some()),
+            (None, Some(i)) => (crate::diskwatch::tiles_status(app, i), true),
+            (None, None) => return None,
+        };
+        crate::diskwatch::row_note(&status, repairable)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (app, layer, tile);
+        None
+    }
+}
+
 /// A layer's row and, expanded, its legend; returns the rectangle of both. With `reorder` off
 /// (the list is filtered or children are sorted by name) the row can't be dragged.
 fn layer_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, scale: f64, reorder: bool, t: &Tokens) -> Rect {
@@ -1884,7 +1918,11 @@ fn layer_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, scale: f64, reorder: 
         let w = crate::widgets::text_w(ui, &text, regular(10.5)) + 10.0;
         (text, w)
     });
-    let shown = if l.definition_query.is_some() { format!("{}  {}", l.name, tl!("(filtered)")) } else { l.name.clone() };
+    let mut shown = if l.definition_query.is_some() { format!("{}  {}", l.name, tl!("(filtered)")) } else { l.name.clone() };
+    let disk = disk_note(app, Some(l), None);
+    if let Some((note, _, _)) = disk.as_ref().filter(|(note, _, _)| !note.is_empty()) {
+        shown = format!("{shown}  {note}");
+    }
     // Every picked row looks alike; the active one has an outline (`active_outline`), not a
     // bolder name, which would read as the only one picked.
     let font = regular(12.5);
@@ -1951,8 +1989,10 @@ fn layer_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, scale: f64, reorder: 
     let out_of_range = !app.session.map().in_scale_range(l, scale);
     let group_hidden = !app.session.map().shows(l) && l.visible;
     let missing = l.raster.as_ref().is_some_and(|r| r.data.is_none()) || l.source.as_ref().is_some_and(|s| s.error.is_some());
-    let color = if missing {
+    let color = if missing || disk.as_ref().is_some_and(|(_, _, tint)| *tint == Some(true)) {
         t.red
+    } else if disk.as_ref().is_some_and(|(_, _, tint)| *tint == Some(false)) {
+        t.amber
     } else if !l.visible || out_of_range || group_hidden {
         t.text_disabled
     } else {
@@ -2046,6 +2086,10 @@ fn layer_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, scale: f64, reorder: 
     };
     // A name cut short shows whole above the details.
     let tip = if elided { format!("{shown}\n{tip}") } else { tip };
+    let tip = match &disk {
+        Some((_, detail, _)) => format!("{tip}\n{detail}"),
+        None => tip,
+    };
     let resp = resp.on_hover_text(tip);
     resp.context_menu(|ui| layer_menu(app, ui, l, reorder));
     // Legend classes.

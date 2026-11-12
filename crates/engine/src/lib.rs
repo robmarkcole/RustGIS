@@ -12,6 +12,8 @@ pub mod extensions;
 pub mod geometry_calc;
 pub mod model;
 mod notice_text;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod observe;
 pub mod peer;
 pub mod policy;
 #[cfg(not(target_arch = "wasm32"))]

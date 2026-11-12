@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 
 pub(crate) const HELP: &str = "Read the selected layer's local source again. Folders reload only when you choose Reload Data; they are not watched. Undo restores in-memory data and configuration, not overwritten files or historical streamed contents.";
 
-fn source(layer: &Layer) -> Option<(&str, Option<&str>, bool)> {
+pub(crate) fn source(layer: &Layer) -> Option<(&str, Option<&str>, bool)> {
     if let Some(edit) = &layer.gpkg {
         rustgis_engine::map::paths::is_local(&edit.path).then_some((edit.path.as_str(), Some(edit.table.as_str()), true))
     } else {

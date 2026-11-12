@@ -197,8 +197,6 @@ In the order of the work: add data, style it, edit it, analyse it, lay it out an
 ### Add data
 - Georeferencer: side-by-side window, transform picker, more formats
   ([#609](https://github.com/opengeos/RustGIS/issues/609)).
-- Noticing when a linked file or tile archive changes on disk, and offering to reload it (Reload
-  Data does it by hand; [#1477](https://github.com/opengeos/RustGIS/issues/1477)).
 - GeoTIFF transparency masks ([#1564](https://github.com/opengeos/RustGIS/issues/1564)).
 - ArcGIS: browsing a signed-in portal's own content (Hub search, sign-in and adding by address
   work today); Esri JSON for layers that offer neither protocol buffers nor GeoJSON (older

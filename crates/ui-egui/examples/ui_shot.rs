@@ -28,6 +28,9 @@
 //! The window opens the World Atlas sample.
 //! `"readsOffFrame": true` on the first line runs Add Data, Load All, models and scripts on a
 //! thread of their own, as the desktop app does (the status bar shows the run and Cancel).
+//! `"watchFiles": true` on the first line watches linked files for changes, as the desktop app
+//! does; `{"copy": [from, to]}` replaces `to` with a copy of `from` (written beside it, then
+//! renamed over it) and `{"remove": path}` deletes a file, as another program would.
 //! `"recovery": "/abs/dir"` on the first line gives the run that recovery folder, as the desktop
 //! app has one (Settings › Autosave; a copy left there is offered by the recovery dialog).
 //!
@@ -155,6 +158,8 @@ fn main() {
     let mut app = RustGisApp::with_sample();
     // As the desktop app does: Add Data, Load All, models and scripts run on a thread of their own.
     app.reads_off_frame = lines.first().and_then(|l| l.get("readsOffFrame")).and_then(Value::as_bool).unwrap_or(false);
+    // As the desktop app does: linked files changed on disk are reported (#1477).
+    app.watch_files = lines.first().and_then(|l| l.get("watchFiles")).and_then(Value::as_bool).unwrap_or(false);
     if let Some(dir) = lines.first().and_then(|l| l.get("recovery")).and_then(Value::as_str) {
         let store = rustgis_ui_egui::FolderStore::open(std::path::Path::new(dir)).expect("recovery folder");
         app = app.with_services(rustgis_ui_egui::Services { recovery: Some(Box::new(store)), ..Default::default() });
@@ -231,6 +236,17 @@ fn main() {
                     println!("{p}");
                 }
                 Err(e) => eprintln!("render failed: {e}"),
+            }
+        } else if let Some([from, to]) = l.get("copy").and_then(Value::as_array).map(Vec::as_slice) {
+            // Another program replacing a file: write beside it, then rename over it.
+            let (from, to) = (from.as_str().unwrap_or_default(), to.as_str().unwrap_or_default());
+            let beside = format!("{to}.ui_shot-copy");
+            if let Err(e) = std::fs::copy(from, &beside).and_then(|_| std::fs::rename(&beside, to)) {
+                eprintln!("copy {from} → {to}: {e}");
+            }
+        } else if let Some(path) = l.get("remove").and_then(Value::as_str) {
+            if let Err(e) = std::fs::remove_file(path) {
+                eprintln!("remove {path}: {e}");
             }
         } else if let Some(ms) = l.get("sleep").and_then(|v| v.as_u64()) {
             // Real time passing, for work off the frame (downloads, the AI assistant's model).

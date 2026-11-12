@@ -18,7 +18,17 @@ pub struct ExportJob {
     started: exports::Started,
     name: &'static str,
     control: Arc<Control>,
-    slot: crate::Slot<Result<Wrote, String>>,
+    /// What it wrote (or why it failed), and the watched file it wrote into as looked at on its
+    /// thread just before and after.
+    slot: crate::Slot<(Result<Wrote, String>, Option<crate::diskwatch::Write>)>,
+    /// The watched file it writes, if any: what scans see there meanwhile is RustGIS's own write.
+    writes: Option<String>,
+}
+
+/// The watched file the export under way writes into: what scans see there meanwhile is the
+/// export's own work, not another program's.
+pub(crate) fn writing(app: &RustGisApp) -> Option<&str> {
+    app.export_job.as_ref()?.writes.as_deref()
 }
 
 /// Refuses another export while one runs, whichever way it would run (one at a time).
@@ -33,6 +43,10 @@ pub fn idle(app: &RustGisApp) -> Result<(), String> {
 /// time: a second is refused while the first runs.
 pub fn start(app: &mut RustGisApp, command: &'static str, p: Value) -> Result<Value, String> {
     idle(app)?;
+    // Which watched file it writes is known here; the file itself is looked at on its thread,
+    // where a stalled drive holds only the export.
+    let mut write = crate::diskwatch::plan_write(app, command, &p);
+    let writes = write.as_ref().map(|w| w.key().to_string());
     let run = exports::export_start(&mut app.session, command, &p)?;
     let (started, name) = (run.started(), run.name);
     // Cancel stops it.
@@ -45,12 +59,18 @@ pub fn start(app: &mut RustGisApp, command: &'static str, p: Value) -> Result<Va
         .name(name.into())
         .spawn(move || {
             let _diagnostics = diagnostics.enter();
+            if let Some(w) = write.as_mut() {
+                w.observe_before();
+            }
             let wrote = run.run(&ctl);
+            if let Some(w) = write.as_mut() {
+                w.observe_after();
+            }
             // Filled even when its lock is poisoned, or the export would show as running forever.
-            *out.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(wrote);
+            *out.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((wrote, write));
         })
         .map_err(|e| e.to_string())?;
-    app.export_job = Some(ExportJob { started, name, control, slot });
+    app.export_job = Some(ExportJob { started, name, control, slot, writes });
     Ok(json!({"started": name}))
 }
 
@@ -59,12 +79,16 @@ pub fn start(app: &mut RustGisApp, command: &'static str, p: Value) -> Result<Va
 pub fn land(app: &mut RustGisApp) -> bool {
     let Some(job) = &app.export_job else { return false };
     let done = job.slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
-    let Some(done) = done else { return true };
+    let Some((done, write)) = done else { return true };
     let started = job.started.clone();
     app.export_job = None;
     // Its notices (a failure among them) are the command's; the answer was for a script, which
     // waits for its own.
-    let _ = exports::export_land(&mut app.session, started, done);
+    if let Ok(answer) = exports::export_land(&mut app.session, started, done)
+        && let Some(write) = write
+    {
+        crate::diskwatch::wrote(app, write, &answer);
+    }
     false
 }
 

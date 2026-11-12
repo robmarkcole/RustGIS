@@ -355,8 +355,10 @@ fetches them again.
 right-click its row in Layers and choose **Reload Data** (**Reload Tile Archive** in Command
 Search). CLI, Python, MCP and the Assistant use
 `map.reloadTiles={"index":0}`; `"name"` or catalog `"id"` can select the archive instead.
-No replacement path is accepted. This is a manual action: RustGIS does not watch the file for changes.
-It rereads that archive's metadata and tiles without clearing other archives or web layers.
+No replacement path is accepted. The desktop app also watches the archive (and an MBTiles file's
+`-wal` and `-journal`) and marks its row **(changed on disk)** with a notification offering
+**Reload Data**; see [Changed on disk](index.md#reload-data). RustGIS doesn't reload it until you choose.
+Reload rereads that archive's metadata and tiles without clearing other archives or web layers.
 The layer keeps its name, visibility, opacity, blend, drawing order, source-layer visibility,
 style and other presentation settings; the map's view stays where it is. Undo cannot restore
 file contents that another program has overwritten.

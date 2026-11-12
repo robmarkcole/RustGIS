@@ -661,6 +661,8 @@ fn main() -> eframe::Result {
     let mut app = app.with_services(services);
     // Add Data and Load All read on a thread of their own, so a large file doesn't hold the window.
     app.reads_off_frame = true;
+    // Linked local files changed by another program are reported, with Reload Data (#1477).
+    app.watch_files = true;
     // Settings › Start-up; `--sample` still opens the sample.
     let blank = if args.iter().any(|a| a == "--sample") { Some(false) } else { (!files.is_empty()).then_some(true) };
     if let Err(e) = app.start(&rustgis_ui_egui::Start { blank, after_crash: unclean, ..Default::default() }) {

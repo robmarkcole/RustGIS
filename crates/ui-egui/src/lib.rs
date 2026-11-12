@@ -31,6 +31,8 @@ mod cswui;
 mod cubesui;
 mod diagnosticlog;
 mod dialogs;
+#[cfg(not(target_arch = "wasm32"))]
+mod diskwatch;
 mod docpanes;
 mod earthaccessui;
 mod editpanes;
@@ -1108,6 +1110,13 @@ pub struct RustGisApp {
     /// Add Data and Load All Features read on a thread of their own (the desktop app; see
     /// [`readjob`]). Off, as for tests and the examples, they read as the command runs.
     pub reads_off_frame: bool,
+    /// Watches linked local files for changes made outside RustGIS and offers Reload Data
+    /// (the desktop app; see [`diskwatch`]). Off for tests, unless one turns it on (as `ui_shot`'s
+    /// `watchFiles` does).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub watch_files: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    diskwatch: diskwatch::Watch,
     /// ModelBuilder's view: the model on its canvas.
     pub mb: modelbuilder::ModelBuilder,
     pub ws: workspacepanes::WorkspaceState,
@@ -1363,6 +1372,10 @@ impl RustGisApp {
             #[cfg(not(target_arch = "wasm32"))]
             reads: readjob::Reads::default(),
             reads_off_frame: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            watch_files: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            diskwatch: diskwatch::Watch::default(),
             mb: modelbuilder::ModelBuilder::default(),
             ws: workspacepanes::WorkspaceState::default(),
             time: timebar::TimeBarState::default(),
@@ -2449,6 +2462,14 @@ impl RustGisApp {
             AppDispatch::ResolvedTiles { crossed_origin, .. } => Some(*crossed_origin),
             _ => None,
         };
+        // What a watched file a save or export writes holds just before it does.
+        #[cfg(not(target_arch = "wasm32"))]
+        let before_write = diskwatch::before_write(self, id, &params);
+        // Discard Edits reads its table as it runs: what the file holds now is what it reads.
+        #[cfg(not(target_arch = "wasm32"))]
+        if id == "gpkg.discardEdits" {
+            diskwatch::reading(self, id, &params);
+        }
         let mut r = match dispatch {
             AppDispatch::Prepared(prepared) => self.session.run_prepared(*prepared),
             AppDispatch::InPlace(id) => self.session.add_in_place_for(id, &params),
@@ -2463,6 +2484,13 @@ impl RustGisApp {
             AppDispatch::Direct => self.session.run(id, &params),
         };
         r = self.deliver_gp_files(r);
+        // A reload acknowledges what it read; a save into a watched file is RustGIS's own write.
+        #[cfg(not(target_arch = "wasm32"))]
+        match &r {
+            Ok(answer) => diskwatch::ran(self, id, &params, answer, before_write),
+            Err(_) if matches!(id, "layer.reloadData" | "map.reloadTiles" | "gpkg.discardEdits") => diskwatch::not_read(self, id, &params),
+            Err(_) => {}
+        }
         if r.is_ok() && id == "tool.set" {
             self.map.cancel_sketch();
             // Esc chooses Explore: a plugin's pick stops waiting for the map, as for any tool.
@@ -5494,6 +5522,10 @@ impl RustGisApp {
         self.note_last_project();
         saveprompt::close_requested(self, ctx);
         autosave::tick(self, ctx);
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.watch_files {
+            diskwatch::tick(self, ctx);
+        }
         self.ensure_script_font();
         // Fonts downloaded by the web app.
         let fonts: Vec<(String, Vec<u8>)> = match &self.services.font_inbox {
@@ -5721,6 +5753,10 @@ impl RustGisApp {
         mapview::confirm_delete(self, &ctx);
         autosave::offer(self, &ctx);
         saveprompt::show(self, &ctx);
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.watch_files {
+            diskwatch::show(self, &ctx);
+        }
         pluginsui::show(self, &ctx);
         extensionsui::show(self, &ctx);
         plugindialog::show(self, &ctx);
