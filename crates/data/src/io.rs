@@ -372,7 +372,7 @@ fn check_size(path: &Path) -> Result<()> {
 }
 
 /// The field KML and GPX name placemarks by: one called `name`, if any.
-fn name_field(ds: &Dataset) -> Option<usize> {
+pub fn name_field(ds: &Dataset) -> Option<usize> {
     ds.fields.iter().position(|f| f.name.eq_ignore_ascii_case("name"))
 }
 
@@ -516,7 +516,7 @@ fn projected_bytes(ds: &Dataset, ext: &str, crs: Crs) -> Result<(Vec<u8>, usize)
             let kml = crate::interop::to_kml(ds, name_field(ds))?.into_bytes();
             (crate::zip::write(&[("doc.kml".to_string(), kml)]).map_err(DataError::Format)?, without_geometry(ds))
         }
-        "gpx" => (crate::interop::to_gpx(ds, name_field(ds))?.into_bytes(), without_geometry(ds)),
+        "gpx" => (crate::interop::to_gpx(ds, name_field(ds))?.into_bytes(), gpx_left_out(ds)),
         "shp" | "zip" => {
             let (parts, left_out) = shapefile_parts_in(ds, crs)?;
             let base: String = ds.name.chars().map(|c| if c.is_alphanumeric() || matches!(c, '-' | '_' | ' ') { c } else { '_' }).collect();
@@ -2686,6 +2686,128 @@ pub fn left_out_note(name: &str, ext: &str, left_out: usize) -> Option<String> {
     })
 }
 
+/// What CSV can't hold of a layer's geometry: it has a point a row (a point layer's longitude
+/// and latitude, see [`CsvWriter`]), and no geometry for a line or polygon layer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CsvLosses {
+    /// Features of a point layer with more than one point (a multipoint), or another shape,
+    /// written as one point.
+    pub as_one_point: usize,
+    /// Features whose geometry isn't written: in a line or polygon layer (or one that declares
+    /// no type), and in a point layer those with no point to write (an empty multipoint).
+    pub unwritten: usize,
+}
+
+impl CsvLosses {
+    /// The losses of `features` in a layer of type `gt`; a streamed export adds up its chunks'.
+    pub fn of(features: &[crate::Feature], gt: GeometryType) -> Self {
+        let mut out = Self::default();
+        for g in features.iter().filter_map(|f| f.geometry.as_ref()) {
+            match (gt, g) {
+                (GeometryType::Point, Geometry::Point(_)) => {}
+                // No point to write: its coordinate cells are left empty.
+                (GeometryType::Point, g) if g.label_point().is_none() => out.unwritten += 1,
+                (GeometryType::Point, Geometry::MultiPoint(v)) if v.len() <= 1 => {}
+                (GeometryType::Point, _) => out.as_one_point += 1,
+                // A layer of lines or polygons, or one that declares no type: no coordinates.
+                _ => out.unwritten += 1,
+            }
+        }
+        out
+    }
+
+    /// One notice for each loss of a layer written to `target`; none without loss. Geometry
+    /// not written is counted by feature, whatever its kind: a layer of one type can hold others.
+    pub fn notes(self, target: &str) -> Vec<String> {
+        let mut notes = Vec::new();
+        if self.as_one_point > 0 {
+            let what = if self.as_one_point == 1 { "1 feature has".to_string() } else { format!("{} features have", self.as_one_point) };
+            notes.push(format!(
+                "{target}: {what} more than one point (a multipoint, line or polygon) and was written as one, as CSV holds a point a row"
+            ));
+        }
+        if self.unwritten > 0 {
+            let what = if self.unwritten == 1 { "1 feature".to_string() } else { format!("{} features", self.unwritten) };
+            notes.push(format!("{target}: CSV holds a point a row, so the geometry of {what} wasn't written, only the attributes"));
+        }
+        notes
+    }
+}
+
+impl std::ops::AddAssign for CsvLosses {
+    /// Adds a chunk's losses.
+    fn add_assign(&mut self, other: Self) {
+        self.as_one_point += other.as_one_point;
+        self.unwritten += other.unwritten;
+    }
+}
+
+/// What a CSV or GPX file (extension `ext`) of the whole dataset `ds` can't hold, written to
+/// `target`: [`CsvLosses`]' notices, or [`gpx_notes`] with each feature named from `name_field`;
+/// none for another format. A streamed export counts CSV's a chunk at a time instead.
+pub fn export_losses_notes(ds: &Dataset, ext: &str, name_field: Option<usize>, target: &str) -> Vec<String> {
+    match ext {
+        "csv" => CsvLosses::of(&ds.features, ds.geometry_type).notes(target),
+        "gpx" => gpx_notes(ds, name_field, target),
+        _ => Vec::new(),
+    }
+}
+
+/// Features a GPX file of `ds` leaves out: those without geometry, and multipoints without a
+/// point, which give no waypoint.
+pub fn gpx_left_out(ds: &Dataset) -> usize {
+    let empty = |g: &Option<Geometry>| match g {
+        None => true,
+        Some(Geometry::MultiPoint(v)) => v.is_empty(),
+        Some(_) => false,
+    };
+    ds.features.iter().filter(|f| empty(&f.geometry)).count()
+}
+
+/// What a GPX file of `ds` can't hold, each feature named from field `name_field`: other
+/// fields' values, polygons (written as tracks along their outer rings, holes left out) and
+/// multipoints (a waypoint per point). One notice per kind; none for a layer GPX holds whole.
+pub fn gpx_notes(ds: &Dataset, name_field: Option<usize>, target: &str) -> Vec<String> {
+    let drawn = || ds.features.iter().filter(|f| f.geometry.is_some());
+    let fields: Vec<&str> = (ds.fields.iter().enumerate())
+        .filter(|(k, _)| Some(*k) != name_field)
+        .filter(|(k, _)| drawn().any(|f| f.attrs.get(*k).is_some_and(|v| !v.is_null())))
+        .map(|(_, f)| f.name.as_str())
+        .collect();
+    let (mut polygons, mut holes, mut multipoints) = (0, 0, 0);
+    for g in drawn().filter_map(|f| f.geometry.as_ref()) {
+        match g {
+            Geometry::Polygon(polys) => {
+                polygons += 1;
+                holes += polys.iter().map(|rings| rings.len().saturating_sub(1)).sum::<usize>();
+            }
+            Geometry::MultiPoint(v) if v.len() > 1 => multipoints += 1,
+            _ => {}
+        }
+    }
+    let mut notes = Vec::new();
+    if !fields.is_empty() {
+        let names: Vec<_> = fields.iter().take(5).map(|s| format!("'{}'", dbf_notice_name(s))).collect();
+        let more = if fields.len() > 5 { format!(" and {} more", fields.len() - 5) } else { String::new() };
+        let what = if fields.len() == 1 { "1 field wasn't" } else { "fields weren't" };
+        notes.push(format!("{target}: GPX holds a name for each feature, so {what} written: {}{more}", names.join(", ")));
+    }
+    if polygons > 0 {
+        let what = if polygons == 1 { "1 polygon was".to_string() } else { format!("{polygons} polygons were") };
+        let left = match holes {
+            0 => String::new(),
+            1 => ", and 1 hole left out".to_string(),
+            n => format!(", and {n} holes left out"),
+        };
+        notes.push(format!("{target}: GPX has no areas, so {what} written as tracks along their outer edges{left}"));
+    }
+    if multipoints > 0 {
+        let what = if multipoints == 1 { "1 multipoint was".to_string() } else { format!("{multipoints} multipoints were") };
+        notes.push(format!("{target}: {what} written as a waypoint for each of its points"));
+    }
+    notes
+}
+
 /// Whether [`shapefile_parts_in`] writes a feature with geometry `g` to a layer of type `gt`: one
 /// of the layer's kind with something drawable (a finite point, a line part of two finite points,
 /// a polygon whose outer ring has three).
@@ -3973,6 +4095,38 @@ mod tests {
         assert_eq!(rep.skipped, 1);
         assert_eq!(ds.features[0].geometry, Some(Geometry::Point(Coord::new(20.0, 10.0))));
         assert!(to_csv(&ds).unwrap().contains("longitude"));
+    }
+
+    /// A layer that declares no geometry type gets no coordinate columns, so geometry it holds
+    /// is counted as not written, as for a line or polygon layer; a point layer's points aren't.
+    #[test]
+    fn csv_losses_count_geometry_a_layer_without_a_type_holds() {
+        let square =
+            Geometry::Polygon(vec![vec![vec![Coord::new(0.0, 0.0), Coord::new(1.0, 0.0), Coord::new(1.0, 1.0), Coord::new(0.0, 0.0)]]]);
+        let mut ds = Dataset::new("t", GeometryType::None, vec![]);
+        ds.push(Some(square), vec![]);
+        ds.push(None, vec![]);
+        let losses = CsvLosses::of(&ds.features, ds.geometry_type);
+        assert_eq!(losses, CsvLosses { as_one_point: 0, unwritten: 1 });
+        assert!(losses.notes("t.csv")[0].contains("the geometry of 1 feature wasn't written"));
+        assert!(!to_csv(&ds).unwrap().contains("longitude"));
+        let points = [crate::Feature { id: 0, geometry: Some(Geometry::Point(Coord::new(1.0, 2.0))), attrs: vec![] }];
+        assert_eq!(CsvLosses::of(&points, GeometryType::Point), CsvLosses::default());
+        // A multipoint without a point in a point layer gets empty coordinate cells.
+        let empty = [crate::Feature { id: 1, geometry: Some(Geometry::MultiPoint(vec![])), attrs: vec![] }];
+        assert_eq!(CsvLosses::of(&empty, GeometryType::Point), CsvLosses { as_one_point: 0, unwritten: 1 });
+    }
+
+    /// GPX leaves out a feature without geometry and a multipoint without a point (no waypoint
+    /// for it), and counts both; a point is written.
+    #[test]
+    fn gpx_counts_a_multipoint_without_points_as_left_out() {
+        let mut ds = Dataset::new("t", GeometryType::Point, vec![]);
+        ds.push(Some(Geometry::Point(Coord::new(1.0, 2.0))), vec![]);
+        ds.push(Some(Geometry::MultiPoint(vec![])), vec![]);
+        ds.push(None, vec![]);
+        assert_eq!(gpx_left_out(&ds), 2);
+        assert_eq!(write_bytes(&ds, "gpx").unwrap().1, 2);
     }
 
     #[test]

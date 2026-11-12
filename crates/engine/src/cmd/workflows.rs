@@ -1590,8 +1590,8 @@ fn similar(s: &mut Session, p: &Value) -> CmdResult {
 }
 
 /// Converts a layer to GeoJSON, CSV, KML, GPX or WKT text, written to `path` or returned; says when
-/// the layer's Z or M values were dropped on import, or its positions are approximate or aren't
-/// longitude/latitude.
+/// the layer's Z or M values were dropped on import, its positions are approximate or aren't
+/// longitude/latitude, or CSV, KML or GPX couldn't hold some of it.
 fn convert(s: &mut Session, p: &Value) -> CmdResult {
     let ds = feature_ds(s, p)?;
     let name_field =
@@ -1605,7 +1605,16 @@ fn convert(s: &mut Session, p: &Value) -> CmdResult {
         f => return Err(format!("unknown format '{f}'")),
     };
     // Every format here is longitude/latitude.
-    let notes = rustgis_data::export_notes([(ds, ds.extent())], ps(p, "path").unwrap_or(&ds.name), rustgis_data::raster::Crs::LonLat);
+    let target = ps(p, "path").unwrap_or(&ds.name);
+    let mut notes = rustgis_data::export_notes([(ds, ds.extent())], target, rustgis_data::raster::Crs::LonLat);
+    // CSV holds a point a row, GPX a name for each feature and no areas.
+    notes.extend(rustgis_data::io::export_losses_notes(ds, ps(p, "format").unwrap_or(""), name_field, target));
+    // KML and GPX hold features with geometry only.
+    if let Some(ext @ ("kml" | "gpx")) = ps(p, "format") {
+        let without =
+            if ext == "gpx" { rustgis_data::io::gpx_left_out(ds) } else { ds.features.iter().filter(|f| f.geometry.is_none()).count() };
+        notes.extend(rustgis_data::io::left_out_note(target, ext, without));
+    }
     let out = match ps(p, "path") {
         Some(path) => {
             rustgis_data::io::write_atomic(std::path::Path::new(path), text.as_bytes()).map_err(|e| format!("{path}: {e}"))?;

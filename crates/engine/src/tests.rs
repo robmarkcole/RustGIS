@@ -19368,6 +19368,97 @@ fn blank_project_starts_in_a_projected_crs() {
     assert!(crate::cmd::share::map_png(&mut s, Some(400.0), Some(300.0), None).unwrap().len() > 1000);
 }
 
+/// CSV and GPX exports say what the format couldn't hold (a line layer's geometry and a
+/// multipoint's other points in CSV; other fields, polygons' holes and multipoints in GPX), and
+/// Data Interop's KML and GPX the rows without geometry, and Export Table the same for a table
+/// that keeps geometry; a layer or table each holds whole gets no such notice.
+#[test]
+fn csv_and_gpx_exports_say_what_they_leave_out() {
+    use rustgis_data::{Coord, Dataset, Field, FieldType, Geometry, GeometryType, Value as V};
+    let dir = std::env::temp_dir().join(format!("rustgis-engine-csv-gpx-losses-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let square = |x: f64, hole: bool| {
+        let ring = |a: f64, b: f64| vec![Coord::new(a, a), Coord::new(b, a), Coord::new(b, b), Coord::new(a, b), Coord::new(a, a)];
+        let mut rings = vec![ring(x, x + 4.0)];
+        if hole {
+            rings.push(ring(x + 1.0, x + 2.0));
+        }
+        Geometry::Polygon(vec![rings])
+    };
+    let layer = |name: &str, kind, rows: Vec<(Geometry, Vec<V>)>| {
+        let mut ds = Dataset::new(name, kind, vec![Field::new("name", FieldType::Text), Field::new("height", FieldType::Double)]);
+        for (g, a) in rows {
+            ds.push(Some(g), a);
+        }
+        ds
+    };
+    let mut s = Session::new(Project::default());
+    s.map_mut().add_dataset(layer("Areas", GeometryType::Polygon, vec![(square(0.0, true), vec![V::Text("A".into()), V::Float(2.5)])]));
+    let pts = vec![
+        (Geometry::Point(Coord::new(1.0, 2.0)), vec![V::Text("P".into()), V::Null]),
+        (Geometry::MultiPoint(vec![Coord::new(3.0, 4.0), Coord::new(5.0, 6.0)]), vec![V::Text("M".into()), V::Null]),
+    ];
+    s.map_mut().add_dataset(layer("Sites", GeometryType::Point, pts));
+    let clean = vec![(Geometry::Point(Coord::new(1.0, 2.0)), vec![V::Text("P".into()), V::Null])];
+    s.map_mut().add_dataset(layer("Clean", GeometryType::Point, clean));
+    let said = |s: &mut Session, id: &str, p: Value| {
+        let mark = s.notices.len();
+        s.run(id, &p).unwrap();
+        s.notices[mark..].iter().map(|n| n.text.clone()).filter(|t| !t.starts_with("Exported ")).collect::<Vec<_>>()
+    };
+    let out = |name: &str| dir.join(name).display().to_string();
+    let n = said(&mut s, "share.exportLayer", json!({"layer": "Areas", "path": out("areas.csv")}));
+    assert!(n.len() == 1 && n[0].contains("the geometry of 1 feature wasn't written"), "{n:?}");
+    let n = said(&mut s, "share.exportLayer", json!({"layer": "Sites", "path": out("sites.csv")}));
+    assert!(n.len() == 1 && n[0].contains("1 feature has more than one point"), "{n:?}");
+    let n = said(&mut s, "share.exportLayer", json!({"layer": "Areas", "path": out("areas.gpx")}));
+    assert_eq!(n.len(), 2, "{n:?}");
+    assert!(
+        n[0].contains("1 field wasn't written: 'height'")
+            && n[1].contains("1 polygon was written as tracks")
+            && n[1].contains("1 hole left out"),
+        "{n:?}"
+    );
+    let n = said(&mut s, "share.exportLayer", json!({"layer": "Sites", "path": out("sites.gpx")}));
+    assert!(n.len() == 1 && n[0].contains("1 multipoint was written as a waypoint for each"), "{n:?}");
+    let n = said(&mut s, "data.convert", json!({"layer": "Areas", "format": "gpx"}));
+    assert!(n.iter().any(|t| t.contains("'height'")) && n.iter().any(|t| t.contains("tracks")), "{n:?}");
+    let n = said(&mut s, "data.convert", json!({"layer": "Areas", "format": "csv"}));
+    assert!(n.iter().any(|t| t.contains("wasn't written, only the attributes")), "{n:?}");
+    // A row without geometry, which KML and GPX can't hold, is counted.
+    let mut rows = layer("Rows", GeometryType::Point, vec![(Geometry::Point(Coord::new(1.0, 2.0)), vec![V::Text("P".into()), V::Null])]);
+    rows.push(None, vec![V::Text("no place".into()), V::Null]);
+    s.map_mut().add_dataset(rows);
+    for format in ["kml", "gpx"] {
+        let n = said(&mut s, "data.convert", json!({"layer": "Rows", "format": format}));
+        assert!(n.len() == 1 && n[0].contains("1 features without drawable geometry were left out"), "{format}: {n:?}");
+    }
+    // A standalone table keeps geometry too: Export Table says the same, and nothing for a clean one.
+    let areas = layer("Area table", GeometryType::Polygon, vec![(square(0.0, true), vec![V::Text("A".into()), V::Float(2.5)])]);
+    let points =
+        layer("Point table", GeometryType::Point, vec![(Geometry::Point(Coord::new(1.0, 2.0)), vec![V::Text("P".into()), V::Null])]);
+    s.project.tables.push(crate::project::Table { id: 9001, dataset: areas });
+    s.project.tables.push(crate::project::Table { id: 9002, dataset: points });
+    let n = said(&mut s, "share.exportTable", json!({"table": 9001, "path": out("table.csv")}));
+    assert!(n.len() == 1 && n[0].contains("the geometry of 1 feature wasn't written"), "{n:?}");
+    let n = said(&mut s, "share.exportTable", json!({"table": 9001, "path": out("table.gpx")}));
+    assert!(n.iter().any(|t| t.contains("'height'")) && n.iter().any(|t| t.contains("1 hole left out")), "{n:?}");
+    for ext in ["csv", "gpx"] {
+        let n = said(&mut s, "share.exportTable", json!({"table": 9002, "path": out(&format!("clean-table.{ext}"))}));
+        assert_eq!(n, Vec::<String>::new(), "{ext}");
+    }
+    // Points alone, their other field empty: CSV and GPX hold them whole.
+    for ext in ["csv", "gpx"] {
+        assert_eq!(
+            said(&mut s, "share.exportLayer", json!({"layer": "Clean", "path": out(&format!("clean.{ext}"))})),
+            Vec::<String>::new()
+        );
+        assert_eq!(said(&mut s, "data.convert", json!({"layer": "Clean", "format": ext})), Vec::<String>::new());
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn exporting_features_refuses_to_replace_an_existing_geopackage() {
     let dir = std::env::temp_dir().join(format!("rustgis-engine-gpkg-preserve-{}", std::process::id()));

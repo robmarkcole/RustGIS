@@ -171,6 +171,8 @@ fn a_streamed_export_writes_what_a_whole_export_writes() {
                     null_numbers: 0,
                     unfit,
                     beyond_web_mercator: 0,
+                    // Counted over the chunks as the whole layer counts it.
+                    csv: if ext == "csv" { crate::io::CsvLosses::of(&whole.features, whole.geometry_type) } else { Default::default() },
                 };
                 assert_eq!(streamed, expected, "{what}");
                 let (a, b) = (read_back(&a), read_back(&b));
