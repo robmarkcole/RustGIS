@@ -1874,19 +1874,25 @@ pub(crate) fn mosaic_work(s: &Session, p: &Value) -> Result<super::workflows::Wo
         return Err(format!("the mosaic would be {cols} × {rows} cells; set a larger cell size in the workspace options"));
     }
     let nb = imgs.iter().map(|r| r.band_count()).min().unwrap_or(1).min(if w.kind == "reality" { 1 } else { 4 });
+    // The images with bands left out, the first five named.
+    let omitted_count = imgs.iter().filter(|r| r.band_count() > nb).count();
     let omitted: Vec<String> = w
         .images
         .iter()
         .zip(&imgs)
         .filter(|(_, r)| r.band_count() > nb)
+        .take(5)
         .map(|(name, r)| {
-            let bands = ((nb + 1)..=r.band_count()).map(|b| b.to_string()).collect::<Vec<_>>().join(", ");
+            // A range, however many bands: a one-band reality mosaic can leave out thousands.
+            let bands = if r.band_count() == nb + 1 { (nb + 1).to_string() } else { format!("{}–{}", nb + 1, r.band_count()) };
             format!("'{name}': band(s) {bands}")
         })
         .collect();
     let mut messages: Vec<String> = Vec::new();
     if !omitted.is_empty() {
-        messages.push(format!("{} image(s) have bands omitted from the {nb}-band mosaic: {}", omitted.len(), omitted.join("; ")));
+        // The count is of every image left out; only the first five are named.
+        let more = if omitted_count > omitted.len() { "; …" } else { "" };
+        messages.push(format!("{omitted_count} image(s) have bands omitted from the {nb}-band mosaic: {}{more}", omitted.join("; ")));
     }
     // A band's wavelength is the images' when they all give it the same one; else it has none,
     // and that is said.

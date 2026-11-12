@@ -19,6 +19,8 @@ use crate::{DataError, Result};
 
 /// The most images (the full one and its overviews) looked at.
 const MAX_LEVELS: usize = 32;
+/// Most images passed over while looking for overviews.
+const MAX_SKIPPED: usize = 64;
 /// The most tiles an image may have.
 const MAX_TILES: usize = 4 << 20;
 /// How many tiles all the levels hold together (their offsets and lengths are kept, 16 bytes a
@@ -435,10 +437,18 @@ fn read_layout(r: Sparse) -> Result<Parse> {
     let full_samples = dec.find_tag_unsigned::<u16>(Tag::SamplesPerPixel).ok().flatten().unwrap_or(1);
     let mut mismatched: Vec<String> = Vec::new();
     let mut mismatched_count = 0usize;
+    // Images passed over (not overviews, or with another sample count).
+    let mut skipped = 0usize;
     loop {
         let subfile = dec.find_tag_unsigned::<u32>(Tag::NewSubfileType).ok().flatten().unwrap_or(0);
-        // Transparency masks are skipped.
-        if subfile & 4 == 0 {
+        // Transparency masks are skipped, and count toward the scan's bound.
+        if subfile & 4 != 0 {
+            skipped += 1;
+            if skipped >= MAX_SKIPPED && dec.more_images() {
+                lost.push(format!("the scan for overviews stopped after {skipped} skipped images: later images aren't read"));
+                break;
+            }
+        } else {
             let Some(tw) = dec.find_tag_unsigned::<u32>(Tag::TileWidth).ok().flatten() else {
                 if index == 0 {
                     return Ok(Parse::NotTiled("a GeoTIFF in strips is read whole".into()));
@@ -447,6 +457,32 @@ fn read_layout(r: Sparse) -> Result<Parse> {
             };
             let th = dec.find_tag_unsigned::<u32>(Tag::TileLength).ok().flatten().unwrap_or(tw);
             let (w, h) = dec.dimensions().map_err(err)?;
+            // An image no smaller than the level before isn't an overview of it. A level decodes
+            // as the full image does, with as many samples: an overview with another count (three
+            // of an RGBI image's four) is left out, and said. Either is skipped before its tile
+            // size is checked or its tiles count against the budget.
+            let samples = dec.find_tag_unsigned::<u16>(Tag::SamplesPerPixel).ok().flatten().unwrap_or(1);
+            let overview = levels.last().is_none_or(|l: &Level| w < l.width);
+            if !overview || samples != full_samples {
+                if overview {
+                    mismatched_count += 1;
+                    if mismatched.len() < 5 {
+                        mismatched.push(format!("image {index} ({samples})"));
+                    }
+                }
+                skipped += 1;
+                if !dec.more_images() {
+                    break;
+                }
+                // The scan is bounded: past so many skipped images, the rest aren't read, and said.
+                if skipped >= MAX_SKIPPED {
+                    lost.push(format!("the scan for overviews stopped after {skipped} skipped images: later images aren't read"));
+                    break;
+                }
+                dec.next_image().map_err(err)?;
+                index += 1;
+                continue;
+            }
             if tw == 0 || th == 0 || (tw as usize).saturating_mul(th as usize).saturating_mul(per_chunk) > MAX_TILE_SAMPLES {
                 return Err(err(format!("tiles of {tw} × {th} pixels")));
             }
@@ -461,20 +497,7 @@ fn read_layout(r: Sparse) -> Result<Parse> {
             // Entries past the image's tiles aren't kept.
             offsets.truncate(n);
             counts.truncate(n);
-            // An overview a little larger than the one before isn't an overview of it.
-            if levels.last().is_none_or(|l: &Level| w < l.width) {
-                // A level decodes as the full image does, with as many samples: an overview with
-                // another count (three of an RGBI image's four) is left out, and said.
-                let samples = dec.find_tag_unsigned::<u16>(Tag::SamplesPerPixel).ok().flatten().unwrap_or(1);
-                if samples == full_samples {
-                    levels.push(Level { ifd: index, width: w, height: h, tile_width: tw, tile_height: th, offsets, counts });
-                } else {
-                    mismatched_count += 1;
-                    if mismatched.len() < 5 {
-                        mismatched.push(format!("image {index} ({samples})"));
-                    }
-                }
-            }
+            levels.push(Level { ifd: index, width: w, height: h, tile_width: tw, tile_height: th, offsets, counts });
         }
         if levels.len() >= MAX_LEVELS || !dec.more_images() {
             break;
