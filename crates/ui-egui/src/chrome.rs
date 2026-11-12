@@ -355,6 +355,7 @@ pub fn status_bar(app: &mut RustGisApp, ui: &mut Ui) {
                     sep(ui, &t);
                     crate::readjob::status(app, ui, &t);
                 }
+                crate::geocodeui::status(app, ui);
                 // Downloads and windows being read off the frame, each with its Cancel.
                 if !app.ui.downloads.is_empty() || window_reads_under_way(app) {
                     sep(ui, &t);

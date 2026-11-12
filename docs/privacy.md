@@ -70,7 +70,7 @@ still identify private data, so review copied diagnostics before sharing them.
 
 - **Locate › By Place or Address** and place search send your query to OpenStreetMap's Nominatim by default.
   **By Place or Address** and **Geocode Addresses** can also use Komoot's Photon, PDOK's Locatieserver (the
-  Netherlands) or a server you specify;
+  Netherlands), the U.S. Census Bureau (U.S. addresses), or a server you specify;
   geocoding sends the address values you choose from your table or layer.
 - **Directions** sends the route's start, stops and destination to FOSSGIS's public Valhalla
   server by default. The Directions pane asks for consent before sending places and remembers

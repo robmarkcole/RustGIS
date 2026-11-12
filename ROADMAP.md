@@ -272,7 +272,7 @@ attributes kept.
   estimated from the points and extent today, not fitted; `kriging.rs`).
 - Charts linked to the selection: histogram, scatter, bar and box plots of a layer's fields.
 - H3 grids built in, next to the A5 grids _(open)_.
-- Reverse geocoding, and the US Census geocoder beside Nominatim and Photon; a DEM downloader so
+- Reverse geocoding; a DEM downloader so
   viewshed works without a loaded elevation raster _(open)_.
 - Reference results for zonal statistics and the terrain tools, beside the existing analysis
   reference cases _(open)_.

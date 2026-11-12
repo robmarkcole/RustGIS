@@ -25,6 +25,10 @@ pub struct State {
     /// Whether a search is under way.
     pub searching: bool,
     job: Option<Job>,
+    /// Batch pacing survives completion and cancellation, so a restart cannot reset it.
+    sent: Option<Instant>,
+    /// A cancelled run's request must finish before another batch can send anything.
+    cancelled: Option<Answer>,
 }
 
 /// A table's addresses being geocoded.
@@ -36,13 +40,14 @@ struct Job {
     next: usize,
     found: Map<String, Value>,
     waiting: Option<(String, Answer)>,
-    sent: Option<Instant>,
     /// Requests that failed (not "not found"), and how many in a row; the last error.
     failed: usize,
     in_a_row: usize,
     error: Option<String>,
     /// Places the answers gave without a usable position.
     skipped: usize,
+    /// Additional candidates omitted when keeping one match per address.
+    limited: usize,
 }
 
 fn fetch(url: &str) -> Answer {
@@ -73,18 +78,35 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
                 }
                 match r {
                     Ok(f) if f.places.is_empty() => app.dialogs.error = Some(tl!("No place found").to_string()),
-                    Ok(f) => {
+                    Ok(mut f) => {
+                        f.limit(8);
+                        if f.limited > 0 {
+                            app.session.notify(
+                                i18n::fmt(
+                                    "Search candidates not shown: {n} (limit {limit}).",
+                                    &[("n", &f.limited.to_string()), ("limit", "8")],
+                                ),
+                                false,
+                            );
+                        }
                         app.dialogs.error = None;
                         st.places = f.places;
                         st.found_by = Some(kind);
                     }
-                    Err(e) => app.dialogs.error = Some(e),
+                    Err(e) => app.dialogs.error = Some(ui_error(e)),
                 }
             }
             None => ctx.request_repaint_after(std::time::Duration::from_millis(100)),
         }
     }
-    let Some(job) = &mut app.ui.geocode.job else { return };
+    if let Some(slot) = &st.cancelled {
+        if take(slot).is_none() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            return;
+        }
+        st.cancelled = None;
+    }
+    let Some(job) = &mut st.job else { return };
     if let Some((q, slot)) = &job.waiting {
         let Some(r) = take(slot) else {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
@@ -93,6 +115,7 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
         match r.and_then(|b| job.g.read(&b)) {
             Ok(found) => {
                 job.skipped += found.skipped;
+                job.limited += found.limited + found.places.len().saturating_sub(1);
                 let place = found.places.into_iter().next();
                 job.found.insert(q.clone(), place.map(|p| json!({"lon": p.lon, "lat": p.lat, "name": p.name})).unwrap_or(Value::Null));
                 job.in_a_row = 0;
@@ -102,7 +125,7 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
             Err(e) => {
                 job.failed += 1;
                 job.in_a_row += 1;
-                job.error = Some(e);
+                job.error = Some(ui_error(e));
                 // The same rule as the command's: three refusals before any answer, or five in a row.
                 if job.in_a_row >= 5 || (job.in_a_row >= 3 && job.found.is_empty()) {
                     job.failed += job.queue.len().saturating_sub(job.next);
@@ -121,19 +144,28 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
             ctx.request_repaint();
             return;
         }
-        let due = job.sent.is_none_or(|t| t.elapsed().as_millis() as u64 >= job.g.spacing_ms());
+        let due = st.sent.is_none_or(|t| t.elapsed().as_millis() as u64 >= job.g.spacing_ms());
         if due {
             job.waiting = Some((q.clone(), fetch(&job.g.url(q, 1))));
-            job.sent = Some(Instant::now());
+            st.sent = Some(Instant::now());
             job.next += 1;
         }
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
         return;
     }
     // Every answer is in: the layer.
-    let Some(job) = app.ui.geocode.job.take() else { return };
+    let Some(job) = st.job.take() else { return };
     if job.skipped > 0 {
         app.session.warn(skipped(job.skipped));
+    }
+    if job.limited > 0 {
+        app.session.notify(
+            i18n::fmt(
+                "{n} additional geocoding candidates were not used; the first match was kept for each address.",
+                &[("n", &job.limited.to_string())],
+            ),
+            false,
+        );
     }
     if job.failed > 0 {
         let why = job.error.unwrap_or_default();
@@ -152,6 +184,36 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
     p["places"] = Value::Object(job.found);
     if app.run("layer.geocode", p).is_ok() {
         app.map.invalidate();
+    }
+}
+
+/// Translate service errors at the UI boundary; the CLI retains the provider's English keys.
+fn ui_error(error: String) -> String {
+    tl!(error.as_str()).to_string()
+}
+
+/// Progress stays visible after the dialog closes. Cancel discards this run, including an
+/// answer already in flight: its download may finish, but cannot add a layer. A restarted batch
+/// waits for that download and keeps the previous request's pacing timestamp.
+pub fn status(app: &mut RustGisApp, ui: &mut egui::Ui) {
+    let Some(job) = &app.ui.geocode.job else { return };
+    ui.separator();
+    ui.label(tl!("Geocoding…"));
+    let done = job.next.saturating_sub(usize::from(job.waiting.is_some()));
+    let total = job.queue.len();
+    ui.add(
+        egui::ProgressBar::new(done as f32 / total.max(1) as f32)
+            .text(format!("{done} / {total}"))
+            .desired_width(100.0)
+            .desired_height(12.0),
+    );
+    if ui.small_button(tl!("Cancel")).clicked() {
+        if let Some(job) = app.ui.geocode.job.take()
+            && let Some((_, slot)) = job.waiting
+        {
+            app.ui.geocode.cancelled = Some(slot);
+        }
+        app.session.notify(tl!("Geocoding cancelled; no layer was added.").to_string(), false);
     }
 }
 
@@ -179,7 +241,11 @@ pub fn find_place(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
     });
     provider(app, ui);
     if go && !app.dialogs.a.trim().is_empty() {
-        match Geocoder::new(Some(app.dialogs.mode), Some(app.dialogs.b.as_str())).and_then(|g| g.check_query(&app.dialogs.a).map(|_| g)) {
+        match Geocoder::new(Some(app.dialogs.mode), Some(app.dialogs.b.as_str())).and_then(|g| {
+            g.check_fetch()?;
+            g.check_query(&app.dialogs.a)?;
+            Ok(g)
+        }) {
             Ok(g) => {
                 let slot = fetch(&g.url(&app.dialogs.a, 8));
                 app.ui.geocode.search = Some((g, slot));
@@ -187,7 +253,7 @@ pub fn find_place(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
                 app.ui.geocode.places.clear();
                 app.dialogs.error = None;
             }
-            Err(e) => app.dialogs.error = Some(e),
+            Err(e) => app.dialogs.error = Some(ui_error(e)),
         }
     }
     if app.ui.geocode.searching {
@@ -217,19 +283,26 @@ pub fn find_place(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
 /// The credit for the places shown: those of the geocoder that found them (another may have been
 /// picked since), or of the one picked when none are shown.
 fn attribution(st: &State, mode: &str) -> &'static str {
-    let pdok = match st.found_by.filter(|_| !st.places.is_empty()) {
-        Some(kind) => kind == Kind::Locatieserver,
-        None => mode == "locatieserver",
-    };
-    if pdok { tl!("Search results: PDOK Locatieserver (Kadaster)") } else { tl!("Search results © OpenStreetMap contributors") }
+    let kind = st.found_by.filter(|_| !st.places.is_empty()).unwrap_or(match mode {
+        "locatieserver" => Kind::Locatieserver,
+        "census" => Kind::Census,
+        "photon" => Kind::Photon,
+        _ => Kind::Nominatim,
+    });
+    match kind {
+        Kind::Locatieserver => tl!("Search results: PDOK Locatieserver (Kadaster)"),
+        Kind::Census => tl!("Search results: U.S. Census Bureau (address ranges)"),
+        _ => tl!("Search results © OpenStreetMap contributors"),
+    }
 }
 
 /// The geocoder choice shared by both dialogs: OpenStreetMap's Nominatim, Photon, PDOK's
-/// Locatieserver (the Netherlands), or a server of one's own.
+/// Locatieserver (the Netherlands), Census, or a server of one's own.
 fn provider(app: &mut RustGisApp, ui: &mut egui::Ui) {
-    if !matches!(app.dialogs.mode, "nominatim" | "photon" | "locatieserver") {
+    if !matches!(app.dialogs.mode, "nominatim" | "photon" | "locatieserver" | "census") {
         app.dialogs.mode = "nominatim";
     }
+    let census = tl!("U.S. Census (addresses)");
     let locatieserver = tl!("Locatieserver (the Netherlands)");
     egui::Grid::new("geocoder").num_columns(2).spacing(vec2(10.0, 8.0)).show(ui, |ui| {
         let input_label = ui.label(tl!("Geocoder"));
@@ -237,6 +310,7 @@ fn provider(app: &mut RustGisApp, ui: &mut egui::Ui) {
             .selected_text(match app.dialogs.mode {
                 "photon" => "Photon",
                 "locatieserver" => locatieserver,
+                "census" => census,
                 _ => "Nominatim",
             })
             .width(200.0)
@@ -244,21 +318,31 @@ fn provider(app: &mut RustGisApp, ui: &mut egui::Ui) {
                 ui.selectable_value(&mut app.dialogs.mode, "nominatim", "Nominatim");
                 ui.selectable_value(&mut app.dialogs.mode, "photon", "Photon");
                 ui.selectable_value(&mut app.dialogs.mode, "locatieserver", locatieserver);
+                ui.selectable_value(&mut app.dialogs.mode, "census", census);
             })
             .response
             .labelled_by(input_label.id);
         ui.end_row();
         let input_label = ui.label(tl!("Server"));
-        let hint = if app.dialogs.mode == "locatieserver" { tl!("PDOK's public server") } else { tl!("OpenStreetMap's public server") };
+        let hint = match app.dialogs.mode {
+            "locatieserver" => tl!("PDOK's public server"),
+            "census" => tl!("Census Bureau's public server"),
+            _ => tl!("OpenStreetMap's public server"),
+        };
         ui.add(egui::TextEdit::singleline(&mut app.dialogs.b).hint_text(hint).desired_width(280.0)).labelled_by(input_label.id);
         ui.end_row();
     });
+    if app.dialogs.mode == "census" {
+        ui.label(tl!("Street addresses only; positions are calculated along address ranges."));
+        #[cfg(target_arch = "wasm32")]
+        ui.label(tl!("In the web app, give a CORS-enabled proxy server; direct Census access needs the desktop app or CLI."));
+    }
 }
 
 /// Geocode Addresses: a table or layer, its address fields and the geocoder; the run goes on
 /// after the dialog closes, a request at a time.
 pub fn geocode(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
-    ui.label(egui::RichText::new(tl!("Turns a table's addresses into points: each row's address fields are joined with commas (such as street, city, country) and looked up. OpenStreetMap's public Nominatim and Photon take up to 100 addresses a run, one a second; PDOK's Locatieserver (Dutch addresses) and a server of your own take more.")).weak());
+    ui.label(egui::RichText::new(tl!("Turns a table's addresses into points: each row's address fields are joined with commas (such as street, city, country) and looked up. OpenStreetMap's public Nominatim and Photon take up to 100 addresses a run, one a second; Census (U.S. street addresses) takes up to 10,000, one a second; PDOK and a server of your own take more.")).weak());
     // A table is picked by its id, since names can repeat: `dialogs.flag` says the choice is a
     // table, and `dialogs.layer` then holds its id.
     let tables: Vec<(u32, String)> = app.session.project.tables.iter().map(|t| (t.id, t.name.clone())).collect();
@@ -315,7 +399,8 @@ pub fn geocode(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
         if !app.dialogs.b.trim().is_empty() {
             params["url"] = json!(app.dialogs.b.trim());
         }
-        let g = Geocoder::new(Some(app.dialogs.mode), Some(app.dialogs.b.as_str()))?;
+        let g = Geocoder::new(Some(app.dialogs.mode), Some(app.dialogs.b.as_str())).map_err(ui_error)?;
+        g.check_fetch().map_err(ui_error)?;
         let (_, queue) = rustgis_engine::cmd::geocode::addresses(&app.session, &params)?;
         if queue.is_empty() {
             return Err(tl!("The address fields are empty in every row.").to_string());
@@ -329,11 +414,11 @@ pub fn geocode(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
             next: 0,
             found: Map::new(),
             waiting: None,
-            sent: None,
             failed: 0,
             in_a_row: 0,
             error: None,
             skipped: 0,
+            limited: 0,
         });
         Ok(())
     })
@@ -343,6 +428,138 @@ pub fn geocode(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// The actual status bar owns Cancel, even when the original dialog is closed. A late
+    /// network answer cannot resume the cancelled job or install its partial output.
+    #[test]
+    fn cancel_geocoding_from_the_status_bar_ignores_a_late_answer() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        let slot = Answer::default();
+        app.ui.geocode.sent = Some(Instant::now() - std::time::Duration::from_secs(2));
+        app.ui.geocode.job = Some(Job {
+            g: Geocoder::new(Some("census"), None).unwrap(),
+            params: json!({"provider":"census", "table":"addresses", "address":"address"}),
+            queue: vec!["first".into(), "second".into()],
+            next: 1,
+            found: Map::new(),
+            waiting: Some(("first".into(), slot.clone())),
+            failed: 0,
+            in_a_row: 0,
+            error: None,
+            skipped: 0,
+            limited: 0,
+        });
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1480.0, 900.0)).build_ui_state(
+            |ui, app: &mut RustGisApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            app,
+        );
+        h.step();
+        assert!(h.query_by_label("Geocoding…").is_some());
+        assert!(h.query_by_label("0 / 2").is_some());
+        h.get_by_label("Cancel").click();
+        h.step();
+        assert!(h.state().ui.geocode.job.is_none());
+        assert!(h.state().ui.geocode.cancelled.is_some());
+        let sent = h.state().ui.geocode.sent;
+        // Restart before the cancelled download answers: even after its pacing interval,
+        // a new batch must not put a second request on the wire.
+        h.state_mut().ui.geocode.job = Some(Job {
+            g: Geocoder::new(Some("census"), Some("http://127.0.0.1:1")).unwrap(),
+            params: json!({"provider":"census", "table":"addresses", "address":"address"}),
+            queue: vec!["third".into()],
+            next: 0,
+            found: Map::new(),
+            waiting: None,
+            failed: 0,
+            in_a_row: 0,
+            error: None,
+            skipped: 0,
+            limited: 0,
+        });
+        h.step();
+        let restart = h.state().ui.geocode.job.as_ref().unwrap();
+        assert_eq!(restart.next, 0);
+        assert!(restart.waiting.is_none());
+        assert_eq!(h.state().ui.geocode.sent, sent, "restarting preserves the last send time");
+        // Cancelling a run which has not sent anything must retain the older download.
+        h.get_by_label("Cancel").click();
+        h.step();
+        assert!(h.state().ui.geocode.cancelled.is_some());
+        *slot.lock().unwrap() = Some(Ok(br#"{"result":{"addressMatches":[{"coordinates":{"x":-77,"y":38}}]}}"#.to_vec()));
+        h.step();
+        assert!(h.state().ui.geocode.job.is_none());
+        assert!(h.state().ui.geocode.cancelled.is_none());
+        assert_eq!(h.state().ui.geocode.sent, sent);
+        assert!(h.state().session.map().layers.is_empty());
+        assert!(h.state().session.notices.iter().any(|n| n.text.contains("Geocoding cancelled")));
+    }
+
+    /// A Census search can return more candidates than requested. Report both the UI limit
+    /// and the parser's safety cap; a clean one-result answer has no such notice.
+    #[test]
+    fn census_search_reports_candidates_withheld_by_its_limit() {
+        for count in [1, 25] {
+            let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+            let p = json!({"matchedAddress":"address", "coordinates":{"x":-77.0,"y":38.0}});
+            let response = json!({"result":{"addressMatches":vec![p;count]}});
+            let slot = Answer::default();
+            *slot.lock().unwrap() = Some(Ok(serde_json::to_vec(&response).unwrap()));
+            app.ui.geocode.search = Some((Geocoder::new(Some("census"), None).unwrap(), slot));
+            poll(&mut app, &egui::Context::default());
+            assert_eq!(app.ui.geocode.places.len(), count.min(8));
+            if count == 1 {
+                assert!(app.session.notices.is_empty());
+            } else {
+                assert_eq!(app.session.notices.len(), 1);
+                assert_eq!(app.session.notices[0].text, "Search candidates not shown: 17 (limit 8).");
+            }
+        }
+    }
+
+    /// Batch runs report all alternatives omitted, including the parser cap, and keep the
+    /// first candidate. A single match produces no omission notice.
+    #[test]
+    fn census_batch_geocoding_reports_unused_candidates() {
+        for count in [1, 3, 25] {
+            let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+            app.run("layer.addDataText", json!({"fileName":"addresses.csv", "text":"address\nA\n"})).unwrap();
+            let p = json!({"matchedAddress":"A", "coordinates":{"x":-77.0,"y":38.0}});
+            let slot = Answer::default();
+            *slot.lock().unwrap() = Some(Ok(serde_json::to_vec(&json!({"result":{"addressMatches":vec![p;count]}})).unwrap()));
+            app.ui.geocode.job = Some(Job {
+                g: Geocoder::new(Some("census"), None).unwrap(),
+                params: json!({"provider":"census", "table":"addresses", "address":"address"}),
+                queue: vec!["A".into()],
+                next: 1,
+                found: Map::new(),
+                waiting: Some(("A".into(), slot)),
+                failed: 0,
+                in_a_row: 0,
+                error: None,
+                skipped: 0,
+                limited: 0,
+            });
+            let mark = app.session.notice_mark();
+            poll(&mut app, &egui::Context::default());
+            assert!(app.ui.geocode.job.is_none());
+            assert_eq!(app.session.map().layers.len(), 1);
+            let notices = app.session.notices_since(mark);
+            if count == 1 {
+                assert!(notices.is_empty(), "{notices:?}");
+            } else {
+                assert_eq!(notices.len(), 1);
+                assert_eq!(
+                    notices[0].text,
+                    format!("{} additional geocoding candidates were not used; the first match was kept for each address.", count - 1)
+                );
+            }
+        }
+    }
 
     /// The credit under the places is the geocoder's that found them, not the one picked since.
     #[test]
@@ -355,10 +572,14 @@ mod tests {
         st.found_by = Some(Kind::Locatieserver);
         assert_eq!(attribution(&st, "nominatim"), pdok);
         assert_eq!(attribution(&st, "locatieserver"), pdok);
+        st.found_by = Some(Kind::Census);
+        let census = tl!("Search results: U.S. Census Bureau (address ranges)");
+        assert_eq!(attribution(&st, "nominatim"), census);
         // No places shown: the picked geocoder's.
         st.places.clear();
         assert_eq!(attribution(&st, "nominatim"), osm);
         assert_eq!(attribution(&st, "locatieserver"), pdok);
+        assert_eq!(attribution(&st, "census"), census);
     }
 
     /// A search's places land with the kind of geocoder that found them.

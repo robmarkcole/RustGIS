@@ -21064,6 +21064,81 @@ fn geocoding_places_and_addresses() {
     assert!(crate::cmd::geocode::check_batch(&g, 101).unwrap_err().contains("100"));
 }
 
+/// Applying supplied answers does not require a network-capable Census endpoint, including
+/// in the browser where the public server lacks CORS.
+#[test]
+fn geocoding_census_supplied_answers_need_no_fetch() {
+    let mut s = Session::new(Project::default());
+    s.run("layer.addDataText", &json!({"fileName":"addresses.csv", "text":"address\nA\n"})).unwrap();
+    let result = s
+        .run(
+            "layer.geocode",
+            &json!({"provider":"census", "table":"addresses", "address":"address",
+        "places":{"A":{"lon":-77.0,"lat":38.0,"name":"A"}}}),
+        )
+        .unwrap();
+    assert_eq!(result["matched"], 1);
+}
+
+/// Census's address response through both public commands, served locally so the test needs
+/// no network. A malformed candidate is reported; unmatched rows retain their attributes.
+#[test]
+fn geocoding_with_census() {
+    let clean = br#"{"result":{"addressMatches":[{"matchedAddress":"4600 SILVER HILL RD, WASHINGTON, DC, 20233","coordinates":{"x":-76.92748724230096,"y":38.84601622386617}}, {"matchedAddress":"SECOND CANDIDATE","coordinates":{"x":-77,"y":38}}]}}"#;
+    let lossy = br#"{"result":{"addressMatches":[{}, {"matchedAddress":"SECOND ADDRESS","coordinates":{"x":-77.0,"y":38.9}}]}}"#;
+    let path = |q: &str| format!("/locations/onelineaddress?address={q}&benchmark=Public_AR_Current&format=json");
+    let (base, asked) = serve_files(vec![
+        (path("4600%20Silver%20Hill%20Rd%2C%20Washington%2C%20DC%2020233"), clean.to_vec()),
+        (path("second"), lossy.to_vec()),
+        (path("missing"), br#"{"result":{"addressMatches":[]}}"#.to_vec()),
+    ]);
+    let mut s = Session::new(Project::default());
+    let result = s
+        .run("map.findPlace", &json!({"provider":"census", "url":base, "query":"4600 Silver Hill Rd, Washington, DC 20233", "limit":1}))
+        .unwrap();
+    assert_eq!(result["count"], 1);
+    assert_eq!(result["places"][0]["lon"], -76.92748724230096);
+    assert_eq!(result["places"][0]["lat"], 38.84601622386617);
+    assert_eq!(s.notices.len(), 1);
+    assert_eq!(s.notices[0].text, "Search candidates not shown: 1 (limit 1).");
+    s.run("layer.addDataText", &json!({"fileName":"addresses.csv", "text":"id,address\n1,second\n2,missing\n"})).unwrap();
+    let result = s.run("layer.geocode", &json!({"provider":"census", "url":base, "table":"addresses", "address":"address"})).unwrap();
+    assert_eq!(result["matched"], 1);
+    assert_eq!(result["unmatched"], 1);
+    let l = s.map().layer_by_name("addresses (geocoded)").unwrap();
+    assert_eq!(l.dataset.features[0].geometry, Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(-77.0, 38.9))));
+    assert!(l.dataset.features[1].geometry.is_none());
+    assert_eq!(l.dataset.value(1, 1).to_string(), "missing");
+    assert_eq!(s.notices.iter().filter(|n| n.text.starts_with("1 of the geocoder's places")).count(), 1);
+    assert_eq!(asked.lock().unwrap().len(), 3);
+}
+
+/// The command reports alternatives omitted by batch geocoding, including the parser cap;
+/// an unambiguous match produces no notice.
+#[test]
+fn geocoding_census_batch_reports_unused_candidates() {
+    for count in [1, 3, 25] {
+        let p = json!({"matchedAddress":"A", "coordinates":{"x":-77.0,"y":38.0}});
+        let response = serde_json::to_vec(&json!({"result":{"addressMatches":vec![p;count]}})).unwrap();
+        let (base, _) = serve_files(vec![("/locations/onelineaddress?address=A&benchmark=Public_AR_Current&format=json".into(), response)]);
+        let mut s = Session::new(Project::default());
+        s.run("layer.addDataText", &json!({"fileName":"addresses.csv", "text":"address\nA\n"})).unwrap();
+        let mark = s.notice_mark();
+        let result = s.run("layer.geocode", &json!({"provider":"census", "url":base, "table":"addresses", "address":"address"})).unwrap();
+        assert_eq!(result["matched"], 1);
+        let notices = s.notices_since(mark);
+        if count == 1 {
+            assert!(notices.is_empty(), "{notices:?}");
+        } else {
+            assert_eq!(notices.len(), 1);
+            assert_eq!(
+                notices[0].text,
+                format!("{} additional geocoding candidates were not used; the first match was kept for each address.", count - 1)
+            );
+        }
+    }
+}
+
 /// PDOK's Locatieserver as the geocoder (a local server answering as it does): places found by
 /// name, a table's Dutch addresses turned into points, and the answers' entries without a usable
 /// point counted in a notice (and no notice when every entry has one).
