@@ -43483,9 +43483,13 @@ fn the_footer_lines_up_with_a_legend_at_the_right() {
 fn a_publication_footer_lines_up_with_its_legend() {
     let piaui = json!([-46.8, -11.6, -38.5, -2.2]);
     let mut seen = Vec::new();
-    for name in
-        ["Countries of the world", "Countries of the world, Natural Earth", "Countries of the world, Natural Earth 1:110m (public domain)"]
-    {
+    for name in [
+        "Countries of the world",
+        "Countries of the world, Natural Earth",
+        "Countries of the world, Natural Earth data",
+        "Countries of the world, Natural Earth 1:110m",
+        "Countries of the world, Natural Earth 1:110m (public domain)",
+    ] {
         let mut s = world();
         s.run("layer.rename", &json!({"layer": "Countries", "name": name})).unwrap();
         s.run(
@@ -43501,12 +43505,15 @@ fn a_publication_footer_lines_up_with_its_legend() {
         let right = legend.x + legend.w >= frame.x + 0.9 * frame.w;
         seen.push((name, at, right, reference.x, legend.x));
         if (0.45..=0.70).contains(&at) && right {
-            assert!(
-                (reference.x - legend.x).abs() < 1e-9,
-                "{name}: the Reference Box at {} mm, the legend at {} mm",
-                reference.x,
-                legend.x
-            );
+            // A legend that starts within half a millimetre of the column leaves the footer as it
+            // is (`align_footer`: "the move a real one"). Where it starts follows the fonts the
+            // machine has, so a name may land there on one platform (macOS: 0.13 mm) and not on
+            // another: the next name is tried.
+            let off = (reference.x - legend.x).abs();
+            if (1e-9..0.5).contains(&off) {
+                continue;
+            }
+            assert!(off < 1e-9, "{name}: the Reference Box at {} mm, the legend at {} mm", reference.x, legend.x);
             assert!(sources.x + sources.w < reference.x && reference.x + reference.w <= frame.x + frame.w + 1e-9, "{name}");
             return;
         }
