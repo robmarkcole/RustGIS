@@ -517,6 +517,7 @@ fn draw_with(
         alpha_band,
         alpha_max: rustgis_data::raster::alpha_max(&r.data_type),
         cell: r.cell_size_m(),
+        east_north: (if r.transform.pixel_width < 0.0 { -1 } else { 1 }, if r.transform.pixel_height > 0.0 { -1 } else { 1 }),
         mask: &style.mask,
     };
     let mut vals = vec![f32::NAN; bw * bh * nb];
@@ -641,6 +642,9 @@ struct Pass1<'a> {
     /// The alpha band's opaque value (its pixel type's: 65535 for 16 bits).
     alpha_max: f32,
     cell: (f64, f64),
+    /// The grid steps (columns, rows) that lead east and north: -1 for a grid stored right to left
+    /// or bottom up, which the hillshade's north-up window must undo.
+    east_north: (i64, i64),
     /// Values drawn as no data.
     mask: &'a RasterMask,
 }
@@ -739,6 +743,7 @@ impl Pass1<'_> {
                     for (k, (dx, dy)) in
                         [(-1, -1), (0, -1), (1, -1), (-1, 0), (0, 0), (1, 0), (-1, 1), (0, 1), (1, 1)].into_iter().enumerate()
                     {
+                        let (dx, dy) = (dx * self.east_north.0, dy * self.east_north.1);
                         z[k] = value(r, self.mask, *b, ci + dx, ri + dy, self.wrap_width).map(f64::from).unwrap_or(centre);
                     }
                     if let Some(s) = shade.get_mut(i) {
@@ -870,6 +875,58 @@ mod tests {
         let nodata = sampling_grid(90.0, Crs::LonLat, Some(30.0));
         assert_eq!(sample(&nodata, &mask, 0, 0.25, 1.5, Resampling::Bilinear, full_turn_width(&nodata)), 0.0);
         assert!(sample(&nodata, &mask, 0, 3.75, 1.5, Resampling::Bilinear, full_turn_width(&nodata)).is_nan());
+    }
+
+    /// A grid's stored direction doesn't change where the light comes from: bottom up and right to
+    /// left rasters shade like the north-up one.
+    #[test]
+    fn shaded_relief_follows_the_grids_orientation() {
+        let view = View {
+            width: 1.0,
+            height: 1.0,
+            pixels_per_point: 1.0,
+            camera: Camera { center: lonlat_to_merc(Coord::new(0.05, 0.05)), res: 1000.0, bearing: 0.0, pitch: 0.0 },
+            sky: false,
+        };
+        // Terrain `height(east, north)` on a 10 x 10 grid of 0.01 degree cells, stored in each direction.
+        let shade = |right_to_left: bool, bottom_up: bool, azimuth: f64, height: &dyn Fn(usize, usize) -> f32| {
+            let gt = GeoTransform {
+                origin_x: if right_to_left { 0.1 } else { 0.0 },
+                origin_y: if bottom_up { 0.0 } else { 0.1 },
+                pixel_width: if right_to_left { -0.01 } else { 0.01 },
+                pixel_height: if bottom_up { 0.01 } else { -0.01 },
+            };
+            let data = (0..10usize)
+                .flat_map(|row| (0..10usize).map(move |col| (col, row)))
+                .map(|(col, row)| height(if right_to_left { 9 - col } else { col }, if bottom_up { row } else { 9 - row }))
+                .collect();
+            let r = Raster::new("relief", 10, 10, vec![data], gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
+            let mut style = RasterStyle::default_for(&r);
+            style.renderer = RasterRenderer::ShadedRelief { band: 0, ramp: None, azimuth, altitude: 45.0, z_factor: 1.0, shadow: 0.0 };
+            style.resampling = Resampling::Nearest;
+            let mut pm = Pixmap::new(1, 1).unwrap();
+            draw(&mut pm, &r, &style, None, &view, 1.0, false, Place::Flat(&Flat::Mercator, "mercator"), None);
+            let p = pm.pixel(0, 0).unwrap();
+            [p.red(), p.green(), p.blue(), p.alpha()]
+        };
+        let north = |_: usize, n: usize| n as f32 * 300.0;
+        let flat = |_: usize, _: usize| 0.0;
+        let diagonal = |e: usize, n: usize| (e + 2 * n) as f32 * 300.0;
+        // Terrain rising to the north, lit from the north: darker than flat ground, in every direction.
+        let lit = shade(false, false, 0.0, &north);
+        assert_eq!(lit[0], 159);
+        assert!(lit[0] < shade(false, false, 0.0, &flat)[0]);
+        for (right_to_left, bottom_up) in [(false, true), (true, false), (true, true)] {
+            assert_eq!(shade(right_to_left, bottom_up, 0.0, &north), lit, "north, rtl {right_to_left}, bottom up {bottom_up}");
+            for azimuth in [45.0, 135.0, 225.0, 315.0] {
+                let want = shade(false, false, azimuth, &diagonal);
+                assert_eq!(
+                    shade(right_to_left, bottom_up, azimuth, &diagonal),
+                    want,
+                    "{azimuth} deg, rtl {right_to_left}, bottom up {bottom_up}"
+                );
+            }
+        }
     }
 
     #[test]
