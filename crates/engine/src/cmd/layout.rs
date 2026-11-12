@@ -1265,6 +1265,21 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
     // A sheet's sizes follow its short side (A4's 210 mm is 1); a figure keeps its texts at their
     // printed size, whatever its width.
     let k = if sheet { page_w.min(page_h) / 210.0 } else { 1.0 };
+    // The sources and the reference that have something in them, each its heading in `head_pt` and
+    // lines in `body_pt`, `tw` wide. Each one's elements keep their names (`Sources`, `Reference`)
+    // whatever its heading reads, the heading filled and wrapped like the rest.
+    let sections = |tw: f64, head_pt: f64, body_pt: f64| -> Vec<(&'static str, Vec<String>, Vec<String>)> {
+        [("Sources", heading(0, "Sources"), &sources), ("Reference", heading(1, "Cartographic reference"), &reference)]
+            .into_iter()
+            .filter(|(.., texts)| !texts.is_empty())
+            .map(|(name, head, texts)| {
+                // Filled first, so `{projection}` reads in capitals too; the live tokens left keep
+                // their case (wrap_as fills again, which then finds nothing).
+                let head = wrap_as(&capitals(&fill(&head)), tw, head_pt, true);
+                (name, head, texts.iter().flat_map(|t| wrap(t, tw, body_pt)).collect::<Vec<_>>())
+            })
+            .collect()
+    };
     // A panel's or an editorial page's map is as wide as its column: where the area is less tall
     // than the frame the sheet leaves it, the sheet is laid out again with the frame the area's
     // height (and a little room), and the whole put in the middle of the page, rather than the map
@@ -1291,21 +1306,6 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
                 if !style.cards() {
                     page_wide.push(("Frame".into(), (m, m, page_w - 2.0 * m, page_full - 2.0 * m), pub_box(clear, ink, 0.8), true));
                 }
-                // The sources and the reference that have something in them, each its heading and lines
-                // `tw` wide. Each one's elements keep their names (`Sources`, `Reference`) whatever its
-                // heading reads, the heading filled and wrapped like the rest.
-                let sections = |tw: f64| -> Vec<(&'static str, Vec<String>, Vec<String>)> {
-                    [("Sources", heading(0, "Sources"), &sources), ("Reference", heading(1, "Cartographic reference"), &reference)]
-                        .into_iter()
-                        .filter(|(.., texts)| !texts.is_empty())
-                        .map(|(name, head, texts)| {
-                            // Filled first, so `{projection}` reads in capitals too; the live tokens left
-                            // keep their case (wrap_as fills again, which then finds nothing).
-                            let head = wrap_as(&capitals(&fill(&head)), tw, head_pt, true);
-                            (name, head, texts.iter().flat_map(|t| wrap(t, tw, body_pt)).collect::<Vec<_>>())
-                        })
-                        .collect()
-                };
                 // The footer, from the bottom up across the sheet: authorship, the note (unless the style
                 // sets it beside the map), then the sources and reference boxed side by side (unless it
                 // stacks them in its panel), as tall as the longer column. Its top.
@@ -1341,7 +1341,7 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
                     let n = [!sources.is_empty(), !reference.is_empty()].iter().filter(|x| **x).count().max(1) as f64;
                     let cw = (iw - gap * (n - 1.0)) / n;
                     let tw = cw - 2.0 * inner;
-                    let columns = sections(tw);
+                    let columns = sections(tw, head_pt, body_pt);
                     let heads = columns.iter().map(|(_, h, _)| h.len()).max().unwrap_or(1);
                     let rows = columns.iter().map(|(.., l)| l.len()).max().unwrap_or(0);
                     if rows > 0 {
@@ -1599,7 +1599,7 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
                         }
                         // The sources and the reference, stacked up from the panel's foot.
                         let mut yb = panel_bottom - ip;
-                        for (name, head, lines) in sections(tw).into_iter().rev().filter(|_| !under) {
+                        for (name, head, lines) in sections(tw, head_pt, body_pt).into_iter().rev().filter(|_| !under) {
                             let (hh, bh) = (head.len() as f64 * pitch(head_pt), lines.len() as f64 * pitch(body_pt));
                             yb -= hh + bh;
                             around.push((
@@ -2646,6 +2646,9 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
             }
         }
     }
+    if let (None, Some(legend)) = (column, spot_of(Surround::Legend)) {
+        align_footer(&mut around, legend, (fx, fw), &sections);
+    }
     for (n, r, kind, _) in over {
         l.add(&n, r, kind);
     }
@@ -2739,6 +2742,65 @@ fn page(s: &mut Session, p: &Value) -> CmdResult {
         l.decimal_comma = comma;
     }
     Ok(json!({"width": w, "height": h, "decimal": if l.decimal_comma { "," } else { "." }}))
+}
+
+/// A sheet's footer of two columns, its right one moved to start where a legend at the right of the
+/// frame (`frame` its left edge and width, page mm) does, when that is between 45 % and 70 % of the
+/// frame's width, so the two line up (#1379). Each column's heading and lines are wrapped again to
+/// its new width (`sections`, as the footer wraps them); when they'd need a taller box, the
+/// footer stays as it is.
+pub(crate) fn align_footer(
+    around: &mut [(String, Rect, ElementKind)],
+    legend: Rect,
+    (fx, fw): (f64, f64),
+    sections: &dyn Fn(f64, f64, f64) -> Vec<(&'static str, Vec<String>, Vec<String>)>,
+) {
+    let at = (legend.0 - fx) / fw;
+    if !(0.45..=0.70).contains(&at) || legend.0 + legend.2 < fx + 0.9 * fw {
+        return;
+    }
+    let find = |name: &str| around.iter().position(|(n, ..)| n == name);
+    let size = |i: Option<usize>| match i.and_then(|i| around.get(i)).map(|e| &e.2) {
+        Some(ElementKind::Text { size, .. }) => Some(*size),
+        _ => None,
+    };
+    let (Some(a), Some(b), Some(head_at)) = (find("Sources Box"), find("Reference Box"), find("Sources Heading")) else { return };
+    let (Some(head_pt), Some(body_pt)) = (size(Some(head_at)), size(find("Sources")).or_else(|| size(find("Reference")))) else { return };
+    let (Some(left), Some(right), Some(head)) = (around.get(a), around.get(b), around.get(head_at)) else { return };
+    let (left, right, inner) = (left.1, right.1, head.1.0 - left.1.0);
+    let gap = right.0 - (left.0 + left.2);
+    let (lw, rw) = (legend.0 - gap - left.0, right.0 + right.2 - legend.0);
+    // Side by side, and the move a real one.
+    if (left.1 - right.1).abs() > 1e-6 || lw <= 2.0 * inner || rw <= 2.0 * inner || (legend.0 - right.0).abs() < 0.5 {
+        return;
+    }
+    let pitch = crate::render::layout::line_pitch_mm;
+    let column = |w: f64, name: &str| sections(w - 2.0 * inner, head_pt, body_pt).into_iter().find(|(n, ..)| *n == name);
+    let (Some((_, l_head, l_lines)), Some((_, r_head, r_lines))) = (column(lw, "Sources"), column(rw, "Reference")) else { return };
+    let head_h = l_head.len().max(r_head.len()) as f64 * pitch(head_pt);
+    let rows = l_lines.len().max(r_lines.len());
+    if 2.0 * inner + head_h + rows as f64 * pitch(body_pt) > left.3 + 1e-6 {
+        return;
+    }
+    for (name, x, w, head, lines) in [("Sources", left.0, lw, l_head, l_lines), ("Reference", legend.0, rw, r_head, r_lines)] {
+        let y = left.1;
+        for (part, r, text) in [
+            (format!("{name} Box"), (x, y, w, left.3), None),
+            (format!("{name} Heading"), (x + inner, y + inner, w - 2.0 * inner, head.len() as f64 * pitch(head_pt)), Some(head.join("\n"))),
+            (
+                name.to_string(),
+                (x + inner, y + inner + head_h, w - 2.0 * inner, lines.len() as f64 * pitch(body_pt)),
+                Some(lines.join("\n")),
+            ),
+        ] {
+            if let Some(e) = around.iter_mut().find(|(n, ..)| *n == part) {
+                e.1 = r;
+                if let (Some(new), ElementKind::Text { text, .. }) = (text, &mut e.2) {
+                    *text = new;
+                }
+            }
+        }
+    }
 }
 
 /// Sets a layout's ruler guides: the lists given replace those there.

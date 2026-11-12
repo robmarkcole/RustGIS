@@ -43283,6 +43283,114 @@ fn a_layer_read_from_a_file_says_whether_it_and_the_file_are_in_step() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// A sheet's footer lines its right column up with a legend at the right of the frame, between
+/// 45 % and 70 % of its width (#1379), its texts wrapped again to the new widths; it stays as it
+/// is for a legend elsewhere, or when the texts would need a taller box.
+#[test]
+fn the_footer_lines_up_with_a_legend_at_the_right() {
+    use crate::cmd::layout::align_footer;
+    use rustgis_map::layout::{ElementKind, FontFamily, TextAlign};
+    let text = |t: &str, size: f64| ElementKind::Text {
+        text: t.into(),
+        size,
+        color: rustgis_map::Rgba::rgb(0, 0, 0),
+        bold: false,
+        italic: false,
+        align: TextAlign::Left,
+        letter_spacing: 0.0,
+        font: FontFamily::Sans,
+        font_name: None,
+        rotation: 0.0,
+    };
+    let card = || ElementKind::Rectangle {
+        fill: rustgis_map::Rgba::new(0, 0, 0, 0),
+        outline: rustgis_map::Rgba::rgb(0, 0, 0),
+        width: 0.5,
+        radius: 0.0,
+        dash: None,
+    };
+    // An A4 footer, two boxes 88 mm wide 4 mm apart, under a frame 180 mm wide from x = 15.
+    let footer = || {
+        vec![
+            ("Sources Box".to_string(), (15.0, 250.0, 88.0, 14.0), card()),
+            ("Sources Heading".to_string(), (17.5, 252.5, 83.0, 3.0), text("SOURCES", 7.5)),
+            ("Sources".to_string(), (17.5, 255.5, 83.0, 3.0), text("Boundaries: IBGE", 7.0)),
+            ("Reference Box".to_string(), (107.0, 250.0, 88.0, 14.0), card()),
+            ("Reference Heading".to_string(), (109.5, 252.5, 83.0, 3.0), text("REFERENCE", 7.5)),
+            ("Reference".to_string(), (109.5, 255.5, 83.0, 3.0), text("UTM zone 24S", 7.0)),
+        ]
+    };
+    // One line each however wide; the reference in three under 70 mm.
+    let short = |_: f64, _: f64, _: f64| {
+        vec![
+            ("Sources", vec!["SOURCES".to_string()], vec!["Boundaries: IBGE".to_string()]),
+            ("Reference", vec!["REFERENCE".to_string()], vec!["UTM zone 24S".to_string()]),
+        ]
+    };
+    let long = |tw: f64, _: f64, _: f64| {
+        let n = if tw < 70.0 { 3 } else { 1 };
+        vec![
+            ("Sources", vec!["SOURCES".to_string()], vec!["IBGE".to_string()]),
+            ("Reference", vec!["REFERENCE".to_string()], vec!["UTM".to_string(); n]),
+        ]
+    };
+    let rect = |around: &[(String, (f64, f64, f64, f64), ElementKind)], name: &str| around.iter().find(|e| e.0 == name).unwrap().1;
+    // A legend from 60 % of the frame to its right edge: the right column starts there.
+    let mut around = footer();
+    align_footer(&mut around, (123.0, 200.0, 72.0, 40.0), (15.0, 180.0), &short);
+    assert_eq!(rect(&around, "Reference Box"), (123.0, 250.0, 72.0, 14.0));
+    assert_eq!(rect(&around, "Sources Box"), (15.0, 250.0, 104.0, 14.0));
+    assert_eq!(rect(&around, "Reference Heading").0, 125.5);
+    assert_eq!(rect(&around, "Reference").2, 67.0);
+    // Elsewhere: at 30 %, short of the right edge, or texts needing a taller box.
+    type Sections = dyn Fn(f64, f64, f64) -> Vec<(&'static str, Vec<String>, Vec<String>)>;
+    let cases: [((f64, f64, f64, f64), &Sections); 3] =
+        [((69.0, 200.0, 126.0, 40.0), &short), ((123.0, 200.0, 20.0, 40.0), &short), ((123.0, 200.0, 72.0, 40.0), &long)];
+    for (legend, sections) in cases {
+        let mut around = footer();
+        align_footer(&mut around, legend, (15.0, 180.0), sections);
+        assert_eq!(around, footer(), "{legend:?}");
+    }
+}
+
+/// `layout.publication` itself lines the footer's right column up with a legend placed at the
+/// right (#1379): with `"arrangement": "legendRight"` and a legend wide enough to start between
+/// 45 % and 70 % of the frame's width, the Reference Box starts where the Legend Box does.
+#[test]
+fn a_publication_footer_lines_up_with_its_legend() {
+    let piaui = json!([-46.8, -11.6, -38.5, -2.2]);
+    let mut seen = Vec::new();
+    for name in
+        ["Countries of the world", "Countries of the world, Natural Earth", "Countries of the world, Natural Earth 1:110m (public domain)"]
+    {
+        let mut s = world();
+        s.run("layer.rename", &json!({"layer": "Countries", "name": name})).unwrap();
+        s.run(
+            "layout.publication",
+            &json!({"profile": "a4-portrait", "extent": piaui, "arrangement": "legendRight", "author": "", "sources": "Natural Earth"}),
+        )
+        .unwrap();
+        let l = s.project.layouts.last().unwrap();
+        let named = |n: &str| l.elements.iter().find(|e| e.name == n).unwrap();
+        let frame = l.elements.iter().find(|e| e.kind.code() == "mapFrame").unwrap();
+        let (legend, reference, sources) = (named("Legend Box"), named("Reference Box"), named("Sources Box"));
+        let at = (legend.x - frame.x) / frame.w;
+        let right = legend.x + legend.w >= frame.x + 0.9 * frame.w;
+        seen.push((name, at, right, reference.x, legend.x));
+        if (0.45..=0.70).contains(&at) && right {
+            assert!(
+                (reference.x - legend.x).abs() < 1e-9,
+                "{name}: the Reference Box at {} mm, the legend at {} mm",
+                reference.x,
+                legend.x
+            );
+            assert!(sources.x + sources.w < reference.x && reference.x + reference.w <= frame.x + frame.w + 1e-9, "{name}");
+            return;
+        }
+    }
+    panic!("no legend fell between 45 % and 70 % of the frame at its right: {seen:?}");
+}
+
 /// Arrangements saved by name (#1379): `layout.arrangement` saves, lists and removes them, within
 /// limits and refusing what it can't keep; `layout.publication` takes one by name, `best` tries
 /// them after the built-in ones, and a favourite named after one removed keeps its corners.

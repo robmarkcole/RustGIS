@@ -17,8 +17,11 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   - **Sheets** (A4, A3 or A2, portrait or landscape): a frame and margin, the title and subtitle,
     the map, and a footer of two boxed columns (sources, and the cartographic reference; one
     with nothing in it is left out, the other taking the width) with a note and the authorship
-    under them. Text sizes follow the sheet: an A3's are 1.41 times an
-    A4's. Given its size alone (`"a4"`, the default, `"a3"` or `"a2"`), a sheet is turned to
+    under them. When the legend sits at the right of the map (its right edge in the frame's
+    right tenth), starting between 45 % and 70 % of the frame's width, the right column starts
+    where the legend does, unless its texts would then need a taller box. Text sizes follow the
+    sheet: an A3's are 1.41 times an A4's. Given its size alone (`"a4"`, the default, `"a3"`
+    or `"a2"`), a sheet is turned to
     portrait or landscape, whichever the map comes out larger on: the area's extent east to west
     against north to south, on the map's projection, with the room the style leaves the map. The
     result names the profile chosen (`"profile": "a4-landscape"`); give it with its orientation
