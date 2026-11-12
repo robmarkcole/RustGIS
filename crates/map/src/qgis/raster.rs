@@ -94,6 +94,7 @@ fn renderer_style(node: Node, pipe: Node, r: Node, kind: &str, layer: &str, repo
                 azimuth: num("azimuth", 315.0).rem_euclid(360.0),
                 altitude: num("angle", 45.0).clamp(0.0, 90.0),
                 z_factor: num("zfactor", 1.0).clamp(0.0001, 10_000.0),
+                shadow: 0.0,
             };
             (renderer, Stretch::None)
         }

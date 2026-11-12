@@ -67,15 +67,27 @@ pub fn archive_revisions(layout: &Layout, maps: &[Map]) -> crate::ArchiveRevisio
 /// Renders a layout at `dpi` (dots per inch). `maps` are the project's maps, found by name.
 /// Refuses a linked archive changed while composing the page, including its different map frames.
 pub fn render(layout: &Layout, maps: &mut [Map], dpi: f64, info: &PageInfo) -> Result<Pixmap, String> {
-    render_pending(layout, maps, dpi, info).map(|(pm, _)| pm)
+    render_page(layout, maps, dpi, info, true).map(|(pm, _)| pm)
 }
 
 /// [`render`], and whether a map frame on the page drew while some of its tiles, or a read of its
 /// streamed layers or rasters, were still on their way: in the browser, which doesn't wait for
 /// them, the page is drawn again once they land.
+/// Drawn for the Layout view on the interface's thread, its frames don't wait for cast shadows
+/// still being worked out: [`crate::shadows_said`] says so, and the page is drawn again as they
+/// land (natively too, where its tiles were waited for).
 pub fn render_pending(layout: &Layout, maps: &mut [Map], dpi: f64, info: &PageInfo) -> Result<(Pixmap, bool), String> {
+    render_page(layout, maps, dpi, info, false)
+}
+
+/// [`render_pending`], its frames waiting for cast shadows when `wait_shadows` (an export).
+fn render_page(layout: &Layout, maps: &mut [Map], dpi: f64, info: &PageInfo, wait_shadows: bool) -> Result<(Pixmap, bool), String> {
     let revisions = archive_revisions(layout, maps);
-    let result = render_pending_inner(layout, maps, dpi, info);
+    let result = if wait_shadows {
+        render_pending_inner(layout, maps, dpi, info)
+    } else {
+        crate::without_shadow_wait(|| render_pending_inner(layout, maps, dpi, info))
+    };
     revisions.finish_revision(archive_revisions(layout, maps), result, "the page is too large to draw")
 }
 
@@ -492,8 +504,13 @@ fn frame_canvas(
     grid: Option<(&Grid, bool)>,
 ) -> Option<Canvas> {
     let view = View { width: w, height: h, pixels_per_point: ppp, camera, sky: false };
-    let img = if record { crate::render_complete_recorded(map, &view) } else { crate::render_complete(map, &view) }?;
-    *pending |= img.tiles_pending || img.data_pending;
+    // Why its layers were drawn without their cast shadows is kept for the page's caller (see
+    // `crate::shadows_said`).
+    let (img, shadows) = crate::frame_with_shadows_to_come(|| {
+        if record { crate::render_complete_recorded(map, &view) } else { crate::render_complete(map, &view) }
+    });
+    let img = img?;
+    *pending |= img.tiles_pending || img.data_pending || shadows;
     Some(finish_frame(img, ppp, grid.map(|(g, comma)| (&*map, &view, g, comma))))
 }
 
@@ -3434,6 +3451,108 @@ mod tests {
             ElementKind::Colorbar { frame, layer: None, title: title.into(), orientation, ticks: 5, tick_side: TickSide::End, reverse };
         l.add("Colorbar", rect, kind);
         render(&l, &mut [map.clone()], 96.0, &PageInfo::default()).unwrap()
+    }
+
+    /// A page whose frame draws a layer without its cast shadows says why, named by the layer; one
+    /// with them, or without any asked for, says nothing.
+    #[test]
+    fn a_page_says_why_a_frame_drew_no_cast_shadows() {
+        let relief = |shadow| rustgis_map::raster::RasterRenderer::ShadedRelief {
+            band: 0,
+            ramp: None,
+            azimuth: 315.0,
+            altitude: 30.0,
+            z_factor: 1.0,
+            shadow,
+        };
+        for shadow in [0.0, 1.0] {
+            let map = ramp_map(relief(shadow), rustgis_map::raster::Stretch::MinMax);
+            let (_, said) = crate::shadows_said(|| colorbar_page(&map, Orientation::Horizontal, false, ""));
+            assert!(said.notices.is_empty() && !said.to_come, "shadow {shadow}: {said:?}");
+        }
+        // Read in place with only its overview held: no whole grid to trace.
+        let mut map = ramp_map(relief(1.0), rustgis_map::raster::Stretch::MinMax);
+        let rl = map.layers.iter_mut().find_map(|l| l.raster.as_mut()).unwrap();
+        rl.in_place = true;
+        let mut r = (**rl.data.as_ref().unwrap()).clone();
+        r.overview = Some((1000, 10));
+        rl.data = Some(std::sync::Arc::new(r));
+        let (_, said) = crate::shadows_said(|| colorbar_page(&map, Orientation::Horizontal, false, ""));
+        let said = said.notices;
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].starts_with("dem: ") && said[0].contains("read in place"), "{said:?}");
+        // What the map view's frame said is not a page's: a clean page drawn after it says nothing.
+        let camera =
+            rustgis_map::Camera { center: rustgis_geom::lonlat_to_merc(Coord::new(0.5, 0.5)), res: 2000.0, bearing: 0.0, pitch: 0.0 };
+        crate::render(&mut map, &crate::View { width: 64.0, height: 64.0, pixels_per_point: 1.0, camera, sky: false });
+        let clean = ramp_map(relief(0.0), rustgis_map::raster::Stretch::MinMax);
+        let (_, said) = crate::shadows_said(|| colorbar_page(&clean, Orientation::Horizontal, false, ""));
+        assert!(said.notices.is_empty(), "{said:?}");
+    }
+
+    /// A page with maps showing copies of one relief (each layer the first of its map, so with the
+    /// same id), each under its own sun, drawn again until it has no shadows to come, as the
+    /// Layout view draws it while they land. Panics if it never settles.
+    fn page_settles_with_suns(suns: &[f64]) {
+        use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster};
+        let n = 300usize;
+        let heights: Vec<f32> = (0..n * n).map(|i| (((i % n) as f32 / 9.0).sin() + ((i / n) as f32 / 7.0).cos()) * 400.0).collect();
+        let gt = GeoTransform { origin_x: -1.0, origin_y: 1.0, pixel_width: 2.0 / n as f64, pixel_height: -2.0 / n as f64 };
+        let dem = Raster::new("dem", n as u32, n as u32, vec![heights], gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
+        let rl = rustgis_map::raster::RasterLayer::from_path(dem, "dem.tif");
+        let mut maps = Vec::new();
+        let mut l = Layout::new("Layout", 100.0, 100.0);
+        for (i, azimuth) in suns.iter().enumerate() {
+            let name = format!("m{i}");
+            let mut copy = rl.clone();
+            copy.style.renderer = rustgis_map::raster::RasterRenderer::ShadedRelief {
+                band: 0,
+                ramp: None,
+                azimuth: *azimuth,
+                altitude: 10.0,
+                z_factor: 1.0,
+                shadow: 1.0,
+            };
+            let mut m = Map::new(name.clone());
+            assert_eq!(m.add_raster("dem", copy), 1);
+            maps.push(m);
+            let frame = ElementKind::MapFrame {
+                map: name.clone(),
+                center: Coord::new(0.0, 0.0),
+                scale: 1e7,
+                shape: FrameShape::Rectangle,
+                grid: None,
+                extent_of: None,
+                extent_color: rustgis_map::layout::INDICATOR_COLOR,
+                extent_width: rustgis_map::layout::INDICATOR_WIDTH,
+                bearing: 0.0,
+                pitch: 0.0,
+            };
+            l.add(&name, (5.0 + 20.0 * i as f64, 5.0, 18.0, 18.0), frame);
+        }
+        let start = std::time::Instant::now();
+        loop {
+            let (drawn, said) = crate::shadows_said(|| render_pending(&l, &mut maps, 48.0, &PageInfo::default()));
+            drawn.unwrap();
+            assert!(said.notices.is_empty(), "{said:?}");
+            if !said.to_come {
+                break;
+            }
+            assert!(start.elapsed() < std::time::Duration::from_secs(60), "the page never got its shadows");
+            std::thread::yield_now();
+        }
+    }
+
+    /// Two maps lit otherwise on a page: neither map's grid stops the other's.
+    #[test]
+    fn two_maps_lit_otherwise_on_a_page_keep_their_own_shadows() {
+        page_settles_with_suns(&[315.0, 135.0]);
+    }
+
+    /// More maps lit otherwise than the grids kept for going back: none is let go while it is drawn.
+    #[test]
+    fn many_maps_lit_otherwise_on_a_page_all_get_their_shadows() {
+        page_settles_with_suns(&[315.0, 135.0, 45.0, 225.0, 0.0]);
     }
 
     /// A map with one 100 × 1 raster valued 0–99 by column, styled by `renderer`.

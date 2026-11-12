@@ -449,7 +449,7 @@ pub fn export_bytes(s: &mut Session, i: usize, format: &str, dpi: f64) -> Result
         }))
     };
     let before = revision(s);
-    let result = export_bytes_inner(s, i, format, dpi);
+    let result = super::share::saying_shadows(s, "The presentation", |s| export_bytes_inner(s, i, format, dpi));
     before.finish_revision(revision(s), Some(result), "could not draw the presentation")?
 }
 

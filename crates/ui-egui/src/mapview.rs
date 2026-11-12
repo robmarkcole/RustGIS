@@ -337,8 +337,9 @@ pub struct MapView {
     pictures: crate::popupmedia::Pictures,
     /// The tile layers' credits, from the last render.
     attribution: Vec<String>,
-    /// Tile layer errors already reported.
-    tile_errors: std::collections::HashSet<String>,
+    /// Tile layer errors, and why layers were drawn without their cast shadows (in the map or
+    /// the Layout view), already reported.
+    pub(crate) tile_errors: std::collections::HashSet<String>,
     /// When the map last rendered (seconds).
     last_render: f64,
     /// The map drawn flat and laid over the globe while it moves.
@@ -907,6 +908,7 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         && cam.pitch == 0.0
         && app.map.live_rev == Some(app.session.revision)
         && !reads_in_place(app.session.map())
+        && !casts_shadows(app.session.map())
     {
         key.tiles = 0;
     } else if fetches_tiles(app.session.map()) {
@@ -1526,12 +1528,20 @@ fn drape_state(app: &RustGisApp) -> (crate::globe_drape::DrapeKey, u64) {
     (key, tiles)
 }
 
-/// Whether the map draws from web tiles (its tile layers, or elevation tiles for its terrain):
-/// tiles arriving draw it again.
+/// Whether the map draws from web tiles (its tile layers, or elevation tiles for its terrain), or
+/// draws cast shadows worked out off the frame: tiles or shadows arriving (both move the tile
+/// cache's generation) draw it again.
 fn fetches_tiles(m: &rustgis_engine::map::Map) -> bool {
     !m.tiles.is_empty()
         || m.view.terrain.as_ref().is_some_and(|t| matches!(t.source, rustgis_engine::map::view::TerrainSource::Tiles { .. }))
         || reads_in_place(m)
+        || casts_shadows(m)
+}
+
+/// Whether a visible raster layer of the map is drawn with cast shadows, which land after the
+/// frame that asks for them (see `RasterLayer::cast_shadows`).
+fn casts_shadows(m: &rustgis_engine::map::Map) -> bool {
+    m.layers.iter().any(|l| l.visible && l.raster.as_ref().is_some_and(|r| r.casts_shadows()))
 }
 
 /// Whether the map has raster layers read in place: the part in view arrives a tile at a time,
@@ -4868,6 +4878,31 @@ mod picture_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A map whose relief casts shadows is drawn again as the tile cache's generation moves, which
+    /// the shadows' landing moves, though it fetches no tiles: a map of a DEM alone gets its
+    /// shadows without being moved. Without shadows (or hidden) it isn't.
+    #[test]
+    fn a_relief_casting_shadows_is_drawn_again_as_they_land() {
+        use rustgis_engine::data::raster::{ColorHint, Crs, GeoTransform, Raster};
+        use rustgis_engine::map::{Map, RasterLayer, RasterRenderer};
+        let gt = GeoTransform { origin_x: 0.0, origin_y: 0.0, pixel_width: 30.0, pixel_height: -30.0 };
+        let r = Raster::new("dem", 4, 4, vec![vec![0.0; 16]], gt, Crs::WebMercator, None, ColorHint::Gray, "Float32").unwrap();
+        let mut map = Map::new("Relief");
+        let id = map.add_raster("dem", RasterLayer::from_path(r, "dem.tif"));
+        let relief = |shadow| RasterRenderer::ShadedRelief { band: 0, ramp: None, azimuth: 315.0, altitude: 30.0, z_factor: 1.0, shadow };
+        let set = |map: &mut Map, shadow: f64, visible: bool| {
+            let l = map.layer_mut(id).unwrap();
+            l.visible = visible;
+            l.raster.as_mut().unwrap().style.renderer = relief(shadow);
+        };
+        set(&mut map, 0.0, true);
+        assert!(!fetches_tiles(&map));
+        set(&mut map, 0.8, true);
+        assert!(fetches_tiles(&map));
+        set(&mut map, 0.8, false);
+        assert!(!fetches_tiles(&map));
+    }
 
     /// Natural Earth is credited only where its world outline is drawn: not on a blank basemap or
     /// another body, whose sources are still credited.

@@ -1173,6 +1173,23 @@ With a raster layer selected in Layers, the **Style** and **Data** tabs show its
 | Style › Enhancement | Brightness, contrast, gamma |
 | Data | Raster information (size, bands, statistics, coordinate system) and Export Raster (GeoTIFF) |
 
+**Cast shadows**, on a Shaded Relief layer (`raster.symbology` `"shadow"`, 0 to 1), darkens the
+slopes the terrain hides from the sun as well as those facing away from it: a valley behind a ridge
+is in shadow, with a soft edge. Only the direct light is darkened: a slope in full shadow keeps the
+relief's ambient light. 0, the default, draws the relief as before. The shadows are worked out once
+for the layer's sun, band and Z factor, off the map's frame on the desktop: the map and the Layout
+view draw without them for the moment that takes (under a second for a few million cells on a
+multi-core computer, several seconds on one thread; a sun under about 5° traces much farther, some
+seconds on a multi-core computer and twenty or so on one thread), then with them. An export
+waits for them; what the window draws at once (Copy Map or Copy Layout to the clipboard, printing,
+the presentation and report previews, an agent's snapshot) doesn't, and says the layers it drew
+without them.
+The strength is drawn, not worked out, so changing it is immediate. The browser works them out for
+rasters of at most 500,000 cells, and a cloud-optimised GeoTIFF read in place has none unless its
+whole image is held: either way the layer is drawn without them, and a notice says so. Terrain
+outside the raster casts nothing on it, and a grid spanning 0 to 360° casts nothing across its
+seam.
+
 **Masking**, at the foot of the Symbology pane (`raster.mask`), hides pixel values from view without
 changing the data: values to draw as no data (a background of 0 or −9999 the file doesn't flag, QA
 flags, land cover classes such as `0, 254, 255`), and values outside, or inside, a range. The

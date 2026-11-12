@@ -24,6 +24,7 @@ pub mod projection;
 pub mod qgis;
 pub mod raster;
 pub mod report;
+pub mod shadow;
 pub mod slots;
 pub mod source;
 pub use slots::{LayerRole, Slot, SlotAt, SlotPos, TileRole};

@@ -309,7 +309,7 @@ fn preview(app: &mut RustGisApp, ui: &mut Ui, i: usize, t: &Tokens) {
     // Any change to the report, its data or the selection runs a command, which moves the
     // revision on.
     let key = format!("{i}#{}#{}", app.reports.page, app.session.revision);
-    if app.reports.preview.as_ref().is_none_or(|p| p.0 != key) {
+    if app.reports.preview.as_ref().is_none_or(|p| !crate::layoutview::preview_current(&p.0, &key)) {
         app.reports.preview = None;
         let built_for = (i, app.session.revision);
         if app.reports.built.as_ref().is_none_or(|b| b.0 != built_for) {
@@ -328,25 +328,32 @@ fn preview(app: &mut RustGisApp, ui: &mut Ui, i: usize, t: &Tokens) {
             None => return,
         };
         let (s, page) = (&mut app.session, app.reports.page);
-        let drawn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<_, String> {
-            let page = page.min(pages.len().saturating_sub(1));
-            let (pm, _, _) = rustgis_engine::render::report::draw_page(doc, pages, page, 60.0, &s.project.layouts, &mut s.project.maps)?;
-            Ok((pm, page, pages.len()))
-        }))
-        .unwrap_or_else(|_| Err("the preview failed unexpectedly".into()));
+        let (drawn, said) = rustgis_engine::render::shadows_said(|| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<_, String> {
+                let page = page.min(pages.len().saturating_sub(1));
+                let (pm, _, _) =
+                    rustgis_engine::render::report::draw_page(doc, pages, page, 60.0, &s.project.layouts, &mut s.project.maps)?;
+                Ok((pm, page, pages.len()))
+            }))
+            .unwrap_or_else(|_| Err("the preview failed unexpectedly".into()))
+        });
+        crate::layoutview::say_frame_shadows(app, &said);
         match drawn {
             Ok((pm, page, total)) => {
                 app.reports.page = page;
                 let img = egui::ColorImage::from_rgba_premultiplied([pm.width() as usize, pm.height() as usize], pm.data());
                 let tex = ui.ctx().load_texture("report_preview", img, egui::TextureOptions::LINEAR);
                 let key = format!("{i}#{page}#{}", app.session.revision);
-                app.reports.preview = Some((key, tex, total));
+                app.reports.preview = Some((crate::layoutview::preview_key(&key, &said), tex, total));
             }
             Err(e) => {
                 ui.label(egui::RichText::new(e).small().color(Color32::from_rgb(0xC0, 0x30, 0x30)));
                 return;
             }
         }
+    }
+    if app.reports.preview.as_ref().is_some_and(|p| crate::layoutview::preview_waits(&p.0)) {
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
     }
     let Some((_, tex, total)) = &app.reports.preview else { return };
     let (tex, total) = (tex.clone(), *total);

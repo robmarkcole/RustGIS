@@ -4093,7 +4093,7 @@ fn layout_bytes_inner(s: &mut Session, li: usize, pdf: bool, dpi: f64, all: bool
     // The map frames a PDF can't georeference, and those it georeferences by their corners only,
     // each with the page (from 1) it is on.
     let (mut left_out, mut by_corners): (Vec<(usize, u32, String, &'static str)>, Vec<(usize, u32, String)>) = (Vec::new(), Vec::new());
-    let mut render_pages = || -> Result<(Vec<rustgis_render::pdf::Page>, Option<Vec<u8>>), String> {
+    let render_pages = || -> Result<(Vec<rustgis_render::pdf::Page>, Option<Vec<u8>>), String> {
         let mut out = Vec::new();
         let mut png = None;
         let mut held = 0usize;
@@ -4153,7 +4153,15 @@ fn layout_bytes_inner(s: &mut Session, li: usize, pdf: bool, dpi: f64, all: bool
         }
         Ok((out, png))
     };
-    let result = render_pages();
+    // Layers its frames drew without their cast shadows (read in place, too large for the
+    // browser, no memory, still being worked out on the interface's thread): said, as the map's
+    // export says them.
+    let (result, said) = rustgis_render::shadows_said(render_pages);
+    if result.is_ok() {
+        for w in super::share::shadow_warnings("The layout", &said) {
+            s.warn(w);
+        }
+    }
     // Stepping through the series moved the frame; put the layout back however that went.
     if stepping && let Some(cur) = s.project.layouts.get_mut(li) {
         *cur = saved.clone();

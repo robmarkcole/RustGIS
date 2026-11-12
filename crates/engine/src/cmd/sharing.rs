@@ -190,8 +190,18 @@ pub fn commands() -> Vec<C> {
     ]
 }
 
-/// The shared item bytes of a kind: its name, bytes and source.
+/// The shared item bytes of a kind: its name, bytes and source. Rasters drawn into it without
+/// their cast shadows are said (see [`super::share::saying_shadows`]).
 pub fn share_bytes(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Vec<u8>, String), String> {
+    let what = match kind {
+        "webMap" => "The web map",
+        "webLayer" => "The web layer",
+        _ => "The shared item",
+    };
+    super::share::saying_shadows(s, what, |s| share_bytes_inner(s, kind, p))
+}
+
+fn share_bytes_inner(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Vec<u8>, String), String> {
     match kind {
         "webMap" => {
             let mut m = map_of(s, p)?;

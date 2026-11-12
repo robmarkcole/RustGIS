@@ -1094,7 +1094,7 @@ fn drawn_bytes(s: &mut Session, i: usize, dpi: f64, pdf: bool) -> Result<(Vec<u8
             .unwrap_or_default()
     };
     let before = revision(s);
-    let result = report_pages_bytes(s, &doc, &pages, dpi, pdf);
+    let result = super::share::saying_shadows(s, "The report", |s| report_pages_bytes(s, &doc, &pages, dpi, pdf));
     before.finish_revision(revision(s), Some(result), "could not draw the report")?
 }
 

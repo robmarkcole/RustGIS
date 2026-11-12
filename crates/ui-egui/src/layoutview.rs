@@ -56,6 +56,34 @@ type Box4 = (f64, f64, f64, f64);
 /// wait ends once the page is whole.
 const FRAMES_REDRAW_S: f64 = 0.25;
 
+/// Says, once each, why frames drawn for a page or a preview drew layers without their cast
+/// shadows (see [`rustgis_engine::render::shadows_said`]), as the map view says them.
+pub(crate) fn say_frame_shadows(app: &mut RustGisApp, said: &rustgis_engine::render::ShadowsSaid) {
+    for e in &said.notices {
+        if app.map.tile_errors.insert(e.clone()) {
+            app.session.warn(e.clone());
+        }
+    }
+}
+
+/// The key a preview drawn for `base` is kept under: with the tile cache's generation when its
+/// frames drew without cast shadows still being worked out (on the interface's thread, which
+/// doesn't wait for them), so it is drawn again as they land (see [`preview_current`]).
+pub(crate) fn preview_key(base: &str, said: &rustgis_engine::render::ShadowsSaid) -> String {
+    if said.to_come { format!("{base}#shadows@{}", rustgis_engine::render::rustgis_tiles::cache::generation()) } else { base.to_string() }
+}
+
+/// Whether a preview kept under `kept` (see [`preview_key`]) is still the one `base` asks for:
+/// a preview waiting for cast shadows is drawn again once anything lands.
+pub(crate) fn preview_current(kept: &str, base: &str) -> bool {
+    kept == base || kept == format!("{base}#shadows@{}", rustgis_engine::render::rustgis_tiles::cache::generation())
+}
+
+/// Whether a preview kept under `kept` waits for cast shadows: the frame is asked again shortly.
+pub(crate) fn preview_waits(kept: &str) -> bool {
+    kept.contains("#shadows@")
+}
+
 /// What has landed so far: the tile cache's generation (tiles, styles, legend pictures, a raster's
 /// parts read in place) and the background reads' (a streamed layer's features, a source or
 /// raster opened by its address). Each goes up as something lands.
@@ -698,17 +726,21 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
     });
     if (app.layout.key != Some(key) || due) && size[0] > 2 && size[1] > 2 {
         let info = page_info(app, li);
-        if let Ok((pm, frames_pending)) = rustgis_engine::render::layout::render_pending(&layout, &mut app.session.project.maps, dpi, &info)
-        {
+        let (drawn, said) = rustgis_engine::render::shadows_said(|| {
+            rustgis_engine::render::layout::render_pending(&layout, &mut app.session.project.maps, dpi, &info)
+        });
+        if let Ok((pm, frames_pending)) = drawn {
             let img = egui::ColorImage::from_rgba_premultiplied([pm.width() as usize, pm.height() as usize], pm.data());
             match &mut app.layout.texture {
                 Some(tex) => tex.set(img, egui::TextureOptions::LINEAR),
                 None => app.layout.texture = Some(ui.ctx().load_texture("layout", img, egui::TextureOptions::LINEAR)),
             }
             app.layout.key = Some(key);
-            // Natively the page waited for them already: drawn again, it would wait again.
+            // Natively the page waited for them already: drawn again, it would wait again. Cast
+            // shadows still being worked out weren't waited for: drawn again as they land.
             let web = cfg!(target_arch = "wasm32");
-            let frames = web && frames_pending;
+            let frames = (web && frames_pending) || said.to_come;
+            say_frame_shadows(app, &said);
             // Waiting for the frames draws it again anyway: the legends are asked about once
             // they are whole.
             let legends = web && !frames && rustgis_engine::render::layout::legends_pending(&layout, &app.session.project.maps);

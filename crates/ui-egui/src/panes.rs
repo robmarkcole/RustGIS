@@ -6701,21 +6701,24 @@ fn raster_symbology(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
         RasterRenderer::Colormap => {
             ui.label(egui::RichText::new(tl!("Colors from the raster's own color table.")).size(11.5).color(t.text_dim));
         }
-        RasterRenderer::ShadedRelief { band, ramp, azimuth, altitude, z_factor } => {
-            let (az, alt, zf, rp) = (*azimuth, *altitude, *z_factor, ramp.as_ref().map(|r| r.name().to_string()));
-            let relief = move |band: usize, az: f64, alt: f64, zf: f64| {
-                let mut p = json!({"type": "shadedRelief", "band": band + 1, "azimuth": az, "altitude": alt, "zFactor": zf});
+        RasterRenderer::ShadedRelief { band, ramp, azimuth, altitude, z_factor, shadow } => {
+            let (az, alt, zf, sh, rp) = (*azimuth, *altitude, *z_factor, *shadow, ramp.as_ref().map(|r| r.name().to_string()));
+            let relief = move |band: usize, az: f64, alt: f64, zf: f64, sh: f64| {
+                let mut p = json!({"type": "shadedRelief", "band": band + 1, "azimuth": az, "altitude": alt, "zFactor": zf, "shadow": sh});
                 match &rp {
                     Some(r) => p["ramp"] = json!(r),
                     None => p["grey"] = json!(true),
                 }
                 p
             };
-            band_combo(app, ui, "Band", *band, &|i| ("raster.symbology".into(), relief(i, az, alt, zf)));
+            band_combo(app, ui, "Band", *band, &|i| ("raster.symbology".into(), relief(i, az, alt, zf, sh)));
             egui::Grid::new("relief").num_columns(2).spacing(vec2(10.0, 4.0)).show(ui, |ui| {
-                for (label, v, range, speed, which) in
-                    [("Azimuth", az, 0.0..=360.0, 1.0, 0), ("Altitude", alt, 0.0..=90.0, 0.5, 1), ("Z factor", zf, 0.001..=1000.0, 0.01, 2)]
-                {
+                for (label, v, range, speed, which) in [
+                    ("Azimuth", az, 0.0..=360.0, 1.0, 0),
+                    ("Altitude", alt, 0.0..=90.0, 0.5, 1),
+                    ("Z factor", zf, 0.001..=1000.0, 0.01, 2),
+                    ("Cast shadows", sh, 0.0..=1.0, 0.01, 3),
+                ] {
                     let input_label = ui.label(tl!(label));
                     let mut x = v;
                     // Kept across a drag until it is let go (#607).
@@ -6723,20 +6726,26 @@ fn raster_symbology(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
                     let r = ui
                         .add(egui::DragValue::new(&mut x).update_while_editing(false).range(range).speed(speed).max_decimals(3))
                         .labelled_by(input_label.id);
+                    let r = if which == 3 {
+                        r.on_hover_text(tl!("How dark the shadows the terrain casts are, from 0 (none) to 1, for the sun set above"))
+                    } else {
+                        r
+                    };
                     if drag.settled(ui, &r, &mut x) && x != v {
-                        let (a, b, c) = match which {
-                            0 => (x, alt, zf),
-                            1 => (az, x, zf),
-                            _ => (az, alt, x),
+                        let (a, b, c, d) = match which {
+                            0 => (x, alt, zf, sh),
+                            1 => (az, x, zf, sh),
+                            2 => (az, alt, x, sh),
+                            _ => (az, alt, zf, x),
                         };
-                        let _ = app.run("raster.symbology", relief(*band, a, b, c));
+                        let _ = app.run("raster.symbology", relief(*band, a, b, c, d));
                     }
                     ui.end_row();
                 }
             });
             let mut tint = ramp.is_some();
             if ui.checkbox(&mut tint, tl!("Tint by elevation")).changed() {
-                let mut p = relief(*band, az, alt, zf);
+                let mut p = relief(*band, az, alt, zf, sh);
                 if tint {
                     p["ramp"] = json!("Terrain");
                     p["grey"] = json!(false);
