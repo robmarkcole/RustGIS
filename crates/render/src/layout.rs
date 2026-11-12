@@ -349,7 +349,7 @@ fn draw_page(
                     None => placeholder(&mut pm, r, "Colorbar", ppp),
                 }
             }
-            ElementKind::Text { text: t, size, color, bold, italic, align, letter_spacing, font, font_name } => {
+            ElementKind::Text { text: t, size, color, bold, italic, align, letter_spacing, font, font_name, rotation } => {
                 let first = layout.first_frame().and_then(frame);
                 let s = expand(t, layout, info, first.and_then(|f| maps.get(f.1).map(|m| (m, f.2))));
                 // An installed family by name (#762), else its generic one. The app doesn't wait
@@ -358,7 +358,13 @@ fn draw_page(
                 let family = font_name.as_deref().and_then(crate::families::find_ready);
                 let face = text::Face { bold: *bold, italic: *italic, serif: *font == rustgis_map::layout::FontFamily::Serif, family };
                 let style = TextStyle { face, align: *align, spacing: *letter_spacing as f32 };
-                text_block(&mut pm, r, &s, *size as f32, *color, style, ppp);
+                if *rotation == 0.0 {
+                    text_block(&mut pm, r, &s, *size as f32, *color, style, ppp);
+                } else if let Some(area) = text_area(r, &s, *size as f32, style, ppp) {
+                    draw_turned_box(&mut pm, r, *rotation as f32, area, |c, r, k| {
+                        text_block(c, r, &s, *size as f32, *color, style, ppp * k)
+                    });
+                }
             }
             ElementKind::Picture { image } => {
                 if let Some(img) = crate::picture::decode(image) {
@@ -2448,6 +2454,71 @@ pub fn line_pitch_mm(size: f64) -> f64 {
     size.clamp(2.0, 400.0) * 1.33 * 1.25 * 25.4 / 96.0
 }
 
+/// The part of a text element's box (pixels, from its top-left corner) [`text_block`] inks, a line's
+/// height more each way: across, its lines as each is aligned (past the box where one overruns
+/// it); down, its lines, or the box and the line [`text_block`] still draws past it. `None` when
+/// it has no line.
+fn text_area(r: Rect, s: &str, size: f32, style: TextStyle, ppp: f64) -> Option<Rect> {
+    let px = size.clamp(2.0, 400.0) * 1.33 * ppp as f32;
+    let spacing = style.spacing * 1.33 * ppp as f32;
+    let w = r.width();
+    let (mut x0, mut x1, mut lines) = (f32::INFINITY, f32::NEG_INFINITY, 0u16);
+    for line in s.lines().take(200) {
+        let (lo, hi) = text::styled_extent(line, px, style.face, spacing);
+        // Where `text_block` puts the ink: from the edge (left), or by the ink (centre, right).
+        let (a, b) = match style.align {
+            TextAlign::Left => (lo, hi),
+            TextAlign::Center => ((w - (hi - lo)) / 2.0, (w + (hi - lo)) / 2.0),
+            TextAlign::Right => (w - (hi - lo), w),
+        };
+        (x0, x1, lines) = (x0.min(a), x1.max(b), lines + 1);
+    }
+    let down = (r.height() + px).min(f32::from(lines) * px * 1.25);
+    (lines > 0).then(|| Rect::from_ltrb(x0 - px, -px, x1 + px, down + px)).flatten()
+}
+
+/// Draws with `draw` (given the box to draw in and how many of the page's pixels one of its own
+/// is) turned `degrees` clockwise about the centre of `r`: kept turned on a recording canvas (a
+/// vector PDF), else drawn upright in a picture of `area` (pixels from the box's top-left corner:
+/// what it inks), which is placed turned. A picture past the page's budget is drawn at a lower
+/// resolution and scaled up, as a frame that large is. Its size is at least a pixel and at most
+/// the budget, and `r` and `area` have a size, so the picture is always made.
+///
+/// A quarter turn at full resolution maps the picture's pixels one for one onto the page's: it is
+/// placed on whole pixels and not filtered, the part of a pixel that moved it drawn into the
+/// picture instead, so its text is sampled once, as upright text is, and keeps as sharp. Another
+/// turn is sampled once more, by the turn.
+fn draw_turned_box(pm: &mut Canvas, r: Rect, degrees: f32, area: Rect, draw: impl FnOnce(&mut Canvas, Rect, f64)) {
+    let (cx, cy) = (r.x() + r.width() / 2.0, r.y() + r.height() / 2.0);
+    if pm.is_recording() {
+        pm.with_transform(Transform::from_rotate_at(degrees, cx, cy), |c| draw(c, r, 1.0));
+        return;
+    }
+    let (w, h) = (f64::from(area.width()), f64::from(area.height()));
+    let k = (MAX_PIXELS / (w * h)).sqrt().min(MAX_SIDE / w.max(h)).min(1.0) as f32;
+    let (pw, ph) = ((w as f32 * k).ceil().max(1.0), (h as f32 * k).ceil().max(1.0));
+    let mut place =
+        Transform::from_scale(1.0 / k, 1.0 / k).post_translate(r.x() + area.x(), r.y() + area.y()).post_rotate_at(degrees, cx, cy);
+    let quarter = k == 1.0 && degrees.rem_euclid(90.0) == 0.0;
+    let (mut dx, mut dy) = (0.0, 0.0);
+    if quarter {
+        // Its turn exactly (0 or ±1 each way), and its corner on a whole pixel: the picture's
+        // content moves back by as much, turned back (the turn's inverse is its transpose).
+        let [sx, ky, kx, sy] = [place.sx, place.ky, place.kx, place.sy].map(f32::round);
+        let (ex, ey) = (place.tx.round() - place.tx, place.ty.round() - place.ty);
+        (dx, dy) = (-(sx * ex + ky * ey), -(kx * ex + sy * ey));
+        place = Transform::from_row(sx, ky, kx, sy, place.tx.round(), place.ty.round());
+    }
+    // The box in the picture: its corner `area`'s offset away from the picture's (and less than a
+    // pixel more, within the room `area` leaves round the ink).
+    let inner = Rect::from_xywh(-area.x() * k + dx, -area.y() * k + dy, r.width() * k, r.height() * k);
+    let (Some(mut pic), Some(inner)) = (Canvas::new(pw as u32, ph as u32), inner) else { return };
+    draw(&mut pic, inner, f64::from(k));
+    let quality = if quarter { tiny_skia::FilterQuality::Nearest } else { tiny_skia::FilterQuality::Bilinear };
+    let paint = PixmapPaint { quality, ..PixmapPaint::default() };
+    pm.draw_pixmap(0, 0, pic.pixmap().as_ref(), &paint, place, None);
+}
+
 /// Text in an element: lines split at `\n` from the top, each placed by the style's alignment. A
 /// centred or right-aligned line wider than the element runs out past its left edge, as a
 /// left-aligned one runs past its right.
@@ -3430,6 +3501,143 @@ mod tests {
     fn text_height(pm: &Pixmap) -> u32 {
         let rows: Vec<u32> = (0..pm.height()).filter(|&y| (0..pm.width()).any(|x| rgb(pm, x, y).0 < 128)).collect();
         rows[rows.len() - 1] - rows[0]
+    }
+
+    /// A page with one text element in (10, 45, 80, 10) mm, turned `turn` degrees.
+    fn turned_text_page(turn: f64) -> Layout {
+        let mut l = Layout::new("L", 100.0, 100.0);
+        let mut kind = ElementKind::text("Fonte: IBGE, 2022", 14.0, Rgba::rgb(0, 0, 0), false);
+        if let ElementKind::Text { rotation, .. } = &mut kind {
+            *rotation = turn;
+        }
+        l.add("Source", (10.0, 45.0, 80.0, 10.0), kind);
+        l
+    }
+
+    /// The dark pixels' bounds: left, top, right, bottom.
+    fn ink_bounds(pm: &Pixmap) -> (u32, u32, u32, u32) {
+        let dark: Vec<(u32, u32)> =
+            (0..pm.height()).flat_map(|y| (0..pm.width()).map(move |x| (x, y))).filter(|&(x, y)| rgb(pm, x, y).0 < 128).collect();
+        let xs = dark.iter().map(|p| p.0);
+        let ys = dark.iter().map(|p| p.1);
+        (xs.clone().min().unwrap(), ys.clone().min().unwrap(), xs.max().unwrap(), ys.max().unwrap())
+    }
+
+    /// A text turned 90° runs down the page from the top of its turned box, -90° up it from the
+    /// bottom, about the centre of its box (#1763); upright, it runs across as before.
+    #[test]
+    fn a_turned_text_runs_down_or_up_the_page() {
+        // 100 mm at 96 dpi; the box's centre at 50 mm.
+        let centre = 50.0 * 96.0 / 25.4;
+        let ink = |turn: f64| ink_bounds(&render(&turned_text_page(turn), &mut [], 96.0, &PageInfo::default()).unwrap());
+        let (l, t, r, b) = ink(0.0);
+        assert!(r - l > 4 * (b - t), "upright runs across: {l},{t} to {r},{b}");
+        for turn in [90.0, -90.0] {
+            let (l, t, r, b) = ink(turn);
+            assert!(b - t > 4 * (r - l), "{turn}° runs along the page: {l},{t} to {r},{b}");
+            // Across: within the turned box, 10 mm wide about the centre.
+            assert!((f64::from(l + r) / 2.0 - centre).abs() < 10.0 * 96.0 / 25.4 / 2.0, "{turn}°: {l}..{r}");
+            // Along: a left-aligned line starts at the box's left edge, which a turn of 90° takes to
+            // the top and one of -90° to the bottom.
+            let middle = f64::from(t + b) / 2.0;
+            assert!(if turn > 0.0 { middle < centre } else { middle > centre }, "{turn}°: {t}..{b} about {centre}");
+        }
+    }
+
+    /// A quarter-turned text keeps as sharp as an upright one: its picture is put on whole pixels,
+    /// not filtered between them, so its edges have no more part-covered pixels (#1763). At 300 dpi
+    /// the box's corner falls between pixels (10 mm is 118.1 of them).
+    #[test]
+    fn a_quarter_turned_text_is_as_sharp_as_upright() {
+        // Solid pixels (darker than 80 %) and part-covered ones (20 to 80 %).
+        let edges = |turn: f64| {
+            let pm = render(&turned_text_page(turn), &mut [], 300.0, &PageInfo::default()).unwrap();
+            let dark = (0..pm.height()).flat_map(|y| (0..pm.width()).map(move |x| (x, y))).map(|(x, y)| 255 - u32::from(rgb(&pm, x, y).0));
+            dark.fold((0u32, 0u32), |(solid, part), d| (solid + u32::from(d > 204), part + u32::from(d > 51 && d <= 204)))
+        };
+        let (solid, part) = edges(0.0);
+        let upright = f64::from(part) / f64::from(solid);
+        for turn in [90.0, -90.0, 180.0] {
+            let (s, p) = edges(turn);
+            let turned = f64::from(p) / f64::from(s);
+            assert!(turned < upright * 1.2, "{turn}°: {p} part-covered to {s} solid, upright {part} to {solid}");
+            assert!(s.abs_diff(solid) * 10 < solid, "{turn}°: as much ink, {s} solid to {solid}");
+        }
+    }
+
+    /// A turned text's picture covers the lines it draws, not its whole box: a short line in a
+    /// large box takes a small picture, where its alignment puts the line (#1763).
+    #[test]
+    fn a_turned_texts_picture_covers_its_lines() {
+        let r = Rect::from_xywh(0.0, 0.0, 2000.0, 1000.0).unwrap();
+        let plain = TextStyle { face: text::Face::default(), align: TextAlign::Left, spacing: 0.0 };
+        let px = 14.0 * 1.33;
+        let area = |align| text_area(r, "Fonte: IBGE", 14.0, TextStyle { align, ..plain }, 1.0).unwrap();
+        let left = area(TextAlign::Left);
+        assert!(left.width() < 200.0 && left.height() < 4.0 * px, "{left:?}");
+        assert!(left.left() < 0.0 && left.top() < 0.0, "a line's height of room: {left:?}");
+        let right = area(TextAlign::Right);
+        assert!((right.right() - (2000.0 + px)).abs() < 1.0 && (right.width() - left.width()).abs() < 1.0, "{right:?}");
+        let centre = area(TextAlign::Center);
+        assert!(((centre.left() + centre.right()) / 2.0 - 1000.0).abs() < 1.0, "{centre:?}");
+        // Two lines, twice the pitch; nothing when there is no line.
+        let two = text_area(
+            r,
+            "Fonte: IBGE
+Elaboração: RustGIS",
+            14.0,
+            plain,
+            1.0,
+        )
+        .unwrap();
+        assert!((two.height() - left.height() - px * 1.25).abs() < 0.01);
+        assert!(text_area(r, "", 14.0, plain, 1.0).is_none());
+    }
+
+    /// A turned box past the page's budget is still drawn turned, at a lower resolution, not
+    /// left out or left upright (#1763).
+    #[test]
+    fn a_huge_turned_box_is_drawn_at_a_lower_resolution() {
+        let mut pm = Canvas::new(200, 200).unwrap();
+        // 20,000 px long (past MAX_SIDE), 20 high, about the canvas's centre.
+        let r = Rect::from_xywh(-9_900.0, 90.0, 20_000.0, 20.0).unwrap();
+        let mut scale = 0.0;
+        let area = Rect::from_xywh(0.0, 0.0, r.width(), r.height()).unwrap();
+        draw_turned_box(&mut pm, r, 90.0, area, |c, inner, k| {
+            scale = k;
+            c.fill_rect(inner, &paint(Rgba::rgb(0, 0, 0), 1.0), Transform::identity(), None);
+        });
+        assert!(scale < 1.0 && scale > 0.0, "{scale}");
+        // Turned upright: a bar down the middle, top to bottom; nothing beside it.
+        let dark = |x: u32, y: u32| pm.pixmap().pixel(x, y).is_some_and(|p| p.alpha() > 128);
+        assert!(dark(100, 2) && dark(100, 197) && dark(95, 100), "the bar runs down the page");
+        assert!(!dark(70, 100) && !dark(130, 100));
+    }
+
+    /// A turned text is kept as turned glyphs, which draw what its picture shows (#1763).
+    #[test]
+    fn a_turned_text_is_kept_turned_as_vectors() {
+        use crate::vector::Item;
+        let layout = turned_text_page(90.0);
+        let info = PageInfo::default();
+        let png = render(&layout, &mut [], 96.0, &info).unwrap();
+        let (drawing, _) = render_drawing(&layout, &mut [], 96.0, &info).unwrap();
+        let (_, _, items) = drawing.finish();
+        let text: String = items
+            .iter()
+            .filter_map(|i| if let Item::Glyphs(r) = i { Some(r) } else { None })
+            .flat_map(|r| r.glyphs.iter().map(|g| g.ch))
+            .collect();
+        assert_eq!(text, "Fonte: IBGE, 2022", "kept as text, not a picture");
+        let mut replayed = Pixmap::new(png.width(), png.height()).unwrap();
+        replayed.fill(tiny_skia::Color::WHITE);
+        crate::vector::replay(&items, &mut replayed, Transform::identity());
+        let (pl, pt, pr, pb) = ink_bounds(&png);
+        let (vl, vt, vr, vb) = ink_bounds(&replayed);
+        assert!(
+            pl.abs_diff(vl) <= 2 && pt.abs_diff(vt) <= 2 && pr.abs_diff(vr) <= 2 && pb.abs_diff(vb) <= 2,
+            "{pl},{pt},{pr},{pb} vs {vl},{vt},{vr},{vb}"
+        );
     }
 
     /// Text elements take italic, alignment and letter spacing (#213, point c); plain, they draw

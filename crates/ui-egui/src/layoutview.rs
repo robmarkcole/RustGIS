@@ -6,9 +6,9 @@
 
 use egui::{Align2, Color32, CornerRadius, CursorIcon, Pos2, Rect, Sense, Stroke, Ui, pos2, vec2};
 use rustgis_engine::map::layout::{
-    Arrange, ArrowStyle, CoordFormat, ElementKind, Grid, GridKind, GridStyle, Layout, LineHead, MAX_COLORBAR_TICKS, MAX_FRAME_SCALE,
-    MAX_GRID_WIDTH, MAX_LEGEND_COLUMNS, MAX_SCALE_DIVISIONS, MAX_TICK_MM, MIN_FRAME_SCALE, Orientation, PT_PER_MM, ScaleBarStyle,
-    ScaleUnits, TickSide, frame_camera, line_angle, line_length,
+    Arrange, ArrowStyle, CoordFormat, Element, ElementKind, Grid, GridKind, GridStyle, Layout, LineHead, MAX_COLORBAR_TICKS,
+    MAX_FRAME_SCALE, MAX_GRID_WIDTH, MAX_LEGEND_COLUMNS, MAX_SCALE_DIVISIONS, MAX_TICK_MM, MIN_FRAME_SCALE, Orientation, PT_PER_MM,
+    ScaleBarStyle, ScaleUnits, TickSide, frame_camera, line_angle, line_length,
 };
 use serde_json::{Value, json};
 
@@ -277,17 +277,20 @@ const HANDLE_PICK: f32 = 11.0;
 /// The selected element's resize handle at a screen point: the element and the handle (0..8
 /// clockwise from top-left), the nearest within reach. On a small element the reach shrinks, so
 /// its inside still moves it; outside, it keeps a floor, so a thin element's handles can still be
-/// picked up. Navigating, a map frame under the pointer pans instead: no handle. A locked
+/// picked up. Navigating, a map frame under the pointer pans instead: no handle, but a text's,
+/// which often sits on a map (a credit, a turned source line) and sticks out over it. A locked
 /// element has none.
 fn handle_at(app: &RustGisApp, layout: &Layout, page: Rect, s: f32, pos: Pos2) -> Option<(u32, usize)> {
-    if nav_frame(app, layout, page, s, pos).is_some() {
+    let e = app.layout.selected.and_then(|id| layout.element(id)).filter(|e| !e.locked)?;
+    if !matches!(e.kind, ElementKind::Text { .. }) && nav_frame(app, layout, page, s, pos).is_some() {
         return None;
     }
-    let e = app.layout.selected.and_then(|id| layout.element(id)).filter(|e| !e.locked)?;
     let r = Rect::from_min_max(to_screen(page, s, (e.x, e.y)), to_screen(page, s, (e.x + e.w, e.y + e.h)));
     let third = r.width().min(r.height()) / 3.0;
-    let reach = HANDLE_PICK.min(if r.contains(pos) { third } else { third.max(5.0) });
+    // A turned text's handles are on its turned box.
+    let reach = HANDLE_PICK.min(if r.contains(screen_turn(pos, r.center(), -e.rotation())) { third } else { third.max(5.0) });
     handles(r)
+        .map(|h| screen_turn(h, r.center(), e.rotation()))
         .iter()
         .enumerate()
         .map(|(i, h)| (i, (h.x - pos.x).abs().max((h.y - pos.y).abs())))
@@ -341,8 +344,27 @@ fn turned(start: f64, from: f64, to: f64, steps: bool) -> f64 {
     (a + 180.0).rem_euclid(360.0) - 180.0
 }
 
-/// The cursor for dragging handle `h`.
-fn handle_cursor(h: usize) -> CursorIcon {
+/// `p` turned `degrees` clockwise about `c`, on screen.
+fn screen_turn(p: Pos2, c: Pos2, degrees: f64) -> Pos2 {
+    if degrees == 0.0 {
+        return p;
+    }
+    let (sin, cos) = degrees.to_radians().sin_cos();
+    let (sin, cos, d) = (sin as f32, cos as f32, p - c);
+    pos2(c.x + d.x * cos - d.y * sin, c.y + d.x * sin + d.y * cos)
+}
+
+/// The corners of the box `r` (mm) turned `degrees` clockwise about its centre, on screen, from
+/// the top left round.
+fn turned_corners(page: Rect, s: f32, (x, y, w, h): Box4, degrees: f64) -> [Pos2; 4] {
+    let r = Rect::from_min_max(to_screen(page, s, (x, y)), to_screen(page, s, (x + w, y + h)));
+    [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()].map(|p| screen_turn(p, r.center(), degrees))
+}
+
+/// The cursor for dragging handle `h` of an element turned `degrees`: the handle's own, an
+/// eighth of a turn on for every 45°.
+fn handle_cursor(h: usize, degrees: f64) -> CursorIcon {
+    let h = (h as i64 + (degrees / 45.0).round() as i64).rem_euclid(8);
     match h {
         0 | 4 => CursorIcon::ResizeNwSe,
         2 | 6 => CursorIcon::ResizeNeSw,
@@ -393,8 +415,10 @@ fn snap_lines(l: &Layout, moving: u32) -> (Vec<f64>, Vec<f64>) {
     xs.extend(&l.guides.x);
     ys.extend(&l.guides.y);
     for e in l.elements.iter().filter(|e| e.id != moving && e.visible) {
-        xs.extend([e.x, e.x + e.w / 2.0, e.x + e.w]);
-        ys.extend([e.y, e.y + e.h / 2.0, e.y + e.h]);
+        // A turned text by the rectangle it takes up.
+        let (x, y, w, h) = e.bounds();
+        xs.extend([x, x + w / 2.0, x + w]);
+        ys.extend([y, y + h / 2.0, y + h]);
     }
     (xs, ys)
 }
@@ -463,11 +487,29 @@ fn drag_landing(lv: &LayoutView, ui: &Ui, layout: &Layout, s: f32, at: (f64, f64
         _ => return None,
     };
     let e = layout.element(id)?;
+    let d = (at.0 - start.0, at.1 - start.1);
+    if let (Some(hd), true) = (handle, e.rotation() != 0.0) {
+        return Some((id, turned_resize(e, hd, d), None, None));
+    }
     let free = lv.no_snap || ui.input(|i| i.modifiers.alt);
     let lines = (!free).then(|| snap_lines(layout, id));
     let tol = f64::from(SNAP_PT / s.max(1e-3));
-    let (r, sx, sy) = landing((e.x, e.y, e.w, e.h), handle, (at.0 - start.0, at.1 - start.1), lines.as_ref().map(|l| (l, tol)));
+    // A turned text moves snapping the rectangle it takes up.
+    let b = e.bounds();
+    let (r, sx, sy) = landing(b, handle, d, lines.as_ref().map(|l| (l, tol)));
+    let r = if handle.is_none() { (e.x + r.0 - b.0, e.y + r.1 - b.1, e.w, e.h) } else { r };
     Some((id, r, sx, sy))
+}
+
+/// The box of a turned element after dragging its handle `h` by (dx, dy) mm on the page: resized
+/// in its own turned frame (unsnapped), then moved so the side the handle doesn't move stays where
+/// it was on the page, though the centre it turns about moved.
+fn turned_resize(e: &Element, h: usize, (dx, dy): (f64, f64)) -> Box4 {
+    let (sin, cos) = e.rotation().to_radians().sin_cos();
+    let local = (dx * cos + dy * sin, -dx * sin + dy * cos);
+    let (x, y, w, nh) = resized((e.x, e.y, e.w, e.h), h, local.0, local.1);
+    let (mx, my) = (x + w / 2.0 - (e.x + e.w / 2.0), y + nh / 2.0 - (e.y + e.h / 2.0));
+    (x + mx * cos - my * sin - mx, y + mx * sin + my * cos - my, w, nh)
 }
 
 /// The guide under a screen point: vertical or not, and its index.
@@ -754,7 +796,7 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
     }
     // The dragged element's outline where it will land, and the lines it snapped to.
     if let Some(p) = pointer
-        && let Some((_, r, sx, sy)) = drag_landing(&app.layout, ui, &layout, s, to_mm(page, s, p))
+        && let Some((dragged, r, sx, sy)) = drag_landing(&app.layout, ui, &layout, s, to_mm(page, s, p))
     {
         if let Some(x) = sx {
             vline(to_screen(page, s, (x, 0.0)).x, SNAP_COLOR);
@@ -762,17 +804,15 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
         if let Some(y) = sy {
             hline(to_screen(page, s, (0.0, y)).y, SNAP_COLOR);
         }
-        let rr = Rect::from_min_max(to_screen(page, s, (r.0, r.1)), to_screen(page, s, (r.0 + r.2, r.1 + r.3)));
-        painter.rect_stroke(rr, 0.0, Stroke::new(1.5, accent), egui::StrokeKind::Middle);
+        // Turned as the element being dragged is.
+        let rot = layout.element(dragged).map_or(0.0, |e| e.rotation());
+        painter.add(egui::Shape::closed_line(turned_corners(page, s, r, rot).to_vec(), Stroke::new(1.5, accent)));
     }
     if let Some(e) = app.layout.selected.and_then(|id| layout.element(id)) {
         let r = Rect::from_min_max(to_screen(page, s, (e.x, e.y)), to_screen(page, s, (e.x + e.w, e.y + e.h)));
-        painter.extend(egui::Shape::dashed_line(
-            &[r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()],
-            Stroke::new(1.2, accent),
-            5.0,
-            3.0,
-        ));
+        // A turned text's box turned with it.
+        let [lt, rt, rb, lb] = turned_corners(page, s, (e.x, e.y, e.w, e.h), e.rotation());
+        painter.extend(egui::Shape::dashed_line(&[lt, rt, rb, lb, lt], Stroke::new(1.2, accent), 5.0, 3.0));
         // The handle under the pointer, or being dragged, is filled.
         let active = match app.layout.drag {
             Some(Drag::Resize(id, h, _)) if id == e.id => Some(h),
@@ -781,9 +821,9 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
         };
         if e.locked {
             // No handles: a lock at the top-right corner says why.
-            crate::icons::paint(&painter, Rect::from_center_size(r.right_top(), vec2(16.0, 16.0)), "lock", accent, accent);
+            crate::icons::paint(&painter, Rect::from_center_size(rt, vec2(16.0, 16.0)), "lock", accent, accent);
         } else {
-            for (i, h) in handles(r).into_iter().enumerate() {
+            for (i, h) in handles(r).map(|h| screen_turn(h, r.center(), e.rotation())).into_iter().enumerate() {
                 let hr = Rect::from_center_size(h, vec2(HANDLE, HANDLE));
                 painter.rect_filled(hr, 2.0, if active == Some(i) { accent } else { Color32::WHITE });
                 painter.rect_stroke(hr, 2.0, Stroke::new(1.5, accent), egui::StrokeKind::Middle);
@@ -797,7 +837,9 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
                 painter.circle(knob, HANDLE * 0.6, if on { accent } else { Color32::WHITE }, Stroke::new(1.5, accent));
             }
         }
-        painter.text(r.left_top() + vec2(0.0, -4.0), Align2::LEFT_BOTTOM, &e.name, regular(11.0), accent);
+        // The name over the turned box's topmost corner.
+        let top = [rt, rb, lb].into_iter().fold(lt, |a, p| if p.y < a.y - 0.5 { p } else { a });
+        painter.text(top + vec2(0.0, -4.0), Align2::LEFT_BOTTOM, &e.name, regular(11.0), accent);
     }
     // A line being turned: where it will point, and its angle.
     if let (Some(Drag::Rotate(id, a0, from)), Some(p)) = (app.layout.drag, pointer)
@@ -1003,7 +1045,9 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, layout: &L
             Some(_) => None,
             None => ruler_at(&app.layout, resp.rect, p).or_else(|| guide_at(layout, page, s, p).map(|g| g.0)),
         };
-        let navigating = app.layout.drag.is_none() && nav_frame(app, layout, page, s, p).is_some();
+        // A text's handle over the frame comes first (`handle_at`).
+        let navigating =
+            app.layout.drag.is_none() && nav_frame(app, layout, page, s, p).is_some() && handle_at(app, layout, page, s, p).is_none();
         let handle = match app.layout.drag {
             Some(Drag::Resize(_, h, _)) => Some(h),
             None if !navigating => handle_at(app, layout, page, s, p).map(|(_, h)| h),
@@ -1014,7 +1058,10 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, layout: &L
         match (vertical, handle) {
             _ if rotating => ui.ctx().set_cursor_icon(CursorIcon::Grabbing),
             _ if knob => ui.ctx().set_cursor_icon(CursorIcon::Grab),
-            (_, Some(h)) => ui.ctx().set_cursor_icon(handle_cursor(h)),
+            (_, Some(h)) => {
+                let rot = app.layout.selected.and_then(|id| layout.element(id)).map_or(0.0, |e| e.rotation());
+                ui.ctx().set_cursor_icon(handle_cursor(h, rot))
+            }
             (Some(true), _) => ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal),
             (Some(false), _) => ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical),
             _ if matches!(app.layout.drag, Some(Drag::PanFrame(..))) => ui.ctx().set_cursor_icon(CursorIcon::Grabbing),
@@ -1561,8 +1608,35 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                 }
                 ui.end_row();
                 match &e.kind {
-                    // Its text, size, colour and boldness: the shared form, below the grid.
-                    ElementKind::Text { .. } => {}
+                    ElementKind::Text { rotation, .. } => {
+                        // Its text, size, colour and boldness are the shared form, below the grid.
+                        // Its turn is clockwise about its centre, as a frame's bearing: 90 reads top
+                        // to bottom, -90 bottom to top.
+                        let input_label = ui.label(tl!("Rotation"));
+                        ui.horizontal(|ui| {
+                            let mut a = *rotation;
+                            let drag = Dragged::lend(ui, drag_key("rotation"), &mut a);
+                            let r = ui
+                                .add(
+                                    egui::DragValue::new(&mut a)
+                                        .update_while_editing(false)
+                                        .range(-180.0..=180.0)
+                                        .speed(1.0)
+                                        .max_decimals(1)
+                                        .suffix("°"),
+                                )
+                                .labelled_by(input_label.id);
+                            if drag.settled(ui, &r, &mut a) && (a - rotation).abs() > 1e-6 {
+                                update(app, json!({"rotation": a}));
+                            }
+                            for quick in [0.0, 90.0, -90.0] {
+                                if ui.selectable_label(*rotation == quick, format!("{quick:.0}°")).clicked() && *rotation != quick {
+                                    update(app, json!({"rotation": quick}));
+                                }
+                            }
+                        });
+                        ui.end_row();
+                    }
                     ElementKind::Legend { title, all_classes, hide_other, columns, .. } => {
                         let input_label = ui.label(tl!("Title"));
                         if let Some(tt) = text_field(app, ui, (li, id, "title"), title, false, input_label.id) {
@@ -1904,7 +1978,7 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
         );
     });
     // A layout's text: the form a text graphic has too (#516, #535), with the page's dynamic text.
-    if let ElementKind::Text { text, size, color, bold, italic, align, letter_spacing, font, font_name } = &e.kind {
+    if let ElementKind::Text { text, size, color, bold, italic, align, letter_spacing, font, font_name, .. } = &e.kind {
         let key = (li, id, "text");
         let mut buf = app.layout.typing.remove(&key).unwrap_or_else(|| text.clone());
         let (mut sz, mut c, mut bb) = (*size, crate::theme::c32(*color), *bold);
@@ -2115,7 +2189,9 @@ pub(crate) fn locked_delete() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{FRAMES_REDRAW_S, PageWait, RULER, landing, page_rect, redraw_due, resized, rotate_handle, snap_to, to_screen, turned};
+    use super::{
+        FRAMES_REDRAW_S, PageWait, RULER, handle_at, landing, page_rect, redraw_due, resized, rotate_handle, snap_to, to_screen, turned,
+    };
     use crate::RustGisApp;
     use egui::{Event, Key, Modifiers, PointerButton, Pos2, Rect, vec2};
     use serde_json::json;
@@ -2158,6 +2234,123 @@ mod tests {
         assert!((turned(10.0, 0.0, 20.0, false) - 30.0).abs() < 1e-9, "30° is left alone");
         assert_eq!(turned(0.0, 0.0, 20.0, true), 15.0, "Shift: 15° steps");
         assert!((turned(170.0, 0.0, 30.0, false) + 160.0).abs() < 1e-9, "200° is -160°");
+    }
+
+    /// A text turned 90° shows its handles on its turned box (#1763): its right-hand handle sits
+    /// at the bottom, and dragging it down lengthens the text, its top staying put.
+    #[test]
+    fn a_turned_text_resizes_by_its_turned_handles() {
+        let mut app = RustGisApp::with_sample();
+        app.run("layout.new", json!({"name": "Turn", "template": "blank"})).unwrap();
+        let li = app.session.active_layout.unwrap();
+        let p = json!({"layout": li, "kind": "text", "text": "Fonte: IBGE", "rotation": 90, "x": 60, "y": 100, "w": 80, "h": 10});
+        let id = app.run("layout.addElement", p).unwrap()["element"].as_u64().unwrap() as u32;
+        app.layout.selected = Some(id);
+        let area = Rc::new(Cell::new(Rect::NOTHING));
+        let shown = area.clone();
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1000.0, 760.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                shown.set(ui.available_rect_before_wrap());
+                super::show(app, ui);
+            },
+            app,
+        );
+        h.run_steps(3);
+        let layout = h.state().session.project.layouts[li].clone();
+        let (page, s) = page_rect(&h.state().layout, area.get(), &layout);
+        // The box's right-hand end, 40 mm right of its centre (100, 105), turned to 40 mm below it.
+        let from = to_screen(page, s, (100.0, 145.0));
+        assert_eq!(handle_at(h.state(), &layout, page, s, from), Some((id, 3)), "the right-hand handle, turned");
+        let to = to_screen(page, s, (100.0, 165.0));
+        let button = |pos: Pos2, pressed| Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        h.event(Event::PointerMoved(from));
+        h.step();
+        h.event(button(from, true));
+        h.step();
+        for i in 1..=6 {
+            h.event(Event::PointerMoved(from + (to - from) * i as f32 / 6.0));
+            h.step();
+        }
+        h.event(button(to, false));
+        h.step();
+        let e = h.state().session.project.layouts[li].element(id).unwrap();
+        assert!((e.w - 100.0).abs() < 1.0 && (e.h - 10.0).abs() < 1e-9, "20 mm longer: {} × {}", e.w, e.h);
+        let (bx, by, bw, bh) = e.bounds();
+        assert!((by - 65.0).abs() < 1e-6 && (bx - 95.0).abs() < 1e-6, "its top and side stay: {bx}, {by}");
+        assert!((bh - e.w).abs() < 1e-6 && (bw - 10.0).abs() < 1e-6);
+    }
+
+    /// Navigating map frames, a selected text on a map frame keeps its handles, where they stick
+    /// out over the map too: dragging one resizes the text and leaves the map be. Another
+    /// element's handle over the frame still pans the map (#1763).
+    #[test]
+    fn a_text_on_a_map_frame_keeps_its_handles_while_navigating() {
+        use rustgis_engine::map::layout::ElementKind;
+        let mut app = RustGisApp::with_sample();
+        app.run("layout.new", json!({"name": "Nav"})).unwrap();
+        let li = app.session.active_layout.unwrap();
+        let frame = app.session.project.layouts[li].first_frame().unwrap();
+        let f = app.session.project.layouts[li].element(frame).unwrap().clone();
+        let (x, y) = (f.x + 10.0, f.y + 10.0);
+        let p = json!({"layout": li, "kind": "text", "text": "Fonte: IBGE", "x": x, "y": y, "w": 40, "h": 8});
+        let text = app.run("layout.addElement", p).unwrap()["element"].as_u64().unwrap() as u32;
+        let p = json!({"layout": li, "kind": "rectangle", "x": x, "y": y + 20.0, "w": 40, "h": 20, "fill": "#00000000"});
+        let rect = app.run("layout.addElement", p).unwrap()["element"].as_u64().unwrap() as u32;
+        app.layout.navigate = true;
+        app.layout.selected = Some(text);
+        let area = Rc::new(Cell::new(Rect::NOTHING));
+        let shown = area.clone();
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1000.0, 760.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                shown.set(ui.available_rect_before_wrap());
+                super::show(app, ui);
+            },
+            app,
+        );
+        h.run_steps(3);
+        let layout = h.state().session.project.layouts[li].clone();
+        let center = |l: &rustgis_engine::map::layout::Layout| match &l.element(frame).unwrap().kind {
+            ElementKind::MapFrame { center, .. } => *center,
+            k => panic!("{k:?}"),
+        };
+        let before = center(&layout);
+        let (page, s) = page_rect(&h.state().layout, area.get(), &layout);
+        // Just right of the text's right-hand handle: off the text, over the map.
+        let from = to_screen(page, s, (x + 40.0, y + 4.0)) + vec2(3.0, 0.0);
+        assert_eq!(layout.hit(x + 40.0 + f64::from(3.0 / s), y + 4.0), Some(frame), "the point is on the map frame");
+        assert_eq!(handle_at(h.state(), &layout, page, s, from), Some((text, 3)), "the text's handle comes first");
+        let to = to_screen(page, s, (x + 60.0, y + 4.0)) + vec2(3.0, 0.0);
+        let button = |pos: Pos2, pressed| Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        h.event(Event::PointerMoved(from));
+        h.step();
+        h.event(button(from, true));
+        h.step();
+        for i in 1..=6 {
+            h.event(Event::PointerMoved(from + (to - from) * i as f32 / 6.0));
+            h.step();
+        }
+        h.event(button(to, false));
+        h.run_steps(2);
+        let after = h.state().session.project.layouts[li].clone();
+        let e = after.element(text).unwrap();
+        assert!((e.w - 60.0).abs() < 1.0 && (e.x - x).abs() < 1e-9, "20 mm wider: {} at {}", e.w, e.x);
+        assert_eq!(center(&after), before, "the map stayed put");
+        // A rectangle's handle there is the map's, as before.
+        h.state_mut().layout.selected = Some(rect);
+        let by = to_screen(page, s, (x + 40.0, y + 30.0)) + vec2(3.0, 0.0);
+        assert_eq!(handle_at(h.state(), &after, page, s, by), None, "the rectangle's handle gives way to panning");
     }
 
     /// Dragging an arrow's round handle from above its centre round to its right turns it a
