@@ -32,8 +32,8 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
     take inside the frame. A graticule's step follows the extent (2° for a state, 15′ for a city),
     with labels on every edge of a sheet.
     The north arrow, the legend (sized to what it lists), the scale bar with the numeric scale
-    under it and the locator sit in the frame's corners, clear of the graticule's
-    labels. The **arrangement** says which corner is each one's. `classic` (the default favourite) puts the
+    under it (in a box the size of the bar) and the locator sit in the frame's corners, clear of
+    the graticule's labels. The **arrangement** says which corner is each one's. `classic` (the default favourite) puts the
     locator at the top left, the arrow at the top right, the legend at the bottom left and the
     scale at the bottom right. `mirrored` swaps left and right, `legendRight` swaps the legend and
     the scale, and `legendTop` swaps the legend and the locator. `"arrangement"` also takes a

@@ -1831,7 +1831,24 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
         sizes = None;
         warnings.push("a WMS or WMTS layer's legend picture is still loading: the legend has a fixed size to fit by hand".into());
     }
-    let (sw, sh, nh) = ((fw * 0.3).max(25.0), if sheet { 8.0 * k } else { 6.0 }, pitch(small_pt) + 0.5);
+    let (sh, nh) = (if sheet { 8.0 * k } else { 6.0 }, pitch(small_pt) + 0.5);
+    // The scale bar's box at a scale: the size of its bar and labels and of the scale under them,
+    // with the padding (#1379). The bar is the one a box 30 % of the frame's width (25 mm at least)
+    // would draw, which sets its length and divisions. The box is the narrowest that draws that same
+    // bar: the renderer gives a bar at most 85 % of its box, so the box is at least the bar's length
+    // over 0.85.
+    let bar_kind = match ElementKind::scale_bar(frame) {
+        ElementKind::ScaleBar { units, divisions, .. } => Some((units, divisions)),
+        _ => None,
+    };
+    let scale_box = |ground_per_pt: f64, scale: f64| {
+        let text = ("{scale}", small_pt, false);
+        let w = bar_kind.map_or((fw * 0.3).max(25.0), |bar| scale_box_width(ground_per_pt, scale, fw, bar, comma, text));
+        (w, sh + nh)
+    };
+    let ground_per_pt = |s: &Session, center: Coord, scale: f64| {
+        s.map().ground_res_at(&rustgis_map::layout::frame_camera(s.map(), center, scale, 0.0, 0.0))
+    };
     let pad = 2.0;
     // The surrounds to place: what each is and its size (the arrangement gives its corner).
     let mut surrounds: Vec<(Surround, f64, f64)> = Vec::new();
@@ -1866,7 +1883,8 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
     if content_h > 0.0 && !legend_in_column {
         surrounds.push((Surround::Legend, (content_w + 2.0 * pad).min(fw * 0.45), (content_h + 2.0 * pad).min(fh * 0.6)));
     }
-    surrounds.push((Surround::Scale, sw, sh + nh));
+    // Its width is set once the frame's centre and scale are settled, below; nothing reads it before.
+    surrounds.push((Surround::Scale, 0.0, sh + nh));
     // A corner's rectangle for a surround `w` × `h`.
     let at = |corner: usize, w: f64, h: f64| {
         let x = if corner.is_multiple_of(2) { fx + left } else { fx + fw - right - w };
@@ -1919,12 +1937,11 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
         bands
     };
     let size_of = |kind: Surround| surrounds.iter().find(|x| x.0 == kind).map(|x| (x.1, x.2));
-    let (locator_side, arrow_size, scale_size) =
-        (size_of(Surround::Locator).map(|x| x.0), size_of(Surround::Arrow), size_of(Surround::Scale));
+    let (locator_side, arrow_size) = (size_of(Surround::Locator).map(|x| x.0), size_of(Surround::Arrow));
     // The fewest columns from `from` up in which the surrounds group in a band around `clip`, with
-    // their places.
-    let grouped = |clip: Rect, from: usize, known: &[(f64, f64); MAX_LEGEND_COLUMNS]| {
-        let (arrow, scale_bar) = (arrow_size?, scale_size?);
+    // their places; the scale bar's box `scale_bar` is the one at the scale tried.
+    let grouped = |clip: Rect, from: usize, known: &[(f64, f64); MAX_LEGEND_COLUMNS], scale_bar: (f64, f64)| {
+        let arrow = arrow_size?;
         (from..known.len()).find_map(|i| {
             bands_around(clip)
                 .iter()
@@ -2081,8 +2098,10 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
                     }
                     let room = free_room(&moved);
                     let Some(n) = need(room) else { continue };
-                    // Under a veil the whole group has to fit, not the legend alone.
-                    let Some(n) = (if veil { grouped(clip, n, here).map(|(i, _)| i) } else { Some(n) }) else { continue };
+                    // Under a veil the whole group has to fit, not the legend alone, the scale bar's box
+                    // as drawn there.
+                    let in_group = |s: &Session| grouped(clip, n, here, scale_box(ground_per_pt(s, there, tried), tried));
+                    let Some(n) = (if veil { in_group(s).map(|(i, _)| i) } else { Some(n) }) else { continue };
                     if found.is_none_or(|(fewest, most)| n < fewest || (n == fewest && room.0 * room.1 > most)) {
                         found = Some((n, room.0 * room.1));
                         (center, scale, coverage, map_shift) = (there, tried, Some(moved), (dx, dy));
@@ -2120,6 +2139,11 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
                 }
             }
         }
+    }
+    // The scale bar's box as the frame is drawn, moved or at another scale or not.
+    let bar_box = scale_box(ground_per_pt(s, center, scale), scale);
+    if let Some(entry) = surrounds.iter_mut().find(|x| x.0 == Surround::Scale) {
+        (entry.1, entry.2) = bar_box;
     }
     // Its cells summed from the top left (a summed-area table), so a rectangle's count is four
     // lookups, however large: the search off the corners tries thousands.
@@ -2267,7 +2291,8 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
     // it no room.
     let mut arrangement_used = arrangement_name(homes);
     if let (Some(clip), Some(known)) = (veiled, sizes)
-        && let Some((i, (legend_place, locator_place, arrow_place, scale_place))) = grouped(clip, 0, &known)
+        && let Some((i, (legend_place, locator_place, arrow_place, scale_place))) =
+            grouped(clip, 0, &known, scale_box(ground_per_pt(s, center, scale), scale))
     {
         legend_cols = i + 1;
         (cw, ch) = known[i];
@@ -2435,9 +2460,9 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
     }
     if let Some((sx, sy, w, h)) = spot_of(Surround::Scale) {
         placed.push(("scale bar", (sx, sy, w, h)));
-        l.add("Scale Box", (sx, sy, sw, sh + nh), surround_box(paper));
-        l.add("Scale Bar", (sx, sy, sw, sh), ElementKind::scale_bar(frame));
-        l.add("Scale", (sx, sy + sh, sw, nh), pub_text("{scale}".into(), small_pt, ink, false, TextAlign::Center));
+        l.add("Scale Box", (sx, sy, w, sh + nh), surround_box(paper));
+        l.add("Scale Bar", (sx, sy, w, sh), ElementKind::scale_bar(frame));
+        l.add("Scale", (sx, sy + sh, w, nh), pub_text("{scale}".into(), small_pt, ink, false, TextAlign::Center));
     }
     // What placing couldn't avoid: a surround over the map's drawing while a clearly freer corner
     // went to another (more surrounds than free corners), or two overlapping (a frame too small
@@ -4089,10 +4114,113 @@ fn update(s: &mut Session, p: &Value) -> CmdResult {
     if let Some(text) = p.get("grid").and_then(|grid| grid.get("crs")).and_then(Value::as_str) {
         super::say_crs_note(s, text);
     }
+    // A frame drawn at another scale or width: a publication's scale bar box measured again.
+    let frame = s.project.layouts.get(li).and_then(|l| l.element(id)).map(|e| &e.kind);
+    if matches!(frame, Some(ElementKind::MapFrame { .. })) && ["scale", "w"].iter().any(|k| p.get(*k).is_some_and(|v| !v.is_null())) {
+        refit_scale_box(s, li, id);
+    }
     if let Some(w) = font_told {
         return Ok(json!({"warning": w}));
     }
     Ok(Value::Null)
+}
+
+/// The width (mm) of a publication's scale bar box (#1379), for a frame `frame_w` mm wide at
+/// `scale` and `ground_per_pt` ground metres a point: the bar a box 30 % of the frame's width (25
+/// mm at least) would draw sets its length and divisions, and the box is the narrowest that draws
+/// that same bar (at least its length over the 85 % of a box the renderer gives a bar), its last
+/// label included, and holds the text written under it: `text` (its `{scale}` filled), in
+/// `text_pt` points, bold or not.
+fn scale_box_width(ground_per_pt: f64, scale: f64, frame_w_mm: f64, bar: (ScaleUnits, usize), comma: bool, text: (&str, f64, bool)) -> f64 {
+    let (text, text_pt, bold) = text;
+    let (widest, pt_per_mm) = ((frame_w_mm * 0.3).max(25.0), rustgis_map::layout::PT_PER_MM);
+    let bar_w = crate::render::layout::scale_bar_width_pt(ground_per_pt, widest * pt_per_mm, bar, comma, 1.5 * pt_per_mm)
+        .map_or(widest, |w| w / pt_per_mm);
+    let written = text.replace("{scale}", &crate::render::layout::scale_ratio_text(scale, comma));
+    bar_w.max(scale_text_mm(&written, text_pt, bold)).min(widest)
+}
+
+/// The width (mm) a scale bar box gives the text under its bar, its tokens filled: its longest
+/// line in `text_pt` points, bold or not, and a millimetre each side.
+fn scale_text_mm(text: &str, text_pt: f64, bold: bool) -> f64 {
+    text.lines().map(|line| crate::render::report::width_mm(line, text_pt as f32, bold)).fold(0.0, f64::max) + 2.0
+}
+
+/// What a publication places over its map, which a scale bar box measured again must stay off.
+const PLACED_OVER_MAP: [&str; 3] = ["Legend Box", "Locator", "North Arrow"];
+
+/// A publication's scale bar box measured again after its frame's scale or width changed (#1379):
+/// the "Scale Box", the "Scale Bar" of `frame` and the "Scale" under it, as a publication lays them
+/// out (one place, one width, none locked), take the width that bar and the text under it (its
+/// tokens filled as the page draws them, measured as drawn) now need, kept on the side of the
+/// frame they are nearer. A layout without them, with them moved apart, with that text spaced out
+/// or in another font, naming a map series page (which differs from page to page), or of a frame
+/// other than the first (whose map the page fills the text from) is left as it is; so is a text
+/// longer than the widest box a publication gives (a box widened by hand for it keeps its width).
+/// A change to the text or the bar alone doesn't measure the box again; the next change of the
+/// frame's scale or width does. A box that would then cover the legend, locator or north arrow,
+/// which it didn't, stays as it was, which is said.
+fn refit_scale_box(s: &mut Session, li: usize, frame: u32) {
+    let Some(l) = s.project.layouts.get(li) else { return };
+    let Some(fr) = l.element(frame) else { return };
+    let ElementKind::MapFrame { map, center, scale, .. } = &fr.kind else { return };
+    let Some(m) = s.project.maps.iter().find(|m| m.name.eq_ignore_ascii_case(map)) else { return };
+    let ground_per_pt = m.ground_res_at(&rustgis_map::layout::frame_camera(m, *center, *scale, 0.0, 0.0));
+    let named = |name: &str| l.elements.iter().find(|e| e.name == name);
+    let (Some(boxed), Some(bar), Some(text)) = (named("Scale Box"), named("Scale Bar"), named("Scale")) else { return };
+    let (
+        ElementKind::ScaleBar { frame: of, units, divisions, .. },
+        ElementKind::Text { text: written, size, bold, letter_spacing, font, font_name, .. },
+    ) = (&bar.kind, &text.kind)
+    else {
+        return;
+    };
+    if *letter_spacing != 0.0
+        || *font != FontFamily::Sans
+        || font_name.is_some()
+        || (l.series.is_some() && written.contains("{page"))
+        || l.first_frame() != Some(frame)
+    {
+        return;
+    }
+    // Its tokens filled as the page draws them, `{scale}` from the frame.
+    let info = crate::render::layout::PageInfo { page: 1, pages: 1, page_name: String::new() };
+    let cam = rustgis_map::layout::frame_camera(m, *center, *scale, 0.0, 0.0);
+    let filled = crate::render::layout::expand(written, l, &info, Some((m, cam)));
+    let together = [bar, text].iter().all(|e| (e.x - boxed.x).abs() < 1e-6 && (e.w - boxed.w).abs() < 1e-6 && !e.locked);
+    if *of != frame || !together || boxed.locked {
+        return;
+    }
+    // A text longer than the widest box a publication gives: a width set by hand for it is kept.
+    if scale_text_mm(&filled, *size, *bold) > (fr.w * 0.3).max(25.0) {
+        return;
+    }
+    let w = scale_box_width(ground_per_pt, *scale, fr.w, (*units, *divisions), l.decimal_comma, (&filled, *size, *bold));
+    let x = if boxed.x + boxed.w / 2.0 > fr.x + fr.w / 2.0 { boxed.x + boxed.w - w } else { boxed.x };
+    let covers = |(x, w): (f64, f64), e: &rustgis_map::layout::Element| {
+        x < e.x + e.w && e.x < x + w && boxed.y < e.y + e.h && e.y < boxed.y + boxed.h
+    };
+    let newly = l
+        .elements
+        .iter()
+        .filter(|e| PLACED_OVER_MAP.contains(&e.name.as_str()) && e.visible)
+        .find(|e| covers((x, w), e) && !covers((boxed.x, boxed.w), e))
+        .map(|e| e.name.to_lowercase().replace(" box", ""));
+    if let Some(what) = newly {
+        s.notify(
+            format!("the scale bar's box would now cover the {what}, so it is left as it was: move or widen it by hand, or make the layout again with layout.publication"),
+            false,
+        );
+        return;
+    }
+    let ids = [boxed.id, bar.id, text.id];
+    if let Some(l) = s.project.layouts.get_mut(li) {
+        for id in ids {
+            if let Some(e) = l.element_mut(id) {
+                (e.x, e.w) = (x, w);
+            }
+        }
+    }
 }
 
 /// Points a frame at an extent.
@@ -4150,6 +4278,7 @@ fn frame_zoom(s: &mut Session, p: &Value) -> CmdResult {
         }
         o => return Err(format!("unknown zoom '{o}'")),
     }
+    refit_scale_box(s, li, frame);
     Ok(json!({"element": frame}))
 }
 
