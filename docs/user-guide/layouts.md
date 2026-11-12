@@ -45,8 +45,12 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
     with another surround. The largest is placed first (the legend, as a rule), so it takes the
     freest place, and a smaller one whose corner it took moves out of its way.
     Your favourite arrangement, set with **`layout.arrangement {"favourite": …}`** and kept with
-    the app's preferences, is the one tried first. `"arrangement": "best"`, the default, lays out
-    the favourite and every arrangement by name, and keeps the one that moves the least
+    the app's preferences, is the one tried first. Arrangements of your own are saved by name with
+    **`layout.arrangement {"save": "Atlas", "arrangement": {…}}`** (up to 20, kept with the
+    preferences too) and removed with `{"remove": "Atlas"}`; `"arrangement": "Atlas"` then takes
+    one as it takes a built-in one, and a favourite can name one. `"arrangement": "best"`, the
+    default, lays out the favourite, every arrangement by name and every saved one, and keeps the
+    one that moves the least
     (by area, so moving the north arrow costs less than moving the legend), then the one leaving
     the least over the data; the favourite wins a tie. `"favourite"` always takes the favourite.
     The answer names the arrangement taken (`"arrangement"`) and the surrounds

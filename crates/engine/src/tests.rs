@@ -43283,6 +43283,89 @@ fn a_layer_read_from_a_file_says_whether_it_and_the_file_are_in_step() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// Arrangements saved by name (#1379): `layout.arrangement` saves, lists and removes them, within
+/// limits and refusing what it can't keep; `layout.publication` takes one by name, `best` tries
+/// them after the built-in ones, and a favourite named after one removed keeps its corners.
+#[test]
+fn arrangements_are_saved_by_name() {
+    use crate::cmd::layout::{MAX_ARRANGEMENT_NAME, MAX_SAVED_ARRANGEMENTS, arrangements_to_try, read_saved_arrangements};
+    let mut s = world();
+    let atlas = json!({"locator": "bottom-left", "northArrow": "top-left", "legend": "top-right", "scaleBar": "bottom-right"});
+    let r = s.run("layout.arrangement", &json!({"save": "Atlas", "arrangement": atlas})).unwrap();
+    assert_eq!(r["saved"]["Atlas"], atlas, "{r}");
+    assert_eq!(r["arrangements"].as_array().unwrap().last(), Some(&json!("Atlas")), "{r}");
+    // A name copies that arrangement's corners.
+    let r = s.run("layout.arrangement", &json!({"save": "Copy", "arrangement": "mirrored"})).unwrap();
+    assert_eq!(r["saved"]["Copy"]["locator"], "top-right", "{r}");
+    // Taken by name, case aside, and named in the answer as it is kept.
+    let homes = |v: &Value| crate::cmd::layout::parse_arrangement(v, &Default::default()).unwrap();
+    assert_eq!(arrangements_to_try(&s, &json!("atlas")).unwrap(), vec![("Atlas".to_string(), homes(&atlas))]);
+    let extent = json!([-46.8, -11.6, -38.5, -2.2]);
+    let r = s.run("layout.publication", &json!({"extent": extent, "author": "", "arrangement": "ATLAS"})).unwrap();
+    assert_eq!(r["arrangement"], "Atlas", "{r}");
+    // Best tries it after the built-in ones; one with a built-in's corners only once.
+    let tried = arrangements_to_try(&s, &json!("best")).unwrap();
+    let names: Vec<&str> = tried.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, ["classic", "mirrored", "legendRight", "legendTop", "Atlas"]);
+    assert_eq!(arrangements_to_try(&s, &Value::Null).unwrap(), tried);
+    // A favourite given corner by corner as a saved one is called by its name.
+    s.run("layout.arrangement", &json!({"favourite": atlas})).unwrap();
+    assert_eq!(arrangements_to_try(&s, &json!("favourite")).unwrap()[0].0, "Atlas");
+    assert_eq!(arrangements_to_try(&s, &atlas).unwrap()[0].0, "Atlas");
+    // Case aside beyond ASCII too.
+    s.run("layout.arrangement", &json!({"save": "Écran", "arrangement": "legendTop"})).unwrap();
+    assert_eq!(arrangements_to_try(&s, &json!("écran")).unwrap()[0].0, "Écran");
+    s.run("layout.arrangement", &json!({"remove": "écran"})).unwrap();
+    // The favourite by its name; removed, it keeps its corners, which is said.
+    s.run("layout.arrangement", &json!({"favourite": "Atlas"})).unwrap();
+    assert_eq!(arrangements_to_try(&s, &json!("favourite")).unwrap()[0].0, "Atlas");
+    let r = s.run("layout.arrangement", &json!({"remove": "atlas"})).unwrap();
+    assert_eq!((s.layout_favourite.clone(), r["corners"].clone()), (atlas.clone(), atlas.clone()), "{r}");
+    assert!(r["warnings"][0].as_str().unwrap().contains("keeps its corners"), "{r}");
+    assert!(r["saved"].get("Atlas").is_none() && s.layout_arrangements.len() == 1);
+    // Removed with another favourite given, nothing is said of keeping its corners.
+    s.run("layout.arrangement", &json!({"save": "Spare", "arrangement": "legendTop", "favourite": "Spare"})).unwrap();
+    let r = s.run("layout.arrangement", &json!({"remove": "Spare", "favourite": atlas})).unwrap();
+    assert!(r["warnings"].as_array().unwrap().is_empty() && s.layout_favourite == atlas, "{r}");
+    // Saved again under a name in other capitals, it replaces it, which is said.
+    let r = s.run("layout.arrangement", &json!({"save": "COPY", "arrangement": "classic"})).unwrap();
+    assert_eq!((s.layout_arrangements.len(), r["saved"]["COPY"]["locator"].clone()), (1, json!("top-left")), "{r}");
+    assert!(r["warnings"][0].as_str().unwrap().contains("is replaced"), "{r}");
+    // Refused, naming what is wrong, with nothing changed.
+    let long = "x".repeat(MAX_ARRANGEMENT_NAME + 1);
+    for (bad, why) in [
+        (json!({"save": "Best", "arrangement": "classic"}), "names an arrangement already"),
+        (json!({"save": "Classic", "arrangement": "mirrored"}), "names an arrangement already"),
+        (json!({"save": " ", "arrangement": "classic"}), "1 to 40 characters"),
+        (json!({"save": long, "arrangement": "classic"}), "1 to 40 characters"),
+        (json!({"save": "a\tb", "arrangement": "classic"}), "1 to 40 characters"),
+        (json!({"save": "Atlas"}), "save takes \"arrangement\""),
+        (json!({"save": "Atlas", "arrangement": "tidy"}), "\"COPY\", or a corner"),
+        (json!({"save": 3, "arrangement": "classic"}), "save is a name"),
+        (json!({"arrangement": "legendTop"}), "saved under a name given as \"save\""),
+        (json!({"remove": "Atlas"}), "no arrangement is saved as \"Atlas\""),
+        (json!({"remove": "COPY", "favourite": "COPY"}), "not \"COPY\""),
+    ] {
+        let e = s.run("layout.arrangement", &bad).unwrap_err();
+        assert!(e.contains(why), "{bad}: {e}");
+        assert_eq!((s.layout_arrangements.len(), s.layout_favourite.clone()), (1, atlas.clone()), "{bad}");
+    }
+    // At most so many.
+    for i in 1..MAX_SAVED_ARRANGEMENTS {
+        s.run("layout.arrangement", &json!({"save": format!("Mine {i}"), "arrangement": "legendTop"})).unwrap();
+    }
+    let e = s.run("layout.arrangement", &json!({"save": "One more", "arrangement": "classic"})).unwrap_err();
+    assert!(e.contains("at most 20 arrangements"), "{e}");
+    assert_eq!(s.layout_arrangements.len(), MAX_SAVED_ARRANGEMENTS);
+    // As the preferences keep them: what can't be used is counted, the rest kept.
+    let text = json!({"Ok": atlas, "best": atlas, "Half": {"locator": "top-left"}, "ok": atlas, "Not": "classic"}).to_string();
+    let (kept, passed) = read_saved_arrangements(&text).unwrap();
+    assert_eq!((kept.keys().map(String::as_str).collect::<Vec<_>>(), passed.len()), (vec!["Ok"], 4));
+    assert_eq!(passed["Half"], json!({"locator": "top-left"}), "kept as it was");
+    assert_eq!(read_saved_arrangements("not json"), None);
+    assert_eq!(read_saved_arrangements("{}"), Some(Default::default()));
+}
+
 /// `"coverage"` (#1379) writes the grid the placement searched as a PNG, three pixels a cell: dark
 /// where the map draws, white where it is free, tinted in the graticule's label strips, the placed
 /// surrounds outlined in red; the answer names it, and asking for it reaches files. A path that

@@ -689,6 +689,9 @@ pub struct Session {
     /// The favourite arrangement of publication layouts (`layout.arrangement`, #1379): a name or a
     /// corner for each surround, kept with the app's preferences, not the project.
     pub layout_favourite: serde_json::Value,
+    /// The arrangements of publication layouts saved by name (`layout.arrangement {"save": …}`),
+    /// each its corners, kept with the app's preferences too.
+    pub layout_arrangements: serde_json::Map<String, serde_json::Value>,
     pub registry: Registry,
     /// Bumped on every change so views can cache.
     pub revision: u64,
@@ -1137,6 +1140,7 @@ impl Session {
             web_logins: service_logins::SessionLogins::new(),
             raster_defaults: rustgis_map::RasterDefaults::default(),
             layout_favourite: serde_json::Value::String("classic".into()),
+            layout_arrangements: serde_json::Map::new(),
             registry: Registry { commands: cmd::all() },
             revision: 1,
             opened: 0,

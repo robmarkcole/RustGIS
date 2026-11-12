@@ -32,10 +32,10 @@ pub fn commands() -> Vec<C> {
             r#"{"name"?: string, "page"?: "letter"|"legal"|"tabloid"|"a5"|"a4"|"a3"|"a2"|"a1"|"a0", "orientation"?: "landscape"|"portrait", "width"?: mm, "height"?: mm, "template"?: "map" (frame, title, legend, north arrow, scale bar; the default)|"blank"}"#,
         ),
         C::new("layout.publication", "New Publication Layout", "Publish › Layout", publication).inputs(publication_inputs).roles(&[]).effects(crate::policy::Effects::NONE).params(
-            r#"{"profile"?: "a4" (the default) | "a3" | "a2" (a sheet turned to portrait or landscape, whichever the area's map comes out larger on: its extent east to west against north to south, on the map's projection) | "a4-portrait"|"a4-landscape"|"a3-portrait"|"a3-landscape"|"a2-portrait"|"a2-landscape" (a sheet: frame, title, subtitle, the map, a boxed footer)|"figure-1col" (90 mm)|"figure-1.5col" (140 mm)|"figure-2col" (190 mm)|"thesis-full" (160 × 225 mm)|"thesis-half" (160 × 110 mm) (a figure: the map edge to edge, its title and sources left to the caption), "extent"?: [west, south, east, north] in degrees that must fit (default: the map view), "name"?: string, "title"?: text, "subtitle"?: text, "sources"?: text | [texts], "reference"?: text | [texts] (default: the projection, datum and graticule), "note"?: text, "author"?: text (default: "Made with RustGIS · {date}"; "" or [] for none), "headings"?: [the sources' heading, the reference's heading, an editorial column's heading], "locator"?: "globe" (a globe with the area outlined; the default on sheets) | "inset" (the surrounding region, the area outlined) | "none" (the default on figures), "decimal"?: "." (the default) | "," (graticule, scale bar and colorbar numbers and {scale} with a decimal comma: 0,05 and 1:6.300.000), "colorbar"?: "auto" (the default: the top visible raster with a colour scale, not drawn by classes, gets one, under the legend in its box; a raster drawn by classes has them in the legend's rows instead) | "none" (no colorbar, and the legend's box has no room for one), "veil"?: true (the default: when no shape of the legend fits, a map that runs on past the extent, with a long legend, has what is outside the extent veiled and its surrounds grouped there, at up to half the scale on a sheet) | false (never veiled, and drawn at its scale; the map may still move aside), "style"?: "classic" (the default: the title over the map, the footer under it) | "banner" (the title and subtitle in a band of the accent colour across the top) | "panel" (the map at the left, a panel at the right with the title, locator, legend, sources and reference) | "editorial" (the title large in serif, a column at the right with the note, the locator and the legend) | "modular" (cards on a light page: the map, the locator and the legend each in one, the sources and reference in tinted ones) | "poster" (the page in the accent colour, the title in light text, the map in a light card, the footer in darker blocks) (a sheet's arrangement; figures leave it to the caption), "accent"?: a colour as #RRGGBB (the style's colour: its band, panel tint, headings and rules, a poster's page), "arrangement"?: "best" (the default: the favourite and each arrangement by name laid out, the one moving the least area off its corners kept, then the one leaving the least over the data, the favourite on a tie) | "favourite" (layout.arrangement's) | an arrangement by name or corner by corner, as layout.arrangement takes (the corners the locator, north arrow, legend and scale bar are at home in; one covering what the map draws there still moves), "coverage"?: "*.png" (writes the coverage grid the placement searched, as it settled on it, three pixels a cell: what the map draws dark, the free cells white, both tinted blue in the strips the graticule's labels keep, the surrounds placed over the map outlined in red; the answer gives its path)} → a new layout of the active map at a round scale, its texts wrapped to their boxes; {projection}, {datum} and {grid} in the texts are filled from the map"#,
+            r#"{"profile"?: "a4" (the default) | "a3" | "a2" (a sheet turned to portrait or landscape, whichever the area's map comes out larger on: its extent east to west against north to south, on the map's projection) | "a4-portrait"|"a4-landscape"|"a3-portrait"|"a3-landscape"|"a2-portrait"|"a2-landscape" (a sheet: frame, title, subtitle, the map, a boxed footer)|"figure-1col" (90 mm)|"figure-1.5col" (140 mm)|"figure-2col" (190 mm)|"thesis-full" (160 × 225 mm)|"thesis-half" (160 × 110 mm) (a figure: the map edge to edge, its title and sources left to the caption), "extent"?: [west, south, east, north] in degrees that must fit (default: the map view), "name"?: string, "title"?: text, "subtitle"?: text, "sources"?: text | [texts], "reference"?: text | [texts] (default: the projection, datum and graticule), "note"?: text, "author"?: text (default: "Made with RustGIS · {date}"; "" or [] for none), "headings"?: [the sources' heading, the reference's heading, an editorial column's heading], "locator"?: "globe" (a globe with the area outlined; the default on sheets) | "inset" (the surrounding region, the area outlined) | "none" (the default on figures), "decimal"?: "." (the default) | "," (graticule, scale bar and colorbar numbers and {scale} with a decimal comma: 0,05 and 1:6.300.000), "colorbar"?: "auto" (the default: the top visible raster with a colour scale, not drawn by classes, gets one, under the legend in its box; a raster drawn by classes has them in the legend's rows instead) | "none" (no colorbar, and the legend's box has no room for one), "veil"?: true (the default: when no shape of the legend fits, a map that runs on past the extent, with a long legend, has what is outside the extent veiled and its surrounds grouped there, at up to half the scale on a sheet) | false (never veiled, and drawn at its scale; the map may still move aside), "style"?: "classic" (the default: the title over the map, the footer under it) | "banner" (the title and subtitle in a band of the accent colour across the top) | "panel" (the map at the left, a panel at the right with the title, locator, legend, sources and reference) | "editorial" (the title large in serif, a column at the right with the note, the locator and the legend) | "modular" (cards on a light page: the map, the locator and the legend each in one, the sources and reference in tinted ones) | "poster" (the page in the accent colour, the title in light text, the map in a light card, the footer in darker blocks) (a sheet's arrangement; figures leave it to the caption), "accent"?: a colour as #RRGGBB (the style's colour: its band, panel tint, headings and rules, a poster's page), "arrangement"?: "best" (the default: the favourite, each arrangement by name and each saved with layout.arrangement laid out, the one moving the least area off its corners kept, then the one leaving the least over the data, the favourite on a tie) | "favourite" (layout.arrangement's) | an arrangement by name (built in or saved) or corner by corner, as layout.arrangement takes (the corners the locator, north arrow, legend and scale bar are at home in; one covering what the map draws there still moves), "coverage"?: "*.png" (writes the coverage grid the placement searched, as it settled on it, three pixels a cell: what the map draws dark, the free cells white, both tinted blue in the strips the graticule's labels keep, the surrounds placed over the map outlined in red; the answer gives its path)} → a new layout of the active map at a round scale, its texts wrapped to their boxes; {projection}, {datum} and {grid} in the texts are filled from the map"#,
         ),
         C::new("layout.arrangement", "Favourite Arrangement", "Publish › Layout", arrangement).roles(&[]).effects(crate::policy::Effects::NONE).view().params(
-            r#"{"favourite"?: "classic" (the locator top left, the north arrow top right, the legend bottom left, the scale bar bottom right) | "mirrored" | "legendRight" | "legendTop" | {"locator", "northArrow", "legend", "scaleBar": "top-left"|"top-right"|"bottom-left"|"bottom-right", each a corner of its own}} → the favourite arrangement of publication layouts (kept with the app's preferences), its corners and the arrangements by name; with no favourite given, it is only shown"#,
+            r#"{"favourite"?: "classic" (the locator top left, the north arrow top right, the legend bottom left, the scale bar bottom right) | "mirrored" | "legendRight" | "legendTop" | {"locator", "northArrow", "legend", "scaleBar": "top-left"|"top-right"|"bottom-left"|"bottom-right", each a corner of its own} | a saved arrangement's name, "save"?: a name (1 to 40 characters, not a built-in one nor "best", "favourite", "custom" or "veil"; one saved under it already, case aside, is replaced) to save "arrangement" under: a name, or a corner for each surround (at most 20 saved), "remove"?: a saved arrangement's name (a favourite named after it keeps its corners, unless "favourite" gives another)} → the favourite arrangement of publication layouts and those saved by name (kept with the app's preferences), the favourite's corners, the arrangements by name and the saved ones' corners; a removal, then a save, then the favourite; with none of them given, they are only shown"#,
         ),
         C::new("layout.activate", "Open Layout", "Browser", |s, p| {
             let i = index(s, &by_name(p))?;
@@ -831,17 +831,42 @@ fn home_slot(kind: Surround) -> usize {
     }
 }
 
-/// An arrangement: one of [`ARRANGEMENTS`] by name, or a corner for each surround
-/// (`{"locator": "top-left", "northArrow": "top-right", "legend": "bottom-left", "scaleBar":
-/// "bottom-right"}`, every corner once). `Value::Null` (none given) is `classic`.
-pub fn parse_arrangement(v: &Value) -> Result<Homes, String> {
-    let names = || ARRANGEMENTS.iter().map(|(n, _)| format!("\"{n}\"")).collect::<Vec<_>>().join(", ");
+/// At most this many arrangements are saved by name, each name at most this many characters
+/// (#1379).
+pub const MAX_SAVED_ARRANGEMENTS: usize = 20;
+pub const MAX_ARRANGEMENT_NAME: usize = 40;
+
+/// Names an arrangement can't be saved under: those `"arrangement"` reads otherwise, and those
+/// the answer gives.
+const RESERVED_ARRANGEMENT_NAMES: [&str; 4] = ["best", "favourite", "custom", "veil"];
+
+/// Two arrangement names the same but for case (beyond ASCII too).
+fn same_name(a: &str, b: &str) -> bool {
+    a.to_lowercase() == b.to_lowercase()
+}
+
+/// The arrangements saved by name (`layout.arrangement {"save": …}`), each its name and corners;
+/// an entry that isn't an arrangement is passed over.
+fn saved_arrangements(saved: &serde_json::Map<String, Value>) -> impl Iterator<Item = (&String, Homes)> {
+    let none = serde_json::Map::new();
+    saved
+        .iter()
+        .filter(|(_, corners)| corners.is_object())
+        .filter_map(move |(name, corners)| parse_arrangement(corners, &none).ok().map(|h| (name, h)))
+}
+
+/// An arrangement: one of [`ARRANGEMENTS`] or of the `saved` ones by name, or a corner for each
+/// surround (`{"locator": "top-left", "northArrow": "top-right", "legend": "bottom-left",
+/// "scaleBar": "bottom-right"}`, every corner once). `Value::Null` (none given) is `classic`.
+pub fn parse_arrangement(v: &Value, saved: &serde_json::Map<String, Value>) -> Result<Homes, String> {
+    let names = || {
+        let saved = saved_arrangements(saved).map(|(n, _)| n.as_str());
+        ARRANGEMENTS.iter().map(|(n, _)| *n).chain(saved).map(|n| format!("\"{n}\"")).collect::<Vec<_>>().join(", ")
+    };
     match v {
         Value::Null => Ok(ARRANGEMENTS[0].1),
-        Value::String(name) => ARRANGEMENTS
-            .iter()
-            .find(|(n, _)| n.eq_ignore_ascii_case(name.trim()))
-            .map(|(_, h)| *h)
+        Value::String(name) => arrangement_named(name, saved)
+            .map(|(_, h)| h)
             .ok_or_else(|| format!("arrangement is {}, or a corner for each surround, not \"{name}\"", names())),
         Value::Object(o) => {
             if let Some(k) = o.keys().find(|k| !ARRANGEMENT_KEYS.contains(&k.as_str())) {
@@ -895,19 +920,156 @@ fn arrangement_name(homes: Homes) -> &'static str {
     ARRANGEMENTS.iter().find(|(_, h)| *h == homes).map_or("custom", |(n, _)| n)
 }
 
-/// Sets or shows the favourite arrangement of publication layouts (#1379): the one
-/// `"arrangement": "favourite"` asks for, and the first `"best"` tries (it wins a tie). Kept with
-/// the app's preferences, not the project.
-fn arrangement(s: &mut Session, p: &Value) -> CmdResult {
-    if let Some(v) = p.get("favourite").filter(|v| !v.is_null()) {
-        parse_arrangement(v)?;
-        s.layout_favourite = v.clone();
+/// A built-in or saved arrangement by `name` (case aside): its name as it is kept, and its corners.
+fn arrangement_named(name: &str, saved: &serde_json::Map<String, Value>) -> Option<(String, Homes)> {
+    let name = name.trim();
+    let built_in = ARRANGEMENTS.iter().find(|(n, _)| same_name(n, name)).map(|(n, h)| ((*n).to_string(), *h));
+    built_in.or_else(|| saved_arrangements(saved).find(|(n, _)| same_name(n, name)).map(|(n, h)| (n.clone(), h)))
+}
+
+/// What an arrangement given as `v` is called in the answer: its name; given corner by corner,
+/// the name of the built-in or saved one with those corners, else `"custom"`.
+fn arrangement_label(v: &Value, homes: Homes, saved: &serde_json::Map<String, Value>) -> String {
+    let by_corners = || {
+        ARRANGEMENTS
+            .iter()
+            .find(|(_, h)| *h == homes)
+            .map(|(n, _)| (*n).to_string())
+            .or_else(|| saved_arrangements(saved).find(|(_, h)| *h == homes).map(|(n, _)| n.clone()))
+            .unwrap_or_else(|| "custom".into())
+    };
+    match v {
+        Value::String(name) => arrangement_named(name, saved).map_or_else(by_corners, |(n, _)| n),
+        _ => by_corners(),
     }
-    let homes = parse_arrangement(&s.layout_favourite)?;
-    let corners: serde_json::Map<String, Value> =
-        ARRANGEMENT_KEYS.iter().zip(homes).map(|(k, h)| ((*k).to_string(), json!(CORNER_NAMES[h]))).collect();
+}
+
+/// The corners of an arrangement, by surround.
+fn corners_of(homes: Homes) -> Value {
+    Value::Object(ARRANGEMENT_KEYS.iter().zip(homes).map(|(k, h)| ((*k).to_string(), json!(CORNER_NAMES[h]))).collect())
+}
+
+/// Refuses a name an arrangement can't be saved under: blank, longer than
+/// [`MAX_ARRANGEMENT_NAME`], with control characters, or one `"arrangement"` already reads.
+fn check_arrangement_name(name: &str) -> Result<(), String> {
+    if name.trim().is_empty() || name.trim() != name || name.chars().count() > MAX_ARRANGEMENT_NAME || name.chars().any(char::is_control) {
+        return Err(format!("an arrangement's name is 1 to {MAX_ARRANGEMENT_NAME} characters, without control characters"));
+    }
+    if ARRANGEMENTS.iter().map(|(n, _)| *n).chain(RESERVED_ARRANGEMENT_NAMES).any(|n| same_name(n, name)) {
+        return Err(format!("\"{name}\" names an arrangement already: choose another name"));
+    }
+    Ok(())
+}
+
+/// Whether this version would use a saved arrangement `name` with `corners`: a name
+/// `layout.arrangement` saves, and a corner for each surround.
+pub fn usable_saved_arrangement(name: &str, corners: &Value) -> bool {
+    check_arrangement_name(name).is_ok() && corners.is_object() && parse_arrangement(corners, &serde_json::Map::new()).is_ok()
+}
+
+/// The arrangements saved by name as the preferences keep them (a JSON object of names and
+/// corners), and the entries passed over, as they were: not an arrangement this version reads, a
+/// name `layout.arrangement` wouldn't save, a name twice (case aside), or past
+/// [`MAX_SAVED_ARRANGEMENTS`]. `None` for text that isn't such an object.
+pub fn read_saved_arrangements(text: &str) -> Option<(serde_json::Map<String, Value>, serde_json::Map<String, Value>)> {
+    let Ok(Value::Object(entries)) = serde_json::from_str::<Value>(text) else { return None };
+    let (mut kept, mut passed) = (serde_json::Map::new(), serde_json::Map::new());
+    for (name, corners) in entries {
+        let usable =
+            usable_saved_arrangement(&name, &corners) && !kept.keys().any(|k| same_name(k, &name)) && kept.len() < MAX_SAVED_ARRANGEMENTS;
+        if usable {
+            kept.insert(name, corners);
+        } else {
+            passed.insert(name, corners);
+        }
+    }
+    Some((kept, passed))
+}
+
+/// The arrangements `layout.publication` tries for `"arrangement": asked` (#1379), each by the name
+/// its answer gives it: for `"best"` (or none) the favourite first, so it wins a tie, then the
+/// built-in ones and those saved by name, one of each set of corners.
+pub(crate) fn arrangements_to_try(s: &Session, asked: &Value) -> Result<Vec<(String, Homes)>, String> {
+    let saved = &s.layout_arrangements;
+    let favourite = parse_arrangement(&s.layout_favourite, saved).unwrap_or(ARRANGEMENTS[0].1);
+    let favourite = (arrangement_label(&s.layout_favourite, favourite, saved), favourite);
+    Ok(match asked {
+        Value::String(a) if a.trim().eq_ignore_ascii_case("favourite") => vec![favourite],
+        Value::Null => arrangements_to_try(s, &json!("best"))?,
+        Value::String(a) if a.trim().eq_ignore_ascii_case("best") => {
+            let built_in = ARRANGEMENTS.iter().map(|(n, h)| ((*n).to_string(), *h));
+            let mut all = vec![favourite];
+            for (name, homes) in built_in.chain(saved_arrangements(saved).map(|(n, h)| (n.clone(), h))) {
+                if !all.iter().any(|(_, h)| *h == homes) {
+                    all.push((name, homes));
+                }
+            }
+            all
+        }
+        v => {
+            let homes = parse_arrangement(v, saved)?;
+            vec![(arrangement_label(v, homes, saved), homes)]
+        }
+    })
+}
+
+/// Sets or shows the favourite arrangement of publication layouts (#1379): the one
+/// `"arrangement": "favourite"` asks for, and the first `"best"` tries (it wins a tie). Saves
+/// arrangements by name, which `"arrangement"` then takes as it takes the built-in ones and
+/// `"best"` tries too, and removes them. All kept with the app's preferences, not the project.
+/// A removal, then a save, then the favourite; checked before anything changes.
+fn arrangement(s: &mut Session, p: &Value) -> CmdResult {
+    let text = |key: &str, what: &str| match p.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(v)) => Ok(Some(v.trim().to_string())),
+        Some(_) => Err(format!("{key} is {what}")),
+    };
+    let (remove, save) = (text("remove", "the name of a saved arrangement")?, text("save", "a name for \"arrangement\"")?);
+    // An arrangement given with nothing to save it under would do nothing.
+    if save.is_none() && p.get("arrangement").is_some_and(|v| !v.is_null()) {
+        return Err("\"arrangement\" is saved under a name given as \"save\"; the favourite is set with \"favourite\"".into());
+    }
+    let mut saved = s.layout_arrangements.clone();
+    let mut warnings: Vec<String> = Vec::new();
+    let mut favourite = s.layout_favourite.clone();
+    if let Some(name) = remove {
+        let key = saved.keys().find(|k| same_name(k, &name)).cloned().ok_or_else(|| format!("no arrangement is saved as \"{name}\""))?;
+        let corners = saved.remove(&key).unwrap_or(Value::Null);
+        // A favourite named after it keeps its corners, unless this call gives another.
+        let replaced = p.get("favourite").is_some_and(|v| !v.is_null());
+        if !replaced && favourite.as_str().is_some_and(|f| same_name(f.trim(), &key)) {
+            favourite = corners;
+            warnings.push(format!("the favourite was the arrangement \"{key}\": it keeps its corners"));
+        }
+    }
+    if let Some(name) = save {
+        let homes = match p.get("arrangement") {
+            None | Some(Value::Null) => return Err("save takes \"arrangement\": a name, or a corner for each surround".into()),
+            Some(v) => parse_arrangement(v, &saved)?,
+        };
+        check_arrangement_name(&name)?;
+        match saved.keys().find(|k| same_name(k, &name)).cloned() {
+            Some(old) => {
+                saved.remove(&old);
+                warnings.push(format!("the arrangement saved as \"{old}\" is replaced"));
+            }
+            None if saved.len() >= MAX_SAVED_ARRANGEMENTS => {
+                return Err(format!("at most {MAX_SAVED_ARRANGEMENTS} arrangements are saved: remove one first"));
+            }
+            None => {}
+        }
+        saved.insert(name, corners_of(homes));
+    }
+    if let Some(v) = p.get("favourite").filter(|v| !v.is_null()) {
+        parse_arrangement(v, &saved)?;
+        favourite = v.clone();
+    }
+    let homes = parse_arrangement(&favourite, &saved)?;
+    (s.layout_arrangements, s.layout_favourite) = (saved, favourite);
+    let names: Vec<&str> =
+        ARRANGEMENTS.iter().map(|(n, _)| *n).chain(saved_arrangements(&s.layout_arrangements).map(|(n, _)| n.as_str())).collect();
     Ok(
-        json!({"favourite": s.layout_favourite, "corners": corners, "arrangements": ARRANGEMENTS.iter().map(|(n, _)| *n).collect::<Vec<_>>()}),
+        json!({"favourite": s.layout_favourite, "corners": corners_of(homes), "arrangements": names, "saved": s.layout_arrangements, "warnings": warnings}),
     )
 }
 
@@ -1036,16 +1198,7 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
         }
     };
     let accent = color(p, "accent", style.accent())?;
-    // The arrangements to try (#1379): the favourite first, so it wins a tie.
-    let favourite = parse_arrangement(&s.layout_favourite).unwrap_or(ARRANGEMENTS[0].1);
-    let tries: Vec<Homes> = match p.get("arrangement").filter(|v| !v.is_null()) {
-        None => std::iter::once(favourite).chain(ARRANGEMENTS.iter().map(|(_, h)| *h).filter(|h| *h != favourite)).collect(),
-        Some(Value::String(a)) if a.trim().eq_ignore_ascii_case("best") => {
-            std::iter::once(favourite).chain(ARRANGEMENTS.iter().map(|(_, h)| *h).filter(|h| *h != favourite)).collect()
-        }
-        Some(Value::String(a)) if a.trim().eq_ignore_ascii_case("favourite") => vec![favourite],
-        Some(v) => vec![parse_arrangement(v)?],
-    };
+    let tries = arrangements_to_try(s, p.get("arrangement").unwrap_or(&Value::Null))?;
     // A translucent accent would leave a band, a poster's page or the headings faint or unseen.
     if accent.a() != 255 {
         return Err("accent is an opaque colour as #RRGGBB".into());
@@ -2244,7 +2397,7 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
     // corners, so it is what goes where that differs. A single arrangement asked for is the one
     // laid out.
     let arranged = |legend: (f64, f64)| -> (Homes, Laid) {
-        let mut laid: Vec<(Homes, Laid)> = tries.iter().map(|h| (*h, lay_out(*h, legend))).collect();
+        let mut laid: Vec<(Homes, Laid)> = tries.iter().map(|(_, h)| (*h, lay_out(*h, legend))).collect();
         let chosen = pick_arrangement(&laid.iter().map(|(_, l)| l.3).collect::<Vec<_>>()).map(|i| laid.swap_remove(i));
         chosen.unwrap_or_else(|| (ARRANGEMENTS[0].1, lay_out(ARRANGEMENTS[0].1, legend)))
     };
@@ -2289,7 +2442,8 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
     // fewest columns that do, rather than each in a corner of its own. The search found that group
     // with these very sizes, so it is found again; the legend goes there too when the corners left
     // it no room.
-    let mut arrangement_used = arrangement_name(homes);
+    let mut arrangement_used =
+        tries.iter().find(|(_, h)| *h == homes).map_or_else(|| arrangement_name(homes).to_string(), |(n, _)| n.clone());
     if let (Some(clip), Some(known)) = (veiled, sizes)
         && let Some((i, (legend_place, locator_place, arrow_place, scale_place))) =
             grouped(clip, 0, &known, scale_box(ground_per_pt(s, center, scale), scale))
@@ -2317,7 +2471,7 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
             })
             .map(|(kind, _)| named(*kind))
             .collect();
-        arrangement_used = "veil";
+        arrangement_used = "veil".into();
     }
     if let Some(ElementKind::MapFrame { center: at, scale: drawn_at, .. }) = l.element_mut(frame).map(|e| &mut e.kind) {
         (*at, *drawn_at) = (center, scale);
