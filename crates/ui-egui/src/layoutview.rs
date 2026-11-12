@@ -1481,17 +1481,33 @@ fn grid_properties(app: &mut RustGisApp, ui: &mut Ui, grid: Option<&Grid>, id: u
             return;
         }
         if measured {
-            let input_label = ui.label(tl!("Short labels"));
-            let mut short = g.short;
+            let input_label = ui.label(tl!("MGRS labels"));
+            let mut mgrs = g.mgrs;
             if ui
-                .checkbox(&mut short, "")
+                .checkbox(&mut mgrs, "")
                 .labelled_by(input_label.id)
-                .on_hover_text(tl!("The kilometres' last two digits, as topographic maps print them: 43 for 543000."))
+                .on_hover_text(tl!(
+                    "Each 100 km square named with its grid zone designation (32T MT), and the lines by their kilometres' last two digits. The grid is in a WGS 84 UTM zone: the one given, else the map's, else the one at the frame's centre."
+                ))
                 .changed()
             {
-                set(app, json!({"short": short}));
+                set(app, json!({"mgrs": mgrs}));
             }
             ui.end_row();
+            // (MGRS labels are short already.)
+            if !g.mgrs {
+                let input_label = ui.label(tl!("Short labels"));
+                let mut short = g.short;
+                if ui
+                    .checkbox(&mut short, "")
+                    .labelled_by(input_label.id)
+                    .on_hover_text(tl!("The kilometres' last two digits, as topographic maps print them: 43 for 543000."))
+                    .changed()
+                {
+                    set(app, json!({"short": short}));
+                }
+                ui.end_row();
+            }
         } else {
             // Degrees: decimal or degrees, minutes and seconds, with hemisphere letters or signs.
             ui.label(tl!("Format"));
@@ -1555,10 +1571,21 @@ fn crs_row(app: &mut RustGisApp, ui: &mut Ui, g: &Grid, id: u32, set: &dyn Fn(&m
     let key = egui::Id::unique(("grid_crs", id));
     let current = g.crs.clone().unwrap_or_default();
     let mut buf = ui.data(|d| d.get_temp::<String>(key)).unwrap_or_else(|| current.clone());
-    let r = ui
-        .add(egui::TextEdit::singleline(&mut buf).hint_text(tl!("The map's, else its UTM zone")).desired_width(150.0))
-        .labelled_by(input_label.id)
-        .on_hover_text(tl!("EPSG:25832, WKT or a PROJ string; empty: the map's when projected, else the UTM zone at the frame's centre."));
+    let (hint, help) = if g.mgrs {
+        (
+            tl!("The map's UTM zone, else the frame's"),
+            tl!(
+                "A WGS 84 UTM zone for MGRS labels, by its EPSG code (32632); empty: the map's when it is one, else the zone at the frame's centre."
+            ),
+        )
+    } else {
+        (
+            tl!("The map's, else its UTM zone"),
+            tl!("EPSG:25832, WKT or a PROJ string; empty: the map's when projected, else the UTM zone at the frame's centre."),
+        )
+    };
+    let r =
+        ui.add(egui::TextEdit::singleline(&mut buf).hint_text(hint).desired_width(150.0)).labelled_by(input_label.id).on_hover_text(help);
     if r.has_focus() {
         ui.data_mut(|d| d.insert_temp(key, buf));
     } else {
@@ -3421,7 +3448,7 @@ mod tests {
     }
 
     /// A frame's grid in the Format pane: a graticule's degree rows, or a measured grid's
-    /// coordinate system (typed, set once left) and short labels.
+    /// coordinate system (typed, set once left), short labels and MGRS labels.
     #[test]
     fn a_measured_grid_is_set_in_the_format_pane() {
         use egui::accesskit::Role;
@@ -3468,6 +3495,17 @@ mod tests {
         h.get_by_label("Short labels").click();
         h.run_steps(2);
         assert!(grid(&h).short);
+        // MGRS labels need a WGS 84 UTM zone: refused over LV95, nothing changed; with the map's
+        // or the frame's zone they're set, and short labels go, as MGRS's are short already.
+        h.get_by_label("MGRS labels").click();
+        h.run_steps(2);
+        assert!(!grid(&h).mgrs && grid(&h).crs.as_deref() == Some("EPSG:2056"));
+        h.state_mut().run("layout.update", json!({"element": frame, "grid": {"crs": ""}})).unwrap();
+        h.run_steps(2);
+        h.get_by_label("MGRS labels").click();
+        h.run_steps(3);
+        assert!(grid(&h).mgrs);
+        assert!(h.query_by_label("Short labels").is_none());
     }
 
     /// Selecting an element opens the Format pane, a tab like the others (#516). Closing it keeps

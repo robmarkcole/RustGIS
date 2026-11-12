@@ -7025,6 +7025,74 @@ fn layout_legends_list_what_the_frame_draws() {
     assert!(matches!(old, rustgis_map::layout::ElementKind::Legend { all_classes: false, hide_other: false, .. }));
 }
 
+/// A measured grid can be labelled as MGRS (#1042 piece 9): with no system or a WGS 84 UTM zone's
+/// EPSG code; refused for a graticule and over another system, nothing changed, and dropped by a
+/// switch to a graticule; kept with the project, and left off, said, when a file names another
+/// system with it.
+#[test]
+fn a_measured_grid_can_be_labelled_as_mgrs() {
+    use rustgis_map::layout::ElementKind;
+    let mut s = world();
+    s.run("layout.new", &json!({"page": "a4", "template": "map"})).unwrap();
+    let frame = s.project.layouts[0].elements.iter().find(|e| e.kind.code() == "mapFrame").unwrap().id;
+    let grid = |s: &Session| match &s.project.layouts[0].element(frame).unwrap().kind {
+        ElementKind::MapFrame { grid, .. } => grid.clone().unwrap(),
+        k => panic!("{k:?}"),
+    };
+    s.run("layout.addElement", &json!({"kind": "grid"})).unwrap();
+    let e = s.run("layout.update", &json!({"element": frame, "grid": {"mgrs": true}})).unwrap_err();
+    assert!(e.contains("measured"), "{e}");
+    s.run("layout.update", &json!({"element": frame, "grid": {"type": "measured", "mgrs": true}})).unwrap();
+    assert!(grid(&s).mgrs && grid(&s).crs.is_none());
+    s.run("layout.update", &json!({"element": frame, "grid": {"crs": "EPSG:32733"}})).unwrap();
+    assert_eq!(grid(&s).crs.as_deref(), Some("EPSG:32733"));
+    let before = grid(&s);
+    for crs in ["EPSG:2056", "EPSG:25832", "+proj=utm +zone=33 +datum=WGS84"] {
+        let e = s.run("layout.update", &json!({"element": frame, "grid": {"crs": crs}})).unwrap_err();
+        assert!(e.contains("MGRS labels need a WGS 84 UTM zone") && e.contains(crs), "{e}");
+    }
+    assert_eq!(grid(&s), before, "a refusal changes nothing");
+    // Off, any system again; on again over one that isn't a UTM zone, refused.
+    s.run("layout.update", &json!({"element": frame, "grid": {"mgrs": false, "crs": "EPSG:2056"}})).unwrap();
+    assert!(s.run("layout.update", &json!({"element": frame, "grid": {"mgrs": true}})).is_err());
+    assert!(!grid(&s).mgrs);
+    s.run("layout.update", &json!({"element": frame, "grid": {"mgrs": true, "crs": ""}})).unwrap();
+    assert!(grid(&s).mgrs && grid(&s).crs.is_none());
+    // A graticule doesn't keep them, so any system can be named on it, and measured again it's
+    // a plain measured grid.
+    s.run("layout.update", &json!({"element": frame, "grid": {"type": "graticule"}})).unwrap();
+    assert!(!grid(&s).mgrs);
+    s.run("layout.update", &json!({"element": frame, "grid": {"crs": "EPSG:2056"}})).unwrap();
+    s.run("layout.update", &json!({"element": frame, "grid": {"type": "measured"}})).unwrap();
+    assert!(!grid(&s).mgrs && grid(&s).crs.as_deref() == Some("EPSG:2056"));
+    s.run("layout.update", &json!({"element": frame, "grid": {"mgrs": true, "crs": ""}})).unwrap();
+    // Kept with the project; a file naming another system with it has it left off, and said.
+    let text = serde_json::to_string(&s.project).unwrap();
+    let back = crate::Project::from_json(&text).unwrap();
+    let saved = |p: &crate::Project| match &p.layouts[0].element(frame).unwrap().kind {
+        ElementKind::MapFrame { grid, .. } => grid.clone().unwrap(),
+        _ => panic!(),
+    };
+    assert!(saved(&back).mgrs);
+    let edited = text.replace("\"mgrs\":true", "\"mgrs\":true,\"crs\":\"EPSG:2056\"");
+    assert_ne!(edited, text);
+    let mut back = crate::Project::from_json(&edited).unwrap();
+    let g = saved(&back);
+    assert_eq!((g.mgrs, g.crs.as_deref()), (false, Some("EPSG:2056")));
+    let said: Vec<String> = back.take_read_notices(&[crate::project::ReadPart::Layouts]).iter().map(|n| n.english()).collect();
+    assert!(said.iter().any(|n| n.contains("MGRS labels turned off on 1 map frame grid(s)")), "{said:?}");
+    assert!(!said.iter().any(|n| n.contains("value out of range")), "{said:?}");
+    // A blank system kept from a file is none: the grid can still be changed.
+    let blank = text.replace("\"mgrs\":true", "\"mgrs\":true,\"crs\":\" \"");
+    let mut blank_project = crate::Project::from_json(&blank).unwrap();
+    let blank_said: Vec<String> =
+        blank_project.take_read_notices(&[crate::project::ReadPart::Layouts]).iter().map(|n| n.english()).collect();
+    assert!(!blank_said.iter().any(|n| n.contains("MGRS labels turned off") || n.contains("value out of range")), "{blank_said:?}");
+    let mut opened = Session::new(blank_project);
+    assert!(saved(&opened.project).mgrs);
+    opened.run("layout.update", &json!({"element": frame, "grid": {"color": "#FF0000"}})).unwrap();
+}
+
 /// A map frame's grid can be a measured grid (#1008): eastings and northings in a projected
 /// system its step apart in metres, with whole or short labels; a system that isn't projected, or
 /// isn't one, is refused; a change of type starts its step afresh.

@@ -1842,6 +1842,13 @@ pub(crate) fn layout_notices(
             layout_names(repairs, |r| r.page_adjusted)
         ));
     }
+    let mgrs = total(|r| r.mgrs_off);
+    if mgrs > 0 {
+        notices.push(format!(
+            "{name}: MGRS labels turned off on {mgrs} map frame grid(s) that weren't measured grids in a WGS 84 UTM zone (named by its EPSG code) {when} (in {})",
+            layout_names(repairs, |r| r.mgrs_off)
+        ));
+    }
     let series = total(|r| r.series_removed);
     if series > 0 {
         notices.push(format!(

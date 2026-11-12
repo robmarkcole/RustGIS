@@ -373,11 +373,8 @@ pub fn to_mgrs(c: Coord, digits: u8) -> Option<Mgrs> {
     if !(SQUARE..9.0 * SQUARE).contains(&e) || !(0.0..=FALSE_NORTHING_SOUTH).contains(&n) {
         return None;
     }
+    let (column, row) = square_letters(u.zone, e, n)?;
     let (e, n) = (e as i64, n as i64);
-    let set = COLUMNS.get(usize::from((u.zone - 1) % 3))?;
-    let column = char::from(*set.get(usize::try_from(e / 100_000 - 1).ok()?)?);
-    let offset = if u.zone.is_multiple_of(2) { EVEN_ZONE_ROW_OFFSET } else { 0 };
-    let row = char::from(*ROWS.get(usize::try_from((n / 100_000 + offset).rem_euclid(20)).ok()?)?);
     let scale = 10i64.pow(5 - u32::from(digits));
     Some(Mgrs {
         zone: u.zone,
@@ -388,6 +385,23 @@ pub fn to_mgrs(c: Coord, digits: u8) -> Option<Mgrs> {
         northing: u32::try_from(n % 100_000 / scale).ok()?,
         digits,
     })
+}
+
+/// The column and row letters of the 100 km square holding easting `e` and northing `n` (metres,
+/// the southern hemisphere's with its 10,000 km false northing) in UTM zone `zone`: `('M', 'B')`
+/// for Baghdad's 444,140 m E 3,684,706 m N in zone 38 (`38S MB`).
+/// `None` outside the zone's columns (eastings 100 km to 900 km) and northings 0 to 10,000 km, and
+/// for a zone outside 1–60.
+pub fn square_letters(zone: u8, e: f64, n: f64) -> Option<(char, char)> {
+    if !(1..=60).contains(&zone) || !(SQUARE..9.0 * SQUARE).contains(&e) || !(0.0..=FALSE_NORTHING_SOUTH).contains(&n) {
+        return None;
+    }
+    let (e, n) = ((e / SQUARE).floor() as i64, (n / SQUARE).floor() as i64);
+    let set = COLUMNS.get(usize::from((zone - 1) % 3))?;
+    let column = char::from(*set.get(usize::try_from(e - 1).ok()?)?);
+    let offset = if zone.is_multiple_of(2) { EVEN_ZONE_ROW_OFFSET } else { 0 };
+    let row = char::from(*ROWS.get(usize::try_from((n + offset).rem_euclid(20)).ok()?)?);
+    Some((column, row))
 }
 
 /// A place as `33U VP 12345 23456` (1 m); `None` outside 80° S to 84° N.
@@ -889,6 +903,27 @@ mod tests {
         let m = to_mgrs(c(10.0, 78.0), 5).unwrap();
         assert_eq!((m.zone, m.band), (33, 'X'));
         assert!("STUVWXYZ".contains(m.column), "{m}");
+    }
+
+    /// A square's letters are those of every place in it: the Baghdad reference's `MB`, zone 31's
+    /// first square at the equator `AA`, an even zone's rows shifted by five; none outside a zone's
+    /// columns or northings.
+    #[test]
+    fn square_letters_name_the_100_km_square() {
+        assert_eq!(square_letters(38, 444_140.54, 3_684_706.36), Some(('M', 'B')));
+        assert_eq!(square_letters(31, 166_021.0, 0.0), Some(('A', 'A')));
+        assert_eq!(square_letters(32, 166_021.0, 0.0), Some(('J', 'F')));
+        let mut r = Lcg(11);
+        for _ in 0..2000 {
+            let p = c(-180.0 + r.next() * 360.0, UTM_MIN_LAT + r.next() * (UTM_MAX_LAT - UTM_MIN_LAT));
+            let (Some(u), Some(m)) = (to_utm(p), to_mgrs(p, 5)) else { continue };
+            let n = if u.north() { u.northing.floor() } else { u.northing.floor().min(FALSE_NORTHING_SOUTH - 1.0) };
+            assert_eq!(square_letters(u.zone, u.easting.floor(), n), Some((m.column, m.row)), "{p:?}");
+        }
+        for (zone, e, n) in [(31, 99_999.0, 0.0), (31, 900_000.0, 0.0), (31, 500_000.0, -1.0), (0, 500_000.0, 0.0), (61, 500_000.0, 0.0)] {
+            assert_eq!(square_letters(zone, e, n), None, "{zone} {e} {n}");
+        }
+        assert_eq!(square_letters(31, f64::NAN, 0.0), None);
     }
 
     #[test]

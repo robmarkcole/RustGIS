@@ -120,6 +120,11 @@ pub struct Grid {
     /// digits (`43` for 543,000 m); off, the whole value.
     #[serde(default, skip_serializing_if = "is_false")]
     pub short: bool,
+    /// A measured grid labelled as MGRS: each 100 km square named with its grid zone designation
+    /// (`32T MT`), and the lines by their kilometres' last two digits (`05`). Its system is a WGS 84 UTM
+    /// zone: the one named, else the map's own when it is one, else the zone at the frame's centre.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mgrs: bool,
 }
 
 /// What a grid's lines are.
@@ -176,6 +181,26 @@ pub fn utm_epsg(lon: f64, lat: f64) -> u32 {
     if lat < 0.0 { 32_700 + zone } else { 32_600 + zone }
 }
 
+/// The WGS 84 UTM zone a coordinate system names by its EPSG code (`EPSG:32632`, `32632`, any
+/// case): its zone and whether it is the northern hemisphere's. `None` for any other system, and
+/// for a UTM zone given as WKT or a PROJ string, which MGRS labels don't read.
+pub fn utm_zone_of(crs: &str) -> Option<(u8, bool)> {
+    let t = crs.trim();
+    let digits = match t.get(..5) {
+        Some(p) if p.eq_ignore_ascii_case("EPSG:") => t.get(5..)?.trim(),
+        _ => t,
+    };
+    if !(digits.len() == 5 && digits.bytes().all(|b| b.is_ascii_digit())) {
+        return None;
+    }
+    let code: u32 = digits.parse().ok()?;
+    let zone = u8::try_from(code % 100).ok()?;
+    match code / 100 {
+        326 | 327 if (1..=60).contains(&zone) => Some((zone, code / 100 == 326)),
+        _ => None,
+    }
+}
+
 impl Default for Grid {
     fn default() -> Grid {
         Grid {
@@ -192,6 +217,7 @@ impl Default for Grid {
             kind: GridKind::Graticule,
             crs: None,
             short: false,
+            mgrs: false,
         }
     }
 }
@@ -249,11 +275,13 @@ impl Grid {
         // Off by rounding error from the stepped loop: put back on the step.
         let v = if step > 0.0 { (v / step).round() * step } else { v };
         // (Short labels of a step of 100 km or more would all read 0: whole ones.)
-        if self.short && step < 100_000.0 {
+        if (self.short || self.mgrs) && step < 100_000.0 {
             let km = (v / 1000.0).rem_euclid(100.0);
             // (99.9999… after rounding error is 0 again.)
             let km = if (km - 100.0).abs() < 1e-6 { 0.0 } else { km };
-            return decimal(km, step / 1000.0);
+            let s = decimal(km, step / 1000.0);
+            // MGRS prints its two digits always: `05`, `00`.
+            return if self.mgrs && km < 10.0 { format!("0{s}") } else { s };
         }
         let s = decimal(v.abs(), step);
         if v < 0.0 && s.chars().any(|c| c.is_ascii_digit() && c != '0') { format!("-{s}") } else { s }
@@ -1370,6 +1398,7 @@ impl Layout {
         let mut seen = std::collections::HashSet::new();
         let mut next = self.elements.iter().map(|e| e.id).filter(|id| *id <= MAX_ID).max().unwrap_or(0).saturating_add(1);
         let mut changed = Vec::with_capacity(self.elements.len());
+        let mut mgrs_off = 0usize;
         for e in &mut self.elements {
             // A picture's image (often large) is never changed here, so it isn't copied.
             let mut before = Element {
@@ -1434,6 +1463,19 @@ impl Layout {
                             GridKind::Measured => step.clamp(MIN_MEASURED_STEP, MAX_MEASURED_STEP),
                         };
                         g.tick_length = finite_or(g.tick_length, tick_length()).clamp(0.0, MAX_TICK_MM);
+                        // MGRS labels name a WGS 84 UTM zone's squares, on a measured grid: on a
+                        // graticule, or with another system named (only a hand-edited file has
+                        // either), they are left off, and counted on their own.
+                        let named_other = g.crs.as_deref().is_some_and(|c| !c.trim().is_empty() && utm_zone_of(c).is_none());
+                        if g.mgrs && (g.kind != GridKind::Measured || named_other) {
+                            g.mgrs = false;
+                            mgrs_off = mgrs_off.saturating_add(1);
+                            // (Counted by `mgrs_off` and said in its own notice, so `before` matches:
+                            // not an adjusted element too.)
+                            if let ElementKind::MapFrame { grid: Some(b), .. } = &mut before.kind {
+                                b.mgrs = false;
+                            }
+                        }
                         g.width = finite_or(g.width, grid_width()).clamp(0.0, MAX_GRID_WIDTH);
                     }
                 }
@@ -1522,6 +1564,7 @@ impl Layout {
             elements_removed: count.saturating_sub(self.elements.len()),
             page_adjusted: usize::from(page_adjusted),
             series_removed: usize::from(series_removed),
+            mgrs_off,
         }
     }
 }
@@ -1540,6 +1583,9 @@ pub struct LayoutRepairs {
     pub page_adjusted: usize,
     /// Whether the map series was removed, its map frame missing (0 or 1).
     pub series_removed: usize,
+    /// Map frames whose grid had MGRS labels on a graticule or over a system other than a WGS 84
+    /// UTM zone, turned off.
+    pub mgrs_off: usize,
 }
 
 impl LayoutRepairs {
@@ -1816,7 +1862,7 @@ mod tests {
         let repairs = l.clamp();
         assert_eq!(
             repairs,
-            LayoutRepairs { elements_adjusted: 2, elements_cut: 0, elements_removed: 1, page_adjusted: 1, series_removed: 1 },
+            LayoutRepairs { elements_adjusted: 2, elements_cut: 0, elements_removed: 1, page_adjusted: 1, series_removed: 1, mgrs_off: 0 },
             "what changed is counted"
         );
         assert!(l.clamp().is_empty(), "a repaired layout needs nothing more");
@@ -1977,6 +2023,67 @@ mod tests {
         assert_eq!(serde_json::from_value::<Grid>(v).unwrap(), m);
         assert_eq!(GridKind::from_name(" Measured "), Some(GridKind::Measured));
         assert_eq!(GridKind::from_name("utm"), None);
+    }
+
+    /// MGRS labels: the kilometres' last two digits on the lines, saved only when on; a WGS 84 UTM
+    /// zone is read from its EPSG code alone; a file with them on a graticule or naming another
+    /// system has them left off, counted on their own.
+    #[test]
+    fn mgrs_labels_need_a_wgs84_utm_zone() {
+        let g = Grid { kind: GridKind::Measured, mgrs: true, ..Grid::default() };
+        assert_eq!(g.measured_label(543_000.0, 1000.0), "43");
+        assert_eq!(g.measured_label(5_262_500.0, 500.0), "62.5");
+        assert_eq!(g.measured_label(500_000.0, 1000.0), "00", "two digits, as MGRS prints them");
+        assert_eq!(g.measured_label(505_500.0, 500.0), "05.5");
+        assert_eq!(Grid { mgrs: false, short: true, ..g.clone() }.measured_label(505_000.0, 1000.0), "5");
+        assert_eq!(g.measured_label(500_000.0, 100_000.0), "500000");
+        assert!(serde_json::to_value(Grid::default()).unwrap().get("mgrs").is_none());
+        let v = serde_json::to_value(&g).unwrap();
+        assert_eq!(v["mgrs"].as_bool(), Some(true));
+        assert_eq!(serde_json::from_value::<Grid>(v).unwrap(), g);
+        for (crs, zone) in [
+            ("EPSG:32632", Some((32, true))),
+            (" epsg:32760 ", Some((60, false))),
+            ("32601", Some((1, true))),
+            ("EPSG: 32733", Some((33, false))),
+            ("EPSG:32600", None),
+            ("EPSG:32661", None),
+            ("EPSG:32761", None),
+            ("EPSG:25832", None),
+            ("EPSG:2056", None),
+            ("EPSG:326320", None),
+            ("+proj=utm +zone=32 +datum=WGS84", None),
+            ("", None),
+        ] {
+            assert_eq!(utm_zone_of(crs), zone, "{crs}");
+        }
+        let frame = |crs: Option<&str>, kind: GridKind| {
+            let mut l = Layout::new("Layout", 297.0, 210.0);
+            l.add(
+                "Map Frame",
+                (10.0, 10.0, 200.0, 150.0),
+                ElementKind::MapFrame {
+                    map: "Map".into(),
+                    center: Coord::new(8.7, 47.5),
+                    scale: 25_000.0,
+                    shape: FrameShape::Rectangle,
+                    grid: Some(Grid { crs: crs.map(Into::into), kind, ..g.clone() }),
+                    extent_of: None,
+                    extent_color: INDICATOR_COLOR,
+                    extent_width: INDICATOR_WIDTH,
+                    bearing: 0.0,
+                    pitch: 0.0,
+                },
+            );
+            let r = l.clamp();
+            let ElementKind::MapFrame { grid: Some(g), .. } = &l.elements[0].kind else { panic!() };
+            (g.mgrs, r.mgrs_off, r.elements_adjusted)
+        };
+        assert_eq!(frame(None, GridKind::Measured), (true, 0, 0));
+        assert_eq!(frame(Some("EPSG:32632"), GridKind::Measured), (true, 0, 0));
+        assert_eq!(frame(Some(" "), GridKind::Measured), (true, 0, 0));
+        assert_eq!(frame(Some("EPSG:2056"), GridKind::Measured), (false, 1, 0), "said on its own, not as a value out of range");
+        assert_eq!(frame(None, GridKind::Graticule), (false, 1, 0));
     }
 
     #[test]
