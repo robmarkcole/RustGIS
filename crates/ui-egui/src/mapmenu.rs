@@ -187,6 +187,16 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui, c: Coord) {
     }
 }
 
+/// A viewshed of `radius` metres from `c` on `dem`, reading the ground as the Workflows pane's
+/// Ground heights says (`bilinear`): the pane its progress shows in.
+fn viewshed_here(bilinear: bool, dem: &str, c: Coord, radius: f64, name: &str) -> serde_json::Value {
+    let mut p = json!({"layer": dem, "lon": c.x, "lat": c.y, "radius": radius, "name": name});
+    if bilinear {
+        p["heights"] = json!("bilinear");
+    }
+    p
+}
+
 /// Quick Analysis: the Buffer tool at a few distances, a viewshed and a line of sight on an
 /// elevation raster in the map, and the Buffer tool's own pane.
 fn quick_analysis(app: &mut RustGisApp, ui: &mut Ui, c: Coord) {
@@ -212,7 +222,7 @@ fn quick_analysis(app: &mut RustGisApp, ui: &mut Ui, c: Coord) {
         {
             let name = i18n::fmt("Viewshed {radius}", &[("radius", &radius)]);
             // In the background on the desktop, its progress and Cancel in the Workflows pane.
-            let p = json!({"layer": dem, "lon": c.x, "lat": c.y, "radius": r, "name": name});
+            let p = viewshed_here(app.workflow.bilinear, dem, c, r, &name);
             crate::analysispane::run_elsewhere(app, "visibility", "analysis.viewshed", p);
             ui.close();
         }
@@ -239,6 +249,16 @@ fn quick_analysis(app: &mut RustGisApp, ui: &mut Ui, c: Coord) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Viewshed N km Here reads the ground between cells when the Workflows pane, where its
+    /// progress shows, is set to.
+    #[test]
+    fn a_viewshed_here_reads_the_ground_as_the_workflows_pane_says() {
+        let c = Coord::new(8.5, 47.4);
+        let nearest = viewshed_here(false, "dem", c, 2000.0, "Viewshed 2 km");
+        assert_eq!(nearest, json!({"layer": "dem", "lon": 8.5, "lat": 47.4, "radius": 2000.0, "name": "Viewshed 2 km"}));
+        assert_eq!(viewshed_here(true, "dem", c, 2000.0, "Viewshed 2 km")["heights"], json!("bilinear"));
+    }
 
     /// A place on a world copy reaches the commands within ±180 (they refuse it otherwise), and
     /// a failed action shows in the status bar instead of doing nothing.

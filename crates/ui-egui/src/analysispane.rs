@@ -24,6 +24,8 @@ pub struct Workflow {
     pub field: String,
     pub number: String,
     pub number2: String,
+    /// The viewshed reads the ground between cells (bilinear heights), not the nearest cell.
+    pub bilinear: bool,
     pub text: String,
     pub function: String,
     pub chain: Vec<String>,
@@ -412,6 +414,25 @@ fn num(s: &str, d: f64) -> f64 {
     s.trim().parse().unwrap_or(d)
 }
 
+/// The viewshed's parameters from the pane, seen from `at`: an empty radius field leaves the
+/// radius out, so the command takes the whole DEM.
+fn viewshed_params(w: &Workflow, at: rustgis_engine::geom::Coord) -> Value {
+    let mut params = json!({"layer": w.layer, "lon": at.x, "lat": at.y});
+    // A number is the height or radius; other text goes as it is, for the command to refuse,
+    // naming it (`inf`, `NaN` and `1e400` parse, but aren't numbers JSON holds: they'd be null).
+    // Empty: the command's own (1.7 m up; the whole raster).
+    for (key, text) in [("height", &w.number), ("radius", &w.number2)] {
+        match text.trim() {
+            "" => {}
+            t => params[key] = t.parse::<f64>().ok().filter(|v| v.is_finite()).map_or_else(|| json!(t), |v| json!(v)),
+        }
+    }
+    if w.bilinear {
+        params["heights"] = json!("bilinear");
+    }
+    params
+}
+
 /// The sections of the Workflows pane: (id, title).
 pub const SECTIONS: &[(&str, &str)] = &[
     ("rasterFunctions", "Raster Functions"),
@@ -702,12 +723,25 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 ui.add(egui::TextEdit::singleline(&mut app.workflow.number).hint_text(tl!("observer height m")).desired_width(110.0));
                 ui.add(egui::TextEdit::singleline(&mut app.workflow.number2).hint_text(tl!("radius m")).desired_width(80.0));
             });
+            // How the ground along each ray is read.
+            ui.horizontal(|ui| {
+                ui.label(tl!("Ground heights"));
+                let (nearest, between) = (tl!("Nearest cell"), tl!("Between cells (bilinear)"));
+                egui::ComboBox::from_id_salt("wf_v_heights")
+                    .selected_text(if app.workflow.bilinear { between } else { nearest })
+                    .width(170.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut app.workflow.bilinear, false, nearest);
+                        ui.selectable_value(&mut app.workflow.bilinear, true, between);
+                    })
+                    .response
+                    .on_hover_text(tl!(
+                        "How the ground between the observer and a cell is read: the cell each point falls in, or between the cells' centres. Between cells is an estimate too, but closer on ground that bulges, a hill seen from its top, where the nearest cell can hide cells just inside the horizon."
+                    ));
+            });
             pick_button(app, ui, "viewshed", 1, "Click the observer on the map");
             if let Some(p) = picked(app, "viewshed").and_then(|v| v.first().copied()) {
-                let mut params = json!({"layer": app.workflow.layer, "lon": p.x, "lat": p.y, "height": num(&app.workflow.number, 1.7)});
-                if let Ok(r) = app.workflow.number2.trim().parse::<f64>() {
-                    params["radius"] = json!(r);
-                }
+                let params = viewshed_params(&app.workflow, p);
                 run(app, "analysis.viewshed", params);
             }
         }
@@ -2130,6 +2164,71 @@ pub fn script_details(app: &mut RustGisApp, ctx: &egui::Context) {
 mod tests {
     use super::*;
     use egui_kittest::kittest::Queryable;
+
+    /// An empty radius field (or one of spaces) runs the viewshed over the whole DEM, about
+    /// 630 km long: one whose radius square, the DEM's diagonal each way, holds far more cells
+    /// than the DEM.
+    #[test]
+    fn a_viewshed_with_an_empty_radius_field_sees_the_whole_dem() {
+        use base64::Engine;
+        use rustgis_engine::geom::Coord;
+        let mut app = RustGisApp::with_sample();
+        use rustgis_engine::data::raster::{ColorHint, Crs, GeoTransform, Raster, geotiff};
+        // A strip 4,000 cells long and 2 high, 0.002° (about 160 m) a cell: about 630 km. The
+        // DEM's diagonal each way spans 8,001 × 8,001 cells, 64 million, of which 8,000 are the
+        // DEM's.
+        let (w, h) = (4_000u32, 2u32);
+        let gt = GeoTransform { origin_x: 10.0, origin_y: 45.004, pixel_width: 0.002, pixel_height: -0.002 };
+        let dem =
+            Raster::new("strip", w, h, vec![vec![200.0; (w * h) as usize]], gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
+        let data = base64::engine::general_purpose::STANDARD.encode(geotiff::write(&dem, 0).unwrap());
+        app.session.run("layer.addDataBytes", &json!({"fileName": "strip.tif", "data": data})).unwrap();
+        let layer = app.session.map().layers.iter().rev().find(|l| l.is_raster()).unwrap().name.clone();
+        // Cells of a viewshed worked out (not left no-data), and whether the strip's far end is.
+        let worked = |app: &RustGisApp, name: &str| {
+            let r = app.session.map().layer_by_name(name).and_then(|l| l.raster.as_ref()?.data.clone()).unwrap();
+            let n = (0..h as i64)
+                .flat_map(|row| (0..w as i64).map(move |col| (col, row)))
+                .filter(|&(c, rr)| r.value(0, c, rr).is_some())
+                .count();
+            (n, r.value(0, i64::from(w) - 1, 0).is_some())
+        };
+        let at = Coord::new(10.001, 45.001);
+        // A radius given short of the far end leaves it out; one past the DEM's diagonal works
+        // out every cell, as an empty field does.
+        app.session
+            .run("analysis.viewshed", &json!({"layer": layer, "lon": at.x, "lat": at.y, "height": 2.0, "radius": 100_000, "name": "short"}))
+            .unwrap();
+        assert!(!worked(&app, "short").1);
+        app.session
+            .run("analysis.viewshed", &json!({"layer": layer, "lon": at.x, "lat": at.y, "height": 2.0, "radius": 1e9, "name": "given"}))
+            .unwrap();
+        assert_eq!(worked(&app, "given"), ((w * h) as usize, true));
+        for (i, radius) in ["", "   "].into_iter().enumerate() {
+            let workflow = Workflow { layer: layer.clone(), number: "2".into(), number2: radius.into(), ..Default::default() };
+            let mut p = viewshed_params(&workflow, at);
+            assert!(p.get("radius").is_none(), "radius {radius:?}: {p}");
+            let name = format!("empty{i}");
+            p["name"] = json!(name);
+            app.session.run("analysis.viewshed", &p).unwrap_or_else(|e| panic!("radius {radius:?}: {e}"));
+            assert_eq!(worked(&app, &name), ((w * h) as usize, true), "radius {radius:?}: every cell worked out");
+        }
+        // A number in the field is the radius; other text is refused, not taken as no radius.
+        let workflow = Workflow { layer: layer.clone(), number2: " 5000 ".into(), ..Default::default() };
+        assert_eq!(viewshed_params(&workflow, Coord::new(10.0005, 45.0005))["radius"], json!(5000.0));
+        // So is the height, and an empty one is the command's 1.7 m.
+        for (text, e) in [("abc", r#"not "abc""#), ("1,7", r#"not "1,7""#), ("-3", "not -3.0")] {
+            let workflow = Workflow { layer: layer.clone(), number: text.into(), ..Default::default() };
+            let got = app.session.run("analysis.viewshed", &viewshed_params(&workflow, at)).unwrap_err();
+            assert!(got.starts_with("height must be a number of metres from 0 to 10,000") && got.ends_with(e), "{got}");
+        }
+        assert!(viewshed_params(&Workflow { layer: layer.clone(), ..Default::default() }, at).get("height").is_none());
+        for text in ["500km", "inf", "NaN", "1e400", "-infinity"] {
+            let workflow = Workflow { layer: layer.clone(), number2: text.into(), ..Default::default() };
+            let e = app.session.run("analysis.viewshed", &viewshed_params(&workflow, at)).unwrap_err();
+            assert_eq!(e, format!(r#"radius must be a number of metres above 0, not "{text}""#));
+        }
+    }
 
     /// A Script pane run works its tools out on a thread of its own: the results say Running…
     /// until it lands, runs land in the order asked, and one cancelled or left says so.
