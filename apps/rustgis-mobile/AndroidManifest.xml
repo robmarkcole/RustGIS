@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- RustGIS on Android, the phase 0 spike (#1902): a NativeActivity that loads librustgis_mobile.so.
-     There is no Java or Kotlin of ours (android:hasCode="false"). -->
+<!-- RustGIS on Android (#1902): a NativeActivity that loads librustgis_mobile.so. Its one Java
+     class (java/org/rustgis/mobile/MainActivity.java) is what reaches the system's file picker. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="org.rustgis.mobile"
     android:versionCode="1"
@@ -14,11 +14,12 @@
 
     <application
         android:label="RustGIS"
-        android:hasCode="false"
+        android:hasCode="true"
+        android:allowBackup="false"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
         <!-- configChanges: a rotation or a resize reaches the running app instead of restarting it. -->
         <activity
-            android:name="android.app.NativeActivity"
+            android:name=".MainActivity"
             android:exported="true"
             android:launchMode="singleTask"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|uiMode|density|fontScale|locale|layoutDirection|navigation">

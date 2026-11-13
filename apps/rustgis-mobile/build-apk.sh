@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds a release APK of the Android spike (#1902), signed with a debug key:
+# Builds a release APK of the Android app (#1902), signed with a debug key:
 # target/android/rustgis-mobile.apk. --debug builds the debug profile instead.
 #
 #   apps/rustgis-mobile/build-apk.sh [--debug] [abi ...]     (default: arm64-v8a x86_64)
@@ -29,7 +29,7 @@ out=$root/target/android
 rm -rf "$out/apk" && mkdir -p "$out/apk"
 targets=()
 for abi in "${abis[@]}"; do targets+=(-t "$abi"); done
-# API 26 (Android 8.0): the oldest this spike is linked for.
+# API 26 (Android 8.0): the oldest the app is linked for.
 (cd "$root" && cargo ndk "${targets[@]}" -P 26 -o "$out/apk/lib" build $profile -p rustgis-mobile)
 # Only the app's library goes in (cargo-ndk also copies a dependency's own cdylib), without its
 # symbols: 115 MB with them, under 80 MB without.
@@ -37,10 +37,18 @@ find "$out/apk/lib" -name '*.so' ! -name librustgis_mobile.so -delete
 strip=$(ls "$ANDROID_NDK_HOME"/toolchains/llvm/prebuilt/*/bin/llvm-strip | head -1)
 find "$out/apk/lib" -name librustgis_mobile.so -exec "$strip" {} \;
 
+# The activity's Java half, compiled without Gradle: javac, then d8 to Android's bytecode.
+rm -rf "$out/java" && mkdir -p "$out/java/classes" "$out/java/dex"
+mapfile -d '' sources < <(find "$root/apps/rustgis-mobile/java" -name '*.java' -print0)
+javac -nowarn -source 11 -target 11 -classpath "$platform/android.jar" -d "$out/java/classes" "${sources[@]}"
+mapfile -d '' classes < <(find "$out/java/classes" -name '*.class' -print0)
+"$tools/d8" --release --min-api 26 --lib "$platform/android.jar" --output "$out/java/dex" "${classes[@]}"
+
 unsigned=$out/unsigned.apk
 "$tools/aapt2" link -o "$unsigned" --manifest "$root/apps/rustgis-mobile/AndroidManifest.xml" -I "$platform/android.jar"
 # The libraries go in uncompressed and page-aligned, so Android maps them straight from the APK.
 (cd "$out/apk" && zip -q -0 -r "$unsigned" lib)
+(cd "$out/java/dex" && zip -q "$unsigned" classes.dex)
 # -P 16: on 16 KB pages, which Android 15 phones may use (build-tools 35 and later).
 "$tools/zipalign" -f -P 16 4 "$unsigned" "$out/aligned.apk"
 

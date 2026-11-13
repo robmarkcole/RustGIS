@@ -1,6 +1,6 @@
 [package]
 name = "rustgis-mobile"
-description = "RustGIS on Android: the phase 0 feasibility spike (#1902), the desktop front end in a NativeActivity"
+description = "RustGIS on Android (#1902): the desktop front end in a NativeActivity, with the phone's file picker"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -26,7 +26,7 @@ type_complexity = "allow"
 # Without the `geolibre` feature: a phone can't run the `geolibre` program.
 rustgis-engine = { workspace = true }
 rustgis-ui-egui = { workspace = true }
-# NativeActivity needs no Java of ours. Its soft keyboard support is poor: a real app moves to
+# NativeActivity's soft keyboard support is poor: a real app moves to
 # GameActivity (`android-game-activity`), which also allows `accesskit`.
 eframe = { workspace = true, features = ["default_fonts", "wgpu", "android-native-activity"] }
 egui = { workspace = true }
@@ -34,5 +34,8 @@ egui = { workspace = true }
 # lists one winit).
 winit = { version = "0.30", default-features = false, features = ["android-native-activity"] }
 log = { workspace = true }
+# Calls into the activity's Java half (`src/phone.rs`). The version `android-activity` uses, so
+# both share one `JavaVM`.
+jni = "0.22"
 # `log` records to logcat.
 android_logger = "0.15"

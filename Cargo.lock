@@ -4928,6 +4928,7 @@ dependencies = [
  "android_logger",
  "eframe",
  "egui",
+ "jni",
  "log",
  "rustgis-engine",
  "rustgis-ui-egui",

@@ -15,6 +15,7 @@ mod notice_text;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod observe;
 pub mod peer;
+pub mod platform;
 pub mod policy;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod prefs;

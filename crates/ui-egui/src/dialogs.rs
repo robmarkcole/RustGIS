@@ -572,7 +572,12 @@ fn save_project(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
         edit.state.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(end))));
         edit.state.store(ui.ctx(), edit.response.id);
     }
-    ui.label(egui::RichText::new(tl!("The project downloads as this file, to the folder your browser saves downloads in.")).small().weak());
+    let place = if cfg!(target_os = "android") {
+        tl!("You choose where the project is saved next.")
+    } else {
+        tl!("The project downloads as this file, to the folder your browser saves downloads in.")
+    };
+    ui.label(egui::RichText::new(place).small().weak());
     buttons(app, ui, "Save", |app| {
         let file = app.dialogs.text.clone();
         app.save_download(&file)
