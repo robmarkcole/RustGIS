@@ -129,7 +129,7 @@ pub fn commands() -> Vec<C> {
             .params(r#"{"layout"?}"#),
         C::new("layout.export", "Export Layout", "Publish › Output", |s, p| super::exports::write_here(s, p, "layout.export")).inputs(layout_inputs).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
             .view()
-            .params(r#"{"layout"?, "path": "*.png|*.pdf|*.svg" (PNG/SVG: current page; SVG: each element a group of its own; text and shapes as SVG, map frames and surrounds as vectors, rasters and tiles in them as pictures at dpi), "dpi"?: 72..600, "allPages"?: bool (PDF only; default true: every map series page, up to 500; false: the current page), "georeference"?: bool (PDF only; default true: map frames carry their coordinates, a GeoPDF; false: none), "pdf"?: {"layers"?: bool (default true: each element, and in a map frame each layer and its labels, a PDF layer that vector editors open as a layer; false: none)}}"#),
+            .params(r#"{"layout"?, "path": "*.png|*.pdf|*.svg" (PNG/SVG: current page; SVG: each element a group of its own; text and shapes as SVG, map frames and surrounds as vectors, rasters and tiles in them as pictures at dpi), "dpi"?: 72..600, "allPages"?: bool (PDF only; default true: every map series page, up to 500; false: the current page), "georeference"?: bool (PDF only; default true: map frames carry their coordinates, a GeoPDF; false: none), "pdf"?: {"layers"?: bool (default true: each element, and in a map frame each layer and its labels, a PDF layer that vector editors open as a layer; false: none), "text"?: "fonts" (default: text in its faces, embedded as subsets, editable in a vector editor; a face that can't be is set in outlines, and said)|"outlines" (glyphs as outlines, as print shops ask)}}"#),
         C::new("layout.save", "Save Layout File", "Publish › Save As", |s, p| {
             let path = ps(p, "path").ok_or("path is required")?;
             let l = active(s, p)?.clone();
@@ -4623,7 +4623,7 @@ pub fn layout_bytes(s: &mut Session, li: usize, pdf: bool, dpi: f64, all: bool) 
 }
 
 /// [`layout_bytes`], a PDF's map frames georeferenced only when `georeference` (#1191), written
-/// as `options` say (its layers, #1815). Returns an actionable error if a linked archive changes
+/// as `options` say (its layers and text, #1815). Returns an actionable error if a linked archive changes
 /// while the pages are drawn.
 pub fn layout_bytes_with(
     s: &mut Session,
@@ -4757,7 +4757,30 @@ fn layout_bytes_inner(
     let (pages, png) = result?;
     pictured_notices(s, &frames_pictured, &pages_pictured);
     georeference_notices(s, &left_out, &by_corners, pages.len());
-    if pdf { Ok(rustgis_render::pdf::write_with(&pages, &saved.name, options)) } else { png.ok_or_else(|| "nothing to draw".to_string()) }
+    if !pdf {
+        return png.ok_or_else(|| "nothing to draw".to_string());
+    }
+    let (bytes, outlined) = rustgis_render::pdf::write_with(&pages, &saved.name, options);
+    outlined_notice(s, &outlined);
+    Ok(bytes)
+}
+
+/// Says which faces a PDF set in outlines though its text was to be in fonts (#1815), with why:
+/// their text is drawings, not text, in a vector editor. One notice, the faces counted.
+pub(crate) fn outlined_notice(s: &mut Session, outlined: &[rustgis_render::pdf::Outlined]) {
+    let n = outlined.len();
+    if n == 0 {
+        return;
+    }
+    let mut each: Vec<String> = outlined.iter().take(10).map(|o| format!("{} ({})", o.face, o.why)).collect();
+    if n > 10 {
+        each.push(format!("and {} more", n - 10));
+    }
+    s.warn(format!(
+        "The PDF sets the text of {n} face{} as outlines, not as text a vector editor can edit: {}",
+        if n == 1 { "" } else { "s" },
+        each.join(", ")
+    ));
 }
 
 /// Says which map frames a PDF doesn't georeference, with why, and which it georeferences by their
@@ -4874,15 +4897,17 @@ pub(crate) fn pictured_notices(s: &mut Session, frames: &[(u32, String)], pages:
 }
 
 /// The keys `layout.export`'s `"pdf"` takes.
-const PDF_KEYS: &[&str] = &["layers"];
+const PDF_KEYS: &[&str] = &["layers", "text"];
 
-/// How `layout.export`'s `"pdf": {…}` asks a PDF to be written: with its layers unless
-/// `"layers": false` (#1815). A key it doesn't know is refused, with the keys it takes.
+/// How `layout.export`'s `"pdf": {…}` asks a PDF to be written (#1815): with its layers unless
+/// `"layers": false`, its text in its fonts unless `"text": "outlines"`. It is checked whatever
+/// the export writes, a PNG or SVG too, so a script's mistake shows on its first run; a key it
+/// doesn't know is refused, with the keys it takes.
 fn pdf_options(p: &Value) -> Result<rustgis_render::pdf::Options, String> {
+    use rustgis_render::pdf::Text;
     let mut options = rustgis_render::pdf::Options::default();
     let Some(pdf) = p.get("pdf").filter(|v| !v.is_null()) else { return Ok(options) };
-    let Some(pdf) = pdf.as_object() else { return Err(r#"pdf is an object: {"layers": true|false}"#.into()) };
-    // A key it doesn't know (a typo) is refused, not left to change nothing unsaid.
+    let Some(pdf) = pdf.as_object() else { return Err(r#"pdf is an object: {"layers": true|false, "text": "fonts"|"outlines"}"#.into()) };
     if let Some(key) = pdf.keys().find(|k| !PDF_KEYS.contains(&k.as_str())) {
         return Err(format!("pdf has no key \"{key}\": its keys are {}", PDF_KEYS.join(", ")));
     }
@@ -4891,6 +4916,12 @@ fn pdf_options(p: &Value) -> Result<rustgis_render::pdf::Options, String> {
         Some(Value::Bool(on)) => options.layers = *on,
         Some(_) => return Err("pdf.layers is true or false".into()),
     }
+    options.text = match pdf.get("text") {
+        None | Some(Value::Null) => Text::Fonts,
+        Some(v) if v == "fonts" => Text::Fonts,
+        Some(v) if v == "outlines" => Text::Outlines,
+        Some(_) => return Err(r#"pdf.text is "fonts" or "outlines""#.into()),
+    };
     Ok(options)
 }
 

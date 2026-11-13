@@ -258,7 +258,7 @@ impl Writer<'_> {
         end(out, st, saved);
     }
 
-    /// Sets a run of glyphs in the document's Type 3 fonts, each at its pen position.
+    /// Sets a run of glyphs in the document's fonts, each at its pen position.
     fn glyphs(&mut self, out: &mut Vec<u8>, st: &mut State, run: &GlyphRun) {
         let mut placed = Vec::with_capacity(run.glyphs.len());
         for g in &run.glyphs {
@@ -295,7 +295,7 @@ impl Writer<'_> {
             if shift.abs() >= 0.05 {
                 num(out, shift, 1);
             }
-            let _ = write!(out, "<{:02X}>", p.code);
+            let _ = if p.wide { write!(out, "<{:04X}>", p.code) } else { write!(out, "<{:02X}>", p.code) };
             pen = x + p.advance * size;
         }
         out.extend_from_slice(b"] TJ\nET\n");

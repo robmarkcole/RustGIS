@@ -1,6 +1,7 @@
-//! The document's fonts: for each face text is set in, Type 3 fonts whose glyphs are the face's
-//! outlines, in font units, 256 glyphs to a font (a Type 3 font's codes are single bytes), each
-//! with the map from its codes back to the characters they stand for.
+//! The document's fonts: each face text is set in, embedded as itself where it can be (a subset
+//! of its file, as a Type 0 font: [`super::embed`]), else as Type 3 fonts whose glyphs are the
+//! face's outlines, in font units, 256 glyphs to a font (a Type 3 font's codes are single bytes);
+//! each font with the map from its codes back to the characters they stand for.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -9,12 +10,26 @@ use ab_glyph::{Font, FontRef, GlyphId, OutlineCurve};
 
 use super::Doc;
 use super::content::num;
+use super::embed::Embedded;
 
 #[derive(Default)]
 pub(super) struct Fonts {
     faces: Vec<Face>,
     /// Faces by the address of their `FontRef` (fonts are parsed once and kept).
     by_font: HashMap<usize, usize>,
+    /// The faces embedded as themselves, in the order given (so a document is written the same
+    /// way each time), and their places there by the same address.
+    real: Vec<Real>,
+    real_by_font: HashMap<usize, usize>,
+}
+
+/// A face embedded as itself: its Type 0 font's object number, its subset, and the glyphs set
+/// in it by their CIDs.
+struct Real {
+    id: usize,
+    font: &'static FontRef<'static>,
+    embedded: Embedded,
+    glyphs: std::collections::BTreeMap<u16, char>,
 }
 
 struct Face {
@@ -31,32 +46,60 @@ struct Chunk {
     glyphs: Vec<(GlyphId, char)>,
 }
 
-/// Where a glyph is: its font's object number, its code there and its advance in ems.
+/// Where a glyph is: its font's object number, its code there (two bytes, a CID, when `wide`)
+/// and its advance in ems.
 pub(super) struct Placed {
     pub font: usize,
-    pub code: u8,
+    pub code: u16,
+    pub wide: bool,
     pub advance: f32,
 }
 
+/// A face's advance for `id` in ems, 0 where it isn't a number.
+fn advance_em(font: &FontRef<'static>, upm: f32, id: GlyphId) -> f32 {
+    let advance = font.h_advance_unscaled(id) / upm;
+    if advance.is_finite() { advance } else { 0.0 }
+}
+
+/// A face's units per em, read as the usual 1000 where it has none usable.
+fn upm_of(font: &FontRef<'static>) -> f32 {
+    font.units_per_em().filter(|u| u.is_finite() && *u > 0.0).unwrap_or(1000.0)
+}
+
 impl Fonts {
+    /// Fonts that set the faces of `real` as themselves, each given its font's number now.
+    pub fn with_real(doc: &mut Doc, real: Vec<(&'static FontRef<'static>, Embedded)>) -> Fonts {
+        let real_by_font = real.iter().enumerate().map(|(i, (font, _))| (std::ptr::from_ref(*font) as usize, i)).collect();
+        let real =
+            real.into_iter().map(|(font, embedded)| Real { id: doc.reserve(), font, embedded, glyphs: Default::default() }).collect();
+        Fonts { real, real_by_font, ..Fonts::default() }
+    }
+
     /// `id` of `font` (standing for `ch`), given a code in one of its Type 3 fonts the first time;
     /// `None` only past what a font can hold.
     pub fn place(&mut self, doc: &mut Doc, font: &'static FontRef<'static>, id: GlyphId, ch: char) -> Option<Placed> {
         let key = std::ptr::from_ref(font) as usize;
+        // An embedded face's glyph is its CID in the subset (every glyph the document sets was
+        // given one before the content was written).
+        if let Some(r) = self.real_by_font.get(&key).and_then(|&i| self.real.get_mut(i))
+            && let Some(cid) = r.embedded.remapper.get(id.0)
+        {
+            r.glyphs.entry(cid).or_insert(ch);
+            return Some(Placed { font: r.id, code: cid, wide: true, advance: advance_em(font, upm_of(font), id) });
+        }
         let fi = match self.by_font.get(&key) {
             Some(&i) => i,
             None => {
                 // A face with no usable units per em is read as the usual 1000, as the pixels read
                 // it at one unit a pixel's em: its text is kept, not left out.
-                let upm = font.units_per_em().filter(|u| u.is_finite() && *u > 0.0).unwrap_or(1000.0);
+                let upm = upm_of(font);
                 self.faces.push(Face { font, upm, chunks: Vec::new(), codes: HashMap::new() });
                 self.by_font.insert(key, self.faces.len() - 1);
                 self.faces.len() - 1
             }
         };
         let face = self.faces.get_mut(fi)?;
-        let advance = font.h_advance_unscaled(id) / face.upm;
-        let advance = if advance.is_finite() { advance } else { 0.0 };
+        let advance = advance_em(font, face.upm, id);
         let (ci, code) = match face.codes.get(&id.0) {
             Some(&c) => c,
             None => {
@@ -71,11 +114,14 @@ impl Fonts {
                 (ci, code)
             }
         };
-        Some(Placed { font: face.chunks.get(ci)?.id, code, advance })
+        Some(Placed { font: face.chunks.get(ci)?.id, code: u16::from(code), wide: false, advance })
     }
 
     /// Writes every font given a glyph.
     pub fn write(self, doc: &mut Doc) {
+        for r in &self.real {
+            write_real(doc, r);
+        }
         for face in &self.faces {
             for chunk in &face.chunks {
                 write_chunk(doc, face, chunk);
@@ -110,7 +156,8 @@ fn write_chunk(doc: &mut Doc, face: &Face, chunk: &Chunk) {
         bbox = [0.0; 4];
     }
     let to_unicode = doc.reserve();
-    doc.stream(to_unicode, "", to_unicode_cmap(&chunk.glyphs).as_bytes(), false);
+    let codes: Vec<(u16, char)> = chunk.glyphs.iter().zip(0u16..).map(|((_, ch), code)| (code, *ch)).collect();
+    doc.stream(to_unicode, "", to_unicode_cmap(&codes, false).as_bytes(), false);
     let mut matrix = Vec::new();
     for v in [1.0 / face.upm, 0.0, 0.0, 1.0 / face.upm, 0.0, 0.0] {
         num(&mut matrix, v, 9);
@@ -128,6 +175,71 @@ fn write_chunk(doc: &mut Doc, face: &Face, chunk: &Chunk) {
             String::from_utf8_lossy(&b).trim_end(),
             String::from_utf8_lossy(&matrix).trim_end(),
             chunk.glyphs.len().saturating_sub(1),
+        )
+        .as_bytes(),
+    );
+}
+
+/// An embedded face's fonts: the Type 0 font over its CID font, the CID font's descriptor and
+/// file, its glyphs' widths and the map from its CIDs back to their characters.
+fn write_real(doc: &mut Doc, r: &Real) {
+    let e = &r.embedded;
+    let (cid_font, descriptor, file, to_unicode) = (doc.reserve(), doc.reserve(), doc.reserve(), doc.reserve());
+    let upm = upm_of(r.font);
+    let gids: Vec<u16> = e.remapper.remapped_gids().collect();
+    let mut widths = String::new();
+    for &cid in r.glyphs.keys() {
+        let gid = gids.get(usize::from(cid)).copied().unwrap_or(0);
+        let mut w = Vec::new();
+        num(&mut w, advance_em(r.font, upm, GlyphId(gid)) * 1000.0, 2);
+        let _ = write!(widths, "{cid} [{}] ", String::from_utf8_lossy(&w));
+    }
+    let n = |v: f32| {
+        let mut b = Vec::new();
+        num(&mut b, if v.is_finite() { v } else { 0.0 }, 1);
+        String::from_utf8_lossy(&b).into_owned()
+    };
+    // The file: TrueType outlines (FontFile2), or CFF ones in an OpenType wrapper (FontFile3).
+    let (subtype, file_key, file_dict, gid_map) = if e.cff {
+        ("CIDFontType0", "FontFile3", "/Subtype /OpenType".to_string(), "")
+    } else {
+        ("CIDFontType2", "FontFile2", format!("/Length1 {}", e.file.len()), " /CIDToGIDMap /Identity")
+    };
+    doc.stream(file, &file_dict, &e.file, false);
+    // Symbolic (its glyphs are reached by CID, not a standard encoding), and italic where it leans.
+    let flags = 4 + if e.italic_angle.abs() > 0.01 { 64 } else { 0 };
+    let [x0, y0, x1, y1] = e.bbox;
+    doc.put(
+        descriptor,
+        format!(
+            "<< /Type /FontDescriptor /FontName /{} /Flags {flags} /FontBBox [{} {} {} {}] /ItalicAngle {} /Ascent {} /Descent {} /CapHeight {} /StemV 80 /{file_key} {file} 0 R >>",
+            e.name,
+            n(x0),
+            n(y0),
+            n(x1),
+            n(y1),
+            n(e.italic_angle),
+            n(e.ascent),
+            n(e.descent),
+            n(e.cap_height)
+        )
+        .as_bytes(),
+    );
+    doc.put(
+        cid_font,
+        format!(
+            "<< /Type /Font /Subtype /{subtype} /BaseFont /{} /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor {descriptor} 0 R /DW 0 /W [{widths}]{gid_map} >>",
+            e.name
+        )
+        .as_bytes(),
+    );
+    let codes: Vec<(u16, char)> = r.glyphs.iter().map(|(c, ch)| (*c, *ch)).collect();
+    doc.stream(to_unicode, "", to_unicode_cmap(&codes, true).as_bytes(), false);
+    doc.put(
+        r.id,
+        format!(
+            "<< /Type /Font /Subtype /Type0 /BaseFont /{} /Encoding /Identity-H /DescendantFonts [{cid_font} 0 R] /ToUnicode {to_unicode} 0 R >>",
+            e.name
         )
         .as_bytes(),
     );
@@ -207,17 +319,19 @@ fn glyph_procedure(font: &FontRef<'static>, id: GlyphId, advance: f32) -> (Vec<u
     (ops, bbox)
 }
 
-/// The CMap taking each code of a font to the character its glyph stands for.
-fn to_unicode_cmap(glyphs: &[(GlyphId, char)]) -> String {
-    let mut s = String::from(
-        "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n/CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n1 begincodespacerange\n<00> <FF>\nendcodespacerange\n",
+/// The CMap taking each code of a font (one byte, or two when `wide`) to the character its glyph
+/// stands for.
+fn to_unicode_cmap(codes: &[(u16, char)], wide: bool) -> String {
+    let space = if wide { "<0000> <FFFF>" } else { "<00> <FF>" };
+    let mut s = format!(
+        "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n/CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n1 begincodespacerange\n{space}\nendcodespacerange\n",
     );
     // At most 100 entries to a block.
-    for (b, block) in glyphs.chunks(100).enumerate() {
+    for block in codes.chunks(100) {
         let _ = writeln!(s, "{} beginbfchar", block.len());
-        for (i, (_, ch)) in block.iter().enumerate() {
+        for (code, ch) in block {
             let hex: String = ch.encode_utf16(&mut [0; 2]).iter().map(|u| format!("{u:04X}")).collect();
-            let _ = writeln!(s, "<{:02X}> <{hex}>", b * 100 + i);
+            let _ = if wide { writeln!(s, "<{code:04X}> <{hex}>") } else { writeln!(s, "<{code:02X}> <{hex}>") };
         }
         s.push_str("endbfchar\n");
     }
@@ -267,8 +381,8 @@ mod tests {
 
     #[test]
     fn the_unicode_map_spans_blocks_and_astral_characters() {
-        let glyphs: Vec<(GlyphId, char)> = (0..150).map(|i| (GlyphId(i), if i == 120 { '🙂' } else { 'é' })).collect();
-        let cmap = to_unicode_cmap(&glyphs);
+        let glyphs: Vec<(u16, char)> = (0..150).map(|i| (i, if i == 120 { '🙂' } else { 'é' })).collect();
+        let cmap = to_unicode_cmap(&glyphs, false);
         assert_eq!(cmap.matches("beginbfchar").count(), 2);
         assert!(cmap.contains("100 beginbfchar") && cmap.contains("50 beginbfchar"));
         assert!(cmap.contains("<00> <00E9>") && cmap.contains("<78> <D83DDE42>"));

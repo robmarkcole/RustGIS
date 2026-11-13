@@ -67,6 +67,12 @@ crs-definitions = { version = "0.6", default-features = false, features = ["proj
 base64 = "0.23"
 # Deflate for PDF image streams.
 miniz_oxide = "0.9"
+# Vector PDF text in the faces it is set in: each face embedded as a subset of its glyphs
+# (opengeos/RustGIS#1815). Without its variable-font instancing, which brings skrifa and write-fonts.
+subsetter = { version = "0.2", default-features = false }
+# A face's embedding permissions, names and metrics for its PDF font (already in the tree through
+# ab_glyph).
+ttf-parser = { version = "0.25", default-features = false, features = ["std"] }
 roxmltree = "0.21"
 # CityGML: where each city object lies in a document, found without building its tree (already in
 # the tree through calamine).
