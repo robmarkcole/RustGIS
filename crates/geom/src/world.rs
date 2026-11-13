@@ -131,24 +131,28 @@ fn unit_forward(kind: Kind, lam: f64, phi: f64, cos_phi1: f64) -> (f64, f64) {
             (x, y)
         }
         Kind::EckertIV => {
-            // θ + sinθ·cosθ + 2·sinθ = (2 + π/2)·sinφ, by Newton.
-            let k = (2.0 + std::f64::consts::FRAC_PI_2) * phi.sin();
-            let mut th = phi / 2.0;
+            // θ + sinθ·cosθ + 2·sinθ = (2 + π/2)·sinφ. Its slope is nought at the poles, where
+            // Newton's method on θ stops short and sinφ rounds away the last centimetres, so it is
+            // solved as eckert_iv_g(u) = (2 + π/2)·(1 - cos v), with u = π/2 - |θ| and
+            // v = π/2 - |φ|. g rises from 0 and bends upward, so Newton's method from √t settles
+            // in a few steps.
+            let half = std::f64::consts::FRAC_PI_2;
+            let t = (2.0 + half) * 2.0 * ((half - phi.abs()) / 2.0).sin().powi(2);
+            let mut u = t.sqrt().min(half);
             for _ in 0..30 {
-                let f = th + th.sin() * th.cos() + 2.0 * th.sin() - k;
-                let d = 1.0 + (2.0 * th).cos() + 2.0 * th.cos();
-                if d.abs() < 1e-12 {
+                let d = 2.0 * u.sin() * (1.0 + u.sin());
+                if d <= 0.0 {
                     break;
                 }
-                let step = f / d;
-                th -= step;
-                if step.abs() < 1e-14 {
+                let step = (eckert_iv_g(u) - t) / d;
+                u = (u - step).clamp(0.0, half);
+                if step.abs() < 1e-15 {
                     break;
                 }
             }
             let pi = std::f64::consts::PI;
-            let x = 2.0 / (pi * (4.0 + pi)).sqrt() * lam * (1.0 + th.cos());
-            let y = 2.0 * (pi / (4.0 + pi)).sqrt() * th.sin();
+            let x = 2.0 / (pi * (4.0 + pi)).sqrt() * lam * (1.0 + u.sin());
+            let y = 2.0 * (pi / (4.0 + pi)).sqrt() * u.cos().copysign(phi);
             (x, y)
         }
     }
@@ -257,21 +261,40 @@ fn on_outline(lam: f64) -> Option<f64> {
     (lam.is_finite() && lam.abs() <= std::f64::consts::PI + OUTLINE_SLACK).then(|| lam.clamp(-std::f64::consts::PI, std::f64::consts::PI))
 }
 
+/// Eckert IV's θ equation measured from the pole: with u = π/2 - |θ|,
+/// (2 + π/2) - (|θ| + sin|θ|·cosθ + 2·sin|θ|) = u - sin(2u)/2 + 2·(1 - cos u), written so it
+/// keeps its precision as u shrinks.
+fn eckert_iv_g(u: f64) -> f64 {
+    u - (2.0 * u).sin() / 2.0 + 4.0 * (u / 2.0).sin().powi(2)
+}
+
 /// Eckert IV's inverse on the unit sphere, (λ, φ) in radians, from Snyder, Map Projections: A
-/// Working Manual (USGS Professional Paper 1395, 1987): θ = asin(y / (2·√(π/(4+π)))),
-/// φ = asin((θ + sinθ·cosθ + 2·sinθ) / (2 + π/2)), λ = x / ((2/√(π(4+π)))·(1 + cosθ)). θ lies
-/// within ±π/2, so 1 + cosθ is at least 1.
+/// Working Manual (USGS Professional Paper 1395, 1987): sinθ = y / (2·√(π/(4+π))),
+/// sinφ = (θ + sinθ·cosθ + 2·sinθ) / (2 + π/2), λ = x / ((2/√(π(4+π)))·(1 + cosθ)). φ is taken
+/// from the pole, as in the forward formula: 1 - sinφ = 2·sin²(v/2) = eckert_iv_g(u) / (2 + π/2).
+/// θ lies within ±π/2, so 1 + cosθ is at least 1.
 fn eckert_iv_inverse(x: f64, y: f64) -> Option<(f64, f64)> {
-    let pi = std::f64::consts::PI;
-    let s = y / (2.0 * (pi / (4.0 + pi)).sqrt());
+    let (pi, half) = (std::f64::consts::PI, std::f64::consts::FRAC_PI_2);
+    let (w, h) = (2.0 / (pi * (4.0 + pi)).sqrt(), 2.0 * (pi / (4.0 + pi)).sqrt());
+    let s = y / h;
     if s.abs() > 1.0 + OUTLINE_SLACK {
         return None;
     }
-    let s = s.clamp(-1.0, 1.0);
-    let (th, c) = (s.asin(), (1.0 - s * s).max(0.0).sqrt());
-    let phi = ((th + s * c + 2.0 * s) / (2.0 + std::f64::consts::FRAC_PI_2)).clamp(-1.0, 1.0).asin();
-    let lam = on_outline(x / (2.0 / (pi * (4.0 + pi)).sqrt() * (1.0 + c)))?;
-    Some((lam, phi))
+    // cosθ from 1 - |sinθ|, which is exact, rather than 1 - sin²θ, which rounds near the poles.
+    let cos_at = |a: f64| ((1.0 - a) * (1.0 + a)).max(0.0).sqrt();
+    let a = s.abs().min(1.0);
+    let c = cos_at(a);
+    let v = 2.0 * (eckert_iv_g(c.atan2(a)) / (2.0 * (2.0 + half))).sqrt().min(1.0).asin();
+    // The sides meet the pole lines at a tangent, so near a corner a rounding error in y moves
+    // the side far in x: a point counts as on the outline when it is within the slack of it in
+    // both x and y. From y as given, not clamped: a point past the pole line has used some of
+    // its slack.
+    let widest = w * pi * (1.0 + cos_at((s.abs() - OUTLINE_SLACK / h).clamp(0.0, 1.0))) + OUTLINE_SLACK;
+    if x.abs() > widest {
+        return None;
+    }
+    let lam = (x / (w * (1.0 + c))).clamp(-pi, pi);
+    Some((lam, (half - v).copysign(s)))
 }
 
 /// Equal Earth's inverse on the unit sphere, (λ, φ) in radians, from Šavrič, Patterson and Jenny,
@@ -361,6 +384,47 @@ mod tests {
                 assert!(off < 1e-3, "{kind:?} {lon},{lat}: {back:?}, {off} m off");
             }
         }
+    }
+
+    /// Eckert IV's sides meet its pole lines at a tangent, so near a corner a rounding error in y
+    /// moves the side far in x: the corners and places along the pole lines and the ±180° edges
+    /// come back. A place 11 cm from a pole is only two nanometres of y from it, about one
+    /// rounding step, so it comes back within the centimetre or so that y can tell apart there.
+    #[test]
+    fn places_on_the_eckert_iv_outline_come_back() {
+        for w in [
+            World::new(Kind::EckertIV, 0.0, MERCATOR_R),
+            World { x0: 500_000.0, y0: 1_000_000.0, ..World::new(Kind::EckertIV, -45.0, MERCATOR_R) },
+        ] {
+            let mut at = vec![(0.0, 89.999_999), (120.0, -89.999_999)];
+            for lat in [-90.0, 90.0] {
+                at.extend([-180.0, -179.9, -90.0, 0.0, 45.0, 179.99, 180.0].map(|lon| (lon, lat)));
+            }
+            for lon in [-180.0, 180.0] {
+                at.extend([-89.999_99, -89.9, -60.0, 0.0, 30.0, 89.999, 89.999_999_9].map(|lat| (lon, lat)));
+            }
+            for (dlon, lat) in at {
+                let lon = w.lon0 + dlon;
+                let m = w.forward(Coord::new(lon, lat)).unwrap();
+                let back = w.inverse(m).unwrap_or_else(|| panic!("{w:?} {lon},{lat}: {m:?}"));
+                // Metres along the meridian and the parallel.
+                let north = (back.y - lat).to_radians() * MERCATOR_R;
+                let dl = (back.x - lon + 540.0).rem_euclid(360.0) - 180.0;
+                let east = dl.to_radians() * lat.to_radians().cos() * MERCATOR_R;
+                let off = north.hypot(east);
+                // About 1 cm here; within a few rounding steps of y of a pole, as another
+                // platform's sine and cosine may round, 5 cm.
+                assert!(off < 0.05, "{w:?} {lon},{lat}: {back:?}, {off} m off");
+            }
+        }
+        // Past a corner by less than the slack in y but far in x: off the outline.
+        let (pi, w, h) = (
+            std::f64::consts::PI,
+            2.0 / (std::f64::consts::PI * (4.0 + std::f64::consts::PI)).sqrt(),
+            2.0 * (std::f64::consts::PI / (4.0 + std::f64::consts::PI)).sqrt(),
+        );
+        assert!(eckert_iv_inverse(w * pi, h).is_some());
+        assert_eq!(eckert_iv_inverse(w * pi + 3e-5, h + 0.9e-9), None);
     }
 
     /// Against pyproj 3.8.0 (PROJ 9.8.1): 10°E 50°N and 120°W 35°S, on PROJ's unit sphere.
