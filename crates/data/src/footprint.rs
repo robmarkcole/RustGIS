@@ -29,6 +29,15 @@ const VERTICES_PER_FACE: usize = 5;
 /// they overflow to a NaN, on which the hull panics (in the browser, where it can't be caught).
 const MAX_COORDINATE: f64 = 1e150;
 
+/// The grid, as a share of a shape's size, its faces' corners are rounded to before their union
+/// (to the power of two below it): a millimetre or less on a kilometre, a hundredth of the
+/// narrowest face [`shows`] takes. A curved mesh seen from above lays faces almost on each other,
+/// their edges apart by less than a micrometre, and the union's work grows with every near
+/// crossing: 97 faces of a chair took 15 seconds, and its 956 never finished (#1891). On the grid,
+/// corners that nearly meet do meet, and the chair's union takes milliseconds. The grid narrows the
+/// union's worst cases; it doesn't bound its time, and a union is one call that Cancel can't stop.
+const UNION_GRID: f64 = 1e-6;
+
 /// Whether a point's X and Y are ones a footprint takes: finite numbers within [`MAX_COORDINATE`].
 pub(crate) fn usable_xy(p: &P3) -> bool {
     p[0].abs() <= MAX_COORDINATE && p[1].abs() <= MAX_COORDINATE
@@ -74,7 +83,9 @@ pub(crate) fn shows(ring: &[P3], size: f64) -> bool {
 /// is too narrow to show. A shape with a point or a face whose X or Y isn't a finite number, or
 /// passes [`MAX_COORDINATE`], has no footprint: the hull, and orienting a face, panic on NaN. A
 /// height that isn't a finite number (or passes the limit) can't say which way a face looks: all of
-/// them go, not only that one (which would drop it silently), and the hull stands in.
+/// them go, not only that one (which would drop it silently), and the hull stands in. A merged
+/// footprint's corners are on [`UNION_GRID`]: within a two-millionth of the shape's size of the
+/// faces'.
 pub(crate) fn footprint<F: AsRef<[Vec<P3>]>>(
     faces: &[F],
     truncated: bool,
@@ -94,7 +105,13 @@ pub(crate) fn footprint<F: AsRef<[Vec<P3>]>>(
     if !size.is_finite() {
         return (None, None);
     }
-    let ring2 = |r: &[P3]| geo::LineString::from(r.iter().map(|p| (p[0], p[1])).collect::<Vec<_>>());
+    // From the shape's corner, on the grid (see `UNION_GRID`); the union is moved back below. The
+    // grid is a power of two: a corner a whole number of steps from the shape's corner stays as it
+    // is (a box from 0 keeps its corners), others move by half a step at most. A shape with no
+    // size (a point) has no grid, and nothing of it shows anyway.
+    let grid = if size > 0.0 { (size * UNION_GRID).log2().floor().exp2() } else { 0.0 };
+    let snap = |v: f64, from: f64| if grid > 0.0 { ((v - from) / grid).round() * grid } else { v - from };
+    let ring2 = |r: &[P3]| geo::LineString::from(r.iter().map(|p| (snap(p[0], x0), snap(p[1], y0))).collect::<Vec<_>>());
     // Past the cap, a partial union would be wrong: the hull below stands in.
     let seen: Vec<geo::Polygon<f64>> = faces
         .iter()
@@ -116,7 +133,10 @@ pub(crate) fn footprint<F: AsRef<[Vec<P3>]>>(
         // Spent before the union runs, so faces whose union panics (and become the hull) count too:
         // the budget bounds the work tried, not the footprints made.
         *budget -= cost;
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| geo::unary_union(seen.iter()))).ok().filter(|u| !u.0.is_empty())
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| geo::unary_union(seen.iter())))
+            .ok()
+            .filter(|u| !u.0.is_empty())
+            .map(|u| geo::MapCoords::map_coords(&u, |c| geo::coord! { x: c.x + x0, y: c.y + y0 }))
     };
     let (shape, hull) = match union {
         Some(u) => (u, None),
@@ -161,6 +181,24 @@ mod tests {
         let (shape, hull) = footprint(&faces, false, &points, &mut budget);
         assert_eq!((hull, budget), (None, 8), "the two flat faces merged: {shape:?}");
         assert!((area(&shape) - 100.0).abs() < 1e-9, "{shape:?}");
+    }
+
+    /// Far from the origin, as projected coordinates are, a footprint is merged near 0 and moved
+    /// back: the box keeps its place and its area.
+    #[test]
+    fn a_footprint_far_from_the_origin_is_where_its_faces_are() {
+        let (x, y) = (458_879.0, 5_438_353.0);
+        let square = |z: f64| vec![[x, y, z], [x + 10.0, y, z], [x + 10.0, y + 10.0, z], [x, y + 10.0, z], [x, y, z]];
+        let mut budget = 10;
+        let (shape, hull) = footprint(&[vec![square(0.0)], vec![square(5.0)]], false, &[square(0.0), square(5.0)], &mut budget);
+        assert_eq!(hull, None);
+        let Some(Geometry::Polygon(polys)) = &shape else { panic!("{shape:?}") };
+        let corners: Vec<&Coord> = polys.iter().flatten().flatten().collect();
+        let (xs, ys): (Vec<f64>, Vec<f64>) = corners.iter().map(|c| (c.x, c.y)).unzip();
+        let min = |v: &[f64]| v.iter().copied().fold(f64::INFINITY, f64::min);
+        let max = |v: &[f64]| v.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        assert_eq!((min(&xs), max(&xs), min(&ys), max(&ys)), (x, x + 10.0, y, y + 10.0), "{shape:?}");
+        assert!((area(&shape) - 100.0).abs() < 1e-6, "{shape:?}");
     }
 
     /// A courtyard stays open: a face's hole is kept in the footprint, not filled.

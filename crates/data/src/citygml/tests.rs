@@ -2318,3 +2318,18 @@ fn a_prototype_solid_with_a_linked_exterior_is_said_as_its_link() {
     let placed = of_type(&out, GeometryType::Polygon);
     assert_eq!(value(placed, row_of(placed, "t"), "z_max"), Value::Float(1.0), "the cavity isn't placed: {:?}", messages_of(&out));
 }
+
+/// A curved mesh seen from above lays its faces almost on each other: 97 faces of the rocking chair
+/// in OGC's CityGML 3.0 LoD 3 sample, whose union took 15 seconds, and the whole chair's 956 never
+/// finished (#1891). With their corners on the union's grid, the chair is read within five seconds
+/// (milliseconds, in fact), its faces merged rather than drawn as the outline of their points.
+#[test]
+fn a_curved_mesh_is_merged_in_a_moment() {
+    let bytes = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/rocking-chair.gml"));
+    let (sent, got) = std::sync::mpsc::channel();
+    std::thread::spawn(move || sent.send(read("chair.gml", bytes, None)));
+    let out = got.recv_timeout(std::time::Duration::from_secs(5)).expect("read within 5 seconds").unwrap();
+    assert_eq!(out[0].0.features.len(), 1);
+    assert!(out[0].0.features[0].geometry.is_some());
+    assert!(!says(&out, "outline"), "merged, not drawn as the outline of its points: {:?}", messages_of(&out));
+}
