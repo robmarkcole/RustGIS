@@ -1168,11 +1168,11 @@ fn assert_placed(what: &str, geometry: Option<&Geometry>, lonlat: Coord) {
     assert!(off < 0.01, "{what}: {off} m off");
 }
 
-/// #1486: the placement cases, each read from a Shapefile's `.prj` (in place and whole) and a
-/// GeoPackage's definition, on the desktop and in the browser: WKT1 in `definition`, WKT2 in
-/// `definition_12_063`.
+/// #1486: the placement cases, each read from a Shapefile's `.prj` (in place and whole), a
+/// GeoPackage's definition and a FlatGeobuf header's WKT without a code (#1855), on the desktop and
+/// in the browser: WKT1 in `definition`, WKT2 in `definition_12_063`.
 #[test]
-fn placement_cases_are_placed_from_a_prj_and_a_geopackage() {
+fn placement_cases_are_placed_from_a_prj_a_geopackage_and_a_flatgeobuf() {
     let d = dir().join("placement");
     std::fs::create_dir_all(&d).unwrap();
     for (i, PlacementCase { what, wkt, xy, lonlat }) in placement_cases().into_iter().enumerate() {
@@ -1199,6 +1199,130 @@ fn placement_cases_are_placed_from_a_prj_and_a_geopackage() {
             assert_placed(what, geometry.as_ref(), lonlat);
             assert!(notes.is_empty(), "{what}: {notes:?}");
         }
+
+        let f = d.join(format!("case{i}.fgb"));
+        write_header_fgb(&f, None, 0, Some(&wkt), xy);
+        for (geometry, notes) in fgb_reads(&f) {
+            assert_placed(what, geometry.as_ref(), lonlat);
+            assert!(notes.is_empty(), "{what}: {notes:?}");
+        }
+    }
+}
+
+/// A FlatGeobuf of one point at `xy` whose header names its system by `org` and `code`, with
+/// `wkt`.
+fn write_header_fgb(path: &Path, org: Option<&str>, code: i32, wkt: Option<&str>, xy: Coord) {
+    use flatgeobuf::{FgbCrs, FgbWriter, FgbWriterOptions, GeometryType as G};
+    let options = FgbWriterOptions { crs: FgbCrs { org, code, wkt, ..Default::default() }, ..Default::default() };
+    let mut w = FgbWriter::create_with_options("point", G::Point, options).unwrap();
+    w.add_feature_geom(flatgeobuf::geozero::wkb::Wkb(wkb::encode(&Geometry::Point(xy))), |_| {}).unwrap();
+    w.write(std::fs::File::create(path).unwrap()).unwrap();
+}
+
+/// A FlatGeobuf's first geometry and notes, as the desktop opens the file and as the browser opens
+/// its bytes.
+fn fgb_reads(path: &Path) -> Vec<(Option<Geometry>, Vec<String>)> {
+    let desktop = open_path(path, None).unwrap();
+    let browser = open_shared("point.fgb", Arc::new(std::fs::read(path).unwrap()), None).unwrap();
+    [desktop, browser]
+        .into_iter()
+        .map(|src| {
+            let batch = src.read(&Request::all()).unwrap();
+            (batch.features.first().and_then(|f| f.geometry.clone()), src.info().notes.clone())
+        })
+        .collect()
+}
+
+/// #1855: a FlatGeobuf header's system is read as a GeoPackage row's is, on the desktop and in the
+/// browser. Its EPSG code is used when its WKT gives no other shift to WGS 84, and the WKT
+/// otherwise, where a `.prj` of it places the point. A grid the WKT gives beside the code is said.
+/// Without an EPSG code the WKT is read; one that can't be read is said. A code without a WKT is
+/// read as before. A negative code without a WKT is longitude/latitude, said.
+#[test]
+fn a_flatgeobuf_headers_system_is_read_as_a_geopackage_rows_is() {
+    use crate::raster::wkt::{read_wkt, to_wkt};
+    let d = dir().join("fgb_header");
+    std::fs::create_dir_all(&d).unwrap();
+    let prj = |wkt: &str, xy: Coord| read_wkt(wkt).unwrap().0.transformer().unwrap().to_lonlat(xy).unwrap();
+    let mut n = 0;
+    let mut read = |org: Option<&str>, code: i32, wkt: Option<&str>, xy: Coord| {
+        n += 1;
+        let p = d.join(format!("case{n}.fgb"));
+        write_header_fgb(&p, org, code, wkt, xy);
+        fgb_reads(&p)
+    };
+    // British National Grid, in England: its own shift is the code's; another `TOWGS84` puts the
+    // point some 4 m away, where a `.prj` of it does.
+    let xy = Coord::new(450_000.0, 250_000.0);
+    let by_code = Crs::Epsg(27700).transformer().unwrap().to_lonlat(xy).unwrap();
+    let bng = to_wkt(Crs::Epsg(27700)).unwrap();
+    let other = bng.replace(BNG_SHIFT, "TOWGS84[375,-111,431,0,0,0,0]");
+    assert_ne!(other, bng);
+    assert!(metres_apart(prj(&other, xy), by_code) > 1.0);
+    for (org, wkt, lonlat) in [
+        (Some("EPSG"), Some(bng.as_str()), by_code),
+        (Some("EPSG"), Some(other.as_str()), prj(&other, xy)),
+        (None, Some(&other), prj(&other, xy)),
+        (Some("EPSG"), None, by_code),
+    ] {
+        for (geometry, notes) in read(org, 27700, wkt, xy) {
+            assert_placed(&format!("{wkt:?}"), geometry.as_ref(), lonlat);
+            assert!(notes.is_empty(), "{notes:?}");
+        }
+    }
+    // Text that isn't WKT beside the code: the code, said.
+    let e = read_wkt("PROJCS[").unwrap_err();
+    for (geometry, notes) in read(Some("EPSG"), 27700, Some("PROJCS["), xy) {
+        assert_placed("not WKT", geometry.as_ref(), by_code);
+        assert_eq!(notes, [format!("its coordinate system: its definition can't be read ({e}), so EPSG:27700 is used")]);
+    }
+    // ED50 / UTM zone 31N bound by Spain's NTv2 grid: read by the code, whose own Helmert shift
+    // stands in for the grid, said.
+    let xy = Coord::new(430_000.0, 4_580_000.0);
+    let by_code = Crs::Epsg(23031).transformer().unwrap().to_lonlat(xy).unwrap();
+    for (geometry, notes) in read(Some("EPSG"), 23031, Some(&ed50_utm31_bound()), xy) {
+        assert_placed("a grid", geometry.as_ref(), by_code);
+        assert_eq!(
+            notes,
+            [
+                "its coordinate system: the definition's NTv2 transformation to WGS 84 (SPED2ETV2.gsb) isn't applied; EPSG:23031's own shift to WGS 84 is used in its place, so positions may be off by the difference between the two"
+            ]
+        );
+    }
+    // Without an EPSG code: WGS 84 / UTM zone 33N, whose name says WGS 84, was read as
+    // longitude/latitude with nothing said; it is read by its WKT. So is another organization's
+    // system. One that can't be read is longitude/latitude, said.
+    let xy = Coord::new(500_000.0, 5_800_000.0);
+    let utm = to_wkt(Crs::Epsg(32633)).unwrap();
+    assert!(utm.contains("WGS 84"), "{utm}");
+    let utm = utm.replace(r#",AUTHORITY["EPSG","32633"]]"#, "]");
+    let lonlat = Crs::Epsg(32633).transformer().unwrap().to_lonlat(xy).unwrap();
+    for (org, code) in [(None, 0), (Some("EPSG"), 0), (Some("EPSG"), -5), (Some("ESRI"), 102_033)] {
+        for (geometry, notes) in read(org, code, Some(&utm), xy) {
+            assert_placed(&format!("{org:?} {code}"), geometry.as_ref(), lonlat);
+            assert!(notes.is_empty(), "{notes:?}");
+        }
+    }
+    for (geometry, notes) in read(None, 0, Some("PROJCS["), Coord::new(5.0, 50.0)) {
+        assert_placed("lon/lat", geometry.as_ref(), Coord::new(5.0, 50.0));
+        assert_eq!(notes, [format!("its coordinate system can't be read ({e}); read as longitude/latitude")]);
+    }
+    // Another organization's code without a WKT: longitude/latitude, said, as before.
+    for (_, notes) in read(Some("ESRI"), 102_033, None, Coord::new(5.0, 50.0)) {
+        assert_eq!(notes, ["its coordinate system is defined by ESRI, not EPSG; read as longitude/latitude"]);
+    }
+    // A negative code isn't an EPSG one: longitude/latitude, said. EPSG's 0 is no code, so nothing
+    // is (a header without an organization is read in `flatgeobuf`).
+    let lonlat = Coord::new(5.0, 50.0);
+    for org in [None, Some("EPSG")] {
+        for (geometry, notes) in read(org, -5, None, lonlat) {
+            assert_placed("a negative code", geometry.as_ref(), lonlat);
+            assert_eq!(notes, ["its coordinate system's code -5 isn't an EPSG code; read as longitude/latitude"]);
+        }
+    }
+    for (geometry, notes) in read(Some("EPSG"), 0, None, lonlat) {
+        assert_placed("no code", geometry.as_ref(), lonlat);
+        assert!(notes.is_empty(), "{notes:?}");
     }
 }
 

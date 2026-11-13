@@ -135,29 +135,33 @@ impl FgbSource {
         let reader = open_reader(r)?;
         let h = reader.header();
         let mut notes = Vec::new();
-        // The code is an EPSG one only when the organization is EPSG (or not given, which means EPSG).
-        let epsg_org = h.crs().is_none_or(|c| c.org().is_none_or(|o| o.eq_ignore_ascii_case("epsg")));
-        let code = h.crs().map(|c| c.code()).and_then(|c| u32::try_from(c).ok()).filter(|c| *c > 0 && epsg_org);
-        // Another body's system (an IAU organization, or WKT that says so) is said, or refused when
-        // its coordinates aren't longitude/latitude. It is checked whenever there's no EPSG code
-        // RustGIS converts, because an unknown code is read as longitude/latitude too.
-        let other_body = match h.crs() {
-            Some(c) if code.and_then(Crs::from_epsg).is_none() => {
-                Reproject::planetary("its coordinate system", c.org(), Some(i64::from(c.code())), c.wkt(), &mut notes)
-            }
-            _ => None,
+        // The header's system is read as a GeoPackage row's is ([`super::declared_reproject`]): by
+        // its EPSG code, or by its WKT when the WKT gives another shift to WGS 84 or there is no
+        // EPSG code (#1855). The code is an EPSG one only when the organization is EPSG (or not
+        // given, which means EPSG); 0 is none.
+        let header_crs = h.crs();
+        let organization = header_crs.and_then(|c| c.org());
+        let epsg_org = organization.is_none_or(|o| o.eq_ignore_ascii_case("epsg"));
+        let code = header_crs.map(|c| i64::from(c.code())).filter(|c| *c != 0);
+        let declared = super::DeclaredCrs {
+            what: "its coordinate system",
+            organization,
+            code,
+            epsg: code.and_then(|c| u32::try_from(c).ok()).filter(|_| epsg_org),
+            wkt1: super::defined(header_crs.and_then(|c| c.wkt())),
+            wkt2: None,
         };
-        let reproject = match other_body {
-            Some(r) => r?,
+        let reproject = match super::declared_reproject(declared, &mut notes) {
+            Some(reproject) => reproject?,
+            // Nothing to read it by: longitude/latitude, said when another organization's code
+            // names the system, or a negative code, which can't be an EPSG one.
             None => {
-                if !epsg_org && let Some(org) = h.crs().and_then(|c| c.org()) {
+                if !epsg_org && let Some(org) = organization {
                     notes.push(format!("its coordinate system is defined by {org}, not EPSG; read as longitude/latitude"));
+                } else if let Some(code) = code {
+                    notes.push(format!("its coordinate system's code {code} isn't an EPSG code; read as longitude/latitude"));
                 }
-                // A coordinate system described (by WKT or name) but without an EPSG code can't be converted.
-                if code.is_none() && h.crs().is_some_and(|c| c.wkt().is_some_and(|w| !w.contains("WGS 84") && !w.contains("WGS84"))) {
-                    notes.push("its coordinate system has no EPSG code; read as longitude/latitude".into());
-                }
-                Reproject::from_epsg(code, &mut notes)
+                Reproject::from_crs(Crs::LonLat, &mut notes)
             }
         };
         let mut date_columns = Vec::new();
