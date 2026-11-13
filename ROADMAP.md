@@ -118,8 +118,7 @@ features build on.
 - What a project holds by default, its own data or links to it
   ([poll #1660](https://github.com/opengeos/RustGIS/discussions/1660)), and storage that opens a
   large project without reading it whole. _Decide first._
-- Dates read and written as dates by Shapefile and GeoPackage, the other files, and the
-  databases, in that order (the field types are in;
+- Dates read and written as dates by database providers (the field types and file readers are in;
   [#853](https://github.com/opengeos/RustGIS/issues/853) has the plan); afterwards time zones (a
   time without a zone stays as written; where an instant is needed, an assumed zone is saved in
   the project, never written into the data) and recovering a project with an invalid date.

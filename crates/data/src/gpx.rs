@@ -130,9 +130,29 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
         if ds.features.is_empty() {
             continue;
         }
-        // Elevations are typed; names, descriptions, symbols and times stay text.
+        // Elevations are inferred; timestamps are explicitly typed by the GPX schema.
         crate::io::type_text_columns(&mut ds, &["name", "desc", "cmt", "sym", "type", "time", "number"]);
-        out.push((ds, ReadReport::default()));
+        let mut report = ReadReport::default();
+        if let Some(k) = ds.field_index("time") {
+            if let Some(field) = ds.fields.get_mut(k) {
+                field.ty = FieldType::DateTime;
+            }
+            let mut counts = Vec::new();
+            for feature in &mut ds.features {
+                crate::progress::step(1)?;
+                if let Some(value @ Value::Text(_)) = feature.attrs.get_mut(k) {
+                    let Value::Text(s) = &*value else { continue };
+                    let parsed = crate::DateTime::parse(s).filter(|_| s.contains(['T', 't']));
+                    if parsed.is_none() {
+                        crate::source::unread_date(&mut counts, k);
+                    }
+                    *value = parsed.map(Value::DateTime).unwrap_or_default();
+                }
+            }
+            report.unread_dates = crate::source::unread_dates_note(&ds.fields, &counts);
+            report.messages.extend(report.unread_dates.clone());
+        }
+        out.push((ds, report));
     }
     if let Some((_, report)) = out.first_mut() {
         report.skipped = skipped;
@@ -178,8 +198,21 @@ mod tests {
         let tp = &layers[3].0;
         assert_eq!(tp.features.len(), 4);
         assert_eq!(tp.value(0, tp.field_index("ele").unwrap()), &Value::Float(1000.5));
-        assert_eq!(tp.value(1, tp.field_index("time").unwrap()), &Value::Text("2024-05-01T07:00:10Z".into()));
+        assert_eq!(tp.value(1, tp.field_index("time").unwrap()), &Value::parse("2024-05-01T07:00:10Z", FieldType::DateTime));
         assert_eq!(tp.value(3, tp.field_index("segment").unwrap()), &Value::Int(2));
+    }
+
+    #[test]
+    fn invalid_gpx_times_are_counted_without_changing_clean_times() {
+        let xml = br#"<gpx><wpt lat="1" lon="1"><time>2026-02-30T12:00:00Z</time></wpt><wpt lat="2" lon="2"><time>2026-03-05T14:30:00.123456+02:00</time></wpt><wpt lat="3" lon="3"/></gpx>"#;
+        let layers = read("times.gpx", xml).unwrap();
+        let (ds, report) = &layers[0];
+        let k = ds.field_index("time").unwrap();
+        assert_eq!(ds.fields[k].ty, FieldType::DateTime);
+        assert!(ds.value(0, k).is_null() && ds.value(2, k).is_null());
+        assert_eq!(ds.value(1, k).to_string(), "2026-03-05T14:30:00.123456+02:00");
+        assert!(report.unread_dates.as_deref().unwrap().starts_with("1 value"));
+        assert!(read("clean.gpx", GPX.as_bytes()).unwrap().iter().all(|(_, r)| r.unread_dates.is_none()));
     }
 
     #[test]

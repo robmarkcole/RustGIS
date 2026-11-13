@@ -1,4 +1,4 @@
-//! Add Data's whole-file reads, layer reload, Load All Features, Convert To Annotation's read of a
+//! Add Data's whole-file reads, layer repair/reload, Load All Features, Convert To Annotation's read of a
 //! layer read in place, local archive validation and model/script tools on the desktop run on a
 //! thread of their own (#1291 step 3), so large reads
 //! and tools don't hold the window: the status bar shows the run under way,
@@ -67,7 +67,7 @@ struct ReadJob {
     seen: Option<(crate::diskwatch::Target, crate::Slot<crate::diskwatch::Seen>)>,
 }
 
-/// Runs Add Data, Load All, Reload Data, Convert To Annotation, archive reload/repair, model/script
+/// Runs Add Data, Load All, Repair/Reload Data, Convert To Annotation, archive reload/repair, model/script
 /// tools or the topology check with `p`: its read on a thread of its own when the desktop app makes it
 /// so ([`reads::read_ahead`]), after any under way; here and now otherwise. While one is under way or
 /// waiting it answers that, not what the command installs, which comes as it lands.
@@ -104,7 +104,7 @@ fn run_presented(
         let r = app.run(command, p);
         return answered(app, then, r);
     }
-    let layer = matches!(command, "layer.loadAll" | "layer.reloadData" | "labels.convert" | "source.syncState")
+    let layer = matches!(command, "layer.loadAll" | "layer.reloadData" | "layer.repairSource" | "labels.convert" | "source.syncState")
         .then(|| app.session.layer_id(&p).ok().and_then(|id| app.session.map().layer(id)).map(|l| (l.instance_id(), l.name.clone())))
         .flatten();
     let notice_mark = app.session.notice_mark();
@@ -1644,7 +1644,9 @@ mod tests {
         assert_eq!(app.run("ui.reloadData", json!({"layer": id})).unwrap()["waiting"], 1);
         let replacement = dir.path().join("replacement.geojson");
         publish_point(&replacement, 5.0);
-        app.run("layer.repairSource", json!({"layer": id, "path": replacement})).unwrap();
+        // A direct command can repair while the UI has old reads queued; UI repairs now
+        // join that queue themselves, so use the command API to exercise stale landing.
+        app.session.run("layer.repairSource", &json!({"layer": id, "path": replacement})).unwrap();
         let before = app.session.undo_label().map(str::to_string);
         landed(&mut app, 60);
         assert_eq!(source_x(&app, id), 5.0);

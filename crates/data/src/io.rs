@@ -1627,17 +1627,19 @@ pub fn read_csv_with(text: &str, name: &str, opts: &CsvOptions) -> Result<(Datas
             }
         })
         .collect();
-    read_rows(&headers, &rows, malformed, name, opts)
+    read_rows(&headers, &rows, malformed, name, opts, None)
 }
 
 /// Rows of text cells under a header row (delimited text, a spreadsheet's sheet) as a dataset, as
-/// [`read_csv_with`] describes; `malformed` rows were already passed over.
+/// [`read_csv_with`] describes; `malformed` rows were already passed over. Workbook cell types
+/// may override text inference by source column, before removing the geometry column.
 pub(crate) fn read_rows(
     headers: &[String],
     rows: &[Vec<String>],
     malformed: usize,
     name: &str,
     opts: &CsvOptions,
+    types: Option<&[Option<FieldType>]>,
 ) -> Result<(Dataset, ReadReport)> {
     let named = |n: &Option<String>, what: &str| -> Result<Option<usize>> {
         match n.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
@@ -1667,7 +1669,12 @@ pub(crate) fn read_rows(
     let columns: Vec<usize> = (0..headers.len()).filter(|&i| Some(i) != wkt).collect();
     let fields: Vec<Field> = columns
         .iter()
-        .filter_map(|&i| Some(Field::new(headers.get(i)?.trim(), text_type(rows.iter().filter_map(|r| r.get(i)).map(|s| s.as_str())))))
+        .filter_map(|&i| {
+            let ty = types
+                .and_then(|t| t.get(i).copied().flatten())
+                .unwrap_or_else(|| text_type(rows.iter().filter_map(|r| r.get(i)).map(|s| s.as_str())));
+            Some(Field::new(headers.get(i)?.trim(), ty))
+        })
         .collect();
     let mut report = ReadReport { skipped: malformed, ..ReadReport::default() };
     if malformed > 0 {
@@ -1676,8 +1683,10 @@ pub(crate) fn read_rows(
     let gt = if xy.is_some() { GeometryType::Point } else { GeometryType::None };
     let mut ds = Dataset::new(name, gt, fields);
     let mut srid: Option<u32> = None;
+    let mut unread_dates = Vec::new();
     let (mut bad_wkt, mut zm_rows) = (0usize, 0usize);
     for r in rows {
+        crate::progress::step(1)?;
         let cell = |i: usize| r.get(i).map(|s| s.trim()).unwrap_or("");
         let geom = if let Some((x, y)) = xy {
             match cell(x).parse::<f64>().ok().zip(cell(y).parse::<f64>().ok()) {
@@ -1708,7 +1717,15 @@ pub(crate) fn read_rows(
         let attrs = columns
             .iter()
             .zip(&ds.fields)
-            .map(|(&i, f)| Value::parse_source(&unguard(r.get(i).map(|s| s.as_str()).unwrap_or("")), f.ty))
+            .enumerate()
+            .map(|(k, (&i, f))| {
+                let text = unguard(r.get(i).map(|s| s.as_str()).unwrap_or(""));
+                let value = Value::parse_source(&text, f.ty);
+                if f.ty.is_temporal() && !text.trim().is_empty() && value.is_null() {
+                    crate::source::unread_date(&mut unread_dates, k);
+                }
+                value
+            })
             .collect();
         ds.push_next(geom, attrs);
     }
@@ -1774,6 +1791,8 @@ pub(crate) fn read_rows(
             }
         }
     }
+    report.unread_dates = crate::source::unread_dates_note(&ds.fields, &unread_dates);
+    report.messages.extend(report.unread_dates.clone());
     Ok((ds, report))
 }
 
@@ -2574,14 +2593,12 @@ fn names_note(fields: &[Field], names: Vec<String>, target: &str, what: &str) ->
 }
 
 /// What an export to `target` says of the date fields it writes as ISO 8601 text, losing the field
-/// type: a Shapefile's date-time fields (a `.dbf` has date fields only), and GeoParquet's and
-/// FlatGeobuf's date fields, which this version doesn't write as dates yet. `None` for other formats,
+/// type: a Shapefile's date-time fields (a `.dbf` has date fields only). `None` for other formats,
 /// whose dates are text anyway or are written as dates, or without such fields.
 pub fn dates_as_text_note(fields: &[Field], target: &str) -> Option<String> {
     let ext = Path::new(target).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     let as_text = |ty: FieldType| match ext.as_str() {
         "shp" | "zip" => ty == FieldType::DateTime,
-        "parquet" | "geoparquet" | "fgb" => ty.is_temporal(),
         _ => false,
     };
     let dates: Vec<String> = fields.iter().filter(|f| as_text(f.ty)).map(|f| format!("'{}'", dbf_notice_name(&f.name))).collect();
@@ -4849,12 +4866,6 @@ mod tests {
     #[test]
     fn dates_written_as_text_are_said() {
         let fields = [Field::new("id", FieldType::Integer), Field::new("issued", FieldType::Date), Field::new("ts", FieldType::DateTime)];
-        for target in ["a.parquet", "a.fgb"] {
-            assert_eq!(
-                dates_as_text_note(&fields, target).as_deref(),
-                Some(format!("{target}: 2 date fields were written as text (ISO 8601), not as dates: 'issued', 'ts'").as_str())
-            );
-        }
         // A Shapefile writes dates as dates, and only its date-times as text.
         for target in ["a.shp", "a.zip"] {
             assert_eq!(
@@ -4863,7 +4874,7 @@ mod tests {
             );
         }
         // Formats without date columns, GeoPackage with them, and layers without dates say nothing.
-        for target in ["a.geojson", "a.csv", "a.kml", "a.gpkg"] {
+        for target in ["a.geojson", "a.csv", "a.kml", "a.gpkg", "a.parquet", "a.geoparquet", "a.fgb"] {
             assert_eq!(dates_as_text_note(&fields, target), None, "{target}");
         }
         assert_eq!(dates_as_text_note(&fields[..2], "a.shp"), None);

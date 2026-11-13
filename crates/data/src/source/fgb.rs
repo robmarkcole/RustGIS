@@ -44,7 +44,53 @@ pub struct FgbSource {
     _workspace: Option<Arc<super::gdal::ReloadWorkspace>>,
 }
 
+/// A header read whose native date schema may still need a complete scan. It cannot read
+/// features until finished, so a frame can schedule that work without publishing a text schema.
+pub struct FgbOpen {
+    source: FgbSource,
+    date_columns: Vec<usize>,
+}
+
+impl FgbOpen {
+    /// Whether completing this local open visits every feature.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn needs_scan(&self) -> bool {
+        !self.date_columns.is_empty() && !matches!(self.source.input, Input::Remote(_))
+    }
+
+    /// Completes the schema, checking cancellation between features of a local date scan.
+    pub fn finish(self) -> Result<FgbSource> {
+        let Self { source: mut src, date_columns } = self;
+        if !date_columns.is_empty() {
+            match &src.input {
+                Input::Remote(_) => src.info.notes.push(format!(
+                    "{} date/time columns are kept as ISO text to read this remote FlatGeobuf by range without scanning every feature",
+                    date_columns.len()
+                )),
+                Input::Path(path) => src.classify_dates(BufReader::new(std::fs::File::open(path)?), &date_columns)?,
+                Input::Bytes(bytes) => src.classify_dates(Cursor::new(bytes.clone()), &date_columns)?,
+            }
+        }
+        if src.info.geometry_type == GeometryType::None {
+            src.info.geometry_type = src.peek_kind();
+        }
+        Ok(src)
+    }
+}
+
 impl FgbSource {
+    /// Reads a local header without classifying date columns; finish it on a worker when needed.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn prepare_path(path: &Path, name: &str) -> Result<FgbOpen> {
+        Self::prepare(BufReader::new(std::fs::File::open(path)?), Input::Path(path.to_path_buf()), name)
+    }
+
+    /// The same staged open for bytes retained by a project, without copying them.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn prepare_shared(bytes: super::Shared, name: &str) -> Result<FgbOpen> {
+        Self::prepare(Cursor::new(bytes.clone()), Input::Bytes(bytes), name)
+    }
+
     pub fn open_path(path: &Path, name: &str) -> Result<Self> {
         let f = BufReader::new(std::fs::File::open(path)?);
         Self::new(f, Input::Path(path.to_path_buf()), name)
@@ -81,6 +127,11 @@ impl FgbSource {
     /// Opens a FlatGeobuf from its header: schema, extent, coordinate system, and notes (including
     /// Z or M values, which reading drops).
     fn new<R: Read + Seek>(r: R, input: Input, name: &str) -> Result<Self> {
+        Self::prepare(r, input, name)?.finish()
+    }
+
+    /// Reads only metadata; a caller must finish the native date scan before using the source.
+    fn prepare<R: Read + Seek>(r: R, input: Input, name: &str) -> Result<FgbOpen> {
         let reader = open_reader(r)?;
         let h = reader.header();
         let mut notes = Vec::new();
@@ -109,12 +160,16 @@ impl FgbSource {
                 Reproject::from_epsg(code, &mut notes)
             }
         };
+        let mut date_columns = Vec::new();
         let mut fields = Vec::new();
         let mut slots = Vec::new();
         let mut left_out = Vec::new();
         for c in h.columns().iter().flat_map(|cols| cols.iter()) {
             match field_type(c.type_()) {
                 Some(ty) => {
+                    if c.type_() == ColumnType::DateTime {
+                        date_columns.push(fields.len());
+                    }
                     slots.push(Some(fields.len()));
                     fields.push(Field::new(c.name().to_string(), ty));
                 }
@@ -161,7 +216,7 @@ impl FgbSource {
         if h.has_z() || h.has_m() {
             info.drop_zm((count > 0).then_some(count));
         }
-        let mut src = FgbSource {
+        let src = FgbSource {
             info,
             input,
             reproject,
@@ -169,10 +224,57 @@ impl FgbSource {
             #[cfg(not(target_arch = "wasm32"))]
             _workspace: None,
         };
-        if src.info.geometry_type == GeometryType::None {
-            src.info.geometry_type = src.peek_kind();
+        Ok(FgbOpen { source: src, date_columns })
+    }
+
+    /// Classifies local DateTime columns by a complete, cancellable pass. Time-only columns
+    /// stay text; all-date columns become Date. Remote sources retain text to keep range reads.
+    /// Checks Cancel after each decoded feature; reading and verifying one encoded feature
+    /// cannot be interrupted midway.
+    fn classify_dates<R: Read + Seek>(&mut self, reader: R, columns: &[usize]) -> Result<()> {
+        crate::progress::begin(self.info.count.and_then(|n| usize::try_from(n).ok()).unwrap_or(0));
+        let mut states = vec![0u8; self.info.fields.len()];
+        let mut iter = open_reader(reader)?.select_all().map_err(err)?;
+        while let Some(feature) = iter.next().map_err(err)? {
+            crate::progress::step(1)?;
+            let mut props = Props {
+                fields: &self.info.fields,
+                slots: &self.slots,
+                values: vec![Value::Null; self.info.fields.len()],
+                unread_dates: Vec::new(),
+            };
+            // Reads skip a feature with unreadable properties and report it in Batch::skipped.
+            // Such a feature must not influence the inferred date type either.
+            if feature.process_properties(&mut props).is_err() {
+                continue;
+            }
+            for &k in columns {
+                if let Some(Value::Text(s)) = props.values.get(k) {
+                    let state = if crate::Date::parse(s).is_some() {
+                        1
+                    } else if crate::DateTime::parse(s).is_some() {
+                        2
+                    } else if is_clock(s) {
+                        4
+                    } else {
+                        0
+                    };
+                    if let Some(v) = states.get_mut(k) {
+                        *v |= state;
+                    }
+                }
+            }
         }
-        Ok(src)
+        for &k in columns {
+            if let Some(field) = self.info.fields.get_mut(k) {
+                field.ty = match states.get(k).copied().unwrap_or(0) {
+                    1 => FieldType::Date,
+                    s if s & 4 != 0 => FieldType::Text,
+                    _ => FieldType::DateTime,
+                };
+            }
+        }
+        Ok(())
     }
 
     /// Reads a request; `scan` ignores the index.
@@ -219,11 +321,17 @@ impl FgbSource {
             if !in_request(&geometry, req) || (late && !sample.wants()) {
                 continue;
             }
-            let mut props = Props { fields: &self.info.fields, slots: &self.slots, values: vec![Value::Null; self.info.fields.len()] };
+            let mut props = Props {
+                fields: &self.info.fields,
+                slots: &self.slots,
+                values: vec![Value::Null; self.info.fields.len()],
+                unread_dates: Vec::new(),
+            };
             if f.process_properties(&mut props).is_err() {
                 out.skipped += 1;
                 continue;
             }
+            super::add_unread_dates(&mut out.unread_dates, &props.unread_dates);
             sample.keep(Feature { id, geometry: Some(geometry), attrs: props.values });
         }
         out.matched = if late || matched == 0 { sample.seen() } else { matched };
@@ -273,11 +381,17 @@ impl FgbSource {
             if !in_request(&geometry, &req) {
                 continue;
             }
-            let mut props = Props { fields: &self.info.fields, slots: &self.slots, values: vec![Value::Null; self.info.fields.len()] };
+            let mut props = Props {
+                fields: &self.info.fields,
+                slots: &self.slots,
+                values: vec![Value::Null; self.info.fields.len()],
+                unread_dates: Vec::new(),
+            };
             if f.process_properties(&mut props).is_err() {
                 out.skipped += 1;
                 continue;
             }
+            super::add_unread_dates(&mut out.unread_dates, &props.unread_dates);
             out.matched += 1;
             chunks.push(Feature { id, geometry: Some(geometry), attrs: props.values })?;
         }
@@ -555,11 +669,17 @@ impl FgbSource {
             if !in_request(&geometry, req) {
                 continue;
             }
-            let mut props = Props { fields: &self.info.fields, slots: &self.slots, values: vec![Value::Null; self.info.fields.len()] };
+            let mut props = Props {
+                fields: &self.info.fields,
+                slots: &self.slots,
+                values: vec![Value::Null; self.info.fields.len()],
+                unread_dates: Vec::new(),
+            };
             if feat.process_properties(&mut props).is_err() {
                 out.skipped += 1;
                 continue;
             }
+            super::add_unread_dates(&mut out.unread_dates, &props.unread_dates);
             out.features.push(Feature { id, geometry: Some(geometry), attrs: props.values });
             if out.features.len() >= limit {
                 break;
@@ -617,6 +737,22 @@ fn err(e: flatgeobuf::Error) -> DataError {
     DataError::Format(format!("FlatGeobuf: {e}"))
 }
 
+/// Validates a complete ISO clock by supplying a neutral day. The original stays text,
+/// so fractional digits past microseconds are checked as digits but never removed from values.
+fn is_clock(s: &str) -> bool {
+    let s = s.trim();
+    if s.as_bytes().get(2) != Some(&b':') {
+        return false;
+    }
+    let check = if let Some((head, tail)) = s.split_once('.') {
+        let digits = tail.bytes().take_while(|c| c.is_ascii_digit()).count();
+        format!("{head}.{}{}", tail.get(..digits.min(6)).unwrap_or_default(), tail.get(digits..).unwrap_or_default())
+    } else {
+        s.to_string()
+    };
+    crate::DateTime::parse(&format!("2000-01-01T{check}")).is_some()
+}
+
 /// The field type a column is read as; `None` for binary, which RustGIS has no field type for.
 fn field_type(t: ColumnType) -> Option<FieldType> {
     Some(match t {
@@ -641,6 +777,7 @@ struct Props<'a> {
     /// The field of each header column (see [`FgbSource::slots`]).
     slots: &'a [Option<usize>],
     values: Vec<Value>,
+    unread_dates: Vec<usize>,
 }
 
 impl PropertyProcessor for Props<'_> {
@@ -665,6 +802,13 @@ impl PropertyProcessor for Props<'_> {
         // Integers in a Double column stay numbers of the column's type.
         let value = match (self.fields.get(idx).map(|f| f.ty), value) {
             (Some(FieldType::Double), Value::Int(i)) => Value::Float(i as f64),
+            (Some(ty @ (FieldType::Date | FieldType::DateTime)), Value::Text(s)) => {
+                let value = Value::parse_source(&s, ty);
+                if !s.trim().is_empty() && value.is_null() {
+                    super::unread_date(&mut self.unread_dates, idx);
+                }
+                value
+            }
             (_, v) => v,
         };
         if let Some(slot) = self.values.get_mut(idx) {
@@ -761,8 +905,8 @@ fn write_run(
             FieldType::Integer => ColumnType::Long,
             FieldType::Double => ColumnType::Double,
             FieldType::Boolean => ColumnType::Bool,
-            // Dates are ISO text until FlatGeobuf's own date-times are written.
-            FieldType::Text | FieldType::Date | FieldType::DateTime => ColumnType::String,
+            FieldType::Text => ColumnType::String,
+            FieldType::Date | FieldType::DateTime => ColumnType::DateTime,
         };
         w.add_column(&f.name, t, |_, c| c.nullable = true);
     }
@@ -795,6 +939,17 @@ fn write_run(
                     _ => {}
                 }
             }
+            // Refuse an invalid date before writing its native column: otherwise another reader
+            // could replace it with null, while this writer reported a successful, lossless export.
+            for (field, value) in fields.iter().zip(&feat.attrs) {
+                if field.ty.is_temporal() && !value.is_null() && Value::parse_source(&value.to_string(), field.ty).is_null() {
+                    return Err(DataError::Format(format!(
+                        "FlatGeobuf: feature {} has an invalid date in '{}'",
+                        feat.id,
+                        crate::io::dbf_notice_name(&field.name)
+                    )));
+                }
+            }
             let mut failed = None;
             w.add_feature_geom(Wkb(wkb::encode(g)), |out| {
                 use flatgeobuf::geozero::PropertyProcessor;
@@ -804,8 +959,11 @@ fn write_run(
                         Value::Int(x) => out.property(i, &f.name, &ColumnValue::Long(*x)),
                         Value::Float(x) => out.property(i, &f.name, &ColumnValue::Double(*x)),
                         Value::Bool(x) => out.property(i, &f.name, &ColumnValue::Bool(*x)),
+                        Value::Text(x) if matches!(f.ty, FieldType::Date | FieldType::DateTime) => {
+                            out.property(i, &f.name, &ColumnValue::DateTime(x))
+                        }
                         Value::Text(x) => out.property(i, &f.name, &ColumnValue::String(x)),
-                        Value::Date(_) | Value::DateTime(_) => out.property(i, &f.name, &ColumnValue::String(&v.to_string())),
+                        Value::Date(_) | Value::DateTime(_) => out.property(i, &f.name, &ColumnValue::DateTime(&v.to_string())),
                     };
                     if let Err(e) = r {
                         failed = Some(e.to_string());

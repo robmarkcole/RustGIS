@@ -47,6 +47,7 @@ fn repair_source(s: &mut Session, p: &Value) -> CmdResult {
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
+        let prepared = super::reads::take::<Result<Prepared, String>>(s, "layer.repairSource");
         let id = s.layer_id(p)?;
         let full = replacement(p)?;
         let table = super::ps(p, "table").map(str::trim).filter(|t| !t.is_empty());
@@ -57,7 +58,7 @@ fn repair_source(s: &mut Session, p: &Value) -> CmdResult {
                 l.name
             ));
         }
-        replace_linked(s, id, &full, table)?;
+        replace_linked(s, id, &full, table, prepared)?;
         Ok(json!({"layer": id, "path": full, "table": s.map().layer(id).and_then(|l| l.linked_table())}))
     }
 }
@@ -207,6 +208,25 @@ pub(crate) fn reload_ahead(s: &Session, p: &Value) -> Option<super::reads::ReadW
     Some(super::reads::ahead("Reload Data", "layer.reloadData".into(), move || input.and_then(prepare)))
 }
 
+/// Repair validates the replacement on the same cancellable worker path as Reload Data.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn repair_ahead(s: &Session, p: &Value) -> Option<super::reads::ReadWork> {
+    let input = (|| {
+        let id = s.layer_id(p)?;
+        let layer = s.map().layer(id).ok_or("the layer no longer exists")?;
+        if layer.linked_file().is_none() {
+            return Err(format!(
+                "{}'s data is kept in the project or read from a database or web address: there's no file to repair",
+                layer.name
+            ));
+        }
+        let path = replacement(p)?;
+        let table = super::ps(p, "table").map(str::trim).filter(|t| !t.is_empty()).map(String::from);
+        capture(s, id, path, table, false)
+    })();
+    Some(super::reads::ahead("Repair Data Source", "layer.repairSource".into(), move || input.and_then(prepare)))
+}
+
 /// Layer repair and layer reload (inline and ahead) share candidate construction and installation policy.
 #[cfg(not(target_arch = "wasm32"))]
 fn prepare(input: Input) -> Result<Prepared, String> {
@@ -227,10 +247,22 @@ fn prepare(input: Input) -> Result<Prepared, String> {
     Ok(Prepared { input, candidate })
 }
 
+/// Installs a matching prepared repair once; rejected or stale candidates never trigger a reread.
 #[cfg(not(target_arch = "wasm32"))]
-fn replace_linked(s: &mut Session, id: u32, path: &str, table: Option<&str>) -> Result<(), String> {
-    let input = capture(s, id, path.into(), table.map(String::from), false)?;
-    let prepared = prepare(input)?;
+fn replace_linked(
+    s: &mut Session,
+    id: u32,
+    path: &str,
+    table: Option<&str>,
+    prepared: Option<Result<Prepared, String>>,
+) -> Result<(), String> {
+    let prepared = match prepared {
+        Some(result) => result?,
+        None => prepare(capture(s, id, path.into(), table.map(String::from), false)?)?,
+    };
+    if prepared.input.id != id || prepared.input.path != path || prepared.input.table.as_deref() != table {
+        return Err("the repair target changed while reading; retry Repair Data Source".into());
+    }
     // Reload keeps a selected branch that has become empty. Repair instead chooses a new
     // source: rows exclusively of another family are not a compatible replacement.
     if let Candidate::Vector(new) = &prepared.candidate

@@ -355,6 +355,8 @@ pub fn status_bar(app: &mut RustGisApp, ui: &mut Ui) {
                     sep(ui, &t);
                     crate::readjob::status(app, ui, &t);
                 }
+                #[cfg(not(target_arch = "wasm32"))]
+                source_open_status(app, ui, &t);
                 crate::geocodeui::status(app, ui);
                 // Downloads and windows being read off the frame, each with its Cancel.
                 if !app.ui.downloads.is_empty() || window_reads_under_way(app) {
@@ -462,6 +464,38 @@ pub fn status_bar(app: &mut RustGisApp, ui: &mut Ui) {
                 });
             });
         });
+}
+
+/// Restored local FlatGeobuf layers classify dates off the frame, including hidden maps.
+/// This status keeps progress and Cancel available until those scans finish.
+#[cfg(not(target_arch = "wasm32"))]
+fn source_open_status(app: &RustGisApp, ui: &mut Ui, t: &Tokens) {
+    let sources: Vec<_> = app
+        .session
+        .project
+        .maps
+        .iter()
+        .flat_map(|m| &m.layers)
+        .filter_map(|l| l.source.as_ref())
+        .filter_map(|s| s.opening_progress().map(|p| (s, p)))
+        .collect();
+    if sources.is_empty() {
+        return;
+    }
+    sep(ui, t);
+    ui.spinner();
+    ui.label(egui::RichText::new(tl!("Reading dates…")).size(11.5).color(t.text_dim));
+    let (done, total) =
+        sources.iter().fold((0u64, 0u64), |(done, total), (_, (d, n, _))| (done.saturating_add(*d), total.saturating_add(*n)));
+    if total > 0 && sources.iter().all(|(_, (_, n, _))| *n > 0) {
+        ui.add(egui::ProgressBar::new((done as f32 / total as f32).min(1.0)).show_percentage().desired_width(120.0).desired_height(12.0));
+    }
+    if ui.add_enabled(sources.iter().any(|(_, (_, _, cancelled))| !cancelled), egui::Button::new(tl!("Cancel")).small()).clicked() {
+        for (source, _) in sources {
+            source.cancel_opening();
+        }
+    }
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
 }
 
 /// Whether windows are being read off the frame (none in the browser).

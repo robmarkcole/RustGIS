@@ -3118,7 +3118,7 @@ fn declared_z_and_m_are_said_and_counted() {
 
 /// A GeoParquet whose columns RustGIS has no field type for (a decimal too wide for a 64-bit
 /// integer, binary, a list, a struct, a leaf beside the bbox covering's box) are said and left
-/// out, and whose dates and times, read as whole numbers, are said with their unit; the box's
+/// out, while dates and timestamps become native values; the box's
 /// zmin and zmax aren't, and a file of ordinary columns says nothing.
 #[test]
 fn geoparquet_columns_not_kept_or_read_as_numbers_are_said() {
@@ -3181,20 +3181,23 @@ fn geoparquet_columns_not_kept_or_read_as_numbers_are_said() {
 
     let left_out = "5 columns of types RustGIS has no field for were left out: \
                     price (decimal), photo (binary), tags (list), extra (struct), geometry_bbox (struct)";
-    let as_numbers = "3 columns of dates or times were read as whole numbers: seen (milliseconds since 1970-01-01), \
-                      logged (microseconds since 1970-01-01), day (days since 1970-01-01)";
     // Read in place: the source's notes, which adding the layer gives as notices.
     let src = open_path(&path, None).unwrap();
     let info = src.info();
-    assert_eq!(info.notes, vec![left_out.to_string(), as_numbers.to_string()]);
+    assert_eq!(info.notes, vec![left_out.to_string()]);
     let names: Vec<&str> = info.fields.iter().map(|f| f.name.as_str()).collect();
     assert_eq!(names, ["name", "seen", "logged", "day"]);
     // Read whole: the same, in the read's report, and the values as said.
     let (ds, report) = materialize(src.as_ref()).unwrap();
-    assert_eq!(report.messages, vec![format!("columns: {left_out}"), format!("columns: {as_numbers}")]);
+    assert_eq!(report.messages, vec![format!("columns: {left_out}")]);
     assert_eq!(
         ds.features[0].attrs,
-        vec![Value::Text("a".into()), Value::Int(1_790_856_000_000), Value::Int(1_790_856_000_000_000), Value::Int(20_727)]
+        vec![
+            Value::Text("a".into()),
+            Value::DateTime(crate::DateTime::with_offset(1_790_856_000_000_000, 0).unwrap()),
+            Value::DateTime(crate::DateTime::local(1_790_856_000_000_000).unwrap()),
+            Value::Date(crate::Date::from_days(20_727).unwrap())
+        ]
     );
 
     // Ordinary columns, with a bbox covering: nothing to say.
@@ -3607,6 +3610,261 @@ fn geojson_in_a_declared_projected_system_is_not_taken_for_swapped() {
     let (ds, messages, _) = geojson_paths("merc-quiet.geojson", &merc_collection(&[point]));
     assert_eq!(ds.features.len(), 1);
     assert!(messages.is_empty(), "{messages:?}");
+}
+
+/// Native writer schemas and independent Arrow decoding distinguish UTC instants from local
+/// clocks. Mixed columns fall back to text; invalid native values are counted as null.
+#[test]
+fn native_file_dates_preserve_zone_policy_and_fractional_seconds() {
+    use ::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use arrow_schema::{DataType, TimeUnit};
+    let fields = vec![
+        Field::new("day", FieldType::Date),
+        Field::new("local", FieldType::DateTime),
+        Field::new("instant", FieldType::DateTime),
+        Field::new("mixed", FieldType::DateTime),
+    ];
+    let mut ds = Dataset::new("dates", GeometryType::Point, fields);
+    for (i, zone) in ["", "Z"].iter().enumerate() {
+        ds.push(
+            Some(Geometry::Point(Coord::new(i as f64, 0.0))),
+            vec![
+                Value::parse("2024-02-29", FieldType::Date),
+                Value::parse("1969-12-31T23:59:59.123456", FieldType::DateTime),
+                Value::parse("2026-03-05T14:30:00.123456+02:00", FieldType::DateTime),
+                Value::parse(&format!("2026-01-01T00:00:00{zone}"), FieldType::DateTime),
+            ],
+        );
+    }
+    let bytes = {
+        use std::sync::atomic::Ordering;
+        let progress = Arc::new(crate::progress::tests::Counted::default());
+        let _guard = crate::progress::install(Some(progress.clone()));
+        crate::progress::begin(ds.features.len());
+        let bytes = parquet::write(&ds).unwrap();
+        assert_eq!(progress.done.load(Ordering::Relaxed), ds.features.len() as u64, "the layout pass must not count written rows");
+        bytes
+    };
+    let arrow = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes.clone())).unwrap();
+    assert_eq!(arrow.schema().field_with_name("day").unwrap().data_type(), &DataType::Date32);
+    assert_eq!(arrow.schema().field_with_name("local").unwrap().data_type(), &DataType::Timestamp(TimeUnit::Microsecond, None));
+    assert_eq!(
+        arrow.schema().field_with_name("instant").unwrap().data_type(),
+        &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+    );
+    assert_eq!(arrow.schema().field_with_name("mixed").unwrap().data_type(), &DataType::Utf8);
+    let (back, report) = crate::io::read_bytes("dates.parquet", &bytes).unwrap();
+    assert!(report.messages.is_empty(), "{report:?}");
+    assert_eq!(back.features[0].attrs[0], ds.features[0].attrs[0]);
+    assert_eq!(back.features[0].attrs[1], ds.features[0].attrs[1]);
+    assert_eq!(back.features[0].attrs[2].to_string(), "2026-03-05T12:30:00.123456Z");
+    assert_eq!(back.features[1].attrs[3], Value::Text("2026-01-01T00:00:00Z".into()));
+    let note = parquet::values_note(&ds, "out.parquet").unwrap();
+    assert!(note.contains("2 date-times were written in UTC") && note.contains("2 date-times were written as ISO text"), "{note}");
+    // A replayable source feed chooses the same schema as an in-memory export.
+    let input = fgb::write(&ds).unwrap();
+    let source = open_bytes("dates.fgb", input, None).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("stream.parquet");
+    let summary = crate::export::write_source_in(source.as_ref(), &ds, &path, Crs::LonLat).unwrap();
+    assert_eq!(summary.written, 2);
+    assert_eq!(summary.date_messages.len(), 2);
+    let (streamed, _) = crate::io::read_path(&path).unwrap();
+    assert_eq!(streamed.fields, back.fields);
+    ds.features[0].attrs[0] = Value::Text("2026-02-30".into());
+    assert!(fgb::write(&ds).unwrap_err().to_string().contains("invalid date"));
+    let note = parquet::values_note(&ds, "bad.parquet").unwrap();
+    assert!(note.contains("1 value couldn't be written"));
+    let (bad, _) = crate::io::read_bytes("bad.parquet", &parquet::write(&ds).unwrap()).unwrap();
+    assert!(bad.features[0].attrs[0].is_null());
+    // Date fields accept the same unzoned midnight text as stored-value conversion;
+    // non-midnight times and zoned midnight still cannot be narrowed to a calendar date.
+    for (text, valid) in [("2026-03-05T00:00:00", true), ("2026-03-05T00:00:01", false), ("2026-03-05T00:00:00Z", false)] {
+        ds.features[0].attrs[0] = Value::Text(text.into());
+        let (read, _) = crate::io::read_bytes("midnight.parquet", &parquet::write(&ds).unwrap()).unwrap();
+        assert_eq!(read.features[0].attrs[0].is_null(), !valid, "{text}");
+        if valid {
+            assert_eq!(read.features[0].attrs[0], Value::parse("2026-03-05", FieldType::Date));
+        }
+    }
+}
+
+/// FlatGeobuf has a shared DateTime wire type. Local classification sees the whole column;
+/// a remote source preserves text with a notice rather than scanning the file at open.
+#[test]
+fn flatgeobuf_classifies_local_dates_and_preserves_remote_text() {
+    use flatgeobuf::geozero::{ColumnValue, PropertyProcessor, wkb::Wkb};
+    use flatgeobuf::{ColumnType, FgbWriter, FgbWriterOptions, GeometryType as G};
+    let mut writer = FgbWriter::create_with_options("dates", G::Point, FgbWriterOptions::default()).unwrap();
+    for name in ["day", "moment", "clock"] {
+        writer.add_column(name, ColumnType::DateTime, |_, c| c.nullable = true);
+    }
+    for (i, values) in
+        [["2024-02-29", "2026-03-05T14:30:00.123456+02:00", "12:30:00.123456789"], ["2026-02-30", "99:99:99", "13:00:00-05:00"]]
+            .iter()
+            .enumerate()
+    {
+        writer
+            .add_feature_geom(Wkb(wkb::encode(&Geometry::Point(Coord::new(i as f64, 0.0)))), |out| {
+                for (k, s) in values.iter().enumerate() {
+                    out.property(k, ["day", "moment", "clock"][k], &ColumnValue::DateTime(s)).unwrap();
+                }
+            })
+            .unwrap();
+    }
+    let mut bytes = Vec::new();
+    writer.write(&mut bytes).unwrap();
+    let local = open_bytes("dates.fgb", bytes.clone(), None).unwrap();
+    assert_eq!(local.info().fields.iter().map(|f| f.ty).collect::<Vec<_>>(), [FieldType::Date, FieldType::DateTime, FieldType::Text]);
+    let batch = local.read(&Request::all()).unwrap();
+    // A malformed clock must not force the moment column to Text; real clock fractions stay intact.
+    assert_eq!(batch.unread_dates, [1, 1]);
+    assert!(batch.features.iter().any(|f| f.attrs[2].to_string() == "12:30:00.123456789"));
+    let (_, report) = materialize(local.as_ref()).unwrap();
+    assert!(report.unread_dates.unwrap().contains("2 values"));
+    let mut rows = Vec::new();
+    let streamed = local
+        .visit_chunks(None, 256, &mut |chunk| {
+            rows.extend(chunk);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(streamed.unread_dates, batch.unread_dates);
+    assert_eq!(rows, batch.features);
+    let url = "https://test.example/native-date-fields.fgb";
+    remote::testing::serve(url, bytes);
+    let remote = open_driven(url);
+    assert!(remote.info().fields.iter().all(|f| f.ty == FieldType::Text));
+    assert!(remote.info().notes.iter().any(|n| n.contains("3 date/time columns are kept as ISO text")));
+    let remote_batch = remote.read(&Request::all()).unwrap();
+    assert!(remote_batch.features.iter().any(|f| f.attrs[0] == Value::Text("2026-02-30".into())));
+}
+
+/// A readable size prefix can contain invalid UTF-8 properties. Classification ignores
+/// that row just as whole and streamed reads do, and the read reports the skipped feature.
+#[test]
+fn flatgeobuf_dates_skip_malformed_properties() {
+    let mut ds = Dataset::new("dates", GeometryType::Point, vec![Field::new("day", FieldType::Date)]);
+    for day in ["2001-01-01", "2024-02-29"] {
+        ds.push(Some(Geometry::Point(Coord::new(0.0, 0.0))), vec![Value::parse(day, FieldType::Date)]);
+    }
+    let mut bytes = fgb::write(&ds).unwrap();
+    let at = bytes.windows(10).position(|s| s == b"2001-01-01").unwrap();
+    bytes[at] = 0xff;
+    let source = open_bytes("dates.fgb", bytes, None).unwrap();
+    assert_eq!(source.info().fields[0].ty, FieldType::Date);
+    let read = source.read(&Request::all()).unwrap();
+    assert_eq!(read.skipped, 1);
+    assert_eq!(read.features.len(), 1);
+    assert_eq!(read.features[0].attrs[0].to_string(), "2024-02-29");
+    let streamed = source.visit_chunks(None, 256, &mut |_| Ok(())).unwrap();
+    assert_eq!(streamed.skipped, 1);
+}
+
+/// Independently authored Arrow columns exercise units, UTC flags, pre-epoch values, nulls,
+/// out-of-range dates and sub-microsecond values in both whole and streamed reads.
+#[test]
+fn parquet_date_units_invalid_values_and_nulls() {
+    use arrow_array::{
+        ArrayRef, BinaryArray, Date32Array, RecordBatch, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    };
+    use arrow_schema::{DataType, Field as AField, Schema, TimeUnit};
+    let geoms: Vec<Vec<u8>> = (0..3).map(|x| wkb::encode(&Geometry::Point(Coord::new(f64::from(x), 0.0)))).collect();
+    let schema = Arc::new(Schema::new(vec![
+        AField::new("geometry", DataType::Binary, false),
+        AField::new("day", DataType::Date32, true),
+        AField::new("ms", DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())), true),
+        AField::new("us", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+        AField::new("ns", DataType::Timestamp(TimeUnit::Nanosecond, None), true),
+    ]));
+    let cols: Vec<ArrayRef> = vec![
+        Arc::new(BinaryArray::from(geoms.iter().map(Vec::as_slice).collect::<Vec<_>>())),
+        Arc::new(Date32Array::from(vec![Some(-1), Some(i32::MAX), None])),
+        Arc::new(TimestampMillisecondArray::from(vec![Some(-1), Some(i64::MAX), None]).with_timezone("UTC")),
+        Arc::new(TimestampMicrosecondArray::from(vec![Some(-1), Some(i64::MAX), None])),
+        Arc::new(TimestampNanosecondArray::from(vec![Some(-1000), Some(1001), None])),
+    ];
+    let mut bytes = Vec::new();
+    let mut w = ::parquet::arrow::ArrowWriter::try_new(&mut bytes, schema.clone(), None).unwrap();
+    w.write(&RecordBatch::try_new(schema, cols).unwrap()).unwrap();
+    w.close().unwrap();
+    let source = open_bytes("units.parquet", bytes, None).unwrap();
+    let batch = source.read(&Request::all()).unwrap();
+    assert_eq!(batch.unread_dates, [1, 1, 1, 1]);
+    assert_eq!(
+        batch.features[0].attrs.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        ["1969-12-31", "1969-12-31T23:59:59.999Z", "1969-12-31T23:59:59.999999", "1969-12-31T23:59:59.999999"]
+    );
+    assert!(batch.features[1..].iter().all(|f| f.attrs.iter().all(Value::is_null)));
+    let extent = Extent::new(-0.1, -0.1, 0.1, 0.1);
+    let filtered = source.read(&Request { extent: Some(extent), limit: usize::MAX }).unwrap();
+    assert_eq!(filtered.features.len(), 1);
+    assert!(filtered.unread_dates.is_empty(), "invalid dates in filtered-out rows aren't read losses");
+    let filtered = source.visit_chunks(Some(extent), 256, &mut |_| Ok(())).unwrap();
+    assert!(filtered.unread_dates.is_empty());
+    let mut rows = Vec::new();
+    let streamed = source
+        .visit_chunks(None, 256, &mut |chunk| {
+            rows.extend(chunk);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(rows, batch.features);
+    assert_eq!(streamed.unread_dates, batch.unread_dates);
+}
+
+/// INT96 stores Julian days and nanoseconds of day with no UTC flag. Negative epochs must use
+/// the day plus its positive time, and finer-than-microsecond input is reported rather than cut.
+#[test]
+fn parquet_int96_is_unzoned_and_checks_submicroseconds() {
+    use ::parquet::basic::{LogicalType, Repetition, TimeUnit, Type as Physical};
+    use ::parquet::data_type::{ByteArray, ByteArrayType, Int64Type, Int96, Int96Type};
+    use ::parquet::file::{properties::WriterProperties, writer::SerializedFileWriter};
+    use ::parquet::schema::types::Type;
+    let base = ::parquet::schema::parser::parse_message_type("message m { REQUIRED BINARY geometry; OPTIONAL INT96 legacy; }").unwrap();
+    let mut fields = base.get_fields().to_vec();
+    for (name, utc) in [("clock_local", false), ("clock_utc", true)] {
+        fields.push(Arc::new(
+            Type::primitive_type_builder(name, Physical::INT64)
+                .with_repetition(Repetition::OPTIONAL)
+                .with_logical_type(Some(LogicalType::time(utc, TimeUnit::MICROS)))
+                .build()
+                .unwrap(),
+        ));
+    }
+    let schema = Arc::new(Type::group_type_builder("m").with_fields(fields).build().unwrap());
+    let mut bytes = Vec::new();
+    let mut w = SerializedFileWriter::new(&mut bytes, schema, Arc::new(WriterProperties::builder().build())).unwrap();
+    let mut rg = w.next_row_group().unwrap();
+    let geom = ByteArray::from(wkb::encode(&Geometry::Point(Coord::new(0.0, 0.0))));
+    let mut col = rg.next_column().unwrap().unwrap();
+    col.typed::<ByteArrayType>().write_batch(&[geom.clone(), geom], None, None).unwrap();
+    col.close().unwrap();
+    let make = |ns: u64, day| {
+        let mut t = Int96::new();
+        t.set_data(ns as u32, (ns >> 32) as u32, day);
+        t
+    };
+    let mut col = rg.next_column().unwrap().unwrap();
+    col.typed::<Int96Type>().write_batch(&[make(86_399_999_999_000, 2_440_587), make(1, 2_440_588)], Some(&[1, 1]), None).unwrap();
+    col.close().unwrap();
+    for _ in 0..2 {
+        let mut col = rg.next_column().unwrap().unwrap();
+        col.typed::<Int64Type>().write_batch(&[0, 1], Some(&[1, 1]), None).unwrap();
+        col.close().unwrap();
+    }
+    rg.close().unwrap();
+    w.close().unwrap();
+    let src = open_bytes("legacy.parquet", bytes, None).unwrap();
+    let batch = src.read(&Request::all()).unwrap();
+    assert_eq!(batch.features[0].attrs[0].to_string(), "1969-12-31T23:59:59.999999");
+    assert!(batch.features[1].attrs[0].is_null());
+    assert_eq!(batch.unread_dates, [1]);
+    assert_eq!(batch.features[0].attrs[1].to_string(), "00:00:00");
+    assert_eq!(batch.features[1].attrs[1].to_string(), "00:00:00.000001");
+    assert_eq!(batch.features[0].attrs[2].to_string(), "00:00:00.000000Z");
+    assert_eq!(batch.features[1].attrs[2].to_string(), "00:00:00.000001Z");
+    assert!(batch.features[0].attrs[2] < batch.features[1].attrs[2]);
 }
 
 /// A feature just below an extent, within the rounding of the Shapefile and GeoJSON indexes'

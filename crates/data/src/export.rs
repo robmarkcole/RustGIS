@@ -50,6 +50,8 @@ pub struct Exported {
     /// Per field of the layer, date-times a GeoPackage holds in UTC rather than at their own
     /// offset ([`crate::io::offset_dates`]; empty for the other formats).
     pub utc_dates: Vec<usize>,
+    /// GeoParquet timestamp representation changes counted during export.
+    pub date_messages: Vec<String>,
 }
 
 /// Writes every feature of `src` to `path` in the format of its extension, in `crs` (see
@@ -172,6 +174,7 @@ fn write_chunks_as(
     };
     let mut table = None;
     let mut unfit = Vec::new();
+    let mut date_messages = Vec::new();
     let left_out = match ext {
         #[cfg(not(target_arch = "wasm32"))]
         "gpkg" => {
@@ -200,13 +203,17 @@ fn write_chunks_as(
             crate::source::fgb::write_features(&layer.name, geometry_type, &layer.fields, crs, out, &mut feed)
         })?,
         _ => write_atomic_with(path, |out| {
-            let (_, counts) = crate::source::parquet::write_features(geometry_type, &layer.fields, out, &mut feed)?;
+            let (_, counts, messages) = crate::source::parquet::write_features(geometry_type, &layer.fields, out, &mut feed)?;
             unfit = counts;
+            date_messages = messages;
             Ok::<_, DataError>(0)
         })?,
     };
     let written = total.saturating_sub(left_out);
-    Ok((Exported { written, left_out, skipped, null_numbers, unfit, beyond_web_mercator, csv, unread_dates, utc_dates }, table))
+    Ok((
+        Exported { written, left_out, skipped, null_numbers, unfit, beyond_web_mercator, csv, unread_dates, utc_dates, date_messages },
+        table,
+    ))
 }
 
 /// Counts attributes a GeoJSON or GeoPackage writer replaces with null. Other formats have

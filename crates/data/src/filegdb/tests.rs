@@ -36,6 +36,7 @@ enum F {
     Oid,
     Text(&'static str),
     Int(&'static str),
+    Date(&'static str, u8),
     Shape { z: bool, wkt: &'static str },
 }
 
@@ -44,6 +45,7 @@ enum V {
     Text(Option<&'static str>),
     Int(Option<i32>),
     Blob(Vec<u8>),
+    Date(Option<(f64, Option<i16>)>),
 }
 
 /// A minimal table (version 3) and its row index, as ArcGIS lays them out.
@@ -72,6 +74,10 @@ fn table(layer_flags: u32, fields: &[F], rows: &[Vec<V>]) -> (Vec<u8>, Vec<u8>) 
             F::Int(n) => {
                 name(&mut f, n);
                 f.extend([1, 4, 5, 0]);
+            }
+            F::Date(n, kind) => {
+                name(&mut f, n);
+                f.extend([*kind, 8, 5, 0]);
             }
             F::Shape { z, wkt } => {
                 name(&mut f, "SHAPE");
@@ -115,7 +121,7 @@ fn table(layer_flags: u32, fields: &[F], rows: &[Vec<V>]) -> (Vec<u8>, Vec<u8>) 
         let mut body = Vec::new();
         for (bit, v) in row.iter().enumerate() {
             match v {
-                V::Text(None) | V::Int(None) => {
+                V::Text(None) | V::Int(None) | V::Date(None) => {
                     if let Some(b) = nulls.get_mut(bit / 8) {
                         *b |= 1 << (bit % 8);
                     }
@@ -125,6 +131,12 @@ fn table(layer_flags: u32, fields: &[F], rows: &[Vec<V>]) -> (Vec<u8>, Vec<u8>) 
                     body.extend(s.as_bytes());
                 }
                 V::Int(Some(i)) => body.extend(i.to_le_bytes()),
+                V::Date(Some((days, offset))) => {
+                    body.extend(days.to_le_bytes());
+                    if let Some(o) = offset {
+                        body.extend(o.to_le_bytes());
+                    }
+                }
                 V::Blob(b) => {
                     body.extend(varuint(b.len() as u64));
                     body.extend(b);
@@ -883,5 +895,49 @@ fn placement_cases_are_placed() {
         // The corner at the point (stored to the millimetre) is within a centimetre of it.
         let off = p[0][0].iter().map(|c| metres_apart(*c, lonlat)).fold(f64::INFINITY, f64::min);
         assert!(off < 0.01, "{what}: {off} m off");
+    }
+}
+
+/// All four FileGDB temporal wire kinds go through the table reader, including a stored invalid
+/// date and a true null. Local times and explicit offsets retain different semantics.
+#[test]
+fn filegdb_temporal_fields_keep_days_offsets_and_null_notices() {
+    let fields = [F::Date("day", 14), F::Date("local", 5), F::Date("offset", 16), F::Date("clock", 15)];
+    let (t, x) = table(
+        0,
+        &fields,
+        &[
+            vec![
+                V::Date(Some((36_526.0, None))),
+                V::Date(Some((36_526.5, None))),
+                V::Date(Some((36_526.5, Some(-300)))),
+                V::Date(Some((0.5, None))),
+            ],
+            vec![V::Date(Some((f64::NAN, None))), V::Date(None), V::Date(None), V::Date(None)],
+        ],
+    );
+    let (ds, report) = read_table("dates", &t, &x, None).unwrap().unwrap();
+    assert_eq!(
+        ds.fields.iter().map(|f| f.ty).collect::<Vec<_>>(),
+        [FieldType::Date, FieldType::DateTime, FieldType::DateTime, FieldType::Text]
+    );
+    assert_eq!(
+        ds.features[0].attrs.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        ["2000-01-01", "2000-01-01T12:00:00", "2000-01-01T12:00:00-05:00", "12:00:00"]
+    );
+    assert!(report.unread_dates.unwrap().starts_with("1 value"));
+    assert!(ds.features[1].attrs.iter().all(Value::is_null));
+    assert_eq!(gdb_datetime(25_569.5, None).to_string(), "1970-01-01T12:00:00");
+    assert!(gdb_datetime(25_569.0, Some(i16::MIN)).is_null());
+    assert!(gdb_datetime(1e100, None).is_null());
+    // Exercise the reader/report boundary as well as the shared serial helper.
+    for (serial, rounded) in [(45_000.5, false), (45_000.1, true)] {
+        let (t, x) = table(0, &[F::Date("moment", 5)], &[vec![V::Date(Some((serial, None)))]]);
+        let (_, report) = read_table("dates", &t, &x, None).unwrap().unwrap();
+        let notices: Vec<_> = report.messages.iter().filter(|n| n.contains("rounded to the nearest microsecond")).collect();
+        assert_eq!(notices.len(), usize::from(rounded), "{serial}: {report:?}");
+        if rounded {
+            assert!(notices[0].contains("1 serial date") && notices[0].contains("moment"));
+        }
     }
 }

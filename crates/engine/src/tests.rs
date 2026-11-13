@@ -43623,6 +43623,25 @@ fn long_commands_stop_when_cancelled_while_they_run() {
         note(command, read.run(&control).map(|_| ()), &control);
     }
 
+    // Replacement validation can now scan temporal fields as well as probing geometry.
+    let mut dates = rustgis_data::Dataset::new(
+        "dates",
+        rustgis_data::GeometryType::Point,
+        vec![rustgis_data::Field::new("day", rustgis_data::FieldType::Date)],
+    );
+    dates.push(
+        Some(rustgis_data::Geometry::Point(rustgis_data::Coord::new(0.0, 0.0))),
+        vec![rustgis_data::Value::parse("2024-02-29", rustgis_data::FieldType::Date)],
+    );
+    let replacement = out("cancel-repair-source.fgb");
+    std::fs::write(&replacement, rustgis_data::source::fgb::write(&dates).unwrap()).unwrap();
+    let id = s.run("layer.addData", &json!({"path": replacement, "stream": true})).unwrap()["layer"].as_u64().unwrap();
+    let read = crate::cmd::reads::read_ahead(&mut s, "layer.repairSource", &json!({"layer": id, "path": replacement})).unwrap();
+    assert!(read.reads());
+    let control = Control::cancelled_once_started();
+    note("layer.repairSource", read.run(&control).map(|_| ()), &control);
+    std::fs::remove_file(replacement).unwrap();
+
     // The tools whose work grows past a second or two on real data: buffers, overlays, joins,
     // hulls, densities and interpolation. Run in the background as the Analysis pane runs them; a
     // new long tool is added here (AGENTS.md › Never hold the window).
@@ -44473,5 +44492,46 @@ fn publication_writes_its_coverage_grid() {
     // Without it, no file and no warning about one.
     let r = s.run("layout.publication", &json!({"extent": piaui})).unwrap();
     assert!(r["coverage"].is_null() && !r["warnings"].to_string().contains("coverage"), "{r}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Repair and reload complete a native date schema on their worker before probing/installing
+/// it. Cancellation prevents installation, and landing keeps the live layer presentation.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn native_date_source_repair_and_reload_use_finished_candidates() {
+    use crate::cmd::reads::{read_ahead, read_land};
+    use rustgis_analysis::control::Control;
+    use rustgis_data::{Dataset, Field, FieldType, GeometryType, Value as Attr};
+    let mut ds = Dataset::new("dates", GeometryType::Point, vec![Field::new("day", FieldType::Date)]);
+    ds.push(Some(rustgis_data::Geometry::Point(rustgis_data::Coord::new(0.0, 0.0))), vec![Attr::parse("2024-02-29", FieldType::Date)]);
+    let dir = std::env::temp_dir().join(format!("rustgis-date-repair-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let old = dir.join("old.fgb");
+    let new = dir.join("new.fgb");
+    let bytes = rustgis_data::source::fgb::write(&ds).unwrap();
+    std::fs::write(&old, &bytes).unwrap();
+    std::fs::write(&new, &bytes).unwrap();
+    let mut s = Session::new(Project::default());
+    let id = s.run("layer.addData", &json!({"path": old, "stream": true})).unwrap()["layer"].as_u64().unwrap() as u32;
+    for command in ["layer.reloadData", "layer.repairSource"] {
+        let p = json!({"layer": id, "path": new});
+        let control = Control::cancelled_once_started();
+        let before = s.undo_depth();
+        assert!(read_ahead(&mut s, command, &p).unwrap().run(&control).is_err());
+        assert!(control.looked() > 0);
+        assert_eq!(s.undo_depth(), before);
+        let ahead = read_ahead(&mut s, command, &p).unwrap();
+        assert!(ahead.reads());
+        let read = ahead.run(&Control::new()).unwrap();
+        s.map_mut().layer_mut(id).unwrap().transparency = 42.0;
+        read_land(&mut s, read).unwrap();
+        let layer = s.map().layer(id).unwrap();
+        assert_eq!(layer.transparency, 42.0);
+        let source = layer.source.as_ref().unwrap();
+        assert!(source.is_open() && !source.is_pending());
+        assert_eq!(source.info().unwrap().fields[0].ty, FieldType::Date);
+        assert_eq!(layer.load_all_counted().unwrap().0.value(0, 0).to_string(), "2024-02-29");
+    }
     std::fs::remove_dir_all(dir).unwrap();
 }

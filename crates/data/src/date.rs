@@ -249,6 +249,20 @@ impl<'de> Deserialize<'de> for DateTime {
     }
 }
 
+/// A binary floating-point day count from an epoch, rounded to microseconds. Split whole
+/// days before scaling: scaling an absolute date as f64 loses low time bits in distant years.
+/// The boolean says that fractional microseconds were rounded, for the reader's notice.
+pub(crate) fn serial_datetime(days: f64, epoch: i64) -> Option<(DateTime, bool)> {
+    if !days.is_finite() || days.abs() > 4_000_000.0 {
+        return None;
+    }
+    let whole = days.floor() as i64;
+    let day = Date::from_days(whole.checked_add(epoch)?)?;
+    let fraction = (days - whole as f64) * DAY_US as f64;
+    let micros = day.sort_key().checked_add(fraction.round() as i64)?;
+    DateTime::local(micros).map(|t| (t, fraction.fract() != 0.0))
+}
+
 /// Whether microseconds since 1970 fall in years 1 to 9999.
 fn in_range(micros: i64) -> bool {
     (i64::from(MIN_DAYS) * DAY_US..(i64::from(MAX_DAYS) + 1) * DAY_US).contains(&micros)
@@ -379,6 +393,20 @@ mod tests {
         // An offset past ±18 hours is refused, the most negative one too.
         assert_eq!(DateTime::with_offset(0, i16::MIN), None);
         assert_eq!(DateTime::with_offset(0, i16::MAX), None);
+    }
+
+    #[test]
+    fn binary_serial_dates_keep_fractional_precision_in_distant_years() {
+        // The next representable fractional day adds about 40.233 microseconds here. Scaling
+        // the whole date as f64 first would quantize the clock to 32-microsecond steps.
+        let serial = 2_958_465.25 + 2f64.powi(-31);
+        let (t, rounded) = serial_datetime(serial, -25_569).unwrap();
+        assert_eq!(t.to_string(), "9999-12-31T06:00:00.000040");
+        assert!(rounded);
+        assert_eq!(serial_datetime(25_569.5, -25_569).unwrap(), (dt("1970-01-01T12:00:00"), false));
+        for bad in [f64::NAN, f64::INFINITY, -1e100, 2_958_466.0] {
+            assert!(serial_datetime(bad, -25_569).is_none());
+        }
     }
 
     #[test]

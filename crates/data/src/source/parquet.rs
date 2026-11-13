@@ -202,8 +202,6 @@ impl ParquetSource {
 
         let mut fields = Vec::new();
         let mut field_cols = Vec::new();
-        // Dates and times, read as the whole numbers they're stored as.
-        let mut as_numbers = Vec::new();
         for i in 0..schema.num_columns() {
             if i == geom_col || covering.is_some_and(|c| c.contains(&i)) {
                 continue;
@@ -211,9 +209,6 @@ impl ParquetSource {
             let Some(name) = top(i) else { continue };
             let c = schema.column(i);
             if let Some(ty) = field_type(&c) {
-                if let Some(unit) = time_unit(&c) {
-                    as_numbers.push((name.clone(), unit));
-                }
                 fields.push(Field::new(name, ty));
                 field_cols.push(i);
             }
@@ -286,7 +281,6 @@ impl ParquetSource {
             &left_out,
             ["of a type RustGIS has no field for was left out", "of types RustGIS has no field for were left out"],
         );
-        info.note_columns(&as_numbers, ["of dates or times was read as whole numbers", "of dates or times were read as whole numbers"]);
         // An empty file loses nothing.
         if zm && count != Some(0) {
             info.drop_zm(if all_zm { count } else { None });
@@ -482,6 +476,7 @@ impl FeatureSource for ParquetSource {
                 return Err(remote::need());
             }
         }
+        let mut unread_dates = Vec::new();
         let mut skipped = 0;
         let mut starts = Vec::with_capacity(md.num_row_groups());
         let mut first_row = 0u64;
@@ -496,11 +491,11 @@ impl FeatureSource for ParquetSource {
             }
             let rg = self.reader.get_row_group(g).map_err(err)?;
             let geoms = read_bytes(rg.as_ref(), self.geom_col, take)?;
-            let attrs: Vec<Vec<Value>> = self.field_cols.iter().map(|&c| read_values(rg.as_ref(), c, take)).collect::<Result<_>>()?;
+            let attrs: Vec<ColumnValues> = self.field_cols.iter().map(|&c| read_values(rg.as_ref(), c, take)).collect::<Result<_>>()?;
             // A column shorter than its row group (a truncated or corrupt file) would pair values
             // with the wrong rows: refuse it.
             let wanted = take.iter().filter(|&&t| t).count();
-            if geoms.len() != wanted || attrs.iter().any(|a| a.len() != wanted) {
+            if geoms.len() != wanted || attrs.iter().any(|a| a.values.len() != wanted) {
                 return Err(DataError::Format(format!("GeoParquet: row group {g} has columns shorter than its rows")));
             }
             let base = starts.get(g).copied().unwrap_or(0);
@@ -521,12 +516,12 @@ impl FeatureSource for ParquetSource {
                 if !matches_extent || (late && !sample.wants()) {
                     continue;
                 }
-                let values = attrs.iter().map(|col| col.get(k).cloned().unwrap_or(Value::Null)).collect();
+                let values = attrs.iter().enumerate().map(|(field, col)| col.value(k, field, &mut unread_dates)).collect();
                 sample.keep(Feature { id: base.saturating_add(r as u64 + 1), geometry, attrs: values });
             }
         }
         let matched = (if late { sample.seen() } else { matched }).saturating_mul(thinned as u64);
-        Ok(Batch { matched, complete: sample.complete() && thinned == 1, skipped, features: sample.items, unread_dates: Vec::new() })
+        Ok(Batch { matched, complete: sample.complete() && thinned == 1, skipped, features: sample.items, unread_dates })
     }
 
     fn remote(&self) -> Option<Arc<Remote>> {
@@ -589,9 +584,9 @@ impl FeatureSource for ParquetSource {
             }
             let rg = self.reader.get_row_group(g).map_err(err)?;
             let geoms = read_bytes(rg.as_ref(), self.geom_col, &take)?;
-            let attrs: Vec<Vec<Value>> = self.field_cols.iter().map(|&c| read_values(rg.as_ref(), c, &take)).collect::<Result<_>>()?;
+            let attrs: Vec<ColumnValues> = self.field_cols.iter().map(|&c| read_values(rg.as_ref(), c, &take)).collect::<Result<_>>()?;
             let wanted = take.iter().filter(|&&t| t).count();
-            if geoms.len() != wanted || attrs.iter().any(|a| a.len() != wanted) {
+            if geoms.len() != wanted || attrs.iter().any(|a| a.values.len() != wanted) {
                 return Err(DataError::Format(format!("GeoParquet: row group {g} has columns shorter than its rows")));
             }
             for (k, (r, _)) in take.iter().enumerate().filter(|(_, t)| **t).enumerate() {
@@ -608,7 +603,7 @@ impl FeatureSource for ParquetSource {
                 if !geometry.as_ref().map_or(req.extent.is_none(), |g| in_request(g, &req)) {
                     continue;
                 }
-                let values = attrs.iter().map(|col| col.get(k).cloned().unwrap_or(Value::Null)).collect();
+                let values = attrs.iter().enumerate().map(|(field, col)| col.value(k, field, &mut out.unread_dates)).collect();
                 out.matched += 1;
                 chunks.push(Feature { id: start.saturating_add(r as u64 + 1), geometry, attrs: values })?;
             }
@@ -936,30 +931,56 @@ fn column_kind(t: &parquet::schema::types::Type) -> &'static str {
     }
 }
 
-/// What a date or time column's whole numbers count ("days since 1970-01-01"); `None` for other
-/// columns.
-fn time_unit(c: &ColumnDescPtr) -> Option<String> {
+/// The unit and UTC adjustment of a time-only column, retained in its ISO text.
+fn clock_kind(c: &ColumnDescPtr) -> Option<(parquet::basic::TimeUnit, bool)> {
     use parquet::basic::TimeUnit;
-    let unit = |u: &TimeUnit| match u {
-        TimeUnit::MILLIS => "milliseconds",
-        TimeUnit::MICROS => "microseconds",
-        TimeUnit::NANOS => "nanoseconds",
-    };
-    let (count, since) = match (c.logical_type_ref(), c.converted_type()) {
-        (Some(LogicalType::Timestamp(t)), _) => (unit(&t.unit), "1970-01-01"),
-        (Some(LogicalType::Time(t)), _) => (unit(&t.unit), "midnight"),
-        (Some(LogicalType::Date), _) | (None, ConvertedType::DATE) => ("days", "1970-01-01"),
-        (None, ConvertedType::TIMESTAMP_MILLIS) => ("milliseconds", "1970-01-01"),
-        (None, ConvertedType::TIMESTAMP_MICROS) => ("microseconds", "1970-01-01"),
-        (None, ConvertedType::TIME_MILLIS) => ("milliseconds", "midnight"),
-        (None, ConvertedType::TIME_MICROS) => ("microseconds", "midnight"),
-        _ => return None,
-    };
-    Some(format!("{count} since {since}"))
+    match (c.logical_type_ref(), c.converted_type()) {
+        (Some(LogicalType::Time(t)), _) => Some((t.unit, t.is_adjusted_to_u_t_c)),
+        (None, ConvertedType::TIME_MILLIS) => Some((TimeUnit::MILLIS, true)),
+        (None, ConvertedType::TIME_MICROS) => Some((TimeUnit::MICROS, true)),
+        _ => None,
+    }
 }
 
-/// A field type for a top-level column; `None` for types not read (binary, INT96, fixed-length).
+/// A time without a day is text rather than a date. Its fractional precision is retained.
+fn clock_value(n: i64, (unit, utc): (parquet::basic::TimeUnit, bool)) -> Value {
+    use parquet::basic::TimeUnit;
+    let (scale, width): (i128, usize) = match unit {
+        TimeUnit::MILLIS => (1_000_000, 3),
+        TimeUnit::MICROS => (1000, 6),
+        TimeUnit::NANOS => (1, 9),
+    };
+    let ns = i128::from(n) * scale;
+    if !(0..86_400_000_000_000).contains(&ns) {
+        return Value::Null;
+    }
+    let seconds = ns / 1_000_000_000;
+    let mut text = format!("{:02}:{:02}:{:02}", seconds / 3600, seconds / 60 % 60, seconds % 60);
+    let fraction = ns % 1_000_000_000;
+    if utc {
+        // Fixed precision keeps a whole second before its fractions when both carry Z.
+        text.push_str(&format!(".{:0width$}Z", fraction / scale));
+    } else if fraction != 0 {
+        text.push('.');
+        text.push_str(format!("{fraction:09}").trim_end_matches('0'));
+    }
+    Value::Text(text)
+}
+
+/// A field type for a top-level column; `None` for types not read (binary, fixed-length).
 fn field_type(c: &ColumnDescPtr) -> Option<FieldType> {
+    if clock_kind(c).is_some() {
+        return Some(FieldType::Text);
+    }
+    if c.physical_type() == Physical::INT96 {
+        return Some(FieldType::DateTime);
+    }
+    match (c.logical_type_ref(), c.converted_type(), c.physical_type()) {
+        (Some(LogicalType::Date), _, Physical::INT32) | (None, ConvertedType::DATE, Physical::INT32) => return Some(FieldType::Date),
+        (Some(LogicalType::Timestamp(_)), _, Physical::INT64)
+        | (None, ConvertedType::TIMESTAMP_MILLIS | ConvertedType::TIMESTAMP_MICROS, Physical::INT64) => return Some(FieldType::DateTime),
+        _ => {}
+    }
     Some(match c.physical_type() {
         Physical::BOOLEAN => FieldType::Boolean,
         Physical::INT32 | Physical::INT64 if decimal_scale(c).is_some() => FieldType::Double,
@@ -1014,22 +1035,114 @@ fn read_column<T: PqType>(r: &mut ColumnReaderImpl<T>, take: &[bool], max_def: i
     Ok(out)
 }
 
-/// Reads a field column as attribute values, for the rows `take` marks, in order.
-fn read_values(rg: &dyn RowGroupReader, col: usize, take: &[bool]) -> Result<Vec<Value>> {
+/// Native Parquet dates and timestamps, respecting UTC adjustment and refusing sub-microsecond
+/// values rather than truncating them. Legacy converted timestamps are UTC, INT96 is unzoned.
+fn temporal_value(c: &ColumnDescPtr, n: i64) -> Value {
+    use parquet::basic::TimeUnit;
+    if field_type(c) == Some(FieldType::Date) {
+        return crate::Date::from_days(n).map(Value::Date).unwrap_or_default();
+    }
+    let (unit, utc) = match (c.logical_type_ref(), c.converted_type()) {
+        (Some(LogicalType::Timestamp(t)), _) => (t.unit, t.is_adjusted_to_u_t_c),
+        (None, ConvertedType::TIMESTAMP_MILLIS) => (TimeUnit::MILLIS, true),
+        (None, ConvertedType::TIMESTAMP_MICROS) => (TimeUnit::MICROS, true),
+        _ => return Value::Null,
+    };
+    let micros = match unit {
+        TimeUnit::MILLIS => n.checked_mul(1000),
+        TimeUnit::MICROS => Some(n),
+        TimeUnit::NANOS => (n % 1000 == 0).then_some(n / 1000),
+    };
+    micros
+        .and_then(|v| if utc { crate::DateTime::with_offset(v, 0) } else { crate::DateTime::local(v) })
+        .map(Value::DateTime)
+        .unwrap_or_default()
+}
+
+/// One decoded column, with invalid non-null dates distinguished from stored nulls. Flags
+/// follow sampled row order so only features accepted by the geometry filter are counted.
+struct ColumnValues {
+    values: Vec<Value>,
+    invalid: Vec<bool>,
+}
+impl ColumnValues {
+    /// Returns an accepted feature's value and counts its invalid date, excluding filtered rows.
+    fn value(&self, row: usize, field: usize, counts: &mut Vec<usize>) -> Value {
+        if self.invalid.get(row) == Some(&true) {
+            super::unread_date(counts, field);
+        }
+        self.values.get(row).cloned().unwrap_or_default()
+    }
+}
+
+/// Reads a field column for the selected rows, keeping invalid-date flags for the final filter.
+fn read_values(rg: &dyn RowGroupReader, col: usize, take: &[bool]) -> Result<ColumnValues> {
     let desc = rg.metadata().column(col).column_descr_ptr();
     let max_def = desc.max_def_level();
     let scale = decimal_scale(&desc).map(|s| 10f64.powi(-s));
-    let int = |v: Option<i64>| match (v, scale) {
-        (None, _) => Value::Null,
-        (Some(i), Some(f)) => Value::Float(i as f64 * f),
-        (Some(i), None) => Value::Int(i),
+    let mut invalid = Vec::new();
+    let mut int = |v: Option<i64>| {
+        invalid.push(false);
+        if let Some(unit) = clock_kind(&desc) {
+            return v
+                .map(|n| {
+                    let value = clock_value(n, unit);
+                    if value.is_null()
+                        && let Some(flag) = invalid.last_mut()
+                    {
+                        *flag = true;
+                    }
+                    value
+                })
+                .unwrap_or_default();
+        }
+        if matches!(field_type(&desc), Some(FieldType::Date | FieldType::DateTime)) {
+            return v
+                .map(|i| {
+                    let value = temporal_value(&desc, i);
+                    if value.is_null()
+                        && let Some(flag) = invalid.last_mut()
+                    {
+                        *flag = true;
+                    }
+                    value
+                })
+                .unwrap_or_default();
+        }
+        match (v, scale) {
+            (None, _) => Value::Null,
+            (Some(i), Some(f)) => Value::Float(i as f64 * f),
+            (Some(i), None) => Value::Int(i),
+        }
     };
-    Ok(match column_reader(rg, col)? {
+    let values = match column_reader(rg, col)? {
         ColumnReader::BoolColumnReader(mut r) => {
             read_column(&mut r, take, max_def)?.into_iter().map(|v| v.map(Value::Bool).unwrap_or_default()).collect()
         }
         ColumnReader::Int32ColumnReader(mut r) => read_column(&mut r, take, max_def)?.into_iter().map(|v| int(v.map(i64::from))).collect(),
         ColumnReader::Int64ColumnReader(mut r) => read_column(&mut r, take, max_def)?.into_iter().map(int).collect(),
+        ColumnReader::Int96ColumnReader(mut r) => read_column(&mut r, take, max_def)?
+            .into_iter()
+            .map(|v| {
+                invalid.push(false);
+                v.map(|v| {
+                    let words = v.data();
+                    let ns = u64::from(words.first().copied().unwrap_or(0)) | (u64::from(words.get(1).copied().unwrap_or(0)) << 32);
+                    let day = i64::from(words.get(2).copied().unwrap_or(0)) - 2_440_588;
+                    let t = (ns < 86_400_000_000_000 && ns.is_multiple_of(1000))
+                        .then_some(())
+                        .and_then(|_| day.checked_mul(86_400_000_000)?.checked_add((ns / 1000) as i64))
+                        .and_then(crate::DateTime::local);
+                    if t.is_none()
+                        && let Some(flag) = invalid.last_mut()
+                    {
+                        *flag = true;
+                    }
+                    t.map(Value::DateTime).unwrap_or_default()
+                })
+                .unwrap_or_default()
+            })
+            .collect(),
         ColumnReader::FloatColumnReader(mut r) => {
             read_column(&mut r, take, max_def)?.into_iter().map(|v| v.map(|f| Value::Float(f64::from(f))).unwrap_or_default()).collect()
         }
@@ -1041,7 +1154,8 @@ fn read_values(rg: &dyn RowGroupReader, col: usize, take: &[bool]) -> Result<Vec
             .map(|v| v.map(|b| Value::Text(String::from_utf8_lossy(b.data()).into_owned())).unwrap_or_default())
             .collect(),
         _ => Vec::new(),
-    })
+    };
+    Ok(ColumnValues { values, invalid })
 }
 
 /// Reads a binary column (the WKB geometry), for the rows `take` marks, in order.
@@ -1247,7 +1361,7 @@ fn wkb_type_name(g: &crate::Geometry) -> &'static str {
 /// `bbox` covering column so readers can skip rows and row groups by extent. A table without
 /// geometry is written as plain Parquet.
 pub fn write(ds: &crate::Dataset) -> Result<Vec<u8>> {
-    write_features(ds.geometry_type, &ds.fields, Vec::new(), &mut |add| add(&ds.features)).map(|(bytes, _)| bytes)
+    write_features(ds.geometry_type, &ds.fields, Vec::new(), &mut |add| add(&ds.features)).map(|(bytes, _, _)| bytes)
 }
 
 /// An Integer column's value, `None` for one it can't hold: a whole float fits; a fraction, a
@@ -1271,6 +1385,69 @@ fn bool_cell(value: &Value) -> Option<bool> {
     }
 }
 
+/// A timestamp column has one zone policy. A mixed zoned/unzoned column is written as ISO
+/// text so no assumption is invented; a wholly zoned column is normalized to UTC.
+#[derive(Default)]
+struct DateLayout {
+    modes: Vec<u8>,
+    offsets: Vec<usize>,
+    counts: Vec<usize>,
+}
+impl DateLayout {
+    /// Accumulates the column's zone policy without keeping any rows; the export feed is replayable.
+    fn add(&mut self, fields: &[Field], rows: &[Feature]) {
+        self.modes.resize(fields.len(), 0);
+        self.offsets.resize(fields.len(), 0);
+        self.counts.resize(fields.len(), 0);
+        for row in rows {
+            for (k, _f) in fields.iter().enumerate().filter(|(_, f)| f.ty == FieldType::DateTime) {
+                if let Some(t) = row.attrs.get(k).and_then(datetime_cell) {
+                    self.modes[k] |= if t.offset().is_some() { 2 } else { 1 };
+                    self.offsets[k] += usize::from(t.offset().is_some_and(|o| o != 0));
+                    self.counts[k] += 1;
+                }
+            }
+        }
+    }
+    /// Counts each representation change and names its fields for the user-facing export notice.
+    fn notes(&self, fields: &[Field], target: &str) -> Vec<String> {
+        let target: String = target.chars().map(crate::io::dbf_notice_char).collect();
+        let mut notes = Vec::new();
+        let utc: Vec<usize> = self.offsets.iter().enumerate().map(|(k, &n)| if self.modes.get(k) == Some(&2) { n } else { 0 }).collect();
+        let text: Vec<usize> = self.counts.iter().enumerate().map(|(k, &n)| if self.modes.get(k) == Some(&3) { n } else { 0 }).collect();
+        for (counts, what) in [
+            (&utc, "date-times were written in UTC without their original offsets"),
+            (&text, "date-times were written as ISO text because their column mixes zoned and unzoned values"),
+        ] {
+            let n: usize = counts.iter().sum();
+            if n > 0 {
+                notes.push(format!("{target}: {n} {what}, in {}", crate::io::named_fields(fields, counts)));
+            }
+        }
+        notes
+    }
+}
+
+/// Values accepted by a native timestamp column; a Date is its unzoned midnight.
+fn datetime_cell(v: &Value) -> Option<crate::DateTime> {
+    match v {
+        Value::DateTime(t) => Some(*t),
+        Value::Date(d) => Some(crate::DateTime::from_date(*d)),
+        Value::Text(s) => crate::DateTime::parse(s),
+        _ => None,
+    }
+}
+
+/// Values accepted by a native date column, without dropping a time or a zone.
+fn date_cell(v: &Value) -> Option<crate::Date> {
+    match v {
+        Value::Date(d) => Some(*d),
+        Value::DateTime(t) if t.is_date() => Some(t.date()),
+        Value::Text(s) => crate::DateTime::parse(s).filter(|t| t.is_date()).map(|t| t.date()),
+        _ => None,
+    }
+}
+
 /// Whether the GeoParquet writer writes `value` as null in a column of type `ty` although it
 /// isn't null (in a Double column: text that isn't a number, NaN or an infinity).
 fn unfit(ty: FieldType, value: &Value) -> bool {
@@ -1279,8 +1456,9 @@ fn unfit(ty: FieldType, value: &Value) -> bool {
             FieldType::Integer => int_cell(value).is_none(),
             FieldType::Double => value.as_f64().is_none(),
             FieldType::Boolean => bool_cell(value).is_none(),
-            // Written as their text, as a Text column is.
-            FieldType::Text | FieldType::Date | FieldType::DateTime => false,
+            FieldType::Date => date_cell(value).is_none(),
+            FieldType::DateTime => datetime_cell(value).is_none(),
+            FieldType::Text => false,
         }
 }
 
@@ -1305,17 +1483,26 @@ pub fn unfit_note(fields: &[Field], counts: &[usize], target: &str) -> Option<St
     Some(format!("{target}: {what} written as null, in {}{more}", list.join(", ")))
 }
 
-/// [`unfit_note`] for writing the whole of `ds` as GeoParquet.
+/// Export notices for the whole of `ds`: unfit values and timestamp representation changes.
+/// Cancellation omits notices; the following writer's check returns the cancellation error.
 pub fn values_note(ds: &crate::Dataset, target: &str) -> Option<String> {
     let mut counts = vec![0usize; ds.fields.len()];
-    for row in &ds.features {
-        for ((field, value), n) in ds.fields.iter().zip(&row.attrs).zip(counts.iter_mut()) {
-            if unfit(field.ty, value) {
-                *n = n.saturating_add(1);
+    let mut layout = DateLayout::default();
+    for chunk in ds.features.chunks(BATCH) {
+        crate::progress::check().ok()?;
+        layout.add(&ds.fields, chunk);
+        for row in chunk {
+            crate::progress::check().ok()?;
+            for ((field, value), n) in ds.fields.iter().zip(&row.attrs).zip(counts.iter_mut()) {
+                if unfit(field.ty, value) {
+                    *n = n.saturating_add(1);
+                }
             }
         }
     }
-    unfit_note(&ds.fields, &counts, target)
+    let mut notes: Vec<String> = unfit_note(&ds.fields, &counts, target).into_iter().collect();
+    notes.extend(layout.notes(&ds.fields, target));
+    if notes.is_empty() { None } else { Some(notes.join("; ")) }
 }
 
 /// Writes GeoParquet to `out`: the features `feed` hands to the function it is given, a run at
@@ -1323,19 +1510,31 @@ pub fn values_note(ds: &crate::Dataset, target: &str) -> Option<String> {
 /// `WRITE_GROUP_ROWS` rows, so only one run is held (a run's last group can be smaller, and a
 /// streamed export's groups end with its chunks); the geometry types and bounding box the `geo`
 /// metadata gives are gathered as the rows go and written with the footer.
+/// Timestamp columns require replaying the feed before writing, to select one Parquet timezone
+/// flag per column without buffering the source. That pass checks Cancel but counts no writes.
 pub(crate) fn write_features<W: std::io::Write + Send>(
     geometry_type: GeometryType,
     fields: &[Field],
     out: W,
     feed: &mut dyn FnMut(&mut dyn FnMut(&[Feature]) -> Result<()>) -> Result<()>,
-) -> Result<(W, Vec<usize>)> {
+) -> Result<(W, Vec<usize>, Vec<String>)> {
     use parquet::basic::{Compression, Encoding, Repetition, ZstdLevel};
-    use parquet::data_type::{BoolType, ByteArray, ByteArrayType, DoubleType, Int64Type};
+    use parquet::data_type::{BoolType, ByteArray, ByteArrayType, DoubleType, Int32Type, Int64Type};
     use parquet::file::metadata::KeyValue;
     use parquet::file::properties::WriterProperties;
     use parquet::file::writer::SerializedFileWriter;
     use parquet::schema::types::{ColumnPath, Type};
 
+    let mut layout = DateLayout::default();
+    if fields.iter().any(|f| f.ty == FieldType::DateTime) {
+        feed(&mut |rows| {
+            for chunk in rows.chunks(BATCH) {
+                crate::progress::check()?;
+                layout.add(fields, chunk);
+            }
+            Ok(())
+        })?;
+    }
     let has_geom = geometry_type != GeometryType::None;
     let geom_name = free_name(fields, "geometry");
     let bbox_name = free_name(fields, "bbox");
@@ -1353,15 +1552,19 @@ pub(crate) fn write_features<W: std::io::Write + Send>(
             Type::group_type_builder(&bbox_name).with_repetition(Repetition::OPTIONAL).with_fields(corners).build().map_err(err)?,
         ));
     }
-    for f in fields {
+    for (k, f) in fields.iter().enumerate() {
         cols.push(match f.ty {
             FieldType::Integer => prim(&f.name, Physical::INT64, Repetition::OPTIONAL, None)?,
             FieldType::Double => prim(&f.name, Physical::DOUBLE, Repetition::OPTIONAL, None)?,
             FieldType::Boolean => prim(&f.name, Physical::BOOLEAN, Repetition::OPTIONAL, None)?,
-            // Dates are ISO text until GeoParquet's own dates and timestamps are written.
-            FieldType::Text | FieldType::Date | FieldType::DateTime => {
-                prim(&f.name, Physical::BYTE_ARRAY, Repetition::OPTIONAL, Some(LogicalType::String))?
-            }
+            FieldType::Date => prim(&f.name, Physical::INT32, Repetition::OPTIONAL, Some(LogicalType::Date))?,
+            FieldType::DateTime if layout.modes.get(k) != Some(&3) => prim(
+                &f.name,
+                Physical::INT64,
+                Repetition::OPTIONAL,
+                Some(LogicalType::timestamp(layout.modes.get(k) == Some(&2), parquet::basic::TimeUnit::MICROS)),
+            )?,
+            FieldType::Text | FieldType::DateTime => prim(&f.name, Physical::BYTE_ARRAY, Repetition::OPTIONAL, Some(LogicalType::String))?,
         });
     }
     let schema = Arc::new(Type::group_type_builder("schema").with_fields(cols).build().map_err(err)?);
@@ -1451,9 +1654,18 @@ pub(crate) fn write_features<W: std::io::Write + Send>(
                         let (v, d) = levels(rows.iter().map(|r| bool_cell(&attr(r))));
                         c.typed::<BoolType>().write_batch(&v, Some(&d), None).map_err(err)?;
                     }
-                    FieldType::Text | FieldType::Date | FieldType::DateTime => {
+                    FieldType::Date => {
+                        let (v, d) = levels(rows.iter().map(|r| date_cell(&attr(r)).map(crate::Date::days)));
+                        c.typed::<Int32Type>().write_batch(&v, Some(&d), None).map_err(err)?;
+                    }
+                    FieldType::DateTime if layout.modes.get(i) != Some(&3) => {
+                        let (v, d) = levels(rows.iter().map(|r| datetime_cell(&attr(r)).map(crate::DateTime::micros)));
+                        c.typed::<Int64Type>().write_batch(&v, Some(&d), None).map_err(err)?;
+                    }
+                    FieldType::Text | FieldType::DateTime => {
                         let (v, d) = levels(rows.iter().map(|r| match attr(r) {
                             Value::Null => None,
+                            v if unfit(f.ty, &v) => None,
                             v => Some(ByteArray::from(v.to_string().into_bytes())),
                         }));
                         c.typed::<ByteArrayType>().write_batch(&v, Some(&d), None).map_err(err)?;
@@ -1484,5 +1696,5 @@ pub(crate) fn write_features<W: std::io::Write + Send>(
         let geo = serde_json::json!({"version": "1.1.0", "primary_column": geom_name, "columns": {geom_name.clone(): col}});
         w.append_key_value_metadata(KeyValue::new("geo".to_string(), geo.to_string()));
     }
-    Ok((w.into_inner().map_err(err)?, unfit_counts))
+    Ok((w.into_inner().map_err(err)?, unfit_counts, layout.notes(fields, "GeoParquet")))
 }

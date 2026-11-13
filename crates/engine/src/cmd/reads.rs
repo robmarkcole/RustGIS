@@ -1,6 +1,6 @@
 //! Reads the desktop app makes on a thread of its own before a command adds what they read
 //! (#1291 step 3): Add Data's whole-file reads (a raster, a raster GDAL converts, a GeoJSON,
-//! delimited text or spreadsheet read whole, a CityJSON or CityGML model's layers), Reload Data, Load All
+//! delimited text or spreadsheet read whole, a CityJSON or CityGML model's layers), Repair/Reload Data, Load All
 //! Features, Convert To Annotation's read of a layer read in place, native models or scripts, the
 //! Error Inspector's topology check (#1291) and Source File State's hashing of a layer's file. [`read_ahead`]
 //! takes what the read needs of the session, [`ReadAhead::run`] reads on the thread, and [`read_land`]
@@ -121,6 +121,13 @@ pub(crate) fn prepare(s: &mut Session, op: Authorized<CommandOp>, owner: Continu
                 .flatten();
             ("Convert To Annotation", work, layer.source.clone())
         }
+        "layer.repairSource" => {
+            #[cfg(not(target_arch = "wasm32"))]
+            let work = super::repair::repair_ahead(s, params);
+            #[cfg(target_arch = "wasm32")]
+            let work = None;
+            ("Repair Data Source", work, None)
+        }
         "layer.reloadData" => {
             #[cfg(not(target_arch = "wasm32"))]
             let work = super::repair::reload_ahead(s, params);
@@ -154,7 +161,7 @@ pub(crate) fn prepare(s: &mut Session, op: Authorized<CommandOp>, owner: Continu
         }
         "topology.validate" => ("Error Inspector", super::design::topology_ahead(s, params), None),
         "source.syncState" => ("Source File State", super::publish::sync_ahead(s, params), None),
-        _ => return Err("only Add Data, Load All, Reload Data, Convert To Annotation, models, scripts, tile archives, service listings, topology and Source File State prepare background work".into()),
+        _ => return Err("only Add Data, Load All, Repair/Reload Data, Convert To Annotation, models, scripts, tile archives, service listings, topology and Source File State prepare background work".into()),
     };
     let name = work.as_ref().map_or(name, |work| work.name);
     Ok(ReadAhead { name, op, owner, source, work })

@@ -204,6 +204,7 @@ fn a_streamed_export_writes_what_a_whole_export_writes() {
                     csv: if ext == "csv" { crate::io::CsvLosses::of(&whole.features, whole.geometry_type) } else { Default::default() },
                     unread_dates: Vec::new(),
                     utc_dates,
+                    date_messages: Vec::new(),
                 };
                 assert_eq!(streamed, expected, "{what}");
                 let (a, b) = (read_back(&a), read_back(&b));
