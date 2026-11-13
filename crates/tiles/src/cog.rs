@@ -2031,7 +2031,7 @@ mod tests {
         out.extend((0..n).flat_map(|_| 1u32.to_le_bytes()));
         out.extend((0..n).flat_map(|i| (data_at + i).to_le_bytes()));
         let px = 1.0 / 3600.0;
-        out.extend([px, px, 0.0, 0.0, 0.0, 0.0, 0.0, -74.0, 6.0, 0.0].iter().flat_map(|v: &f64| v.to_le_bytes()));
+        out.extend([px, px, 0.0, 0.0, 0.0, 0.0, -74.0, 6.0, 0.0].iter().flat_map(|v: &f64| v.to_le_bytes()));
         out.extend([1u16, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326].iter().flat_map(|v| v.to_le_bytes()));
         out
     }
@@ -2045,6 +2045,7 @@ mod tests {
         assert_eq!(layout.levels.len(), 1);
         assert_eq!(layout.levels[0].offsets.len(), 490_000);
         assert_eq!(layout.levels[0].width, 179_200);
+        assert_eq!((layout.transform.origin_x, layout.transform.origin_y), (-74., 6.));
         assert!(rounds <= 6, "{rounds} reads");
         // No byte is read twice: a read stops where a part already read starts.
         assert!(held <= file.len() as u64, "{held} bytes held of a {}-byte header", file.len());
