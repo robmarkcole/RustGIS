@@ -130,7 +130,8 @@ or other WKT:
 
 - A transformation in the file (a `TOWGS84`, or a WKT2 `BOUNDCRS`'s) takes precedence, also over
   the built-in one of an EPSG code in the WKT, as in PROJ and GDAL. It also takes precedence over
-  the EPSG code given beside the WKT in a GeoPackage system or a File Geodatabase. A system
+  the EPSG code given beside the WKT in a GeoPackage system, a FlatGeobuf header or a File
+  Geodatabase. A system
   RustGIS can read only by that code keeps the code's transformation, with a notice. Web Mercator
   is on WGS 84, so a transformation its file gives is set aside, with a notice.
 - A `BOUNDCRS` whose transformation goes to another datum than WGS 84 continues with that
@@ -139,7 +140,7 @@ or other WKT:
   none of these, when the target gives a zero transformation where its datum has another (a
   writer's placeholder, as for ED50 or NAD 27), or when combining the two transformations'
   rotations could be off by a centimetre. When it is refused beside the EPSG code of a GeoPackage
-  system or a File Geodatabase, the code is used instead, with a notice.
+  system, a FlatGeobuf header or a File Geodatabase, the code is used instead, with a notice.
 - A grid transformation (NTv2 or NADCON, a `BOUNDCRS`'s, or GDAL's WKT1 `PROJ4_GRIDS` or
   `+nadgrids` in its `PROJ4` extension), or another without Helmert translations, isn't applied:
   the system is read without it, with a notice naming it and its grid file, as positions may be
@@ -147,9 +148,9 @@ or other WKT:
   WGS 84 uses that shift instead, and the notice says so. A `BOUNDCRS` without a transformation, which
   PROJ refuses, is read as its source system, with a notice unless the source is on WGS 84. A
   ballpark offset is no known shift (the datum's own notice says so), and a null offset is none.
-- The notices come with WKT read from a Shapefile's or ASCII grid's `.prj`, a GeoPackage's or
-  FileGDB's system, a LAS file or a Zarr store. WKT given as a command's `crs`, and a GeoPackage
-  system read by its EPSG code, say of these only the two above: a transformation that isn't
+- The notices come with WKT read from a Shapefile's or ASCII grid's `.prj`, a GeoPackage's,
+  FlatGeobuf's or FileGDB's system, a LAS file or a Zarr store. WKT given as a command's `crs`,
+  and a GeoPackage or FlatGeobuf system read by its EPSG code, say of these only the two above: a transformation that isn't
   applied, and a `BOUNDCRS` without one (typed WKT also says its projection method's formula, as
   below). A Zarr store's `crs` says them only when the slice uses it: a store that gives its own
   system, or a longitude/latitude grid, doesn't. A PostGIS, MySQL or SQL Server layer's `crs` is

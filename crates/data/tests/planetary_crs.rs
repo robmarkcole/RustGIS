@@ -34,6 +34,14 @@ const NAD27_ESRI: &str = r#"GEOGCS["GCS_North_American_1927",DATUM["D_North_Amer
 
 const ANOTHER_BODY: &str = "belongs to another body than the Earth";
 
+/// WGS 84 longitude/latitude: an Earth definition to put beside another body's IAU code.
+const WGS84: &str = r#"GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]]"#;
+
+/// The notice for an Earth definition read in place of another body's IAU code.
+fn earth_over_iau_notes(messages: &[String]) -> Vec<&String> {
+    messages.iter().filter(|m| m.contains("is another body's, but its definition is the Earth's")).collect()
+}
+
 /// Olympus Mons and Jezero crater (planetocentric, east positive).
 fn craters(points: [(f64, f64); 2]) -> Dataset {
     let mut ds = Dataset::new("craters", GeometryType::Point, vec![Field::new("name", FieldType::Text)]);
@@ -440,6 +448,7 @@ fn geopackage_iau_systems_are_read_said_or_refused() {
         assert_eq!(points(&ds), LONLAT.map(|(x, y)| Coord::new(x, y)).to_vec(), "{name}");
         assert_eq!(planetary_notes(&report.messages).len(), 1, "{name}: {:?}", report.messages);
         assert!(!report.messages.iter().any(|m| m.contains("no EPSG code")), "{name}: {:?}", report.messages);
+        assert!(earth_over_iau_notes(&report.messages).is_empty(), "{name}: {:?}", report.messages);
         // A definition gives the layer its system, not WGS 84's name.
         assert_eq!(ds.crs.is_some_and(Crs::is_planetary), name != "code", "{name}");
     }
@@ -480,6 +489,17 @@ fn geopackage_iau_systems_are_read_said_or_refused() {
     assert_eq!(ds.features.len(), 2);
     assert!(planetary_notes(&report.messages).is_empty(), "{:?}", report.messages);
     assert!(planetary_notes(&mem(&path).unwrap().info().notes).is_empty());
+    // An Earth definition beside another body's IAU code is read, and the code set aside is said,
+    // on the desktop and in the browser. An EPSG code beside it says nothing.
+    let said = "its coordinate system (srs_id 990001): its code IAU_2015:49910 is another body's, but its definition is the Earth's, which is used";
+    for (name, srs, notes) in [("earth_iau", ("IAU_2015", 49910, WGS84), vec![said]), ("earth_epsg", ("EPSG", 4326, WGS84), vec![])] {
+        let path = geopackage(dir.path(), name, LONLAT, srs);
+        let (ds, report) = io::read_path(&path).unwrap();
+        assert_eq!(points(&ds), LONLAT.map(|(x, y)| Coord::new(x, y)).to_vec(), "{name}");
+        // The desktop's report names the layer.
+        assert_eq!(report.messages, notes.iter().map(|n| format!("craters: {n}")).collect::<Vec<_>>(), "{name}");
+        assert_eq!(mem(&path).unwrap().info().notes, notes, "{name}");
+    }
 }
 
 /// #1677: a GeoPackage row naming an Earth system by its EPSG code while its definition is Mars's
@@ -556,15 +576,28 @@ fn flatgeobuf_iau_systems_are_read_said_or_refused() {
         assert_eq!(got, [Coord::new(-133.8, 18.65), Coord::new(77.45, 18.44)]);
         assert_eq!(planetary_notes(&report.messages).len(), 1, "{org:?} {wkt:?}: {:?}", report.messages);
         assert!(!report.messages.iter().any(|m| m.contains("not EPSG") || m.contains("no EPSG code")), "{:?}", report.messages);
+        assert!(earth_over_iau_notes(&report.messages).is_empty(), "{:?}", report.messages);
         assert_eq!(ds.crs.is_some_and(Crs::is_planetary), wkt.is_some());
     }
-    // Mars metres: the reader converts EPSG codes only, so it would read them as degrees.
-    let metres = [(-7_930_954.0, 1_105_492.0), (4_591_220.0, 1_093_043.0)];
-    for (org, code, wkt) in [(Some("IAU_2015"), 49910, Some(MARS_EQC)), (Some("IAU_2015"), 49910, None), (None, 0, Some(MARS_EQC))] {
-        flatgeobuf(&path, metres, org, code, wkt);
-        let e = io::read_path(&path).unwrap_err().to_string();
-        assert!(e.contains(ANOTHER_BODY) && e.contains("metres"), "{e}");
+    // Mars metres: read by the WKT, as a GeoPackage's definition is (unprojected on its sphere),
+    // with the notice (#1855). Without a WKT the reader can't place them, so they are refused.
+    let r = 3_396_190.0f64;
+    let eqc = LONLAT.map(|(lon, lat)| (r * lon.to_radians(), r * lat.to_radians()));
+    for (org, code) in [(Some("IAU_2015"), 49910), (None, 0)] {
+        flatgeobuf(&path, eqc, org, code, Some(MARS_EQC));
+        let (ds, report) = io::read_path(&path).unwrap();
+        let mut got = points(&ds);
+        got.sort_by(|a, b| a.x.total_cmp(&b.x));
+        for (got, (lon, lat)) in got.into_iter().zip(LONLAT) {
+            assert!((got.x - lon).abs() < 1e-9 && (got.y - lat).abs() < 1e-9, "{org:?}: {got:?}");
+        }
+        assert_eq!(planetary_notes(&report.messages).len(), 1, "{org:?}: {:?}", report.messages);
+        assert!(earth_over_iau_notes(&report.messages).is_empty(), "{org:?}: {:?}", report.messages);
+        assert!(ds.crs.is_some_and(Crs::is_planetary), "{org:?}");
     }
+    flatgeobuf(&path, eqc, Some("IAU_2015"), 49910, None);
+    let e = io::read_path(&path).unwrap_err().to_string();
+    assert!(e.contains(ANOTHER_BODY) && e.contains("metres"), "{e}");
     // Earth systems say what they said before.
     flatgeobuf(&path, LONLAT, Some("ESRI"), 102_100, None);
     let (_, report) = io::read_path(&path).unwrap();
@@ -573,15 +606,27 @@ fn flatgeobuf_iau_systems_are_read_said_or_refused() {
         "{:?}",
         report.messages
     );
+    // An Earth WKT without a code is read (#1855).
     flatgeobuf(&path, LONLAT, None, 0, Some(NAD27_ESRI));
     let (_, report) = io::read_path(&path).unwrap();
     assert!(
-        planetary_notes(&report.messages).is_empty() && report.messages.iter().any(|m| m.contains("no EPSG code")),
+        planetary_notes(&report.messages).is_empty() && !report.messages.iter().any(|m| m.contains("no EPSG code")),
         "{:?}",
         report.messages
     );
     flatgeobuf(&path, LONLAT, Some("EPSG"), 4326, None);
     assert!(io::read_path(&path).unwrap().1.messages.is_empty());
+    // An Earth WKT beside another body's IAU code is read, and the code set aside is said. An
+    // Esri code beside it names no other body, so it says nothing.
+    let said = "its coordinate system: its code IAU_2015:49910 is another body's, but its definition is the Earth's, which is used";
+    for (org, code, notes) in [(Some("IAU_2015"), 49910, vec![said]), (Some("ESRI"), 104_000, vec![])] {
+        flatgeobuf(&path, LONLAT, org, code, Some(WGS84));
+        let (ds, report) = io::read_path(&path).unwrap();
+        let mut got = points(&ds);
+        got.sort_by(|a, b| a.x.total_cmp(&b.x));
+        assert_eq!(got, [Coord::new(-133.8, 18.65), Coord::new(77.45, 18.44)], "{org:?}");
+        assert_eq!(report.messages, notes.iter().map(|n| format!("craters: {n}")).collect::<Vec<_>>(), "{org:?}");
+    }
 }
 
 /// A GeoTIFF of 8 × 4 cells of 45°, from longitude `west` to `west` + 360, row by row numbered
@@ -1058,11 +1103,15 @@ fn an_epsg_code_that_is_not_converted_leaves_another_body_s_definition_to_say() 
     let path = geopackage(dir.path(), "epsg_known", LONLAT, ("EPSG", 4326, NAD27_ESRI));
     assert!(planetary_notes(&io::read_path(&path).unwrap().1.messages).is_empty());
 
-    // FlatGeobuf: the same.
+    // FlatGeobuf: the same (#1855).
     let path = dir.path().join("epsg.fgb");
-    flatgeobuf(&path, metres, Some("EPSG"), UNKNOWN, Some(MARS_EQC));
+    flatgeobuf(&path, eqc, Some("EPSG"), UNKNOWN, Some(MARS_EQC));
+    let (ds, report) = io::read_path(&path).unwrap();
+    assert_eq!(planetary_notes(&report.messages).len(), 1, "{:?}", report.messages);
+    assert!(ds.crs.is_some_and(Crs::is_planetary));
+    flatgeobuf(&path, metres, Some("EPSG"), UNKNOWN, Some(MARS_BONNE));
     let e = io::read_path(&path).unwrap_err().to_string();
-    assert!(e.contains(ANOTHER_BODY) && e.contains("metres"), "{e}");
+    assert!(e.contains(ANOTHER_BODY) && e.contains("Bonne"), "{e}");
     flatgeobuf(&path, LONLAT, Some("EPSG"), UNKNOWN, Some(MARS_WKT2));
     let (ds, report) = io::read_path(&path).unwrap();
     assert_eq!(planetary_notes(&report.messages).len(), 1, "{:?}", report.messages);
@@ -1070,9 +1119,9 @@ fn an_epsg_code_that_is_not_converted_leaves_another_body_s_definition_to_say() 
     flatgeobuf(&path, LONLAT, None, UNKNOWN, Some(MARS_ESRI));
     assert_eq!(planetary_notes(&io::read_path(&path).unwrap().1.messages).len(), 1);
     flatgeobuf(&path, LONLAT, Some("EPSG"), UNKNOWN, Some(NAD27_ESRI));
-    let (_, report) = io::read_path(&path).unwrap();
+    let (ds, report) = io::read_path(&path).unwrap();
+    assert_eq!(ds.features.len(), 2);
     assert!(planetary_notes(&report.messages).is_empty(), "{:?}", report.messages);
-    assert!(report.messages.iter().any(|m| m.contains(&format!("EPSG:{UNKNOWN}"))), "{:?}", report.messages);
     flatgeobuf(&path, LONLAT, Some("EPSG"), 4326, Some(NAD27_ESRI));
     assert!(planetary_notes(&io::read_path(&path).unwrap().1.messages).is_empty());
 }
