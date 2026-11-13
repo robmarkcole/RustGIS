@@ -120,6 +120,8 @@ jobs:
           PROPERTY_CASES: "2000"
         run: |
           cargo test --locked -p rustgis-engine --test never_silent_roundtrip
+          PROPERTY_CASES=200 cargo test --locked -p rustgis-analysis --test parallel_serial
+          cargo test --locked -p rustgis-engine --test project_save_roundtrip
 
   report:
     name: Report

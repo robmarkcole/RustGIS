@@ -4730,6 +4730,7 @@ dependencies = [
  "a5",
  "geo",
  "log",
+ "proptest",
  "rustgis-data",
  "rustgis-geom",
  "serde",
