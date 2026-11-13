@@ -4,9 +4,9 @@
 //! three proj4rs lacks (Natural Earth, Winkel Tripel, Eckert IV) is read with them, on a sphere of
 //! its datum's semi-major axis as in PROJ (opengeos/RustGIS#1701).
 //!
-//! The forward formulas follow the projections' published definitions. Inverses use Newton's
-//! method on the forward formula, which also rejects points outside the map's outline (no
-//! longitude/latitude maps to them).
+//! The forward formulas follow the projections' published definitions. Eckert IV and Equal Earth
+//! have inverse formulas; the others use Newton's method on the forward formula. Both reject points
+//! outside the map's outline (no longitude/latitude maps to them).
 
 use crate::Coord;
 
@@ -192,12 +192,29 @@ impl World {
         out.is_finite().then_some(out)
     }
 
-    /// Newton's method from a starting guess; `None` when no point maps to `m`.
+    /// The longitude and latitude at `m`; `None` when no point maps to it. Eckert IV and Equal
+    /// Earth have inverse formulas; the others use Newton's method from a starting guess.
     pub fn inverse(&self, m: Coord) -> Option<Coord> {
         if !m.is_finite() {
             return None;
         }
         let (tx, ty) = ((m.x - self.x0) / self.radius, (m.y - self.y0) / self.radius);
+        let (lam, phi) = match self.kind {
+            Kind::EckertIV => eckert_iv_inverse(tx, ty)?,
+            Kind::EqualEarth => equal_earth_inverse(tx, ty)?,
+            _ => self.newton_inverse(tx, ty)?,
+        };
+        // Within ±180° as PROJ gives it, as `Sinusoidal` and `Eqc` do: a whole world's east edge
+        // is 180°, not -180° (a rounding error past it too, as in `forward`).
+        let lon = lam.to_degrees() + self.lon0;
+        let lon = if lon.abs() <= 180.0 + 1e-9 { lon.clamp(-180.0, 180.0) } else { (lon + 540.0).rem_euclid(360.0) - 180.0 };
+        Some(Coord::new(lon, phi.to_degrees()))
+    }
+
+    /// Newton's method on the forward formula for (λ, φ) in radians at (tx, ty), multiples of the
+    /// radius. Near a pole y barely changes with latitude, so a point found this way can be metres
+    /// off there; Eckert IV and Equal Earth don't use it.
+    fn newton_inverse(&self, tx: f64, ty: f64) -> Option<(f64, f64)> {
         let cos_phi1 = self.lat1.to_radians().cos();
         let forward = |lam: f64, phi: f64| unit_forward(self.kind, lam, phi, cos_phi1);
         let (pi, half) = (std::f64::consts::PI, std::f64::consts::FRAC_PI_2);
@@ -228,12 +245,64 @@ impl World {
         if (fx - tx).abs() + (fy - ty).abs() > 1e-9 {
             return None;
         }
-        // Within ±180° as PROJ gives it, as `Sinusoidal` and `Eqc` do: a whole world's east edge
-        // is 180°, not -180° (a rounding error past it too, as in `forward`).
-        let lon = lam.to_degrees() + self.lon0;
-        let lon = if lon.abs() <= 180.0 + 1e-9 { lon.clamp(-180.0, 180.0) } else { (lon + 540.0).rem_euclid(360.0) - 180.0 };
-        Some(Coord::new(lon, phi.to_degrees()))
+        Some((lam, phi))
     }
+}
+
+/// How far past the map's outline, in radii or radians, a point still counts as on it (rounding).
+const OUTLINE_SLACK: f64 = 1e-9;
+
+/// A longitude in radians a rounding error past ±π, clamped; `None` beyond that (off the outline).
+fn on_outline(lam: f64) -> Option<f64> {
+    (lam.is_finite() && lam.abs() <= std::f64::consts::PI + OUTLINE_SLACK).then(|| lam.clamp(-std::f64::consts::PI, std::f64::consts::PI))
+}
+
+/// Eckert IV's inverse on the unit sphere, (λ, φ) in radians, from Snyder, Map Projections: A
+/// Working Manual (USGS Professional Paper 1395, 1987): θ = asin(y / (2·√(π/(4+π)))),
+/// φ = asin((θ + sinθ·cosθ + 2·sinθ) / (2 + π/2)), λ = x / ((2/√(π(4+π)))·(1 + cosθ)). θ lies
+/// within ±π/2, so 1 + cosθ is at least 1.
+fn eckert_iv_inverse(x: f64, y: f64) -> Option<(f64, f64)> {
+    let pi = std::f64::consts::PI;
+    let s = y / (2.0 * (pi / (4.0 + pi)).sqrt());
+    if s.abs() > 1.0 + OUTLINE_SLACK {
+        return None;
+    }
+    let s = s.clamp(-1.0, 1.0);
+    let (th, c) = (s.asin(), (1.0 - s * s).max(0.0).sqrt());
+    let phi = ((th + s * c + 2.0 * s) / (2.0 + std::f64::consts::FRAC_PI_2)).clamp(-1.0, 1.0).asin();
+    let lam = on_outline(x / (2.0 / (pi * (4.0 + pi)).sqrt() * (1.0 + c)))?;
+    Some((lam, phi))
+}
+
+/// Equal Earth's inverse on the unit sphere, (λ, φ) in radians, from Šavrič, Patterson and Jenny,
+/// "The Equal Earth map projection" (International Journal of Geographical Information Science,
+/// 2018): θ from y by Newton's method, then φ = asin(2·sinθ/√3) and
+/// λ = 3·x·(A1 + 3·A2·θ² + 7·A3·θ⁶ + 9·A4·θ⁸) / (2·√3·cosθ). θ lies within ±π/3, so cosθ is at
+/// least ½.
+fn equal_earth_inverse(x: f64, y: f64) -> Option<(f64, f64)> {
+    const A1: f64 = 1.340264;
+    const A2: f64 = -0.081106;
+    const A3: f64 = 0.000893;
+    const A4: f64 = 0.003796;
+    let third = std::f64::consts::FRAC_PI_3;
+    let y_of = |t: f64| t * (A1 + t * t * (A2 + t.powi(4) * (A3 + A4 * t * t)));
+    let dy = |t: f64| A1 + 3.0 * A2 * t * t + 7.0 * A3 * t.powi(6) + 9.0 * A4 * t.powi(8);
+    let edge = y_of(third);
+    if y.abs() > edge * (1.0 + OUTLINE_SLACK) {
+        return None;
+    }
+    // y grows with θ (dy is at least 1.1 within ±π/3), so Newton's method settles quickly.
+    let mut th = y.clamp(-edge, edge) / A1;
+    for _ in 0..20 {
+        let step = (y_of(th) - y) / dy(th);
+        th = (th - step).clamp(-third, third);
+        if step.abs() < 1e-15 {
+            break;
+        }
+    }
+    let phi = (2.0 * th.sin() / 3.0_f64.sqrt()).clamp(-1.0, 1.0).asin();
+    let lam = on_outline(3.0 * x * dy(th) / (2.0 * 3.0_f64.sqrt() * th.cos()))?;
+    Some((lam, phi))
 }
 
 #[cfg(test)]
@@ -274,6 +343,24 @@ mod tests {
         // A central meridian shifts the map.
         let shifted = World::new(Kind::EqualEarth, 150.0, MERCATOR_R);
         assert!(shifted.forward(Coord::new(150.0, 0.0)).unwrap().x.abs() < 1e-6);
+    }
+
+    /// Near a pole y barely changes with latitude, so an inverse that stops once the map
+    /// coordinates are close brings a pole back metres away, or not at all off the central meridian.
+    #[test]
+    fn places_at_and_near_the_poles_come_back_within_a_millimetre() {
+        for kind in [Kind::EckertIV, Kind::EqualEarth] {
+            let w = World::new(kind, 0.0, MERCATOR_R);
+            for (lon, lat) in [(0.0, 90.0), (0.0, -90.0), (100.0, 90.0), (-100.0, -90.0), (45.0, 89.99), (-170.0, -89.999)] {
+                let m = w.forward(Coord::new(lon, lat)).unwrap();
+                let back = w.inverse(m).unwrap_or_else(|| panic!("{kind:?} {lon},{lat}"));
+                // Metres along the meridian and the parallel.
+                let north = (back.y - lat).to_radians() * MERCATOR_R;
+                let east = (back.x - lon).to_radians() * lat.to_radians().cos() * MERCATOR_R;
+                let off = north.hypot(east);
+                assert!(off < 1e-3, "{kind:?} {lon},{lat}: {back:?}, {off} m off");
+            }
+        }
     }
 
     /// Against pyproj 3.8.0 (PROJ 9.8.1): 10°E 50°N and 120°W 35°S, on PROJ's unit sphere.
