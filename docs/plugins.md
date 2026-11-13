@@ -179,9 +179,14 @@ cargo build --release --target wasm32-unknown-unknown
 - `runtime`: `wasm` (the default), `process` or `skills`. For WebAssembly plugins, `entry`
   defaults to `plugin.wasm` and must name a `.wasm` file relative to the manifest, using
   forward slashes with no `.` or `..` path segments. `abi` defaults to `1` and must equal `1`.
-- `version` and optional `minRustgisVersion` are numeric versions such as `1.2.3` or `1.2`.
-  RustGIS compares their numeric components, ignoring prerelease and build suffixes, and
-  refuses a plugin that needs a newer RustGIS.
+- `version` and optional `minRustgisVersion` are numeric versions such as `1.2.3` or `1.2`,
+  optionally with a pre-release (`1.2.3-beta.1`) and build metadata (`+build.5`). Plugin
+  versions follow [SemVer](https://semver.org/) precedence: a pre-release comes before its
+  release, pre-releases compare identifier by identifier (`beta.2` before `beta.11` before
+  `rc.1`), and build metadata is ignored. So **Update** is offered from `1.0.0-beta.1` to
+  `1.0.0-beta.2` and to `1.0.0`, never to an equal or older version. `minRustgisVersion`
+  compares only the numbers: RustGIS refuses a plugin that needs a newer RustGIS, and a
+  RustGIS pre-release such as `0.7.0-rc.1` runs plugins that need `0.7.0`.
 - `permissions`: `edit`, `files` and `network` (see [Safety](#safety)); empty by default.
   Ask only for what you use.
 - `commands[].params`: a string describing the command's parameters for scripts and agents,

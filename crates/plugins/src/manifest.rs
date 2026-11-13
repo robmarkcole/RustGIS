@@ -431,7 +431,7 @@ pub fn valid_path(s: &str) -> bool {
         && s.split('/').all(|seg| !seg.is_empty() && seg != "." && seg != "..")
 }
 
-/// A version's numbers (`1.2.3`, `1.2`, `1.2.3-beta.1`: the pre-release part is ignored).
+/// A version's numbers (`1.2.3`, `1.2`, `1.2.3-beta.1`: the pre-release part is left out).
 pub fn version_parts(v: &str) -> Option<[u64; 3]> {
     let core = v.trim().trim_start_matches('v').split(['-', '+']).next()?;
     let mut out = [0u64; 3];
@@ -443,9 +443,53 @@ pub fn version_parts(v: &str) -> Option<[u64; 3]> {
     (n > 0).then_some(out)
 }
 
-/// Compares two versions; an unreadable one sorts first.
+/// Compares two versions by SemVer 2.0.0 precedence: the numbers first, then a pre-release
+/// sorts before its release (`1.0.0-beta.1` < `1.0.0`), and pre-releases compare identifier by
+/// identifier (`beta.2` < `beta.11` < `rc.1`). Build metadata (`+…`) is ignored, and a missing
+/// number counts as 0 (`v2.0` = `2.0.0`). An unreadable version sorts first.
 pub fn version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
-    version_parts(a).cmp(&version_parts(b))
+    match (version_parts(a), version_parts(b)) {
+        (Some(x), Some(y)) => x.cmp(&y).then_with(|| prerelease_cmp(prerelease(a), prerelease(b))),
+        (x, y) => x.cmp(&y),
+    }
+}
+
+/// The pre-release part of a version: after the first `-` and before any build metadata.
+fn prerelease(v: &str) -> &str {
+    let v = v.trim();
+    let v = v.split_once('+').map_or(v, |(core, _)| core);
+    v.split_once('-').map_or("", |(_, pre)| pre)
+}
+
+/// One dot-separated pre-release identifier. Numbers sort before words and compare by value
+/// (as digits without leading zeros, so any length works); words compare as ASCII text.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum PrereleaseId<'a> {
+    Number(usize, &'a str),
+    Word(&'a str),
+}
+
+/// A pre-release part's identifiers, skipping empty ones (`beta..1`), which the versions
+/// accepted so far allow.
+fn prerelease_ids(pre: &str) -> impl Iterator<Item = PrereleaseId<'_>> {
+    pre.split('.').filter(|id| !id.is_empty()).map(|id| {
+        if id.bytes().all(|c| c.is_ascii_digit()) {
+            let digits = id.trim_start_matches('0');
+            PrereleaseId::Number(digits.len(), digits)
+        } else {
+            PrereleaseId::Word(id)
+        }
+    })
+}
+
+/// Orders two pre-release parts; an empty one is a release and sorts after any pre-release.
+fn prerelease_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    match (prerelease_ids(a).next().is_none(), prerelease_ids(b).next().is_none()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        (false, false) => prerelease_ids(a).cmp(prerelease_ids(b)),
+    }
 }
 
 /// RustGIS's own version.
@@ -642,7 +686,8 @@ impl Manifest {
             if version_parts(&self.min_rustgis_version).is_none() {
                 return Err("plugin.json: minRustgisVersion is not a version number".into());
             }
-            if version_cmp(RUSTGIS_VERSION, &self.min_rustgis_version).is_lt() {
+            // Numbers only: a RustGIS pre-release (`0.7.0-rc.1`) runs the plugins its release will.
+            if version_parts(RUSTGIS_VERSION) < version_parts(&self.min_rustgis_version) {
                 return Err(format!("{} needs RustGIS {} or newer (this is {RUSTGIS_VERSION})", self.name, self.min_rustgis_version));
             }
         }

@@ -574,7 +574,23 @@ fn blocked_plugins_are_unloaded_and_refused() {
 fn versions_and_translations() {
     assert!(version_cmp("1.10.0", "1.9.3").is_gt());
     assert!(version_cmp("v2.0", "2.0.0").is_eq());
-    assert!(version_cmp("1.0.0-beta.1", "1.0.0").is_eq());
+    // SemVer precedence: a pre-release sorts before its release and after the one before it,
+    // so updates are offered from a beta to the release and from one beta to the next.
+    assert!(version_cmp("1.0.0", "1.0.0-beta.1").is_gt());
+    assert!(version_cmp("1.0.0-beta.1", "0.9.9").is_gt());
+    assert!(version_cmp("v1.0-rc.1", "1.0.0-beta.11").is_gt());
+    assert!(version_cmp("1.0.0-beta.11", "1.0.0-beta.2").is_gt(), "numeric identifiers compare by value");
+    assert!(version_cmp("1.0.0-beta", "1.0.0-alpha.1").is_gt());
+    assert!(version_cmp("1.0.0-alpha.beta", "1.0.0-alpha.1").is_gt(), "words sort after numbers");
+    assert!(version_cmp("1.0.0-alpha.1", "1.0.0-alpha").is_gt(), "more identifiers sort later");
+    // Equal versions and downgrades are not updates; build metadata doesn't count.
+    assert!(version_cmp("1.0.0-beta.2", "1.0.0-beta.2").is_eq());
+    assert!(version_cmp("1.0.0+build.7", "1.0.0").is_eq());
+    assert!(version_cmp("1.0.0-rc.1+build-5", "1.0.0-rc.01").is_eq());
+    assert!(version_cmp("1.0.0-beta.1", "1.0.0").is_lt());
+    // An unreadable version still sorts first.
+    assert!(version_cmp("next", "0.0.1-alpha").is_lt());
+    assert!(version_cmp("next", "later").is_eq());
     let m = Manifest::parse(&testing::manifest("tr", &[])).unwrap();
     assert_eq!(m.translate("de-AT", "Hello"), "Hallo");
     assert_eq!(m.translate("fr", "Hello"), "Hello");
