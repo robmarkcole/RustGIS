@@ -659,7 +659,9 @@ fn reads_what_gdal_writes_when_gdal_is_installed() {
     assert_eq!(rows[0].attrs[at("name")], Value::Text("Zürich".into()));
     assert_eq!(rows[0].attrs[at("count")], Value::Int(3));
     assert_eq!(rows[0].attrs[at("height")], Value::Float(1.5));
-    assert!(matches!(&rows[0].attrs[at("day")], Value::Text(d) if d.starts_with("2024-05-06")), "{:?}", rows[0].attrs);
+    // GDAL's CSV autodetect makes the date an ESRI `Date` field, which is read as a native date
+    // and time (midnight here), as every FileGDB date is (#1894).
+    assert!(matches!(&rows[0].attrs[at("day")], Value::DateTime(d) if d.to_string() == "2024-05-06T00:00:00"), "{:?}", rows[0].attrs);
     assert_eq!(rows[1].attrs[at("count")], Value::Null);
     let (blocks, _) = &read[1];
     assert_eq!(blocks.crs, Some(Crs::Epsg(2056)), "the coordinate system, by its code");
