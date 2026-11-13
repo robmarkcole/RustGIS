@@ -16,6 +16,7 @@ mod esri;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod gdal;
 pub mod geotiff;
+mod image_grid;
 mod lzw;
 mod mask;
 pub mod pam;
@@ -26,6 +27,7 @@ pub mod zarr;
 use std::path::Path;
 
 pub use crs::{Crs, Transformer};
+pub use image_grid::ImageGrid;
 use rustgis_geom::{Coord, Extent};
 use serde::{Deserialize, Serialize};
 
