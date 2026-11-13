@@ -1823,16 +1823,21 @@ fn out_of_lonlat(g: &Geometry) -> bool {
 }
 
 /// The type of a column of text values: Integer or Double when every non-empty value is one,
-/// otherwise (or with no values) Text.
+/// otherwise (or with no values) Text. A number whose digits a Double doesn't keep, such as a
+/// 20-digit identifier, keeps its column Text, so no digit is rounded away ([`double_holds`]).
 pub(crate) fn text_type<'a>(vals: impl Iterator<Item = &'a str>) -> FieldType {
     let mut ty: Option<FieldType> = None;
+    // A whole number a Double can't hold: fine in an Integer column, not in a Double one.
+    let mut whole_past_double = false;
     for v in vals.map(str::trim).filter(|s| !s.is_empty()) {
         let t = if has_leading_zero(v) {
             // Identifiers such as ZIP codes keep their leading zeros.
             FieldType::Text
-        } else if v.parse::<i64>().is_ok() {
+        } else if let Ok(i) = v.parse::<i64>() {
+            // A whole number is held when its Double is the same number (in i128: no saturation).
+            whole_past_double |= (i as f64) as i128 != i128::from(i);
             FieldType::Integer
-        } else if v.parse::<f64>().is_ok_and(f64::is_finite) {
+        } else if double_holds(v) {
             FieldType::Double
         } else {
             FieldType::Text
@@ -1842,7 +1847,36 @@ pub(crate) fn text_type<'a>(vals: impl Iterator<Item = &'a str>) -> FieldType {
             Some(prev) => widen(prev, Some(t)),
         });
     }
-    ty.unwrap_or(FieldType::Text)
+    match ty {
+        Some(FieldType::Double) if whole_past_double => FieldType::Text,
+        ty => ty.unwrap_or(FieldType::Text),
+    }
+}
+
+/// Whether a number's text reads as a finite Double that, written with as many significant digits,
+/// gives the same digits back, so no digit is lost: `1.50`, `0.1`, `1e300` and
+/// `0.10000000000000001` (0.1 to 17 digits) and `0.00000000023283064365386962890625` (2^-32
+/// exactly) are; `12345678901234567891` and `0.12345678901234567891` aren't. No Double's exact
+/// value has more than 767 significant digits, so longer text isn't one, and isn't formatted.
+fn double_holds(v: &str) -> bool {
+    /// The digits of a number's mantissa without leading or trailing zeros.
+    fn digits(s: &str) -> String {
+        let mantissa = s.split(['e', 'E']).next().unwrap_or_default();
+        let all: String = mantissa.chars().filter(char::is_ascii_digit).collect();
+        all.trim_start_matches('0').trim_end_matches('0').to_string()
+    }
+    // A whole number written as one is held only exactly: `12345678901234567000` is a Double's
+    // 17 digits and zeros, but that Double is 12345678901234567168.
+    let whole = v.strip_prefix(['-', '+']).unwrap_or(v);
+    if !whole.is_empty() && whole.bytes().all(|b| b.is_ascii_digit()) {
+        // A whole Double's exact digits, written out (no finite Double has more than 309).
+        let digits = whole.trim_start_matches('0');
+        let digits = if digits.is_empty() { "0" } else { digits };
+        return digits.len() <= 309 && v.parse::<f64>().is_ok_and(|x| x.is_finite() && format!("{:.0}", x.abs()) == digits);
+    }
+    let want = digits(v);
+    v.parse::<f64>()
+        .is_ok_and(|x| x.is_finite() && (want.is_empty() || want.len() <= 767 && digits(&format!("{x:.*e}", want.len() - 1)) == want))
 }
 
 /// Types a dataset's Text columns from their values (see [`text_type`]), for readers whose
@@ -4440,6 +4474,31 @@ mod tests {
         assert_eq!(back.value(0, 2), &Value::Text("-abc".into()));
         assert_eq!(back.value(1, 2), &Value::Text("=x".into()));
         assert_eq!(to_csv(&back).unwrap(), once, "export/import is stable");
+    }
+
+    #[test]
+    fn csv_digits_a_number_cannot_hold_stay_text() {
+        let text = "id,share,mixed,n,x\n12345678901234567891,0.12345678901234567891,9007199254740993,7,1.50\n2,0.5,1.5,8,1e300\n";
+        let (ds, _) = read_csv(text, "t").unwrap();
+        let types: Vec<FieldType> = ds.fields.iter().map(|f| f.ty).collect();
+        assert_eq!(types, [FieldType::Text, FieldType::Text, FieldType::Text, FieldType::Integer, FieldType::Double]);
+        assert_eq!(ds.value(0, 0), &Value::Text("12345678901234567891".into()));
+        assert_eq!(ds.value(0, 1), &Value::Text("0.12345678901234567891".into()));
+        assert_eq!(ds.value(0, 2), &Value::Text("9007199254740993".into()), "a whole number past 2^53 in a decimal column");
+        assert_eq!(ds.value(1, 4), &Value::Float(1e300));
+        // A number written to 17 digits, as `%.17g` writes 0.1, is a Double.
+        let (ds, _) = read_csv("v\n0.10000000000000001\n2.5\n", "t").unwrap();
+        assert_eq!((ds.fields[0].ty, ds.value(0, 0)), (FieldType::Double, &Value::Float(0.1)));
+        // So is one written out exactly, however many digits that takes.
+        assert!(double_holds("0.00000000023283064365386962890625") && !double_holds(&"1".repeat(800)));
+        // A whole number past i64 with trailing zeros is held only if exactly.
+        assert!(!double_holds("12345678901234567000") && double_holds("18446744073709551616"));
+        // At any size, with no saturation: i128::MAX isn't one, 2^200 is.
+        assert!(!double_holds("170141183460469231731687303715884105727"));
+        assert!(double_holds("1606938044258990275541962092341162602522202993782792835301376"));
+        // A whole number beside a decimal: 2^60 is a Double exactly, 10^18 + 100 isn't.
+        let (ds, _) = read_csv("a,b\n1152921504606846976,1000000000000000100\n0.5,0.5\n", "t").unwrap();
+        assert_eq!((ds.fields[0].ty, ds.fields[1].ty), (FieldType::Double, FieldType::Text));
     }
 
     /// CSV export writes numbers as stored (#513): through `Display` a 0.4 m² area in km² was 0.

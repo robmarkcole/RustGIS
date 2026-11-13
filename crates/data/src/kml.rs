@@ -617,6 +617,16 @@ mod tests {
 </Document></kml>"##;
 
     #[test]
+    fn digits_a_number_cannot_hold_stay_text() {
+        let doc = r#"<kml><Document><Placemark><ExtendedData><Data name="id"><value>12345678901234567891</value></Data>
+            </ExtendedData><Point><coordinates>1,2</coordinates></Point></Placemark></Document></kml>"#;
+        let layers = read("ids.kml", doc.as_bytes()).unwrap();
+        let ds = &layers[0].dataset;
+        let id = ds.field_index("id").unwrap();
+        assert_eq!(ds.value(0, id), &Value::Text("12345678901234567891".into()));
+    }
+
+    #[test]
     fn reads_placemarks_folders_data_and_styles() {
         let layers = read("trip.kml", DOC.as_bytes()).unwrap();
         let names: Vec<&str> = layers.iter().map(|l| l.dataset.name.as_str()).collect();
