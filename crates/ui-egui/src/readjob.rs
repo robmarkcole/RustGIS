@@ -589,6 +589,11 @@ impl Reads {
             job.control.cancel();
         }
     }
+
+    /// Whether the run under way has finished reading on its thread (its answer waits to land).
+    pub fn read_finished_for_tests(&self) -> bool {
+        self.job.as_ref().is_some_and(|job| job.slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some())
+    }
 }
 
 /// Whether the status bar shows a read.
