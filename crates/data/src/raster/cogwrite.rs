@@ -8,12 +8,13 @@
 //! directories' sizes depend only on the tile counts, so they are written first with empty tile
 //! tables, and the tables are filled in once the tiles' places are known.
 //!
-//! Memory: the raster is read in place. A tile is gathered from the bands, compressed and written
-//! before the next one, so no second copy of the pixels is made, and each overview tile is made
-//! straight from the full image (a block of 2ⁿ × 2ⁿ pixels), so no pyramid is kept. The price is
-//! time: every overview level reads the whole full image again, so writing takes about as many
-//! passes over the pixels as there are levels, where building each level from the one before
-//! would take about 1⅓ but hold a second copy.
+//! Memory: the raster is read in place. A tile is gathered from the bands and compressed on its
+//! own, and only a few tiles a thread are held before they are written, so no second copy of the
+//! pixels is made, and each overview tile is made straight from the full image (a block of
+//! 2ⁿ × 2ⁿ pixels), so no pyramid is kept. The price is time: every overview level reads the
+//! whole full image again, so writing takes about as many passes over the pixels as there are
+//! levels, where building each level from the one before would take about 1⅓ but hold a second
+//! copy.
 //!
 //! Tiles are compressed with Deflate at its fastest level, after a predictor that makes neighbouring
 //! samples alike: the floating-point one for floats, differences along the row for whole numbers.
@@ -24,11 +25,15 @@
 //! don't change smoothly, so differences make them no smaller, and their long runs compress quickly
 //! at any level, to half the size of the fastest.
 //!
+//! On the desktop the tiles are made on several threads ([`crate::threads::max`]) while one thread
+//! writes them in their order, so the file is the same as one thread writes, byte for byte; in the
+//! browser they are made one after another.
+//!
 //! Classic TIFF is used when the file can't pass 4 GiB even with every tile left uncompressed,
 //! BigTIFF otherwise.
 //!
 //! The untiled GeoTIFF ([`super::geotiff::write`]) is written here too, by [`write_strips`]: one
-//! image in strips of rows, with the same predictors and Deflate effort, and no overviews.
+//! image in strips of rows, with the same predictors, Deflate effort and threads, and no overviews.
 
 use std::io::{Seek, SeekFrom, Write};
 use std::ops::Range;
@@ -689,28 +694,39 @@ pub fn write_to<W: Write + Seek>(r: &Raster, band: usize, flavour: Flavour, out:
     let mut pos = head.bytes.len() as u64;
 
     // Smallest overview first, the full image last; each in row order.
+    let order: Vec<(usize, u32, u32)> = levels
+        .iter()
+        .enumerate()
+        .rev()
+        .flat_map(|(i, lv)| (0..lv.down).flat_map(move |ty| (0..lv.across).map(move |tx| (i, tx, ty))))
+        .collect();
     let mut places: Vec<Vec<(u64, u64)>> = vec![Vec::new(); levels.len()];
-    crate::progress::begin(tiles);
-    let mut row = Vec::new();
     let effort = if plan.categorical { DEFLATE_CLASSES } else { DEFLATE_FAST };
-    for (i, lv) in levels.iter().enumerate().rev() {
-        for ty in 0..lv.down {
-            for tx in 0..lv.across {
-                crate::progress::step(1)?;
-                let mut raw = tile_samples(r, &plan, lv, tx, ty);
-                predict(&mut raw, &plan, &mut row);
-                let zipped = miniz_oxide::deflate::compress_to_vec_zlib(&raw, effort);
-                if !big && pos + zipped.len() as u64 > u64::from(u32::MAX) {
-                    return Err(err("the file is too large for classic TIFF"));
-                }
-                out.write_all(&zipped).map_err(err)?;
-                if let Some(p) = places.get_mut(i) {
-                    p.push((pos, zipped.len() as u64));
-                }
-                pos += zipped.len() as u64;
+    let tile_bytes = (TILE as usize * TILE as usize).saturating_mul(spp * bps);
+    in_order(
+        order.len(),
+        tile_bytes,
+        err,
+        Vec::new,
+        |row, k| {
+            let (i, tx, ty) = order.get(k).copied().ok_or_else(|| err("a tile past the image"))?;
+            let lv = levels.get(i).ok_or_else(|| err("a tile past the image"))?;
+            let mut raw = tile_samples(r, &plan, lv, tx, ty);
+            predict(&mut raw, &plan, row);
+            Ok(miniz_oxide::deflate::compress_to_vec_zlib(&raw, effort))
+        },
+        |k, zipped| {
+            if !big && pos + zipped.len() as u64 > u64::from(u32::MAX) {
+                return Err(err("the file is too large for classic TIFF"));
             }
-        }
-    }
+            out.write_all(&zipped).map_err(err)?;
+            if let Some(p) = order.get(k).and_then(|(i, _, _)| places.get_mut(*i)) {
+                p.push((pos, zipped.len() as u64));
+            }
+            pos += zipped.len() as u64;
+            Ok(())
+        },
+    )?;
 
     fill_tables(out, &head.patches, &places, big, pos, err)?;
     Ok(CogInfo { big, levels: levels.iter().map(|l| (l.w, l.h)).collect(), bytes: pos })
@@ -768,13 +784,13 @@ const STRIP_BYTES: u64 = 1 << 20;
 /// Writes an untiled TIFF of one image into `out` (which must be empty: offsets are from its
 /// start): its directory and tags, then its strips, each made by `rows` (which appends the
 /// samples of a range of rows, interleaved and little-endian), run through the predictor and
-/// compressed with Deflate before the next is made. Classic TIFF when the file can't pass 4 GiB,
-/// BigTIFF otherwise. It counts the strips as its progress, and a cancelled run stops it within a
-/// strip.
+/// compressed with Deflate, on several threads on the desktop ([`in_order`]). Classic TIFF when
+/// the file can't pass 4 GiB, BigTIFF otherwise. It counts the strips as its progress, and a
+/// cancelled run stops it within the few strips being made.
 pub(super) fn write_strips<W: Write + Seek>(
     img: Strips,
     out: &mut W,
-    mut rows: impl FnMut(Range<usize>, &mut Vec<u8>) -> Result<()>,
+    rows: impl Fn(Range<usize>, &mut Vec<u8>) -> Result<()> + Sync,
 ) -> Result<()> {
     if img.w == 0 || img.h == 0 {
         return Err(strip_err("the raster has no pixels to write"));
@@ -820,26 +836,197 @@ pub(super) fn write_strips<W: Write + Seek>(
 
     let effort = if img.classes { DEFLATE_CLASSES } else { DEFLATE_FAST };
     let mut places = vec![Vec::with_capacity(strips)];
-    let (mut raw, mut row) = (Vec::new(), Vec::new());
-    crate::progress::begin(strips);
-    for y in (0..img.h as usize).step_by(per_strip as usize) {
-        crate::progress::step(1)?;
-        raw.clear();
-        rows(y..(y + per_strip as usize).min(img.h as usize), &mut raw)?;
-        predict_rows(&mut raw, line, spp, img.sample, predictor, &mut row);
-        let zipped = miniz_oxide::deflate::compress_to_vec_zlib(&raw, effort);
-        if !big && pos + zipped.len() as u64 > u64::from(u32::MAX) {
-            return Err(strip_err("the file is too large for classic TIFF"));
-        }
-        out.write_all(&zipped).map_err(strip_err)?;
-        if let Some(p) = places.first_mut() {
-            p.push((pos, zipped.len() as u64));
-        }
-        pos += zipped.len() as u64;
-    }
-    // A cancel that came while the last strip was made stops the write too.
-    crate::progress::check()?;
+    let (h, per_strip) = (img.h as usize, per_strip as usize);
+    in_order(
+        strips,
+        line.saturating_mul(per_strip),
+        strip_err,
+        || (Vec::new(), Vec::new()),
+        |(raw, row), k| {
+            let y = k * per_strip;
+            raw.clear();
+            rows(y..(y + per_strip).min(h), raw)?;
+            predict_rows(raw, line, spp, img.sample, predictor, row);
+            Ok(miniz_oxide::deflate::compress_to_vec_zlib(raw, effort))
+        },
+        |_, zipped| {
+            if !big && pos + zipped.len() as u64 > u64::from(u32::MAX) {
+                return Err(strip_err("the file is too large for classic TIFF"));
+            }
+            out.write_all(&zipped).map_err(strip_err)?;
+            if let Some(p) = places.first_mut() {
+                p.push((pos, zipped.len() as u64));
+            }
+            pos += zipped.len() as u64;
+            Ok(())
+        },
+    )?;
     fill_tables(out, &head.patches, &places, big, pos, strip_err)
+}
+
+/// Makes `count` pieces of a file (tiles or strips, each about `bytes` uncompressed) with `make`
+/// and hands each to `put` in their order, with its index. `make` gets the scratch its thread
+/// made with `scratch` once; `err` words a failure of the threads. Every piece stands alone, so
+/// on the desktop, with more than one piece, they are made on several threads
+/// ([`crate::threads::max`], fewer when [`crate::memory::thread_scratch`] can't hold their pieces)
+/// while this thread writes them: the same file as one thread makes, byte for byte. In the browser
+/// they are made one after another.
+///
+/// It counts the pieces as its progress, and a cancelled run stops it within the few pieces being
+/// made ([`AHEAD`] a thread). The first error in the pieces' order comes back, as on one thread.
+fn in_order<S>(
+    count: usize,
+    bytes: usize,
+    err: fn(String) -> DataError,
+    scratch: impl Fn() -> S + Sync,
+    make: impl Fn(&mut S, usize) -> Result<Vec<u8>> + Sync,
+    put: impl FnMut(usize, Vec<u8>) -> Result<()>,
+) -> Result<()> {
+    crate::progress::begin(count);
+    // A piece being made holds about twice its bytes (its samples and their compressed copy), and
+    // each waiting to be written up to its bytes again.
+    let affordable = 1 + crate::memory::thread_scratch() / bytes.saturating_mul(2 + AHEAD).max(1);
+    let threads = crate::threads::for_items(count).min(affordable);
+    if threads > 1 {
+        return in_order_parallel(count, threads, err, scratch, make, put);
+    }
+    one_by_one(count, err, scratch, make, put)?;
+    // A cancel that came while the last piece was made stops the write too.
+    crate::progress::check()
+}
+
+/// [`in_order`] on this thread alone: each piece made, then written, before the next.
+fn one_by_one<S>(
+    count: usize,
+    err: fn(String) -> DataError,
+    scratch: impl Fn() -> S,
+    make: impl Fn(&mut S, usize) -> Result<Vec<u8>>,
+    mut put: impl FnMut(usize, Vec<u8>) -> Result<()>,
+) -> Result<()> {
+    let mut s = scratch();
+    for k in 0..count {
+        crate::progress::step(1)?;
+        put(k, caught(&make, &mut s, k, err).0?)?;
+    }
+    Ok(())
+}
+
+/// Piece `k` from `make`, a panic in it as an error, so the write fails the same way on any number
+/// of threads; and whether it panicked, after which `s` may be half changed.
+fn caught<S>(
+    make: impl Fn(&mut S, usize) -> Result<Vec<u8>>,
+    s: &mut S,
+    k: usize,
+    err: fn(String) -> DataError,
+) -> (Result<Vec<u8>>, bool) {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| make(s, k))) {
+        Ok(made) => (made, false),
+        Err(_) => (Err(err("a piece of the image couldn't be made".into())), true),
+    }
+}
+
+/// The pieces a thread of [`in_order`] may make ahead of the one being written: enough that the
+/// threads rarely wait for a slow piece, few enough that the pieces waiting stay small.
+const AHEAD: usize = 2;
+
+/// [`in_order`] on `threads` threads besides this one, which writes. A thread takes the next piece
+/// unless it is more than [`AHEAD`] a thread past the one to write next, so a slow piece holds up
+/// only that many. A piece's panic comes back as an error in its place. A thread the OS refuses
+/// costs speed, not the write; when it refuses all of them, this thread makes the pieces itself.
+fn in_order_parallel<S>(
+    count: usize,
+    threads: usize,
+    err: fn(String) -> DataError,
+    scratch: impl Fn() -> S + Sync,
+    make: impl Fn(&mut S, usize) -> Result<Vec<u8>> + Sync,
+    mut put: impl FnMut(usize, Vec<u8>) -> Result<()>,
+) -> Result<()> {
+    use std::collections::BTreeMap;
+    use std::sync::{Condvar, Mutex, mpsc};
+
+    /// The next piece to take, the next to write, and whether to stop taking pieces.
+    struct Turn {
+        next: usize,
+        written: usize,
+        stop: bool,
+    }
+    let ahead = threads.saturating_mul(AHEAD);
+    let turn = Mutex::new(Turn { next: 0, written: 0, stop: false });
+    let moved = Condvar::new();
+    let failed = || err("a piece of the image couldn't be made".into());
+    // Takes the next piece once it is no more than `ahead` past the one to write; None to stop.
+    let take = || -> Option<usize> {
+        let mut t = turn.lock().ok()?;
+        while !t.stop && t.next < count && t.next >= t.written.saturating_add(ahead) {
+            t = moved.wait(t).ok()?;
+        }
+        if t.stop || t.next >= count {
+            return None;
+        }
+        t.next += 1;
+        Some(t.next - 1)
+    };
+    /// Stops the threads when dropped, however the writing ends: done, an error, or a panic in
+    /// `put`, which would otherwise leave them waiting for the writer for good, and the scope
+    /// waiting for them.
+    struct Stop<'a>(&'a Mutex<Turn>, &'a Condvar);
+    impl Drop for Stop<'_> {
+        fn drop(&mut self) {
+            if let Ok(mut t) = self.0.lock() {
+                t.stop = true;
+            }
+            self.1.notify_all();
+        }
+    }
+
+    std::thread::scope(|scope| {
+        let (tx, rx) = mpsc::channel::<(usize, Result<Vec<u8>>)>();
+        let work = |tx: mpsc::Sender<(usize, Result<Vec<u8>>)>| {
+            let mut s = scratch();
+            while let Some(k) = take() {
+                let (made, panicked) = caught(&make, &mut s, k, err);
+                // A thread whose piece panicked stops: its scratch may be half changed.
+                if tx.send((k, made)).is_err() || panicked {
+                    break;
+                }
+            }
+        };
+        let started = (0..threads)
+            .filter_map(|_| {
+                let tx = tx.clone();
+                std::thread::Builder::new().spawn_scoped(scope, move || work(tx)).ok()
+            })
+            .count();
+        drop(tx);
+        // The threads finish the pieces they are making and take no more; the scope waits for them.
+        let _stop = Stop(&turn, &moved);
+        (|| -> Result<()> {
+            if started == 0 {
+                return one_by_one(count, err, &scratch, &make, &mut put);
+            }
+            // Pieces made before the ones ahead of them, by their index.
+            let mut waiting = BTreeMap::new();
+            for k in 0..count {
+                let piece = loop {
+                    if let Some(p) = waiting.remove(&k) {
+                        break p;
+                    }
+                    // Every thread gone before piece `k` came: one panicked outside a piece.
+                    let (i, p) = rx.recv().map_err(|_| failed())?;
+                    waiting.insert(i, p);
+                };
+                crate::progress::step(1)?;
+                put(k, piece?)?;
+                if let Ok(mut t) = turn.lock() {
+                    t.written = k + 1;
+                }
+                moved.notify_all();
+            }
+            Ok(())
+        })()
+    })?;
+    // A cancel that came while the last piece was made stops the write too.
+    crate::progress::check()
 }
 
 /// The bands [`write`] and [`write_file`] write of `r` given `band`, from the same plan.
@@ -1395,6 +1582,62 @@ mod tests {
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
         write_file(&r, 0, &path).unwrap();
         assert!(geotiff::write(&r, 0).is_ok());
+    }
+
+    /// Pieces made on several threads, the later ones sooner, are written in their order; the
+    /// first failure in that order comes back, and a piece that panics is an error, not a crash.
+    #[test]
+    fn pieces_made_on_threads_are_written_in_order() {
+        let slow_first = |_: &mut (), k: usize| {
+            std::thread::sleep(std::time::Duration::from_millis(((40 - k) % 7) as u64));
+            Ok(vec![k as u8])
+        };
+        let mut written = Vec::new();
+        in_order_parallel(
+            40,
+            4,
+            err,
+            || (),
+            slow_first,
+            |k, p| {
+                written.push((k, p));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(written, (0..40).map(|k| (k, vec![k as u8])).collect::<Vec<_>>());
+
+        let failing = |_: &mut (), k: usize| match k {
+            9 => Err(err("nine")),
+            17 => panic!("seventeen"),
+            _ => Ok(Vec::new()),
+        };
+        let mut n = 0;
+        let e = in_order_parallel(
+            40,
+            4,
+            err,
+            || (),
+            failing,
+            |_, _| {
+                n += 1;
+                Ok(())
+            },
+        );
+        assert!(e.unwrap_err().to_string().contains("nine"));
+        assert_eq!(n, 9, "the pieces before the failure are written");
+        let panics = |_: &mut (), k: usize| if k == 3 { panic!("three") } else { Ok(Vec::new()) };
+        let e = in_order_parallel(10, 3, err, || (), panics, |_, _| Ok(()));
+        assert!(e.unwrap_err().to_string().contains("couldn't be made"));
+        // A panic while a piece is written, with the threads waiting for it, is passed on rather
+        // than leaving the write waiting for them.
+        let caught_write = std::panic::catch_unwind(|| {
+            in_order_parallel(40, 2, err, || (), |_, _| Ok(Vec::new()), |k, _| if k == 0 { panic!("write") } else { Ok(()) })
+        });
+        assert!(caught_write.is_err());
+        // On one thread too (the browser, a one-core machine).
+        let e = one_by_one(10, err, || (), panics, |_, _| Ok(()));
+        assert!(e.unwrap_err().to_string().contains("couldn't be made"));
     }
 
     /// A cancel that comes while the untiled writer makes its last strip stops the write, rather

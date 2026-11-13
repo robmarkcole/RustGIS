@@ -1658,7 +1658,7 @@ pub fn write_all(r: &Raster) -> Result<Vec<u8>> {
 
 /// Writes `data` (samples interleaved as `img` lays them out, a row after another) as `img`'s
 /// strips, at the end of `out`.
-fn put<T: Copy, const N: usize>(
+fn put<T: Copy + Sync, const N: usize>(
     img: super::cogwrite::Strips,
     data: &[T],
     le: fn(T) -> [u8; N],
