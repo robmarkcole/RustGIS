@@ -1182,17 +1182,20 @@ exporting it (`layer.addData`, `share.exportRaster`) give the full size as `over
 and the MCP server see it too. A GeoTIFF read in place that is added before its overview is in
 (the desktop app, the browser) answers `"reading": true`, sized by its header when that is in, and
 with `null` for its size and bands until then.
-`share.exportRaster` writes an untiled GeoTIFF, with an 8-bit grey band (a hillshade, say) as
-bytes and another single band as 32-bit floats; with `"cog": true` it writes a cloud-optimised one:
-512-pixel tiles compressed with Deflate after a predictor (the floating-point one for decimal
-values, differences along the row for whole numbers, none for classes), overviews (each half the
-size of the last, down to one tile), and every directory ahead of the tiles, so a reader fetches the header once and then only the
-tiles it needs. Overviews are averaged, except for a palette raster or one with a few whole-number
-classes, whose overviews take a pixel so that no class is invented; a palette keeps its colour
-table, though not the table's transparency, which a TIFF colour table can't hold (GDAL drops it
-too). The file is classic TIFF when it would fit in 4 GiB even uncompressed and BigTIFF when it
-might not. Exported to a file it is written tile by tile, never held whole in memory (the browser
-builds it in memory to download it).
+`share.exportRaster` writes an untiled GeoTIFF, in strips of rows, with an 8-bit grey band (a
+hillshade, say) as bytes and another single band as 32-bit floats; with `"cog": true` it writes a
+cloud-optimised one: 512-pixel tiles, overviews (each half the size of the last, down to one tile),
+and every directory ahead of the tiles, so a reader fetches the header once and then only the tiles
+it needs. Both compress with Deflate after a predictor: the floating-point one for decimal values,
+differences along the row for whole numbers, none for classes. Overviews are averaged, except for a
+single band of classes (a palette raster's, a band with class names, or a band written as 8- or
+16-bit whole numbers with a few distinct values), whose overviews take a pixel so that no class is
+invented; colour and grey-with-alpha files are always averaged. A palette keeps its colour table,
+though not the table's transparency, which a TIFF colour table can't hold (GDAL drops it too).
+Either file is classic TIFF when it would fit in 4 GiB even uncompressed and BigTIFF when it might
+not.
+Exported to a file, a cloud-optimised one is written tile by tile, never held whole in memory (the
+browser builds it in memory to download it).
 GeoTIFFs may be regular or cloud-optimised: grey, RGB(A), palette (coloured by the file's colour
 table, as land cover such as the NLCD is) or multiband, of any pixel type, tiled or striped, and
 compressed with Deflate, LZW, PackBits, JPEG or Zstandard. JPEG-compressed YCbCr images are shown
