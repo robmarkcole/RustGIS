@@ -168,7 +168,7 @@ pub(crate) fn made_layer(name: String, layer: rustgis_map::RasterLayer, extra: O
 
 /// Adds a made raster as a layer: the command's answer is the layer's (its id, size and bands) and
 /// what the command says besides (`extra`), and what it does then.
-fn add_made(s: &mut Session, m: Made) -> CmdResult {
+pub(crate) fn add_made(s: &mut Session, m: Made) -> CmdResult {
     let Made { name, layer, extra, then, .. } = m;
     let mut v = super::raster::add_raster(s, &name, layer)?;
     if let (Some(Value::Object(more)), Some(o)) = (extra, v.as_object_mut()) {
@@ -201,6 +201,8 @@ pub(crate) const IN_BACKGROUND: &[(&str, &str, Start)] = &[
     ("raster.process", "Process", super::imagery::process_work),
     ("imagery.mosaic", "Build Mosaic", super::imagery::mosaic_work),
     ("dl.classify", "Deep Learning", super::deeplearning::classify_work),
+    ("embeddings.similarity", "Satellite Embedding Similarity", super::embeddings::similarity_work),
+    ("embeddings.change", "Satellite Embedding Change", super::embeddings::change_work),
 ];
 
 /// `command` and what it is called, when it makes its raster on another thread from the app (see

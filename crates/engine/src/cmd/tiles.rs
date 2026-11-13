@@ -49,6 +49,8 @@ pub const NETWORK: &[&str] = &[
     "embeddings.search",
     "embeddings.add",
     "embeddings.addCube",
+    "embeddings.similarity",
+    "embeddings.change",
     "earthdata.collections",
     "earthdata.granules",
     "nldi.flowline",

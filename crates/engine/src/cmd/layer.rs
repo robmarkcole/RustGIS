@@ -4385,7 +4385,7 @@ fn add_in_place(
 #[cfg(not(target_arch = "wasm32"))]
 const MAX_WINDOW_VALUES: u64 = if cfg!(test) { 300_000 } else { crate::render::rustgis_tiles::cog::MAX_VALUES_READ };
 
-/// The most bands a window reads: each band is a read of its own (8 under test, whose examples
+/// The most bands a window reads, [`WINDOW_BATCH`] a read (8 under test, whose examples
 /// have 16 bands at most).
 #[cfg(not(target_arch = "wasm32"))]
 const MAX_WINDOW_BANDS: usize = if cfg!(test) { 8 } else { 256 };
@@ -4393,6 +4393,14 @@ const MAX_WINDOW_BANDS: usize = if cfg!(test) { 8 } else { 256 };
 /// How long a window's bands are read for, all together: past it, no band more is asked for.
 #[cfg(not(target_arch = "wasm32"))]
 const WINDOW_WAIT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The bands of a window read together, at most: their tiles asked for at once.
+#[cfg(not(target_arch = "wasm32"))]
+const WINDOW_BATCH: usize = 16;
+
+/// How long a window's band may be waited for: a batch of bands has this much a band.
+#[cfg(not(target_arch = "wasm32"))]
+const BAND_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// The extension an address's file name has (lowercase, without the dot), if it has one: the
 /// query and fragment aside.
@@ -4485,6 +4493,20 @@ pub struct WindowAsked {
     bbox: [f64; 4],
     cell: Option<f64>,
     name: Option<String>,
+    /// The bands the file must have, when the caller needs a number of them (checked from its
+    /// header, before anything else is read).
+    bands: Option<usize>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl WindowAsked {
+    /// A window of the file at `url` over `bbox` (west, south, east, north in degrees), with the
+    /// coarsest level whose cells are at most `cell` (the full image without), as `layer.addUrl`
+    /// with that box and `"cellSize"` reads it; a file without `bands` bands is refused from its
+    /// header.
+    pub(crate) fn of(url: &str, bbox: [f64; 4], cell: Option<f64>, bands: usize) -> WindowAsked {
+        WindowAsked { url: url.to_string(), bbox, cell, name: None, bands: Some(bands) }
+    }
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -4518,7 +4540,7 @@ fn window_settled(s: &Session, p: &Value, url: &str, seen: Option<[f64; 4]>) -> 
         Some(v) => Some(v.as_f64().filter(|c| c.is_finite() && *c > 0.0).ok_or_else(|| named("cellSize is a size above 0".into()))?),
     };
     let name = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).map(String::from);
-    Ok(WindowAsked { url: url.to_string(), bbox, cell, name })
+    Ok(WindowAsked { url: url.to_string(), bbox, cell, name, bands: None })
 }
 
 /// A window the app reads off the frame: `p`, a `layer.addUrl` with `"bbox"` and its address bound
@@ -4563,11 +4585,11 @@ pub fn read_cog_window(asked: &WindowAsked) -> Result<CogWindow, String> {
     read_cog_window_until(asked, &std::sync::atomic::AtomicBool::new(false))
 }
 
-/// [`read_cog_window`], giving up within a moment of `stop` being set (the app's Cancel of the
-/// download, or its project closed): in the wait on the header, before each band and in the wait
-/// on its tiles. Making the raster and writing its GeoTIFF, once the values are in, don't look.
+/// [`read_cog_window`]'s raster, giving up within a moment of `stop` being set (the app's Cancel of
+/// the download, or its project closed): in the wait on the header, before each batch of bands
+/// and in the wait on their tiles. Making the raster, once the values are in, doesn't look.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn read_cog_window_until(asked: &WindowAsked, stop: &std::sync::atomic::AtomicBool) -> Result<CogWindow, String> {
+pub(crate) fn read_window_raster(asked: &WindowAsked, stop: &std::sync::atomic::AtomicBool) -> Result<WindowRaster, String> {
     use crate::render::rustgis_tiles::cog;
     use rustgis_data::raster::cog::Level;
     let url = asked.url.as_str();
@@ -4582,9 +4604,12 @@ pub fn read_cog_window_until(asked: &WindowAsked, stop: &std::sync::atomic::Atom
     if !(pw.is_finite() && ph.is_finite() && pw != 0.0 && ph != 0.0) {
         return Err(named("its header gives no pixel size, so no window can be placed in it".into()));
     }
-    if ph > 0.0 || pw < 0.0 {
-        return Err(named("it isn't stored north up, which a window doesn't read yet".into()));
+    if pw < 0.0 {
+        return Err(named("it is stored east to west, which a window doesn't read yet".into()));
     }
+    // Stored bottom-up (AlphaEarth's files): the rows are read south first, and turned over once
+    // read, so the window is north up as any other.
+    let bottom_up = ph > 0.0;
     // The box in the file's coordinates: its edges at 32 points each, and each piece halved until
     // it is straight in the file to within a quarter of its pixel. A projected file bends them (a
     // parallel in a conic projection is an arc whose lowest point can fall between two points).
@@ -4668,8 +4693,12 @@ pub fn read_cog_window_until(asked: &WindowAsked, stop: &std::sync::atomic::Atom
         let at = |v: f64, most: u32| v.clamp(0.0, f64::from(most)) as u32;
         let (c0, c1) =
             (at(((x0 - lt.origin_x) / lt.pixel_width).floor(), l.width), at(((x1 - lt.origin_x) / lt.pixel_width).ceil(), l.width));
-        let (r0, r1) =
-            (at(((y1 - lt.origin_y) / lt.pixel_height).floor(), l.height), at(((y0 - lt.origin_y) / lt.pixel_height).ceil(), l.height));
+        // The file's first row is its northern edge, or its southern one when stored bottom-up.
+        let (first, last) = if bottom_up { (y0, y1) } else { (y1, y0) };
+        let (r0, r1) = (
+            at(((first - lt.origin_y) / lt.pixel_height).floor(), l.height),
+            at(((last - lt.origin_y) / lt.pixel_height).ceil(), l.height),
+        );
         (c0, c1, r0, r1)
     };
     let values = |l: &Level| {
@@ -4691,12 +4720,13 @@ pub fn read_cog_window_until(asked: &WindowAsked, stop: &std::sync::atomic::Atom
     // onto the pixels isn't a cut).
     let cut: Vec<&str> = {
         let lt = layout.transform_of(lv);
-        let (fx1, fy0) = (lt.origin_x + f64::from(lv.width) * lt.pixel_width, lt.origin_y + f64::from(lv.height) * lt.pixel_height);
+        let (fx1, fy) = (lt.origin_x + f64::from(lv.width) * lt.pixel_width, lt.origin_y + f64::from(lv.height) * lt.pixel_height);
+        let (south, north) = (fy.min(lt.origin_y), fy.max(lt.origin_y));
         [
             ("west", x0 < lt.origin_x - tolerance),
             ("east", x1 > fx1 + tolerance),
-            ("south", y0 < fy0 - tolerance),
-            ("north", y1 > lt.origin_y + tolerance),
+            ("south", y0 < south - tolerance),
+            ("north", y1 > north + tolerance),
         ]
         .into_iter()
         .filter_map(|(side, past)| past.then_some(side))
@@ -4718,29 +4748,48 @@ pub fn read_cog_window_until(asked: &WindowAsked, stop: &std::sync::atomic::Atom
         )));
     }
     let count = layout.bands.max(1);
+    if let Some(want) = asked.bands.filter(|n| *n != count) {
+        return Err(named(format!("it has {count} band(s), where {want} are needed")));
+    }
     if count > MAX_WINDOW_BANDS {
         return Err(named(format!("the file has {count} bands; a window reads {MAX_WINDOW_BANDS} at most")));
     }
-    // One read a band, each waiting up to two minutes; no band is started once five minutes are
-    // up (the header's read counted), so the last one started may run two minutes more.
+    // One read a batch of bands (their tiles asked for together, so a file of many bands stored
+    // apart isn't read one band after another), each waiting up to two minutes a band
+    // ([`batch_wait`]); no batch is started once five minutes are up (the header's read counted),
+    // and none runs past two minutes more, as the last band started could when they were read
+    // one at a time.
     // The values `f32` rounded (32- and 64-bit whole numbers and floats), a count a band, are said
     // when the layer is added, as for a file read whole.
     // Those past its range can't be held: left out (no value), and said apart.
     let (mut bands, mut rounded, mut overflowed) = (Vec::with_capacity(count), Vec::with_capacity(count), 0u64);
-    for band in 0..count {
-        band_in_time(band, count, started.elapsed(), WINDOW_WAIT).map_err(named)?;
-        let (values, changed, past) =
-            cog::read_values_counted_blocking(&info, url, level, band, (c0, c1), (r0, r1), stop).map_err(named)?;
-        bands.push(values);
-        rounded.push(changed);
-        overflowed += past;
+    let all: Vec<usize> = (0..count).collect();
+    for batch in all.chunks(WINDOW_BATCH) {
+        band_in_time(batch.first().copied().unwrap_or(0), count, started.elapsed(), WINDOW_WAIT).map_err(named)?;
+        let wait = batch_wait(batch.len(), started.elapsed());
+        for (values, changed, past) in
+            cog::read_bands_counted_blocking(&info, url, level, batch, (c0, c1), (r0, r1), wait, stop).map_err(named)?
+        {
+            bands.push(values);
+            rounded.push(changed);
+            overflowed += past;
+        }
     }
     let lt = layout.transform_of(lv);
-    let transform = rustgis_data::raster::GeoTransform {
+    let mut transform = rustgis_data::raster::GeoTransform {
         origin_x: lt.origin_x + f64::from(c0) * lt.pixel_width,
         origin_y: lt.origin_y + f64::from(r0) * lt.pixel_height,
         ..lt
     };
+    if bottom_up {
+        let width = (c1 - c0) as usize;
+        for band in &mut bands {
+            let rows: Vec<f32> = band.chunks(width.max(1)).rev().flatten().copied().collect();
+            *band = rows;
+        }
+        transform.origin_y = lt.origin_y + f64::from(r1) * lt.pixel_height;
+        transform.pixel_height = -lt.pixel_height;
+    }
     let color = match &layout.palette {
         Some(table) if bands.len() == 1 => rustgis_data::raster::ColorHint::Palette(table.clone()),
         _ => layout.color.clone(),
@@ -4764,6 +4813,36 @@ pub fn read_cog_window_until(asked: &WindowAsked, stop: &std::sync::atomic::Atom
     if let Some(described) = &layout.described {
         r.apply_pam(described, rustgis_data::raster::pam::GDAL_METADATA);
     }
+    let size = size_of(lv);
+    let of = if level == 0 { "the full image".to_string() } else { format!("overview {level} of {}", layout.levels.len() - 1) };
+    let read = format!("a {} × {} window of {of}, cells of {size:.1}{unit}, read by range from its address", r.width, r.height);
+    let finer = finer.map(|c| format!("cellSize {c} is finer than the file's finest cells ({size:.1}{unit}): the full image is read"));
+    let mut edges = Vec::new();
+    if !cut.is_empty() {
+        edges.push(format!("the box reaches past the file's {} edge(s): the window is cut to the file", cut.join(", ")));
+    }
+    if unrefined > 0 {
+        edges.push(format!(
+            "{unrefined} piece(s) of the box's edges not followed to a quarter of a pixel: the window may fall short of a bent edge"
+        ));
+    }
+    if unplaced > 0 {
+        edges.push(format!(
+            "{unplaced} of the {points} points tested along the box's edges have no place in the file's coordinate system: the window is placed from the others"
+        ));
+    }
+    Ok(WindowRaster { raster: r, read, finer, edges, columns: [c0, c1], rows: [r0, r1], level, cell_size: size })
+}
+
+/// [`read_cog_window`], giving up within a moment of `stop` being set (the app's Cancel of the
+/// download, or its project closed): in the wait on the header, before each batch of bands and in
+/// the wait on their tiles. Making the raster and writing its GeoTIFF, once the values are in,
+/// don't look.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn read_cog_window_until(asked: &WindowAsked, stop: &std::sync::atomic::AtomicBool) -> Result<CogWindow, String> {
+    let named = |e: String| crate::sources::message_with_address(&asked.url, &e);
+    let WindowRaster { raster: r, read, finer, edges, columns, rows, level, cell_size } = read_window_raster(asked, stop)?;
+    let name = asked.name.clone().unwrap_or_else(|| cog_name(&asked.url));
     // Kept in the project as a GeoTIFF of the window: a cloud-optimised one, which keeps a colour
     // table; one it can't write (a palette with no index left for no-data) is kept plain, and said so.
     // Neither writes more bands than colour (or grey and alpha) takes: the others are said.
@@ -4784,32 +4863,47 @@ pub fn read_cog_window_until(asked: &WindowAsked, stop: &std::sync::atomic::Atom
             bytes
         }
     };
-    let (width, height, size) = (r.width, r.height, size_of(lv));
     let layer = rustgis_map::RasterLayer::from_bytes(r, format!("{name}.tif"), bytes);
-    let of = if level == 0 { "the full image".to_string() } else { format!("overview {level} of {}", layout.levels.len() - 1) };
-    let mut notes = vec![format!("a {width} × {height} window of {of}, cells of {size:.1}{unit}, read by range from its address")];
+    let mut notes = vec![read];
     notes.extend(plain);
-    if let Some(c) = finer {
-        notes.push(format!("cellSize {c} is finer than the file's finest cells ({size:.1}{unit}): the full image is read"));
-    }
+    notes.extend(finer);
     if left_out > 0 {
         let kept = band_count - left_out;
         notes.push(format!("the project keeps {kept} of its {band_count} bands: {left_out} band(s) are left out once it is reopened"));
     }
-    if !cut.is_empty() {
-        notes.push(format!("the box reaches past the file's {} edge(s): the window is cut to the file", cut.join(", ")));
+    notes.extend(edges);
+    Ok(CogWindow { name, layer, notes, columns, rows, level, cell_size })
+}
+
+/// A window's raster as [`read_window_raster`] reads it, every band kept, and what to say of the
+/// read: its size and level, a cell size finer than the file's, and the box's edges (cut to the
+/// file, not followed, unplaced).
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) struct WindowRaster {
+    pub(crate) raster: rustgis_data::raster::Raster,
+    read: String,
+    finer: Option<String>,
+    edges: Vec<String>,
+    columns: [u32; 2],
+    rows: [u32; 2],
+    level: usize,
+    cell_size: f64,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl WindowRaster {
+    /// What to say of the read, in order, and what its raster left out (`lost`: what the header
+    /// holds but isn't read, values past `f32`'s range), for a caller that makes another raster
+    /// from it and so doesn't add this one (whose `lost` the layer would say).
+    pub(crate) fn notes(&self) -> Vec<String> {
+        self.read_notes().into_iter().chain(self.raster.lost.iter().cloned()).collect()
     }
-    if unrefined > 0 {
-        notes.push(format!(
-            "{unrefined} piece(s) of the box's edges not followed to a quarter of a pixel: the window may fall short of a bent edge"
-        ));
+
+    /// What to say of the read alone (its size and level, a cell size finer than the file's, the
+    /// box's edges), without what the raster left out: the same for windows of one grid.
+    pub(crate) fn read_notes(&self) -> Vec<String> {
+        std::iter::once(self.read.clone()).chain(self.finer.clone()).chain(self.edges.iter().cloned()).collect()
     }
-    if unplaced > 0 {
-        notes.push(format!(
-            "{unplaced} of the {points} points tested along the box's edges have no place in the file's coordinate system: the window is placed from the others"
-        ));
-    }
-    Ok(CogWindow { name, layer, notes, columns: [c0, c1], rows: [r0, r1], level, cell_size: size })
 }
 
 /// Adds a window read by [`read_cog_window`] and says what it read. `p` is the command adding it
@@ -4841,6 +4935,15 @@ pub(crate) fn band_in_time(band: usize, count: usize, elapsed: std::time::Durati
         ));
     }
     Ok(())
+}
+
+/// How long a batch of `bands` bands of a window may wait for its tiles, `elapsed` into the
+/// window's read: two minutes a band, but no later than two minutes past the window's wait (when
+/// the last batch may still start), and never less than one band's two minutes.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn batch_wait(bands: usize, elapsed: std::time::Duration) -> std::time::Duration {
+    let left = (WINDOW_WAIT + BAND_WAIT).saturating_sub(elapsed).max(BAND_WAIT);
+    BAND_WAIT.saturating_mul(u32::try_from(bands.max(1)).unwrap_or(u32::MAX)).min(left)
 }
 
 /// A window can't be read in the web app yet: nothing there may wait for the tiles.

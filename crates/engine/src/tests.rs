@@ -37828,6 +37828,15 @@ fn a_windows_bands_are_started_within_its_wait() {
     assert!(band_in_time(3, 4, Duration::from_secs(299), wait).is_ok());
     let e = band_in_time(2, 4, Duration::from_secs(301), wait).unwrap_err();
     assert_eq!(e, "2 of 4 bands read in 5 minutes, so the window is given up: take a smaller box or a larger cellSize");
+    // A batch of bands waits two minutes a band, within the window's five minutes and the two
+    // past them the last band started had.
+    use crate::cmd::layer::batch_wait;
+    let s = Duration::from_secs;
+    assert_eq!(batch_wait(1, s(0)), s(120));
+    assert_eq!(batch_wait(2, s(0)), s(240));
+    assert_eq!(batch_wait(16, s(0)), s(420));
+    assert_eq!(batch_wait(16, s(299)), s(121));
+    assert_eq!(batch_wait(16, s(400)), s(120), "a band's two minutes at least");
 }
 
 /// A script or model the desktop app runs off the frame, as a plugin's command, leaves a window to
@@ -38074,6 +38083,67 @@ fn a_cog_windows_read_is_apart_from_adding_it() {
     let asked = window_asked(&s, &json!({"url": format!("{gone}/a.tif?token=hidden-1330"), "bbox": [1, 2, 3, 4]})).unwrap();
     let e = read_cog_window(&asked).err().unwrap();
     assert!(e.contains("/a.tif") && !e.contains("hidden-1330"), "{e}");
+}
+
+/// A window of a file stored bottom-up, as AlphaEarth's are (planar signed bytes, no-data −128, a
+/// positive Y pixel size; #1720): its rows turned over once read, so the raster is north up, its
+/// values where they lie and its no-data kept.
+#[test]
+fn a_bottom_up_cog_window_comes_in_north_up() {
+    use rustgis_data::raster::cog::{Example, example_with};
+    // 1024 pixels over 10°–11° E, 45°–46° N, the file's row y at 45° + y/1024; band b of pixel
+    // (x, y) is (x + y + 10 b) % 100 − 50, and pixel (0, 0), the south-west corner, is no-data.
+    let e = Example { size: 1024, tile: 256, bands: 2, planar: true, int8: true, bottom_up: true, ..Example::default() };
+    let (base, _) = serve_ranges(example_with(&e));
+    let mut s = world();
+    let url = format!("{base}/aef.tif");
+    let r = s.run("layer.addUrl", &json!({"url": url, "bbox": [10.25, 45.5, 10.5, 45.75], "name": "Up"})).unwrap();
+    assert_eq!(r["window"]["columns"], json!([256, 512]));
+    let w = s.map().layer_by_name("Up").and_then(|l| l.raster.as_ref()?.data.clone()).unwrap();
+    assert_eq!((w.width, w.height, w.band_count()), (256, 256, 2));
+    assert_eq!((w.transform.origin_x, w.transform.origin_y), (10.25, 45.75));
+    assert!(w.transform.pixel_height < 0.0);
+    // The window's north-west cell is the file's (256, 767); five rows down and ten across, (266, 762).
+    assert_eq!((w.value(0, 0, 0), w.value(1, 0, 0), w.value(0, 10, 5)), (Some(-27.0), Some(-17.0), Some(-22.0)));
+    // At the file's south-west corner, the window's bottom-left cell is the file's no-data.
+    s.run("layer.addUrl", &json!({"url": url, "bbox": [10.0, 45.0, 10.01, 45.01], "name": "Corner"})).unwrap();
+    let c = s.map().layer_by_name("Corner").and_then(|l| l.raster.as_ref()?.data.clone()).unwrap();
+    assert_eq!((c.value(0, 0, i64::from(c.height) - 1), c.value(0, 1, i64::from(c.height) - 1)), (None, Some(-49.0)));
+    assert_eq!(c.transform.origin_y, 45.0 + f64::from(c.height) / 1024.0);
+}
+
+/// A window read for a raster made from it (AlphaEarth's similarity and change, #1720) says what
+/// its header left out, as `layer.addUrl` says it when it adds the window; a clean file, nothing.
+#[test]
+fn a_window_read_for_another_raster_says_what_its_header_left_out() {
+    use crate::cmd::layer::{WindowAsked, read_window_raster};
+    use rustgis_data::raster::cog::{Example, example, example_with};
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let (lossy, _) = serve_ranges(example_with(&Example { size: 512, tile: 256, classes: true, lossy: true, ..Example::default() }));
+    let w = read_window_raster(&WindowAsked::of(&format!("{lossy}/lossy.tif"), [10.0, 45.0, 10.5, 45.5], None, 1), &stop).unwrap();
+    let notes = w.notes();
+    assert!(notes.iter().any(|n| n.starts_with("its colour table has 384 entries")), "{notes:?}");
+    assert!(notes.iter().any(|n| n.contains("its GDAL metadata: 1 CLASS_ item(s)")), "{notes:?}");
+    let (clean, _) = serve_ranges(example(512, 256));
+    let w = read_window_raster(&WindowAsked::of(&format!("{clean}/clean.tif"), [10.0, 45.0, 10.5, 45.5], None, 1), &stop).unwrap();
+    assert_eq!(w.notes().len(), 1, "only the read: {:?}", w.notes());
+    // A change says what each year's file left out, by its year, and once for both when both left
+    // it out; the read, the same for both, once.
+    use crate::cmd::embeddings::two_years_notes;
+    let lossy = read_window_raster(&WindowAsked::of(&format!("{lossy}/lossy.tif"), [10.0, 45.0, 10.5, 45.5], None, 1), &stop).unwrap();
+    let said = two_years_notes(&w, &lossy, (2017, 2025));
+    assert!(said.iter().any(|n| n.starts_with("the 2025 file: its colour table has 384 entries")), "{said:?}");
+    assert!(!said.iter().any(|n| n.starts_with("the 2017")), "{said:?}");
+    assert_eq!(said.iter().filter(|n| n.contains("window of the full image")).count(), 1, "{said:?}");
+    let said = two_years_notes(&lossy, &w, (2017, 2025));
+    assert!(said.iter().any(|n| n.starts_with("the 2017 file: its colour table has 384 entries")), "{said:?}");
+    let said = two_years_notes(&lossy, &lossy, (2017, 2025));
+    assert_eq!(said.iter().filter(|n| n.contains("its colour table has 384 entries")).count(), 1, "{said:?}");
+    assert!(said.iter().any(|n| n.starts_with("the 2017 and 2025 files: its colour table")), "{said:?}");
+    assert_eq!(two_years_notes(&w, &w, (2017, 2025)).len(), 1, "two clean files: only the read");
+    // A file without the bands asked for is refused from its header.
+    let e = read_window_raster(&WindowAsked::of(&format!("{clean}/clean.tif"), [10.0, 45.0, 10.5, 45.5], None, 64), &stop).err().unwrap();
+    assert!(e.contains("it has 1 band(s), where 64 are needed"), "{e}");
 }
 
 /// `layer.addUrl` with `"bbox"` (#1204): a window of a cloud-optimised GeoTIFF, read by range as a
@@ -43677,6 +43747,9 @@ fn long_commands_stop_when_cancelled_while_they_run() {
             "dl.classify",
             json!({"layer": "scene", "training": "training", "classField": "class", "bands": [1, 2], "epochs": 30, "model": "landcover"}),
         ),
+        // Cancelled before the index is read: nothing reaches the network.
+        ("embeddings.similarity", json!({"dataset": "alphaearth", "point": [10.01, 45.01], "bbox": [10.0, 45.0, 10.02, 45.02]})),
+        ("embeddings.change", json!({"dataset": "alphaearth", "bbox": [10.0, 45.0, 10.02, 45.02]})),
     ];
     // Every command that runs in the background is here, and only those.
     fn listed<'a>(l: &[(&'a str, Value)]) -> std::collections::BTreeSet<&'a str> {
