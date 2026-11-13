@@ -198,6 +198,18 @@ pub struct TileLayer {
     /// doesn't offer) it is drawn in tiles. Off in a project saved before: tiles, as then.
     #[serde(default, skip_serializing_if = "is_false")]
     pub single_image: bool,
+    /// A cloud-optimised GeoTIFF's files whose header losses have been said (as it was added, or
+    /// once a header landed: the engine's `Session::notice_landed_rasters`): each date's file of a
+    /// dated series, as the slider shows it. For the session only, so a project opened again says
+    /// them again.
+    #[serde(skip)]
+    pub headers_said: Vec<String>,
+    /// The addresses a dated series has shown (each date's file, as the slider moved to it),
+    /// for the session only: a file whose header lands after the slider moved on (or after an
+    /// export of the time steps drew it) is still said, by the engine's
+    /// `Session::notice_landed_rasters`. At most [`MAX_STEPS`](crate::time::MAX_STEPS).
+    #[serde(skip)]
+    pub headers_shown: Vec<String>,
 }
 
 /// The longest legend address kept.
@@ -401,6 +413,8 @@ impl TileLayer {
             expanded: false,
             selected: false,
             single_image: false,
+            headers_said: Vec::new(),
+            headers_shown: Vec::new(),
         }
     }
 
@@ -451,6 +465,10 @@ impl TileLayer {
     pub fn apply_time(&mut self, time: Option<&crate::time::TimeSlider>) {
         let window = time.map(crate::time::TimeSlider::window);
         let current = time.map(|t| t.current);
+        // The date it leaves is kept too: its header's read may have started as it was drawn.
+        if !self.time_urls.is_empty() || self.time_url.is_some() {
+            self.note_shown();
+        }
         if !self.time_urls.is_empty() {
             let at = match window {
                 Some((from, to)) => self.time_urls.iter().rposition(|(d, _)| *d >= from && *d < to),
@@ -460,6 +478,7 @@ impl TileLayer {
             if let Some((d, u)) = at.and_then(|i| self.time_urls.get(i)) {
                 self.url.clone_from(u);
                 self.time_at = *d;
+                self.note_shown();
             }
             return;
         }
@@ -467,6 +486,23 @@ impl TileLayer {
         if let Some(template) = self.time_url.as_ref().filter(|u| is_web(u)) {
             self.url = rustgis_data::time::fill_template(template, current.unwrap_or(self.time_at));
             self.time_at = current.unwrap_or(self.time_at);
+            self.note_shown();
+        }
+    }
+
+    /// Keeps the address it now shows among those a dated series has shown ([`TileLayer::headers_shown`]):
+    /// a cloud-optimised GeoTIFF's only, whose header's losses are said once it lands, and only
+    /// while they haven't been (a date whose file was said, its look at the address's end or
+    /// not, isn't kept again), so the list holds the dates still to say, not every date shown.
+    pub fn note_shown(&mut self) {
+        let file = self.url.rsplit_once('#').map_or(self.url.as_str(), |(file, _)| file);
+        let said = self.headers_said.iter().any(|f| *f == self.url || f == file);
+        if self.kind == TileKind::Cog
+            && !said
+            && self.headers_shown.len() < crate::time::MAX_STEPS
+            && !self.headers_shown.contains(&self.url)
+        {
+            self.headers_shown.push(self.url.clone());
         }
     }
 
@@ -670,6 +706,8 @@ impl TileLayer {
             expanded: _,
             selected: _,
             single_image: _,
+            headers_said: _,
+            headers_shown: _,
         } = self;
         use crate::TileRole as R;
         let mut out = vec![(R::Url, url.as_str(), self.archive_file().is_some())];
@@ -752,6 +790,31 @@ mod tests {
         assert_eq!(TileKind::guess("https://example.com/tiles/{z}/{x}/{y}.pbf?key=1"), TileKind::Vector);
         assert_eq!(TileKind::guess("https://tiles.openfreemap.org/styles/liberty"), TileKind::Style);
         assert_eq!(TileKind::guess("https://api.maptiler.com/maps/streets/style.json?key=k"), TileKind::Style);
+    }
+
+    /// Only a cloud-optimised GeoTIFF's dates are kept as shown (their headers' losses are said once
+    /// they land, #1331): the date it leaves and the one it goes to, from a list or a template;
+    /// other dated tile layers keep none, however the slider moves.
+    #[test]
+    fn only_a_cogs_dates_are_kept_as_shown() {
+        let (a, b) = ("https://a.example.com/2000.tif".to_string(), "https://a.example.com/2001.tif".to_string());
+        for (kind, kept) in [(TileKind::Cog, vec![a.clone(), b.clone()]), (TileKind::Raster, Vec::new())] {
+            let mut t = TileLayer::new("Series", kind, a.clone());
+            t.time_urls = vec![(1.0, a.clone()), (2.0, b.clone())];
+            t.apply_time(None);
+            assert_eq!(t.headers_shown, kept, "{kind:?}");
+            // A template: the address it fills in for its date is kept too.
+            let mut t = TileLayer::new("Series", kind, a.clone());
+            t.time_url = Some("https://a.example.com/{YYYY}.tif".into());
+            t.apply_time(None);
+            assert_eq!(t.headers_shown.contains(&t.url), kind == TileKind::Cog, "{kind:?}: {:?}", t.headers_shown);
+            // A date whose file was said isn't kept again, its look at the address's end or not.
+            let mut t = TileLayer::new("Series", kind, format!("{a}#bands=1"));
+            t.headers_said = vec![a.clone()];
+            t.time_urls = vec![(1.0, format!("{a}#bands=1")), (2.0, b.clone())];
+            t.apply_time(None);
+            assert_eq!(t.headers_shown, kept.iter().filter(|u| **u != a).cloned().collect::<Vec<_>>(), "{kind:?}");
+        }
     }
 
     #[test]
