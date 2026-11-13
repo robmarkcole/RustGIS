@@ -44822,6 +44822,38 @@ fn publication_writes_its_coverage_grid() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// `layer.rename` refuses a name over 200 characters (once trimmed) rather than cutting it
+/// (#1817): the layer keeps its name and the error gives the length. Characters are counted, not
+/// bytes, so a name in a non-Latin script at 200 is taken; 200 and fewer are taken whole.
+#[test]
+fn a_layer_name_over_200_characters_is_refused_not_cut() {
+    let mut s = world();
+    for (name, taken) in [
+        ("a".repeat(200), true),
+        ("a".repeat(201), false),
+        ("é".repeat(200), true),
+        ("é".repeat(201), false),
+        ("名".repeat(201), false),
+        (format!("  {}  ", "b".repeat(200)), true),
+    ] {
+        let before = s.map().layer_by_name("Cities").unwrap().id;
+        let old = s.map().layer(before).unwrap().name.clone();
+        let r = s.run("layer.rename", &json!({"layer": before, "name": name}));
+        let now = s.map().layer(before).unwrap().name.clone();
+        if taken {
+            r.unwrap();
+            assert_eq!(now, name.trim(), "{} characters", name.chars().count());
+            // Back to its own name for the next case.
+            s.run("layer.rename", &json!({"layer": before, "name": "Cities"})).unwrap();
+        } else {
+            let e = r.unwrap_err();
+            let chars = name.trim().chars().count();
+            assert!(e.contains(&format!("{chars} characters")) && e.contains("at most 200"), "{e}");
+            assert_eq!(now, old, "unchanged after a refusal");
+        }
+    }
+}
+
 /// Commands that take the first N of a list refuse a list given over its limit, and say what
 /// they leave of one they work out or read (#1896): `raster.measure`'s points; the lines
 /// `profile.alongSelected` profiles; the steps `map.route`'s answer lists; the fields

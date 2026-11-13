@@ -2005,6 +2005,27 @@ fn permission_policy_ignored_rename_does_not_promote_another_task() {
     assert!(s.item_trusted("task", "Authored"), "the actual user-edited task retains its content record");
 }
 
+/// A rename past the name's limit is refused when it runs (#1817), so strict review files no
+/// spelling for it: a later step naming the first 200 characters finds no layer, and is refused,
+/// rather than approved against a rename that won't happen. At the limit, the spelling is filed.
+#[test]
+fn permission_policy_rename_past_the_limit_files_no_spelling() {
+    let s = world();
+    let (scope, _) = assistant(3506);
+    let script = |name: &str, step: &str| {
+        let rename = json!({"layer": "Cities", "name": name});
+        let hide = json!({"layer": step, "visible": false});
+        Call::command("script.run", json!({"script": format!("layer.rename {rename}\nlayer.visibility {hide}")}))
+    };
+    let long = "é".repeat(201);
+    let prefix: String = long.chars().take(200).collect();
+    assert!(
+        matches!(s.review(&scope, &script(&long, &prefix)), Outcome::Refused(e) if e.contains("no layer")),
+        "the cut spelling names nothing"
+    );
+    assert!(matches!(s.review(&scope, &script(&prefix, &prefix)), Outcome::NeedsApproval(_)), "a name at the limit is filed");
+}
+
 /// Strict consent refuses a name collision instead of guessing which layer execution will select.
 #[test]
 fn permission_policy_rename_collision_refuses_only_strict_review() {

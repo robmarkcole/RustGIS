@@ -2447,6 +2447,46 @@ mod tests {
         assert_eq!(web, ["geojson", "parquet", "shp", "csv", "kml", "kmz", "gpx"]);
     }
 
+    /// The Rename… dialog shows why a name over 200 characters isn't taken and stays open with
+    /// it, the layer keeping its name; a name of 200 renames it and closes the dialog (#1817).
+    #[test]
+    fn the_rename_dialog_says_a_name_is_too_long() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = RustGisApp::with_sample();
+        let id = app.session.map().layers.first().map(|l| l.id).unwrap();
+        app.run("layer.select", json!({"layer": id})).unwrap();
+        let old = app.session.map().layer(id).unwrap().name.clone();
+        app.run("ui.dialog", json!({"name": "renameLayer"})).unwrap();
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(900.0, 700.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                let ctx = ui.ctx().clone();
+                super::show(app, &ctx);
+            },
+            app,
+        );
+        h.run_steps(3);
+        h.state_mut().dialogs.text = "é".repeat(201);
+        h.run_steps(1);
+        h.get_by_label("Rename").click();
+        h.run_steps(2);
+        let error = h.state().dialogs.error.clone().unwrap_or_default();
+        assert!(error.contains("201 characters") && error.contains("at most 200"), "{error}");
+        assert_eq!(h.state().dialogs.open, Some("renameLayer"), "stays open with the reason");
+        assert_eq!(h.state().session.map().layer(id).unwrap().name, old);
+        h.state_mut().dialogs.text = "é".repeat(200);
+        h.run_steps(1);
+        h.get_by_label("Rename").click();
+        h.run_steps(2);
+        assert_eq!(h.state().session.map().layer(id).unwrap().name, "é".repeat(200));
+        assert_eq!(h.state().dialogs.open, None);
+    }
+
     /// The Coordinate System dialog re-centres a preset (opengeos/RustGIS#517): the central
     /// meridian, set as assistive technology does, goes into the code that Apply uses.
     #[test]

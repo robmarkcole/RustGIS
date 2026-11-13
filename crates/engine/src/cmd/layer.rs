@@ -12,6 +12,10 @@ use serde_json::{Value, json};
 use super::{b, f, need_feature_layer, need_layer, ps, uint};
 use crate::{CmdResult, CommandSpec as C, Session};
 
+/// The most characters a layer's name has (`layer.rename`, once trimmed): a longer one is refused,
+/// not cut. The Layer Properties pane's name box takes no more.
+pub const MAX_LAYER_NAME: usize = 200;
+
 /// Registers layer commands shared by the UI, CLI and command search.
 pub fn commands() -> Vec<C> {
     vec![
@@ -57,9 +61,15 @@ pub fn commands() -> Vec<C> {
             .params(r#"{"layer"?: name|id | [name|id] (default: the active layer; the last of a list becomes the active layer), "mode"?: "replace" (only these; the default) | "toggle" (each in or out of the layer selection; the last one out leaves no active layer) | "extend" (added to it)}"#)
             .view(),
         C::new("layer.rename", "Rename", "Layers", |s, p| {
-            let n = s_req(p, "name")?.trim().chars().take(200).collect::<String>();
+            let n = s_req(p, "name")?.trim().to_string();
             if n.is_empty() {
                 return Err("name is required".into());
+            }
+            // Refused rather than cut, so the name a script or the Rename… dialog gives is never
+            // changed without a word (#1817).
+            let chars = n.chars().count();
+            if chars > MAX_LAYER_NAME {
+                return Err(format!("name is {chars} characters: a layer's name takes at most {MAX_LAYER_NAME}"));
             }
             let id = s.layer_id(p)?;
             let old = s.map().layer(id).map(|l| l.name.clone()).unwrap_or_default();
@@ -97,7 +107,7 @@ pub fn commands() -> Vec<C> {
             legends_follow_layer(s, &old, Some(&n));
             references_follow_layer(s, &old, &n);
             Ok(r)
-        }).roles(&[]).effects(crate::policy::Effects::NONE).params(r#"{"layer"?, "name": string}"#)
+        }).roles(&[]).effects(crate::policy::Effects::NONE).params(r#"{"layer"?, "name": string (at most 200 characters once trimmed; a longer one is refused)}"#)
         .when(need_layer),
         C::new("layer.visibility", "Visibility", "Layers", |s, p| {
             let ids = layer_ids(s, p)?;

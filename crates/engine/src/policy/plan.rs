@@ -677,8 +677,10 @@ impl<'a> Builder<'a> {
                 .find(|t| matches!(t, Target::Layer { .. } | Target::MadeLayer { .. }))
                 .cloned()
                 .or_else(|| self.context().active_layer.map(|id| self.layer_target(id, false)));
-            if let Some(target) = target {
-                let spelling = name.trim().chars().take(200).collect::<String>();
+            // A name past the limit is refused when it runs (#1817): the layer keeps its
+            // spelling, so no later step finds it by the name given, or by part of it.
+            if let Some(target) = target.filter(|_| name.trim().chars().count() <= crate::cmd::layer::MAX_LAYER_NAME) {
+                let spelling = name.trim().to_string();
                 if self.strict
                     && (self.symbol(&spelling).is_some_and(|other| !Self::same_layer_target(&target, other))
                         || self.context().map().layers.iter().any(|layer| {
