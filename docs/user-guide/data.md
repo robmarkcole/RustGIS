@@ -279,7 +279,9 @@ WHERE bbox.xmin BETWEEN -83.95 AND -83.89 AND bbox.ymin BETWEEN 35.94 AND 35.98
 ```
 
 The first geometry column becomes the layer's geometry; other columns become its attributes (types
-RustGIS doesn't read, such as dates and lists, as text). A geometry that says its coordinate system
+RustGIS doesn't read, such as lists, as text). `DATE` columns become dates, `TIMESTAMP` columns
+date-times without a zone and `TIMESTAMPTZ` columns instants in UTC; a `TIMESTAMP_NS` stays text,
+which keeps its nanoseconds. A geometry that says its coordinate system
 is converted to longitude/latitude; give `"crs"` (such as `EPSG:2263`) for one that doesn't. A
 result mixing geometry types becomes a layer per type (points on top, polygons at the bottom), and
 rows without a geometry are left out.
@@ -318,6 +320,12 @@ type, points on top, and empty tables (such as the TIGER geocoder's) are left ou
 their ids between views: the table's integer primary key, else the row's place in the table (the
 rows of a view or a partitioned table without a key are numbered as read, so theirs can change
 between views).
+
+`date` columns are read as dates, and `timestamp` and `timestamptz` columns as date-times:
+a `timestamp` stays the wall-clock time it holds, and a `timestamptz` is the instant, shown in UTC
+whatever the server's or database's time zone. Values a date field can't hold (`infinity`, a
+year BC or after 9999) are read as empty, and the layer counts them by field. `time` and
+`interval` columns stay text.
 
 Passwords are never written to the project. By default, an entered password lasts until
 RustGIS closes. For a named desktop connection, **Remember on this computer** is an unchecked
@@ -389,8 +397,11 @@ Only what you changed is written: the columns whose values differ, and the geome
 takes the value of its key field, else the table's default key (`serial`, identity), else its
 feature id, and its feature takes the key it was saved with. A new row's empty fields take their
 column's default, NULL when it has none. Fields the table has no column for
-aren't saved, and the message names them. The layer says when the database's user can't insert,
-update or delete the table's rows; saving is then refused.
+aren't saved, and the message names them. A date-time with an offset (`+02:00`) saved to a
+`timestamptz` column keeps its moment, held in UTC; saved to a `timestamp` column, it keeps the
+clock time it shows. Either way its offset isn't kept. A date-time without a zone saved to a
+`timestamptz` column is taken as UTC. The message counts each of these by field. The layer says
+when the database's user can't insert, update or delete the table's rows; saving is then refused.
 
 ```sh
 rustgis-cli run --cmd 'pg.connect={"host":"localhost","database":"gis","user":"postgres"}' \
@@ -489,6 +500,11 @@ columns). An address without a database lists the tables of every database but t
 as `database.table`. The session is read only, and a server asking for a local file (`LOAD DATA
 LOCAL INFILE`) is sent none.
 
+`DATE` columns are read as dates and `DATETIME` columns as date-times without a zone. `TIMESTAMP`
+columns, which MySQL holds as instants, are read in UTC whatever the server's time zone. Zero
+and partial dates (`0000-00-00`, `2026-03-00`) are read as empty, and the layer counts them by
+field. `TIME` and `YEAR` columns stay as they were: text and numbers.
+
 `ssl-mode` in the address's query sets the encryption, as the `mysql` client names it:
 `PREFERRED` (the default) encrypts, connecting unencrypted only when the server offers no
 encryption (the layer then says so), and `REQUIRED` always encrypts; neither checks the server's
@@ -553,6 +569,12 @@ more rows match than a view draws; small tables are loaded whole. Curves are lin
 coordinates converted to longitude/latitude. Only rows with the first non-null geometry's SRID
 are read; give `"crs"` for SRID 0. Mixed geometry families become separate layers. An integer
 primary key provides stable feature ids; without one (including views), ids are numbered as read.
+
+`date` columns are read as dates, and `datetime`, `datetime2` and `smalldatetime` columns as
+date-times without a zone. A `datetimeoffset` keeps its offset. RustGIS keeps times to the
+microsecond, so a seventh digit of a second (100 ns) is left out. Looking at up to 100,000 rows,
+the layer names the columns where those rows hold one, and says a larger table's may when they
+hold none (or all of them may, when they couldn't be looked at). `time` columns stay text.
 
 At database compatibility level 100 or lower, streamed `geography` layers filter their whole-table
 read or sample locally instead of sending a viewport polygon to the server. A small view can

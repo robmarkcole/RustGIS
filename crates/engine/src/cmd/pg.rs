@@ -80,6 +80,8 @@ fn pending_edits(s: &mut Session, p: &Value) -> CmdResult {
     }))
 }
 
+/// `pg.saveEdits`: writes a layer's pending edits to its PostGIS table in one transaction, and
+/// says what the table didn't keep: fields without a column, offsets its date-time columns drop.
 fn save_edits(s: &mut Session, p: &Value) -> CmdResult {
     #[cfg(target_arch = "wasm32")]
     {
@@ -164,6 +166,9 @@ fn save_edits(s: &mut Session, p: &Value) -> CmdResult {
         if !saved.skipped_fields.is_empty() {
             s.notify(format!("{name}: {table} has no column for {}, so it wasn't saved", saved.skipped_fields.join(", ")), false);
         }
+        for note in postgis::saved_dates_notes(&fields, &saved, &format!("{name}: {table}")) {
+            s.notify(note, false);
+        }
         Ok(json!({
             "saved": true,
             "inserted": saved.inserted.len(),
@@ -176,6 +181,8 @@ fn save_edits(s: &mut Session, p: &Value) -> CmdResult {
     }
 }
 
+/// `pg.discardEdits`: loads a layer's rows again as they are in its PostGIS table, saying how
+/// many values weren't dates RustGIS holds.
 fn discard_edits(s: &mut Session, p: &Value) -> CmdResult {
     #[cfg(target_arch = "wasm32")]
     {
@@ -200,6 +207,7 @@ fn discard_edits(s: &mut Session, p: &Value) -> CmdResult {
         let editable = src.read_editable(edit.condition.as_deref(), limit).map_err(err)?;
         let read: std::collections::HashMap<u64, i64> = editable.versions.iter().copied().collect();
         let n = editable.features.len();
+        let unread = rustgis_data::source::unread_dates_note(&src.info().fields, &editable.unread_dates);
         let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
         l.dataset.fields = src.info().fields.clone();
         l.dataset.features = editable.features.into();
@@ -211,6 +219,9 @@ fn discard_edits(s: &mut Session, p: &Value) -> CmdResult {
             pg.writable = editable.writable;
         }
         s.notify(format!("{name}: edits discarded; {n} rows loaded again from {}", edit.origin.table), false);
+        if let Some(note) = unread {
+            s.notify(format!("{name}: {note}"), false);
+        }
         Ok(json!({"features": n, "matched": editable.matched}))
     }
 }
@@ -388,6 +399,9 @@ fn add_layer(s: &mut Session, p: &Value) -> CmdResult {
                     ),
                     false,
                 );
+            }
+            if let Some(note) = rustgis_data::source::unread_dates_note(&info.fields, &editable.unread_dates) {
+                s.notify(format!("{layer_name}: {note}"), false);
             }
             if !editable.writable {
                 s.notify(format!("{layer_name}: this user can't insert, update or delete its rows, so edits can't be saved to it"), false);

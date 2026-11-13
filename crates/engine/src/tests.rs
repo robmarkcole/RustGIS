@@ -34722,6 +34722,106 @@ fn postgis_edits_live() {
     assert_eq!(n, 1);
 }
 
+/// Dates in a live PostGIS table: `date`, `timestamp` and `timestamptz` read as dates whatever the
+/// database's own `DateStyle` and `TimeZone`, what RustGIS can't hold (`infinity`, a year BC) is
+/// read as empty and said, and saving says which offsets its columns don't keep.
+/// `RUSTGIS_TEST_POSTGIS` names a database where the test may make and drop a table.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+#[ignore]
+fn postgis_dates_live() {
+    use rustgis_data::{FieldType, Value as V};
+    /// Drops the table, however the test ends.
+    struct Cleanup(String, String);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            if let Ok(mut c) = postgres::Client::connect(&self.0, postgres::NoTls) {
+                let _ = c.batch_execute(&format!("DROP TABLE IF EXISTS public.{}", self.1));
+            }
+        }
+    }
+    let Ok(url) = std::env::var("RUSTGIS_TEST_POSTGIS") else { return };
+    // Settings that would give other text, on every connection the test and RustGIS make:
+    // RustGIS's own session doesn't follow them.
+    let url = if url.contains("://") {
+        let sep = if url.contains('?') { '&' } else { '?' };
+        format!("{url}{sep}options=-c%20DateStyle%3DSQL%2CDMY%20-c%20TimeZone%3DAmerica%2FChicago")
+    } else {
+        format!("{} options='-c DateStyle=SQL,DMY -c TimeZone=America/Chicago'", url.trim_start_matches("postgres:"))
+    };
+    let mut db = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let style: String = db.query_one("SHOW DateStyle", &[]).unwrap().get(0);
+    assert_eq!(style, "SQL, DMY");
+    let table = format!("rustgis_dates_test_{}", std::process::id());
+    let _cleanup = Cleanup(url.clone(), table.clone());
+    db.batch_execute(&format!(
+        "CREATE TABLE public.{table} (id int PRIMARY KEY, d date, ts timestamp, tz timestamptz, geom geometry(Point, 4326));
+         INSERT INTO public.{table} VALUES
+           (1, '2026-03-05', '2026-03-05 14:30:00.25', '2026-03-05 14:30:00+02', ST_SetSRID(ST_MakePoint(1, 1), 4326)),
+           (2, 'infinity', '0044-03-15 12:00:00 BC', NULL, ST_SetSRID(ST_MakePoint(2, 2), 4326));"
+    ))
+    .unwrap();
+
+    let mut s = Session::new(Project::default());
+    s.run("pg.connect", &json!({"connection": url})).unwrap();
+    let mark = s.notice_mark();
+    let r = s.run("pg.addLayer", &json!({"table": format!("public.{table}"), "name": "D"})).unwrap();
+    let id = r["layers"][0].as_u64().unwrap() as u32;
+    let notices: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+    assert!(notices.iter().any(|n| n == "D: 2 values aren't dates and were read as empty, in 'd', 'ts'"), "{notices:?}");
+    let l = s.map().layer(id).unwrap();
+    let types: Vec<FieldType> = l.dataset.fields.iter().map(|f| f.ty).collect();
+    assert_eq!(types, [FieldType::Integer, FieldType::Date, FieldType::DateTime, FieldType::DateTime]);
+    let row_of = |s: &Session, key: u64| s.map().layer(id).unwrap().dataset.features.iter().position(|f| f.id == key).unwrap();
+    let text = |s: &Session, row: usize, k: usize| s.map().layer(id).unwrap().dataset.value(row, k).to_string();
+    let (one, two) = (row_of(&s, 1), row_of(&s, 2));
+    assert_eq!([text(&s, one, 1), text(&s, one, 2), text(&s, one, 3)], ["2026-03-05", "2026-03-05T14:30:00.250", "2026-03-05T12:30:00Z"]);
+    assert!((1..4).all(|k| s.map().layer(id).unwrap().dataset.value(two, k) == &V::Null));
+    // Read live (as a layer drawn from the table), the same, with the same count.
+    {
+        use rustgis_data::source::{FeatureSource, Request, postgis};
+        let conn = postgis::connect(&url, false).unwrap();
+        let t = postgis::find_table(&conn, &format!("public.{table}")).unwrap();
+        let src = postgis::PostgisSource::open(conn, t, None, None).unwrap();
+        let b = src.read(&Request { extent: None, limit: 100 }).unwrap();
+        let note = rustgis_data::source::unread_dates_note(&src.info().fields, &b.unread_dates);
+        assert_eq!(note.as_deref(), Some("2 values aren't dates and were read as empty, in 'd', 'ts'"));
+        let f = b.features.iter().find(|f| f.id == 1).unwrap();
+        assert_eq!(f.attrs.get(3).map(ToString::to_string).as_deref(), Some("2026-03-05T12:30:00Z"));
+    }
+
+    // Edited and saved: the timestamptz keeps the instant in UTC, the timestamp the clock time,
+    // each said; the row not edited keeps its `infinity`.
+    s.map_mut().editing.settings.enabled = true;
+    for (field, value) in [("d", "2027-01-02"), ("ts", "2026-03-06T09:00:00+05:00"), ("tz", "2026-03-06T09:00:00+05:00")] {
+        s.run("edit.setValue", &json!({"layer": "D", "row": one, "field": field, "value": value})).unwrap();
+    }
+    let mark = s.notice_mark();
+    assert_eq!(s.run("pg.saveEdits", &json!({"layer": "D"})).unwrap()["updated"], 1);
+    let notices: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+    for note in [
+        format!("D: {table}: 1 date-time was saved in UTC, without its offset (a timestamptz column holds only the moment), in 'tz'"),
+        format!(
+            "D: {table}: 1 date-time was saved at the clock time shown, without its offset (a timestamp column has no time zone), in 'ts'"
+        ),
+    ] {
+        assert!(notices.contains(&note), "{notices:?}");
+    }
+    db.batch_execute("SET DateStyle = 'ISO, YMD'; SET TimeZone = 'UTC'").unwrap();
+    let row = db.query_one(format!("SELECT d::text, ts::text, tz::text FROM public.{table} WHERE id = 1").as_str(), &[]).unwrap();
+    assert_eq!(
+        (row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, String>(2)),
+        ("2027-01-02".into(), "2026-03-06 09:00:00".into(), "2026-03-06 04:00:00+00".into())
+    );
+    let row = db.query_one(format!("SELECT d::text, ts::text FROM public.{table} WHERE id = 2").as_str(), &[]).unwrap();
+    assert_eq!((row.get::<_, String>(0), row.get::<_, String>(1)), ("infinity".into(), "0044-03-15 12:00:00 BC".into()));
+    // A clean read says nothing of dates.
+    db.batch_execute(&format!("DELETE FROM public.{table} WHERE id = 2")).unwrap();
+    let mark = s.notice_mark();
+    s.run("pg.discardEdits", &json!({"layer": "D"})).unwrap();
+    assert!(s.notices_since(mark).iter().all(|n| !n.text.contains("aren't dates") && !n.text.contains("isn't a date")));
+}
+
 /// Edits go back to one local GeoPackage table atomically, without replacing the file or
 /// losing columns RustGIS doesn't edit. No external database or program is needed.
 #[cfg(not(target_arch = "wasm32"))]

@@ -238,6 +238,8 @@ fn redacted(config: &postgres::Config, error: DataError) -> DataError {
     }
 }
 
+/// Connects with `config` over `tls`, setting up the session: read only unless `writable`, the
+/// statement timeout, full float precision, and dates as ISO text in UTC.
 fn connect_client(config: &postgres::Config, tls: &Tls, writable: bool) -> Result<postgres::Client> {
     let mut client = match tls {
         Tls::Disable => config.connect(postgres::NoTls),
@@ -253,7 +255,13 @@ fn connect_client(config: &postgres::Config, tls: &Tls, writable: bool) -> Resul
         if refused_login(&e) { DataError::Login(message) } else { DataError::Format(message) }
     })?;
     let read_only = if writable { "" } else { "SET default_transaction_read_only = on; " };
-    client.batch_execute(&format!("{read_only}SET statement_timeout = '{STATEMENT_TIMEOUT}'; SET extra_float_digits = 3;")).map_err(err)?;
+    // Dates as text in ISO 8601 whatever the server's own settings, and `timestamptz` in UTC
+    // (`+00`), so a date-time with a zone reads as that instant.
+    client
+        .batch_execute(&format!(
+            "{read_only}SET statement_timeout = '{STATEMENT_TIMEOUT}'; SET extra_float_digits = 3; SET DateStyle = 'ISO, YMD'; SET TimeZone = 'UTC';"
+        ))
+        .map_err(err)?;
     Ok(client)
 }
 
@@ -683,6 +691,9 @@ pub struct Editable {
     pub matched: u64,
     /// Whether this connection's user may insert, update and delete the table's rows.
     pub writable: bool,
+    /// Values in date fields that weren't dates RustGIS holds (`infinity`, a year BC or past
+    /// 9999), read as empty: their count for each field ([`super::unread_dates_note`]).
+    pub unread_dates: Vec<usize>,
 }
 
 /// One geometry column of a table (one family of it, for a column of mixed types), read live.
@@ -723,6 +734,10 @@ fn field_cast(ty: &str) -> Option<(FieldType, &'static str)> {
         "float4" | "float8" | "numeric" => Some((FieldType::Double, "float8")),
         // `money` has no cast to a number; as text it keeps its currency's format.
         "bool" => Some((FieldType::Boolean, "bool")),
+        // Read as ISO text (the session's `DateStyle`), which a date field parses: a `timestamp`
+        // without a zone stays its wall-clock time, a `timestamptz` comes in UTC.
+        "date" => Some((FieldType::Date, "text")),
+        "timestamp" | "timestamptz" => Some((FieldType::DateTime, "text")),
         "geometry" | "geography" | "raster" | "bytea" | "box2d" | "box3d" | "tsvector" => None,
         _ => Some((FieldType::Text, "text")),
     }
@@ -927,9 +942,20 @@ impl PostgisSource {
                 .try_get(0)?;
             Ok((u64::try_from(n).unwrap_or(0), t.query(sql.as_str(), &[])?, writable))
         })?;
-        let mut out = Editable { features: Vec::with_capacity(rows.len()), versions: Vec::with_capacity(rows.len()), matched, writable };
+        let mut out = Editable {
+            features: Vec::with_capacity(rows.len()),
+            versions: Vec::with_capacity(rows.len()),
+            matched,
+            writable,
+            unread_dates: Vec::new(),
+        };
         for r in &rows {
-            let (Some(f), Some(v)) = (self.feature(r), r.try_get::<_, Option<i64>>(version).ok().flatten()) else { continue };
+            // Dates that aren't ones are counted in the rows kept.
+            let mut unread = Vec::new();
+            let (Some(f), Some(v)) = (self.feature(r, &mut unread), r.try_get::<_, Option<i64>>(version).ok().flatten()) else {
+                continue;
+            };
+            super::add_unread_dates(&mut out.unread_dates, &unread);
             out.versions.push((f.id, v));
             out.features.push(f);
         }
@@ -937,8 +963,9 @@ impl PostgisSource {
     }
 
     /// A row read as a feature: the id, the geometry (WKB) and the fields, in the order of
-    /// `select`. `None` without an id or a geometry RustGIS reads.
-    fn feature(&self, r: &postgres::Row) -> Option<Feature> {
+    /// `select`. `None` without an id or a geometry RustGIS reads. A value of a date field that
+    /// isn't a date RustGIS holds is null, counted in `unread` ([`Batch::unread_dates`]).
+    fn feature(&self, r: &postgres::Row, unread: &mut Vec<usize>) -> Option<Feature> {
         let id = r.try_get::<_, Option<i64>>(0).ok().flatten()?;
         let geometry = r.try_get::<_, Option<Vec<u8>>>(1).ok().flatten().and_then(|b| wkb::decode(&b))?;
         let attrs = self
@@ -946,15 +973,16 @@ impl PostgisSource {
             .fields
             .iter()
             .enumerate()
-            .map(|(i, f)| {
-                let i = i + 2;
+            .map(|(k, f)| {
+                let i = k + 2;
                 match f.ty {
                     FieldType::Integer => r.try_get::<_, Option<i64>>(i).ok().flatten().map(Value::Int),
                     FieldType::Double => r.try_get::<_, Option<f64>>(i).ok().flatten().map(Value::Float),
                     FieldType::Boolean => r.try_get::<_, Option<bool>>(i).ok().flatten().map(Value::Bool),
-                    // This reader gives no date fields yet: their values come as text.
-                    FieldType::Text | FieldType::Date | FieldType::DateTime => {
-                        r.try_get::<_, Option<String>>(i).ok().flatten().map(Value::Text)
+                    FieldType::Text => r.try_get::<_, Option<String>>(i).ok().flatten().map(Value::Text),
+                    FieldType::Date | FieldType::DateTime => {
+                        let text = r.try_get::<_, Option<String>>(i).ok().flatten();
+                        Some(super::server_date(text.as_deref(), f.ty, unread, k))
                     }
                 }
                 .unwrap_or(Value::Null)
@@ -1138,6 +1166,61 @@ fn text_value(v: &Value) -> Option<String> {
     }
 }
 
+/// Counts a date-time written to a column (`column`, its type as `format_type` names it) that
+/// doesn't keep what it says: a `timestamptz` holds the instant in UTC, so an offset isn't kept
+/// ([`Saved::utc_dates`]) and a time without a zone is taken as UTC ([`Saved::assumed_utc`]); a
+/// `timestamp` keeps the clock time, without the offset ([`Saved::zoneless_dates`]). Text in the
+/// field counts when it reads as such a date-time.
+fn count_offset(saved: &mut Saved, field: usize, column: &str, v: &Value) {
+    let t = match v {
+        Value::DateTime(t) => Some(*t),
+        // A date is stored at its midnight, without a zone.
+        Value::Date(d) => Some(crate::date::DateTime::from_date(*d)),
+        Value::Text(s) => crate::date::DateTime::parse(s),
+        _ => None,
+    };
+    let Some(t) = t.filter(|_| column.starts_with("timestamp")) else { return };
+    let counts = match (column.ends_with("without time zone"), t.offset()) {
+        (true, Some(_)) => &mut saved.zoneless_dates,
+        (false, Some(o)) if o != 0 => &mut saved.utc_dates,
+        (false, None) => &mut saved.assumed_utc,
+        _ => return,
+    };
+    if counts.len() <= field {
+        counts.resize(field + 1, 0);
+    }
+    if let Some(n) = counts.get_mut(field) {
+        *n = n.saturating_add(1);
+    }
+}
+
+/// What saving to `table` says of the date-times its columns didn't keep as they were
+/// ([`Saved::utc_dates`], [`Saved::zoneless_dates`], [`Saved::assumed_utc`]), naming the fields
+/// of `fields` they were in.
+pub fn saved_dates_notes(fields: &[Field], saved: &Saved, table: &str) -> Vec<String> {
+    let table: String = table.chars().map(crate::io::dbf_notice_char).collect();
+    let kinds: [(&[usize], &str, &str); 3] = [
+        (&saved.utc_dates, "1 date-time was saved in UTC, without its offset", "date-times were saved in UTC, without their offsets"),
+        (
+            &saved.zoneless_dates,
+            "1 date-time was saved at the clock time shown, without its offset",
+            "date-times were saved at the clock time shown, without their offsets",
+        ),
+        (&saved.assumed_utc, "1 date-time without a time zone was saved as UTC", "date-times without a time zone were saved as UTC"),
+    ];
+    let why =
+        ["(a timestamptz column holds only the moment)", "(a timestamp column has no time zone)", "(a timestamptz column holds a moment)"];
+    kinds
+        .iter()
+        .zip(why)
+        .filter_map(|((counts, one, many), why)| {
+            let total: usize = counts.iter().sum();
+            let what = if total == 1 { (*one).to_string() } else { format!("{total} {many}") };
+            (total > 0).then(|| format!("{table}: {what} {why}, in {}", crate::io::named_fields(fields, counts)))
+        })
+        .collect()
+}
+
 impl PostgisSource {
     /// The geometry of parameter `$n` (WKB in longitude/latitude) as the column holds it: in its
     /// coordinate system, its single or multi type, and its dimensions.
@@ -1281,7 +1364,7 @@ impl PostgisSource {
             let current: std::collections::HashMap<u64, Feature> = t
                 .query(format!("SELECT {} FROM {from} WHERE {k} = ANY($1::int8[])", cols.join(", ")).as_str(), &[&ids])?
                 .iter()
-                .filter_map(|r| self.feature(r))
+                .filter_map(|r| self.feature(r, &mut Vec::new()))
                 .map(|f| (f.id, f))
                 .collect();
             for (f, _) in &edits.updates {
@@ -1293,6 +1376,7 @@ impl PostgisSource {
                     if was.and_then(|w| w.attrs.get(tg.read)) == Some(value) {
                         continue;
                     }
+                    count_offset(&mut saved, tg.field, &tg.ty, value);
                     params.push(Box::new(text_value(value)));
                     sets.push(format!("{} = CAST(${}::text AS {})", ident(&tg.name), params.len(), tg.ty));
                 }
@@ -1326,6 +1410,7 @@ impl PostgisSource {
                     if *value == Value::Null {
                         continue;
                     }
+                    count_offset(&mut saved, tg.field, &tg.ty, value);
                     params.push(Box::new(text_value(value)));
                     names.push(ident(&tg.name));
                     values.push(format!("CAST(${}::text AS {})", params.len(), tg.ty));
@@ -1408,7 +1493,9 @@ impl FeatureSource for PostgisSource {
         })?;
         out.matched = matched;
         for r in &rows {
-            let Some(feature) = self.feature(r) else {
+            // Dates that aren't ones are counted in the rows kept.
+            let mut unread = Vec::new();
+            let Some(feature) = self.feature(r, &mut unread) else {
                 out.skipped += 1;
                 continue;
             };
@@ -1419,6 +1506,7 @@ impl FeatureSource for PostgisSource {
             {
                 continue;
             }
+            super::add_unread_dates(&mut out.unread_dates, &unread);
             out.features.push(feature);
         }
         out.complete = step <= 1 && (rows.len() as u64) >= out.matched;
@@ -1557,8 +1645,47 @@ mod tests {
     fn field_casts() {
         assert_eq!(field_cast("int4"), Some((FieldType::Integer, "int8")));
         assert_eq!(field_cast("numeric"), Some((FieldType::Double, "float8")));
-        assert_eq!(field_cast("timestamptz"), Some((FieldType::Text, "text")));
+        assert_eq!(field_cast("date"), Some((FieldType::Date, "text")));
+        assert_eq!(field_cast("timestamp"), Some((FieldType::DateTime, "text")));
+        assert_eq!(field_cast("timestamptz"), Some((FieldType::DateTime, "text")));
+        assert_eq!(field_cast("time"), Some((FieldType::Text, "text")));
         assert_eq!(field_cast("geometry"), None);
+    }
+
+    /// Saving counts what a column doesn't keep: a `timestamptz` keeps an offset's instant in UTC
+    /// and takes a time without a zone as UTC, a `timestamp` keeps the clock time; UTC in a
+    /// `timestamptz`, a time without a zone in a `timestamp` and other columns lose nothing.
+    #[test]
+    fn saved_offsets_are_counted() {
+        let at = |s: &str| Value::parse(s, FieldType::DateTime);
+        let mut saved = Saved::default();
+        for (column, v) in [
+            ("timestamp with time zone", at("2026-03-05T14:30:00+02:00")),
+            ("timestamp(3) with time zone", at("2026-03-05T14:30:00Z")),
+            ("timestamp with time zone", at("2026-03-05T14:30:00")),
+            ("timestamp without time zone", at("2026-03-05T14:30:00Z")),
+            ("timestamp(0) without time zone", Value::Text("2026-03-05 14:30+05:30".into())),
+            ("timestamp without time zone", at("2026-03-05T14:30:00")),
+            ("text", at("2026-03-05T14:30:00+02:00")),
+            ("date", Value::parse("2026-03-05", FieldType::Date)),
+            ("timestamp with time zone", Value::parse("2026-03-05", FieldType::Date)),
+        ] {
+            count_offset(&mut saved, 1, column, &v);
+        }
+        assert_eq!(
+            (saved.utc_dates.as_slice(), saved.zoneless_dates.as_slice(), saved.assumed_utc.as_slice()),
+            (&[0, 1][..], &[0, 2][..], &[0, 2][..])
+        );
+        let fields = [Field::new("id", FieldType::Integer), Field::new("seen", FieldType::DateTime)];
+        assert_eq!(
+            saved_dates_notes(&fields, &saved, "wells"),
+            [
+                "wells: 1 date-time was saved in UTC, without its offset (a timestamptz column holds only the moment), in 'seen'",
+                "wells: 2 date-times were saved at the clock time shown, without their offsets (a timestamp column has no time zone), in 'seen'",
+                "wells: 2 date-times without a time zone were saved as UTC (a timestamptz column holds a moment), in 'seen'"
+            ]
+        );
+        assert!(saved_dates_notes(&fields, &Saved::default(), "wells").is_empty());
     }
 
     /// Reads every table of a live database: `RUSTGIS_TEST_POSTGIS="host=… dbname=… user=…

@@ -335,6 +335,8 @@ fn connect_client(config: &Config, password: Option<&str>) -> Result<((mysql::Co
     Err(last.map(err).unwrap_or_else(|| DataError::Format("not connected".into())))
 }
 
+/// Sets up a new connection's session: read only, `TIMESTAMP` values in UTC, and a statement
+/// timeout where the server has one; with which server it is.
 fn session(mut c: mysql::Conn) -> Result<(mysql::Conn, Server)> {
     let version: Option<String> = c.query_first("SELECT VERSION()").map_err(err)?;
     let server = Server::from_version(version.as_deref().unwrap_or(""));
@@ -344,6 +346,9 @@ fn session(mut c: mysql::Conn) -> Result<(mysql::Conn, Server)> {
         format!("SET SESSION max_execution_time = {}", STATEMENT_TIMEOUT * 1000)
     };
     c.query_drop("SET SESSION TRANSACTION READ ONLY").map_err(err)?;
+    // `TIMESTAMP` values in UTC, so they read as instants whatever the server's zone. Unlike the
+    // timeout, required: without it they'd be read in the server's zone and labelled UTC.
+    c.query_drop("SET SESSION time_zone = '+00:00'").map_err(err)?;
     // MySQL 5.7 and older MariaDB have neither: their statements end with the read timeout.
     let _ = c.query_drop(timeout);
     Ok((c, server))
@@ -633,6 +638,11 @@ fn field_cast(data_type: &str, column_type: &str, col: &str) -> Option<(FieldTyp
         "tinyint" | "smallint" | "mediumint" | "int" | "integer" | "bigint" | "year" => (FieldType::Integer, col.to_string()),
         "bit" => (FieldType::Integer, format!("CAST({col} AS UNSIGNED)")),
         "float" | "double" | "real" | "decimal" | "numeric" => (FieldType::Double, col.to_string()),
+        // As ISO text, which a date field parses: a `DATETIME` is a wall-clock time, a
+        // `TIMESTAMP` an instant, given in UTC (the session's zone).
+        "date" => (FieldType::Date, format!("CAST({col} AS CHAR)")),
+        "datetime" => (FieldType::DateTime, format!("CAST({col} AS CHAR)")),
+        "timestamp" => (FieldType::DateTime, format!("CONCAT(CAST({col} AS CHAR), 'Z')")),
         _ => (FieldType::Text, format!("CAST({col} AS CHAR)")),
     })
 }
@@ -873,7 +883,10 @@ impl MysqlSource {
         box_text(&self.reproject.extent_from_lonlat(&e), self.reproject.is_lonlat())
     }
 
-    fn row_feature(&self, r: &mysql::Row) -> Option<Feature> {
+    /// A row read as a feature: the id, the geometry and the fields, in the order of the select.
+    /// `None` without an id or a geometry RustGIS reads. A value of a date field that isn't a date
+    /// RustGIS holds is null, counted in `unread` ([`Batch::unread_dates`]).
+    fn row_feature(&self, r: &mysql::Row, unread: &mut Vec<usize>) -> Option<Feature> {
         let id = id_of(at(r, 0))?;
         let geometry = match at(r, 1) {
             mysql::Value::Bytes(b) => wkb::decode(b),
@@ -885,15 +898,15 @@ impl MysqlSource {
             .fields
             .iter()
             .enumerate()
-            .map(|(i, f)| {
-                let v = at(r, i + 2);
+            .map(|(k, f)| {
+                let v = at(r, k + 2);
                 match f.ty {
                     // An unsigned value past `i64::MAX` as a number still, if inexact.
                     FieldType::Integer => int_of(v).map(Value::Int).or_else(|| float_of(v).map(Value::Float)),
                     FieldType::Double => float_of(v).map(Value::Float),
                     FieldType::Boolean => int_of(v).map(|i| Value::Bool(i != 0)),
-                    // This reader gives no date fields yet: their values come as text.
-                    FieldType::Text | FieldType::Date | FieldType::DateTime => text_of(v).map(Value::Text),
+                    FieldType::Text => text_of(v).map(Value::Text),
+                    FieldType::Date | FieldType::DateTime => Some(super::server_date(text_of(v).as_deref(), f.ty, unread, k)),
                 }
                 .unwrap_or(Value::Null)
             })
@@ -1002,7 +1015,9 @@ impl MysqlSource {
         let step = stride(matched, limit);
         out.matched = matched;
         for r in &rows {
-            let Some(f) = self.row_feature(r) else {
+            // Dates that aren't ones are counted in the rows kept.
+            let mut unread = Vec::new();
+            let Some(f) = self.row_feature(r, &mut unread) else {
                 out.skipped += 1;
                 continue;
             };
@@ -1012,6 +1027,7 @@ impl MysqlSource {
             if !in_request(g, req) {
                 continue;
             }
+            super::add_unread_dates(&mut out.unread_dates, &unread);
             out.features.push(f);
         }
         out.complete = step <= 1 && (rows.len() as u64) >= out.matched;
@@ -1106,7 +1122,10 @@ mod tests {
         assert_eq!(field_cast("tinyint", "tinyint(1)", "`b`"), Some((FieldType::Boolean, "`b`".into())));
         assert_eq!(field_cast("bigint", "bigint unsigned", "`n`"), Some((FieldType::Integer, "`n`".into())));
         assert_eq!(field_cast("decimal", "decimal(10,2)", "`d`"), Some((FieldType::Double, "`d`".into())));
-        assert_eq!(field_cast("date", "date", "`d`"), Some((FieldType::Text, "CAST(`d` AS CHAR)".into())));
+        assert_eq!(field_cast("date", "date", "`d`"), Some((FieldType::Date, "CAST(`d` AS CHAR)".into())));
+        assert_eq!(field_cast("datetime", "datetime(6)", "`t`"), Some((FieldType::DateTime, "CAST(`t` AS CHAR)".into())));
+        assert_eq!(field_cast("timestamp", "timestamp", "`t`"), Some((FieldType::DateTime, "CONCAT(CAST(`t` AS CHAR), 'Z')".into())));
+        assert_eq!(field_cast("time", "time", "`t`"), Some((FieldType::Text, "CAST(`t` AS CHAR)".into())));
         assert_eq!(field_cast("longblob", "longblob", "`b`"), None);
         assert_eq!(field_cast("point", "point", "`p`"), None);
     }

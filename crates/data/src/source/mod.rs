@@ -251,6 +251,19 @@ pub(crate) fn unread_date(counts: &mut Vec<usize>, k: usize) {
     }
 }
 
+/// The value of the date field at `k` from a database server's ISO 8601 text (PostgreSQL, MySQL,
+/// SQL Server): null for none. Text that isn't a date of the field's type RustGIS holds
+/// (`infinity`, a year BC or past 9999, MySQL's `0000-00-00`) is null too, counted in `unread`
+/// ([`Batch::unread_dates`]).
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn server_date(text: Option<&str>, ty: crate::FieldType, unread: &mut Vec<usize>, k: usize) -> crate::Value {
+    let Some(text) = text else { return crate::Value::Null };
+    gpkg_blob::temporal(Some(text), ty).unwrap_or_else(|| {
+        unread_date(unread, k);
+        crate::Value::Null
+    })
+}
+
 /// Adds the counts of a later read to `counts` ([`Batch::unread_dates`]).
 pub fn add_unread_dates(counts: &mut Vec<usize>, more: &[usize]) {
     if counts.len() < more.len() {

@@ -4018,3 +4018,29 @@ fn a_feature_just_outside_an_extent_is_left_out_of_its_read() {
     assert!(geojson.read(&req).unwrap().features.is_empty());
     std::fs::remove_dir_all(&d).unwrap();
 }
+
+/// The ISO text database servers give for dates (PostgreSQL with `DateStyle` ISO and `TimeZone`
+/// UTC, MySQL's casts with `Z` added for a `TIMESTAMP`, SQL Server's style 126 cut to
+/// microseconds) reads as dates without a count. What RustGIS can't hold (`infinity`, a year BC
+/// or past 9999, MySQL's zero and partial dates) is null and counted, and none is null uncounted.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn database_date_text_reads_as_dates_and_counts_the_rest() {
+    let mut unread = Vec::new();
+    let clean = [
+        (Some("2026-03-05"), FieldType::Date, "2026-03-05"),
+        (Some("2026-03-05 14:30:00.25"), FieldType::DateTime, "2026-03-05T14:30:00.250"),
+        (Some("2026-03-05 14:30:00+00"), FieldType::DateTime, "2026-03-05T14:30:00Z"),
+        (Some("2026-03-05 14:30:00.123456Z"), FieldType::DateTime, "2026-03-05T14:30:00.123456Z"),
+        (Some("2026-03-05T14:30:00.123456+02:00"), FieldType::DateTime, "2026-03-05T14:30:00.123456+02:00"),
+        (None, FieldType::Date, "<Null>"),
+    ];
+    for (text, ty, shown) in clean {
+        assert_eq!(server_date(text, ty, &mut unread, 1).to_string(), shown, "{text:?}");
+    }
+    assert!(unread.is_empty(), "clean text counts nothing: {unread:?}");
+    for text in ["infinity", "-infinity", "0044-03-15 BC", "12026-01-01", "0000-00-00", "2026-03-00", "0000-00-00 00:00:00Z"] {
+        assert_eq!(server_date(Some(text), FieldType::DateTime, &mut unread, 1).to_string(), "<Null>", "{text}");
+    }
+    assert_eq!(unread, [0, 7]);
+}
