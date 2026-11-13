@@ -6,6 +6,9 @@ use rustgis_geom::{Coord, Extent};
 use rustgis_map::{Rgba, symbology::Renderer};
 use serde_json::{Value, json};
 
+/// The most steps `map.route`'s answer lists (its steps layer has them all).
+const MAX_LISTED_STEPS: usize = 200;
+
 use super::{b, ps};
 use crate::render::rustgis_tiles::routing::{self, Avoid, Mode, Route, Router};
 use crate::{CmdResult, CommandSpec as C, Session};
@@ -132,13 +135,27 @@ fn route(s: &mut Session, p: &Value) -> CmdResult {
         "distance": routing::format_distance(r.distance_m, imperial),
         "duration": routing::format_duration(r.duration_s),
         "summary": r.summary,
-        "steps": r.steps.iter().take(200).map(|st| json!({
+        "steps": r.steps.iter().take(MAX_LISTED_STEPS).map(|st| json!({
             "instruction": st.instruction, "type": st.kind, "modifier": st.modifier, "road": st.road,
             "distanceM": st.distance_m, "durationS": st.duration_s, "lon": st.location.x, "lat": st.location.y,
         })).collect::<Vec<_>>(),
     });
+    if !b(p, "addLayer").unwrap_or(true) && r.steps.len() > MAX_LISTED_STEPS {
+        let n = r.steps.len();
+        s.notify(format!("Directions: the answer lists the first {MAX_LISTED_STEPS} of the route's {n} steps"), false);
+    }
     if b(p, "addLayer").unwrap_or(true) {
         let (line, steps) = add_layers(s, r, mode, imperial);
+        // The steps layer has them all; the answer lists the first, and says so (#1896).
+        if r.steps.len() > MAX_LISTED_STEPS {
+            let n = r.steps.len();
+            s.notify(
+                format!(
+                    "Directions: the answer lists the first {MAX_LISTED_STEPS} of the route's {n} steps; the Route steps layer has them all"
+                ),
+                false,
+            );
+        }
         out["layer"] = json!(line);
         out["stepsLayer"] = json!(steps);
     }

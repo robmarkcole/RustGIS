@@ -63,6 +63,9 @@ fn now() -> f64 {
     web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
 }
 
+/// The most lines `profile.alongSelected` profiles.
+const MAX_PROFILED_LINES: usize = 50;
+
 /// Separates in-memory cache controls from commands that read or remove files on disk.
 pub fn commands() -> Vec<C> {
     vec![
@@ -222,7 +225,11 @@ pub fn commands() -> Vec<C> {
         .params(r#"{"layer": elevation raster, "samples"?: number (default 200), "lines": line layer, "row"?: number (the first selected when omitted)}"#),
         C::new("profile.alongSelected", "Profile Along Selected Lines", "View › Profile Viewing", |s, p| {
             let lines = selected_lines(s, p, true)?;
-            let out: Vec<Value> = lines.iter().take(50).map(|l| profile(s, p, l)).collect::<Result<_, _>>()?;
+            // The lines past the first 50 get no profile, and that is said (#1896).
+            if lines.len() > MAX_PROFILED_LINES {
+                s.notify(format!("Profile Along Selected Lines: the first {MAX_PROFILED_LINES} of the {} lines are profiled", lines.len()), false);
+            }
+            let out: Vec<Value> = lines.iter().take(MAX_PROFILED_LINES).map(|l| profile(s, p, l)).collect::<Result<_, _>>()?;
             Ok(Value::Array(out))
         }).inputs(profile_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
         .view()

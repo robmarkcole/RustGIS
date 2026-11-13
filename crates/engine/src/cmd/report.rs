@@ -128,17 +128,28 @@ pub fn commands() -> Vec<C> {
         C::new("report.field", "Field", "Data › Data Design", |s, p| {
             let (i, field) = field_of(s, p, "field")?;
             let r = s.project.reports.get_mut(i).ok_or("no report")?;
-            toggle(&mut r.fields, field, b(p, "remove").unwrap_or(false));
+            let remove = b(p, "remove").unwrap_or(false);
+            if !remove && r.fields.len() >= MAX_ITEMS && !r.fields.iter().any(|f| f.eq_ignore_ascii_case(&field)) {
+                return Err(format!("a report lists at most {MAX_ITEMS} fields"));
+            }
+            toggle(&mut r.fields, field, remove);
             Ok(json!({"fields": r.fields}))
         }).inputs(layer_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
         .when(need_report)
         .params(r#"{"report"?, "field": name, "remove"?: bool}"#),
         C::new("report.autofill", "Autofill Fields", "Data › Data Design", |s, p| {
             let i = index(s, p)?;
-            let names = layer_of(s, i)?.dataset.fields.iter().take(MAX_ITEMS).map(|f| f.name.clone()).collect::<Vec<_>>();
+            let fields = &layer_of(s, i)?.dataset.fields;
+            let all = fields.len();
+            let names = fields.iter().take(MAX_ITEMS).map(|f| f.name.clone()).collect::<Vec<_>>();
             let r = s.project.reports.get_mut(i).ok_or("no report")?;
             r.fields = names;
-            Ok(json!({"fields": r.fields}))
+            let (answer, report) = (json!({"fields": r.fields}), r.name.clone());
+            // A layer with more fields than a report takes: the first are filled in, and that is said (#1896).
+            if all > MAX_ITEMS {
+                s.notify(format!("{report}: the first {MAX_ITEMS} of the layer's {all} fields are filled in"), false);
+            }
+            Ok(answer)
         }).inputs(layer_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
         .when(need_report)
         .params(r#"{"report"?}"#),
@@ -309,6 +320,8 @@ struct Fitted {
     settings: usize,
     filter_cleared: bool,
     columns_replaced: bool,
+    /// The layer's fields, when the default columns are its first `MAX_ITEMS` of more (#1896).
+    layer_fields: usize,
     subreports: usize,
     subreport_fields: usize,
 }
@@ -326,6 +339,7 @@ impl Fitted {
                 usize::from(self.columns_replaced),
                 "{name}: {n} report column set(s) replaced with the layer's default columns because none of the requested columns exist {when}",
             ),
+            (self.layer_fields, "{name}: the report's columns are the first 64 of the layer's {n} fields {when}"),
             (self.subreports, "{name}: {n} subreport(s) whose relationship no longer involves the layer removed {when}"),
             (self.subreport_fields, "{name}: {n} subreport field(s) missing from the related layer removed {when}"),
         ] {
@@ -374,6 +388,7 @@ fn fit_to_layer(r: &mut Report, ds: &rustgis_data::Dataset) -> Fitted {
         - usize::from(r.chart.is_some());
     if r.fields.is_empty() {
         fitted.columns_replaced = fitted.fields > 0;
+        fitted.layer_fields = if ds.fields.len() > MAX_ITEMS { ds.fields.len() } else { 0 };
         r.fields = ds.fields.iter().take(MAX_ITEMS).map(|f| f.name.clone()).collect();
     }
     fitted.filter_cleared = !r.where_clause.is_empty() && rustgis_data::query::parse_fields(&r.where_clause, ds).is_err();
@@ -428,21 +443,28 @@ fn new_report(s: &mut Session, p: &Value) -> CmdResult {
     };
     r.title = ps(p, "title").unwrap_or(&layer.name).chars().take(500).collect();
     let ds = &layer.dataset;
-    let fields_of = |key: &str| -> Result<Vec<String>, String> {
+    // A list given is refused past its limit (#1896), not cut.
+    let fields_of = |key: &str, of: &str, limit: usize| -> Result<Vec<String>, String> {
+        let given = p.get(key).and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+        if given.len() > limit {
+            return Err(format!("{key} has {} entries: {of} at most {limit}", given.len()));
+        }
         let mut out = Vec::new();
-        for v in p.get(key).and_then(Value::as_array).into_iter().flatten().take(MAX_ITEMS) {
+        for v in given {
             let n = v.as_str().ok_or_else(|| format!("{key} are field names"))?;
             let fi = ds.field_index(n).ok_or_else(|| format!("'{}' has no field '{n}'", layer.name))?;
             out.extend(ds.fields.get(fi).map(|f| f.name.clone()));
         }
         Ok(out)
     };
-    r.fields = fields_of("fields")?;
+    r.fields = fields_of("fields", "a report lists", MAX_ITEMS)?;
+    // The layer's fields when none are given: the first of a wide layer, and that is said.
+    let all = ds.fields.len();
+    let first_of = r.fields.is_empty() && all > MAX_ITEMS;
     if r.fields.is_empty() {
         r.fields = ds.fields.iter().take(MAX_ITEMS).map(|f| f.name.clone()).collect();
     }
-    r.groups = fields_of("groups")?;
-    r.groups.truncate(MAX_GROUPS);
+    r.groups = fields_of("groups", "a report groups by", MAX_GROUPS)?;
     if let Some(w) = ps(p, "where").map(str::trim).filter(|w| !w.is_empty()) {
         rustgis_data::query::parse(w, ds)?;
         r.where_clause = w.to_string();
@@ -464,6 +486,9 @@ fn new_report(s: &mut Session, p: &Value) -> CmdResult {
     s.project.reports.push(r);
     let i = s.project.reports.len() - 1;
     s.active_report = Some(i);
+    if first_of {
+        s.notify(format!("{name}: the report lists the first {MAX_ITEMS} of the layer's {all} fields"), false);
+    }
     Ok(json!({"report": i, "name": name}))
 }
 
@@ -566,8 +591,12 @@ fn subreport(s: &mut Session, p: &Value) -> CmdResult {
     let other = opposite(r, &layer).ok_or_else(|| format!("the relationship '{}' doesn't involve '{layer}'", r.name))?.to_string();
     let name = r.name.clone();
     let ds = &find_layer(s, &other).ok_or_else(|| format!("no layer named '{other}'"))?.dataset;
+    let given = p.get("fields").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+    if given.len() > MAX_ITEMS {
+        return Err(format!("fields has {} entries: a subreport lists at most {MAX_ITEMS}", given.len()));
+    }
     let mut fields = Vec::new();
-    for v in p.get("fields").and_then(Value::as_array).into_iter().flatten().take(MAX_ITEMS) {
+    for v in given {
         let n = v.as_str().ok_or("fields are field names")?;
         let fi = ds.field_index(n).ok_or_else(|| format!("'{other}' has no field '{n}'"))?;
         fields.extend(ds.fields.get(fi).map(|f| f.name.clone()));

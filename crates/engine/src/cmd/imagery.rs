@@ -1746,9 +1746,17 @@ fn edit_pixels(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"pixels": n}))
 }
 
+/// The most points `raster.measure` takes.
+const MAX_MEASURE_POINTS: usize = 10_000;
+
 fn measure(s: &mut Session, p: &Value) -> CmdResult {
-    let pts: Vec<Coord> =
-        p.get("points").and_then(Value::as_array).ok_or("points is required")?.iter().take(10_000).map(point).collect::<Result<_, _>>()?;
+    let given = p.get("points").and_then(Value::as_array).ok_or("points is required")?;
+    // Refused over the limit: a measurement of the first points would read as the whole
+    // geometry's (#1896).
+    if given.len() > MAX_MEASURE_POINTS {
+        return Err(format!("points has {} entries: a measurement takes at most {MAX_MEASURE_POINTS}", given.len()));
+    }
+    let pts: Vec<Coord> = given.iter().map(point).collect::<Result<_, _>>()?;
     let kind = ps(p, "kind").ok_or("kind is required")?;
     let dem = ps(p, "layer").map(|n| raster_named(s, n)).transpose()?;
     // A scan's heights would be read at the made-up place it is laid.
