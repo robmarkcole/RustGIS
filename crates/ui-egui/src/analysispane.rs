@@ -186,6 +186,30 @@ fn combo(ui: &mut Ui, id: &str, name: &str, value: &mut String, options: &[Strin
         .on_hover_text(tl!(name));
 }
 
+/// Asks where a desktop conversion goes before starting its export worker. Browser downloads
+/// retain the text-returning command; that command refuses a streamed layer's partial view.
+fn convert_layer(app: &mut RustGisApp) -> Result<(), String> {
+    let format = app.workflow.format.clone();
+    let ext = if format == "wkt" { "csv" } else { &format };
+    let name = format!("{}.{ext}", app.workflow.layer);
+    let mut params = json!({"layer": app.workflow.layer, "format": format});
+    if app.services.download.is_some() {
+        let answer = app.session.run("data.convert", &params)?;
+        app.download_bytes(&name, answer["text"].as_str().unwrap_or("").as_bytes().to_vec());
+    } else if let Some(path) = crate::dialogs::pick_save(&name, &[ext], tl!("Converted data")) {
+        params["path"] = json!(path);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            crate::exportjob::start(app, "data.convert", params)?;
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            app.session.run("data.convert", &params)?;
+        }
+    }
+    Ok(())
+}
+
 /// Runs a workflow's command: on the desktop the slow ones on a thread of their own
 /// ([`background`]), the rest here.
 fn run(app: &mut RustGisApp, id: &str, p: Value) {
@@ -886,20 +910,7 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             }
             combo(ui, "wf_xf", "Format", &mut app.workflow.format, &formats);
             if ui.button(tl!("Convert…")).clicked() {
-                match app.session.run("data.convert", &json!({"layer": app.workflow.layer, "format": app.workflow.format})) {
-                    Ok(v) => {
-                        let ext = if app.workflow.format == "wkt" { "csv".to_string() } else { app.workflow.format.clone() };
-                        let name = format!("{}.{ext}", app.workflow.layer);
-                        let bytes = v["text"].as_str().unwrap_or("").as_bytes().to_vec();
-                        if app.services.download.is_some() {
-                            app.download_bytes(&name, bytes);
-                        } else if let Some(path) = crate::dialogs::pick_save(&name, &[ext.as_str()], tl!("Converted data")) {
-                            let r = rustgis_engine::data::io::write_atomic(std::path::Path::new(&path), &bytes).map_err(|e| e.to_string());
-                            app.workflow.error = r.err();
-                        }
-                    }
-                    Err(e) => app.workflow.error = Some(e),
-                }
+                app.workflow.error = convert_layer(app).err();
             }
         }
         "environments" => {
@@ -2629,6 +2640,57 @@ mod tests {
             assert!(std::time::Instant::now() < end, "the run never landed");
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+    }
+
+    /// The real Convert button asks for a destination first, starts the export job and lands
+    /// its file; dismissing the picker never starts a conversion.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn interop_button_starts_an_export_after_picking_a_file() {
+        let mut app = RustGisApp::with_sample();
+        app.ui.right = Some(crate::RightPane::Workflows);
+        app.workflow.section = "interop";
+        app.workflow.layer = "Cities".into();
+        app.workflow.format = "wkt".into();
+        let dir = std::env::temp_dir().join(format!("rustgis-interop-button-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cities.csv");
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1480.0, 900.0)).with_pixels_per_point(1.3).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                app.ui(ui);
+            },
+            app,
+        );
+        h.run();
+        let logged = h.state().session.log.entries().len();
+        crate::dialogs::PICKED.with(|c| *c.borrow_mut() = None);
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Convert…").click();
+        h.run();
+        assert!(h.state().export_job.is_none());
+        assert_eq!(h.state().session.log.entries().len(), logged, "dismissing the picker does no conversion");
+        assert!(h.state().workflow.error.is_none());
+        crate::dialogs::PICKED.with(|c| *c.borrow_mut() = Some(path.display().to_string()));
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Convert…").click();
+        h.step();
+        assert!(h.state().export_job.is_some(), "{:?}", h.state().workflow.error);
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while h.state().export_job.is_some() {
+            assert!(std::time::Instant::now() < end, "conversion never landed");
+            h.step();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        h.run();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("wkt,"));
+        assert_eq!(text.lines().count() - 1, h.state().session.map().layer_by_name("Cities").unwrap().dataset.features.len());
+        assert_eq!(h.state().session.log.entries().last().unwrap().command, "data.convert");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// Every workflow has named inputs, including both weights sharing a row (#790).

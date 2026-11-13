@@ -465,8 +465,8 @@ impl WktParser {
     }
 }
 
-/// CSV with a `wkt` geometry column and every attribute.
-pub fn to_wkt_csv(ds: &Dataset) -> String {
+/// CSV with a `wkt` geometry column and every attribute; cancellable between features.
+pub fn to_wkt_csv(ds: &Dataset) -> crate::Result<String> {
     // Text starting like a formula is prefixed with ' so spreadsheets show it rather than run it.
     let q = |s: &str| {
         let s = if s.starts_with(['=', '+', '-', '@']) && s.parse::<f64>().is_err() { format!("'{s}") } else { s.to_string() };
@@ -479,6 +479,7 @@ pub fn to_wkt_csv(ds: &Dataset) -> String {
     }
     out.push('\n');
     for f in &ds.features {
+        crate::progress::step(1)?;
         out.push_str(&q(&f.geometry.as_ref().map(wkt).unwrap_or_default()));
         for v in &f.attrs {
             out.push(',');
@@ -486,7 +487,7 @@ pub fn to_wkt_csv(ds: &Dataset) -> String {
         }
         out.push('\n');
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -524,7 +525,7 @@ mod tests {
         let g = to_gpx(&ds, Some(0)).unwrap();
         assert!(g.contains("<wpt lat=\"48.85\" lon=\"2.35\">"));
         assert_eq!(wkt(&Geometry::Line(vec![vec![Coord::new(0.0, 0.0), Coord::new(1.0, 1.0)]])), "LINESTRING (0 0, 1 1)");
-        assert!(to_wkt_csv(&ds).starts_with("wkt,name\nPOINT (2.35 48.85),Paris & co"));
+        assert!(to_wkt_csv(&ds).unwrap().starts_with("wkt,name\nPOINT (2.35 48.85),Paris & co"));
     }
 
     /// Numbers are written in full and a null name as nothing, not as they're shown (rounded to
@@ -545,7 +546,7 @@ mod tests {
         numbered.push(Some(Geometry::Point(Coord::new(1.0, 2.0))), vec![Value::Float(0.1234567891)]);
         assert!(to_kml(&numbered, Some(0)).unwrap().contains("<name>0.1234567891</name>"));
         assert!(to_gpx(&numbered, Some(0)).unwrap().contains("<name>0.1234567891</name>"));
-        let c = to_wkt_csv(&ds);
+        let c = to_wkt_csv(&ds).unwrap();
         assert!(c.contains("POINT (1 2),,0.1234567891\n") && c.contains(",B,0.000000001\n"), "{c}");
     }
 }

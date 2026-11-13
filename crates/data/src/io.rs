@@ -1389,6 +1389,13 @@ pub fn to_geojson(ds: &Dataset) -> Json {
     json!({"type": "FeatureCollection", "name": ds.name, "features": features})
 }
 
+/// A GeoJSON text conversion with per-feature progress and cancellation.
+pub fn to_geojson_text(ds: &Dataset) -> Result<String> {
+    let mut writer = GeoJsonWriter::new(Vec::new(), &ds.name, &ds.fields)?;
+    writer.write(&ds.features)?;
+    String::from_utf8(writer.finish()?).map_err(|e| DataError::Format(e.to_string()))
+}
+
 /// A feature as a GeoJSON Feature, its attributes named by `fields`.
 fn feature_to_geojson(fields: &[Field], f: &crate::Feature) -> Json {
     let mut props = Map::new();

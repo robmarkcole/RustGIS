@@ -785,7 +785,7 @@ fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, gpkg: Gpk
 
 /// Reports numeric loss after the file has been written, keeping the output path literal in
 /// translated interface text. A clean export emits no loss notice.
-fn notify_null_numbers(s: &mut Session, path: &str, count: usize) {
+pub(crate) fn notify_null_numbers(s: &mut Session, path: &str, count: usize) {
     if count > 0 {
         s.notify_text(
             crate::notice_text::NoticeText::format(

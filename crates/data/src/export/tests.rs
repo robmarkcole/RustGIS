@@ -109,6 +109,27 @@ impl FeatureSource for Runs {
     }
 }
 
+/// An explicit mixed-case format selects its text writer even when the path says otherwise.
+#[test]
+fn an_explicit_export_format_ignores_case_and_the_filename() {
+    let d = folder("explicit-format");
+    let mut ds = Dataset::new("places", GeometryType::Point, vec![Field::new("name", FieldType::Text)]);
+    ds.push_next(Some(Geometry::Point(Coord::new(1.0, 2.0))), vec![Value::Text("place".into())]);
+    let src = Runs::new(&ds, 1);
+    for format in ["CSV", "GeOjSoN"] {
+        let path = d.join(format!("{format}.bin"));
+        assert_eq!(write_source_as_in(&src, &ds, &path, Crs::LonLat, format).unwrap().written, 1);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("place"), "{format}: {text}");
+        if format == "GeOjSoN" {
+            assert_eq!(serde_json::from_str::<serde_json::Value>(&text).unwrap()["features"].as_array().unwrap().len(), 1);
+        } else {
+            assert_eq!(text, crate::io::to_csv(&ds).unwrap());
+        }
+    }
+    std::fs::remove_dir_all(d).unwrap();
+}
+
 /// An export in Web Mercator written a chunk at a time counts the vertices beyond 85.05° it
 /// writes at 85.05°, as it writes them: from a source that declares no extent, whose features
 /// beyond aren't in its first chunk. In longitude/latitude, or within 85.05°, it counts none.

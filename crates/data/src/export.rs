@@ -88,17 +88,37 @@ fn write_chunks_to(
     bytes: usize,
 ) -> Result<(Exported, Option<GpkgWritten>)> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-    if !streams(&ext) {
+    write_chunks_as(src, layer, path, crs, gpkg, bytes, &ext)
+}
+
+/// Writes a source in the explicitly chosen format (ignoring case), regardless of the destination's
+/// extension. Used by Data Interop, whose format parameter is independent of its path.
+pub fn write_source_as_in(src: &dyn FeatureSource, layer: &Dataset, path: &Path, crs: Crs, format: &str) -> Result<Exported> {
+    let format = format.to_ascii_lowercase();
+    write_chunks_as(src, layer, path, crs, &GpkgTable::default(), CHUNK_BYTES, &format).map(|(e, _)| e)
+}
+
+/// Shared chunk writer for extension-based exports and explicit-format conversion.
+fn write_chunks_as(
+    src: &dyn FeatureSource,
+    layer: &Dataset,
+    path: &Path,
+    crs: Crs,
+    gpkg: &GpkgTable,
+    bytes: usize,
+    ext: &str,
+) -> Result<(Exported, Option<GpkgWritten>)> {
+    if !streams(ext) {
         return Err(DataError::Unsupported(format!(".{ext} written a chunk at a time")));
     }
     if !src.visits_chunks() {
         return Err(DataError::Unsupported("a source that can't be read a chunk at a time".into()));
     }
     if crs != Crs::LonLat {
-        if !PROJECTED_FORMATS.contains(&ext.as_str()) {
+        if !PROJECTED_FORMATS.contains(&ext) {
             return Err(DataError::Unsupported(format!(".{ext} in {} (it holds longitude/latitude only)", crs.label())));
         }
-        check_projected(&ext, crs)?;
+        check_projected(ext, crs)?;
     }
     // A layer that declares no geometry type takes its first geometry's, as a whole read does.
     let geometry_type = match layer.geometry_type {
@@ -137,7 +157,7 @@ fn write_chunks_to(
                 project_each(&mut chunk, t, crs, false)?;
             }
             total = total.saturating_add(chunk.len());
-            null_numbers = null_numbers.saturating_add(numbers_written_as_null(&chunk, &layer.fields, &ext));
+            null_numbers = null_numbers.saturating_add(numbers_written_as_null(&chunk, &layer.fields, ext));
             if ext == "csv" {
                 csv += crate::io::CsvLosses::of(&chunk, geometry_type);
             }
@@ -152,7 +172,7 @@ fn write_chunks_to(
     };
     let mut table = None;
     let mut unfit = Vec::new();
-    let left_out = match ext.as_str() {
+    let left_out = match ext {
         #[cfg(not(target_arch = "wasm32"))]
         "gpkg" => {
             // Every feature is written: one of another kind makes the column GEOMETRY.

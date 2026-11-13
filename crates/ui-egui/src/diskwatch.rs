@@ -587,6 +587,8 @@ pub(crate) fn plan_write(app: &RustGisApp, command: &str, params: &Value) -> Opt
             let edit = l.gpkg.as_ref()?;
             (edit.path.clone(), edit.table.clone(), Some(Target::Layer { map: s.map().instance_id(), layer: l.instance_id() }))
         }
+        // Conversion replaces a whole file; it writes no container table and refreshes no reader.
+        "data.convert" => (params.get("path").and_then(Value::as_str)?.to_string(), String::new(), None),
         // An existing GeoPackage written into; a new file isn't watched yet.
         "share.exportLayer" | "share.exportTable" => {
             let path = params.get("path").and_then(Value::as_str)?.to_string();
@@ -610,7 +612,12 @@ pub(crate) fn plan_write(app: &RustGisApp, command: &str, params: &Value) -> Opt
     if !app.diskwatch.monitor.watches(&key) {
         return None;
     }
-    let stale = stale_for(&app.diskwatch.found, &key, &path, &table, writer.as_ref());
+    let stale = if command == "data.convert" {
+        // The explicit format can differ from the suffix: even a .gpkg is replaced whole.
+        app.diskwatch.found.iter().filter(|f| f.key == key).map(|f| f.target.clone()).collect()
+    } else {
+        stale_for(&app.diskwatch.found, &key, &path, &table, writer.as_ref())
+    };
     Some(Write { before: None, result: None, key, path, stale, writer, table })
 }
 
@@ -665,7 +672,7 @@ pub(crate) fn ran(app: &mut RustGisApp, command: &str, params: &Value, answer: &
         }
         // A save that wrote nothing (no edits) isn't a write.
         "gpkg.saveEdits" if answer.get("saved").and_then(Value::as_bool) == Some(false) => {}
-        "gpkg.saveEdits" | "share.exportLayer" | "share.exportTable" => {
+        "gpkg.saveEdits" | "share.exportLayer" | "share.exportTable" | "data.convert" => {
             if let Some(write) = before {
                 wrote(app, write, answer);
             }
@@ -1259,6 +1266,14 @@ mod tests {
         let stale = |app: &RustGisApp, command, params: Value| before_write(app, command, &params).map(|w| w.stale.len());
         // Over a single-dataset file: the layer reading it now shows what was there before.
         assert_eq!(stale(&app, "share.exportLayer", json!({"path": geojson})), Some(1));
+        // Interop replaces a whole file in its explicit format, even with a .gpkg suffix:
+        // it refreshes no layer or table, so every reader keeps its old rows.
+        for path in [&geojson, &package] {
+            let write = before_write(&app, "data.convert", &json!({"path": path, "format": "csv"})).unwrap();
+            assert_eq!(write.stale.len(), 1);
+            assert!(write.writer.is_none());
+            assert!(write.table.is_empty());
+        }
         // Into the GeoPackage table a layer reads, by table id or by name; another table, none.
         let by_id = before_write(&app, "share.exportTable", &json!({"table": 7, "path": package, "mode": "replaceTable"})).unwrap();
         assert!(by_id.stale.contains(&table));
