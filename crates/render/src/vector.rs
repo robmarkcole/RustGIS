@@ -103,6 +103,62 @@ pub struct GlyphRun {
     pub color: Color,
     pub transform: Transform,
     pub glyphs: Vec<Glyph>,
+    /// A halo's copy of the text, drawn under it (#1815): its glyphs filled and stroked this wide
+    /// (in the run's pixels), rounded, in `color`. `None` for the text itself.
+    pub halo: Option<f32>,
+}
+
+impl GlyphRun {
+    /// The run's glyph outlines as one path, in the run's space (before `transform`); `None`
+    /// for a run with no outline (spaces).
+    pub(crate) fn outline(&self) -> Option<Path> {
+        let upm = self.font.units_per_em().filter(|u| u.is_finite() && *u > 0.0).unwrap_or(1000.0);
+        let k = self.size / upm;
+        let mut pb = tiny_skia::PathBuilder::new();
+        for g in &self.glyphs {
+            let Some(o) = self.font.outline(g.id) else { continue };
+            let at = |p: ab_glyph::Point| (g.x + p.x * k, -p.y * k);
+            let mut last = None;
+            for c in &o.curves {
+                let (a, e) = match c {
+                    ab_glyph::OutlineCurve::Line(a, b)
+                    | ab_glyph::OutlineCurve::Quad(a, _, b)
+                    | ab_glyph::OutlineCurve::Cubic(a, _, _, b) => (*a, *b),
+                };
+                if last != Some(a) {
+                    if last.is_some() {
+                        pb.close();
+                    }
+                    let (x, y) = at(a);
+                    pb.move_to(x, y);
+                }
+                match c {
+                    ab_glyph::OutlineCurve::Line(_, b) => {
+                        let (x, y) = at(*b);
+                        pb.line_to(x, y);
+                    }
+                    ab_glyph::OutlineCurve::Quad(_, q, b) => {
+                        let ((qx, qy), (x, y)) = (at(*q), at(*b));
+                        pb.quad_to(qx, qy, x, y);
+                    }
+                    ab_glyph::OutlineCurve::Cubic(_, q1, q2, b) => {
+                        let ((ax, ay), (bx, by), (x, y)) = (at(*q1), at(*q2), at(*b));
+                        pb.cubic_to(ax, ay, bx, by, x, y);
+                    }
+                }
+                last = Some(e);
+            }
+            if last.is_some() {
+                pb.close();
+            }
+        }
+        pb.finish()
+    }
+
+    /// The stroke a halo run's glyphs are drawn with: `width` wide, rounded.
+    pub(crate) fn halo_stroke(width: f32) -> Stroke {
+        Stroke { width, cap: LineCap::Round, join: LineJoin::Round, ..Stroke::default() }
+    }
 }
 
 /// A glyph at its pen position along the run, and the character it stands for (what copying
@@ -418,8 +474,7 @@ pub(crate) fn without_layers(items: Vec<Item>) -> Vec<Item> {
 /// recording with what the renderer draws.
 #[cfg(test)]
 pub(crate) fn replay(items: &[Item], pm: &mut Pixmap, base: Transform) {
-    use ab_glyph::Font;
-    use tiny_skia::{GradientStop, Paint, PathBuilder, PixmapPaint, Point, SpreadMode};
+    use tiny_skia::{GradientStop, Paint, PixmapPaint, Point, SpreadMode};
     let paint = |c: Color| {
         let mut p = Paint::default();
         p.set_color(c);
@@ -463,48 +518,14 @@ pub(crate) fn replay(items: &[Item], pm: &mut Pixmap, base: Transform) {
                 pm.stroke_path(path, &paint(*color), &st, base.pre_concat(*transform), None);
             }
             Item::Glyphs(run) => {
-                let upm = run.font.units_per_em().unwrap_or(1000.0);
-                let k = run.size / upm;
-                let mut pb = PathBuilder::new();
-                for g in &run.glyphs {
-                    let Some(o) = run.font.outline(g.id) else { continue };
-                    let at = |p: ab_glyph::Point| (g.x + p.x * k, -p.y * k);
-                    let mut last = None;
-                    for c in &o.curves {
-                        let (a, e) = match c {
-                            ab_glyph::OutlineCurve::Line(a, b)
-                            | ab_glyph::OutlineCurve::Quad(a, _, b)
-                            | ab_glyph::OutlineCurve::Cubic(a, _, _, b) => (*a, *b),
-                        };
-                        if last != Some(a) {
-                            if last.is_some() {
-                                pb.close();
-                            }
-                            let (x, y) = at(a);
-                            pb.move_to(x, y);
-                        }
-                        match c {
-                            ab_glyph::OutlineCurve::Line(_, b) => {
-                                let (x, y) = at(*b);
-                                pb.line_to(x, y);
-                            }
-                            ab_glyph::OutlineCurve::Quad(_, q, b) => {
-                                let ((qx, qy), (x, y)) = (at(*q), at(*b));
-                                pb.quad_to(qx, qy, x, y);
-                            }
-                            ab_glyph::OutlineCurve::Cubic(_, q1, q2, b) => {
-                                let ((ax, ay), (bx, by), (x, y)) = (at(*q1), at(*q2), at(*b));
-                                pb.cubic_to(ax, ay, bx, by, x, y);
-                            }
-                        }
-                        last = Some(e);
+                if let Some(path) = run.outline() {
+                    let at = base.pre_concat(run.transform);
+                    pm.fill_path(&path, &paint(run.color), tiny_skia::FillRule::Winding, at, None);
+                    if let Some(w) = run.halo {
+                        let s = GlyphRun::halo_stroke(w);
+                        let st = tiny_skia::Stroke { width: s.width, line_cap: s.cap, line_join: s.join, ..tiny_skia::Stroke::default() };
+                        pm.stroke_path(&path, &paint(run.color), &st, at, None);
                     }
-                    if last.is_some() {
-                        pb.close();
-                    }
-                }
-                if let Some(path) = pb.finish() {
-                    pm.fill_path(&path, &paint(run.color), tiny_skia::FillRule::Winding, base.pre_concat(run.transform), None);
                 }
             }
             Item::Image(image) => {
@@ -598,6 +619,7 @@ mod tests {
             color: Color::BLACK,
             transform: Transform::identity(),
             glyphs: vec![Glyph { id: ab_glyph::Font::glyph_id(font, 'W'), x: 0.0, ch: 'W' }],
+            halo: None,
         };
         let mut page = Drawing::new(10.0, 10.0);
         page.glyphs(run());

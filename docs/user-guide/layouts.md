@@ -408,8 +408,10 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   file's default; when its file doesn't hold it as drawn; when its file can't be subset (a damaged
   file, or a CFF2 variable font); when its subset would pass 8 MB; or when the document's
   embedded faces would pass 32 MB.
-  `"pdf": {"text": "outlines"}` on `layout.export` sets all the text as outlines, as a print shop
-  asking for outlined type wants.
+  A label's halo is a copy of its text under it, filled and stroked as wide as the halo, so it is
+  text too (marked as decoration, an artifact, for readers that leave those out of what they copy).
+  `"pdf": {"text": "outlines"}` on `layout.export` sets all the text, halos too, as outlines, as a
+  print shop asking for outlined type wants.
   Its page has layers (PDF optional content groups), which a vector editor that reads them opens
   as layers (VectorCraft, where it was checked), and PDF readers list in their layers panel:
   one for each element, named after it, and inside a map frame's, one for each map layer and one

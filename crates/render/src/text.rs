@@ -737,8 +737,8 @@ fn draw_upright(pm: &mut Canvas, l: &PlacedLabel, ppp: f32, ink: Ink) {
         }
     };
     if pm.is_recording() {
-        // Kept as vectors: the background, then each line's halo as its letters' outlines spread
-        // all round (filled, and stroked as wide again), then the text as glyphs.
+        // Kept as vectors: the background, then each line's halo as a copy of its glyphs filled
+        // and stroked all round (text a PDF keeps as text, #1815), then the text as glyphs.
         if ink != Ink::Text {
             draw_background(pm, l, ppp);
         }
@@ -749,16 +749,11 @@ fn draw_upright(pm: &mut Canvas, l: &PlacedLabel, ppp: f32, ink: Ink) {
             };
             // (No width, no halo, as the pixels have it; none built once the recording has
             // overflowed, as nothing more is kept.)
-            for &(line, left, lw, y) in placed.iter().filter(|_| r > 0.0) {
+            for line in placed.iter().filter(|_| r > 0.0) {
                 if pm.overflowed() {
                     break;
                 }
-                let outline = if styled {
-                    styled_outline(line, left, y, px, label_face(l), spacing)
-                } else {
-                    plain_outline(line, left + lw / 2.0, y, px, l.bold)
-                };
-                keep_halo(pm, outline, r, h);
+                keep_halo(pm, r, h, |c, color| put(c, line, color, (0.0, 0.0)));
             }
         }
         if ink != Ink::Halo {
@@ -1036,7 +1031,8 @@ pub fn text_at(pm: &mut Canvas, text: &str, x: f32, y: f32, px_size: f32, color:
         Align::Right => x - measure(text, px_size / 1.33, bold) / 2.0,
     };
     if halo && pm.is_recording() {
-        keep_halo(pm, plain_outline(text, cx, y, px_size, bold), (px_size * 0.09).max(1.0), Rgba::new(255, 255, 255, 230));
+        let r = (px_size * 0.09).max(1.0);
+        keep_halo(pm, r, Rgba::new(255, 255, 255, 230), |c, color| draw_text(c, text, cx, y, px_size, color, bold, (0.0, 0.0)));
     } else if halo {
         let r = (px_size * 0.09).max(1.0);
         for (dx, dy) in [(-r, 0.0), (r, 0.0), (0.0, -r), (0.0, r)] {
@@ -1071,98 +1067,16 @@ fn keep_glyphs(
             color: tiny_skia::Color::from_rgba8(color.r(), color.g(), color.b(), color.a()),
             transform: Transform::from_row(1.0, 0.0, kx, 1.0, origin.0, origin.1),
             glyphs: run.iter().map(|&(i, &(_, id, x, ch))| crate::vector::Glyph { id, x: x + spacing * i as f32, ch }).collect(),
+            halo: None,
         });
     }
 }
 
-/// The outline of one line of [`draw_text`]'s, centred on (`cx`, `cy`), as one path.
-fn plain_outline(text: &str, cx: f32, cy: f32, px: f32, bold: bool) -> Option<tiny_skia::Path> {
-    let f = font(bold)?;
-    let sf = f.as_scaled(em(f, px));
-    let (glyphs, width) = shape(text, px, f, None);
-    let base = cy + (sf.ascent() + sf.descent()) / 2.0;
-    outline_of(&glyphs, (cx - width / 2.0, base), px, 0.0, |_| false)
-}
-
-/// The outline of one line of [`styled_at`]'s, from `left`, as one path.
-fn styled_outline(text: &str, left: f32, cy: f32, px: f32, face: Face, spacing: f32) -> Option<tiny_skia::Path> {
-    let (f, slanted) = face_font(face)?;
-    let sf = f.as_scaled(em(f, px));
-    let base = cy + (sf.ascent() + sf.descent()) / 2.0;
-    let (glyphs, _) = shape(text, px, f, sans_beside(f, face));
-    outline_of(&glyphs, (left, base), px, spacing, |gf| leans(face, f, slanted, gf))
-}
-
-/// `glyphs`' outlines placed as [`keep_glyphs`] places them, in pixels, as one path.
-fn outline_of(
-    glyphs: &[Shaped],
-    (x0, base): (f32, f32),
-    px: f32,
-    spacing: f32,
-    lean: impl Fn(&FontRef<'static>) -> bool,
-) -> Option<tiny_skia::Path> {
-    let mut pb = tiny_skia::PathBuilder::new();
-    for (i, &(f, id, x, _)) in glyphs.iter().enumerate() {
-        // A face with no usable units per em is read at the usual 1000, as its glyphs are in the
-        // PDF's fonts.
-        let upm = f.units_per_em().filter(|u| u.is_finite() && *u > 0.0).unwrap_or(1000.0);
-        let Some(o) = f.outline(id) else { continue };
-        let (k, slant, pen) = (px / upm, if lean(f) { SLANT } else { 0.0 }, x0 + x + spacing * i as f32);
-        // Font units (y up, from the pen on the baseline) to pixels.
-        let at = |p: ab_glyph::Point| (pen + (p.x + slant * p.y) * k, base - p.y * k);
-        let mut last: Option<ab_glyph::Point> = None;
-        for c in &o.curves {
-            let (start, end) = match c {
-                ab_glyph::OutlineCurve::Line(a, b) | ab_glyph::OutlineCurve::Quad(a, _, b) | ab_glyph::OutlineCurve::Cubic(a, _, _, b) => {
-                    (*a, *b)
-                }
-            };
-            if last != Some(start) {
-                if last.is_some() {
-                    pb.close();
-                }
-                let (sx, sy) = at(start);
-                pb.move_to(sx, sy);
-            }
-            match c {
-                ab_glyph::OutlineCurve::Line(_, b) => {
-                    let (bx, by) = at(*b);
-                    pb.line_to(bx, by);
-                }
-                ab_glyph::OutlineCurve::Quad(_, k1, b) => {
-                    let ((kx, ky), (bx, by)) = (at(*k1), at(*b));
-                    pb.quad_to(kx, ky, bx, by);
-                }
-                ab_glyph::OutlineCurve::Cubic(_, k1, k2, b) => {
-                    let ((ax, ay), (cx, cy), (bx, by)) = (at(*k1), at(*k2), at(*b));
-                    pb.cubic_to(ax, ay, cx, cy, bx, by);
-                }
-            }
-            last = Some(end);
-        }
-        if last.is_some() {
-            pb.close();
-        }
-    }
-    pb.finish()
-}
-
-/// Keeps a halo `r` pixels wide round `outline` in `color`: the letters filled and their outlines
-/// stroked twice `r` wide, rounded, both opaque in a group at the colour's alpha, so a see-through
-/// halo is one coat where they overlap.
-fn keep_halo(pm: &mut Canvas, outline: Option<tiny_skia::Path>, r: f32, color: Rgba) {
-    let Some(path) = outline else { return };
-    let stroke = tiny_skia::Stroke {
-        width: 2.0 * r,
-        line_cap: tiny_skia::LineCap::Round,
-        line_join: tiny_skia::LineJoin::Round,
-        ..tiny_skia::Stroke::default()
-    };
-    let solid = crate::paint(color.with_alpha(255), 1.0);
-    pm.group(f32::from(color.a()) / 255.0, |c| {
-        c.fill_path(&path, &solid, tiny_skia::FillRule::Winding, Transform::identity(), None);
-        c.stroke_path(&path, &solid, &stroke, Transform::identity(), None);
-    });
+/// Keeps a halo `r` pixels wide in `color` round the text `draw` sets (given the colour to set it
+/// in): a copy of its glyphs, filled and stroked twice `r` wide, rounded (#1815), opaque in a
+/// group at the colour's alpha, so a see-through halo is one coat where glyphs overlap.
+fn keep_halo(pm: &mut Canvas, r: f32, color: Rgba, draw: impl FnOnce(&mut Canvas, Rgba)) {
+    pm.group(f32::from(color.a()) / 255.0, |c| c.halo(2.0 * r, |c| draw(c, color.with_alpha(255))));
 }
 
 #[cfg(test)]

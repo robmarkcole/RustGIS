@@ -153,7 +153,7 @@ pub(super) fn embed(font: &FontRef<'_>, glyphs: &[GlyphId], room: usize) -> Resu
     let name = if name.is_empty() { "Face".to_string() } else { name };
     Ok(Embedded {
         cff: face.tables().cff.is_some(),
-        name: format!("{}+{name}", tag(&name, glyphs)),
+        name: format!("{}+{name}", tag(&name, glyphs, data)),
         remapper,
         bbox: [f32::from(b.x_min) * k, f32::from(b.y_min) * k, f32::from(b.x_max) * k, f32::from(b.y_max) * k],
         ascent: f32::from(face.ascender()) * k,
@@ -188,10 +188,15 @@ fn curve_points(c: &OutlineCurve) -> (u8, [(f32, f32); 4]) {
     }
 }
 
-/// A subset's six-letter tag, from its face's name and glyphs: the same subset, the same tag.
-fn tag(name: &str, glyphs: &[GlyphId]) -> String {
+/// A subset's six-letter tag, from its face's name, glyphs and file (its size and bytes): the same
+/// subset, the same tag, and two files with the same name and glyphs, two tags.
+fn tag(name: &str, glyphs: &[GlyphId], file: &[u8]) -> String {
+    // FNV-1a, a byte at a time: a multiplication carries a byte's bits only upwards, so a wider
+    // value mixed at once would leave its high bytes out of the low bits the letters are read from.
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in name.bytes().chain(glyphs.iter().flat_map(|g| g.0.to_le_bytes())) {
+    let glyph_bytes = glyphs.iter().flat_map(|g| g.0.to_le_bytes());
+    let len_bytes = (file.len() as u64).to_le_bytes();
+    for b in name.bytes().chain(glyph_bytes).chain(len_bytes).chain(file.iter().copied()) {
         h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
     }
     (0..6).map(|i| char::from(b'A' + ((h >> (i * 5)) % 26) as u8)).collect()
@@ -230,6 +235,7 @@ mod tests {
             color: Color::BLACK,
             transform: Transform::from_row(1.0, 0.0, kx, 1.0, 10.0, 40.0),
             glyphs: text.chars().zip(0..).map(|(ch, i)| Glyph { id: font.glyph_id(ch), x: 11.0 * i as f32, ch }).collect(),
+            halo: None,
         };
         let mut d = Drawing::new(200.0, 100.0);
         d.glyphs(run(0.0));
@@ -306,6 +312,23 @@ mod tests {
         checked
     }
 
+    /// A subset's tag follows its face's file, not only its name and glyphs: two files with the
+    /// same name and glyphs get two tags (#1815), whichever of their bytes differs, the high bytes
+    /// of an eight-byte word too.
+    #[test]
+    fn a_subset_tag_follows_its_file() {
+        let glyphs = [GlyphId(3), GlyphId(7)];
+        let a = tag("Face", &glyphs, b"ABCDEFGHIJKLMNOP");
+        assert_eq!(a, tag("Face", &glyphs, b"ABCDEFGHIJKLMNOP"), "the same subset, the same tag");
+        assert!(a.len() == 6 && a.chars().all(|c| c.is_ascii_uppercase()), "{a}");
+        // The same length, one byte apart: each of a word's eight bytes, in turn.
+        for at in 0..8 {
+            let mut other = *b"ABCDEFGHIJKLMNOP";
+            other[at] ^= 0x5A;
+            assert_ne!(a, tag("Face", &glyphs, &other), "byte {at}");
+        }
+    }
+
     /// A CFF face (an OpenType .otf) is embedded as a CIDFontType0 over its subset as an
     /// OpenType file (FontFile3, PDF 1.6), each CID its character's glyph. The face is the
     /// test's own (testdata/README.md): a square, a triangle and two bars, each its own width.
@@ -322,6 +345,48 @@ mod tests {
         assert!(!cid_font.contains("/CIDToGIDMap"), "{cid_font}");
         assert!(objs.iter().any(|o| o.0.contains("/FontFile3")) && objs.iter().any(|o| o.0.contains("/Subtype /OpenType")));
         assert_eq!(cids_are_their_glyphs(font, &objs, "/Subtype /CIDFontType0"), 3, "C, A, B");
+    }
+
+    /// A halo (#1815) is its text again under it, filled and stroked: in an embedded face, the
+    /// same font in rendering mode 2, its stroke rounded and as wide as the run's scale makes it,
+    /// marked as an artifact; in outlines, its glyphs' outlines filled and stroked, as before.
+    #[test]
+    fn a_halo_is_its_text_filled_and_stroked() {
+        let font = face(|_| ());
+        let run = |halo: Option<f32>, color: Color| GlyphRun {
+            font,
+            size: 20.0,
+            color,
+            transform: Transform::from_row(2.0, 0.0, 0.0, 2.0, 10.0, 40.0),
+            glyphs: "Rio".chars().zip(0..).map(|(ch, i)| Glyph { id: font.glyph_id(ch), x: 11.0 * i as f32, ch }).collect(),
+            halo,
+        };
+        let page = || {
+            let mut d = Drawing::new(200.0, 100.0);
+            d.begin_group(0.9, rustgis_map::effects::Blend::Normal, None);
+            d.glyphs(run(Some(2.4), Color::WHITE));
+            d.end_group();
+            d.glyphs(run(None, Color::BLACK));
+            Page::drawing(d, 100.0, 50.0)
+        };
+        let streams =
+            |pdf: &[u8]| objects(pdf).into_iter().map(|o| String::from_utf8_lossy(&o.1).into_owned()).collect::<Vec<_>>().join("\n");
+        let (pdf, outlined) = write_with(&[page()], "Halo", Options { text: Text::Fonts, ..Options::default() });
+        assert!(outlined.is_empty());
+        let text = String::from_utf8_lossy(&pdf);
+        assert_eq!(text.matches("/Subtype /Type0").count(), 1, "the halo in the text's own font");
+        let content = streams(&pdf);
+        let halo = content.split("/Artifact BMC\n").nth(1).and_then(|h| h.split("EMC\n").next()).unwrap_or_else(|| panic!("{content}"));
+        assert!(halo.starts_with("BT\n2 Tr\n") && halo.ends_with("] TJ\n0 Tr\nET\n"), "{halo}");
+        // Stroked in white, rounded, the run's 2.4 pixels doubled by its scale.
+        assert!(
+            content.contains("1 1 1 RG") && content.contains("4.8 w") && content.contains("1 J") && content.contains("1 j"),
+            "{content}"
+        );
+        assert_eq!(content.matches(" Tr\n").count(), 2, "the text itself is filled only");
+        // In outlines: the halo as its glyphs' outlines, filled and stroked.
+        let outlines = streams(&write_with(&[page()], "Halo", Options { text: Text::Outlines, ..Options::default() }).0);
+        assert!(!outlines.contains(" Tr\n") && !outlines.contains("/Artifact") && outlines.contains("\nB\n"), "{outlines}");
     }
 
     /// A face whose licence forbids embedding (fsType 2) is set in outlines, and said.

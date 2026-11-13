@@ -260,6 +260,18 @@ impl Writer<'_> {
 
     /// Sets a run of glyphs in the document's fonts, each at its pen position.
     fn glyphs(&mut self, out: &mut Vec<u8>, st: &mut State, run: &GlyphRun) {
+        // A halo (#1815): in an embedded face, the same text filled and stroked (rendering mode
+        // 2), so an editor sees it as text too, marked as an artifact; in outlines (a Type 3
+        // glyph is filled only), its glyphs' outlines filled and stroked, as before.
+        let halo = run.halo.filter(|w| w.is_finite() && *w > 0.0);
+        if let Some(w) = halo
+            && !self.fonts.is_real(run.font)
+        {
+            if let Some(path) = run.outline() {
+                self.fill_and_stroke(out, st, &path, run.color, FillRule::Winding, (run.color, &GlyphRun::halo_stroke(w)), run.transform);
+            }
+            return;
+        }
         let mut placed = Vec::with_capacity(run.glyphs.len());
         for g in &run.glyphs {
             if let Some(p) = self.fonts.place(self.doc, run.font, g.id, g.ch) {
@@ -271,7 +283,23 @@ impl Writer<'_> {
         }
         self.alpha(out, st, run.color.alpha());
         set_color(out, &mut st.fill, run.color, "rg");
+        if let Some(w) = halo {
+            // A text's stroke is in user space, not the text matrix's: the run's scale applied.
+            let t = run.transform;
+            let scale = (t.sx * t.sy - t.kx * t.ky).abs().sqrt();
+            set_color(out, &mut st.stroke, run.color, "RG");
+            stroke_state(out, st, &GlyphRun::halo_stroke(w * scale));
+        }
+        if halo.is_some() {
+            // The copy is decoration, marked so (an artifact) for readers that leave artifacts out
+            // of what they copy and find. (An empty `ActualText` would hide it from every reader's
+            // text, but VectorCraft then drops the halo altogether.)
+            out.extend_from_slice(b"/Artifact BMC\n");
+        }
         out.extend_from_slice(b"BT\n");
+        if halo.is_some() {
+            out.extend_from_slice(b"2 Tr\n");
+        }
         // Glyph space is y up: flipped into the run's y-down space.
         write_matrix(out, run.transform.pre_scale(1.0, -1.0));
         out.extend_from_slice(b" Tm\n");
@@ -298,7 +326,8 @@ impl Writer<'_> {
             let _ = if p.wide { write!(out, "<{:04X}>", p.code) } else { write!(out, "<{:02X}>", p.code) };
             pen = x + p.advance * size;
         }
-        out.extend_from_slice(b"] TJ\nET\n");
+        // (The rendering mode is text state, kept past ET: set back for the text that follows.)
+        out.extend_from_slice(if halo.is_some() { b"] TJ\n0 Tr\nET\nEMC\n" } else { b"] TJ\nET\n" });
     }
 
     /// Places a picture: an image object (with its alpha as a soft mask) drawn where it lies.
@@ -720,6 +749,7 @@ mod tests {
             color: Color::from_rgba8(20, 20, 20, 255),
             transform: Transform::from_translate(210.0, 40.0),
             glyphs,
+            halo: None,
         });
         let mut pic = Pixmap::new(4, 4).unwrap();
         pic.fill(Color::from_rgba8(0, 160, 0, 200));
@@ -805,7 +835,7 @@ mod tests {
         let x = font.h_advance_unscaled(a) / upm * 20.0 + 5.0;
         let mut d = Drawing::new(100.0, 100.0);
         let glyphs = vec![Glyph { id: a, x: 0.0, ch: 'A' }, Glyph { id: v, x, ch: 'V' }];
-        d.glyphs(GlyphRun { font, size: 20.0, color: Color::BLACK, transform: Transform::from_translate(10.0, 50.0), glyphs });
+        d.glyphs(GlyphRun { font, size: 20.0, color: Color::BLACK, transform: Transform::from_translate(10.0, 50.0), glyphs, halo: None });
         let objs = objects(&write(&[Page::drawing(d, 10.0, 10.0)], ""));
         let content = objs.iter().map(|o| String::from_utf8_lossy(&o.1).into_owned()).find(|c| c.contains("TJ")).unwrap();
         assert!(content.contains("1 0 0 -1 10 50 Tm\n") && content.contains("[<00>-250<01>] TJ"), "{content}");

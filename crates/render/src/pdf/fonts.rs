@@ -75,6 +75,11 @@ impl Fonts {
         Fonts { real, real_by_font, ..Fonts::default() }
     }
 
+    /// Whether `font` is embedded as itself (else its glyphs go to Type 3 fonts).
+    pub fn is_real(&self, font: &FontRef<'static>) -> bool {
+        self.real_by_font.contains_key(&(std::ptr::from_ref(font) as usize))
+    }
+
     /// `id` of `font` (standing for `ch`), given a code in one of its Type 3 fonts the first time;
     /// `None` only past what a font can hold.
     pub fn place(&mut self, doc: &mut Doc, font: &'static FontRef<'static>, id: GlyphId, ch: char) -> Option<Placed> {
