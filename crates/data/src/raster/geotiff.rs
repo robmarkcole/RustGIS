@@ -74,8 +74,8 @@ pub fn read_image_grid<R: Read + Seek>(input: R) -> Result<ImageGrid> {
             return Err(err("image grid requires a full-resolution first image, not an overview or mask"));
         }
         let (width, height) = dec.dimensions().map_err(err)?;
-        image_grid_tags(&mut dec)?;
-        let geo = geo_tags(&mut dec)?;
+        let keys = image_grid_tags(&mut dec)?;
+        let geo = geo_tags_with_keys(&mut dec, &keys)?;
         let crs = geo.crs.ok_or_else(|| match geo.unknown_epsg {
             Some(code) => err(super::crs::unusable_epsg(code)),
             None => err(geo.custom_error.as_deref().unwrap_or("image grid requires a recognised embedded coordinate system")),
@@ -89,8 +89,8 @@ pub fn read_image_grid<R: Read + Seek>(input: R) -> Result<ImageGrid> {
 
 /// The exact-grid API refuses malformed georeferencing rather than taking a partial matrix,
 /// falling back to another tag, or interpreting inconsistent ground-control points as affine.
-fn image_grid_tags<R: Read + Seek>(dec: &mut Decoder<R>) -> Result<()> {
-    let keys = dec
+fn image_grid_tags<R: Read + Seek>(dec: &mut Decoder<R>) -> Result<Vec<u16>> {
+    let mut keys = dec
         .find_tag(Tag::GeoKeyDirectoryTag)
         .map_err(err)?
         .ok_or_else(|| err("image grid requires embedded GeoTIFF keys"))?
@@ -103,7 +103,30 @@ fn image_grid_tags<R: Read + Seek>(dec: &mut Decoder<R>) -> Result<()> {
         return Err(err("image grid has an unsupported GeoKey directory version"));
     }
     let entries = keys.get(4..4 + usize::from(count) * 4).ok_or_else(|| err("image grid has an incomplete GeoKey directory"))?;
+    let doubles = |dec: &mut Decoder<R>, tag| -> Result<Option<Vec<f64>>> {
+        dec.find_tag(Tag::Unknown(tag)).map_err(err)?.map(|v| v.into_f64_vec().map_err(err)).transpose()
+    };
+    let parameters = doubles(dec, 34736)?.unwrap_or_default();
+    let ascii = dec.find_tag(Tag::Unknown(34737)).map_err(err)?.map(|v| v.into_string().map_err(err)).transpose()?.unwrap_or_default();
     for &[key, location, count, value] in entries.as_chunks::<4>().0 {
+        crate::progress::check()?;
+        let expected_location = match key {
+            1026 | 2049 | 3073 | 4097 => Some(34737),
+            2053 | 2055 | 2057..=2059 | 2061 | 3077..=3096 => Some(34736),
+            1024 | 1025 | 2048 | 2050..=2052 | 2054 | 2056 | 2060 | 3072 | 3074..=3076 | 4096 | 4098 | 4099 => Some(0),
+            _ => None,
+        };
+        let start = usize::from(value);
+        let readable = match location {
+            0 => count == 1,
+            34736 => count == 1 && parameters.get(start).is_some_and(|v| v.is_finite()),
+            34737 => count > 0 && ascii.get(start..start + usize::from(count)).is_some(),
+            // The CRS reader cannot resolve other storage, including SHORT parameter arrays.
+            _ => false,
+        };
+        if !readable || expected_location.is_some_and(|expected| location != expected) {
+            return Err(err(format!("image grid GeoKey {key} has an unreadable parameter reference")));
+        }
         if matches!(key, 2048 | 3072) && (location != 0 || count != 1) {
             return Err(err("image grid has an invalid coordinate system GeoKey"));
         }
@@ -111,9 +134,6 @@ fn image_grid_tags<R: Read + Seek>(dec: &mut Decoder<R>) -> Result<()> {
             return Err(err("image grid requires two-dimensional area or point GeoTIFF georeferencing"));
         }
     }
-    let doubles = |dec: &mut Decoder<R>, tag| -> Result<Option<Vec<f64>>> {
-        dec.find_tag(Tag::Unknown(tag)).map_err(err)?.map(|v| v.into_f64_vec().map_err(err)).transpose()
-    };
     if let Some(m) = doubles(dec, 34264)? {
         if m.len() != 16 || !m.iter().all(|v| v.is_finite()) || m.get(12..) != Some(&[0., 0., 0., 1.]) {
             return Err(err("image grid requires a finite 4 × 4 affine transformation matrix"));
@@ -139,7 +159,8 @@ fn image_grid_tags<R: Read + Seek>(dec: &mut Decoder<R>) -> Result<()> {
             }
         }
     }
-    Ok(())
+    keys.truncate(4 + usize::from(count) * 4);
+    Ok(keys)
 }
 
 /// Whether the first sample past the colour ones is declared alpha (extra sample 1, associated, or
@@ -157,12 +178,16 @@ pub(super) fn multiband_color<R: Read + Seek>(dec: &mut Decoder<R>, n: u16) -> C
 }
 
 fn geo_tags<R: Read + Seek>(dec: &mut Decoder<R>) -> Result<Geo> {
+    let keys: Vec<u16> = dec.find_tag(Tag::GeoKeyDirectoryTag).ok().flatten().and_then(|v| v.into_u16_vec().ok()).unwrap_or_default();
+    geo_tags_with_keys(dec, &keys)
+}
+
+/// Ordinary readers pass their legacy whole directory; exact grids pass validated declared keys.
+fn geo_tags_with_keys<R: Read + Seek>(dec: &mut Decoder<R>, keys: &[u16]) -> Result<Geo> {
     let doubles =
         |dec: &mut Decoder<R>, tag: u16| -> Option<Vec<f64>> { dec.find_tag(Tag::Unknown(tag)).ok().flatten()?.into_f64_vec().ok() };
-    // GeoKey directory: a header of four shorts, then (key, location, count, value) entries.
-    let keys: Vec<u16> = dec.find_tag(Tag::GeoKeyDirectoryTag).ok().flatten().and_then(|v| v.into_u16_vec().ok()).unwrap_or_default();
     let key = |k: u16| -> Option<u16> {
-        key_entries(&keys)?.iter().find(|[key, location, _, _]| *key == k && *location == 0).map(|[_, _, _, value]| *value)
+        key_entries(keys)?.iter().find(|[key, location, _, _]| *key == k && *location == 0).map(|[_, _, _, value]| *value)
     };
     let pixel_is_point = key(1025) == Some(2);
     let geographic_model = key(1024) == Some(2);
@@ -172,7 +197,7 @@ fn geo_tags<R: Read + Seek>(dec: &mut Decoder<R>) -> Result<Geo> {
     // A projected file with a user-defined projection (the NLCD's Albers, say) defines it in its
     // keys: read as its own system, never as the geographic system it's based on.
     let user_defined = key(1024) == Some(1) && key(3072).is_none_or(|c| !usable(&c));
-    let citation = |k: u16| match geokey(&keys, &gdoubles, &gascii, k) {
+    let citation = |k: u16| match geokey(keys, &gdoubles, &gascii, k) {
         Some(KeyValue::Ascii(t)) if !t.trim().is_empty() => Some(t),
         _ => None,
     };
@@ -182,7 +207,7 @@ fn geo_tags<R: Read + Seek>(dec: &mut Decoder<R>) -> Result<Geo> {
     // says so, as GDAL names one. GeoTIFF has no key for axis directions, and PROJ gives such a
     // projection westings.
     if user_defined
-        && planetary_axes(&keys, &gdoubles, &gascii).is_some()
+        && planetary_axes(keys, &gdoubles, &gascii).is_some()
         // PCSCitation, GTCitation, GeogCitation.
         && [3073, 1026, 2049].into_iter().filter_map(citation).any(|t| super::planetary::ographic_name(&t))
     {
@@ -192,7 +217,7 @@ fn geo_tags<R: Read + Seek>(dec: &mut Decoder<R>) -> Result<Geo> {
     // later only if the coordinates aren't degrees), its reason kept for the message.
     let mut custom_error = None;
     let (code, crs) = if user_defined {
-        match custom_crs(&keys, &gdoubles, &gascii) {
+        match custom_crs(keys, &gdoubles, &gascii) {
             Ok(crs) => (None, Some(crs)),
             Err(e) => {
                 custom_error = Some(e.to_string());
@@ -208,11 +233,11 @@ fn geo_tags<R: Read + Seek>(dec: &mut Decoder<R>) -> Result<Geo> {
     // A projection of it that can't be read is refused, because its metres would be read as
     // degrees.
     let crs = match crs {
-        None if geographic_model && key(2048).is_none_or(|c| !usable(&c)) => planetary_geographic(&keys, &gdoubles, &gascii)?.or(crs),
+        None if geographic_model && key(2048).is_none_or(|c| !usable(&c)) => planetary_geographic(keys, &gdoubles, &gascii)?.or(crs),
         crs => crs,
     };
     if let Some(e) = &custom_error
-        && planetary_axes(&keys, &gdoubles, &gascii).is_some()
+        && planetary_axes(keys, &gdoubles, &gascii).is_some()
     {
         return Err(err(super::planetary::refused(&system(), e.strip_prefix("GeoTIFF: ").unwrap_or(e))));
     }
@@ -347,11 +372,10 @@ enum KeyValue {
     Ascii(String),
 }
 
-/// Only the declared entries are keys: the directory's tail may hold SHORT parameter values.
+/// Preserve ordinary readers' legacy scan when a file misstates its key count. The exact-grid
+/// API passes only the declared entries, validated separately, so it cannot scan parameter tails.
 fn key_entries(keys: &[u16]) -> Option<&[[u16; 4]]> {
-    let available = keys.len().saturating_sub(4) / 4;
-    let count = usize::from(*keys.get(3)?).min(available);
-    Some(keys.get(4..4 + count * 4)?.as_chunks::<4>().0)
+    Some(keys.get(4..)?.as_chunks::<4>().0)
 }
 
 fn geokey(keys: &[u16], doubles: &[f64], ascii: &str, k: u16) -> Option<KeyValue> {

@@ -111,6 +111,18 @@ mod tests {
 
     /// A full-resolution image, optionally followed by a smaller overview, with chosen geo tags.
     fn tiff(matrix: Option<&[f64]>, scale: Option<&[f64]>, ties: Option<&[f64]>, keys: Option<&[u16]>, overview: bool) -> Vec<u8> {
+        tiff_with_params(matrix, scale, ties, keys, None, None, overview)
+    }
+
+    fn tiff_with_params(
+        matrix: Option<&[f64]>,
+        scale: Option<&[f64]>,
+        ties: Option<&[f64]>,
+        keys: Option<&[u16]>,
+        parameters: Option<&[f64]>,
+        ascii: Option<&str>,
+        overview: bool,
+    ) -> Vec<u8> {
         let mut out = Cursor::new(Vec::new());
         {
             let mut enc = TiffEncoder::new(&mut out).unwrap();
@@ -122,6 +134,12 @@ mod tests {
             }
             if let Some(keys) = keys {
                 image.encoder().write_tag(Tag::GeoKeyDirectoryTag, keys).unwrap();
+            }
+            if let Some(parameters) = parameters {
+                image.encoder().write_tag(Tag::Unknown(34736), parameters).unwrap();
+            }
+            if let Some(ascii) = ascii {
+                image.encoder().write_tag(Tag::Unknown(34737), ascii).unwrap();
             }
             image.write_data(&[7; 200]).unwrap();
             if overview {
@@ -250,6 +268,76 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn image_grid_bounds_keys_without_changing_ordinary_reads_with_short_counts() {
+        for count in [0, 1, 2] {
+            let mut keys = KEYS;
+            keys[3] = count;
+            keys[11] = 2; // PixelIsPoint, including when it lies past the declared count.
+            for (x, y) in [(500_000., 1000.), (10., 50.)] {
+                let bytes = tiff(None, Some(&[1., 1., 0.]), Some(&[0., 0., 0., x, y, 0.]), Some(&keys), false);
+                let raster = geotiff::read(Cursor::new(&bytes), "short count").unwrap();
+                assert_eq!(raster.crs, Crs::from_epsg(32633).unwrap());
+                assert_eq!((raster.transform.origin_x, raster.transform.origin_y), (x - 0.5, y + 0.5));
+                assert!(raster.georeferenced && raster.lost.is_empty());
+                assert!(geotiff::read_image_grid(Cursor::new(bytes)).is_err());
+            }
+        }
+        // A trailing SHORT parameter that resembles a raster-type key must not shift an exact grid.
+        let keys = [1, 1, 0, 1, 3072, 0, 1, 32633, 1025, 0, 1, 2];
+        let bytes = tiff(None, Some(&[1., 1., 0.]), Some(&[0., 0., 0., 10., 50., 0.]), Some(&keys), false);
+        let grid = geotiff::read_image_grid(Cursor::new(bytes)).unwrap();
+        assert_eq!(grid.affine(), [10., 1., 0., 50., 0., -1.]);
+    }
+
+    #[test]
+    fn image_grid_refuses_dangling_or_mistyped_custom_crs_parameters() {
+        // Custom Transverse Mercator, with a DOUBLE central meridian and ASCII citation.
+        let keys = [
+            1, 1, 0, 7, 1024, 0, 1, 1, 1025, 0, 1, 1, 2048, 0, 1, 4326, 3072, 0, 1, 32767, 3075, 0, 1, 1, 3080, 34736, 1, 0, 3073, 34737,
+            8, 0,
+        ];
+        let read = |keys: &[u16], parameters: Option<&[f64]>, ascii: Option<&str>| {
+            let bytes =
+                tiff_with_params(None, Some(&[1., 1., 0.]), Some(&[0., 0., 0., 500_000., 1000., 0.]), Some(keys), parameters, ascii, false);
+            geotiff::read_image_grid(NoPixels::new(bytes))
+        };
+        let grid = read(&keys, Some(&[15.]), Some("Test TM|")).unwrap();
+        let definition = grid.crs().custom_def().unwrap();
+        assert!(definition.proj4.contains("+proj=tmerc") && definition.proj4.contains("+lon_0=15"));
+        assert_eq!(definition.label, "Test TM");
+        let origin = grid.crs().transformer().unwrap().to_lonlat(Coord::new(0., 0.)).unwrap();
+        assert!((origin.x - 15.).abs() < 1e-9 && origin.y.abs() < 1e-9);
+        for parameters in [None, Some(&[][..]), Some(&[f64::NAN][..]), Some(&[f64::INFINITY][..])] {
+            assert!(read(&keys, parameters, Some("Test TM|")).unwrap_err().to_string().contains("parameter reference"));
+        }
+        for (index, value) in [
+            (25, 0),
+            (25, 34735),
+            (25, 34737),
+            (25, 65000), // Unsupported or wrong storage for a numeric key.
+            (26, 0),
+            (26, 2),
+            (27, 1),
+            (27, u16::MAX), // Zero/multiple values and out-of-range DOUBLE offsets.
+            (29, 0),
+            (29, 34736),
+            (30, 0),
+            (30, 9),
+            (31, 1),
+            (31, u16::MAX), // Invalid ASCII references.
+            (21, 34736),    // A projection-method code must remain an inline SHORT.
+        ] {
+            let mut bad = keys;
+            bad[index] = value;
+            assert!(
+                read(&bad, Some(&[15.]), Some("Test TM|")).unwrap_err().to_string().contains("parameter reference"),
+                "{index}: {value}"
+            );
+        }
+        assert!(read(&keys, Some(&[15.]), None).unwrap_err().to_string().contains("parameter reference"));
     }
 
     #[test]
