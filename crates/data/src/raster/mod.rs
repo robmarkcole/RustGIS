@@ -165,16 +165,33 @@ pub struct BandStats {
 impl BandStats {
     /// Statistics of the finite values in `data`.
     pub fn from_values(data: &[f32]) -> BandStats {
-        BandStats::compute(data, f32::is_finite)
+        BandStats::compute_with(data, |_, v| v.is_finite(), None)
     }
 
-    fn compute(data: &[f32], valid: impl Fn(f32) -> bool + Sync) -> BandStats {
-        BandStats::compute_with(data, valid, None)
+    /// Statistics of a raster's band `data`: the values `valid` takes, less, for a colour band of
+    /// a raster with alpha, the cells its alpha band (`alpha`) draws see-through ([`see_through`],
+    /// an alpha of `opaque` being opaque). `stored` is the band's whole statistics, for a reduced
+    /// overview ([`BandStats::compute_with`]); GDAL counts see-through cells in all but 8-bit
+    /// images, so a band with `alpha` doesn't take them.
+    fn of_band(
+        data: &[f32],
+        valid: impl Fn(f32) -> bool + Sync,
+        alpha: Option<&[f32]>,
+        opaque: f32,
+        stored: Option<pam::Stats>,
+    ) -> BandStats {
+        match alpha {
+            Some(alpha) => {
+                BandStats::compute_with(data, |i, v| valid(v) && alpha.get(i).is_some_and(|&a| !see_through(a, valid(a), opaque)), None)
+            }
+            None => BandStats::compute_with(data, |_, v| valid(v), stored),
+        }
     }
 
-    /// [`BandStats::compute`], taking the range, mean and spread from `stored` (statistics of the
-    /// whole band, when `data` is a reduced overview of it).
-    fn compute_with(data: &[f32], valid: impl Fn(f32) -> bool + Sync, stored: Option<pam::Stats>) -> BandStats {
+    /// Statistics of the values of `data` that `valid` takes (given each one's place in `data` and
+    /// its value), taking the range, mean and spread from `stored` (statistics of the whole band,
+    /// when `data` is a reduced overview of it).
+    fn compute_with(data: &[f32], valid: impl Fn(usize, f32) -> bool + Sync, stored: Option<pam::Stats>) -> BandStats {
         BandStats::compute_on(data, valid, stored, threads_for(data.len()))
     }
 
@@ -184,10 +201,14 @@ impl BandStats {
     /// the same to the bit; what doesn't depend on the order is counted on the others
     /// ([`on_runs`]), the range while this thread sums. The range keeps the first of equal values
     /// (−0 or 0) in the band's order either way.
-    fn compute_on(data: &[f32], valid: impl Fn(f32) -> bool + Sync, stored: Option<pam::Stats>, threads: usize) -> BandStats {
-        let ranged = |run: &[f32], sum: bool| {
+    fn compute_on(data: &[f32], valid: impl Fn(usize, f32) -> bool + Sync, stored: Option<pam::Stats>, threads: usize) -> BandStats {
+        // A run of `data` from `start`.
+        let ranged = |start: usize, run: &[f32], sum: bool| {
             let (mut n, mut min, mut max, mut whole, mut sums) = (0usize, f64::INFINITY, f64::NEG_INFINITY, true, (0.0f64, 0.0f64));
-            for &v in run.iter().filter(|&&v| valid(v)) {
+            for (j, &v) in run.iter().enumerate() {
+                if !valid(start + j, v) {
+                    continue;
+                }
                 let x = v as f64;
                 n += 1;
                 (min, max) = (lower(min, x), higher(max, x));
@@ -199,10 +220,10 @@ impl BandStats {
             (n, min, max, whole, sums)
         };
         let (n, mut min, mut max, whole, (sum, sum2)) = if threads <= 1 {
-            ranged(data, true)
+            ranged(0, data, true)
         } else {
-            let sums = || ranged(data, true).4;
-            let (runs, sums) = on_runs_beside(data, threads, sums, |run| ranged(run, false));
+            let sums = || ranged(0, data, true).4;
+            let (runs, sums) = on_runs_beside(data, threads, sums, |start, run| ranged(start, run, false));
             let mut all = (0usize, f64::INFINITY, f64::NEG_INFINITY, true, sums);
             for (rn, rmin, rmax, rwhole, _) in runs {
                 all = (all.0 + rn, lower(all.1, rmin), higher(all.2, rmax), all.3 && rwhole, all.4);
@@ -225,8 +246,8 @@ impl BandStats {
         let small_ints = whole && min >= 0.0 && max <= 65_535.0;
         let k = (HISTOGRAM_BINS as f64 - 1.0) / if span > 0.0 { span } else { 1.0 };
         let b = Binning { min, k, small_ints, whole };
-        let mut runs = on_runs(data, threads, |run| Tally::run(run, &valid, b)).into_iter();
-        let mut tally = runs.next().unwrap_or_else(|| Tally::run(&[], &valid, b));
+        let mut runs = on_runs(data, threads, |start, run| Tally::run(start, run, &valid, b)).into_iter();
+        let mut tally = runs.next().unwrap_or_else(|| Tally::run(0, &[], &valid, b));
         for t in runs {
             tally.histogram.iter_mut().zip(&t.histogram).for_each(|(a, b)| *a += b);
             tally.bits.iter_mut().zip(&t.bits).for_each(|(a, b)| *a |= b);
@@ -310,32 +331,40 @@ fn threads_for(len: usize) -> usize {
     if cfg!(target_arch = "wasm32") || len < PARALLEL_VALUES { 1 } else { crate::threads::max().min(len / (PARALLEL_VALUES / 4)) }
 }
 
-/// `f` over `threads` runs of `data` that cover it in order, its results in that order, the
-/// calling thread taking the first. A worker's panic is raised again here; a run whose thread
-/// can't start is made on this one.
-fn on_runs<T: Send>(data: &[f32], threads: usize, f: impl Fn(&[f32]) -> T + Sync) -> Vec<T> {
+/// `f` over `threads` runs of `data` that cover it in order, each given with where it starts in
+/// `data`, its results in that order, the calling thread taking the first. A worker's panic is
+/// raised again here; a run whose thread can't start is made on this one.
+fn on_runs<T: Send>(data: &[f32], threads: usize, f: impl Fn(usize, &[f32]) -> T + Sync) -> Vec<T> {
     on_runs_beside(data, threads, || (), f).0
 }
 
 /// [`on_runs`], the calling thread running `beside` first, while the other threads start on
 /// their runs.
-fn on_runs_beside<T: Send, U>(data: &[f32], threads: usize, beside: impl FnOnce() -> U, f: impl Fn(&[f32]) -> T + Sync) -> (Vec<T>, U) {
+fn on_runs_beside<T: Send, U>(
+    data: &[f32],
+    threads: usize,
+    beside: impl FnOnce() -> U,
+    f: impl Fn(usize, &[f32]) -> T + Sync,
+) -> (Vec<T>, U) {
     if threads <= 1 || data.is_empty() {
         let beside = beside();
-        return (vec![f(data)], beside);
+        return (vec![f(0, data)], beside);
     }
-    let mut runs = data.chunks(data.len().div_ceil(threads));
-    let first = runs.next().unwrap_or_default();
+    let size = data.len().div_ceil(threads);
+    let mut runs = data.chunks(size).enumerate().map(|(k, run)| (k * size, run));
+    let (start, first) = runs.next().unwrap_or_default();
     let f = &f;
     std::thread::scope(|scope| {
-        let started: Vec<_> = runs.map(|run| std::thread::Builder::new().spawn_scoped(scope, move || f(run)).map_err(|_| run)).collect();
+        let started: Vec<_> = runs
+            .map(|(start, run)| std::thread::Builder::new().spawn_scoped(scope, move || f(start, run)).map_err(|_| (start, run)))
+            .collect();
         let beside = beside();
-        let mut out = vec![f(first)];
+        let mut out = vec![f(start, first)];
         for run in started {
             out.push(match run {
                 Ok(h) => h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)),
                 // The OS refused a thread: made here.
-                Err(run) => f(run),
+                Err((start, run)) => f(start, run),
             });
         }
         (out, beside)
@@ -343,14 +372,14 @@ fn on_runs_beside<T: Send, U>(data: &[f32], threads: usize, beside: impl FnOnce(
 }
 
 impl Tally {
-    /// `data`'s valid values counted on this thread.
-    fn run(data: &[f32], valid: &impl Fn(f32) -> bool, b: Binning) -> Tally {
+    /// `data`'s valid values counted on this thread: a run of a band from `start`.
+    fn run(start: usize, data: &[f32], valid: &impl Fn(usize, f32) -> bool, b: Binning) -> Tally {
         let mut histogram = vec![0u64; HISTOGRAM_BINS];
         let mut bits = if b.small_ints { vec![0u64; 1024] } else { Vec::new() };
         let mut distinct = std::collections::BTreeSet::new();
         let mut track = b.whole;
-        for &v in data {
-            if !valid(v) {
+        for (j, &v) in data.iter().enumerate() {
+            if !valid(start + j, v) {
                 continue;
             }
             let x = v as f64;
@@ -538,6 +567,13 @@ pub fn alpha_max(data_type: &str) -> f32 {
     }
 }
 
+/// Whether an alpha value draws its cell fully see-through, as the map draws it: an alpha of no
+/// value (`valid` false: NaN, or the raster's no-data), or one under half a 256th of `opaque` (the
+/// pixel type's [`alpha_max`]), which is nothing in 8 bits.
+pub fn see_through(a: f32, valid: bool, opaque: f32) -> bool {
+    !valid || ((a / opaque).clamp(0.0, 1.0) * 255.0).round() == 0.0
+}
+
 /// How a raster's bands were meant to be shown, from the file.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub enum ColorHint {
@@ -549,6 +585,19 @@ pub enum ColorHint {
     Rgb { alpha: bool },
     /// Band 1 indexes this colour table (RGBA).
     Palette(Vec<[u8; 4]>),
+}
+
+impl ColorHint {
+    /// For a raster of `bands` bands shown this way with alpha, its alpha band and the colour
+    /// bands that band makes see-through: an RGBA image's fourth band over its first three, grey
+    /// and alpha's second over its first.
+    pub fn alpha(&self, bands: usize) -> Option<(usize, std::ops::Range<usize>)> {
+        match self {
+            ColorHint::Rgb { alpha: true } if bands >= 4 => Some((3, 0..3)),
+            ColorHint::GrayAlpha if bands >= 2 => Some((1, 0..1)),
+            _ => None,
+        }
+    }
 }
 
 /// A raster on a grid: georeferenced, unless `georeferenced` is false (a scan, whose transform
@@ -738,16 +787,21 @@ impl Raster {
         let transformer = crs.transformer().map_err(DataError::Format)?;
         let nd = nodata.filter(|v| v.is_finite()).map(|v| v as f32);
         let valid = move |v: f32| v.is_finite() && nd.is_none_or(|d| v != d);
+        let data_type = data_type.into();
+        let (alpha, opaque) = (color.alpha(bands.len()), alpha_max(&data_type));
+        let stats: Vec<BandStats> = bands
+            .iter()
+            .enumerate()
+            .map(|(i, data)| {
+                let alpha = alpha.as_ref().filter(|(_, colour)| colour.contains(&i)).and_then(|(a, _)| bands.get(*a));
+                if measure { BandStats::of_band(data, valid, alpha.map(Vec::as_slice), opaque, None) } else { BandStats::default() }
+            })
+            .collect();
         let bands = bands
             .into_iter()
+            .zip(stats)
             .enumerate()
-            .map(|(i, data)| Band {
-                name: format!("Band {}", i + 1),
-                stats: if measure { BandStats::compute(&data, valid) } else { BandStats::default() },
-                data,
-                classes: Vec::new(),
-                wavelength: None,
-            })
+            .map(|(i, (data, stats))| Band { name: format!("Band {}", i + 1), stats, data, classes: Vec::new(), wavelength: None })
             .collect();
         let mut r = Raster {
             name: name.into(),
@@ -758,7 +812,7 @@ impl Raster {
             crs,
             nodata: nodata.filter(|v| v.is_finite()),
             color,
-            data_type: data_type.into(),
+            data_type,
             source: None,
             overview: None,
             georeferenced: true,
@@ -839,6 +893,16 @@ impl Raster {
         let nd = self.nodata.map(|v| v as f32);
         let valid = move |v: f32| v.is_finite() && nd.is_none_or(|d| v != d);
         let overview = self.overview.is_some();
+        // Worked out before the bands change, as a colour band's take its alpha band's values.
+        let (alpha, opaque) = (self.color.alpha(self.bands.len()), alpha_max(&self.data_type));
+        let mut measured: Vec<Option<BandStats>> = (0..self.bands.len())
+            .map(|i| {
+                let stored = pam.band(i + 1).and_then(|p| p.stats).filter(|_| overview);
+                let data = self.bands.get(i).filter(|_| recompute || stored.is_some())?;
+                let alpha = alpha.as_ref().filter(|(_, colour)| colour.contains(&i)).and_then(|(a, _)| self.bands.get(*a));
+                Some(BandStats::of_band(&data.data, valid, alpha.map(|a| a.data.as_slice()), opaque, stored))
+            })
+            .collect();
         for (i, band) in self.bands.iter_mut().enumerate() {
             let p = pam.band(i + 1);
             if let Some(d) = p.and_then(|p| p.description.as_ref()) {
@@ -850,9 +914,8 @@ impl Raster {
             if let Some(w) = p.and_then(|p| p.wavelength) {
                 band.wavelength = Some(w);
             }
-            let stored = p.and_then(|p| p.stats).filter(|_| overview);
-            if recompute || stored.is_some() {
-                band.stats = BandStats::compute_with(&band.data, valid, stored);
+            if let Some(stats) = measured.get_mut(i).and_then(Option::take) {
+                band.stats = stats;
             }
         }
     }
@@ -1011,6 +1074,17 @@ impl Raster {
         }
         self.rounded = Vec::new();
         self.rounded_some = if marks.contains(&true) { marks } else { Vec::new() };
+    }
+
+    /// The cells of `band` drawn see-through, by their place (row by row): `band` is a colour
+    /// band of a raster with alpha ([`ColorHint::alpha`]) and the cell's alpha draws it so
+    /// ([`see_through`]). Its statistics leave them out. `None` when the band has no such cells
+    /// to have: no alpha, or the alpha band or a band of data beside the colours.
+    pub fn see_through_cells(&self, band: usize) -> Option<impl Fn(usize) -> bool + Sync + '_> {
+        let (a, colour) = self.color.alpha(self.bands.len())?;
+        let alpha = &self.bands.get(a).filter(|_| colour.contains(&band))?.data;
+        let opaque = alpha_max(&self.data_type);
+        Some(move |i: usize| alpha.get(i).is_none_or(|&v| see_through(v, self.is_valid(v), opaque)))
     }
 
     /// Whether a value is a real measurement (not no-data or NaN).
@@ -1541,14 +1615,30 @@ pub(crate) mod tests {
             ("gaps", (0..n).map(|i| [f32::NAN, -0.0, 0.0, -9999.0, 17.5][at(i) % 5]).collect()),
         ];
         let bits = |s: &BandStats| (s.count, s.min.to_bits(), s.max.to_bits(), s.mean.to_bits(), s.std_dev.to_bits());
-        let valid = |v: f32| v.is_finite() && v != -9999.0;
+        let value = |v: f32| v.is_finite() && v != -9999.0;
+        let valid = |_: usize, v: f32| value(v);
         for (name, data) in &bands {
-            let want = one_pass(data, valid);
+            let want = one_pass(data, value);
             for threads in [1, 2, 7, 16] {
                 let got = BandStats::compute_on(data, valid, None, threads);
                 assert_eq!(bits(&got), bits(&want), "{name} on {threads}");
                 assert_eq!(got.histogram, want.histogram, "{name} on {threads}");
                 assert_eq!(got.categories, want.categories, "{name} on {threads}");
+            }
+        }
+        // A validity that depends on the cell's place, as a see-through cell's does (#1810): each
+        // run is given where it starts, so several threads leave out the same cells as one. A
+        // cell's place is checked against its band too: every third one is left out, and so is
+        // the band's last cell, which a run off by one would miss or count twice.
+        for (name, data) in &bands {
+            let by_place = |i: usize, v: f32| value(v) && !i.is_multiple_of(3) && i + 1 != data.len();
+            let kept: Vec<f32> = data.iter().enumerate().map(|(i, &v)| if by_place(i, v) { v } else { f32::NAN }).collect();
+            let want = one_pass(&kept, value);
+            for threads in [1, 2, 7, 16] {
+                let got = BandStats::compute_on(data, by_place, None, threads);
+                assert_eq!(bits(&got), bits(&want), "{name} by place on {threads}");
+                assert_eq!(got.histogram, want.histogram, "{name} by place on {threads}");
+                assert_eq!(got.categories, want.categories, "{name} by place on {threads}");
             }
         }
         assert!(BandStats::compute_on(&bands[1].1, valid, None, 2).categories.is_none(), "257 small whole values");
@@ -1557,6 +1647,93 @@ pub(crate) mod tests {
         let small: Vec<f32> = (0..1000).map(|i| (i % 37) as f32).collect();
         assert_eq!(BandStats::from_values(&small), one_pass(&small, f32::is_finite));
         assert_eq!(BandStats::compute_on(&vec![f32::NAN; n], valid, None, 4), BandStats::default());
+    }
+
+    /// Cells a raster's alpha draws see-through are left out of its colour bands' statistics,
+    /// whatever their values (#1810): −3.4e38 in a Float32 image, a stray byte in an 8-bit one. An
+    /// opaque black cell counts, the alpha band counts every cell, and a raster without alpha (or
+    /// with a fourth band of data) counts every valid cell, as before.
+    #[test]
+    fn see_through_cells_are_left_out_of_colour_statistics() {
+        let gt = GeoTransform { origin_x: 500_000.0, origin_y: 4_800_000.0, pixel_width: 1.0, pixel_height: -1.0 };
+        let utm = Crs::from_epsg(32611).unwrap();
+        // 4 × 4: the bottom row see-through (holding `see`), the first cell opaque black, the rest 100.
+        let colour = |see: f32| {
+            (0..16)
+                .map(|i| {
+                    if i >= 12 {
+                        see
+                    } else if i == 0 {
+                        0.0
+                    } else {
+                        100.0
+                    }
+                })
+                .collect::<Vec<f32>>()
+        };
+        let alpha = |opaque: f32| (0..16).map(|i| if i >= 12 { 0.0 } else { opaque }).collect::<Vec<f32>>();
+        let stats = |b: &Band| (b.stats.count, b.stats.min, b.stats.max);
+        for (data_type, see, opaque) in [("Float32", -3.4e38_f32, 1.0), ("UInt8", 7.0, 255.0), ("UInt16", 7.0, 65535.0)] {
+            let bands = vec![colour(see), colour(see), colour(see), alpha(opaque)];
+            let r = Raster::new("rgba", 4, 4, bands, gt, utm, None, ColorHint::Rgb { alpha: true }, data_type).unwrap();
+            for b in &r.bands[..3] {
+                assert_eq!(stats(b), (12, 0.0, 100.0), "{data_type}");
+                // Eleven cells of 100 and one of 0: the mean GDAL 3.9.3 gives an 8-bit RGBA band.
+                assert!((b.stats.mean - 1100.0 / 12.0).abs() < 1e-9, "{data_type}: {}", b.stats.mean);
+                assert_eq!(b.stats.histogram.iter().sum::<u64>(), 12, "{data_type}");
+            }
+            assert_eq!(stats(&r.bands[3]), (16, 0.0, f64::from(opaque)), "{data_type}");
+            // Read back from its GeoTIFF, the same.
+            let back = geotiff::read(std::io::Cursor::new(geotiff::write(&r, 0).unwrap()), "back").unwrap();
+            assert_eq!(back.color, ColorHint::Rgb { alpha: true }, "{data_type}");
+            // Written in the type it was before: a Float32 image whose see-through cells hold
+            // −3.4e38 isn't taken for bytes, as a GeoTIFF or a cloud-optimised one.
+            if data_type == "Float32" {
+                let cog = geotiff::read(std::io::Cursor::new(cogwrite::write(&r, 0).unwrap()), "cog").unwrap();
+                assert_eq!((back.data_type.as_str(), cog.data_type.as_str()), ("Float32", "Float32"));
+            }
+            assert_eq!(back.bands.iter().map(stats).collect::<Vec<_>>(), r.bands.iter().map(stats).collect::<Vec<_>>(), "{data_type}");
+        }
+        // As the map draws it: an alpha under half a 256th of opaque is see-through (16 bits: 100
+        // of 65535), one above it isn't (200).
+        let faint: Vec<f32> = (0..16)
+            .map(|i| {
+                if i >= 12 {
+                    100.0
+                } else if i >= 8 {
+                    200.0
+                } else {
+                    65535.0
+                }
+            })
+            .collect();
+        let r = Raster::new(
+            "faint",
+            4,
+            4,
+            vec![colour(7.0), colour(7.0), colour(7.0), faint],
+            gt,
+            utm,
+            None,
+            ColorHint::Rgb { alpha: true },
+            "UInt16",
+        )
+        .unwrap();
+        assert_eq!(r.bands[0].stats.count, 12);
+        // Grey and alpha: the grey band.
+        let r = Raster::new("grey", 4, 4, vec![colour(7.0), alpha(255.0)], gt, utm, None, ColorHint::GrayAlpha, "UInt8").unwrap();
+        assert_eq!((stats(&r.bands[0]), r.bands[1].stats.count), ((12, 0.0, 100.0), 16));
+        // No-data 0: an alpha of no value is see-through, as the map draws it, and the black cell
+        // is no-data, as before.
+        let bands = vec![colour(-3.4e38), colour(-3.4e38), colour(-3.4e38), alpha(1.0)];
+        let r = Raster::new("nodata", 4, 4, bands, gt, utm, Some(0.0), ColorHint::Rgb { alpha: true }, "Float32").unwrap();
+        assert_eq!(stats(&r.bands[0]), (11, 100.0, 100.0));
+        // Without alpha every valid cell counts: RGB, and RGB with a fourth band of data.
+        for nb in [3, 4] {
+            let bands = (0..nb).map(|_| colour(7.0)).collect();
+            let r = Raster::new("rgb", 4, 4, bands, gt, utm, None, ColorHint::Rgb { alpha: false }, "UInt8").unwrap();
+            assert!(r.bands.iter().all(|b| stats(b) == (16, 0.0, 100.0)), "{nb} bands");
+        }
     }
 
     /// A band the machine can't hold is an error naming its size, not the end of the program

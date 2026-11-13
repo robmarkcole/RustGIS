@@ -1256,6 +1256,17 @@ With a raster layer selected in Layers, the **Style** and **Data** tabs show its
 | Style › Enhancement | Brightness, contrast, gamma |
 | Data | Raster information (size, bands, statistics, coordinate system) and Export Raster (GeoTIFF) |
 
+**See-through cells** of an image with an alpha band (RGBA, or grey and alpha) are left out of
+its colour bands' statistics. These are the cells the map draws fully see-through: an alpha of no
+value, or one under half a 256th of opaque. That is alpha 0 in an 8-bit image, 128 or less of
+65535 in a 16-bit one, and under about 0.002 of 1 in a Float32 one. Leaving them out changes
+Raster information's counts and ranges, and the stretches taken from them: Minimum Maximum,
+Percent Clip, Standard Deviation, Histogram Equalize, a style mask's, and a cloud-optimised
+GeoTIFF's own. So a value those cells hold, such as −3.4e38 in a Float32 image, doesn't set the
+stretch, and an opaque black cell still counts. The alpha band's own statistics count every
+alpha with a value, see-through ones included.
+**Change Detection** gives no-data where either image is see-through.
+
 **Cast shadows**, on a Shaded Relief layer (`raster.symbology` `"shadow"`, 0 to 1), darkens the
 slopes the terrain hides from the sun as well as those facing away from it: a valley behind a ridge
 is in shadow, with a soft edge. Only the direct light is darkened: a slope in full shadow keeps the

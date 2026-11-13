@@ -784,22 +784,41 @@ fn with_stretch(info: Arc<Info>, file: String, look: Look, then: StretchThen) {
             w(s.clone());
         }
     };
+    // The colour bands, and the alpha band where the file has one: a cell it hides is left out,
+    // as the map leaves it unpainted (#1810), so a value a see-through cell holds (−3.4e38 in a
+    // Float32 image) doesn't set the stretch.
+    let read = info.shown_from(colour.clone());
+    let alpha = info.alpha.and_then(|a| read.iter().rposition(|b| *b == a));
+    let opaque = rustgis_data::raster::alpha_max(info.layout.data_type);
     fetch_bands(
         info,
         file,
         coarsest,
         tiles,
-        colour.clone(),
+        read,
         Box::new(move |r| match r {
             Ok(picked) => {
                 let s: Vec<(f32, f32)> = (0..colour.len())
                     .map(|j| {
+                        // The alpha band shown as a colour isn't hidden by itself.
+                        let alpha = alpha.filter(|a| *a != j);
                         percentiles(
                             picked
                                 .iter()
-                                .filter_map(|t| t.get(j))
-                                .filter_map(|(chunk, b)| chunk.get(*b))
-                                .flat_map(|v| v.iter().map(|x| shown_value(*x, look.aef)))
+                                .filter_map(|t| {
+                                    let band = t.get(j).and_then(|(chunk, b)| chunk.get(*b))?;
+                                    Some((band, alpha.and_then(|a| t.get(a)).and_then(|(chunk, b)| chunk.get(*b))))
+                                })
+                                .flat_map(|(band, hides)| {
+                                    band.iter()
+                                        .enumerate()
+                                        .filter(move |(i, _)| {
+                                            hides.is_none_or(|al| {
+                                                al.get(*i).is_some_and(|&a| !rustgis_data::raster::see_through(a, !a.is_nan(), opaque))
+                                            })
+                                        })
+                                        .map(|(_, x)| shown_value(*x, look.aef))
+                                })
                                 .collect(),
                         )
                     })
@@ -1748,6 +1767,65 @@ mod tests {
         let stretch = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("answered at once").unwrap();
         assert_eq!(stretch, vec![(0.0, 255.0)]);
         assert!(info.stretch_for(&own).is_none(), "kept, which a look of its bands would take for its own");
+    }
+
+    /// A colour image's stretch leaves out the cells its alpha band hides (#1810): an RGBA
+    /// Float32 COG whose see-through half holds −3.4e38, as an export from before #1759 wrote it,
+    /// is stretched over its opaque half, black cells and all.
+    #[test]
+    fn a_stretch_leaves_out_what_the_alpha_band_hides() {
+        use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster};
+        let _turn = crate::cache::turn();
+        let _alarm = crate::cache::alarm_turn();
+        let (w, h) = (512usize, 512usize);
+        let n = w * h;
+        // The top half opaque, 10 to 209 and black in its first column; the bottom see-through.
+        let colour: Vec<f32> = (0..n)
+            .map(|i| {
+                if i >= n / 2 {
+                    -3.4e38
+                } else if i % w == 0 {
+                    0.0
+                } else {
+                    (10 + i % 200) as f32
+                }
+            })
+            .collect();
+        let alpha: Vec<f32> = (0..n).map(|i| if i >= n / 2 { 0.0 } else { 1.0 }).collect();
+        let gt = GeoTransform { origin_x: 500_000.0, origin_y: 4_800_000.0, pixel_width: 10.0, pixel_height: -10.0 };
+        let utm = Crs::from_epsg(32611).unwrap();
+        let bands = vec![colour.clone(), colour.clone(), colour, alpha];
+        let r = Raster::new("rgba", w as u32, h as u32, bands, gt, utm, None, ColorHint::Rgb { alpha: true }, "Float32").unwrap();
+        let file = Arc::new(rustgis_data::raster::cogwrite::write(&r, 0).unwrap());
+        let held = Arc::new(Mutex::new(Vec::<(String, Done)>::new()));
+        let hold = held.clone();
+        crate::cache::set_fetcher(move |url, done| hold.lock().unwrap().push((url, done)));
+        let drain = || {
+            for _ in 0..100 {
+                let pending = std::mem::take(&mut *held.lock().unwrap());
+                if pending.is_empty() {
+                    return;
+                }
+                for (url, done) in pending {
+                    let (a, b) = crate::cache::split_range(&url).1.unwrap();
+                    done(Ok(file[a as usize..((b + 1) as usize).min(file.len())].to_vec()));
+                }
+            }
+            panic!("bounded reads");
+        };
+        let url = "https://see-through.invalid/rgba.tif".to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        with_info(&url, Box::new(move |r| tx.send(r).unwrap()));
+        drain();
+        let info = rx.recv().unwrap().unwrap();
+        assert_eq!(info.alpha, Some(3));
+        let (tx, rx) = std::sync::mpsc::channel();
+        with_stretch(info, url.clone(), Look::default(), Box::new(move |r| tx.send(r).unwrap()));
+        drain();
+        let stretch = rx.recv().unwrap().unwrap();
+        assert_eq!(stretch.len(), 3);
+        assert!(stretch.iter().all(|(lo, hi)| (0.0..=209.0).contains(lo) && (0.0..=209.0).contains(hi) && lo < hi), "{stretch:?}");
+        forget_file(&url);
     }
 
     /// A joint read whose tiles the fetch queue keeps dropping ends, saying so, rather than

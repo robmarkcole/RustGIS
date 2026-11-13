@@ -1619,13 +1619,22 @@ fn as_area(keys: &[u16]) -> Vec<u16> {
 }
 
 /// Whether band `b` is written as bytes: whole numbers within 0–255 (or no valid pixels at all),
-/// and a no-data value that is one too.
+/// and a no-data value that is one too. A colour band's statistics leave out the cells its alpha
+/// draws see-through (#1810), so those cells' values are looked at too: a file is written in the
+/// type it was before, whatever they hold.
 pub(super) fn fits_bytes(r: &Raster, b: usize) -> bool {
     let Some(band) = r.bands.get(b) else { return false };
     let s = &band.stats;
     let whole_bytes = s.min >= 0.0 && s.max <= 255.0 && (s.categories.is_some() || r.data_type == "UInt8");
     let nodata_ok = r.nodata.is_none_or(|d| (0.0..=255.0).contains(&d) && d.fract() == 0.0);
-    nodata_ok && (whole_bytes || s.count == 0)
+    let byte = |v: f32| !r.is_valid(v) || (v.fract() == 0.0 && (0.0..=255.0).contains(&v));
+    // Looked at only once the statistics fit, as it reads the whole band; an 8-bit band's are
+    // bytes already.
+    let see_through_bytes = || {
+        r.data_type == "UInt8"
+            || r.see_through_cells(b).is_none_or(|hidden| band.data.iter().enumerate().all(|(i, &v)| !hidden(i) || byte(v)))
+    };
+    nodata_ok && (whole_bytes || s.count == 0) && see_through_bytes()
 }
 
 /// The bands [`write`] writes of `r` given `band`: RGB and its fourth sample (alpha only when

@@ -44206,6 +44206,156 @@ fn stac_search_by_shape_says_what_it_leaves_out() {
     assert_eq!(said(&s, "have no geometry"), before);
 }
 
+/// An RGBA orthophoto whose see-through cells hold −3.4e38 (a Float32 one, as an export from
+/// before #1759 wrote it, its alpha 0 to 255 as that file had it), with opaque black cells, on
+/// 40 × 40 one-metre cells in UTM zone 11N: see-through in its left ten columns, black along its
+/// top row. With its colours, which are 10 to 249 elsewhere.
+#[cfg(not(target_arch = "wasm32"))]
+fn see_through_ortho(name: &str, see: impl Fn(usize) -> bool, offset: f32) -> rustgis_data::raster::Raster {
+    use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster};
+    let (w, n) = (40usize, 1600usize);
+    let colour = |b: usize| -> Vec<f32> {
+        (0..n).map(|i| if see(i) { -3.4e38 } else if i < w { 0.0 } else { (10 + (i * 7 + b * 60) % 240) as f32 } + offset).collect()
+    };
+    let alpha = (0..n).map(|i| if see(i) { 0.0 } else { 255.0 }).collect();
+    let gt = GeoTransform { origin_x: 500_000.0, origin_y: 4_800_040.0, pixel_width: 1.0, pixel_height: -1.0 };
+    let utm = Crs::from_epsg(32611).unwrap();
+    Raster::new(name, 40, 40, vec![colour(0), colour(1), colour(2), alpha], gt, utm, None, ColorHint::Rgb { alpha: true }, "Float32")
+        .unwrap()
+}
+
+/// The cells an RGBA raster's alpha draws see-through are left out of its colour bands'
+/// statistics (#1810): read from a file, projected (nearest) and clipped to a polygon. Its opaque
+/// black cells count, its alpha band counts every cell, and the stretch shared from it (`like`)
+/// spans its opaque colours, not −3.4e38.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn see_through_cells_are_left_out_of_an_rgba_rasters_statistics() {
+    use rustgis_data::raster::geotiff;
+    let dir = std::env::temp_dir().join(format!("rustgis-see-through-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("ortho.tif");
+    std::fs::write(&path, geotiff::write(&see_through_ortho("ortho", |i| i % 40 < 10, 0.0), 0).unwrap()).unwrap();
+    let mut s = Session::new(Project::default());
+    s.run("layer.addData", &json!({"path": path, "name": "ortho"})).unwrap();
+    let tr = rustgis_data::raster::Crs::from_epsg(32611).unwrap().transformer().unwrap();
+    let ll = |x: f64, y: f64| {
+        let c = tr.to_lonlat(rustgis_geom::Coord::new(x, y)).unwrap();
+        json!([c.x, c.y])
+    };
+    // A square over the middle, across the see-through columns.
+    s.run("layer.template", &json!({"template": "polygons", "name": "Boundary"})).unwrap();
+    let ring = [
+        ll(500_005.0, 4_800_035.0),
+        ll(500_035.0, 4_800_035.0),
+        ll(500_035.0, 4_800_005.0),
+        ll(500_005.0, 4_800_005.0),
+        ll(500_005.0, 4_800_035.0),
+    ];
+    s.run("edit.addFeature", &json!({"layer": "Boundary", "geometry": {"type": "Polygon", "coordinates": [ring]}})).unwrap();
+    s.run("raster.project", &json!({"layer": "ortho", "crs": 32611, "cellSize": 1.0, "resampling": "nearest", "name": "projected"}))
+        .unwrap();
+    s.run(
+        "raster.process",
+        &json!({"layer": "ortho", "operation": "clip", "polygon": "Boundary", "selectedOnly": false, "name": "clipped"}),
+    )
+    .unwrap();
+    for name in ["ortho", "projected", "clipped"] {
+        let r = s.map().layer_by_name(name).unwrap().raster.as_ref().unwrap().data.clone().unwrap();
+        // The cells its alpha shows: alpha above half a 256th of opaque (Float32's 1).
+        let shown = r.bands[3].data.iter().filter(|a| **a >= 0.5 / 255.0).count();
+        assert!(shown > 0 && shown < r.bands[3].data.len(), "{name}: {shown}");
+        let info = s.run("raster.info", &json!({"layer": name})).unwrap();
+        for b in 0..3 {
+            let band = &info["bands"][b];
+            assert_eq!(band["validPixels"], json!(shown), "{name} band {b}: {band}");
+            let (min, max) = (band["min"].as_f64().unwrap(), band["max"].as_f64().unwrap());
+            assert!((0.0..=249.0).contains(&min) && (10.0..=249.0).contains(&max), "{name} band {b}: {band}");
+        }
+        assert_eq!(info["bands"][3]["validPixels"], json!(r.bands[3].data.len()), "{name}");
+    }
+    // The file's black row counts.
+    assert_eq!(s.run("raster.info", &json!({"layer": "ortho"})).unwrap()["bands"][0]["min"], json!(0.0));
+    // The range now drawn, shared: within the opaque colours.
+    s.run("raster.stretch", &json!({"layer": "ortho", "like": "ortho"})).unwrap();
+    let style = &s.map().layer_by_name("ortho").unwrap().raster.as_ref().unwrap().style;
+    let rustgis_map::raster::Stretch::Custom { bands: Some(bands), .. } = style.stretch else { panic!("{:?}", style.stretch) };
+    assert!(bands.iter().all(|[lo, hi]| (0.0..=249.0).contains(lo) && (0.0..=249.0).contains(hi) && lo < hi), "{bands:?}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Change Detection leaves out a cell either raster draws see-through (#1810): the first's left
+/// ten columns, holding −3.4e38, and the second's bottom ten rows, holding a stray 7, on the same
+/// grid and on one moved 0.4 m. Every cell both show compares, black ones included: 5 apart. A
+/// second moved five cells east, see-through in its own right ten columns, has its alpha
+/// resampled as its band is: read at the first's cells instead, it would hide other columns.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn change_detection_leaves_out_see_through_cells() {
+    use rustgis_data::raster::Raster;
+    let before = see_through_ortho("before", |i| i % 40 < 10, 0.0);
+    // Five cells east: its column k is the first's column k + 5, with the first's colours plus 5
+    // (its first five columns cover the first's see-through ones), see-through from its column 30.
+    let moved = {
+        let see = |i: usize| i % 40 >= 30;
+        let bands = (0..4)
+            .map(|b| {
+                (0..1600)
+                    .map(|i| match (b, see(i)) {
+                        (3, true) => 0.0,
+                        (3, false) => 255.0,
+                        (_, true) => 7.0,
+                        (_, false) => before.bands[b].data[i + 5] + 5.0,
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut gt = before.transform;
+        gt.origin_x += 5.0;
+        Raster::new("after moved", 40, 40, bands, gt, before.crs, None, before.color.clone(), "Float32").unwrap()
+    };
+    let mut after = see_through_ortho("after", |i| i >= 1200, 5.0);
+    for band in after.bands.iter_mut().take(3) {
+        for v in band.data.iter_mut().skip(1200) {
+            *v = 7.0;
+        }
+    }
+    let shifted = {
+        let mut gt = after.transform;
+        gt.origin_x += 0.4;
+        let bands = after.bands.iter().map(|b| b.data.clone()).collect();
+        Raster::new("after shifted", 40, 40, bands, gt, after.crs, None, after.color.clone(), "Float32").unwrap()
+    };
+    let mut s = Session::new(Project::default());
+    for r in [before, after, shifted, moved] {
+        let name = r.name.clone();
+        let bytes = rustgis_data::raster::geotiff::write(&r, 0).unwrap();
+        crate::cmd::raster::add_raster(&mut s, &name, rustgis_map::RasterLayer::from_bytes(r, "x.tif", bytes)).unwrap();
+    }
+    for after in ["after", "after shifted"] {
+        let out = format!("{after} change");
+        s.run("raster.change", &json!({"before": "before", "after": after, "method": "difference", "name": out})).unwrap();
+        let r = s.map().layer_by_name(&out).unwrap().raster.as_ref().unwrap().data.clone().unwrap();
+        let kept: Vec<f32> = r.bands[0].data.iter().copied().filter(|v| r.is_valid(*v)).collect();
+        // Opaque in both: columns 10 to 39 of rows 0 to 29. The shift of 0.4 m east keeps each
+        // cell's centre in the same column of the second.
+        assert_eq!(kept.len(), 30 * 30, "{after}");
+        assert!(kept.iter().all(|v| *v == 5.0), "{after}: {:?}", kept.iter().find(|v| **v != 5.0));
+    }
+    // Moved: the first's columns 0 to 4 are off the second, 5 to 9 see-through in the first, and
+    // 35 to 39 the second's see-through 30 to 34; 10 to 34 of every row compare, 5 apart. Its alpha
+    // read at the first's cells would hide 30 to 39 instead (800 cells, and 7s compared).
+    s.run("raster.change", &json!({"before": "before", "after": "after moved", "method": "difference", "name": "moved change"})).unwrap();
+    let r = s.map().layer_by_name("moved change").unwrap().raster.as_ref().unwrap().data.clone().unwrap();
+    let kept: Vec<usize> = (0..1600).filter(|i| r.is_valid(r.bands[0].data[*i])).collect();
+    assert_eq!(kept.len(), 25 * 40);
+    assert!(
+        kept.iter().all(|i| (10..35).contains(&(i % 40)) && r.bands[0].data[*i] == 5.0),
+        "{:?}",
+        kept.iter().find(|i| r.bands[0].data[**i] != 5.0)
+    );
+}
+
 /// A layer read whole from a Shapefile or GeoJSON file remembers the files and its rows as read
 /// (#1385): `source.syncState` says when it has edits the file lacks, when the file changed
 /// since, and neither once an edit is undone. The record is saved with the project.

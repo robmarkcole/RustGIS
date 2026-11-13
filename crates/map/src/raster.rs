@@ -1546,10 +1546,22 @@ impl RasterMask {
     }
 
     /// Statistics of `band`'s valid pixels that the mask leaves, from a sample of a large band.
+    /// A colour band's cells its alpha draws see-through are left out, as the band's own
+    /// statistics leave them out (#1810).
     pub fn stats(&self, r: &Raster, band: usize) -> BandStats {
         let Some(b) = r.bands.get(band) else { return BandStats::default() };
         let step = b.data.len().div_ceil(MASK_STATS_SAMPLE).max(1);
-        let kept: Vec<f32> = b.data.iter().step_by(step).map(|v| if r.is_valid(*v) && !self.hides(*v) { *v } else { f32::NAN }).collect();
+        let hidden = r.see_through_cells(band);
+        let kept: Vec<f32> = b
+            .data
+            .iter()
+            .enumerate()
+            .step_by(step)
+            .map(|(i, v)| {
+                let shown = r.is_valid(*v) && !self.hides(*v) && !hidden.as_ref().is_some_and(|h| h(i));
+                if shown { *v } else { f32::NAN }
+            })
+            .collect();
         BandStats::from_values(&kept)
     }
 
@@ -2561,6 +2573,35 @@ mod tests {
         assert_eq!(c.color(&[3.5], None), None);
         let k = RasterStyle { renderer: classify(&r, 0, 3, ClassMethod::EqualInterval, Ramp::Ember), ..s };
         assert!(Colorizer::new(&k, &r, None).color(&[5.0], None).is_some());
+    }
+
+    /// A style mask's statistics leave out the cells a colour band's alpha draws see-through, as
+    /// the band's own leave them out (#1810).
+    #[test]
+    fn a_masks_statistics_leave_out_see_through_cells() {
+        use rustgis_data::raster::{ColorHint, Crs, GeoTransform};
+        let gt = GeoTransform { origin_x: 0.0, origin_y: 4.0, pixel_width: 1.0, pixel_height: -1.0 };
+        // The bottom row see-through, holding −3.4e38; 200 elsewhere, and a black first cell.
+        let colour: Vec<f32> = (0..16)
+            .map(|i| {
+                if i >= 12 {
+                    -3.4e38
+                } else if i == 0 {
+                    0.0
+                } else {
+                    200.0
+                }
+            })
+            .collect();
+        let alpha: Vec<f32> = (0..16).map(|i| if i >= 12 { 0.0 } else { 1.0 }).collect();
+        let bands = vec![colour.clone(), colour.clone(), colour, alpha];
+        let r = Raster::new("rgba", 4, 4, bands, gt, Crs::LonLat, None, ColorHint::Rgb { alpha: true }, "Float32").unwrap();
+        let mask = RasterMask { values: vec![200.0], ..RasterMask::default() };
+        // 200 hidden by the mask, the bottom row by the alpha: the black cell alone.
+        let st = mask.stats(&r, 0);
+        assert_eq!((st.count, st.min, st.max), (1, 0.0, 0.0));
+        // The alpha band itself: every cell the mask leaves.
+        assert_eq!(mask.stats(&r, 3).count, 16);
     }
 
     /// #348: values a mask lists, or outside (or inside) its range, are no data.

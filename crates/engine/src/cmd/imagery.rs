@@ -884,6 +884,19 @@ pub(crate) fn change_work(s: &Session, p: &Value) -> Result<super::workflows::Wo
     Ok(Box::new(move || {
         let av = &a.bands.get(band).ok_or("no such band")?.data;
         let bv = rasterops::resample_to(&bfr, band, &a)?;
+        // A cell either raster draws see-through has no colour to compare (#1810): the first's by
+        // its alpha band, the second's by its alpha band resampled onto the first's grid as its
+        // band is (a cell outside it, or of no alpha value, is see-through).
+        let a_hidden = a.see_through_cells(band);
+        let b_alpha = match bfr.color.alpha(bfr.band_count()) {
+            Some((alpha, colour)) if colour.contains(&band) => Some(rasterops::resample_to(&bfr, alpha, &a)?),
+            _ => None,
+        };
+        let b_opaque = raster::alpha_max(&bfr.data_type);
+        let hidden = |i: usize| {
+            a_hidden.as_ref().is_some_and(|h| h(i))
+                || b_alpha.as_ref().is_some_and(|al| al.get(i).is_none_or(|&v| raster::see_through(v, bfr.is_valid(v), b_opaque)))
+        };
         let n = a.width as usize * a.height as usize;
         let out = rasterops::per_index(
             n,
@@ -892,7 +905,7 @@ pub(crate) fn change_work(s: &Session, p: &Value) -> Result<super::workflows::Wo
             || (),
             |_, i| {
                 let (Some(x), Some(y)) = (av.get(i).copied(), bv.get(i).copied()) else { return NODATA };
-                if !a.is_valid(x) || y == NODATA {
+                if !a.is_valid(x) || y == NODATA || hidden(i) {
                     return NODATA;
                 }
                 let v = match method.as_str() {
