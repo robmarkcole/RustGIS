@@ -267,8 +267,8 @@ fn name_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer) {
     }
 }
 
-/// What the Details pane shows of the layer, and the actions on its source the layer's menu has,
-/// each where the menu shows it.
+/// What the Details pane shows of the layer, and the actions on its source: those the layer's
+/// menu has, each where the menu shows it, and Define Projection…, which is here only (#1803).
 fn source(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
     crate::panes::source_details(ui, l, t);
     ui.add_space(8.0);
@@ -580,6 +580,7 @@ mod tests {
         assert!(h.query_by_role_and_label(Role::ComboBox, "Layer Blend").is_none(), "blend is a raster's");
         open_tab(&mut h, "Source");
         assert!(h.query_by_label("Geometry").is_some(), "the Details rows");
+        assert!(h.query_by_role_and_label(Role::Button, "Define Projection…").is_some(), "here, not in the layer menu");
         open_tab(&mut h, "Query");
         assert!(h.query_by_role_and_label(Role::MultilineTextInput, "Where").is_some());
     }

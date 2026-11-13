@@ -743,6 +743,13 @@ pub fn shortcuts(app: &mut RustGisApp, ctx: &egui::Context) {
             }
             continue;
         }
+        // Rename with no name given (F2) opens the Rename dialog for the active layer, as Command
+        // Search does: the name is typed there. One naming another layer runs the command, which
+        // says the name is missing, rather than renaming the active layer instead.
+        if id == "layer.rename" && p.get("name").is_none() && p.get("layer").is_none() {
+            let _ = app.run("ui.dialog", json!({"name": "renameLayer"}));
+            continue;
+        }
         let _ = app.run_by_user(id, p);
     }
 }

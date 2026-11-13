@@ -2367,12 +2367,9 @@ fn layer_menu(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, reorder: bool) {
         ui.close();
     }
     ui.separator();
+    // F2 too (`keymap::DEFAULTS`).
     if ui.button(tl!("Rename…")).clicked() {
         let _ = app.run("ui.dialog", json!({"name": "renameLayer"}));
-        ui.close();
-    }
-    if !l.is_raster() && ui.button(tl!("Define Projection…")).clicked() {
-        let _ = app.run("ui.dialog", json!({"name": "defineProjection"}));
         ui.close();
     }
     // Layer groups (#413): a service's collections stay in their service group.
@@ -2408,8 +2405,8 @@ fn layer_menu(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, reorder: bool) {
             ui.close();
         }
     } else {
-        // The definition query and the time slider binding are on the Query and Time tabs of
-        // Properties… (#1803).
+        // The definition query, the time slider binding and Define Projection… are on the Query,
+        // Time and Source tabs of Properties… (#1803).
         if ui.button(tl!("Export Features…")).clicked() {
             let _ = app.run("ui.exportLayer", Value::Null);
             ui.close();
@@ -8461,5 +8458,50 @@ mod tests {
         let map = h.state().session.map();
         assert!(map.layer_by_name("Cities Annotation").is_some(), "no annotation layer");
         assert!(!map.layer_by_name("Cities").unwrap().labels.enabled, "the layer's own labels give way to it");
+    }
+
+    /// Define Projection… is on the Source tab of Properties…, not in the layer menu (#1803); the
+    /// menu's data actions stay, for the layers they apply to: here a file read in place.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn the_layer_menu_leaves_define_projection_to_properties() {
+        use egui_kittest::kittest::Queryable;
+        use rustgis_engine::data::{Coord, Dataset, Field, FieldType, Geometry, GeometryType, Value as V, raster::Crs, source::gpkg};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("places.gpkg");
+        let mut data = Dataset::new("places", GeometryType::Point, vec![Field::new("name", FieldType::Text)]);
+        data.push(Some(Geometry::Point(Coord::new(1.0, 20.0))), vec![V::Text("a".into())]);
+        gpkg::write_in(&data, &path, Crs::LonLat).unwrap();
+        let mut app = RustGisApp::with_sample();
+        app.run("layer.addData", json!({"path": &path, "stream": true, "name": "Places"})).unwrap();
+        let l = app.session.map().layer_by_name("Places").cloned().unwrap();
+        assert!(l.is_streamed() && l.linked_file().is_some());
+        let mut h = egui_kittest::Harness::builder().build_ui_state(move |ui, app: &mut RustGisApp| layer_menu(app, ui, &l, true), app);
+        h.step();
+        assert!(h.query_by_label("Define Projection…").is_none(), "Define Projection… is still in the menu");
+        for kept in ["Rename…", "Export Features…", "Load All Features", "Reload Data", "Repair Data Source…", "Properties…"] {
+            assert!(h.query_by_label(kept).is_some(), "no {kept}");
+        }
+    }
+
+    /// F2 renames the active layer: it opens the Rename dialog with the layer's name, as the
+    /// layer menu's Rename… does.
+    #[test]
+    fn f2_opens_the_rename_dialog_for_the_active_layer() {
+        let mut app = RustGisApp::with_sample();
+        app.session.active_layer = Some(layer(&app, "Rivers"));
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).with_max_steps(64).build_ui_state(
+            |ui, app: &mut RustGisApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            app,
+        );
+        h.run_steps(2);
+        h.key_press(egui::Key::F2);
+        h.run_steps(2);
+        assert_eq!(h.state().dialogs.open, Some("renameLayer"));
+        assert_eq!(h.state().dialogs.text, "Rivers");
     }
 }
