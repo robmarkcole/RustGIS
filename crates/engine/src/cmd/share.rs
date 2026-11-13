@@ -643,8 +643,11 @@ pub(crate) fn layer_work(s: &Session, p: &Value) -> Result<Work, String> {
     let ext = Path::new(&path).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     let gpkg = gpkg_table(p, &ext)?;
     let compatibility = ps(p, "crs").and_then(|text| asked.and_then(|crs| rustgis_data::raster::wkt::typed_crs_note(text, crs)));
+    let (boxes, map) = (s.boxes.clone(), s.map().instance_id());
     Ok(Box::new(move || {
+        let note = boxes.export_note(map, &l)?;
         let mut wrote = write_layer(&l, &path, asked, gpkg)?;
+        wrote.notes.extend(note);
         if let Some(note) = compatibility {
             wrote.notes.insert(0, format!("crs: {note}"));
         }

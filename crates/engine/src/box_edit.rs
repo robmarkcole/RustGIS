@@ -1,0 +1,573 @@
+//! Runtime construction for boxes on ordinary polygon layers. No fields or saved metadata are
+//! added to a dataset. Construction snapshots accompany undo/redo; a foreign
+//! vertex edit invalidates the constrained editor instead of silently fitting another box.
+use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
+
+use rustgis_data::raster::{Crs, ImageGrid, Transformer};
+use rustgis_data::{Geometry, GeometryType};
+use rustgis_geom::Coord;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+use crate::{CmdResult, CommandSpec as C, Session};
+
+/// A frozen planar grid, with x right and y down. The default is Web Mercator grid metres,
+/// not ground metres. A GeoTIFF's original grid can be supplied through [`Self::from_grid`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Frame {
+    pub epsg: u32,
+    pub width: u32,
+    pub height: u32,
+    pub affine: [f64; 6],
+}
+impl Default for Frame {
+    fn default() -> Self {
+        Self { epsg: 3857, width: 1, height: 1, affine: [0., 1., 0., 0., 0., -1.] }
+    }
+}
+thread_local! {
+    static PROJECTION: std::cell::RefCell<Option<(u32, std::rc::Rc<Transformer>)>> = const { std::cell::RefCell::new(None) };
+}
+impl Frame {
+    pub fn from_grid(grid: &ImageGrid) -> Result<Self, String> {
+        let epsg = u32::from(grid.crs().epsg());
+        if epsg == 0 {
+            return Err("box grids currently require a recognised EPSG coordinate system".into());
+        }
+        Ok(Self { epsg, width: grid.width(), height: grid.height(), affine: grid.affine() })
+    }
+    fn grid(&self) -> Result<ImageGrid, String> {
+        let crs =
+            Crs::from_epsg(self.epsg).filter(|c| !c.lacks_datum_shift()).ok_or("box grid needs a supported EPSG coordinate system")?;
+        ImageGrid::new(self.width, self.height, crs, self.affine).map_err(|e| e.to_string())
+    }
+    fn projection(&self) -> Option<std::rc::Rc<Transformer>> {
+        PROJECTION.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if let Some((_, t)) = cache.as_ref().filter(|(e, _)| *e == self.epsg) {
+                return Some(std::rc::Rc::clone(t));
+            }
+            let t = std::rc::Rc::new(self.grid().ok()?.crs().transformer().ok()?);
+            *cache = Some((self.epsg, std::rc::Rc::clone(&t)));
+            Some(t)
+        })
+    }
+    pub fn to_lonlat(&self, p: [f64; 2]) -> Option<Coord> {
+        self.projection()?.to_lonlat(self.grid().ok()?.to_world(p[0], p[1])?)
+    }
+    pub fn to_local(&self, c: Coord) -> Option<[f64; 2]> {
+        let (x, y) = self.grid().ok()?.to_pixel(self.projection()?.from_lonlat(c)?)?;
+        Some([x, y])
+    }
+}
+
+/// Clockwise degrees from the grid's positive x axis. Every edit regenerates four corners from
+/// these parameters, never repeatedly rotating the previous polygon's vertices.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoxSpec {
+    #[serde(default)]
+    pub frame: Frame,
+    pub center: [f64; 2],
+    pub width: f64,
+    pub height: f64,
+    pub angle: f64,
+}
+impl BoxSpec {
+    pub fn axes(&self) -> ([f64; 2], [f64; 2]) {
+        let (s, c) = self.angle.rem_euclid(360.).to_radians().sin_cos();
+        ([c, s], [-s, c])
+    }
+    pub fn point(&self, x: f64, y: f64) -> [f64; 2] {
+        let (u, v) = self.axes();
+        [self.center[0] + u[0] * x + v[0] * y, self.center[1] + u[1] * x + v[1] * y]
+    }
+    pub fn corners(&self) -> [[f64; 2]; 4] {
+        let (w, h) = (self.width / 2., self.height / 2.);
+        [self.point(-w, -h), self.point(w, -h), self.point(w, h), self.point(-w, h)]
+    }
+    pub fn geometry(&self) -> Result<Geometry, String> {
+        self.frame.grid()?;
+        if !self.center.iter().chain([&self.width, &self.height, &self.angle]).all(|v| v.is_finite() && v.abs() <= 1e12)
+            || self.width < 1e-6
+            || self.height < 1e-6
+        {
+            return Err("a box needs finite coordinates, angle and positive dimensions".into());
+        }
+        let mut ring = Vec::with_capacity(5);
+        for p in self.corners() {
+            ring.push(
+                self.frame
+                    .to_lonlat(p)
+                    .filter(|c| c.is_finite() && c.x.abs() <= 180. && c.y.abs() < 85.05)
+                    .ok_or("box crosses an unsupported projection boundary or the polar editing limit")?,
+            );
+        }
+        let span = ring.iter().map(|p| p.x).fold(f64::NEG_INFINITY, f64::max) - ring.iter().map(|p| p.x).fold(f64::INFINITY, f64::min);
+        if span > 180. {
+            return Err("boxes crossing the antimeridian are not supported".into());
+        }
+        let mut sign = 0.;
+        for i in 0..4 {
+            let (Some(a), Some(b), Some(c)) = (ring.get(i), ring.get((i + 1) % 4), ring.get((i + 2) % 4)) else {
+                return Err("missing box corner".into());
+            };
+            let turn = (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x);
+            if !turn.is_finite() || turn == 0. || (sign != 0. && turn.signum() != sign) {
+                return Err("box folds or collapses after transformation; use a smaller box".into());
+            }
+            sign = turn.signum();
+        }
+        if sign < 0. {
+            ring.reverse();
+        }
+        let first = ring.first().copied().ok_or("missing box corner")?;
+        ring.push(first);
+        Ok(Geometry::Polygon(vec![vec![ring]]))
+    }
+}
+
+type Key = (u64, u64, u64, u64);
+#[derive(Clone)]
+struct Record {
+    spec: BoxSpec,
+    geometry: Geometry,
+}
+type Shard = Arc<BTreeMap<Key, Arc<Record>>>;
+
+/// Immutable snapshots accompany undo and background exports. An edit copies at most 512
+/// record references and the 256-entry directory; construction geometries remain shared.
+#[derive(Clone, Default)]
+pub(crate) struct Cache {
+    shards: Arc<Vec<Shard>>,
+    len: usize,
+}
+impl Cache {
+    fn key(s: &Session, layer: u32, row: usize) -> Option<Key> {
+        let l = s.map().layer(layer)?;
+        Some((s.map().instance_id(), l.instance_id(), l.replacement_revision(), l.dataset.features.get(row)?.id))
+    }
+    fn shard(key: Key) -> usize {
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hash);
+        (hash.finish() % 256) as usize
+    }
+    fn get(&self, key: Key, geometry: &Geometry) -> Option<&Record> {
+        self.shards.get(Self::shard(key))?.get(&key).map(|r| r.as_ref()).filter(|r| r.geometry == *geometry)
+    }
+    fn room(&self) -> Result<(), String> {
+        if self.len >= 100_000 {
+            Err("this session already holds 100000 box constructions; start a new session for more".into())
+        } else {
+            Ok(())
+        }
+    }
+    fn remember(&mut self, key: Key, record: Record) -> Result<(), String> {
+        let at = Self::shard(key);
+        if self.shards.is_empty() {
+            let empty = Arc::new(BTreeMap::new());
+            self.shards = Arc::new(vec![empty; 256]);
+        }
+        let shards = Arc::make_mut(&mut self.shards);
+        let shard = shards.get_mut(at).ok_or("box cache is unavailable")?;
+        let exists = shard.contains_key(&key);
+        if !exists && shard.len() >= 512 {
+            return Err("box construction cache capacity reached; start a new session for more".into());
+        }
+        Arc::make_mut(shard).insert(key, Arc::new(record));
+        if !exists {
+            self.len += 1;
+        }
+        Ok(())
+    }
+    fn remove(&mut self, key: Key) {
+        let at = Self::shard(key);
+        if self.shards.get(at).is_none_or(|s| !s.contains_key(&key)) {
+            return;
+        }
+        if let Some(shard) = Arc::make_mut(&mut self.shards).get_mut(at)
+            && Arc::make_mut(shard).remove(&key).is_some()
+        {
+            self.len = self.len.saturating_sub(1);
+        }
+    }
+    pub(crate) fn export_note(&self, map: u64, layer: &rustgis_map::Layer) -> Result<Option<String>, String> {
+        if self.len == 0 {
+            return Ok(None);
+        }
+        let mut count = 0;
+        for (row, feature) in layer.dataset.features.iter().enumerate() {
+            if row.is_multiple_of(256) {
+                rustgis_data::progress::check().map_err(|e| e.to_string())?;
+            }
+            let key = (map, layer.instance_id(), layer.replacement_revision(), feature.id);
+            if feature.geometry.as_ref().is_some_and(|g| self.get(key, g).is_some()) {
+                count += 1;
+            }
+        }
+        Ok((count > 0).then(|| format!("{count} rotated box(es) exported as ordinary polygons with four transformed corners: box construction does not survive saving or reimport, and curved grid edges are represented by straight polygon edges")))
+    }
+}
+/// Newly inserted ordinary features must never inherit a deleted feature's construction if
+/// its row id is reused. Deletion forgets only the live snapshot; undo retains the old cache.
+pub(crate) fn forget_feature(s: &mut Session, layer: u32, feature: u64) {
+    if let Some(l) = s.map().layer(layer) {
+        let key = (s.map().instance_id(), l.instance_id(), l.replacement_revision(), feature);
+        s.boxes.remove(key);
+    }
+}
+impl Session {
+    /// Only unchanged boxes constructed in this session get constrained handles. Imported
+    /// polygons and boxes whose vertices were independently edited are never silently refitted.
+    pub fn box_spec(&self, layer: u32, row: usize) -> Option<BoxSpec> {
+        let g = self.map().layer(layer)?.dataset.features.get(row)?.geometry.as_ref()?;
+        self.boxes.get(Cache::key(self, layer, row)?, g).map(|r| r.spec.clone())
+    }
+}
+
+pub(crate) fn commands() -> Vec<C> {
+    let roles: &[crate::ParamRole] =
+        &[crate::ParamRole { key: "box", role: crate::Role::Opaque }, crate::ParamRole { key: "attributes", role: crate::Role::Opaque }];
+    vec![
+        C::new("edit.addBox", "Add Rotated Box", "Edit › Features", add).inputs(crate::cmd::design::new_feature_inputs).roles(roles).effects(crate::policy::Effects::NONE)
+            .when(crate::cmd::design::need_editable).params(r#"{"layer"?: name|id, "box": {"center":[x,y],"width":number,"height":number,"angle":clockwise degrees,"frame"?:{"epsg":number,"width":pixels,"height":pixels,"affine":[x0,xc,xr,y0,yc,yr]}},"attributes"?:{field:value},"template"?:string}"#),
+        C::new("edit.updateBox", "Update Rotated Box", "Edit › Features", update).roles(roles).effects(crate::policy::Effects::NONE)
+            .when(crate::cmd::design::need_editable).params(r#"{"layer"?:name|id,"row":number,"featureId"?:number,"box":as edit.addBox}"#),
+        C::new("edit.deleteBox", "Delete Box", "Edit › Features", delete_box).roles(&[]).effects(crate::policy::Effects::NONE)
+            .when(crate::cmd::design::need_editable).params(r#"{"layer"?:name|id,"row":number,"featureId"?:number}"#),
+        C::new("edit.boxInfo", "Box Construction", "Edit › Features", info).roles(&[]).effects(crate::policy::Effects::NONE).view()
+            .params(r#"{"layer"?:name|id,"row":number}"#),
+    ]
+}
+pub fn check_layer(s: &Session, id: u32) -> Result<(), String> {
+    if s.map().body != "earth" {
+        return Err("rotated box grids currently require an Earth map".into());
+    }
+    if !s.map().editing.settings.enabled {
+        return Err("turn on editing first (Edit › Edit)".into());
+    }
+    let l = s.map().layer(id).ok_or("select an editable polygon layer")?;
+    if l.is_streamed() || l.graphics || l.raster.is_some() || !matches!(l.geometry_type(), GeometryType::Polygon | GeometryType::None) {
+        return Err("choose a loaded editable polygon layer".into());
+    }
+    Ok(())
+}
+fn parsed(p: &Value) -> Result<BoxSpec, String> {
+    let mut b: BoxSpec = BoxSpec::deserialize(p.get("box").ok_or("box is required")?).map_err(|e| e.to_string())?;
+    if !b.angle.is_finite() || b.angle.abs() > 1e12 {
+        return Err("box angle must be finite".into());
+    }
+    b.angle = b.angle.rem_euclid(360.);
+    b.geometry()?;
+    Ok(b)
+}
+fn row(p: &Value) -> Result<usize, String> {
+    p.get("row").and_then(Value::as_u64).and_then(|r| usize::try_from(r).ok()).ok_or_else(|| "row is required".into())
+}
+fn add(s: &mut Session, p: &Value) -> CmdResult {
+    let id = s.layer_id(p)?;
+    check_layer(s, id)?;
+    s.boxes.room()?;
+    let b = parsed(p)?;
+    if let Some(attributes) = p.get("attributes") {
+        let attributes = attributes.as_object().ok_or("attributes must be an object")?;
+        let layer = s.map().layer(id).ok_or("no layer")?;
+        for field in attributes.keys() {
+            if !layer.dataset.fields.iter().any(|f| f.name == *field) {
+                return Err(format!("no attribute field '{field}'; add it to the layer first"));
+            }
+        }
+    }
+    let g = b.geometry()?;
+    let result = crate::cmd::edit::add_geometry(s, id, p, g)?;
+    let row = result.get("row").and_then(Value::as_u64).and_then(|r| usize::try_from(r).ok()).ok_or("box was not added")?;
+    remember(s, id, row, b.clone())?;
+    Ok(json!({"row":row,"box":b}))
+}
+fn remember(s: &mut Session, id: u32, row: usize, spec: BoxSpec) -> Result<(), String> {
+    let key = Cache::key(s, id, row).ok_or("box source changed")?;
+    if key.3 == u64::MAX {
+        return Err("feature IDs have reached their limit; create a fresh layer for boxes".into());
+    }
+    let g =
+        s.map().layer(id).and_then(|l| l.dataset.features.get(row)).and_then(|f| f.geometry.clone()).ok_or("box geometry is missing")?;
+    if g != spec.geometry()? {
+        return Err("an edit rule changed the box geometry".into());
+    }
+    s.boxes.remember(key, Record { spec, geometry: g })
+}
+fn update(s: &mut Session, p: &Value) -> CmdResult {
+    let id = s.layer_id(p)?;
+    check_layer(s, id)?;
+    let row = row(p)?;
+    let key = Cache::key(s, id, row).ok_or("no such feature")?;
+    let g = s.map().layer(id).and_then(|l| l.dataset.features.get(row)).and_then(|f| f.geometry.as_ref()).ok_or("missing box geometry")?;
+    let before = s.boxes.get(key, g).map(|r| r.spec.clone()).ok_or("this feature has no unchanged box construction; use Edit Vertices")?;
+    if p.get("featureId").is_some_and(|v| v.as_u64() != Some(key.3)) {
+        return Err("the feature changed during this edit".into());
+    }
+    let b = parsed(p)?;
+    if b.frame != before.frame {
+        return Err("a box's construction grid is frozen; start another box to change grids".into());
+    }
+    crate::cmd::design::replace_geometry(s, id, row, b.geometry()?)?;
+    remember(s, id, row, b.clone())?;
+    Ok(json!({"row":row,"box":b}))
+}
+fn delete_box(s: &mut Session, p: &Value) -> CmdResult {
+    let id = s.layer_id(p)?;
+    check_layer(s, id)?;
+    let row = row(p)?;
+    let key = Cache::key(s, id, row).ok_or("no such feature")?;
+    if s.box_spec(id, row).is_none() {
+        return Err("this feature has no unchanged box construction".into());
+    }
+    if p.get("featureId").is_some_and(|v| v.as_u64() != Some(key.3)) {
+        return Err("the feature changed during this edit".into());
+    }
+    let layer = s.map_mut().layer_mut(id).ok_or("no layer")?;
+    let before = layer.dataset.features.remove(row);
+    layer.selection = layer.selection.iter().copied().filter(|r| *r != row).map(|r| if r > row { r - 1 } else { r }).collect();
+    layer.touch_geometry();
+    forget_feature(s, id, before.id);
+    crate::cmd::design::apply(s, id, vec![crate::cmd::design::Change { before: Some(before), row: None }])?;
+    Ok(json!({"deleted":1,"featureId":key.3}))
+}
+fn info(s: &mut Session, p: &Value) -> CmdResult {
+    let id = s.layer_id(p)?;
+    let row = row(p)?;
+    let b = s.box_spec(id, row).ok_or("this feature has no unchanged box construction")?;
+    Ok(json!({"row":row,"box":b}))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use rustgis_data::{Dataset, Field, FieldType};
+    fn session() -> (Session, u32) {
+        let mut s = Session::new(crate::Project::default());
+        let id = s.map_mut().add_dataset(Dataset::new(
+            "Boxes",
+            GeometryType::Polygon,
+            vec![Field::new("class", FieldType::Text), Field::new("_rustgis_box", FieldType::Text)],
+        ));
+        s.active_layer = Some(id);
+        s.run("edit.enable", &json!({"on":true})).unwrap();
+        (s, id)
+    }
+    fn spec() -> BoxSpec {
+        BoxSpec { frame: Frame::default(), center: [1000., 1000.], width: 200., height: 100., angle: 30. }
+    }
+    fn add(s: &mut Session, b: &BoxSpec) -> usize {
+        s.run("edit.addBox", &json!({"box":b,"attributes":{"class":"vehicle","_rustgis_box":"user-owned"}})).unwrap()["row"]
+            .as_u64()
+            .unwrap() as usize
+    }
+    #[test]
+    fn box_edit_preserves_attributes_identity_and_construction_through_history() {
+        let (mut s, id) = session();
+        let b = spec();
+        let row = add(&mut s, &b);
+        let original = s.map().layer(id).unwrap().dataset.features[row].clone();
+        let fields = s.map().layer(id).unwrap().dataset.fields.clone();
+        let mut next = b.clone();
+        next.angle = 112.;
+        next.width = 310.;
+        s.run("edit.updateBox", &json!({"row":row,"featureId":original.id,"box":next})).unwrap();
+        let after = &s.map().layer(id).unwrap().dataset.features[row];
+        assert_eq!(after.id, original.id);
+        assert_eq!(after.attrs, original.attrs);
+        assert_eq!(s.map().layer(id).unwrap().dataset.fields, fields);
+        assert_eq!(s.box_spec(id, row), Some(next.clone()));
+        s.run("edit.undo", &json!({})).unwrap();
+        assert_eq!(s.box_spec(id, row), Some(b.clone()));
+        assert_eq!(s.map().layer(id).unwrap().dataset.features[row].geometry, original.geometry);
+        s.run("edit.redo", &json!({})).unwrap();
+        assert_eq!(s.box_spec(id, row), Some(next));
+        s.run("edit.delete", &json!({})).unwrap();
+        assert!(s.box_spec(id, row).is_none());
+        s.run("edit.undo", &json!({})).unwrap();
+        assert!(s.box_spec(id, row).is_some());
+    }
+    #[test]
+    fn box_edit_history_branch_does_not_lose_an_unchanged_boxes_construction() {
+        let (mut s, id) = session();
+        let b = spec();
+        let first = add(&mut s, &b);
+        let second = add(&mut s, &b);
+        let mut next = b.clone();
+        next.angle = 80.;
+        s.run("edit.updateBox", &json!({"row":first,"box":next})).unwrap();
+        s.run("edit.undo", &json!({})).unwrap();
+        for n in 0..45 {
+            next.angle = f64::from(n);
+            s.run("edit.updateBox", &json!({"row":second,"box":next})).unwrap();
+        }
+        assert_eq!(s.box_spec(id, first), Some(b));
+        for _ in 0..40 {
+            s.run("edit.undo", &json!({})).unwrap();
+        }
+        assert!(s.box_spec(id, first).is_some());
+        assert!(s.box_spec(id, second).is_some());
+    }
+    #[test]
+    fn box_edit_foreign_geometry_changes_disable_handles_and_undo_restores_them() {
+        let (mut s, id) = session();
+        let b = spec();
+        let row = add(&mut s, &b);
+        let changed = Geometry::Polygon(vec![vec![vec![Coord::new(0., 0.), Coord::new(1., 0.), Coord::new(0., 1.), Coord::new(0., 0.)]]]);
+        s.run("edit.setGeometry", &json!({"row":row,"geometry":rustgis_data::io::geometry_to_geojson(&changed)})).unwrap();
+        assert!(s.box_spec(id, row).is_none());
+        assert!(s.run("edit.updateBox", &json!({"row":row,"box":b})).is_err());
+        s.run("edit.undo", &json!({})).unwrap();
+        assert_eq!(s.box_spec(id, row), Some(b));
+    }
+    #[test]
+    fn box_edit_uses_the_original_affine_grid_without_accumulating_rotation_error() {
+        let grid = ImageGrid::new(400, 300, Crs::from_epsg(32633).unwrap(), [500_000., 0.8, 0.2, 1000., 0.1, -0.8]).unwrap();
+        let mut b = BoxSpec { frame: Frame::from_grid(&grid).unwrap(), center: [200., 150.], width: 60., height: 30., angle: 0. };
+        for angle in [0., 17., 90., 181., 359., 17.] {
+            b.angle = angle;
+            let Geometry::Polygon(polygons) = b.geometry().unwrap() else { panic!("polygon") };
+            let ring = &polygons[0][0];
+            assert_eq!(ring.len(), 5);
+            assert_eq!(ring.first(), ring.last());
+            for corner in b.corners() {
+                assert!(ring.iter().take(4).any(|c| {
+                    let q = b.frame.to_local(*c).unwrap();
+                    (q[0] - corner[0]).abs() < 1e-5 && (q[1] - corner[1]).abs() < 1e-5
+                }));
+            }
+            let c = b.corners();
+            let a = [c[1][0] - c[0][0], c[1][1] - c[0][1]];
+            let d = [c[2][0] - c[1][0], c[2][1] - c[1][1]];
+            assert!((a[0] * d[0] + a[1] * d[1]).abs() < 1e-9);
+            assert!((a[0].hypot(a[1]) - 60.).abs() < 1e-10);
+            assert!((d[0].hypot(d[1]) - 30.).abs() < 1e-10);
+        }
+    }
+    #[test]
+    fn box_edit_refuses_bad_parameters_and_stale_identities_without_partial_edits() {
+        let (mut s, id) = session();
+        let b = spec();
+        let row = add(&mut s, &b);
+        let before = s.map().layer(id).unwrap().dataset.features[row].clone();
+        let depth = s.undo_depth();
+        for patch in [
+            json!({"width":0}),
+            json!({"height":-1}),
+            json!({"angle":"NaN"}),
+            json!({"center":[1e99,0]}),
+            json!({"frame":{"epsg":0}}),
+            json!({"frame":{"affine":[0,0,0,0,0,0]}}),
+        ] {
+            let mut bad = serde_json::to_value(&b).unwrap();
+            for (k, v) in patch.as_object().unwrap() {
+                bad[k] = v.clone();
+            }
+            assert!(s.run("edit.updateBox", &json!({"row":row,"box":bad})).is_err());
+            assert_eq!(s.box_spec(id, row), Some(b.clone()));
+            assert_eq!(s.undo_depth(), depth);
+        }
+        assert!(s.run("edit.updateBox", &json!({"row":row,"featureId":before.id+1,"box":b})).is_err());
+        let after = &s.map().layer(id).unwrap().dataset.features[row];
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.geometry, before.geometry);
+        assert_eq!(after.attrs, before.attrs);
+    }
+    #[test]
+    fn box_edit_snapshots_make_export_notices_stable_during_later_edits() {
+        let (mut s, id) = session();
+        let b = spec();
+        let row = add(&mut s, &b);
+        let cache = s.boxes.clone();
+        let layer = s.map().layer(id).unwrap().clone();
+        let map = s.map().instance_id();
+        for n in 0..45 {
+            let mut b = b.clone();
+            b.angle = f64::from(n);
+            s.run("edit.updateBox", &json!({"row":row,"box":b})).unwrap();
+        }
+        assert!(cache.export_note(map, &layer).unwrap().unwrap().starts_with("1 rotated box"));
+        assert!(s.boxes.export_note(map, &layer).unwrap().is_none());
+    }
+    #[test]
+    fn box_edit_geojson_is_plain_geometry_with_counted_export_notes() {
+        let (mut s, id) = session();
+        let b = spec();
+        add(&mut s, &b);
+        add(&mut s, &b);
+        let path = std::env::temp_dir().join(format!("rustgis-box-edit-{}.geojson", std::process::id()));
+        s.notices.clear();
+        s.run("share.exportLayer", &json!({"layer":id,"path":path})).unwrap();
+        assert_eq!(s.notices.iter().filter(|n| n.text.starts_with("2 rotated box")).count(), 1);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(path);
+        let (ds, report) = rustgis_data::io::read_geojson(&text, "shared").unwrap();
+        assert_eq!(ds.features.len(), 2);
+        assert_eq!(report.skipped, 0);
+        assert_eq!(ds.features[0].attrs[ds.field_index("class").unwrap()], rustgis_data::Value::Text("vehicle".into()));
+        let json: Value = serde_json::from_str(&text).unwrap();
+        assert!(json.get("rustgis_annotation").is_none());
+        assert_eq!(json["features"][0]["properties"]["_rustgis_box"], "user-owned");
+        assert!(json["features"][0]["properties"].as_object().unwrap().get("frame").is_none());
+        let mut reopened = Session::new(crate::Project::default());
+        let other = reopened.map_mut().add_dataset(ds);
+        reopened.active_layer = Some(other);
+        assert!(reopened.box_spec(other, 0).is_none());
+        let ordinary = Dataset::new("ordinary", GeometryType::Polygon, vec![]);
+        let ordinary = rustgis_map::Layer::new(99, ordinary);
+        assert!(s.boxes.export_note(s.map().instance_id(), &ordinary).unwrap().is_none());
+    }
+    #[test]
+    fn box_edit_delete_targets_one_object_and_row_id_reuse_never_adopts_a_polygon() {
+        let (mut s, id) = session();
+        let b = spec();
+        let first = add(&mut s, &b);
+        let second = add(&mut s, &b);
+        s.map_mut().layer_mut(id).unwrap().selection = vec![first, second];
+        let depth = s.undo_depth();
+        s.run("edit.deleteBox", &json!({"row":first})).unwrap();
+        assert_eq!(s.map().layer(id).unwrap().dataset.features.len(), 1);
+        assert!(s.box_spec(id, 0).is_some());
+        assert_eq!(s.undo_depth(), depth + 1);
+        s.run("edit.undo", &json!({})).unwrap();
+        assert_eq!(s.map().layer(id).unwrap().dataset.features.len(), 2);
+        assert!(s.box_spec(id, first).is_some() && s.box_spec(id, second).is_some());
+        s.run("edit.delete", &json!({})).unwrap();
+        s.run("edit.addFeature", &json!({"geometry":rustgis_data::io::geometry_to_geojson(&b.geometry().unwrap())})).unwrap();
+        assert!(s.box_spec(id, 0).is_none());
+    }
+
+    #[test]
+    fn box_edit_rejects_unknown_attributes_and_exhausted_feature_ids() {
+        let (mut s, id) = session();
+        let b = spec();
+        assert!(s.run("edit.addBox", &json!({"box":b,"attributes":{"missing":"lost"}})).is_err());
+        assert!(s.map().layer(id).unwrap().dataset.features.is_empty());
+        s.map_mut().layer_mut(id).unwrap().dataset.features.push(rustgis_data::Feature {
+            id: u64::MAX,
+            geometry: Some(b.geometry().unwrap()),
+            attrs: vec![],
+        });
+        assert!(s.run("edit.addBox", &json!({"box":b})).is_err());
+        assert_eq!(s.map().layer(id).unwrap().dataset.features.len(), 1);
+        assert!(s.box_spec(id, 0).is_none());
+    }
+
+    #[test]
+    fn box_edit_replacement_sources_and_reopened_projects_do_not_inherit_construction() {
+        let (mut s, id) = session();
+        let b = spec();
+        let row = add(&mut s, &b);
+        let reopened = Session::new(s.project.clone());
+        assert!(reopened.box_spec(id, row).is_none());
+        let l = s.map_mut().layer_mut(id).unwrap();
+        l.touch_replacement();
+        assert!(s.box_spec(id, row).is_none());
+    }
+}

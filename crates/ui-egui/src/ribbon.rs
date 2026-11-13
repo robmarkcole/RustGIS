@@ -2629,6 +2629,25 @@ fn edit_tab(app: &mut RustGisApp, ui: &mut Ui) {
         if r.clicked() {
             app.map.cancel_sketch();
         }
+        let can_box = crate::boxedit::ready(app);
+        ui.add_enabled_ui(can_box, |ui| {
+            let r = big(
+                ui,
+                app,
+                "g_rect",
+                "Rotated\nBox",
+                "Draw boxes; drag the paddle to rotate, corners to resize. Space or middle-drag pans.",
+                "tool.set",
+                json!({"tool":"rotatedBox"}),
+                app.session.tool == Tool::RotatedBox,
+                false,
+            );
+            if r.clicked() {
+                app.map.cancel_sketch();
+                app.ui.open_right(RightPane::Editing);
+            }
+            r.on_disabled_hover_text(tl!("Turn editing on and select a loaded polygon layer in a flat Earth map."));
+        });
         big(ui, app, "delete", "Delete", "Delete the selected features.", "edit.delete", Value::Null, false, false);
         let r = big(
             ui,

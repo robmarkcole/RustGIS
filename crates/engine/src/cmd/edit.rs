@@ -7,7 +7,7 @@ use super::{need_layer, ps};
 use crate::{CmdResult, CommandSpec as C, Session};
 
 pub fn commands() -> Vec<C> {
-    vec![
+    let mut commands = vec![
         C::new("edit.calculateGeometry", "Calculate Geometry", "Attribute Table", crate::geometry_calc::run).roles(&[]).effects(crate::policy::Effects::NONE)
             .when(super::design::need_editable)
             .params(r#"{"layer"?, "field": string, "create": bool, "overwrite": bool, "property": string, "unit": string, "epsg"?: number, "scope": "all"|"selected"}"#),
@@ -30,12 +30,19 @@ pub fn commands() -> Vec<C> {
         C::new("edit.calculateField", "Calculate Field", "Attribute Table", calculate_field).roles(&[]).effects(crate::policy::Effects::NONE)
             .when(super::design::need_editable)
             .params(r#"{"layer"?, "field": string, "expression": "an expression: fields, 'text', numbers, + - * / % ^ ||, functions (see the Expressions page)"}"#),
-    ]
+    ];
+    commands.extend(crate::box_edit::commands());
+    commands
 }
 
 pub(crate) fn add_feature(s: &mut Session, p: &Json) -> CmdResult {
     let id = s.layer_id(p)?;
     let g = geometry_param(p)?;
+    add_geometry(s, id, p, g)
+}
+
+/// Inserts an already validated construction through the same attributes, templates and rules.
+pub(crate) fn add_geometry(s: &mut Session, id: u32, p: &Json, g: Geometry) -> CmdResult {
     let l = s.map_mut().layer_mut(id).ok_or("no layer")?;
     let want = l.geometry_type();
     let ok = want == g.kind() || want == GeometryType::None;
@@ -89,7 +96,9 @@ pub(crate) fn add_feature(s: &mut Session, p: &Json) -> CmdResult {
     l.dataset.push(Some(g), attrs?);
     l.touch_geometry();
     let row = l.dataset.features.len() - 1;
+    let feature = l.dataset.features.get(row).map(|f| f.id).ok_or("feature was not added")?;
     l.selection = vec![row];
+    crate::box_edit::forget_feature(s, id, feature);
     super::design::apply(s, id, vec![super::design::Change { before: None, row: Some(row) }])?;
     for (field, key) in losses {
         s.notify_text(
@@ -320,6 +329,11 @@ fn delete(s: &mut Session, _: &Json) -> CmdResult {
         removed.push((l.id, changes));
     }
     for (id, changes) in removed {
+        for change in &changes {
+            if let Some(feature) = &change.before {
+                crate::box_edit::forget_feature(s, id, feature.id);
+            }
+        }
         super::design::apply(s, id, changes)?;
     }
     s.notify(format!("Deleted {n} features"), false);

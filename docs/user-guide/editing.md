@@ -142,6 +142,61 @@ you edit the value or choose units; click **Apply elevation** to apply the new i
   [Geoprocessing tools](analysis.md#geoprocessing-tools), **Near the poles**).
 - **Status**: features added, changed and deleted per layer since the last save.
 
+### Rotated boxes
+
+Choose a loaded, visible polygon layer, turn **Edit › Edit** on, and select **Edit › Features ›
+Rotated Box**. The existing **Editing** pane opens with precise controls for the selected box.
+These are ordinary polygon features: the layer's fields, feature templates, symbology and edit
+rules continue to apply. Box tools do not create annotation or class fields.
+
+- Drag to create a box. Drag inside one to move it, or drag a corner or side handle to resize it.
+  The opposite corner or side stays fixed. Hold ++shift++ to draw a square or preserve the
+  aspect ratio while resizing a corner.
+- Drag the round paddle outside the top edge to rotate; ++shift++ snaps rotation to 15°.
+  Width, height and angle are regenerated from the construction, avoiding accumulated vertex
+  rotation error. The pane also edits centre X/Y, width, height and angle numerically.
+- Click a box to select it. ++alt++-click cycles overlapping features; ++shift++ adds to the
+  selection. ++ctrl++/++cmd++-drag starts a new box even over an existing box.
+- Hold ++space++ and drag, or drag with the middle mouse button, to pan. Releasing ++space++
+  keeps Rotated Box active so the next click selects an object. The wheel still zooms.
+- Right-click a box for **Edit Box Dimensions** or **Delete Selected Box**. The delete action
+  removes only that object; the ordinary ++delete++ shortcut removes the selection. Each
+  completed move, resize, rotation or deletion is undoable. ++esc++ cancels a held gesture;
+  press it again to leave the tool.
+
+The interactive tool starts in Web Mercator grid metres, **not ground metres**; angles run
+clockwise from grid east. Flat Earth maps are supported; tilted/globe views, boxes crossing the
+antimeridian, the polar editing limit, and unsupported projection or datum transformations are
+refused. The grid is frozen for an existing box. Scripts can supply an original image grid
+from `raster::geotiff::read_image_grid` through `rustgis_engine::box_edit::Frame::from_grid`;
+then the box dimensions and centre are original image pixels, including for rotated/skewed
+GeoTIFFs. This does not bind a layer to an image or save image metadata.
+
+Construction is kept only in the current session. An independent vertex edit disables the
+box handles rather than silently fitting a new box; undo restores them. Saving/reopening or
+sharing GeoJSON leaves **ordinary polygons** and ordinary feature properties. In-session edits
+preserve feature identity; import uses the normal GeoJSON reader. There is no automatic
+recognition of imported polygons. Use **Edit Vertices** to edit those polygons.
+Data exports include one counted note explaining that box construction does not round-trip.
+Polygons contain four transformed corners; curved grid edges are represented by straight
+polygon edges, as the export note explains.
+
+Commands use the same editing and undo paths:
+
+```text
+edit.addBox={"layer":"Training polygons","box":{"center":[1000,1000],"width":200,"height":100,"angle":30},"attributes":{"class":"vehicle"}}
+edit.updateBox={"layer":"Training polygons","row":0,"box":{"center":[1000,1000],"width":240,"height":100,"angle":45}}
+edit.boxInfo={"layer":"Training polygons","row":0}
+edit.deleteBox={"layer":"Training polygons","row":0}
+```
+
+`attributes` names must already exist in the layer. `edit.updateBox` and `edit.deleteBox` also
+accept `featureId` to refuse a stale row. `edit.boxInfo` returns the current construction;
+updates keep its frame and the feature's identity/attributes. An optional `box.frame` holds
+`epsg`, original `width`/`height` and the full GDAL-order `affine` array. Only recognised EPSG
+frames with supported datum transformations are accepted. These parameters are command input,
+not GeoJSON properties or a new saved-file representation.
+
 ### Moving shared polygon vertices
 
 **Edit › Features › Shared Vertices** opts polygon moves into linked editing. It starts off,

@@ -1117,7 +1117,7 @@ fn edit_vertex(s: &mut Session, p: &Json) -> CmdResult {
 }
 
 /// Replaces a feature's shape with one of the layer's kind, as one edit.
-fn replace_geometry(s: &mut Session, id: u32, row: usize, g: Geometry) -> Result<(), String> {
+pub(crate) fn replace_geometry(s: &mut Session, id: u32, row: usize, g: Geometry) -> Result<(), String> {
     super::edit::validate(&g)?;
     let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
     if l.geometry_type() != GeometryType::None && l.geometry_type() != g.kind() {

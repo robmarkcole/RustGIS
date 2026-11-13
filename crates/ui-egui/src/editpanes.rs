@@ -108,6 +108,7 @@ fn combo(ui: &mut Ui, id: &str, name: &str, value: &mut String, options: &[Strin
 }
 
 pub fn editing(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
+    crate::boxedit::panel(app, ui);
     message(app, ui, t);
     let settings = app.session.map().editing.settings.clone();
     ui.horizontal(|ui| {
