@@ -88,8 +88,8 @@ This guide walks through RustGIS by task. Each page covers one part of the app:
 - **Map view**: one tab per map and layout. The buttons at the top right zoom in, zoom out and go
   to the full extent; the north arrow and scale bar sit in the corners (on a rotated or tilted
   map, click the north arrow to face north and look straight down); tile credits at the bottom right.
-- **Panes** (right): Tools (geoprocessing), Symbology, Labeling, History, Details, Bookmarks,
-  Editing, Workflows, Script, SQL, the AI Assistant and more. Open them from **View › Windows** or the commands that use
+- **Panes** (right): Tools (geoprocessing), Symbology, Labeling, Layer Properties, History,
+  Bookmarks, Editing, Workflows, Script, SQL, the AI Assistant and more. Open them from **View › Windows** or the commands that use
   them. Each pane opened gets a tab at the top, in the order opened: click a tab to show its pane,
   and its **✕** to close it (the next tab shows; closing the last hides the side). Right-click a
   tab to close it, the others or all; the **✕** at the header's end closes every pane. Tabs that

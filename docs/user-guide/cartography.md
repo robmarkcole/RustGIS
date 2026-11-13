@@ -662,19 +662,18 @@ Turn labels on per layer (Labeling › Labels › **Label**), then:
 
 ## Layer properties
 
-The **Layer Properties pane** brings together a layer's settings that are otherwise spread over
-the ribbon, the Details pane and the layer's right-click menu. A tab per topic shows one part at a
-time:
+The **Layer Properties pane** brings together a layer's settings that are otherwise spread over the
+ribbon and the layer's right-click menu. A tab per topic shows one part at a time:
 
 - **General**: the layer's name (renamed when you leave the box or press Enter; Escape keeps the
   old one; up to 200 characters: a longer paste is cut to fit, and a note under the full box says
   so),
   **Visible**, for a feature layer **Selectable** (whether the Select tool picks its
   features on the map), and **Show legend in Layers**. Symbology and labels keep their own panes.
-- **Source**: what the Details pane shows (geometry, feature and field counts, source, coordinate
-  system, extent and fields), with the actions on the source that the layer's menu has, where they
-  apply: **Load All Features**, **Repair Data Source…**, **Reload Data** (desktop) and **Define
-  Projection…**.
+- **Source**: what the layer is read from (geometry, feature and field counts, source, coordinate
+  system, extent and fields; for a raster, its size, bands, statistics and coordinate system), with
+  the actions on the source that the layer's menu has, where they apply: **Load All Features**,
+  **Repair Data Source…**, **Reload Data** (desktop) and **Define Projection…**.
 - **Display**: the visibility range (**Out Beyond**, **In Beyond**, **Clear Limits**),
   **Transparency**, **Masking**, a raster's **Layer Blend** or a feature layer's **Reference
   scale**, and the **Depth priority** that View › Scene › Raise and Lower Priority change (a
@@ -690,13 +689,14 @@ time:
   on [View › Time](workspace.md). Each change undoes on its own.
 
 Open it with Layers › right-click › **Properties…** or **View › Windows › Layer Properties**;
-**Data › Definition Query** opens it on the Query tab. It
-follows the selected layer, as the Symbology and Labeling panes do: its header shows the layer's
-type and name, and lights up for a moment when another layer is selected, and the pane's tab names
-the layer too. A name being typed is kept when you click away, even on another layer, as Enter keeps
-it; Escape drops it. It runs the same commands as the ribbon, so each change undoes on its own,
-except **Show legend in Layers**: like the arrow beside a layer in the Layers pane, it changes what
-that pane shows, not the layer, so it isn't a step to undo.
+**Data › Definition Query** opens it on the Query tab, and **View › Windows › Details** (for a
+raster also **Data › Raster Information**) on the Source tab, which they show and hide as they did
+the Details pane it replaces. It follows the selected layer, as the Symbology and Labeling panes do:
+its header shows the layer's type and name, and lights up for a moment when another layer is
+selected, and the pane's tab names the layer too. A name being typed is kept when you click away,
+even on another layer, as Enter keeps it; Escape drops it. It runs the same commands as the ribbon,
+so each change undoes on its own, except **Show legend in Layers**: like the arrow beside a layer in
+the Layers pane, it changes what that pane shows, not the layer, so it isn't a step to undo.
 
 ## Layer effects
 

@@ -121,11 +121,11 @@ identify and the raster tools work on it as on a file's. The layer holds an over
 file too large to hold whole is opened from an overview; zoomed in past it, the map reads the part
 in view at the resolution it needs as it draws, and draws it with the layer's style and the
 overview's statistics, so the image looks the same at every zoom. Until a part's tiles arrive, the
-level zoomed from stands in for them. A turned layer (Rotation in the Symbology pane) is drawn
-from the overview it holds: zoomed in past it, the map says so and an export refuses it. The
-Details pane says the image's full size and that it is read in place. The desktop app adds the
-layer at once and reads its overview as the map draws (the Details pane says so until it is in),
-so a slow host doesn't hold the window; the command line and Python wait for it, up to two
+level zoomed from stands in for them. A turned layer (Rotation in the Symbology pane) is drawn from
+the overview it holds: zoomed in past it, the map says so and an export refuses it. The Source tab
+of its properties says the image's full size and that it is read in place. The desktop app adds the
+layer at once and reads its overview as the map draws (the Source tab says so until it is in), so a
+slow host doesn't hold the window; the command line and Python wait for it, up to two
 minutes, so a command's result is complete. A saved S3 connection chosen for such layers (Choose
 S3 connection…) counts them as still being read until their overview is in, apart from what it
 opened. A file whose smallest image is too large to hold as the overview (a large image saved

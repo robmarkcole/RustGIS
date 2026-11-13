@@ -2175,10 +2175,10 @@ fn view_tab(app: &mut RustGisApp, ui: &mut Ui) {
                 app,
                 "identify",
                 "Details",
-                "Details of the selected layer.",
+                "Details of the selected layer, on the Source tab of its properties.",
                 "ui.pane.details",
                 Value::Null,
-                app.ui.right == Some(RightPane::Details),
+                crate::layerprops::source_in_view(&app.ui),
             );
         });
         col(ui, |ui| {
@@ -4774,10 +4774,10 @@ fn raster_data_groups(app: &mut RustGisApp, ui: &mut Ui) {
             app,
             "identify",
             "Raster\nInformation",
-            "Size, bands, statistics and coordinate system.",
+            "Size, bands, statistics and coordinate system, on the Source tab of the raster's properties.",
             "ui.pane.details",
             Value::Null,
-            app.ui.right == Some(RightPane::Details),
+            crate::layerprops::source_in_view(&app.ui),
             false,
         );
     });
