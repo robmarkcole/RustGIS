@@ -61,6 +61,8 @@ fn saved_arrangements_are_kept_and_restored() {
     });
     let atlas = json!({"locator": "bottom-left", "northArrow": "top-left", "legend": "top-right", "scaleBar": "bottom-right"});
     app.run("layout.arrangement", json!({"save": "Atlas", "arrangement": atlas, "favourite": "Atlas"})).unwrap();
+    // With nothing passed over, a save drops nothing and says nothing of it.
+    assert!(!app.session.notices.iter().any(|n| n.text.contains("are dropped")));
     let last = |key: &str| saved.lock().unwrap().iter().rev().find(|(k, _)| k == key).map(|(_, v)| v.clone()).unwrap();
     let (arrangements, favourite) = (last(SAVED), last(KEY));
     assert_eq!(serde_json::from_str::<serde_json::Value>(&arrangements).unwrap(), json!({"Atlas": atlas}));
@@ -124,4 +126,40 @@ fn saved_arrangements_are_kept_and_restored() {
     let written: serde_json::Value = serde_json::from_str(&last(SAVED)).unwrap();
     // One this version can't read stays as it was.
     assert_eq!(written, json!({"Keep": mirrored, "ATLAS": {"locator": "middle"}}));
+    // A name saved here takes the place of a usable entry passed over under it but for case, so
+    // the next start keeps the new one; one this version can't read stays.
+    let text = json!({"Atlas": atlas, "atlas": mirrored, "zed": {"locator": "middle"}}).to_string();
+    let writes = saved.clone();
+    let mut restored = RustGisApp::new(Session::new(Project::default())).with_services(Services {
+        load_pref: Some(Box::new(move |k| (k == SAVED).then(|| text.clone()))),
+        save_pref: Some(Box::new(move |k, v| writes.lock().unwrap().push((k.to_string(), v.to_string())))),
+        ..Services::default()
+    });
+    // Replaced under its very name, it takes the place of the usable entry passed over beside it.
+    let replaced = json!({"Atlas": atlas, "atlas": mirrored}).to_string();
+    let writes = saved.clone();
+    let mut kept = RustGisApp::new(Session::new(Project::default())).with_services(Services {
+        load_pref: Some(Box::new(move |k| (k == SAVED).then(|| replaced.clone()))),
+        save_pref: Some(Box::new(move |k, v| writes.lock().unwrap().push((k.to_string(), v.to_string())))),
+        ..Services::default()
+    });
+    kept.run("layout.arrangement", json!({"save": "Atlas", "arrangement": "legendTop"})).unwrap();
+    let written: serde_json::Value = serde_json::from_str(&last(SAVED)).unwrap();
+    assert_eq!(
+        written,
+        json!({"Atlas": {"locator": "bottom-left", "northArrow": "top-right", "legend": "top-left", "scaleBar": "bottom-right"}})
+    );
+    restored.run("layout.arrangement", json!({"remove": "Atlas", "save": "ATLAS", "arrangement": "legendTop"})).unwrap();
+    // The entry passed over that goes with it is said.
+    assert!(restored.session.notices.iter().any(|n| n.text.ends_with("are dropped: 1.")), "said");
+    restored.run("layout.arrangement", json!({"save": "Zed", "arrangement": "classic"})).unwrap();
+    let written: serde_json::Value = serde_json::from_str(&last(SAVED)).unwrap();
+    let names: Vec<&String> = written.as_object().unwrap().keys().collect();
+    assert_eq!(names.len(), 3, "{written}");
+    assert_eq!(
+        (written["ATLAS"]["locator"].clone(), written["zed"].clone()),
+        (json!("bottom-left"), json!({"locator": "middle"})),
+        "{written}"
+    );
+    assert_eq!(written["Zed"]["locator"], "top-left", "{written}");
 }
