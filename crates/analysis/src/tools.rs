@@ -6362,7 +6362,7 @@ pub(crate) fn unique_field(out: &Dataset, base: &str) -> String {
 /// Features' extents on a grid, to find those whose extents may meet another extent without
 /// testing every one. Up to 16 features, or when the grid would hold more than a million
 /// references (large features on a fine grid), there is no grid and every feature is a candidate.
-struct ExtentIndex {
+pub(crate) struct ExtentIndex {
     /// The union of the extents.
     total: Extent,
     cell_w: f64,
@@ -6383,7 +6383,7 @@ impl ExtentIndex {
     const MAX_REFERENCES: usize = 1_000_000;
 
     /// An index of these extents, numbered in order from 0.
-    fn new(extents: impl Iterator<Item = Extent>) -> Self {
+    pub(crate) fn new(extents: impl Iterator<Item = Extent>) -> Self {
         let extents: Vec<Extent> = extents.collect();
         let total = extents.iter().fold(Extent::EMPTY, |t, e| t.union(e));
         let n_cells = (extents.len() as f64).sqrt().clamp(4.0, 256.0);
@@ -6455,7 +6455,7 @@ impl ExtentIndex {
 
     /// Whether any candidate passes `test`, stopping immediately at the first match. Test each
     /// candidate at most once even when it spans several cells; candidate order is unspecified.
-    fn any_candidate(&self, ext: &Extent, mut test: impl FnMut(usize) -> bool) -> bool {
+    pub(crate) fn any_candidate(&self, ext: &Extent, mut test: impl FnMut(usize) -> bool) -> bool {
         let Some(grid) = &self.grid else { return (0..self.len).any(test) };
         let Some(((x0, y0), (x1, y1))) = self.query_cells(ext) else { return false };
         let mut seen = std::collections::HashSet::new();
