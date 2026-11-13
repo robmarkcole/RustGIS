@@ -735,12 +735,13 @@ fn every_keyword_is_listed_once_and_read() {
     assert_eq!(select(&clause.to_ascii_lowercase(), &d).unwrap(), vec![0]);
 }
 
-/// The user guide's section headed `## {heading}`, up to the next one.
-fn guide_section(heading: &str) -> &'static str {
-    let guide = include_str!("../../../../docs/user-guide/expressions.md");
+/// The user guide's section headed `## {heading}`, up to the next one. A Windows checkout may
+/// give the guide CRLF line endings (`core.autocrlf`), so they are read as LF.
+fn guide_section(heading: &str) -> String {
+    let guide = include_str!("../../../../docs/user-guide/expressions.md").replace("\r\n", "\n");
     let start = guide.find(&format!("\n## {heading}\n")).unwrap_or_else(|| panic!("no {heading} section"));
     let rest = guide.get(start + 1..).unwrap_or_default();
-    rest.get(3..).and_then(|r| r.find("\n## ")).map_or(rest, |end| rest.get(..end + 3).unwrap_or(rest))
+    rest.get(3..).and_then(|r| r.find("\n## ")).map_or(rest, |end| rest.get(..end + 3).unwrap_or(rest)).to_string()
 }
 
 #[test]
