@@ -139,6 +139,11 @@ fn value(ty: FieldType) -> BoxedStrategy<Value> {
             ])
             .prop_map(|s| Value::Text(s.to_string())),
             1 => (1usize..400).prop_map(|n| Value::Text("é".repeat(n))),
+            // Digits a Double doesn't hold: identifiers past i64, and decimals past 17 digits.
+            1 => prop::sample::select(vec![
+                "12345678901234567891", "12345678901234567000", "9007199254740993", "0.12345678901234567891", "-99999999999999999999",
+            ])
+            .prop_map(|s| Value::Text(s.to_string())),
         ]
         .boxed(),
         _ => any::<bool>().prop_map(Value::Bool).boxed(),
@@ -208,6 +213,24 @@ fn tag(v: &Value) -> &'static str {
     }
 }
 
+/// Whether the number `v` keeps every digit of the text `t`: a whole number exactly, a decimal at
+/// the precision of its digits, as the readers type text (`text_type`).
+fn keeps_digits(t: &str, v: &Value) -> bool {
+    let t = t.trim();
+    let Value::Float(f) = v else { return true };
+    let digits = |s: &str| {
+        let m = s.split(['e', 'E']).next().unwrap_or_default();
+        m.chars().filter(char::is_ascii_digit).collect::<String>().trim_start_matches('0').trim_end_matches('0').to_string()
+    };
+    let whole = t.strip_prefix(['-', '+']).unwrap_or(t);
+    if whole.bytes().all(|b| b.is_ascii_digit()) {
+        let d = whole.trim_start_matches('0');
+        return format!("{:.0}", f.abs()) == if d.is_empty() { "0" } else { d };
+    }
+    let want = digits(t);
+    want.is_empty() || digits(&format!("{f:.*e}", want.len() - 1)) == want
+}
+
 /// How a value changed, if it did; the same number in another type isn't a change. The kinds
 /// name what a format that holds text does to a value, so [`LIMITS`] can allow just that.
 fn value_change(a: &Value, b: &Value) -> Option<String> {
@@ -232,7 +255,7 @@ fn value_change(a: &Value, b: &Value) -> Option<String> {
     Some(match (a, b) {
         (Value::Text(x), Value::Null) if x.trim().is_empty() => "blank text became null".into(),
         (Value::Text(x), Value::Text(y)) if x.trim() == y.trim() => "text trimmed".into(),
-        (Value::Text(x), _) if reads_as(x, b) => "text became a number".into(),
+        (Value::Text(x), _) if reads_as(x, b) && keeps_digits(x, b) => "text became a number".into(),
         (Value::Float(x), Value::Text(y))
             if !x.is_finite() && y.trim().parse::<f64>().is_ok_and(|m| m == *x || m.is_nan() && x.is_nan()) =>
         {
