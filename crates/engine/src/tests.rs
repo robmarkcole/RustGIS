@@ -2747,6 +2747,50 @@ fn a_reference_scale_is_set_kept_and_undone() {
 }
 
 #[test]
+fn a_reference_scale_out_of_range_in_a_project_is_left_out_and_said() {
+    let mut s = world();
+    s.run("layer.referenceScale", &json!({"layer": "Rivers", "scale": 25000})).unwrap();
+    let text = serde_json::to_string(&s.project).unwrap();
+    let said = |text: &str| {
+        let mut t = Session::new(Project::default());
+        let mark = t.notices_given();
+        t.run("project.openText", &json!({"text": text})).unwrap();
+        let notices: Vec<String> = t.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+        (t.map().layer_by_name("Rivers").unwrap().reference_scale, notices)
+    };
+    // One the command takes opens as saved, with nothing to say.
+    let (kept, notices) = said(&text);
+    assert_eq!(kept, Some(25000.0));
+    assert!(!notices.iter().any(|n| n.contains("reference scale")), "{notices:?}");
+    // One it would refuse is left out, and the notice names the layer.
+    for bad in ["1e39", "-5", "0"] {
+        let edited = text.replace("\"reference_scale\":25000.0", &format!("\"reference_scale\":{bad}"));
+        assert_ne!(edited, text);
+        let (kept, notices) = said(&edited);
+        assert_eq!(kept, None, "{bad}");
+        assert!(
+            notices.iter().any(|n| n.contains("1 layer(s) with a reference scale out of range") && n.contains("'Rivers'")),
+            "{bad}: {notices:?}"
+        );
+    }
+    // So does a map file or a layer file added on its own, and a clean one says nothing.
+    let map = serde_json::to_string(s.map()).unwrap();
+    let layer = serde_json::to_string(s.map().layer_by_name("Rivers").unwrap()).unwrap();
+    for (command, text) in [("map.import", map), ("layer.addLayerFile", layer)] {
+        let said = |text: String| {
+            let mut t = world();
+            let mark = t.notices_given();
+            t.run(command, &json!({"text": text})).unwrap();
+            t.notices_since(mark).iter().map(|n| n.text.clone()).collect::<Vec<String>>()
+        };
+        let clean = said(text.clone());
+        assert!(!clean.iter().any(|n| n.contains("reference scale")), "{command}: {clean:?}");
+        let bad = said(text.replace("\"reference_scale\":25000.0", "\"reference_scale\":0"));
+        assert!(bad.iter().any(|n| n.contains("reference scale out of range") && n.contains("'Rivers'")), "{command}: {bad:?}");
+    }
+}
+
+#[test]
 fn rivers_are_labelled_along_their_lines_in_italics() {
     let mut s = world();
     s.run("labels.field", &json!({"layer": "Rivers", "field": "name"})).unwrap();

@@ -1,5 +1,5 @@
-//! Count label-setting and diagram losses while skipping feature data and retaining no
-//! moved-label arrays or diagrams.
+//! Count label-setting and diagram losses, and reference scales left out, while skipping feature
+//! data and retaining no moved-label arrays or diagrams.
 
 use serde::Deserialize;
 
@@ -90,7 +90,11 @@ struct Labels {
 #[derive(Deserialize)]
 struct Layer {
     #[serde(default)]
+    name: String,
+    #[serde(default)]
     labels: Labels,
+    #[serde(default)]
+    reference_scale: Option<serde_json::Value>,
     #[serde(default)]
     diagram: rustgis_map::diagram::DiagramAudit,
 }
@@ -191,13 +195,6 @@ pub(crate) fn hidden<'a>(layers: impl Iterator<Item = &'a rustgis_map::Layer>) -
     for l in layers.filter(|l| crate::cmd::diagram::hidden_text(l).is_some()) {
         if l.geometry_type() == rustgis_data::GeometryType::Point { binned.push(&l.name) } else { extruded.push(&l.name) }
     }
-    let names = |names: &[&String]| {
-        let shown: Vec<String> = names.iter().take(MAX_NAMED).map(|n| format!("'{}'", crate::project::short_name(n))).collect();
-        match names.len().saturating_sub(MAX_NAMED) {
-            0 => shown.join(", "),
-            more => format!("{} and {more} more", shown.join(", ")),
-        }
-    };
     let mut notices = Vec::new();
     if !binned.is_empty() {
         notices.push(format!(
@@ -216,8 +213,38 @@ pub(crate) fn hidden<'a>(layers: impl Iterator<Item = &'a rustgis_map::Layer>) -
     notices.into_iter().map(|m| (ReadPart::HiddenDiagrams, m)).collect()
 }
 
-/// The layers a hidden-diagram notice names; the rest are counted.
+/// The layers a notice names; the rest are counted.
 const MAX_NAMED: usize = 3;
+
+/// The first few layer names, quoted, and how many more.
+fn names(names: &[&String]) -> String {
+    let shown: Vec<String> = names.iter().take(MAX_NAMED).map(|n| format!("'{}'", crate::project::short_name(n))).collect();
+    match names.len().saturating_sub(MAX_NAMED) {
+        0 => shown.join(", "),
+        more => format!("{} and {more} more", shown.join(", ")),
+    }
+}
+
+/// One notice with a count and the first few names, for the raw layers whose saved reference
+/// scale is out of [`rustgis_map::REFERENCE_SCALES`], which reading the layer leaves out.
+fn refused_reference_scales<'a>(raw: impl Iterator<Item = &'a Layer>) -> Vec<(ReadPart, String)> {
+    let (least, most) = rustgis_map::REFERENCE_SCALES;
+    let refused: Vec<&String> = raw
+        .filter(|l| l.reference_scale.as_ref().and_then(serde_json::Value::as_f64).is_some_and(|r| !(least..=most).contains(&r)))
+        .map(|l| &l.name)
+        .collect();
+    if refused.is_empty() {
+        return Vec::new();
+    }
+    vec![(
+        ReadPart::Maps,
+        format!(
+            "{} layer(s) with a reference scale out of range (1:{least} to 1:{most}) opened without one ({})",
+            refused.len(),
+            names(&refused)
+        ),
+    )]
+}
 
 /// The notices of the parts asked for.
 fn only(notices: Vec<(ReadPart, String)>, diagrams: bool) -> Vec<String> {
@@ -262,6 +289,7 @@ pub(super) fn notices_for_maps(text: &str, project: &Project, maps_only: bool) -
         let raw = file.maps.iter().take(project.maps.len()).flat_map(|m| &m.layers);
         let retained = project.maps.iter().flat_map(|m| &m.layers).map(|l| &l.labels);
         let mut notices = count(raw, retained, &project.name, "the imported maps");
+        notices.extend(refused_reference_scales(file.maps.iter().take(project.maps.len()).flat_map(|m| &m.layers)));
         notices.extend(hidden(project.maps.iter().flat_map(|m| &m.layers)));
         return Ok(notices);
     }
@@ -274,18 +302,22 @@ pub(super) fn notices_for_maps(text: &str, project: &Project, maps_only: bool) -
         .map(|l| &l.labels)
         .chain(project.styles.iter().map(|s| &s.labels));
     let mut notices = count(raw, retained, &project.name, "the project");
+    notices.extend(refused_reference_scales(file.maps.iter().chain(file.offline_areas.iter().map(|a| &a.data)).flat_map(|m| &m.layers)));
     // Offline snapshots say so when `offline.open` opens them as maps.
     notices.extend(hidden(project.maps.iter().flat_map(|m| &m.layers)));
     Ok(notices)
 }
 
 /// The same audit for a map file read on its own; unreadable label settings give no notice
-/// (the map itself was read, so its labels were too). Diagram notices only with `diagrams`
-/// (an import that takes the layers' diagrams).
+/// (the map itself was read, so its labels were too). Diagram and reference scale notices only
+/// with `diagrams` (an import that takes the layers whole, not only their styles).
 pub(crate) fn map_notices(text: &str, map: &rustgis_map::Map, diagrams: bool) -> Vec<String> {
     // The layers' own state still says whether a diagram is hidden when the audit can't read them.
     let Ok(raw) = serde_json::from_str::<Map>(text) else { return only(hidden(map.layers.iter()), diagrams) };
     let mut notices = count(raw.layers.iter(), map.layers.iter().map(|l| &l.labels), &map.name, "the map file");
+    if diagrams {
+        notices.extend(refused_reference_scales(raw.layers.iter()));
+    }
     notices.extend(hidden(map.layers.iter()));
     only(notices, diagrams)
 }
@@ -294,6 +326,9 @@ pub(crate) fn map_notices(text: &str, map: &rustgis_map::Map, diagrams: bool) ->
 pub(crate) fn layer_notices(text: &str, layer: &rustgis_map::Layer, diagrams: bool) -> Vec<String> {
     let Ok(raw) = serde_json::from_str::<Layer>(text) else { return only(hidden(std::iter::once(layer)), diagrams) };
     let mut notices = count(std::iter::once(&raw), std::iter::once(&layer.labels), &layer.name, "the layer file");
+    if diagrams {
+        notices.extend(refused_reference_scales(std::iter::once(&raw)));
+    }
     notices.extend(hidden(std::iter::once(layer)));
     only(notices, diagrams)
 }
