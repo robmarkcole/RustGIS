@@ -85,10 +85,18 @@ fn place_is_flat(p: &Place) -> bool {
     matches!(p, Place::Flat(..))
 }
 
+/// The grids a Shaded Relief layer is lit with, worked out off the frame, one value per cell: the
+/// light its cast shadows leave (see [`rustgis_map::raster::RasterLayer::cast_shadows`]) and the
+/// share of the sky it sees ([`rustgis_map::raster::RasterLayer::sky_view`]).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Lights<'a> {
+    pub shadow: Option<&'a [u8]>,
+    pub sky: Option<&'a [u8]>,
+}
+
 /// Draws a raster layer onto `pm` at `opacity`. `stats` are the renderer bands' statistics
-/// without the masked pixels, when the style has a mask. `light` is the light its cast shadows
-/// leave on each of its cells, for Shaded Relief with shadows (see
-/// [`rustgis_map::raster::RasterLayer::cast_shadows`]).
+/// without the masked pixels, when the style has a mask. `light` is what it is lit with, for
+/// Shaded Relief with shadows or sky.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn draw(
     pm: &mut Pixmap,
@@ -99,7 +107,7 @@ pub(crate) fn draw(
     opacity: f32,
     full_res: bool,
     place: Place,
-    light: Option<&[u8]>,
+    light: Lights,
 ) {
     let threads = threads_for(pm.width() as usize * pm.height() as usize);
     draw_with(pm, r, style, stats, view, opacity, full_res, place, threads, light);
@@ -143,7 +151,7 @@ pub(crate) fn draw_in_place(
     opacity: f32,
     full_res: bool,
     place: Place,
-    light: Option<&[u8]>,
+    light: Lights,
 ) -> Result<bool, String> {
     let bands = style.renderer.bands();
     let own: Vec<BandStats> = match stats {
@@ -263,12 +271,12 @@ pub(crate) fn draw_in_place(
         if opacity >= 1.0 {
             whole(pm);
             for part in &parts {
-                draw(pm, part, &own_style, Some(stats), view, 1.0, full_res, place, None);
+                draw(pm, part, &own_style, Some(stats), view, 1.0, full_res, place, Lights::default());
             }
         } else if let Some(mut both) = Pixmap::new(pm.width(), pm.height()) {
-            draw(&mut both, r, style, Some(stats), view, 1.0, full_res, place, None);
+            draw(&mut both, r, style, Some(stats), view, 1.0, full_res, place, Lights::default());
             for part in &parts {
-                draw(&mut both, part, &own_style, Some(stats), view, 1.0, full_res, place, None);
+                draw(&mut both, part, &own_style, Some(stats), view, 1.0, full_res, place, Lights::default());
             }
             pm.draw_pixmap(0, 0, both.as_ref(), &PixmapPaint { opacity, ..PixmapPaint::default() }, Transform::identity(), None);
         } else {
@@ -279,7 +287,7 @@ pub(crate) fn draw_in_place(
         }
     } else {
         for part in &parts {
-            draw(pm, part, &own_style, Some(stats), view, opacity, full_res, place, None);
+            draw(pm, part, &own_style, Some(stats), view, opacity, full_res, place, Lights::default());
         }
     }
     match (pending, failed) {
@@ -388,7 +396,7 @@ fn draw_with(
     full_res: bool,
     place: Place,
     threads: usize,
-    light: Option<&[u8]>,
+    light: Lights,
 ) {
     // On high-density screens, compute at logical-pixel resolution and scale up (unless asked
     // for full resolution, as exports are): a quarter of the work at 2×.
@@ -477,12 +485,11 @@ fn draw_with(
         RasterRenderer::ShadedRelief { azimuth, altitude, z_factor, .. } => Some((azimuth, altitude, z_factor)),
         _ => None,
     };
-    // Cast shadows darken the direct light by their strength, the ambient light left as it is.
-    let shadow = match style.renderer {
-        RasterRenderer::ShadedRelief { shadow, .. } if shadow > 0.0 => {
-            light.filter(|g| g.len() == r.width as usize * r.height as usize).map(|g| (g, shadow.min(1.0)))
-        }
-        _ => None,
+    // Cast shadows darken the direct light by their strength; the sky a cell sees, the ambient.
+    let cells = r.width as usize * r.height as usize;
+    let (shadow, sky) = match style.renderer {
+        RasterRenderer::ShadedRelief { shadow, sky, .. } => (lit_by(light.shadow, shadow, cells), lit_by(light.sky, sky, cells)),
+        _ => (None, None),
     };
     // Blending neighbours would invent values that aren't classes or palette entries.
     let resampling = match style.renderer {
@@ -513,6 +520,7 @@ fn draw_with(
         data: bands.iter().map(|b| r.bands.get(*b).map(|b| b.data.as_slice())).collect(),
         relief,
         shadow,
+        sky,
         resampling,
         alpha_band,
         alpha_max: rustgis_data::raster::alpha_max(&r.data_type),
@@ -523,12 +531,17 @@ fn draw_with(
     let mut vals = vec![f32::NAN; bw * bh * nb];
     let mut shade = if relief.is_some() { vec![0u8; bw * bh] } else { Vec::new() };
     let mut alpha = if alpha_band.is_some() { vec![0u8; bw * bh] } else { Vec::new() };
+    let mut ambient = if sky.is_some() { vec![255u8; bw * bh] } else { Vec::new() };
     let threads = threads.clamp(1, bh);
     let rows = bh.div_ceil(threads.max(1));
     each_chunk(
         threads,
-        vals.chunks_mut(rows * bw * nb).zip(chunks_or_empty(&mut shade, rows * bw)).zip(chunks_or_empty(&mut alpha, rows * bw)).enumerate(),
-        |(i, ((v, sh), al))| pass1.rows(y0 + i * rows, v, sh, al),
+        vals.chunks_mut(rows * bw * nb)
+            .zip(chunks_or_empty(&mut shade, rows * bw))
+            .zip(chunks_or_empty(&mut alpha, rows * bw))
+            .zip(chunks_or_empty(&mut ambient, rows * bw))
+            .enumerate(),
+        |(i, (((v, sh), al), am))| pass1.rows(y0 + i * rows, v, sh, al, am),
     );
 
     // Dynamic range adjustment: statistics of the values in view.
@@ -538,19 +551,19 @@ fn draw_with(
 
     // Pass 2: colours, premultiplied, into a pixmap the size of the raster's screen box.
     let Some(mut lay) = Pixmap::new(bw as u32, bh as u32) else { return };
-    let (vals, shade, alpha) = (&vals, &shade, &alpha);
+    let (vals, shade, alpha, ambient) = (&vals, &shade, &alpha, &ambient);
     each_chunk(threads, lay.data_mut().chunks_mut(rows * bw * 4).enumerate(), |(ci, out)| {
         let first = ci * rows * bw;
         // Neighbouring pixels often share their values (zoomed in, or classes): colour once.
-        let mut last: Option<(&[f32], Option<u8>, Option<u8>, Option<[u8; 4]>)> = None;
+        let mut last: Option<(&[f32], [Option<u8>; 3], Option<[u8; 4]>)> = None;
         for (j, px) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let i = first + j;
             let Some(v) = vals.get(i * nb..(i + 1) * nb) else { continue };
-            let (sh, al) = (shade.get(i).copied(), alpha.get(i).copied());
+            let (sh, al, am) = (shade.get(i).copied(), alpha.get(i).copied(), ambient.get(i).copied());
             let c = match last {
-                Some((lv, ls, la, c)) if ls == sh && la == al && same(lv, v) => c,
+                Some((lv, l, c)) if l == [sh, al, am] && same(lv, v) => c,
                 _ => {
-                    let c = colorizer.color(v, sh).map(|mut c| {
+                    let c = colorizer.color_lit(v, sh, am).map(|mut c| {
                         if let Some(a) = al {
                             c[3] = ((c[3] as u16 * a as u16 + 127) / 255) as u8;
                         }
@@ -558,7 +571,7 @@ fn draw_with(
                         let pm = |x: u8| ((x as u16 * a + 127) / 255) as u8;
                         [pm(c[0]), pm(c[1]), pm(c[2]), c[3]]
                     });
-                    last = Some((v, sh, al, c));
+                    last = Some((v, [sh, al, am], c));
                     c
                 }
             };
@@ -578,6 +591,11 @@ fn draw_with(
     // The rows it covers on screen.
     let rows = ((y0 as f64 * k).floor().max(0.0) as usize, (((y0 + bh) as f64 * k).ceil() as usize).min(pm.height() as usize));
     draw_scaled(pm, &lay, &PixmapPaint { opacity, quality, ..PixmapPaint::default() }, at, rows, threads);
+}
+
+/// A light `grid` drawn at `strength` (up to 1), unless that is 0 or the grid isn't `cells` long.
+fn lit_by(grid: Option<&[u8]>, strength: f64, cells: usize) -> Option<(&[u8], f64)> {
+    grid.filter(|g| strength > 0.0 && g.len() == cells).map(|g| (g, strength.min(1.0)))
 }
 
 /// Rows of the screen drawn as one band when a raster is scaled up (see [`draw_scaled`]).
@@ -637,6 +655,8 @@ struct Pass1<'a> {
     relief: Option<(f64, f64, f64)>,
     /// The light cast shadows leave on each cell, and how dark they are drawn (0 to 1).
     shadow: Option<(&'a [u8], f64)>,
+    /// The share of the sky each cell sees, and how much it scales the ambient light (0 to 1).
+    sky: Option<(&'a [u8], f64)>,
     resampling: Resampling,
     alpha_band: Option<usize>,
     /// The alpha band's opaque value (its pixel type's: 65535 for 16 bits).
@@ -650,9 +670,9 @@ struct Pass1<'a> {
 }
 
 impl Pass1<'_> {
-    /// Fills the band values (and hillshade and alpha, when kept) of the screen rows from `py0`
-    /// on, as many as `vals` holds.
-    fn rows(&self, py0: usize, vals: &mut [f32], shade: &mut [u8], alpha: &mut [u8]) {
+    /// Fills the band values (and hillshade, alpha and ambient light, when kept) of the screen rows
+    /// from `py0` on, as many as `vals` holds.
+    fn rows(&self, py0: usize, vals: &mut [f32], shade: &mut [u8], alpha: &mut [u8], ambient: &mut [u8]) {
         let (r, bw, nb) = (self.r, self.bw, self.bands.len().max(1));
         let lerp = |p: f64, q: f64, t: f64| p + (q - p) * t;
         // Each grid column's source position at this row, interpolated down the grid.
@@ -754,6 +774,12 @@ impl Pass1<'_> {
                             let left = 1.0 - strength * (1.0 - f64::from(*lit) / 255.0);
                             *s = (f64::from(*s) * left).round().clamp(0.0, 255.0) as u8;
                         }
+                    }
+                    if let Some((grid, strength)) = self.sky
+                        && let Some(seen) = grid.get(ri as usize * r.width as usize + ci as usize)
+                        && let Some(a) = ambient.get_mut(i)
+                    {
+                        *a = ((1.0 - strength * (1.0 - f64::from(*seen) / 255.0)) * 255.0).round().clamp(0.0, 255.0) as u8;
                     }
                 }
             }
@@ -902,10 +928,11 @@ mod tests {
                 .collect();
             let r = Raster::new("relief", 10, 10, vec![data], gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
             let mut style = RasterStyle::default_for(&r);
-            style.renderer = RasterRenderer::ShadedRelief { band: 0, ramp: None, azimuth, altitude: 45.0, z_factor: 1.0, shadow: 0.0 };
+            style.renderer =
+                RasterRenderer::ShadedRelief { band: 0, ramp: None, azimuth, altitude: 45.0, z_factor: 1.0, shadow: 0.0, sky: 0.0 };
             style.resampling = Resampling::Nearest;
             let mut pm = Pixmap::new(1, 1).unwrap();
-            draw(&mut pm, &r, &style, None, &view, 1.0, false, Place::Flat(&Flat::Mercator, "mercator"), None);
+            draw(&mut pm, &r, &style, None, &view, 1.0, false, Place::Flat(&Flat::Mercator, "mercator"), Lights::default());
             let p = pm.pixel(0, 0).unwrap();
             [p.red(), p.green(), p.blue(), p.alpha()]
         };
@@ -935,7 +962,8 @@ mod tests {
         let data = [0.0, 1_000_000.0, 2_000_000.0, 3_000_000.0].repeat(18);
         let r = Raster::new("regional relief", 4, 18, vec![data], gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
         let mut style = RasterStyle::default_for(&r);
-        style.renderer = RasterRenderer::ShadedRelief { band: 0, ramp: None, azimuth: 270.0, altitude: 45.0, z_factor: 1.0, shadow: 0.0 };
+        style.renderer =
+            RasterRenderer::ShadedRelief { band: 0, ramp: None, azimuth: 270.0, altitude: 45.0, z_factor: 1.0, shadow: 0.0, sky: 0.0 };
         style.resampling = Resampling::Nearest;
         let view = View {
             width: 1.0,
@@ -945,7 +973,7 @@ mod tests {
             sky: false,
         };
         let mut pm = Pixmap::new(1, 1).unwrap();
-        draw(&mut pm, &r, &style, None, &view, 1.0, false, Place::Flat(&Flat::Mercator, "mercator"), None);
+        draw(&mut pm, &r, &style, None, &view, 1.0, false, Place::Flat(&Flat::Mercator, "mercator"), Lights::default());
         let z = [0.0, 0.0, 1_000_000.0, 0.0, 0.0, 1_000_000.0, 0.0, 0.0, 1_000_000.0];
         let (cell_x, cell_y) = r.cell_size_m();
         let shade = hillshade(&z, cell_x, cell_y, 270.0, 45.0, 1.0);
@@ -974,10 +1002,21 @@ mod tests {
         let dark = vec![0u8; 4 * 18];
         let drawn = |shadow: f64, light: Option<&[u8]>| {
             let mut style = RasterStyle::default_for(&r);
-            style.renderer = RasterRenderer::ShadedRelief { band: 0, ramp: None, azimuth: 270.0, altitude: 45.0, z_factor: 1.0, shadow };
+            style.renderer =
+                RasterRenderer::ShadedRelief { band: 0, ramp: None, azimuth: 270.0, altitude: 45.0, z_factor: 1.0, shadow, sky: 0.0 };
             style.resampling = Resampling::Nearest;
             let mut pm = Pixmap::new(1, 1).unwrap();
-            draw(&mut pm, &r, &style, None, &view, 1.0, false, Place::Flat(&Flat::Mercator, "mercator"), light);
+            draw(
+                &mut pm,
+                &r,
+                &style,
+                None,
+                &view,
+                1.0,
+                false,
+                Place::Flat(&Flat::Mercator, "mercator"),
+                Lights { shadow: light, sky: None },
+            );
             let p = pm.pixel(0, 0).unwrap();
             let want = |shade: u8| Colorizer::new(&style, &r, None).color(&[0.0], Some(shade)).unwrap();
             ([p.red(), p.green(), p.blue(), p.alpha()], want(lit), want(0), want((f64::from(lit) * 0.5).round() as u8))
@@ -994,6 +1033,54 @@ mod tests {
         // A grid of another size isn't read.
         let (pixel, lit, _, _) = drawn(1.0, Some(&dark[..10]));
         assert_eq!(pixel, lit);
+    }
+
+    /// The sky a cell sees scales its ambient light by the sky's strength, the direct light left
+    /// as it is; a sky of 0 draws today's pixels, with a sky grid or without.
+    #[test]
+    fn the_sky_scales_the_ambient_light_by_its_strength() {
+        let gt = GeoTransform { origin_x: 0.0, origin_y: 90.0, pixel_width: 10.0, pixel_height: -10.0 };
+        let data = [0.0, 1_000_000.0, 2_000_000.0, 3_000_000.0].repeat(18);
+        let r = Raster::new("relief", 4, 18, vec![data], gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
+        let view = View {
+            width: 1.0,
+            height: 1.0,
+            pixels_per_point: 1.0,
+            camera: Camera { center: lonlat_to_merc(Coord::new(5.0, 0.0)), res: 1000.0, bearing: 0.0, pitch: 0.0 },
+            sky: false,
+        };
+        let z = [0.0, 0.0, 1_000_000.0, 0.0, 0.0, 1_000_000.0, 0.0, 0.0, 1_000_000.0];
+        let (cell_x, cell_y) = r.cell_size_m();
+        let lit = hillshade(&z, cell_x, cell_y, 270.0, 45.0, 1.0);
+        let (none, dark) = (vec![0u8; 4 * 18], vec![0u8; 4 * 18]);
+        let drawn = |shadow: f64, sky: f64, light: Lights| {
+            let mut style = RasterStyle::default_for(&r);
+            style.renderer =
+                RasterRenderer::ShadedRelief { band: 0, ramp: None, azimuth: 270.0, altitude: 45.0, z_factor: 1.0, shadow, sky };
+            style.resampling = Resampling::Nearest;
+            let mut pm = Pixmap::new(1, 1).unwrap();
+            draw(&mut pm, &r, &style, None, &view, 1.0, false, Place::Flat(&Flat::Mercator, "mercator"), light);
+            let p = pm.pixel(0, 0).unwrap();
+            [p.red(), p.green(), p.blue(), p.alpha()]
+        };
+        let today = drawn(0.0, 0.0, Lights::default());
+        let hidden = Lights { shadow: None, sky: Some(&none) };
+        assert_eq!(drawn(0.0, 0.0, hidden), today, "a sky of 0");
+        assert_eq!(drawn(0.0, 1.0, Lights::default()), today, "no grid");
+        // No sky at all: the direct light alone.
+        let mut style = RasterStyle::default_for(&r);
+        style.renderer =
+            RasterRenderer::ShadedRelief { band: 0, ramp: None, azimuth: 270.0, altitude: 45.0, z_factor: 1.0, shadow: 0.0, sky: 1.0 };
+        let want = Colorizer::new(&style, &r, None).color_lit(&[0.0], Some(lit), Some(0)).unwrap();
+        assert_eq!(drawn(0.0, 1.0, hidden), want);
+        assert!(want[0] < today[0]);
+        // In full shadow only the ambient light is left: a quarter of the colour, scaled by the
+        // sky by its strength.
+        let half_seen = vec![128u8; 4 * 18];
+        for (sky, grid, want) in [(1.0, &dark, 0), (0.5, &dark, 32), (1.0, &half_seen, 32), (0.0, &dark, 64)] {
+            let light = Lights { shadow: Some(&dark), sky: Some(grid.as_slice()) };
+            assert_eq!(drawn(1.0, sky, light), [want, want, want, 255], "sky {sky}, seen {}", grid[0]);
+        }
     }
 
     /// A 0–360° grid seen across its seam: the part in view is two strips, one at each end of
@@ -1037,10 +1124,10 @@ mod tests {
             let r = Raster::new("relief", 36, 18, vec![data], gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
             let mut style = RasterStyle::default_for(&r);
             style.renderer =
-                RasterRenderer::ShadedRelief { band: 0, ramp: None, azimuth: 270.0, altitude: 45.0, z_factor: 1.0, shadow: 0.0 };
+                RasterRenderer::ShadedRelief { band: 0, ramp: None, azimuth: 270.0, altitude: 45.0, z_factor: 1.0, shadow: 0.0, sky: 0.0 };
             style.resampling = Resampling::Nearest;
             let mut pm = Pixmap::new(80, 40).unwrap();
-            draw(&mut pm, &r, &style, None, &view, 1.0, false, Place::Flat(&Flat::Mercator, "mercator"), None);
+            draw(&mut pm, &r, &style, None, &view, 1.0, false, Place::Flat(&Flat::Mercator, "mercator"), Lights::default());
             pm
         };
         let seam = render(0.0, 0);
@@ -1065,7 +1152,7 @@ mod tests {
         style.resampling = Resampling::Bilinear;
         let draw_it = |style: &RasterStyle, stats: Option<&[BandStats]>| {
             let mut pm = Pixmap::new(200, 200).unwrap();
-            draw(&mut pm, &r, style, stats, &view, 1.0, false, flat, None);
+            draw(&mut pm, &r, style, stats, &view, 1.0, false, flat, Lights::default());
             pm
         };
         let px = |pm: &Pixmap, x: u32| pm.pixel(x, 100).map(|p| (p.alpha(), p.red())).unwrap_or((0, 0));
@@ -1109,7 +1196,7 @@ mod tests {
         let camera = Camera { center: lonlat_to_merc(Coord::new(-81.0, 42.0)), res: 2000.0, bearing: 0.0, pitch: 0.0 };
         let view = View { width: 200.0, height: 200.0, pixels_per_point: 1.0, camera, sky: false };
         let mut pm = Pixmap::new(200, 200).unwrap();
-        draw(&mut pm, &r, &style, None, &view, 1.0, false, Place::Flat(&Flat::Mercator, "mercator"), None);
+        draw(&mut pm, &r, &style, None, &view, 1.0, false, Place::Flat(&Flat::Mercator, "mercator"), Lights::default());
         let alpha = |x: u32, y: u32| pm.pixel(x, y).map(|p| p.alpha()).unwrap_or(0);
         assert_eq!(alpha(100, 100), 255, "the centre is covered");
         assert_eq!(alpha(2, 2), 0, "the corner of the view is outside the raster");
@@ -1123,16 +1210,24 @@ mod tests {
                 "rgb" => RasterRenderer::Rgb { red: 0, green: 0, blue: 0 },
                 "classify" => rustgis_map::raster::classify(&r, 0, 5, Default::default(), Default::default()),
                 "unique" => rustgis_map::raster::unique_values(&r, 0, Default::default()),
-                _ => RasterRenderer::ShadedRelief { band: 0, ramp: None, azimuth: 315.0, altitude: 45.0, z_factor: 1.0, shadow: 0.0 },
+                _ => RasterRenderer::ShadedRelief {
+                    band: 0,
+                    ramp: None,
+                    azimuth: 315.0,
+                    altitude: 45.0,
+                    z_factor: 1.0,
+                    shadow: 0.0,
+                    sky: 0.0,
+                },
             };
             s.dra = true;
             s.resampling = Resampling::Bilinear;
-            draw(&mut pm, &r, &s, None, &view, 0.5, false, Place::Flat(&Flat::Mercator, "mercator"), None);
+            draw(&mut pm, &r, &s, None, &view, 0.5, false, Place::Flat(&Flat::Mercator, "mercator"), Lights::default());
         }
         // High-density screens draw at logical resolution, scaled up.
         let hi = View { pixels_per_point: 2.0, ..view };
         let mut pm2 = Pixmap::new(400, 400).unwrap();
-        draw(&mut pm2, &r, &style, None, &hi, 1.0, false, Place::Flat(&Flat::Mercator, "mercator"), None);
+        draw(&mut pm2, &r, &style, None, &hi, 1.0, false, Place::Flat(&Flat::Mercator, "mercator"), Lights::default());
         assert_eq!(pm2.pixel(200, 200).map(|p| p.alpha()), Some(255));
         assert_eq!(pm2.pixel(4, 4).map(|p| p.alpha()), Some(0));
         // Spread over threads, every pixel comes out as drawn on one, for each renderer.
@@ -1141,21 +1236,27 @@ mod tests {
             let mut s = style.clone();
             s.renderer = match kind {
                 "rgb" => RasterRenderer::Rgb { red: 0, green: 0, blue: 0 },
-                "shadedRelief" => {
-                    RasterRenderer::ShadedRelief { band: 0, ramp: None, azimuth: 315.0, altitude: 45.0, z_factor: 1.0, shadow: 0.0 }
-                }
+                "shadedRelief" => RasterRenderer::ShadedRelief {
+                    band: 0,
+                    ramp: None,
+                    azimuth: 315.0,
+                    altitude: 45.0,
+                    z_factor: 1.0,
+                    shadow: 0.0,
+                    sky: 0.0,
+                },
                 _ => s.renderer,
             };
             let mut one = Pixmap::new(420, 300).unwrap();
             let mut many = Pixmap::new(420, 300).unwrap();
-            draw_with(&mut one, &r, &s, None, &wide, 1.0, false, Place::Flat(&Flat::Mercator, "mercator"), 1, None);
-            draw_with(&mut many, &r, &s, None, &wide, 1.0, false, Place::Flat(&Flat::Mercator, "mercator"), 7, None);
+            draw_with(&mut one, &r, &s, None, &wide, 1.0, false, Place::Flat(&Flat::Mercator, "mercator"), 1, Lights::default());
+            draw_with(&mut many, &r, &s, None, &wide, 1.0, false, Place::Flat(&Flat::Mercator, "mercator"), 7, Lights::default());
             assert!(one.data() == many.data(), "{kind}");
             assert!(one.pixels().iter().any(|p| p.alpha() == 255), "{kind} draws");
         }
         let far = View { width: 3.0, height: 1.0, pixels_per_point: 2.0, camera: Camera::world(), sky: false };
         let mut tiny = Pixmap::new(6, 2).unwrap();
-        draw(&mut tiny, &r, &style, None, &far, 1.0, true, Place::Flat(&Flat::Mercator, "mercator"), None);
+        draw(&mut tiny, &r, &style, None, &far, 1.0, true, Place::Flat(&Flat::Mercator, "mercator"), Lights::default());
     }
 
     /// #1792: a projected raster scaled up to a high-density screen, its reprojection grid and
@@ -1179,8 +1280,30 @@ mod tests {
                 let mut one = Pixmap::new(size.0, size.1).unwrap();
                 one.fill(tiny_skia::Color::from_rgba8(20, 120, 40, 255));
                 let mut many = one.clone();
-                draw_with(&mut one, &r, &style, None, &view, opacity, false, Place::Flat(&Flat::Mercator, "mercator"), 1, None);
-                draw_with(&mut many, &r, &style, None, &view, opacity, false, Place::Flat(&Flat::Mercator, "mercator"), 7, None);
+                draw_with(
+                    &mut one,
+                    &r,
+                    &style,
+                    None,
+                    &view,
+                    opacity,
+                    false,
+                    Place::Flat(&Flat::Mercator, "mercator"),
+                    1,
+                    Lights::default(),
+                );
+                draw_with(
+                    &mut many,
+                    &r,
+                    &style,
+                    None,
+                    &view,
+                    opacity,
+                    false,
+                    Place::Flat(&Flat::Mercator, "mercator"),
+                    7,
+                    Lights::default(),
+                );
                 assert!(one.data() == many.data(), "res {res} ppp {ppp} opacity {opacity} {resampling:?}");
                 assert!(one.pixels().iter().any(|p| p.green() != 120), "res {res} ppp {ppp}: the raster is drawn");
             }
@@ -1199,7 +1322,7 @@ mod tests {
         let camera = Camera { center: Coord::new(0.0, 0.0), res: 100_000.0, bearing: 0.0, pitch: 0.0 };
         let view = View { width: 400.0, height: 200.0, pixels_per_point: 1.0, camera, sky: false };
         let mut pm = Pixmap::new(400, 200).unwrap();
-        draw(&mut pm, &r, &style, None, &view, 1.0, false, Place::Flat(&Flat::Mercator, "mercator"), None);
+        draw(&mut pm, &r, &style, None, &view, 1.0, false, Place::Flat(&Flat::Mercator, "mercator"), Lights::default());
         let at = |lon: f64| {
             let (x, y) = view.to_screen(lonlat_to_merc(Coord::new(lon, 10.0)));
             pm.pixel(x as u32, y as u32).map(|p| (p.alpha(), p.red())).unwrap_or((0, 0))
@@ -1226,7 +1349,7 @@ mod tests {
             let camera = Camera { center: Coord::new(0.0, 0.0), res: 100_000.0, bearing: 0.0, pitch: 0.0 };
             let view = View { width: 400.0, height: 200.0, pixels_per_point: 1.0, camera, sky: false };
             let mut pm = Pixmap::new(400, 200).unwrap();
-            draw(&mut pm, &r, &style, None, &view, 1.0, false, Place::Flat(&flat, "robinson +lon_0=150"), None);
+            draw(&mut pm, &r, &style, None, &view, 1.0, false, Place::Flat(&flat, "robinson +lon_0=150"), Lights::default());
             let screen = |lon: f64| view.to_screen(flat.forward(Coord::new(lon, 10.0)).unwrap());
             let red = |x: f64, y: f64| pm.pixel(x as u32, y as u32).map(|p| (p.alpha(), p.red())).unwrap_or((0, 0));
             let ((xa, y), (xb, _)) = (screen(170.5), screen(-170.5));

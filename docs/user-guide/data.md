@@ -1273,6 +1273,20 @@ whole image is held: either way the layer is drawn without them, and a notice sa
 outside the raster casts nothing on it, and a grid spanning 0 to 360° casts nothing across its
 seam.
 
+**Sky visibility**, on a Shaded Relief layer (`raster.symbology` `"sky"`, 0 to 1), dims the
+relief's ambient light where the terrain around a cell hides part of the sky: valley floors, pits
+and the foot of a cliff get less of it than a plain or a ridge, whatever the sun. Each cell's sky is
+the share of the half sphere above its horizon, looked for in 16 directions up to 100 cells away
+(past 32 cells, in steps of a sixteenth of the distance, so a peak narrower than that far away can
+be missed); 1 scales the ambient light by it, 0, the default, draws the relief as before, and the
+direct light (and its cast shadows) is left as it is. It is worked out once for the layer's band,
+Z factor and mask, not for the sun, so moving the sun doesn't work it out again: off the map's
+frame on the desktop, about a second for two million cells on a multi-core computer, nine or so on
+one thread. It is drawn, waited for by
+exports, and said when it can't be drawn (in the browser over 500,000 cells, or a cloud-optimised
+GeoTIFF read in place) as cast shadows are. Terrain outside the raster, or farther than 100 cells,
+hides none of its sky.
+
 **Masking**, at the foot of the Symbology pane (`raster.mask`), hides pixel values from view without
 changing the data: values to draw as no data (a background of 0 or −9999 the file doesn't flag, QA
 flags, land cover classes such as `0, 254, 255`), and values outside, or inside, a range. The

@@ -237,7 +237,7 @@ pub(crate) fn shadow_warnings(what: &str, said: &rustgis_render::ShadowsSaid) ->
     let mut out: Vec<String> = said.notices.iter().map(|e| format!("{what}: {e}")).collect();
     if said.to_come {
         out.push(format!(
-            "{what}: made without the cast shadows still being worked out, as the window doesn't wait for them: once the map shows them, draw or export it again"
+            "{what}: made without the cast shadows or sky visibility still being worked out, as the window doesn't wait for them: once the map shows them, draw or export it again"
         ));
     }
     out

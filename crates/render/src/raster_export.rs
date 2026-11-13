@@ -59,21 +59,20 @@ pub fn export(layer: &RasterLayer, min_zoom: u8, max_zoom: u8, opacity: f32) -> 
         ranges.push((z, x0, x1, y0, y1));
     }
     let stats = layer.masked_stats();
-    // Its cast shadows, waited for; ones that can't be drawn leave the archive unwritten, as a
-    // part drawn from less than it needs does.
-    let light = match layer.cast_shadows(true, (u64::MAX, u64::MAX), || {}) {
-        rustgis_map::raster::CastShadows::Ready(grid) => Some(grid),
-        rustgis_map::raster::CastShadows::Unavailable(why) => return Err(format!("{}: {why}, so the archive isn't written", r.name)),
+    // Its cast shadows and sky, waited for; ones that can't be drawn leave the archive unwritten,
+    // as a part drawn from less than it needs does.
+    let lit = |got: rustgis_map::raster::CastShadows, what: &str| match got {
+        rustgis_map::raster::CastShadows::Ready(grid) => Ok(Some(grid)),
+        rustgis_map::raster::CastShadows::Unavailable(why) => Err(format!("{}: {why}, so the archive isn't written", r.name)),
         // Only when the run is cancelled: nothing is written.
         rustgis_map::raster::CastShadows::Pending => {
-            return Err(format!(
-                "{}: its cast shadows weren't worked out (the export was cancelled), so the archive isn't written",
-                r.name
-            ));
+            Err(format!("{}: its {what} worked out (the export was cancelled), so the archive isn't written", r.name))
         }
-        rustgis_map::raster::CastShadows::None => None,
+        rustgis_map::raster::CastShadows::None => Ok(None),
     };
-    let light = light.as_deref().map(Vec::as_slice);
+    let shadow = lit(layer.cast_shadows(true, (u64::MAX, u64::MAX), || {}), "cast shadows weren't")?;
+    let sky = lit(layer.sky_view(true, (u64::MAX, u64::MAX), || {}), "sky visibility wasn't")?;
+    let light = raster::Lights { shadow: shadow.as_deref().map(Vec::as_slice), sky: sky.as_deref().map(Vec::as_slice) };
     // A raster read in place waits for its tiles natively, two minutes at most in all.
     let deadline = web_time::Instant::now() + rustgis_data::raster::IN_PLACE_WAIT;
     let mut tiles = Vec::new();
@@ -191,8 +190,15 @@ mod tests {
         assert!(e.contains("the archive isn't written"), "{e}");
         // With cast shadows, which only the whole image could have: refused for them, and said.
         let mut layer = layer;
-        layer.style.renderer =
-            rustgis_map::RasterRenderer::ShadedRelief { band: 0, ramp: None, azimuth: 315.0, altitude: 30.0, z_factor: 1.0, shadow: 1.0 };
+        layer.style.renderer = rustgis_map::RasterRenderer::ShadedRelief {
+            band: 0,
+            ramp: None,
+            azimuth: 315.0,
+            altitude: 30.0,
+            z_factor: 1.0,
+            shadow: 1.0,
+            sky: 0.0,
+        };
         let e = export(&layer, 2, 2, 1.0).err().unwrap_or_else(|| panic!("an archive without its shadows"));
         assert!(e.contains("cast shadows") && e.contains("read in place"), "{e}");
     }
@@ -215,8 +221,15 @@ mod tests {
         let raster =
             Raster::new("plain", n, n, vec![data], gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap_or_else(|e| panic!("{e}"));
         let mut layer = RasterLayer::from_path(raster, "plain.tif");
-        layer.style.renderer =
-            rustgis_map::RasterRenderer::ShadedRelief { band: 0, ramp: None, azimuth: 90.0, altitude: 2.0, z_factor: 1.0, shadow: 1.0 };
+        layer.style.renderer = rustgis_map::RasterRenderer::ShadedRelief {
+            band: 0,
+            ramp: None,
+            azimuth: 90.0,
+            altitude: 2.0,
+            z_factor: 1.0,
+            shadow: 1.0,
+            sky: 0.0,
+        };
         let _cancelled = rustgis_data::progress::install(Some(std::sync::Arc::new(Cancelled)));
         let e = export(&layer, 0, 0, 1.0).err().unwrap_or_else(|| panic!("an archive without its shadows"));
         assert!(e.contains("cancelled") && e.contains("isn't written"), "{e}");

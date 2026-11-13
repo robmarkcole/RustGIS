@@ -4051,10 +4051,11 @@ fn render_frame(
                 };
                 let stats = rl.masked_stats();
                 let stats = stats.as_ref().map(|s| s.as_slice());
-                // Its cast shadows, never waited for here (an export waits before it draws, see
-                // `complete`): drawn without them meanwhile, and again once they land. A map's frame
-                // says so as tiles to come; a page's, as shadows to come.
-                let light = match rl.cast_shadows(false, (map_instance, layer.instance_id()), shadows_landed) {
+                // Its cast shadows and sky, never waited for here (an export waits before it draws,
+                // see `complete`): drawn without them meanwhile, and again once they land. A map's
+                // frame says so as tiles to come; a page's, as shadows to come.
+                let owner = (map_instance, layer.instance_id());
+                let mut lit = |got: rustgis_map::raster::CastShadows| match got {
                     rustgis_map::raster::CastShadows::Ready(grid) => Some(grid),
                     rustgis_map::raster::CastShadows::Pending => {
                         if full_res_rasters {
@@ -4080,7 +4081,8 @@ fn render_frame(
                     }
                     rustgis_map::raster::CastShadows::None => None,
                 };
-                let light = light.as_deref().map(Vec::as_slice);
+                let (shadow, sky) = (lit(rl.cast_shadows(false, owner, shadows_landed)), lit(rl.sky_view(false, owner, shadows_landed)));
+                let light = raster::Lights { shadow: shadow.as_deref().map(Vec::as_slice), sky: sky.as_deref().map(Vec::as_slice) };
                 // Read in place: the part in view, at the level the view needs.
                 let address = rl.path.as_deref().filter(|_| rl.in_place);
                 let mut draw_it = |pm: &mut Pixmap, opacity: f32| match address {
@@ -6452,7 +6454,7 @@ pub(crate) fn frame_with_shadows_to_come<T>(f: impl FnOnce() -> T) -> (T, bool) 
     (out, to_come)
 }
 
-/// Waits for the cast shadows of the map's Shaded Relief layers drawn in `view` (visible, in
+/// Waits for the cast shadows and sky of the map's Shaded Relief layers drawn in `view` (visible, in
 /// their and their groups' scale range at the view's centre or, tilted, at one of its bands, as
 /// `render_pass` draws them), as an export does (it runs off the interface's thread); the wait
 /// gives up when the run is cancelled.
@@ -6463,7 +6465,9 @@ fn wait_for_cast_shadows(map: &Map, view: &View) {
     let scales = drawn_scales(map, &camera, view);
     for layer in map.layers.iter().filter(|l| scales.iter().any(|s| map.draws_at(l, *s))) {
         if let Some(rl) = &layer.raster {
-            rl.cast_shadows(true, (map.instance_id(), layer.instance_id()), shadows_landed);
+            let owner = (map.instance_id(), layer.instance_id());
+            rl.cast_shadows(true, owner, shadows_landed);
+            rl.sky_view(true, owner, shadows_landed);
         }
     }
 }
@@ -6645,7 +6649,7 @@ pub fn render_placed(map: &mut Map, view: &View) -> Result<Placed, String> {
     let mut gaps = shadows;
     if to_come {
         gaps.push(
-            "made without the cast shadows still being worked out, as the window doesn't wait for them: once the map shows them, draw or export it again"
+            "made without the cast shadows or sky visibility still being worked out, as the window doesn't wait for them: once the map shows them, draw or export it again"
                 .to_string(),
         );
     }
@@ -8763,8 +8767,15 @@ mod tests {
         let lit = |m: &mut Map, shadow: f64| {
             let l = m.layer_mut(id).unwrap();
             l.visible = true;
-            l.raster.as_mut().unwrap().style.renderer =
-                rustgis_map::RasterRenderer::ShadedRelief { band: 0, ramp: None, azimuth: 315.0, altitude: 5.0, z_factor: 1.0, shadow };
+            l.raster.as_mut().unwrap().style.renderer = rustgis_map::RasterRenderer::ShadedRelief {
+                band: 0,
+                ramp: None,
+                azimuth: 315.0,
+                altitude: 5.0,
+                z_factor: 1.0,
+                shadow,
+                sky: 0.0,
+            };
         };
         let camera = Camera { center: lonlat_to_merc(Coord::new(0.0, 0.0)), res: 1200.0, bearing: 0.0, pitch: 0.0 };
         let view = View { width: 200.0, height: 200.0, pixels_per_point: 1.0, camera, sky: false };
@@ -8789,8 +8800,15 @@ mod tests {
         assert!(farthest > centre * 1.01, "a far band is drawn at a smaller scale: {scales:?}");
         let l = m.layer_mut(id).unwrap();
         l.visible = true;
-        l.raster.as_mut().unwrap().style.renderer =
-            rustgis_map::RasterRenderer::ShadedRelief { band: 0, ramp: None, azimuth: 210.0, altitude: 5.0, z_factor: 1.0, shadow: 1.0 };
+        l.raster.as_mut().unwrap().style.renderer = rustgis_map::RasterRenderer::ShadedRelief {
+            band: 0,
+            ramp: None,
+            azimuth: 210.0,
+            altitude: 5.0,
+            z_factor: 1.0,
+            shadow: 1.0,
+            sky: 0.0,
+        };
         // Drawn only zoomed out past a scale between the centre's and the far band's.
         l.max_scale = Some((centre + farthest) / 2.0);
         // Its work held before it traces: an export that waits for it can't end until it is let
@@ -8832,6 +8850,7 @@ mod tests {
                 altitude: 5.0,
                 z_factor: 1.0,
                 shadow: 1.0,
+                sky: 0.0,
             };
             // Drawn only zoomed in past 1:1: or in a group drawn only there.
             if grouped {

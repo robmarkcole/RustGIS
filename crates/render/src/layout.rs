@@ -3680,6 +3680,7 @@ mod tests {
             altitude: 30.0,
             z_factor: 1.0,
             shadow,
+            sky: 0.0,
         };
         for shadow in [0.0, 1.0] {
             let map = ramp_map(relief(shadow), rustgis_map::raster::Stretch::MinMax);
@@ -3728,6 +3729,7 @@ mod tests {
                 altitude: 10.0,
                 z_factor: 1.0,
                 shadow: 1.0,
+                sky: 0.0,
             };
             let mut m = Map::new(name.clone());
             assert_eq!(m.add_raster("dem", copy), 1);

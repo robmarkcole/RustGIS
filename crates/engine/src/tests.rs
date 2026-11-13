@@ -3972,6 +3972,64 @@ fn shaded_relief_keeps_its_cast_shadows() {
     assert_eq!(shadow(&s), 0.0, "a new Shaded Relief casts none");
 }
 
+/// Shaded Relief's sky visibility is set, clamped, kept when left out (the shadows' too), saved
+/// with the project only when there is some, and drawn in an export (waited for) with nothing to
+/// say.
+#[test]
+fn shaded_relief_keeps_its_sky_visibility() {
+    let mut s = with_raster();
+    let light = |s: &Session| match s.map().layers.first().and_then(|l| l.raster.as_ref()).map(|r| &r.style.renderer) {
+        Some(rustgis_map::RasterRenderer::ShadedRelief { shadow, sky, .. }) => (*shadow, *sky),
+        other => panic!("{other:?}"),
+    };
+    s.run("raster.symbology", &json!({"type": "shadedRelief"})).unwrap();
+    assert_eq!(light(&s), (0.0, 0.0));
+    let skies_saved = |s: &mut Session| s.project.saved_text(None).unwrap().0.matches("\"sky\"").count();
+    let before = skies_saved(&mut s);
+    s.run("raster.symbology", &json!({"type": "shadedRelief", "sky": 0.6, "shadow": 0.5})).unwrap();
+    s.run("raster.symbology", &json!({"type": "shadedRelief", "azimuth": 200})).unwrap();
+    assert_eq!(light(&s), (0.5, 0.6), "left out, kept");
+    s.run("raster.symbology", &json!({"type": "shadedRelief", "sky": -3})).unwrap();
+    assert_eq!(light(&s), (0.5, 0.0));
+    assert_eq!(skies_saved(&mut s), before, "saved only when there is some");
+    s.run("raster.symbology", &json!({"type": "shadedRelief", "sky": 4})).unwrap();
+    assert_eq!(light(&s), (0.5, 1.0));
+    assert_eq!(skies_saved(&mut s), before + 1);
+    s.notices.clear();
+    assert!(crate::cmd::share::map_png(&mut s, Some(300.0), Some(200.0), None).unwrap().len() > 1000);
+    assert!(s.notices.iter().all(|n| !n.text.contains("sky")), "{:?}", s.notices);
+}
+
+/// An export draws the sky a pit hides: its floor darker with `sky` 1 than with 0, the ground
+/// around it (which sees the whole sky) the same. The first export with the sky, from a cold
+/// cache, waits for the grid: it is the same image as one drawn once the grid is kept.
+#[test]
+fn an_export_draws_the_sky_a_pit_hides_and_waits_for_it() {
+    use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster, geotiff};
+    let mut s = world();
+    // A round pit 16 cells across and 400 m deep, in flat ground 41 cells of 30 m a side.
+    let pit: Vec<f32> =
+        (0..41 * 41).map(|i| if f64::from(i % 41 - 20).hypot(f64::from(i / 41 - 20)) <= 8.0 { -400.0 } else { 0.0 }).collect();
+    let gt = GeoTransform { origin_x: 500_000.0, origin_y: 7_000_000.0, pixel_width: 30.0, pixel_height: -30.0 };
+    let r = Raster::new("pit", 41, 41, vec![pit], gt, Crs::from_epsg(31983).unwrap(), None, ColorHint::Gray, "Float32").unwrap();
+    let bytes = geotiff::write(&r, 0).unwrap();
+    crate::cmd::raster::add_raster(&mut s, "pit", rustgis_map::RasterLayer::from_bytes(r, "pit.tif".to_string(), bytes)).unwrap();
+    s.run("layer.zoomTo", &json!({"layer": "pit"})).unwrap();
+    let drawn = |s: &mut Session, sky: f64| {
+        s.run("raster.symbology", &json!({"layer": "pit", "type": "shadedRelief", "grey": true, "sky": sky})).unwrap();
+        let png = crate::cmd::share::map_png(s, Some(200.0), Some(200.0), None).unwrap();
+        crate::render::decode_png(&png).unwrap()
+    };
+    let open = drawn(&mut s, 0.0);
+    let cold = drawn(&mut s, 1.0);
+    let ready = drawn(&mut s, 1.0);
+    assert!(cold.data() == ready.data(), "the first export waited for the sky");
+    let red = |p: &tiny_skia::Pixmap, x: u32, y: u32| p.pixel(x, y).unwrap().red();
+    // The pit's floor, in the middle, sees less sky; flat ground well outside it, all of it.
+    assert!(red(&cold, 100, 100) < red(&open, 100, 100), "{} vs {}", red(&cold, 100, 100), red(&open, 100, 100));
+    assert_eq!(red(&cold, 170, 100), red(&open, 170, 100));
+}
+
 /// A map export that draws a layer without its cast shadows says so, as such (not as a tile layer
 /// that failed), in a PNG, a GeoTIFF and the app's map image alike; one with nothing missing says
 /// nothing.
