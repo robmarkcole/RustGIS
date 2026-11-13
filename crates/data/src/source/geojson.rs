@@ -11,7 +11,7 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use super::{Batch, FeatureSource, Reproject, Request, SourceInfo, clamp_limit, stride};
+use super::{Batch, FeatureSource, Reproject, Request, SourceInfo, clamp_limit, in_request, stride};
 use crate::io::{
     FeatureSink, Schema, declared_crs, geojson_attrs, geojson_geometry, geojson_has_z, geometry_to_lonlat, latitude_past_poles,
     swapped_latitude_note,
@@ -288,6 +288,10 @@ impl FeatureSource for GeoJsonSource {
                 },
                 (_, g) => g,
             };
+            // The boxes are rounded outward to f32, so they can match a feature just outside.
+            if geometry.as_ref().is_some_and(|g| !in_request(g, req)) {
+                continue;
+            }
             features.push(Feature { id: u64::from(i) + 1, geometry, attrs: geojson_attrs(&json, &self.info.fields) });
         }
         Ok(Batch { features, matched: matched as u64, complete: step == 1, skipped, unread_dates: Vec::new() })

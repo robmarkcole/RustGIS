@@ -19,7 +19,7 @@ mod index;
 pub use cache::use_temporary_index_dir;
 pub use cache::{Emptied, empty_index_cache};
 
-use super::{Batch, FeatureSource, Reproject, Request, SourceInfo, clamp_limit};
+use super::{Batch, FeatureSource, Reproject, Request, SourceInfo, clamp_limit, in_request};
 use crate::io::group_rings;
 use crate::{DataError, Feature, Field, FieldType, Geometry, GeometryType, Result, Value};
 use rustgis_geom::{Coord, Extent};
@@ -207,6 +207,10 @@ impl FeatureSource for ShpSource {
                     return Ok(());
                 }
             };
+            // The index's boxes are rounded outward to f32, so it can match a shape just outside.
+            if geometry.as_ref().is_some_and(|g| !in_request(g, req)) {
+                return Ok(());
+            }
             let attrs = if u64::from(i) < self.table.rows {
                 let at = self.table.header_len + u64::from(i) * self.table.row_len as u64;
                 if dbf.read_at(at, &mut row).is_err() {
@@ -232,6 +236,7 @@ impl FeatureSource for ShpSource {
     fn visit_chunks(&self, extent: Option<Extent>, bytes: usize, visit: &mut dyn FnMut(Vec<Feature>) -> Result<()>) -> Result<Batch> {
         let encoding = self.encoding.decoder();
         let mut chunks = super::chunk_memory::Chunker::new(bytes, visit)?;
+        let req = Request { extent, limit: usize::MAX };
         let extent = extent.map(|e| self.reproject.extent_from_lonlat(&e));
         if extent.is_some_and(|e| e.is_empty()) {
             return Ok(Batch { complete: true, ..Batch::default() });
@@ -271,6 +276,10 @@ impl FeatureSource for ShpSource {
                     return Ok(());
                 }
             };
+            // As in `read`, the shape itself is checked.
+            if geometry.as_ref().is_some_and(|g| !in_request(g, &req)) {
+                return Ok(());
+            }
             let attrs = if u64::from(i) < self.table.rows {
                 let at = self.table.header_len + u64::from(i) * self.table.row_len as u64;
                 if dbf.read_at(at, &mut row).is_err() {

@@ -3608,3 +3608,31 @@ fn geojson_in_a_declared_projected_system_is_not_taken_for_swapped() {
     assert_eq!(ds.features.len(), 1);
     assert!(messages.is_empty(), "{messages:?}");
 }
+
+/// A feature just below an extent, within the rounding of the Shapefile and GeoJSON indexes'
+/// single-precision boxes, is left out of a read of that extent, as it is in a whole read's
+/// filter and the other formats.
+#[test]
+fn a_feature_just_outside_an_extent_is_left_out_of_its_read() {
+    let d = dir().join("just-outside");
+    std::fs::create_dir_all(&d).unwrap();
+    let mut ds = Dataset::new("edge", GeometryType::Point, vec![]);
+    ds.push(Some(Geometry::Point(Coord::new(0.0, 0.999_999_999))), vec![]);
+    let extent = Some(Extent::new(-1.0, 1.0, 1.0, 2.0));
+    let req = Request { extent, limit: 1000 };
+    let (shp_path, geojson_path) = (d.join("edge.shp"), d.join("edge.geojson"));
+    crate::io::write_path(&ds, &shp_path).unwrap();
+    crate::io::write_path(&ds, &geojson_path).unwrap();
+    let shp = shp::ShpSource::open_path(&shp_path, "edge").unwrap();
+    assert!(shp.read(&req).unwrap().features.is_empty());
+    let mut rows = Vec::new();
+    shp.visit_chunks(extent, 1 << 20, &mut |chunk| {
+        rows.extend(chunk);
+        Ok(())
+    })
+    .unwrap();
+    assert!(rows.is_empty());
+    let geojson = geojson::GeoJsonSource::open_path(&geojson_path, "edge").unwrap();
+    assert!(geojson.read(&req).unwrap().features.is_empty());
+    std::fs::remove_dir_all(&d).unwrap();
+}
