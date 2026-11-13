@@ -83,6 +83,9 @@ mod android {
         app: RustGisApp,
         /// The files pushed to the app's folder ([`pushed`]), until the first frame takes them.
         pushed: Vec<std::path::PathBuf>,
+        /// Whether the system bars' icons were last asked to be dark (a light ground); `None`
+        /// before the first frame.
+        bars_light: Option<bool>,
         /// The phone's file picker, where its Java half is there.
         phone: Option<Rc<Phone>>,
         /// Picked files the front end reads as bytes (`Services::inbox`).
@@ -250,6 +253,14 @@ mod android {
         }
     }
 
+    /// The room the system's bars take at the window's edges (the status bar, the navigation bar,
+    /// a camera cutout), in points: egui keeps every panel out of it. `None` when the phone
+    /// can't say, which leaves egui's last answer in place.
+    fn insets(phone: Option<&Phone>, pixels_per_point: f32) -> Option<egui::SafeAreaInsets> {
+        let [left, top, right, bottom] = phone?.insets()?.map(|edge| edge.max(0.0) / pixels_per_point.max(0.1));
+        Some(egui::SafeAreaInsets(egui::epaint::MarginF32 { left, top, right, bottom }))
+    }
+
     /// What starts the name of a file from the picker for `purpose` in the inbox, as the browser's
     /// shell marks them: the front end sends a marked file to the dialog that asked for it.
     fn mark(purpose: &str) -> &'static str {
@@ -287,10 +298,23 @@ mod android {
         }
 
         fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-            self.app.ui(ui);
+            // The window runs under the system's bars; the interface keeps to what they leave
+            // (`insets`), over a ground of its own colour so the bars read as part of it.
+            let ctx = ui.ctx().clone();
+            let tokens = rustgis_ui_egui::theme::Tokens::get(&ctx);
+            // The bars' icons are drawn to be read on that ground, whichever theme it is.
+            if self.bars_light != Some(!tokens.dark) {
+                self.bars_light = Some(!tokens.dark);
+                if let Some(phone) = &self.phone {
+                    phone.bars_light(!tokens.dark);
+                }
+            }
+            ui.painter().rect_filled(ctx.viewport_rect(), 0.0, tokens.pane);
+            ui.scope_builder(egui::UiBuilder::new().max_rect(ctx.content_rect()), |ui| self.app.ui(ui));
         }
 
         fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+            raw_input.safe_area_insets = insets(self.phone.as_deref(), ctx.pixels_per_point());
             self.take_phone_events(ctx, raw_input);
             // The pushed files open as files dropped on the desktop window do: once the window
             // runs, read off its thread with progress and Cancel, each failure said in the window.
@@ -406,6 +430,8 @@ mod android {
                 None
             }
         };
+        // A phone gets the touch interface; its More sheet has the desktop one.
+        app.chrome = Some(rustgis_ui_touch::chrome);
         let pushed = pushed(&android, &mut app);
         app.session.mark_saved();
         let mut wgpu_options = eframe::egui_wgpu::WgpuConfiguration::default();
@@ -420,6 +446,7 @@ mod android {
             Box::new(move |_cc| {
                 Ok(Box::new(App {
                     app,
+                    bars_light: None,
                     pushed,
                     phone,
                     inbox,

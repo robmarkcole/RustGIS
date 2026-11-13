@@ -498,6 +498,40 @@ fn source_open_status(app: &RustGisApp, ui: &mut Ui, t: &Tokens) {
     ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
 }
 
+/// Whether work is running that the status bar shows with its progress and Cancel: an export, a
+/// file or a layer being read, a download.
+pub(crate) fn background_busy(app: &RustGisApp) -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    if app.export_job.is_some() || crate::readjob::showing(app) || sources_opening(app) {
+        return true;
+    }
+    !app.ui.downloads.is_empty() || window_reads_under_way(app)
+}
+
+/// That work's progress and Cancel, as the status bar draws them, for a shell without one.
+pub(crate) fn background_status(app: &mut RustGisApp, ui: &mut Ui) {
+    let t = Tokens::get(ui.ctx());
+    #[cfg(not(target_arch = "wasm32"))]
+    if app.export_job.is_some() {
+        crate::exportjob::status(app, ui, &t);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    if crate::readjob::showing(app) {
+        crate::readjob::status(app, ui, &t);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    source_open_status(app, ui, &t);
+    if !app.ui.downloads.is_empty() || window_reads_under_way(app) {
+        downloads_status(app, ui, &t);
+    }
+}
+
+/// Whether a restored layer's dates are still being read ([`source_open_status`] shows them).
+#[cfg(not(target_arch = "wasm32"))]
+fn sources_opening(app: &RustGisApp) -> bool {
+    app.session.project.maps.iter().flat_map(|m| &m.layers).filter_map(|l| l.source.as_ref()).any(|s| s.opening_progress().is_some())
+}
+
 /// Whether windows are being read off the frame (none in the browser).
 fn window_reads_under_way(app: &RustGisApp) -> bool {
     #[cfg(not(target_arch = "wasm32"))]

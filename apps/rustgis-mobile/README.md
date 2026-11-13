@@ -2,7 +2,8 @@
 
 RustGIS on Android ([#1902](https://github.com/opengeos/RustGIS/issues/1902)). It runs the desktop
 front end (`rustgis-ui-egui`) in a `NativeActivity`, with the system's file picker for opening and
-saving. It is not a field app yet: there is no touch interface and no location.
+saving, and the touch interface (`rustgis-ui-touch`) around its map. It is not a field app yet:
+there is no feature form, no digitizing by touch and no location.
 
 ## Build
 
@@ -67,6 +68,18 @@ Rust calls Java and never the other way: each frame the app collects what happen
 - **Not yet.** Choosing a folder (Add Folder, a Zarr store) says it isn't available. The copies of
   data and projects in `files/picked` are never removed (a dialog's file is removed once read). Bringing edits back to the original file is phase 3.
 
+## The touch interface
+
+A phone starts in the touch interface: the map, a bar of four large buttons under it (Layers, Add
+Data, Full Extent, More) and sheets that rise over the map. The Layers sheet shows and hides
+layers, zooms to one and makes one the active layer; the More sheet has the project, undo and
+redo, and **Use the Desktop Interface**, which brings back the ribbon and panes until the app is
+started again.
+
+The interface keeps out of the room the system's bars take: the activity's Java half reports the
+insets, and the bars' icons are drawn dark over a light theme's ground and light over a dark
+one's.
+
 ## What differs from the desktop
 
 | | On Android |
@@ -97,7 +110,7 @@ On the Android 15 emulator (x86_64, software GPU), from this crate as it is:
 
 What it showed is wrong or missing:
 
-- The window draws under the status bar and the navigation bar: the app ignores the system's insets.
+- (Fixed since.) The window drew under the status bar and the navigation bar.
 - The desktop ribbon and panes are unusable at a phone's width, as expected. Phase 2 is a new front end.
 - The map draws on the CPU here (the emulator has no GPU). Frame rates need a phone.
 - Not tried on a phone: arm64, a real GPU, pinch zoom, the soft keyboard, memory limits.

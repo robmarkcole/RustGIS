@@ -4,8 +4,9 @@
 //!
 //! Commands never ask: `project.new` and the rest run as before for the CLI, scripts, the AI
 //! Assistant and attached agents. What the user does in the interface goes through
-//! [`RustGisApp::run_by_user`], which asks first. The desktop app asks; the browser warns before
-//! its page is left instead, and saves by downloading, so it doesn't.
+//! [`RustGisApp::run_by_user`], which asks first. The desktop app asks, and so does a phone's
+//! shell before a project is replaced; the browser warns before its page is left instead, and
+//! saves by downloading, so it doesn't.
 
 use egui::vec2;
 use serde_json::Value;
@@ -39,9 +40,14 @@ pub(crate) struct SavePromptState {
 }
 
 /// Whether running command `id` from the interface asks first: it replaces the project, which
-/// has unsaved changes, in the desktop app.
+/// has unsaved changes, in the desktop app or on a phone.
+///
+/// A phone's shell saves through the system's picker, as the browser saves by downloading, but
+/// it has no page to warn before leaving: so it asks too. Its Save starts the save and leaves
+/// the project as it is (the picker answers later, and the dialog reads the result at once);
+/// Don't Save and Cancel are the desktop's.
 pub(crate) fn asks(app: &RustGisApp, id: &str) -> bool {
-    REPLACES.contains(&id) && unsaved_here(app)
+    REPLACES.contains(&id) && app.session.dirty() && (app.opens_files() || cfg!(target_os = "android"))
 }
 
 /// Whether the project has unsaved changes in a shell that asks about them (the desktop app).

@@ -24,6 +24,7 @@ const LAYERS: &[(&str, u8)] = &[
     ("engine", 4),
     ("assistant", 5),
     ("ui-egui", 6),
+    ("ui-touch", 7),
 ];
 const UI_ONLY: &[&str] = &["egui", "eframe", "egui_extras", "egui-wgpu", "egui_kittest", "rfd", "wgpu", "winit"];
 

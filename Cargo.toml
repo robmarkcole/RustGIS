@@ -19,6 +19,7 @@ rustgis-analysis = { path = "crates/analysis" }
 rustgis-render = { path = "crates/render" }
 rustgis-engine = { path = "crates/engine" }
 rustgis-ui-egui = { path = "crates/ui-egui" }
+rustgis-ui-touch = { path = "crates/ui-touch" }
 rustgis-geolibre = { path = "crates/geolibre" }
 rustgis-plugins = { path = "crates/plugins" }
 rustgis-tiles = { path = "crates/tiles" }

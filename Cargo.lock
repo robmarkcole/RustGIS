@@ -4932,6 +4932,7 @@ dependencies = [
  "log",
  "rustgis-engine",
  "rustgis-ui-egui",
+ "rustgis-ui-touch",
  "winit",
 ]
 
@@ -5037,6 +5038,15 @@ dependencies = [
  "sys-locale",
  "tempfile",
  "web-time",
+]
+
+[[package]]
+name = "rustgis-ui-touch"
+version = "0.6.0"
+dependencies = [
+ "egui",
+ "rustgis-ui-egui",
+ "serde_json",
 ]
 
 [[package]]
