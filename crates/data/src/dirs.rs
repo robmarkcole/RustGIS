@@ -8,9 +8,24 @@
 //! | [`cache_dir`] | `RUSTGIS_CACHE_DIR` | `%LOCALAPPDATA%\RustGIS\cache` | `~/Library/Caches/RustGIS` | `$XDG_CACHE_HOME/rustgis` (`~/.cache/rustgis`) |
 //!
 //! An override is used as is. There are none in the browser, where these give `None`.
+//!
+//! An app whose system gives it one folder of its own and no environment to name it in (Android)
+//! calls [`set_root`] once at start-up: the folders are then `config`, `data` and `cache` in it,
+//! unless an override names one.
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+/// The app's own folder, where the system gives it one ([`set_root`]).
+static ROOT: OnceLock<PathBuf> = OnceLock::new();
+
+/// Puts the three folders in `root` (`config`, `data` and `cache`) instead of the platform's usual
+/// places. For an app the system gives one folder of its own, called once before anything asks
+/// for a folder. Returns whether it took: the first call wins, a later one changes nothing.
+pub fn set_root(root: PathBuf) -> bool {
+    ROOT.set(root).is_ok()
+}
 
 /// The environment variable that names the settings folder.
 pub const CONFIG_ENV: &str = "RUSTGIS_CONFIG_DIR";
@@ -45,17 +60,17 @@ const OS: Os = if cfg!(target_os = "windows") {
 
 /// Settings: preferences, the crash log, AI Assistant sign-ins and skills.
 pub fn config_dir() -> Option<PathBuf> {
-    resolve(Kind::Config, OS, &env)
+    rooted(Kind::Config, OS, &env, ROOT.get().map(PathBuf::as_path))
 }
 
 /// App data kept on this computer: installed plugins and programs, recovery copies of unsaved work.
 pub fn app_data_dir() -> Option<PathBuf> {
-    resolve(Kind::AppData, OS, &env)
+    rooted(Kind::AppData, OS, &env, ROOT.get().map(PathBuf::as_path))
 }
 
 /// Files that can be made again, such as format conversions.
 pub fn cache_dir() -> Option<PathBuf> {
-    resolve(Kind::Cache, OS, &env)
+    rooted(Kind::Cache, OS, &env, ROOT.get().map(PathBuf::as_path))
 }
 
 /// An environment variable, unless it is unset or empty.
@@ -63,14 +78,31 @@ fn env(name: &str) -> Option<OsString> {
     std::env::var_os(name).filter(|v| !v.is_empty())
 }
 
-/// The folder `kind` on `os`, reading the environment through `env`.
-fn resolve(kind: Kind, os: Os, env: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
-    let over = match kind {
+/// The environment variable that overrides the folder `kind`.
+fn override_name(kind: Kind) -> &'static str {
+    match kind {
         Kind::Config => CONFIG_ENV,
         Kind::AppData => APP_DATA_ENV,
         Kind::Cache => CACHE_ENV,
-    };
-    if let Some(d) = env(over) {
+    }
+}
+
+/// The folder `kind`: its override, else its place in the app's own folder `root` when there is
+/// one, else the platform's usual place.
+fn rooted(kind: Kind, os: Os, env: &dyn Fn(&str) -> Option<OsString>, root: Option<&Path>) -> Option<PathBuf> {
+    match root {
+        Some(root) if env(override_name(kind)).is_none() => Some(root.join(match kind {
+            Kind::Config => "config",
+            Kind::AppData => "data",
+            Kind::Cache => "cache",
+        })),
+        _ => resolve(kind, os, env),
+    }
+}
+
+/// The folder `kind` on `os`, reading the environment through `env`.
+fn resolve(kind: Kind, os: Os, env: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    if let Some(d) = env(override_name(kind)) {
         return Some(PathBuf::from(d));
     }
     let var = |name: &str| env(name).map(PathBuf::from);
@@ -160,5 +192,20 @@ mod tests {
         // An empty override is no override.
         let env = with(&[("HOME", "/home/a"), (CONFIG_ENV, "")]);
         assert_eq!(resolve(Kind::Config, Os::Other, &env), Some(PathBuf::from("/home/a/.config/rustgis")));
+    }
+
+    #[test]
+    fn an_app_folder_holds_all_three_unless_overridden() {
+        let root = Path::new("/app/files");
+        let folders = |env: &dyn Fn(&str) -> Option<OsString>| {
+            [Kind::Config, Kind::AppData, Kind::Cache].map(|k| rooted(k, Os::Other, env, Some(root)))
+        };
+        // No HOME, as on Android: the root alone places them.
+        assert_eq!(folders(&with(&[])), paths(["/app/files/config", "/app/files/data", "/app/files/cache"]));
+        // An override still names its own folder; the others stay in the root.
+        assert_eq!(folders(&with(&[(CACHE_ENV, "/p/cache")])), paths(["/app/files/config", "/app/files/data", "/p/cache"]));
+        // Without a root, the platform's places.
+        let home = with(&[("HOME", "/home/a")]);
+        assert_eq!(rooted(Kind::Config, Os::Other, &home, None), Some(PathBuf::from("/home/a/.config/rustgis")));
     }
 }

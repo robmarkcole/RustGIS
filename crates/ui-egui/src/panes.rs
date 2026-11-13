@@ -3244,7 +3244,8 @@ fn geolibre_card(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                         ui.add(egui::Hyperlink::from_label_and_url(tl!("Download the GeoLibre runner"), download).open_in_new_tab(true));
                         #[cfg(not(target_arch = "wasm32"))]
                         if ui.small_button(tl!("Locate…")).clicked()
-                            && let Some(path) = rfd::FileDialog::new().set_title(tl!("Locate the GeoLibre runner")).pick_file()
+                            && let Some(path) =
+                                crate::filedialog::FileDialog::new().set_title(tl!("Locate the GeoLibre runner")).pick_file()
                         {
                             let path = path.display().to_string();
                             match app.run("gp.setGeolibre", json!({"path": path})) {
@@ -4099,7 +4100,7 @@ fn browse_file(app: &mut RustGisApp, tool: &'static str, param: &'static str) {
     #[cfg(not(target_arch = "wasm32"))]
     {
         let exts: Vec<&str> = exts.iter().map(String::as_str).collect();
-        let dialog = rfd::FileDialog::new();
+        let dialog = crate::filedialog::FileDialog::new();
         let dialog = if exts.is_empty() { dialog } else { dialog.add_filter(exts.join(", "), &exts).add_filter(tl!("All files"), &["*"]) };
         if let Some(path) = dialog.pick_file() {
             app.gp.files.remove(param);

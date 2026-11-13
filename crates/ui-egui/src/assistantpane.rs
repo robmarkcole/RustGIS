@@ -1377,13 +1377,13 @@ fn skills_setting(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         ui.horizontal_wrapped(|ui| {
             let mut picked = None;
             if ui.button(tl!("Add skill…")).clicked() {
-                picked = rfd::FileDialog::new()
+                picked = crate::filedialog::FileDialog::new()
                     .set_title(tl!("Add skill…"))
                     .add_filter(tl!("Skill (SKILL.md or .zip)"), &["md", "zip"])
                     .pick_file();
             }
             if ui.button(tl!("Add folder…")).clicked() {
-                picked = rfd::FileDialog::new().set_title(tl!("Add folder…")).pick_folder();
+                picked = crate::filedialog::FileDialog::new().set_title(tl!("Add folder…")).pick_folder();
             }
             if let Some(path) = picked {
                 done = Some(

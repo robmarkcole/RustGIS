@@ -2181,6 +2181,12 @@ impl Session {
     fn say_bundled_roots(&mut self, bundled: bool) {
         if bundled && !self.bundled_roots_said {
             self.bundled_roots_said = true;
+            // Android: the bundled roots are the only source yet (`rustgis_data::http`).
+            #[cfg(target_os = "android")]
+            self.warn(
+                "HTTPS servers are checked against the Mozilla roots bundled with RustGIS, not this device's own certificates: a server trusted only by a certificate installed on the device is refused",
+            );
+            #[cfg(not(target_os = "android"))]
             self.warn(
                 "This system has no CA certificates, so HTTPS servers are checked against the Mozilla roots bundled with RustGIS: install the system's CA certificates (or set SSL_CERT_FILE or SSL_CERT_DIR) to use its trust instead",
             );

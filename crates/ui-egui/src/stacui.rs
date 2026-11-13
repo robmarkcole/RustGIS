@@ -1298,7 +1298,7 @@ fn rectangle([w, s, e, n]: [f64; 4]) -> Geometry {
 /// A file of features, read and merged on a thread of their own.
 #[cfg(not(target_arch = "wasm32"))]
 fn pick_file(app: &mut RustGisApp) {
-    let Some(path) = rfd::FileDialog::new().pick_file() else { return };
+    let Some(path) = crate::filedialog::FileDialog::new().pick_file() else { return };
     let path = path.display().to_string();
     let name = std::path::Path::new(&path).file_name().map_or_else(|| path.clone(), |n| n.to_string_lossy().into_owned());
     start_loading(app, name, move || rustgis_engine::cmd::stac_area::load_file(&path));

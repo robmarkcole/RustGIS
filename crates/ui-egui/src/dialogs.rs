@@ -2068,20 +2068,20 @@ fn select_by_attributes(app: &mut RustGisApp, ui: &mut egui::Ui, t: &Tokens) -> 
 /// files); `None` when cancelled.
 #[cfg(all(not(target_arch = "wasm32"), not(test)))]
 pub fn pick_open(exts: &[&str], label: &str) -> Option<String> {
-    let dialog = rfd::FileDialog::new();
+    let dialog = crate::filedialog::FileDialog::new();
     let dialog = if exts.is_empty() { dialog } else { dialog.add_filter(label, exts) };
     dialog.add_filter("All files", &["*"]).pick_file().map(|p| p.display().to_string())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn pick_folder() -> Option<String> {
-    rfd::FileDialog::new().pick_folder().map(|p| p.display().to_string())
+    crate::filedialog::FileDialog::new().pick_folder().map(|p| p.display().to_string())
 }
 
 /// Asks where to save, suggesting file `name`, with the system's dialog; `None` when cancelled.
 #[cfg(all(not(target_arch = "wasm32"), not(test)))]
 pub fn pick_save(name: &str, exts: &[&str], label: &str) -> Option<String> {
-    rfd::FileDialog::new().set_file_name(name).add_filter(label, exts).save_file().map(|p| p.display().to_string())
+    crate::filedialog::FileDialog::new().set_file_name(name).add_filter(label, exts).save_file().map(|p| p.display().to_string())
 }
 
 // Unit tests can't answer the system's file dialogs: a picker answers what the test put in

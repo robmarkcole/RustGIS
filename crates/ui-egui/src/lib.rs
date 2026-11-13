@@ -43,6 +43,8 @@ mod extensionsui;
 mod failureui;
 mod fieldlists;
 mod fieldmenu;
+#[cfg(not(target_arch = "wasm32"))]
+mod filedialog;
 mod fill_editor;
 mod geocodeui;
 mod geolibreui;
@@ -3960,7 +3962,7 @@ impl RustGisApp {
             }
             "ui.addFolder" => {
                 #[cfg(not(target_arch = "wasm32"))]
-                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                if let Some(dir) = crate::filedialog::FileDialog::new().pick_folder() {
                     return self.run("project.addFolder", json!({"path": dir.display().to_string()}));
                 }
                 #[cfg(target_arch = "wasm32")]
