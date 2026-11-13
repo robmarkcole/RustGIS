@@ -92,6 +92,10 @@ is out of scope.
   maintainer translates them before each release (format in `docs/i18n.md`). Command ids, data
   and the CLI are never translated.
 - **Layering** is enforced by `cargo xtask layers`: nothing below L6 depends on egui/eframe/rfd.
+- **The expression language has one vocabulary**: a new function, variable or keyword goes in
+  the catalogs in `crates/data/src/query.rs` (`Func::spec`, `VARS`, `Kw`), which the parser
+  reads, and in `docs/user-guide/expressions.md`; the `query` tests fail when the guide misses
+  a signature, unit, variable or keyword, or names a function that doesn't exist.
 
 ## Assets
 - No third-party vendor icons, images, styles, fonts, help text or code. Icons are drawn in

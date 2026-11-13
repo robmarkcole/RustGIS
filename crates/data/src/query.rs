@@ -20,6 +20,9 @@
 //! too costly to match ([`MAX_LIKE_STEPS`]) is unknown, as is any that would take an expression's
 //! `LIKE`s past what they may take for one row together ([`MAX_ROW_LIKE_STEPS`]). Arithmetic on a
 //! null, a division by zero or an overflow gives null; `+` joins text that isn't a number.
+//!
+//! The vocabulary lives in catalogs the parser reads, with a signature and description for
+//! each entry: [`functions`], [`VARS`] and [`Kw`]. Whatever helps write expressions reads them too.
 
 use crate::{Dataset, Measure, Value};
 use std::borrow::Cow;
@@ -129,6 +132,24 @@ pub struct Env {
     pub map_scale: Option<f64>,
 }
 
+/// Declares an enum and its `ALL`, every variant in the order declared, from one list, so a
+/// new variant can't be left out of `ALL`.
+macro_rules! listed_enum {
+    ($(#[$meta:meta])* pub enum $name:ident { $($(#[$vmeta:meta])* $variant:ident,)* }) => {
+        $(#[$meta])*
+        pub enum $name {
+            $($(#[$vmeta])* $variant,)*
+        }
+
+        impl $name {
+            /// Every variant, in the order declared.
+            pub const ALL: &'static [$name] = &[$($name::$variant,)*];
+        }
+    };
+}
+
+listed_enum! {
+/// A function of the language. Its catalog entry is [`Func::spec`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Func {
     If,
@@ -166,6 +187,7 @@ pub enum Func {
     Area,
     Perimeter,
     LineLength,
+}
 }
 
 /// Whether `t` is a whole date in a form other than ISO 8601: digits only, five or more
@@ -227,43 +249,222 @@ fn number_func(f: Func) -> bool {
     )
 }
 
-/// Functions by name, with their fewest and most arguments.
-const FUNCS: &[(&str, Func, usize, usize)] = &[
-    ("if", Func::If, 2, 3),
-    ("coalesce", Func::Coalesce, 1, MAX_ARGS),
-    ("nullif", Func::NullIf, 2, 2),
-    ("abs", Func::Abs, 1, 1),
-    ("round", Func::Round, 1, 2),
-    ("floor", Func::Floor, 1, 1),
-    ("ceil", Func::Ceil, 1, 1),
-    ("sqrt", Func::Sqrt, 1, 1),
-    ("exp", Func::Exp, 1, 1),
-    ("ln", Func::Ln, 1, 1),
-    ("log10", Func::Log10, 1, 1),
-    ("pi", Func::Pi, 0, 0),
-    ("min", Func::Min, 1, MAX_ARGS),
-    ("max", Func::Max, 1, MAX_ARGS),
-    ("clamp", Func::Clamp, 3, 3),
-    ("scale_linear", Func::ScaleLinear, 5, 5),
-    ("scale_exp", Func::ScaleExp, 6, 6),
-    ("to_string", Func::ToString, 1, 1),
-    ("to_int", Func::ToInt, 1, 1),
-    ("to_real", Func::ToReal, 1, 1),
-    ("length", Func::Length, 1, 1),
-    ("upper", Func::Upper, 1, 1),
-    ("lower", Func::Lower, 1, 1),
-    ("trim", Func::Trim, 1, 1),
-    ("substr", Func::Substr, 2, 3),
-    ("left", Func::Left, 2, 2),
-    ("right", Func::Right, 2, 2),
-    ("replace", Func::Replace, 3, 3),
-    ("concat", Func::Concat, 1, MAX_ARGS),
-    ("color_rgb", Func::ColorRgb, 3, 3),
-    ("color_rgba", Func::ColorRgba, 4, 4),
-    ("area", Func::Area, 0, 1),
-    ("perimeter", Func::Perimeter, 0, 1),
-    ("line_length", Func::LineLength, 0, 1),
+/// A function's catalog entry: how it is called and what it gives. The parser reads it (a call
+/// resolves by `name` and its arguments are counted against `min` and `max`), and so does
+/// whatever helps write expressions, so the two can't disagree.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FuncSpec {
+    pub func: Func,
+    /// The name it is called by (any letter case).
+    pub name: &'static str,
+    /// Fewest and most arguments.
+    pub min: usize,
+    pub max: usize,
+    /// How it is written, optional arguments in brackets: `round(x[, places])`.
+    pub signature: &'static str,
+    /// What it gives, in English (the interface translates it).
+    pub description: &'static str,
+    /// A call that parses and evaluates on a layer it fits.
+    pub example: &'static str,
+}
+
+impl Func {
+    /// Its catalog entry. One arm per function, so a new [`Func`] doesn't compile without its
+    /// name, signature, description and example.
+    pub const fn spec(self) -> FuncSpec {
+        let (name, min, max, signature, description, example) = match self {
+            Func::If => {
+                ("if", 2, 3, "if(condition, a[, b])", "a when the condition is true, otherwise b (or null)", "if(1 > 0, 'yes', 'no')")
+            }
+            Func::Coalesce => ("coalesce", 1, MAX_ARGS, "coalesce(a, b, …)", "The first value that isn't null", "coalesce(NULL, 'none')"),
+            Func::NullIf => ("nullif", 2, 2, "nullif(a, b)", "Null when a equals b, otherwise a", "nullif(5, 0)"),
+            Func::Abs => ("abs", 1, 1, "abs(x)", "Absolute value", "abs(-3)"),
+            Func::Round => (
+                "round",
+                1,
+                2,
+                "round(x[, places])",
+                "Rounded half away from zero to places decimals (0 by default; negative rounds to tens, hundreds…)",
+                "round(3.14159, 2)",
+            ),
+            Func::Floor => ("floor", 1, 1, "floor(x)", "Rounded down", "floor(2.7)"),
+            Func::Ceil => ("ceil", 1, 1, "ceil(x)", "Rounded up", "ceil(2.1)"),
+            Func::Sqrt => ("sqrt", 1, 1, "sqrt(x)", "Square root", "sqrt(16)"),
+            Func::Exp => ("exp", 1, 1, "exp(x)", "e to the power x", "exp(1)"),
+            Func::Ln => ("ln", 1, 1, "ln(x)", "Natural logarithm", "ln(10)"),
+            Func::Log10 => ("log10", 1, 1, "log10(x)", "Base-10 logarithm", "log10(1000)"),
+            Func::Pi => ("pi", 0, 0, "pi()", "π", "pi()"),
+            Func::Min => {
+                ("min", 1, MAX_ARGS, "min(a, b, …)", "The smallest number; values that aren't numbers are skipped", "min(3, 1, 2)")
+            }
+            Func::Max => ("max", 1, MAX_ARGS, "max(a, b, …)", "The largest number; values that aren't numbers are skipped", "max(3, 1, 2)"),
+            Func::Clamp => {
+                ("clamp", 3, 3, "clamp(low, x, high)", "x kept within low…high; null when low is above high", "clamp(0, 15, 10)")
+            }
+            Func::ScaleLinear => (
+                "scale_linear",
+                5,
+                5,
+                "scale_linear(x, d0, d1, r0, r1)",
+                "x mapped from the domain d0…d1 to the range r0…r1, clamped to the domain",
+                "scale_linear(50, 0, 100, 2, 12)",
+            ),
+            Func::ScaleExp => (
+                "scale_exp",
+                6,
+                6,
+                "scale_exp(x, d0, d1, r0, r1, exponent)",
+                "As scale_linear, along a curve: 0.5 grows fast then slowly, 2 slowly then fast",
+                "scale_exp(50, 0, 100, 2, 12, 0.5)",
+            ),
+            Func::ToString => ("to_string", 1, 1, "to_string(x)", "x as text", "to_string(42)"),
+            Func::ToInt => {
+                ("to_int", 1, 1, "to_int(x)", "x as a whole number (cut toward zero); null if it isn't a number", "to_int('12.7')")
+            }
+            Func::ToReal => ("to_real", 1, 1, "to_real(x)", "x as a decimal number; null if it isn't a number", "to_real('3.5')"),
+            Func::Length => ("length", 1, 1, "length(s)", "Number of characters", "length('Paris')"),
+            Func::Upper => ("upper", 1, 1, "upper(s)", "Upper case", "upper('paris')"),
+            Func::Lower => ("lower", 1, 1, "lower(s)", "Lower case", "lower('PARIS')"),
+            Func::Trim => ("trim", 1, 1, "trim(s)", "Without surrounding spaces", "trim('  Paris  ')"),
+            Func::Substr => (
+                "substr",
+                2,
+                3,
+                "substr(s, start[, length])",
+                "Part of s from character start (1 is the first; negative counts from the end); a negative length leaves that many characters off the end",
+                "substr('Paris', 2, 3)",
+            ),
+            Func::Left => ("left", 2, 2, "left(s, n)", "The first n characters", "left('Paris', 2)"),
+            Func::Right => ("right", 2, 2, "right(s, n)", "The last n characters", "right('Paris', 2)"),
+            Func::Replace => ("replace", 3, 3, "replace(s, find, with)", "Every find in s replaced by with", "replace('a-b-c', '-', ' ')"),
+            Func::Concat => {
+                ("concat", 1, MAX_ARGS, "concat(a, b, …)", "The values joined as text, nulls skipped", "concat('a', NULL, 'b')")
+            }
+            Func::ColorRgb => {
+                ("color_rgb", 3, 3, "color_rgb(r, g, b)", "A colour as the text 'r,g,b', each channel 0–255", "color_rgb(255, 128, 0)")
+            }
+            Func::ColorRgba => (
+                "color_rgba",
+                4,
+                4,
+                "color_rgba(r, g, b, a)",
+                "A colour as the text 'r,g,b,a', each channel 0–255",
+                "color_rgba(255, 128, 0, 128)",
+            ),
+            Func::Area => ("area", 0, 1, "area([unit])", "A polygon's area, in square metres or the unit given", "area('ha')"),
+            Func::Perimeter => {
+                ("perimeter", 0, 1, "perimeter([unit])", "The length of a polygon's rings, in metres or the unit given", "perimeter('km')")
+            }
+            Func::LineLength => {
+                ("line_length", 0, 1, "line_length([unit])", "A line's length, in metres or the unit given", "line_length('km')")
+            }
+        };
+        FuncSpec { func: self, name, min, max, signature, description, example }
+    }
+}
+
+/// Every function of the language, with its catalog entry.
+pub fn functions() -> impl Iterator<Item = FuncSpec> {
+    Func::ALL.iter().map(|f| f.spec())
+}
+
+/// A variable's catalog entry. The parser resolves `@…` and `$…` through [`VARS`], so a variable
+/// can be written only once it is listed there.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VarSpec {
+    /// The names it is written by (any letter case), the usual one first.
+    pub names: &'static [&'static str],
+    pub var: Var,
+    /// What it reads, in English (the interface translates it).
+    pub description: &'static str,
+}
+
+/// Every variable of the language.
+pub const VARS: &[VarSpec] = &[
+    VarSpec {
+        names: &["@map_scale", "$scale"],
+        var: Var::MapScale,
+        description: "The scale denominator of the map being drawn; null in queries and Calculate Field",
+    },
+    VarSpec { names: &["@row_number"], var: Var::RowNumber, description: "The feature's position in the layer, from 1" },
+    VarSpec { names: &["$id"], var: Var::Id, description: "The feature's id" },
+    VarSpec { names: &["$area"], var: Var::Measure(Measure::Area, 1.0), description: "A polygon's area in square metres (holes subtract)" },
+    VarSpec {
+        names: &["$perimeter"],
+        var: Var::Measure(Measure::Perimeter, 1.0),
+        description: "The length of a polygon's rings in metres",
+    },
+    VarSpec { names: &["$length"], var: Var::Measure(Measure::Length, 1.0), description: "A line's length in metres" },
 ];
+
+listed_enum! {
+/// A keyword of the language. The parser matches keywords only through [`Kw::word`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kw {
+    And,
+    Or,
+    Not,
+    Is,
+    Null,
+    Like,
+    Ilike,
+    In,
+    Between,
+    True,
+    False,
+    Case,
+    When,
+    Then,
+    Else,
+    End,
+}
+}
+
+impl Kw {
+    /// How it is written (any letter case is read).
+    pub const fn word(self) -> &'static str {
+        match self {
+            Kw::And => "AND",
+            Kw::Or => "OR",
+            Kw::Not => "NOT",
+            Kw::Is => "IS",
+            Kw::Null => "NULL",
+            Kw::Like => "LIKE",
+            Kw::Ilike => "ILIKE",
+            Kw::In => "IN",
+            Kw::Between => "BETWEEN",
+            Kw::True => "TRUE",
+            Kw::False => "FALSE",
+            Kw::Case => "CASE",
+            Kw::When => "WHEN",
+            Kw::Then => "THEN",
+            Kw::Else => "ELSE",
+            Kw::End => "END",
+        }
+    }
+
+    /// What it does, in English (the interface translates it).
+    pub const fn description(self) -> &'static str {
+        match self {
+            Kw::And => "True when both sides are true",
+            Kw::Or => "True when either side is true",
+            Kw::Not => "The opposite of a condition; also NOT LIKE, NOT IN, NOT BETWEEN",
+            Kw::Is => "IS NULL, IS NOT NULL: whether the value is missing",
+            Kw::Null => "The missing value",
+            Kw::Like => "Text pattern, ignoring letter case: % matches any run of characters, _ one character",
+            Kw::Ilike => "The same as LIKE",
+            Kw::In => "Equal to one of the values in brackets",
+            Kw::Between => "BETWEEN a AND b: at least a and at most b",
+            Kw::True => "The boolean true",
+            Kw::False => "The boolean false",
+            Kw::Case => "Starts a choice: CASE WHEN … THEN … ELSE … END",
+            Kw::When => "In CASE, a condition, or a value to match",
+            Kw::Then => "In CASE, the value given for the WHEN before it",
+            Kw::Else => "In CASE, the value given when no WHEN matches",
+            Kw::End => "Ends a CASE",
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 enum Tok {
@@ -427,13 +628,13 @@ struct Parser<'a> {
 }
 
 impl Parser<'_> {
-    fn peek_kw(&self, kw: &str) -> bool {
+    fn peek_kw(&self, kw: Kw) -> bool {
         self.kw_at(self.pos, kw)
     }
-    fn kw_at(&self, i: usize, kw: &str) -> bool {
-        matches!(self.toks.get(i), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case(kw))
+    fn kw_at(&self, i: usize, kw: Kw) -> bool {
+        matches!(self.toks.get(i), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case(kw.word()))
     }
-    fn eat_kw(&mut self, kw: &str) -> bool {
+    fn eat_kw(&mut self, kw: Kw) -> bool {
         let y = self.peek_kw(kw);
         if y {
             self.pos += 1;
@@ -465,7 +666,7 @@ impl Parser<'_> {
     fn or(&mut self) -> Result<Expr, String> {
         self.deeper()?;
         let mut terms = vec![self.and()?];
-        while self.eat_kw("OR") {
+        while self.eat_kw(Kw::Or) {
             if terms.len() >= MAX_TERMS {
                 return Err("the expression has too many terms".into());
             }
@@ -484,7 +685,7 @@ impl Parser<'_> {
     }
     fn and(&mut self) -> Result<Expr, String> {
         let mut terms = vec![self.not()?];
-        while self.eat_kw("AND") {
+        while self.eat_kw(Kw::And) {
             if terms.len() >= MAX_TERMS {
                 return Err("the expression has too many terms".into());
             }
@@ -501,7 +702,7 @@ impl Parser<'_> {
         )
     }
     fn not(&mut self) -> Result<Expr, String> {
-        if self.eat_kw("NOT") {
+        if self.eat_kw(Kw::Not) {
             self.deeper()?;
             let e = self.not()?;
             self.depth -= 1;
@@ -511,9 +712,9 @@ impl Parser<'_> {
     }
     fn cmp(&mut self) -> Result<Expr, String> {
         let l = self.concat()?;
-        if self.eat_kw("IS") {
-            let negate = self.eat_kw("NOT");
-            if !self.eat_kw("NULL") {
+        if self.eat_kw(Kw::Is) {
+            let negate = self.eat_kw(Kw::Not);
+            if !self.eat_kw(Kw::Null) {
                 return Err("expected NULL after IS".into());
             }
             return Ok(match l {
@@ -521,15 +722,15 @@ impl Parser<'_> {
                 e => Expr::IsNullExpr { e: Box::new(e), negate },
             });
         }
-        let negate = self.eat_kw("NOT");
-        if self.eat_kw("LIKE") || self.eat_kw("ILIKE") {
+        let negate = self.eat_kw(Kw::Not);
+        if self.eat_kw(Kw::Like) || self.eat_kw(Kw::Ilike) {
             let p = self.concat()?;
             return Ok(match (l, p) {
                 (Expr::Field(field), Expr::Lit(Value::Text(pattern))) => Expr::Like { field, pattern, negate },
                 (e, p) => Expr::LikeExpr { e: Box::new(e), pattern: Box::new(p), negate },
             });
         }
-        if self.eat_kw("IN") {
+        if self.eat_kw(Kw::In) {
             self.expect(Tok::LParen, "'(' after IN")?;
             let mut list = vec![self.item()?];
             loop {
@@ -550,9 +751,9 @@ impl Parser<'_> {
                 e => Expr::InExpr { e: Box::new(e), list, negate },
             });
         }
-        if self.eat_kw("BETWEEN") {
+        if self.eat_kw(Kw::Between) {
             let lo = self.concat()?;
-            if !self.eat_kw("AND") {
+            if !self.eat_kw(Kw::And) {
                 return Err("expected AND after BETWEEN …".into());
             }
             let hi = self.concat()?;
@@ -739,7 +940,8 @@ impl Parser<'_> {
     }
     /// Whether the token at `i` starts the operator of a comparison.
     fn comparison_at(&self, i: usize) -> bool {
-        matches!(self.toks.get(i), Some(Tok::Op(_))) || ["IS", "LIKE", "ILIKE", "IN", "NOT", "BETWEEN"].iter().any(|k| self.kw_at(i, k))
+        matches!(self.toks.get(i), Some(Tok::Op(_)))
+            || [Kw::Is, Kw::Like, Kw::Ilike, Kw::In, Kw::Not, Kw::Between].into_iter().any(|k| self.kw_at(i, k))
     }
     fn field(&self, name: &str) -> Result<Expr, String> {
         self.ds.field_index(name).map(Expr::Field).ok_or_else(|| format!("no field named '{name}'"))
@@ -776,14 +978,10 @@ impl Parser<'_> {
             Some(Tok::Num(_)) => Err("the number is too large".into()),
             Some(Tok::Str(s)) => Ok(Expr::Lit(Value::Text(s))),
             Some(Tok::QuotedIdent(s)) => self.field(&s),
-            Some(Tok::Var(v)) => match v.to_ascii_lowercase().as_str() {
-                "@map_scale" | "$scale" => Ok(Expr::Var(Var::MapScale)),
-                "@row_number" => Ok(Expr::Var(Var::RowNumber)),
-                "$id" => Ok(Expr::Var(Var::Id)),
-                name => match name.strip_prefix('$').and_then(Measure::from_key) {
-                    Some(m) => self.measure(&v, m, 1.0),
-                    None => Err(format!("unknown variable '{v}'")),
-                },
+            Some(Tok::Var(v)) => match VARS.iter().find(|s| s.names.iter().any(|n| n.eq_ignore_ascii_case(&v))).map(|s| s.var) {
+                Some(Var::Measure(m, size)) => self.measure(&v, m, size),
+                Some(var) => Ok(Expr::Var(var)),
+                None => Err(format!("unknown variable '{v}'")),
             },
             Some(Tok::Ident(s)) => {
                 if self.toks.get(self.pos) == Some(&Tok::LParen) {
@@ -791,15 +989,16 @@ impl Parser<'_> {
                 }
                 // A field named like a keyword is still read as the field before a comparison
                 // (`null = 'x'`), as the WHERE language always has.
-                let lower = s.to_ascii_lowercase();
-                let keyword = matches!(lower.as_str(), "true" | "false" | "null" | "case")
-                    && !(self.ds.field_index(&s).is_some() && self.comparison_at(self.pos));
-                match (keyword, lower.as_str()) {
-                    (true, "true") => Ok(Expr::Lit(Value::Bool(true))),
-                    (true, "false") => Ok(Expr::Lit(Value::Bool(false))),
-                    (true, "null") => Ok(Expr::Lit(Value::Null)),
-                    (true, _) => self.case(),
-                    _ => self.field(&s),
+                let keyword = [Kw::True, Kw::False, Kw::Null, Kw::Case]
+                    .into_iter()
+                    .find(|k| k.word().eq_ignore_ascii_case(&s))
+                    .filter(|_| !(self.ds.field_index(&s).is_some() && self.comparison_at(self.pos)));
+                match keyword {
+                    Some(Kw::True) => Ok(Expr::Lit(Value::Bool(true))),
+                    Some(Kw::False) => Ok(Expr::Lit(Value::Bool(false))),
+                    Some(Kw::Null) => Ok(Expr::Lit(Value::Null)),
+                    Some(_) => self.case(),
+                    None => self.field(&s),
                 }
             }
             other => Err(format!("expected a value, found {}", show(other.as_ref()))),
@@ -808,8 +1007,8 @@ impl Parser<'_> {
     /// A call of the function `name`, its arguments counted; a measure's call becomes the
     /// variable it reads, its unit (fixed text) checked here.
     fn call(&mut self, name: &str) -> Result<Expr, String> {
-        let &(fname, f, min, max) =
-            FUNCS.iter().find(|(n, ..)| n.eq_ignore_ascii_case(name)).ok_or_else(|| format!("unknown function '{name}'"))?;
+        let FuncSpec { name: fname, func: f, min, max, .. } =
+            functions().find(|s| s.name.eq_ignore_ascii_case(name)).ok_or_else(|| format!("unknown function '{name}'"))?;
         self.pos += 1; // '('
         let mut args = Vec::new();
         if !self.eat(&Tok::RParen) {
@@ -871,9 +1070,9 @@ impl Parser<'_> {
     }
     fn case(&mut self) -> Result<Expr, String> {
         self.deeper()?;
-        let subject = if self.peek_kw("WHEN") { None } else { Some(Box::new(self.or()?)) };
+        let subject = if self.peek_kw(Kw::When) { None } else { Some(Box::new(self.or()?)) };
         let mut arms = Vec::new();
-        while self.eat_kw("WHEN") {
+        while self.eat_kw(Kw::When) {
             if arms.len() >= MAX_TERMS {
                 return Err("the expression has too many terms".into());
             }
@@ -882,7 +1081,7 @@ impl Parser<'_> {
             if let Some(s) = &subject {
                 self.date_against_number(s, &when)?;
             }
-            if !self.eat_kw("THEN") {
+            if !self.eat_kw(Kw::Then) {
                 return Err(format!("expected THEN, found {}", show(self.toks.get(self.pos))));
             }
             arms.push((when, self.or()?));
@@ -890,8 +1089,8 @@ impl Parser<'_> {
         if arms.is_empty() {
             return Err(format!("expected WHEN, found {}", show(self.toks.get(self.pos))));
         }
-        let otherwise = if self.eat_kw("ELSE") { Some(Box::new(self.or()?)) } else { None };
-        if !self.eat_kw("END") {
+        let otherwise = if self.eat_kw(Kw::Else) { Some(Box::new(self.or()?)) } else { None };
+        if !self.eat_kw(Kw::End) {
             return Err(format!("expected END, found {}", show(self.toks.get(self.pos))));
         }
         self.depth -= 1;
