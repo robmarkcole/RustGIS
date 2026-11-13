@@ -3,7 +3,7 @@
 
 use geo::{Area, BooleanOps, BoundingRect, Contains, Intersects, Orient, orient::Direction};
 use rustgis_data::{Dataset, Geometry};
-use rustgis_geom::{Coord, MAX_LAT, WGS84_POLAR_RADIUS_M, lonlat_to_plane, plane_to_lonlat};
+use rustgis_geom::{Coord, Extent, MAX_LAT, WGS84_POLAR_RADIUS_M, lonlat_to_plane, plane_to_lonlat};
 
 use crate::convert::{from_multipolygon, to_multipolygon};
 
@@ -1058,10 +1058,12 @@ fn less(of: &[(f64, f64)], holes: &[(f64, f64)]) -> Vec<(f64, f64)> {
 /// as everywhere else (#1033). Features of `by` the test at a pole had to leave out (a coordinate
 /// missing or infinite, or a million turns around) when the rest don't surround it, or might not
 /// have with them, are counted in `skipped`, each once at either pole, for the check to say its
-/// result there may be wrong.
+/// result there may be wrong. Each point is tested only against the polygons whose boxes may hold
+/// it, through an index of them (#1252).
 pub fn not_covered(ds: &Dataset, rows: &[usize], by: &Dataset) -> Checked {
     let all: Vec<usize> = (0..by.features.len()).collect();
     let polys = polygons(by, &all);
+    let index = crate::tools::ExtentIndex::new(polys.iter().map(|(_, _, bb)| Extent::new(bb.min().x, bb.min().y, bb.max().x, bb.max().y)));
     // Whether the polygons together surround each pole, found at the first point there, with the
     // features left out.
     type Holds = Option<(bool, Vec<usize>)>;
@@ -1093,7 +1095,10 @@ pub fn not_covered(ds: &Dataset, rows: &[usize], by: &Dataset) -> Checked {
                 (_, true) => holds_south.get_or_insert_with(|| surrounds_pole(parts(), false)).0,
                 _ => false,
             };
-            let covered = surrounded || polys.iter().any(|(_, mp, bb)| rects_touch(bb, &geo::Rect::new(p.0, p.0)) && mp.contains(&p));
+            let covered = surrounded
+                || index.any_candidate(&Extent::new(m.x, m.y, m.x, m.y), |i| {
+                    polys.get(i).is_some_and(|(_, mp, bb)| rects_touch(bb, &geo::Rect::new(p.0, p.0)) && mp.contains(&p))
+                });
             if !covered {
                 out.push(TopologyError { rows: vec![*r], at: c });
             }
@@ -1620,5 +1625,32 @@ mod tests {
         let mut ds = Dataset::new("l", GeometryType::Polyline, vec![]);
         ds.push(Some(Geometry::Line(vec![hairpin])), vec![]);
         assert!(dangles(&ds, &[0], 1.0).errors.is_empty());
+    }
+
+    /// Past 16 polygons the points are looked up through an index of the polygons' boxes: a point
+    /// inside one, on an edge two share, on a corner, in a gap between them or beyond them all is
+    /// reported as the test against every polygon reports it (#1252).
+    #[test]
+    fn not_covered_finds_the_same_points_through_its_index() {
+        let c = Coord::new;
+        let mut by = Dataset::new("by", GeometryType::Polygon, vec![]);
+        // 10 × 10 squares of 0.1°, the last column 0.05° wide: a gap from 8.95° to 9°.
+        for i in 0..10 {
+            for j in 0..10 {
+                let (x, y) = (8.0 + f64::from(i) * 0.1, 47.0 + f64::from(j) * 0.1);
+                let w = if i == 9 { 0.05 } else { 0.1 };
+                by.push(Some(Geometry::Polygon(vec![vec![vec![c(x, y), c(x + w, y), c(x + w, y + 0.1), c(x, y + 0.1), c(x, y)]]])), vec![]);
+            }
+        }
+        let mut pts = Dataset::new("pts", GeometryType::Point, vec![]);
+        for p in [c(8.15, 47.25), c(8.2, 47.25), c(8.2, 47.3), c(8.97, 47.5), c(9.5, 47.5), c(8.0, 47.0), c(7.99, 47.5)] {
+            pts.push(Some(Geometry::Point(p)), vec![]);
+        }
+        let rows: Vec<usize> = (0..pts.features.len()).collect();
+        let reported: Vec<usize> = not_covered(&pts, &rows, &by).errors.iter().map(|e| e.rows[0]).collect();
+        // Inside one: covered. On an edge two share, a corner four share and the outer corner
+        // (on a boundary, which the guide says is still reported), in the gap, east of everything
+        // and west of everything: reported.
+        assert_eq!(reported, [1, 2, 3, 4, 5, 6]);
     }
 }
