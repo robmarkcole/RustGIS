@@ -610,12 +610,6 @@ fn header_blob(wkb: &[u8], e: &Extent, srs_id: i32) -> Vec<u8> {
     out
 }
 
-/// A name not taken by a field (`base`, else `base_1`, `base_2`, …).
-fn free_name(fields: &[Field], base: &str) -> String {
-    let taken = |n: &str| fields.iter().any(|f| f.name.eq_ignore_ascii_case(n));
-    (0..).map(|i| if i == 0 { base.to_string() } else { format!("{base}_{i}") }).find(|n| !taken(n)).unwrap_or_else(|| base.to_string())
-}
-
 /// Writes a dataset as a GeoPackage with one table (WGS 84, with an R-tree spatial index), or an
 /// attributes table for a dataset without geometry. The destination must be new: an existing
 /// GeoPackage may contain other tables. The file is built beside `path` and installed without
@@ -939,20 +933,8 @@ fn plan(name: &str, geometry_type: GeometryType, fields: &[Field], multi_points:
         table = format!("layer_{table}");
     }
     let has_geom = geometry_type != GeometryType::None;
-    let fid = free_name(fields, "fid");
-    let geom = free_name(fields, "geom");
-    // SQLite column names are unique without regard to case: a later `a` beside `A` becomes `a_1`.
-    let mut columns: Vec<String> = Vec::with_capacity(fields.len());
-    for f in fields {
-        let taken = |n: &str, cols: &[String]| {
-            cols.iter().any(|c| c.eq_ignore_ascii_case(n)) || n.eq_ignore_ascii_case(&fid) || n.eq_ignore_ascii_case(&geom)
-        };
-        let name = (0..)
-            .map(|i| if i == 0 { f.name.clone() } else { format!("{}_{i}", f.name) })
-            .find(|n| !taken(n, &columns))
-            .unwrap_or_else(|| f.name.clone());
-        columns.push(name);
-    }
+    let (fid, geom) = (crate::io::free_column_name(fields, "fid"), crate::io::free_column_name(fields, "geom"));
+    let columns = crate::io::geopackage_columns(fields);
     let mixed = mixed && has_geom;
     // A GEOMETRY column holds single points as they are.
     let multi_points = multi_points && !mixed;

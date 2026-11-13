@@ -38233,6 +38233,61 @@ fn geoparquet_export_says_which_values_it_wrote_as_null() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// Exporting to a GeoPackage says which field names it changed to be unique ignoring case, as
+/// SQLite's columns are, and as the file has them: from a layer read whole or in place, and from
+/// a table; names that differ otherwise give no such notice.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn geopackage_exports_say_which_field_names_they_changed() {
+    let dir = std::env::temp_dir().join(format!("rustgis-engine-gpkg-names-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("sites.geojson");
+    std::fs::write(
+        &src,
+        r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"name":"a","NAME":"b","id":3},"geometry":{"type":"Point","coordinates":[1,2]}}]}"#,
+    )
+    .unwrap();
+    isolate_plugins();
+    let mut s = Session::new(Project::default());
+    let changed = |s: &Session, mark| -> Vec<String> {
+        s.notices_since(mark).iter().filter(|n| n.text.contains("changed to fit a GeoPackage")).map(|n| n.text.clone()).collect()
+    };
+    let names = |s: &mut Session, out: &str| -> Vec<String> {
+        let back = s.run("layer.addData", &json!({"path": out})).unwrap()["layer"].as_u64().unwrap() as u32;
+        s.map().layer(back).unwrap().dataset.fields.iter().map(|f| f.name.clone()).collect()
+    };
+    for stream in [false, true] {
+        let id = s.run("layer.addData", &json!({"path": src, "stream": stream})).unwrap()["layer"].as_u64().unwrap();
+        let out = dir.join(format!("out-{stream}.gpkg")).display().to_string();
+        let mark = s.notice_mark();
+        s.run("share.exportLayer", &json!({"layer": id, "path": out})).unwrap();
+        let said = changed(&s, mark);
+        assert_eq!(said.len(), 1, "stream {stream}: {:?}", s.notices_since(mark));
+        // The notice names the field the file renamed, as the file has it.
+        let back = names(&mut s, &out);
+        let renamed = back.iter().find(|n| n.ends_with("_1")).unwrap();
+        let old = renamed.trim_end_matches("_1");
+        assert!(said[0].ends_with(&format!("unique ignoring case): '{old}' → '{renamed}'")), "stream {stream}: {said:?} {back:?}");
+    }
+    // A table, the same way; names that differ otherwise say nothing.
+    use rustgis_data::{Dataset, Field, FieldType, GeometryType};
+    let table = |name: &str, fields: &[&str]| {
+        let mut ds = Dataset::new(name, GeometryType::None, fields.iter().map(|f| Field::new(*f, FieldType::Integer)).collect());
+        ds.push(None, fields.iter().map(|_| rustgis_data::Value::Int(1)).collect());
+        ds
+    };
+    s.project.add_table(table("Cased", &["A", "a"]));
+    s.project.add_table(table("Fits", &["a", "b", "fid"]));
+    let out = dir.join("cased.gpkg").display().to_string();
+    let mark = s.notice_mark();
+    s.run("share.exportTable", &json!({"table": "Cased", "path": out})).unwrap();
+    assert_eq!(changed(&s, mark), [format!("{out}: 1 field name was changed to fit a GeoPackage (unique ignoring case): 'a' → 'a_1'")]);
+    let mark = s.notice_mark();
+    s.run("share.exportTable", &json!({"table": "Fits", "path": dir.join("fits.gpkg")})).unwrap();
+    assert!(changed(&s, mark).is_empty(), "{:?}", s.notices_since(mark));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// Exporting to a Shapefile says which field names it changed to fit dBase's 10 bytes, as the
 /// file has them, from a layer read whole or in place; names that fit, and other formats, give no
 /// such notice.

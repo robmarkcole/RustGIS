@@ -52,6 +52,9 @@ pub fn commands() -> Vec<C> {
             if matches!(ext.as_str(), "parquet" | "geoparquet") {
                 dbf_notes.extend(rustgis_data::source::parquet::values_note(&t.dataset, path));
             }
+            if ext == "gpkg" {
+                dbf_notes.extend(rustgis_data::io::geopackage_names_note(&t.dataset.fields, path));
+            }
             dbf_notes.extend(rustgis_data::io::dates_as_text_note(&t.dataset.fields, path));
             dbf_notes.extend(gpkg_dates_note(&t.dataset, &ext, path));
             // CSV holds a point a row, GPX a name for each feature and no areas.
@@ -725,6 +728,9 @@ fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, gpkg: Gpk
         dbf_notes.extend(rustgis_data::io::shapefile_names_note(&ds.fields, path));
         dbf_notes.extend(rustgis_data::io::shapefile_values_notes(ds, path));
         dbf_notes.extend(rustgis_data::io::shapefile_geometry_notes(ds, path, crs));
+    }
+    if ext == "gpkg" {
+        dbf_notes.extend(rustgis_data::io::geopackage_names_note(&ds.fields, path));
     }
     dbf_notes.extend(rustgis_data::io::dates_as_text_note(&ds.fields, path));
     // FlatGeobuf, KML, GPX and Shapefile hold features with geometry only (a Shapefile, only
