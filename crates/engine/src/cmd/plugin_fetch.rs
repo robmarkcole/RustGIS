@@ -229,19 +229,25 @@ impl Calls {
         Calls { plugin: plugin.to_string(), ..Calls::default() }
     }
 
-    /// Runs `host.fetch {url}` for a plugin that may.
+    /// Runs `host.fetch {url, json?}` for a plugin that may. `json: false` leaves `json` out of
+    /// the answer (a plugin that only passes `text` on doesn't parse it in its fuel); the cache
+    /// keeps the whole answer, so a later call without it still gets `json`.
     pub(super) fn fetch(&mut self, p: &Value) -> CmdResult {
         let url = checked(p.get("url").and_then(Value::as_str).ok_or("url is required")?)?;
+        let with_json = match p.get("json") {
+            None => true,
+            Some(Value::Bool(b)) => *b,
+            Some(_) => return Err("json must be true or false".into()),
+        };
         if self.count >= MAX_PER_CALL {
             return Err(format!("a plugin call may fetch at most {MAX_PER_CALL} documents"));
         }
         self.count += 1;
         let key = key(&self.plugin, &url);
         let kept = cache().get(&key);
-        if let Some(answer) = kept {
-            return answer;
-        }
-        if !waits() {
+        let answer = if let Some(answer) = kept {
+            answer
+        } else if !waits() {
             if !self.pending.contains(&key) {
                 if self.pending.len() >= MAX_PENDING {
                     return Err(format!("a plugin call may wait for at most {MAX_PENDING} documents at once"));
@@ -250,8 +256,15 @@ impl Calls {
                 start(&key, &url);
             }
             return Ok(json!({"pending": true, "url": url}));
-        }
-        self.blocking(&key, &url)
+        } else {
+            self.blocking(&key, &url)
+        };
+        answer.map(|mut a| {
+            if !with_json && let Some(o) = a.as_object_mut() {
+                o.remove("json");
+            }
+            a
+        })
     }
 
     #[cfg(not(target_arch = "wasm32"))]

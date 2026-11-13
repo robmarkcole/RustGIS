@@ -13109,7 +13109,7 @@ fn fetch_mode(local: bool, wait: bool) {
 }
 
 /// `host.fetch` needs `network`, takes only public http(s) addresses (redirects too), caps the
-/// size, wants UTF-8, answers JSON parsed, and keeps answers.
+/// size, wants UTF-8, answers JSON parsed unless asked not to (`json: false`), and keeps answers.
 #[test]
 fn plugins_fetch_documents_with_network() {
     let mut s = world();
@@ -13147,6 +13147,29 @@ fn plugins_fetch_documents_with_network() {
     // Asked again: the cache answers.
     let again = forward(&mut s, "eng-fetch", "host.fetch", json!({"url": format!("{base}/json?r=1#ignored")})).unwrap();
     assert_eq!(again, a);
+    assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), n, "answered from the cache");
+    // `json` must be a bool: anything else is refused before it is counted or fetched.
+    for junk in [json!("no"), json!(0), Value::Null, json!({"a": 1})] {
+        let e = forward(&mut s, "eng-fetch", "host.fetch", json!({"url": format!("{base}/json?r=2"), "json": junk})).unwrap_err();
+        assert!(e.contains("json must be true or false"), "{junk}: {e}");
+    }
+    assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), n, "nothing fetched");
+    // `json: false`: downloaded, answered without `json`...
+    let bare = forward(&mut s, "eng-fetch", "host.fetch", json!({"url": format!("{base}/json?r=2"), "json": false})).unwrap();
+    assert_eq!(bare["url"], format!("{base}/json?r=2"));
+    assert!(bare["text"].as_str().unwrap().starts_with('{'));
+    assert!(bare.get("json").is_none(), "{bare}");
+    let n = count.load(std::sync::atomic::Ordering::SeqCst);
+    // ...while the cache keeps it whole: the default call there answers `json`, and `json: true`
+    // is the default.
+    for asked in [json!({"url": format!("{base}/json?r=2")}), json!({"url": format!("{base}/json?r=2"), "json": true})] {
+        let full = forward(&mut s, "eng-fetch", "host.fetch", asked).unwrap();
+        assert_eq!(full["json"]["select"][0], 49059);
+        assert_eq!(full["text"], bare["text"]);
+    }
+    // A cached answer is given without `json` too.
+    let bare = forward(&mut s, "eng-fetch", "host.fetch", json!({"url": format!("{base}/json?r=1"), "json": false})).unwrap();
+    assert_eq!(bare, json!({"url": a["url"], "text": a["text"]}));
     assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), n, "answered from the cache");
     let t = forward(&mut s, "eng-fetch", "host.fetch", json!({"url": format!("{base}/text")})).unwrap();
     assert_eq!(t["text"], "plain text");
@@ -13239,6 +13262,20 @@ fn plugin_fetches_run_the_command_again_when_they_land() {
     let e = forward(&mut s, "eng-fetch-web", "host.fetch", json!({"url": format!("{base}/json?web=2")})).unwrap_err();
     assert!(e.contains("gave up"), "{e}");
     s.retry_tries = 0;
+    // `json: false` holds when the command runs again and the cache answers.
+    let r = forward(&mut s, "eng-fetch-web", "host.fetch", json!({"url": format!("{base}/json?web=3"), "json": false})).unwrap();
+    assert_eq!(r["pending"], true);
+    let t0 = std::time::Instant::now();
+    let ran = loop {
+        let ran = s.poll_plugin_retries();
+        if !ran.is_empty() || t0.elapsed() > std::time::Duration::from_secs(10) {
+            break ran;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let bare = ran[0].1.as_ref().unwrap();
+    assert!(bare["text"].as_str().unwrap().starts_with('{'), "{bare}");
+    assert!(bare.get("json").is_none(), "{bare}");
     fetch_mode(false, true);
     rustgis_plugins::unload("eng-fetch-web");
 }
