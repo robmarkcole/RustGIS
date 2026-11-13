@@ -94,10 +94,11 @@ fn layer<'a>(out: &'a [(Dataset, ReadReport)], name: &str) -> &'a Dataset {
 fn it_is_known_by_its_root_and_namespace() {
     assert!(looks_like_citygml(&lonlat("")));
     assert!(!looks_like_citygml(br#"<wfs:FeatureCollection xmlns:gml="http://www.opengis.net/gml"><gml:featureMember/>"#));
-    let three = br#"<core:CityModel xmlns:core="http://www.opengis.net/citygml/3.0"></core:CityModel>"#;
-    assert!(looks_like_citygml(three), "3.0 is known, to be refused by name");
-    let err = read("new.gml", three, None).unwrap_err().to_string();
-    assert!(err.contains("CityGML 3.0: RustGIS reads CityGML 1.0 and 2.0"), "{err}");
+    assert!(looks_like_citygml(&model3("EPSG:4326", "")), "3.0's too");
+    let err = read("next.gml", br#"<core:CityModel xmlns:core="http://www.opengis.net/citygml/4.0"></core:CityModel>"#, None)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("not a CityGML 1.0, 2.0 or 3.0 city model"), "{err}");
     let err = read("a.gml", br#"<Other xmlns="http://www.opengis.net/citygml/2.0"/>"#, None).unwrap_err().to_string();
     assert!(err.contains("its root isn't CityModel"), "{err}");
     let err = read("a.gml", &lonlat(""), None).unwrap_err().to_string();
@@ -1437,7 +1438,11 @@ fn generic_value_attributes_that_are_not_kept_are_said() {
     let out = read("model.gml", &lonlat(&building("b1", &inner)), None).unwrap();
     assert!(says(&out, "1 values have attributes other than their unit (uom) or code list (codeSpace)"), "{:?}", messages_of(&out));
     assert!(says(&out, "1 values name the code list they are taken from (codeSpace)"), "{:?}", messages_of(&out));
-    assert!(says(&out, "1 generic attributes in a set (genericAttributeSet) have no name"), "{:?}", messages_of(&out));
+    assert!(
+        says(&out, "1 generic attributes (genericAttribute, or a member of a genericAttributeSet) have no name"),
+        "{:?}",
+        messages_of(&out)
+    );
     let clean = format!(
         r#"<gen:stringAttribute name="label"><gen:value>Town hall</gen:value></gen:stringAttribute>
         <gen:measureAttribute name="depth"><gen:value uom="m">2</gen:value></gen:measureAttribute>{}"#,
@@ -2332,4 +2337,188 @@ fn a_curved_mesh_is_merged_in_a_moment() {
     assert_eq!(out[0].0.features.len(), 1);
     assert!(out[0].0.features[0].geometry.is_some());
     assert!(!says(&out, "outline"), "merged, not drawn as the outline of its points: {:?}", messages_of(&out));
+}
+
+/// A CityGML 3.0 city model in `srs`, its core the default namespace as 3.0's own samples write
+/// it, holding `members`.
+fn model3(srs: &str, members: &str) -> Vec<u8> {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<CityModel xmlns="http://www.opengis.net/citygml/3.0" xmlns:core="http://www.opengis.net/citygml/3.0"
+  xmlns:bldg="http://www.opengis.net/citygml/building/3.0" xmlns:con="http://www.opengis.net/citygml/construction/3.0"
+  xmlns:gen="http://www.opengis.net/citygml/generics/3.0" xmlns:frn="http://www.opengis.net/citygml/cityfurniture/3.0"
+  xmlns:grp="http://www.opengis.net/citygml/cityobjectgroup/3.0" xmlns:ver="http://www.opengis.net/citygml/versioning/3.0"
+  xmlns:gml="http://www.opengis.net/gml/3.2" xmlns:xlink="http://www.w3.org/1999/xlink">
+  <gml:boundedBy><gml:Envelope srsName="{srs}" srsDimension="3">
+    <gml:lowerCorner>0 0 0</gml:lowerCorner><gml:upperCorner>10 10 5</gml:upperCorner>
+  </gml:Envelope></gml:boundedBy>
+  {members}
+</CityModel>"#
+    )
+    .into_bytes()
+}
+
+/// 2.0 members written as 3.0 writes them: members and implicit geometries in core, which is the
+/// default namespace; thematic surfaces in `boundary` from the construction module; geometry
+/// properties in core; openings in `fillingSurface`; parts in `buildingPart`; a prototype in
+/// `relativeGeometry`.
+fn three(members: &str) -> String {
+    let mut s = members
+        .replace("core:cityObjectMember", "cityObjectMember")
+        .replace("bldg:boundedBy", "boundary")
+        .replace("bldg:consistsOfBuildingPart", "bldg:buildingPart")
+        .replace("bldg:opening", "con:fillingSurface")
+        .replace("bldg:Door", "con:DoorSurface")
+        .replace("core:relativeGMLGeometry", "relativeGeometry")
+        .replace("frn:lod2ImplicitRepresentation", "lod2ImplicitRepresentation");
+    for name in ["ImplicitGeometry", "referencePoint", "transformationMatrix"] {
+        s = s.replace(&format!("core:{name}"), name);
+    }
+    for kind in ["GroundSurface", "WallSurface", "RoofSurface"] {
+        s = s.replace(&format!("bldg:{kind}"), &format!("con:{kind}"));
+    }
+    for lod in 0..4 {
+        for g in ["MultiSurface", "Solid", "MultiCurve"] {
+            s = s.replace(&format!("bldg:lod{lod}{g}"), &format!("lod{lod}{g}"));
+        }
+    }
+    s
+}
+
+/// The same model written in 3.0 reads as in 2.0: the same layers, rows, footprints, heights and
+/// notices, for thematic surfaces, an opening, a part, a solid linking its surfaces' polygons, and implicit
+/// geometries placed in place and linked from another member.
+#[test]
+fn a_3_0_model_reads_as_the_same_model_in_2_0() {
+    let solid = r##"<bldg:lod2Solid><gml:Solid><gml:exterior><gml:CompositeSurface>
+        <gml:surfaceMember xlink:href="#b1-g"/><gml:surfaceMember xlink:href="#b1-w"/><gml:surfaceMember xlink:href="#b1-r"/>
+        </gml:CompositeSurface></gml:exterior></gml:Solid></bldg:lod2Solid>"##;
+    let part = format!(
+        r#"<bldg:consistsOfBuildingPart><bldg:BuildingPart gml:id="p1">{}</bldg:BuildingPart></bldg:consistsOfBuildingPart>"#,
+        box_surfaces("p1")
+    );
+    let door = format!(
+        r#"<bldg:boundedBy><bldg:WallSurface><bldg:opening><bldg:Door gml:id="d1"><bldg:lod3MultiSurface><gml:MultiSurface><gml:surfaceMember>{}</gml:surfaceMember></gml:MultiSurface></bldg:lod3MultiSurface></bldg:Door></bldg:opening></bldg:WallSurface></bldg:boundedBy>"#,
+        polygon("d1-f", "2 0 0 4 0 0 4 0 2 2 0 2 2 0 0")
+    );
+    let prototype = format!(
+        r#"<core:relativeGMLGeometry><gml:MultiSurface gml:id="proto" srsName="local"><gml:surfaceMember>{}</gml:surfaceMember></gml:MultiSurface></core:relativeGMLGeometry>"#,
+        polygon("proto-f", &square(0.0, 0.0, 1.0, 0.0))
+    );
+    let members = [
+        building("b1", &format!("{}{door}{solid}{part}", box_surfaces("b1"))),
+        furniture(
+            "t1",
+            &format!(
+                "<core:transformationMatrix>2 0 0 0 0 2 0 0 0 0 2 0 0 0 0 1</core:transformationMatrix>{prototype}{}",
+                reference(5.0, 5.0, 1.0)
+            ),
+        ),
+        furniture("t2", &format!(r##"<core:relativeGMLGeometry xlink:href="#proto"/>{}"##, reference(20.0, 20.0, 0.0))),
+    ]
+    .concat();
+    let two = read("model.gml", &lonlat(&members), None).unwrap();
+    let three = read("model.gml", &model3("EPSG:4326", &three(&members)), None).unwrap();
+    assert!(
+        two.len() > 1 && layer(&two, "model BuildingPart").features.len() == 1,
+        "{:?}",
+        two.iter().map(|(d, _)| &d.name).collect::<Vec<_>>()
+    );
+    assert!(!says(&two, "thematic surfaces or openings"), "the door is an opening: {:?}", messages_of(&two));
+    assert_eq!(format!("{three:?}"), format!("{two:?}"));
+}
+
+/// 3.0's own ways: a part, a group's member and its role given by links, generic attributes named
+/// by `gen:name` (a set's too), and its spaces as objects; what it holds that isn't read (relations
+/// between objects, versions, terrain intersection curves, generic attributes with no name, a
+/// set's code list) is said, and a clean 3.0 model says none of it.
+#[test]
+fn a_3_0_model_reads_its_own_ways_and_says_what_it_leaves_out() {
+    let building = format!(
+        r##"<cityObjectMember><bldg:Building gml:id="b1">
+        <genericAttribute><gen:IntAttribute><gen:name>rooms</gen:name><gen:value>12</gen:value></gen:IntAttribute></genericAttribute>
+        <genericAttribute><gen:StringAttribute><gen:name>code</gen:name><gen:value>007</gen:value></gen:StringAttribute></genericAttribute>
+        <genericAttribute><gen:GenericAttributeSet><gen:name>survey</gen:name>
+          <gen:genericAttribute><gen:DoubleAttribute><gen:name>area</gen:name><gen:value>10.5</gen:value></gen:DoubleAttribute></gen:genericAttribute>
+        </gen:GenericAttributeSet></genericAttribute>
+        <bldg:buildingPart xlink:href="#p1"/>
+        <bldg:buildingRoom><bldg:BuildingRoom gml:id="room1">{}</bldg:BuildingRoom></bldg:buildingRoom>
+        {}</bldg:Building></cityObjectMember>"##,
+        three(&surface("FloorSurface", &[polygon("room1-f", &square(1.0, 1.0, 2.0, 0.0))]))
+            .replace("bldg:FloorSurface", "con:FloorSurface"),
+        three(&box_surfaces("b1"))
+    );
+    let part = format!(
+        r#"<cityObjectMember><bldg:BuildingPart gml:id="p1">{}</bldg:BuildingPart></cityObjectMember>"#,
+        three(&box_surfaces("p1"))
+    );
+    let group = r##"<cityObjectMember><grp:CityObjectGroup gml:id="g1">
+        <grp:groupMember><grp:Role><grp:role>landmark</grp:role><grp:groupMember xlink:href="#b1"/></grp:Role></grp:groupMember>
+        <grp:groupMember><grp:Role><grp:role> </grp:role><grp:groupMember xlink:href="#p1"/></grp:Role></grp:groupMember>
+        </grp:CityObjectGroup></cityObjectMember>"##;
+    let clean = read("model.gml", &model3("EPSG:4326", &[building.as_str(), &part, group].concat()), None).unwrap();
+    let ds = layer(&clean, "model Building");
+    assert_eq!(value(ds, 0, "rooms"), Value::Int(12));
+    assert_eq!(value(ds, 0, "code"), Value::Text("007".into()));
+    assert_eq!(value(ds, 0, "survey"), Value::Text(r#"{"area":10.5}"#.into()));
+    assert_eq!(value(ds, 0, "buildingPart"), Value::Text("#p1".into()));
+    let part = layer(&clean, "model BuildingPart");
+    assert_eq!(value(part, 0, "parent"), Value::Text("b1, g1".into()), "the link makes it the building's part, and the group's member");
+    assert_eq!(value(layer(&clean, "model BuildingRoom"), 0, "parent"), Value::Text("b1".into()));
+    assert_eq!(value(layer(&clean, "model CityObjectGroup"), 0, "groupMember"), Value::Text(r##"["#b1","#p1"]"##.into()));
+    assert!(
+        says(&clean, "1 members of groups (groupMember) have a role in their group"),
+        "a blank role isn't one: {:?}",
+        messages_of(&clean)
+    );
+    for text in ["CityObjectRelation", "(versionMember, versionTransitionMember)", "have no name", "codeSpace"] {
+        assert!(!says(&clean, text), "{text}: {:?}", messages_of(&clean));
+    }
+    // A relation to another object, and the model's versions: left out, and said.
+    let terrain = "<lod2TerrainIntersectionCurve><gml:MultiCurve><gml:curveMember><gml:LineString><gml:posList>0 0 0 10 0 0</gml:posList></gml:LineString></gml:curveMember></gml:MultiCurve></lod2TerrainIntersectionCurve>";
+    let relation = r##"<cityObjectMember><bldg:Building gml:id="b2"><relatedTo><CityObjectRelation><relationType>adjacent</relationType><relatedTo xlink:href="#b1"/></CityObjectRelation></relatedTo>
+        <genericAttribute><gen:StringAttribute><gen:value>lost</gen:value></gen:StringAttribute></genericAttribute>
+        <genericAttribute><gen:GenericAttributeSet><gen:name>set</gen:name><gen:codeSpace>list</gen:codeSpace>
+          <gen:genericAttribute><gen:StringAttribute><gen:value>lost too</gen:value></gen:StringAttribute></gen:genericAttribute>
+        </gen:GenericAttributeSet></genericAttribute>"##;
+    let versions = r#"<versionMember><ver:Version gml:id="v1"/></versionMember><versionTransitionMember><ver:VersionTransition gml:id="vt1"/></versionTransitionMember>"#;
+    let members = format!("{building}{relation}{terrain}{}</bldg:Building></cityObjectMember>{versions}", three(&box_surfaces("b2")));
+    let out = read("model.gml", &model3("EPSG:4326", &members), None).unwrap();
+    assert!(says(&out, "1 relations between city objects (CityObjectRelation) aren't read"), "{:?}", messages_of(&out));
+    assert!(
+        says(&out, "the file's versions (versionMember, versionTransitionMember) aren't read: 2 are left out"),
+        "{:?}",
+        messages_of(&out)
+    );
+    assert!(says(&out, "1 terrain intersection curves (where objects meet the ground) aren't read"), "{:?}", messages_of(&out));
+    assert!(
+        says(&out, "2 generic attributes (genericAttribute, or a member of a genericAttributeSet) have no name"),
+        "{:?}",
+        messages_of(&out)
+    );
+    assert!(says(&out, "1 sets of generic attributes (genericAttributeSet) name a code list (codeSpace)"), "{:?}", messages_of(&out));
+    assert_eq!(layer(&out, "model Building").features.len(), 2);
+    assert!(out.iter().all(|(ds, _)| ds.geometry_type == GeometryType::Polygon), "the curve isn't drawn as a line");
+}
+
+/// The names 3.0 adds are read only in its namespaces: an extension (ADE) of a 2.0 model may name a
+/// property of its own `boundary` or `buildingPart`, and it keeps the meaning it had in 2.0. Its
+/// feature in `boundary` is an object of its own, not the building's thematic surface, and its
+/// `buildingPart` is a link kept as an attribute, which makes no part.
+#[test]
+fn an_extension_of_2_0_keeps_its_own_properties_named_as_3_0s() {
+    let ade = r#"xmlns:ade="http://example.com/ade""#;
+    let inner = format!(
+        r##"{}<ade:boundary {ade}><ade:Sensor gml:id="s1"><ade:lod2MultiSurface><gml:MultiSurface><gml:surfaceMember>{}</gml:surfaceMember></gml:MultiSurface></ade:lod2MultiSurface></ade:Sensor></ade:boundary>
+        <ade:buildingPart {ade} xlink:href="#p1"/>"##,
+        box_surfaces("b1"),
+        polygon("s1-g", &square(20.0, 20.0, 2.0, 0.0))
+    );
+    let members = format!("{}{}", building("b1", &inner), building("p1", &box_surfaces("p1")));
+    let out = read("model.gml", &lonlat(&members), None).unwrap();
+    let sensors = layer(&out, "model Sensor");
+    assert_eq!(value(sensors, row_of(sensors, "s1"), "parent"), Value::Text("b1".into()), "{:?}", messages_of(&out));
+    let buildings = layer(&out, "model Building");
+    assert_eq!(value(buildings, row_of(buildings, "p1"), "parent"), Value::Null, "no part made");
+    assert_eq!(value(buildings, row_of(buildings, "b1"), "buildingPart"), Value::Text("#p1".into()));
 }
