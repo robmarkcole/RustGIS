@@ -79,6 +79,7 @@ rustix = { version = "1.1", features = ["process", "fs"] }
 parquet = { workspace = true, features = ["arrow"] }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
+proptest = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # Writing Zstandard-compressed GeoTIFFs.
