@@ -190,6 +190,7 @@ fn permission_review_render_owners_require_tile_network_access() {
     for (id, params) in [
         ("time.export", json!({"path":"review-frames.zip"})),
         ("animation.export", json!({"path":"review-camera.zip"})),
+        ("map.exportOrbit", json!({"path":"review-orbit.zip","frames":2})),
         ("project.thumbnail", json!({"create":true})),
         ("map.thumbnail", json!({"create":true})),
     ] {
@@ -206,12 +207,58 @@ fn permission_review_render_owners_require_tile_network_access() {
     assert!(admitted.is_empty(), "rendering web tiles needs network authority: {admitted:?}");
 }
 
+/// A terrain's elevation tiles are fetched as a tile layer's are: a map whose only web source
+/// they are still needs network authority to be drawn, shows where they come from, and a
+/// remembered consent doesn't cover another address.
+#[test]
+fn permission_review_render_owners_count_terrain_elevation_tiles() {
+    let calls = [
+        ("time.export", json!({"path":"review-frames.zip"})),
+        ("animation.export", json!({"path":"review-camera.zip"})),
+        ("map.exportOrbit", json!({"path":"review-orbit.zip","frames":2})),
+        ("share.exportMap", json!({"path":"review-map.png"})),
+        ("map.thumbnail", json!({"create":true})),
+    ];
+    let mut s = rendering_session();
+    let offline = without_effect(Effect::Network);
+    let refused = |s: &Session| -> Vec<&str> {
+        calls
+            .iter()
+            .filter(|(id, p)| matches!(s.review(&offline, &Call::command(id, p.clone())), Outcome::Refused(_)))
+            .map(|c| c.0)
+            .collect()
+    };
+    assert!(refused(&s).is_empty(), "nothing to fetch yet: {:?}", refused(&s));
+    let terrain = |s: &mut Session, token: &str| {
+        let url = format!("https://terrain-review.invalid/{{z}}/{{x}}/{{y}}.png?token=RGSYNTH_review_{token}");
+        s.map_mut().view.terrain = Some(rustgis_map::view::Terrain {
+            source: rustgis_map::view::TerrainSource::Tiles { url, encoding: rustgis_map::view::TerrainEncoding::Terrarium },
+            exaggeration: 1.0,
+        });
+    };
+    terrain(&mut s, "one");
+    assert_eq!(refused(&s).len(), calls.len(), "elevation tiles need network authority: {:?}", refused(&s));
+    let scope = Scope::assistant(1943, Arc::new(Live));
+    for (id, params) in &calls {
+        terrain(&mut s, "one");
+        let call = Call::command(id, params.clone());
+        let Outcome::NeedsApproval(approved) = s.review(&scope, &call) else { panic!("{id} needs approval") };
+        let shown = format!("{:?}", approved.review());
+        assert!(shown.contains("terrain-review.invalid") && !shown.contains("RGSYNTH_review_"), "{id}: {shown}");
+        let remembered = approved.remember().unwrap();
+        terrain(&mut s, "two");
+        let Outcome::NeedsApproval(changed) = s.review(&scope, &call) else { panic!("{id} still needs approval") };
+        assert!(!changed.covered_by(&remembered), "{id}: a consent covered another terrain address");
+    }
+}
+
 #[test]
 fn permission_review_render_owners_bind_raw_tile_routes() {
     let mut unchanged = Vec::new();
     for (id, params) in [
         ("time.export", json!({"path":"review-frames.zip"})),
         ("animation.export", json!({"path":"review-camera.zip"})),
+        ("map.exportOrbit", json!({"path":"review-orbit.zip","frames":2})),
         ("project.thumbnail", json!({"create":true})),
         ("map.thumbnail", json!({"create":true})),
     ] {
