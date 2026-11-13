@@ -429,7 +429,7 @@ fn read_layout(r: Sparse) -> Result<Parse> {
             None
         }
     };
-    let mut levels = Vec::new();
+    let mut levels: Vec<Level> = Vec::new();
     let mut index = 0usize;
     let mut allowance = MAX_TOTAL_TILES;
     // Overviews left out for a sample count other than the full image's (its tag's, which a
@@ -437,7 +437,13 @@ fn read_layout(r: Sparse) -> Result<Parse> {
     let full_samples = dec.find_tag_unsigned::<u16>(Tag::SamplesPerPixel).ok().flatten().unwrap_or(1);
     let mut mismatched: Vec<String> = Vec::new();
     let mut mismatched_count = 0usize;
-    // Images passed over (not overviews, or with another sample count).
+    // Images no smaller than the full image in both width and height (not overviews), and how many.
+    let mut other: Vec<String> = Vec::new();
+    let mut other_count = 0usize;
+    // Overviews as wide as one already kept (each size is one level), and how many.
+    let mut same: Vec<String> = Vec::new();
+    let mut same_count = 0usize;
+    // Images passed over (not overviews, with another sample count, or at a size already kept).
     let mut skipped = 0usize;
     // Transparency masks passed over.
     let mut masks = 0usize;
@@ -461,19 +467,41 @@ fn read_layout(r: Sparse) -> Result<Parse> {
             };
             let th = dec.find_tag_unsigned::<u32>(Tag::TileLength).ok().flatten().unwrap_or(tw);
             let (w, h) = dec.dimensions().map_err(err)?;
-            // An image no smaller than the level before isn't an overview of it. A level decodes
-            // as the full image does, with as many samples: an overview with another count (three
-            // of an RGBI image's four) is left out, and said. Either is skipped before its tile
-            // size is checked or its tiles count against the budget.
+            // An overview is smaller than the full image in both width and height, whatever the file's
+            // order: TIFF doesn't require the cloud-optimised largest-first order, and some
+            // writers store the smallest first (#1908). A level decodes as the full image does,
+            // with as many samples: an overview with another count (three of an RGBI image's four)
+            // is left out, and said. Each size is one level, so an image as wide as one kept is
+            // passed over too. All are said, and skipped before a tile size is checked or their
+            // tiles count against the budget.
             let samples = dec.find_tag_unsigned::<u16>(Tag::SamplesPerPixel).ok().flatten().unwrap_or(1);
-            let overview = levels.last().is_none_or(|l: &Level| w < l.width);
-            if !overview || samples != full_samples {
-                if overview {
+            let passed = match levels.first().map(|l| (l.width, l.height)) {
+                // The full image itself.
+                None => false,
+                Some((full_width, full_height)) if w >= full_width || h >= full_height => {
+                    other_count += 1;
+                    if other.len() < 5 {
+                        other.push(format!("image {index} ({w} × {h})"));
+                    }
+                    true
+                }
+                Some(_) if samples != full_samples => {
                     mismatched_count += 1;
                     if mismatched.len() < 5 {
                         mismatched.push(format!("image {index} ({samples})"));
                     }
+                    true
                 }
+                Some(_) if levels.iter().skip(1).any(|l| l.width == w) => {
+                    same_count += 1;
+                    if same.len() < 5 {
+                        same.push(format!("image {index} ({w} × {h})"));
+                    }
+                    true
+                }
+                Some(_) => false,
+            };
+            if passed {
                 skipped += 1;
                 if !dec.more_images() {
                     break;
@@ -509,11 +537,30 @@ fn read_layout(r: Sparse) -> Result<Parse> {
         dec.next_image().map_err(err)?;
         index += 1;
     }
+    // The full image first, then the overviews finest to coarsest, whatever order the file stores
+    // them in: the window and the tile layer read them so.
+    if levels.len() > 1 {
+        levels[1..].sort_by(|a, b| b.width.cmp(&a.width).then(b.height.cmp(&a.height)));
+    }
+    if other_count > 0 {
+        let more = if other_count > other.len() { ", …" } else { "" };
+        lost.push(format!(
+            "{other_count} image(s) not smaller than the full image in both width and height are left out: {}{more}",
+            other.join(", ")
+        ));
+    }
     if mismatched_count > 0 {
         let more = if mismatched_count > mismatched.len() { ", …" } else { "" };
         lost.push(format!(
             "{mismatched_count} overview(s) with samples per pixel other than the full image's {full_samples} are left out: {}{more}",
             mismatched.join(", ")
+        ));
+    }
+    if same_count > 0 {
+        let more = if same_count > same.len() { ", …" } else { "" };
+        lost.push(format!(
+            "{same_count} overview(s) as wide as one already kept are left out, so each size is one level: {}{more}",
+            same.join(", ")
         ));
     }
     if masks > 0 {
@@ -1003,6 +1050,56 @@ pub(crate) mod tests {
         // A wrong tile index, junk tile bytes: errors, never a panic.
         assert!(decode_tile(&s, &l, 0, 99, Vec::new()).is_err());
         let _ = decode_tile(&s, &l, 0, 0, vec![1, 2, 3]);
+    }
+
+    /// The same file with its overviews' IFDs chained smallest first, as some writers store them,
+    /// leaving the full image first (#1908). Only the chain changes, not the data.
+    fn overviews_smallest_first(mut file: Vec<u8>) -> Vec<u8> {
+        let long = |b: &[u8], at: usize| u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
+        let next_at = |b: &[u8], at: usize| {
+            let n = u16::from_le_bytes([b[at], b[at + 1]]) as usize;
+            at + 2 + 12 * n
+        };
+        let mut at = long(&file, 4) as usize;
+        let mut chain = Vec::new();
+        while at != 0 {
+            chain.push(at);
+            at = long(&file, next_at(&file, at)) as usize;
+        }
+        chain[1..].reverse();
+        for pair in chain.windows(2) {
+            let (to, next) = (next_at(&file, pair[0]), pair[1] as u32);
+            file[to..to + 4].copy_from_slice(&next.to_le_bytes());
+        }
+        let last = chain.last().copied().unwrap_or(0);
+        if last != 0 {
+            let to = next_at(&file, last);
+            file[to..to + 4].copy_from_slice(&0u32.to_le_bytes());
+        }
+        file
+    }
+
+    #[test]
+    fn overviews_stored_smallest_first_are_read_finest_first() {
+        let largest = example(1024, 256);
+        let smallest = overviews_smallest_first(largest.clone());
+        let (_, a) = layout_of(&largest);
+        let (_, b) = layout_of(&smallest);
+        // The same levels either way: the full image, then the overviews finest to coarsest.
+        let widths = |l: &Layout| l.levels.iter().map(|l| l.width).collect::<Vec<_>>();
+        assert_eq!(widths(&a), vec![1024, 512, 256]);
+        assert_eq!(widths(&b), vec![1024, 512, 256]);
+        assert!(b.lost.is_empty(), "{:?}", b.lost);
+        for i in 0..a.levels.len() {
+            assert_eq!(a.transform_of(&a.levels[i]), b.transform_of(&b.levels[i]));
+        }
+        // The coarsest overview decodes the same, from its own IFD.
+        let read = |l: &Layout, file: &[u8]| {
+            let lv = &l.levels[2];
+            let (at, n) = (lv.offsets[0] as usize, lv.counts[0] as usize);
+            decode_tile(&Sparse::default().with(0, file.to_vec()), l, 2, 0, file[at..at + n].to_vec()).unwrap()
+        };
+        assert_eq!(read(&a, &largest), read(&b, &smallest));
     }
 
     /// Reads a file's layout from its bytes, as the tile cache would.

@@ -2872,13 +2872,41 @@ mod tests {
                 }
             }
         }
-        // An image no smaller than the level before isn't an overview: skipped, whatever its
-        // samples, rather than failing the file.
+        // An image smaller than the full one is an overview candidate wherever it sits, so one
+        // whose samples differ is left out and said, rather than silently passed over.
         let bytes = rgb_tiled_samples(&[(40, 16, 4), (20, 16, 4), (20, 16, 3)], 8, 1, |b, x, y| (b * 10 + x + y) as u16);
         let whole = Sparse::default().with_len(bytes.len() as u64).with(0, bytes);
         let Parse::Done(layout) = cog::layout(&whole).unwrap() else { panic!("not a COG") };
         assert_eq!((layout.levels.len(), layout.bands), (2, 4));
-        assert!(layout.lost.iter().all(|n| !n.contains("overview(s)")), "{:?}", layout.lost);
+        assert!(
+            layout
+                .lost
+                .iter()
+                .any(|n| n.contains("1 overview(s) with samples per pixel other than the full image's 4") && n.contains("image 2 (3)")),
+            "{:?}",
+            layout.lost
+        );
+        // An image no smaller than the full one in both directions isn't an overview: passed over,
+        // and said, whatever its samples.
+        let bytes = rgb_tiled_samples(&[(40, 16, 4), (40, 16, 4), (20, 16, 4)], 8, 1, |b, x, y| (b * 10 + x + y) as u16);
+        let whole = Sparse::default().with_len(bytes.len() as u64).with(0, bytes);
+        let Parse::Done(layout) = cog::layout(&whole).unwrap() else { panic!("not a COG") };
+        assert_eq!(layout.levels.iter().map(|l| l.width).collect::<Vec<_>>(), [40, 20]);
+        assert!(
+            layout.lost.iter().any(|n| n.contains("1 image(s) not smaller than the full image") && n.contains("image 1 (40 × 40)")),
+            "{:?}",
+            layout.lost
+        );
+        // Each size is one level: an overview as wide as one kept is passed over, and said.
+        let bytes = rgb_tiled_samples(&[(40, 16, 4), (20, 16, 4), (20, 16, 4)], 8, 1, |b, x, y| (b * 10 + x + y) as u16);
+        let whole = Sparse::default().with_len(bytes.len() as u64).with(0, bytes);
+        let Parse::Done(layout) = cog::layout(&whole).unwrap() else { panic!("not a COG") };
+        assert_eq!(layout.levels.iter().map(|l| l.width).collect::<Vec<_>>(), [40, 20]);
+        assert!(
+            layout.lost.iter().any(|n| n.contains("1 overview(s) as wide as one already kept") && n.contains("image 2 (20 × 20)")),
+            "{:?}",
+            layout.lost
+        );
         // A left-out overview's tiles, too large to be a level's, don't fail the file: the next
         // overview with the full image's samples is still a level.
         let bytes = rgb_tiled_samples(&[(40, 16, 4), (20, 1200, 3), (10, 16, 4)], 8, 1, |b, x, y| (b * 10 + x + y) as u16);
