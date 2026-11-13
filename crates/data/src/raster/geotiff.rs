@@ -349,7 +349,8 @@ enum KeyValue {
 
 /// Only the declared entries are keys: the directory's tail may hold SHORT parameter values.
 fn key_entries(keys: &[u16]) -> Option<&[[u16; 4]]> {
-    let count = usize::from(*keys.get(3)?);
+    let available = keys.len().saturating_sub(4) / 4;
+    let count = usize::from(*keys.get(3)?).min(available);
     Some(keys.get(4..4 + count * 4)?.as_chunks::<4>().0)
 }
 

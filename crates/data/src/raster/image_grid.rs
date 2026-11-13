@@ -231,6 +231,28 @@ mod tests {
     }
 
     #[test]
+    fn image_grid_stays_strict_while_ordinary_reads_keep_complete_geokeys() {
+        for count in [4, u16::MAX] {
+            for partial_tail in [false, true] {
+                let mut keys = KEYS.to_vec();
+                keys[3] = count;
+                if partial_tail {
+                    keys.extend([2048, 0]); // An incomplete entry must not hide the complete projected CRS.
+                }
+                // Exercise both an unknown-CRS error and a silent lon/lat fallback without the fix.
+                for (x, y) in [(500_000., 1000.), (10., 50.)] {
+                    let bytes = tiff(None, Some(&[1., 1., 0.]), Some(&[0., 0., 0., x, y, 0.]), Some(&keys), false);
+                    let raster = geotiff::read(Cursor::new(&bytes), "truncated keys").unwrap();
+                    assert_eq!(raster.crs, Crs::from_epsg(32633).unwrap());
+                    assert!(raster.georeferenced && raster.lost.is_empty());
+                    let error = geotiff::read_image_grid(Cursor::new(bytes)).unwrap_err();
+                    assert!(error.to_string().contains("incomplete GeoKey directory"));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn image_grid_refuses_missing_unknown_or_malformed_georeferencing() {
         let read = |bytes| geotiff::read_image_grid(Cursor::new(bytes));
         assert!(read(tiff(None, None, None, None, false)).unwrap_err().to_string().contains("embedded"));
