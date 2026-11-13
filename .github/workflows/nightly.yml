@@ -110,6 +110,16 @@ jobs:
         env:
           RUSTGIS_WORKFLOW_DATA: ${{ github.workspace }}/workflow-data
         run: cargo test --locked -p rustgis-engine --test workflows -- --ignored
+      # The property tests (docs/contributing.md › Property tests), on a new seed each night this
+      # job runs (one with new commits) and more cases than a pull request runs; a failure gives
+      # the seed to run again.
+      - name: Run the property tests on a new seed
+        if: ${{ !cancelled() }}
+        env:
+          PROPERTY_SEED: ${{ github.run_id }}
+          PROPERTY_CASES: "2000"
+        run: |
+          cargo test --locked -p rustgis-engine --test never_silent_roundtrip
 
   report:
     name: Report

@@ -78,6 +78,8 @@ roxmltree = "0.21"
 # the tree through calamine).
 quick-xml = "0.42"
 url = "2.5.8"
+# Property tests (dev-dependency): only what generating values and shrinking need.
+proptest = { version = "1", default-features = false, features = ["std"] }
 epaint_default_fonts = "0.37"
 # Vector data providers: GeoParquet (pure Rust, so the browser reads it too), FlatGeobuf and
 # GeoPackage (SQLite, desktop only).

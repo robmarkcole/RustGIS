@@ -289,6 +289,24 @@ it locally, download the files listed there into one folder, check them with `sh
 the checksums beside them, and run
 `RUSTGIS_WORKFLOW_DATA=<folder> cargo test -p rustgis-engine --test workflows -- --ignored`.
 
+### Property tests
+
+A property test checks a rule over generated inputs instead of a few written ones: an export
+comes back the same or says what changed (`crates/engine/tests/never_silent_roundtrip.rs`). They
+use [proptest](https://docs.rs/proptest) (a dev-dependency) and follow one pattern, so CI runs
+them all the same way:
+
+- An integration test (`crates/<crate>/tests/`) seeds its runner from `PROPERTY_SEED` (1 if
+  unset) and runs `PROPERTY_CASES` cases, with a default that takes a few seconds, and no
+  failure file. A failure panics with `PROPERTY_SEED=<seed>` and the smallest input found.
+- Pull requests run the fixed seed with `cargo test`. The nightly runs each property test on a
+  new seed with more cases; add a new one to its step in `nightly.yml`.
+- What the rule allows (a format's limits, a tolerance) is a list in the test, each entry with
+  its reason.
+
+To run a failing seed again, or deeper:
+`PROPERTY_SEED=7 PROPERTY_CASES=2000 cargo test -p rustgis-engine --test never_silent_roundtrip`.
+
 ## Documentation
 
 The site is built with [Zensical](https://zensical.org):
