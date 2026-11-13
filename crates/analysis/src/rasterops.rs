@@ -40,6 +40,18 @@ pub fn derive(r: &Raster, name: &str, bands: Vec<Vec<f32>>) -> Result<Raster, St
         .map_err(|e| e.to_string())
 }
 
+/// [`derive`] for a [`hillshade`]'s pixels: one band of whole numbers 1–255 stored as bytes
+/// (`UInt8`), with 0 as no-data, so it is written as 8-bit samples, not 32-bit floats.
+pub fn derive_hillshade(r: &Raster, name: &str, mut shade: Vec<f32>) -> Result<Raster, String> {
+    r.require_coordinates()?;
+    for v in &mut shade {
+        if !v.is_finite() || *v < 1.0 {
+            *v = 0.0;
+        }
+    }
+    Raster::new(name, r.width, r.height, vec![shade], r.transform, r.crs, Some(0.0), ColorHint::Gray, "UInt8").map_err(|e| e.to_string())
+}
+
 fn band(r: &Raster, b: usize) -> Result<&[f32], String> {
     r.bands.get(b).map(|b| b.data.as_slice()).ok_or_else(|| format!("{} has no band {}", r.name, b + 1))
 }
@@ -196,7 +208,8 @@ pub fn aspect(r: &Raster, b: usize) -> Result<Vec<f32>, String> {
     terrain(r, d, 1.0, |gx, gy| if gx.abs() < 1e-12 && gy.abs() < 1e-12 { -1.0 } else { (-gx).atan2(-gy).to_degrees().rem_euclid(360.0) })
 }
 
-/// Hillshade (0–255) lit from `azimuth` and `altitude` degrees.
+/// Hillshade (1–255) lit from `azimuth` and `altitude` degrees: a cell in full shadow is 1, so
+/// that 0 is left for the no-data of the bytes [`derive_hillshade`] makes of it.
 pub fn hillshade(r: &Raster, b: usize, azimuth: f64, altitude: f64, zf: f64) -> Result<Vec<f32>, String> {
     let d = band(r, b)?;
     let (zen, az) = ((90.0 - altitude).to_radians(), azimuth.to_radians());
@@ -205,7 +218,7 @@ pub fn hillshade(r: &Raster, b: usize, azimuth: f64, altitude: f64, zf: f64) -> 
         let slope = gx.hypot(gy).atan();
         let aspect = (-gx).atan2(-gy);
         let v = cos_zen * slope.cos() + sin_zen * slope.sin() * (az - aspect).cos();
-        (v.max(0.0) * 255.0).round()
+        (v.max(0.0) * 255.0).round().max(1.0)
     })
 }
 
@@ -2400,6 +2413,24 @@ mod tests {
             hillshade(&r, 0, 315.0, 45.0, 1.5).unwrap_or_default(),
             [182.0, 184.0, 185.0, 183.0, 186.0, NODATA, 178.0, 175.0, 183.0, 178.0, 175.0, 174.0]
         );
+    }
+
+    /// A cell in full shadow is 1, not 0, so that the bytes made of a hillshade keep 0 for its
+    /// no-data cells.
+    #[test]
+    fn hillshade_keeps_zero_for_no_data() {
+        let gt = GeoTransform { origin_x: 0.0, origin_y: 1.0, pixel_width: 0.001, pixel_height: -0.001 };
+        let mut cells = vec![10.0; 25];
+        cells[12] = -9999.0;
+        let r = Raster::new("plane", 5, 5, vec![cells], gt, Crs::LonLat, Some(-9999.0), ColorHint::Gray, "Float32")
+            .unwrap_or_else(|e| panic!("{e}"));
+        // The sun on the horizon lights no flat ground.
+        let shade = hillshade(&r, 0, 315.0, 0.0, 1.0).unwrap_or_default();
+        assert_eq!((shade[0], shade[12]), (1.0, NODATA));
+        let out = derive_hillshade(&r, "shade", shade).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!((out.data_type.as_str(), out.nodata), ("UInt8", Some(0.0)));
+        assert_eq!((out.value(0, 0, 0), out.value(0, 2, 2), out.bands[0].data[12]), (Some(1.0), None, 0.0));
+        assert_eq!(out.bands[0].stats.count, 24);
     }
 
     #[test]

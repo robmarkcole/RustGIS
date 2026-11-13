@@ -1019,6 +1019,7 @@ fn function_work(s: &Session, p: &Value) -> Result<Work, String> {
     let src = raster_of(s, ps(p, "layer").ok_or("layer is required")?)?;
     let target = resample_target(s, p)?;
     let name = out_name(p, format!("{}_{}", src.name, ps(p, "function").unwrap_or("")));
+    let defaults = s.raster_defaults.clone();
     let mut p = p.clone();
     // Read here, on the command's thread, where an unreadable value is said (#1600); only a remap
     // or threshold reads it.
@@ -1027,9 +1028,30 @@ fn function_work(s: &Session, p: &Value) -> Result<Work, String> {
     }
     Ok(Box::new(move || {
         let pixels = apply_function(&src, &p, target.as_deref())?;
+        if is_hillshade(&p) {
+            return made_hillshade(rasterops::derive_hillshade(&src, &name, pixels)?, &defaults);
+        }
         // Only a resample takes another raster's grid.
         made(rasterops::derive(target.as_deref().unwrap_or(&src), &name, vec![pixels])?, None)
     }))
+}
+
+/// Whether raster function step `p` is a hillshade, whose pixels are bytes
+/// ([`rasterops::derive_hillshade`]).
+fn is_hillshade(p: &Value) -> bool {
+    ps(p, "function") == Some("hillshade")
+}
+
+/// [`made`] for a hillshade, drawn as a stretch on the session's raster `defaults` however few
+/// shades it holds: as whole numbers, 16 or fewer (a gentle slope) would otherwise be drawn as
+/// classes (Unique Values).
+fn made_hillshade(raster: Raster, defaults: &rustgis_map::RasterDefaults) -> Result<Made, String> {
+    let mut m = made(raster, None)?;
+    let style = &mut m.layer.style;
+    style.renderer = rustgis_map::RasterRenderer::Stretch { band: 0, ramp: defaults.ramp.clone(), invert: defaults.invert };
+    style.stretch = defaults.stretch;
+    style.resampling = defaults.resampling;
+    Ok(m)
 }
 
 /// Runs raster functions one after another, each on the previous one's output.
@@ -1056,6 +1078,7 @@ fn function_chain_work(s: &Session, p: &Value) -> Result<Work, String> {
         .map(|(i, st)| resample_target(s, st).map_err(|e| format!("step {} ({}): {e}", i + 1, func(st))))
         .collect::<Result<_, _>>()?;
     let named = Some(out_name(p, String::new())).filter(|n| !n.is_empty());
+    let defaults = s.raster_defaults.clone();
     Ok(Box::new(move || {
         let mut cur: Raster = (*src).clone();
         let mut names = Vec::new();
@@ -1063,11 +1086,19 @@ fn function_chain_work(s: &Session, p: &Value) -> Result<Work, String> {
             let f = func(st);
             let pixels = apply_function(&cur, st, target.as_deref()).map_err(|e| format!("step {} ({f}): {e}", i + 1))?;
             // Only a resample takes another raster's grid; otherwise the grid is the current one.
-            cur = rasterops::derive(target.as_deref().unwrap_or(&cur), &cur.name, vec![pixels])?;
+            cur = if is_hillshade(st) {
+                rasterops::derive_hillshade(&cur, &cur.name, pixels)?
+            } else {
+                rasterops::derive(target.as_deref().unwrap_or(&cur), &cur.name, vec![pixels])?
+            };
             names.push(f);
         }
         cur.name = named.unwrap_or_else(|| format!("{}_{}", cur.name, names.join("_")));
-        made(cur, None)
+        // A chain that ends in a hillshade is drawn as one.
+        match steps.last() {
+            Some(last) if is_hillshade(last) => made_hillshade(cur, &defaults),
+            _ => made(cur, None),
+        }
     }))
 }
 

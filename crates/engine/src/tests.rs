@@ -11450,6 +11450,58 @@ fn a_scan_warped_onto_its_points_is_placed_for_real() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A hillshade is made as bytes, 1–255 with 0 for no data, so it is exported as 8-bit samples (a
+/// GeoTIFF and a COG); it is still drawn as a grey stretch, even of a plane with a single shade,
+/// which as whole numbers would otherwise be drawn as classes. A chain ending in one is the same.
+#[test]
+fn hillshade_is_made_and_written_as_bytes() {
+    use base64::Engine;
+    use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster, geotiff};
+    let mut s = world();
+    s.run("layer.addDataBytes", &json!({"fileName": "dem.tif", "data": dem_b64()})).unwrap();
+    let gt = GeoTransform { origin_x: 10.0, origin_y: 45.04, pixel_width: 0.001, pixel_height: -0.001 };
+    let plane = Raster::new("plane", 10, 10, vec![vec![50.0; 100]], gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
+    let plane = base64::engine::general_purpose::STANDARD.encode(geotiff::write(&plane, 0).unwrap());
+    s.run("layer.addDataBytes", &json!({"fileName": "plane.tif", "data": plane})).unwrap();
+    let shade = |s: &mut Session, cmd: &str, p: Value| {
+        let r = s.run(cmd, &p).unwrap_or_else(|e| panic!("{cmd} {p}: {e}"));
+        let l = s.map().layer(r["layer"].as_u64().unwrap() as u32).unwrap().raster.clone().unwrap();
+        let d = l.data.clone().unwrap();
+        assert_eq!((d.data_type.as_str(), d.nodata), ("UInt8", Some(0.0)), "{cmd} {p}");
+        assert!(matches!(l.style.renderer, rustgis_map::RasterRenderer::Stretch { .. }), "{cmd} {p}: {:?}", l.style.renderer);
+        (s.map().layer(r["layer"].as_u64().unwrap() as u32).unwrap().name.clone(), d)
+    };
+    let (hill, d) = shade(&mut s, "raster.function", json!({"layer": "dem", "function": "hillshade"}));
+    let st = &d.bands[0].stats;
+    assert!(st.min >= 1.0 && st.max <= 255.0 && st.count == 1600, "{st:?}");
+    let (_, flat) = shade(&mut s, "raster.function", json!({"layer": "plane", "function": "hillshade"}));
+    assert_eq!(flat.bands[0].stats.categories.as_ref().map(Vec::len), Some(1));
+    let steps = json!([{"function": "bandMath", "expression": "b1 * 2"}, {"function": "hillshade"}]);
+    shade(&mut s, "raster.functionChain", json!({"layer": "dem", "steps": steps}));
+    // A step after a hillshade reads its no-data, and makes floats again.
+    let r = s
+        .run(
+            "raster.functionChain",
+            &json!({"layer": "dem", "steps": [{"function": "hillshade"}, {"function": "threshold", "value": 128}]}),
+        )
+        .unwrap();
+    let after = s.map().layer(r["layer"].as_u64().unwrap() as u32).unwrap().raster.clone().unwrap().data.unwrap();
+    assert_eq!((after.data_type.as_str(), after.bands[0].stats.count), ("Float32", 1600));
+    let dir = std::env::temp_dir().join(format!("rustgis-hillshade-bytes-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for cog in [false, true] {
+        let tif = dir.join(format!("hill-{cog}.tif"));
+        s.run("share.exportRaster", &json!({"layer": hill, "path": tif.display().to_string(), "cog": cog})).unwrap();
+        let back = rustgis_data::raster::read_path(&tif).unwrap();
+        assert_eq!(
+            (back.data_type.as_str(), back.nodata, back.bands[0].data.as_slice()),
+            ("UInt8", Some(0.0), d.bands[0].data.as_slice()),
+            "cog: {cog}"
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn exporting_a_raster_as_a_cog() {
     let mut s = world();
