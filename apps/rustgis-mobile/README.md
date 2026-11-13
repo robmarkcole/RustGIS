@@ -2,8 +2,9 @@
 
 RustGIS on Android ([#1902](https://github.com/opengeos/RustGIS/issues/1902)). It runs the desktop
 front end (`rustgis-ui-egui`) in a `NativeActivity`, with the system's file picker for opening and
-saving, and the touch interface (`rustgis-ui-touch`) around its map. It is not a field app yet:
-there is no feature form, no digitizing by touch and no location.
+saving, and the touch interface (`rustgis-ui-touch`) around its map, which can capture a point
+with its attributes. It is not a field app yet: lines and polygons can't be drawn by touch, and
+there is no location.
 
 ## Build
 
@@ -71,10 +72,18 @@ Rust calls Java and never the other way: each frame the app collects what happen
 ## The touch interface
 
 A phone starts in the touch interface: the map, a bar of four large buttons under it (Layers, Add
-Data, Full Extent, More) and sheets that rise over the map. The Layers sheet shows and hides
-layers, zooms to one and makes one the active layer; the More sheet has the project, undo and
-redo, and **Use the Desktop Interface**, which brings back the ribbon and panes until the app is
-started again.
+Data, Capture, More) and sheets that rise over the map. The Layers sheet shows and hides layers,
+zooms to one and makes one the active layer; the More sheet has Full Extent, the project, undo
+and redo, and **Use the Desktop Interface**, which brings back the ribbon and panes until the app
+is started again.
+
+**Capture** adds a point to one of the map's point layers. A cross marks the middle of the map:
+the map is moved under it, the sheet's fields are filled in (one for each of the layer's
+attributes), and **Add Point Here** puts the point there. The sheet stays up, its fields emptied,
+for the next point. Editing is turned on for the map when it was off, and the sheet says so.
+What it doesn't do yet: lines and polygons, a new layer to capture into, value lists and
+defaults from the layer's design, and keeping the field being typed in above the soft keyboard
+(the keyboard covers the lower fields: close it to reach them).
 
 The interface keeps out of the room the system's bars take: the activity's Java half reports the
 insets, and the bars' icons are drawn dark over a light theme's ground and light over a dark
