@@ -492,9 +492,36 @@ impl Reader {
             Field::new("folder", FieldType::Text),
             Field::new("style", FieldType::Text),
         ];
-        // Extended data keys that don't clash with those.
-        let keys: Vec<String> = self.keys.iter().filter(|k| !fields.iter().any(|f| f.name.eq_ignore_ascii_case(k))).cloned().collect();
-        fields.extend(keys.iter().map(|k| Field::new(k.clone(), FieldType::Text)));
+        // Each extended data key's column, as (key, column name). A key named like one of those,
+        // ignoring case, is left out when it only repeats that column (an exported name field
+        // does), else kept under a free name.
+        let mut taken: Vec<Field> =
+            fields.iter().cloned().chain(self.keys.iter().map(|k| Field::new(k.clone(), FieldType::Text))).collect();
+        let mut keys: Vec<(String, String)> = Vec::new();
+        let mut renamed: Vec<(String, String)> = Vec::new();
+        for k in &self.keys {
+            let Some(i) = fields.iter().position(|f| f.name.eq_ignore_ascii_case(k)) else {
+                keys.push((k.clone(), k.clone()));
+                continue;
+            };
+            let repeats = |r: &Row| {
+                let fixed = match i {
+                    0 => r.name.as_deref(),
+                    1 => r.description.as_deref(),
+                    2 => Some(r.folder.as_str()),
+                    _ => r.style.as_deref(),
+                };
+                r.data.iter().find(|(dk, _)| dk == k).is_none_or(|(_, v)| v == fixed.unwrap_or_default())
+            };
+            if self.rows.iter().all(repeats) {
+                continue;
+            }
+            let column = crate::io::free_column_name(&taken, k);
+            taken.push(Field::new(column.clone(), FieldType::Text));
+            renamed.push((k.clone(), column.clone()));
+            keys.push((k.clone(), column));
+        }
+        fields.extend(keys.iter().map(|(_, c)| Field::new(c.clone(), FieldType::Text)));
         let mut out = Vec::new();
         for (i, (kind, label)) in present.iter().enumerate() {
             let title = if present.len() == 1 { name.to_string() } else { format!("{name} {label}") };
@@ -509,7 +536,8 @@ impl Reader {
                     r.style.clone().map(Value::Text).unwrap_or_default(),
                 ];
                 attrs.extend(
-                    keys.iter().map(|k| r.data.iter().find(|(dk, _)| dk == k).map(|(_, v)| Value::Text(v.clone())).unwrap_or_default()),
+                    keys.iter()
+                        .map(|(k, _)| r.data.iter().find(|(dk, _)| dk == k).map(|(_, v)| Value::Text(v.clone())).unwrap_or_default()),
                 );
                 if let Some(s) = &r.style
                     && !used.contains(s)
@@ -530,6 +558,23 @@ impl Reader {
                 }
                 if self.dropped_keys > 0 {
                     report.messages.push(format!("{name}: extended data past {MAX_KEYS} distinct names was left out"));
+                }
+                if !renamed.is_empty() {
+                    let listed: Vec<String> = renamed
+                        .iter()
+                        .take(5)
+                        .map(|(k, c)| format!("'{}' → '{}'", crate::io::dbf_notice_name(k), crate::io::dbf_notice_name(c)))
+                        .collect();
+                    let more = if renamed.len() > 5 { format!(" and {} more", renamed.len() - 5) } else { String::new() };
+                    let count = if renamed.len() == 1 {
+                        "1 extended data name was".to_string()
+                    } else {
+                        format!("{} extended data names were", renamed.len())
+                    };
+                    report.messages.push(format!(
+                        "{name}: {count} renamed, as RustGIS gives every placemark a name, description, folder and style column: {}{more}",
+                        listed.join(", ")
+                    ));
                 }
             }
             if zm_rows > 0 {
@@ -612,6 +657,32 @@ mod tests {
         let style = polys.dataset.value(0, polys.dataset.field_index("style").unwrap()).to_string();
         assert_eq!(style, "#inline-1");
         assert_eq!(polys.styles[0].1.fill, Some([0, 170, 0, 255]));
+    }
+
+    #[test]
+    fn extended_data_named_like_a_fixed_column_is_kept_under_a_free_name() {
+        // `name` becomes the placemark's name and, like every field, extended data too; `NAME`
+        // clashes with the name column ignoring case but holds something else.
+        let mut ds =
+            Dataset::new("t", GeometryType::Point, vec![Field::new("name", FieldType::Double), Field::new("NAME", FieldType::Integer)]);
+        ds.push_next(Some(Geometry::Point(Coord::new(1.0, 2.0))), vec![Value::Float(0.0), Value::Int(1)]);
+        let kml = crate::interop::to_kml(&ds, crate::io::name_field(&ds)).unwrap();
+        let layers = read("t.kml", kml.as_bytes()).unwrap();
+        let (back, report) = (&layers[0].dataset, &layers[0].report);
+        let names: Vec<&str> = back.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["name", "description", "folder", "style", "NAME_1"], "the copy of the name isn't a column of its own");
+        assert_eq!(back.value(0, 0), &Value::Text("0".into()));
+        assert_eq!(back.value(0, 4), &Value::Int(1));
+        assert_eq!(
+            report.messages,
+            [
+                "t: 1 extended data name was renamed, as RustGIS gives every placemark a name, description, folder and style column: 'NAME' → 'NAME_1'"
+            ]
+        );
+
+        // Without a clash, nothing is said.
+        let layers = read("trip.kml", DOC.as_bytes()).unwrap();
+        assert!(layers[0].report.messages.iter().all(|m| !m.contains("renamed")), "{:?}", layers[0].report.messages);
     }
 
     #[test]
