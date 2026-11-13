@@ -305,11 +305,16 @@ fn read_with(file_name: &str, bytes: &[u8], given: Option<Crs>, keep_named: bool
         *v = [v[0] * s[0] + t[0], v[1] * s[1] + t[1], v[2] * s[2] + t[2]];
     }
     let mut notes = Vec::new();
-    let named = named_system(doc.metadata.as_ref());
+    // A compound URN is read by its horizontal part; its vertical part, said when its heights
+    // aren't metres upward, gives the heights' unit.
+    let system = named_system(doc.metadata.as_ref());
+    let named = system.map(crate::gml::horizontal);
+    let vertical = system.and_then(crate::gml::vertical);
     let given = given.filter(|_| !keep_named || named.and_then(known_system).is_none());
     let mut reach = Reach::default();
     vertices.iter().for_each(|v| reach.add(v));
-    let crs = coordinate_system(file_name, given, named, &reach, &mut notes)?;
+    let crs = coordinate_system(file_name, given, named, vertical.is_some(), &reach, &mut notes)?;
+    notes.extend(vertical.and_then(vertical_note));
     notes.extend(doc.appearance.and_then(appearance_note));
     let Some(objects) = doc.objects else {
         return Err(DataError::Format(format!("{file_name}: no CityObjects")));

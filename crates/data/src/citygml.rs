@@ -12,7 +12,10 @@
 //! converted from the system the `srsName`s name (on geometries and envelopes, often the only place
 //! a file names it), by its horizontal part; the URN and URL forms of a geographic system are
 //! latitude first, as GML 3 says. Names that disagree are refused, unless a system is given in
-//! their place, which reads them all and says how many named another.
+//! their place, which reads them all and says how many named another. Heights are kept as the
+//! file has them: a compound URN's vertical part that isn't a height in metres (feet, a depth, or
+//! one RustGIS doesn't know) is said, each one the file names once, the system given or not; a
+//! vertical part named says the heights' unit in place of the horizontal system's.
 //!
 //! 3.0 is read by the same names where they stay (its geometry properties, `cityObjectMember`), and
 //! by its own where they change: thematic surfaces in `boundary`, openings in `fillingSurface`, a
@@ -78,7 +81,7 @@ use serde_json::{Map, Value as Json};
 
 use crate::citymodel::*;
 use crate::footprint::P3;
-use crate::gml::{horizontal, lat_first, local};
+use crate::gml::{horizontal, lat_first, local, vertical};
 use crate::raster::Crs;
 use crate::{DataError, Dataset, ReadReport, Result};
 
@@ -338,7 +341,7 @@ fn read_with(file_name: &str, bytes: &[u8], given: Option<Crs>, keep_named: bool
     let Reading { counts, mut built, rows, reach, mut said, relations, .. } = reading;
     said.object_links += relate(&mut built, relations);
     let mut notes = Vec::new();
-    let crs = coordinate_system(file_name, given, named, &reach, &mut notes)?;
+    let crs = coordinate_system(file_name, given, named, index.vertical_named, &reach, &mut notes)?;
     if let Some(other) = &index.other {
         notes.push(format!(
             "{} geometries or envelopes name a coordinate system other than the file's first ({other}), and are read in {}, the coordinate system given",
@@ -346,9 +349,20 @@ fn read_with(file_name: &str, bytes: &[u8], given: Option<Crs>, keep_named: bool
             crs.label()
         ));
     }
+    notes.extend(index.verticals.iter().filter_map(|(_, v)| vertical_note(v)));
+    if index.verticals_past > 0 {
+        notes.push(format!(
+            "{} geometries or envelopes name a vertical system, past the first {VERTICALS} said, that isn't a height in metres: their heights are kept as the file has them",
+            index.verticals_past
+        ));
+    }
     notes.extend(said.notes(index.cut));
     finish(file_name, stem, rows, built, counts, notes, crs)
 }
+
+/// Most vertical systems a file's `srsName`s name that are said one by one, so crafted names can't
+/// make the notices grow with their number: past them, the `srsName`s naming another are counted.
+const VERTICALS: usize = 8;
 
 /// Where a document's members lie, the namespaces its root declares, and the system it names.
 #[derive(Default)]
@@ -363,6 +377,15 @@ struct Index {
     namespaces: String,
     /// The first `srsName`.
     system: Option<String>,
+    /// The vertical parts compound `srsName`s name that aren't heights in metres, each once by its
+    /// EPSG code (by its name when it names none), at most [`VERTICALS`]: the horizontal part alone
+    /// decides whether names agree, so each is said for itself. Past them, the `srsName`s naming
+    /// another are counted (`verticals_past`).
+    verticals: Vec<(Option<u32>, String)>,
+    verticals_past: usize,
+    /// Whether an `srsName` names a vertical part, in metres or not: its unit is the heights', so
+    /// the horizontal system's isn't said as theirs.
+    vertical_named: bool,
     /// A system is given in place of those the file names, so `srsName`s that disagree are kept to
     /// the first rather than refused.
     overridden: bool,
@@ -840,15 +863,29 @@ impl Index {
     /// Takes in an `srsName`, on a geometry or on an envelope (often the only place a file names its
     /// system): the first names the file's system, and one naming another is an error, unless a
     /// system is given in their place. One system with its axes in different orders is an error
-    /// either way: the order a name gives is how its coordinates are read.
+    /// either way: the order a name gives is how its coordinates are read. Vertical parts don't
+    /// decide whether names agree; each one named is kept, to be said.
     fn see_system(&mut self, file_name: &str, srs: &str) -> Result<()> {
+        if self.system.as_deref() == Some(srs) {
+            return Ok(());
+        }
+        let named = vertical(srs);
+        self.vertical_named |= named.is_some();
+        // A part with an EPSG code is the same system as one with the same code, however spelled;
+        // one with none, as one of the same name.
+        if let Some((v, code)) = named.and_then(|v| Some((v, vertical_code(v)?)))
+            && !self.verticals.iter().any(|(c, seen)| *c == code && (code.is_some() || seen == v))
+        {
+            if self.verticals.len() < VERTICALS {
+                self.verticals.push((code, v.to_string()));
+            } else {
+                self.verticals_past += 1;
+            }
+        }
         let Some(first) = &self.system else {
             self.system = Some(srs.to_string());
             return Ok(());
         };
-        if first == srs {
-            return Ok(());
-        }
         let system = |name: &str| known_system(horizontal(name)).map(|crs| (crs, lat_first(name, crs)));
         let cut = |s: &str| s.chars().take(80).collect::<String>();
         match (system(first), system(srs)) {

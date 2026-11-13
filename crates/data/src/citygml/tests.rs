@@ -212,6 +212,69 @@ fn a_compound_system_is_read_by_its_horizontal_part() {
     assert!(err.contains("different coordinate systems (EPSG:25832 and EPSG:25833)"), "{err}");
 }
 
+/// A compound system's vertical part is said when its heights aren't metres upward: another unit, a
+/// depth, or a system RustGIS doesn't know; each one the file names once, the system given or not.
+#[test]
+fn a_vertical_system_that_isnt_metres_upward_is_said() {
+    let ground = square(500_000.0, 5_500_000.0, 10.0, 0.0);
+    let inner = |srs: &[&str]| {
+        srs.iter()
+            .map(|srs| {
+                format!(
+                    r#"<bldg:boundedBy><bldg:GroundSurface><bldg:lod2MultiSurface><gml:MultiSurface srsName="{srs}"><gml:surfaceMember>{}</gml:surfaceMember></gml:MultiSurface></bldg:lod2MultiSurface></bldg:GroundSurface></bldg:boundedBy>"#,
+                    polygon("g", &ground)
+                )
+            })
+            .collect::<String>()
+    };
+    let compound = |h: &str, v: &str| format!("urn:ogc:def:crs,crs:EPSG::{h},crs:EPSG::{v}");
+    let notes = |root: &str, geometries: &[&str], given: Option<Crs>| {
+        messages_of(&read("model.gml", &model(root, &building("b1", &inner(geometries))), given).unwrap())
+            .into_iter()
+            .filter(|m| m.contains("vertical system") || m.contains("measures in"))
+            .collect::<Vec<_>>()
+    };
+    // Metres upward, or no vertical part: nothing to say.
+    assert!(notes(&compound("25832", "5783"), &["EPSG:25832"], None).is_empty());
+    assert!(notes(&compound("25832", "5799"), &["EPSG:25832"], None).is_empty());
+    assert!(notes("EPSG:25832", &["EPSG:25832"], None).is_empty());
+    assert_eq!(
+        notes(&compound("25832", "6360"), &["EPSG:25832"], None),
+        [
+            "a vertical system the file names (crs:EPSG::6360) measures heights in US survey feet: z_min, z_max and height are kept as the file has them, and Style › Extrusion reads metres, so objects may stand at the wrong height"
+        ]
+    );
+    let depth = notes(&compound("25832", "5715"), &["EPSG:25832"], None);
+    assert!(depth.len() == 1 && depth[0].contains("(crs:EPSG::5715) measures depth, downward, in metres"), "{depth:?}");
+    let unknown = notes(&compound("25832", "9999"), &["EPSG:25832"], None);
+    assert!(unknown.len() == 1 && unknown[0].contains("(crs:EPSG::9999) is one RustGIS doesn't know"), "{unknown:?}");
+    // A geometry whose vertical part differs from the root's is said too; one system is said once,
+    // however it is spelled.
+    let both = notes(&compound("25832", "5783"), &[&compound("25832", "8228")], None);
+    assert!(both.len() == 1 && both[0].contains("(crs:EPSG::8228) measures heights in feet"), "{both:?}");
+    let spelled = "URN:OGC:DEF:CRS,crs:EPSG:6.18:25832, crs:EPSG:6.18:6360";
+    assert_eq!(notes(&compound("25832", "6360"), &[spelled], None).len(), 1);
+    // The system given replaces the horizontal part only: the heights are still the file's, and a
+    // geometry naming another system is read in the one given, its vertical part said.
+    assert_eq!(notes(&compound("25832", "6360"), &["EPSG:25832"], Some(Crs::Epsg(25832))).len(), 1);
+    let given = notes(&compound("25832", "5783"), &[&compound("25833", "8228")], Some(Crs::Epsg(25832)));
+    assert!(given.len() == 1 && given[0].contains("(crs:EPSG::8228)"), "{given:?}");
+    // A horizontal system in feet says so only when no vertical system says what the heights are.
+    let feet = notes("EPSG:2263", &["EPSG:2263"], None);
+    assert!(feet.len() == 1 && feet[0].contains("measures in us-ft"), "{feet:?}");
+    assert!(notes(&compound("2263", "5703"), &["EPSG:2263"], None).is_empty());
+    // A geometry naming a vertical part gives the heights' unit, whatever the first name says.
+    assert!(notes("EPSG:2263", &[&compound("2263", "5703")], None).is_empty());
+    let one = notes(&compound("2263", "6360"), &["EPSG:2263"], None);
+    assert!(one.len() == 1 && one[0].contains("(crs:EPSG::6360)"), "{one:?}");
+    // Past the systems said one by one, the rest are counted.
+    let many: Vec<String> = (0..VERTICALS + 2).map(|k| compound("25832", &(9000 + k).to_string())).collect();
+    let many: Vec<&str> = many.iter().map(String::as_str).collect();
+    let said = notes("EPSG:25832", &many, Some(Crs::Epsg(25832)));
+    assert_eq!(said.len(), VERTICALS + 1, "{said:?}");
+    assert!(said[VERTICALS].starts_with("2 geometries or envelopes name a vertical system, past the first 8 said"), "{said:?}");
+}
+
 /// A part is an object of its own, with its parent's id, and lends its parent its heights.
 #[test]
 fn a_building_part_names_its_parent_and_raises_it() {
