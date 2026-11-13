@@ -76,6 +76,15 @@ pub(crate) fn cancel_stale(app: &mut RustGisApp) {
     if app.boxes.gesture.as_ref().is_some_and(|g| !valid(app, g)) {
         cancel(app);
     }
+    if !app.forms.template.is_empty()
+        && !app
+            .session
+            .active_layer
+            .and_then(|id| app.session.map().layer(id))
+            .is_some_and(|l| l.design.templates.iter().any(|t| t.name == app.forms.template))
+    {
+        app.forms.template.clear();
+    }
 }
 fn at(app: &RustGisApp, rect: Rect, frame: &Frame, p: [f64; 2]) -> Option<Pos2> {
     lonlat_to_screen(app, rect, frame.to_lonlat(p)?)
@@ -109,7 +118,10 @@ pub(crate) fn click(app: &mut RustGisApp, c: Coord, shift: bool, alt: bool) {
         return;
     }
     let hits = hits(app, c);
-    let current = selected(app).map(|(id, row, _)| (id, row));
+    let current = app.session.active_layer.and_then(|id| {
+        let [row] = app.session.map().layer(id)?.selection.as_slice() else { return None };
+        Some((id, *row))
+    });
     let index = if alt { current.and_then(|c| hits.iter().position(|h| *h == c)).map_or(0, |i| (i + 1) % hits.len().max(1)) } else { 0 };
     if let Some(&(layer, row)) = hits.get(index) {
         let _ = app.run("select.rows", json!({"layer":layer,"rows":[row],"mode":if shift {"add"} else {"new"}}));
@@ -126,7 +138,9 @@ pub(crate) fn drag_start(app: &mut RustGisApp, rect: Rect, origin: Pos2, force_n
         None
     } else {
         selected(app)
-            .and_then(|(id, row, b)| handle_at(app, rect, origin, &b).map(|h| (id, row, b, h)))
+            .and_then(|(id, row, b)| {
+                handle_at(app, rect, origin, &b).or_else(|| contains(&b, c).then_some(Handle::Move)).map(|h| (id, row, b, h))
+            })
             .or_else(|| hits(app, c).into_iter().find_map(|(id, row)| app.session.box_spec(id, row).map(|b| (id, row, b, Handle::Move))))
     };
     let Some(id) = app.session.active_layer else { return false };
@@ -232,7 +246,7 @@ pub(crate) fn drag_stop(app: &mut RustGisApp) {
         }
     } else {
         let mut p = json!({"layer":g.layer,"box":b});
-        if !app.forms.template.is_empty() {
+        if app.session.map().layer(g.layer).is_some_and(|l| l.design.templates.iter().any(|t| t.name == app.forms.template)) {
             p["template"] = json!(app.forms.template);
         }
         let _ = app.run("edit.addBox", p);
@@ -243,11 +257,13 @@ pub(crate) fn cursor(app: &RustGisApp, rect: Rect, p: Pos2) -> Option<egui::Curs
     if handle_at(app, rect, p, &b).is_some() {
         return Some(egui::CursorIcon::Crosshair);
     }
-    let q = b.frame.to_local(screen_to_lonlat(app, rect, p)?)?;
+    contains(&b, screen_to_lonlat(app, rect, p)?).then_some(egui::CursorIcon::Grab)
+}
+fn contains(b: &BoxSpec, c: Coord) -> bool {
+    let Some(q) = b.frame.to_local(c) else { return false };
     let d = [q[0] - b.center[0], q[1] - b.center[1]];
     let (u, v) = b.axes();
-    ((d[0] * u[0] + d[1] * u[1]).abs() <= b.width / 2. && (d[0] * v[0] + d[1] * v[1]).abs() <= b.height / 2.)
-        .then_some(egui::CursorIcon::Grab)
+    (d[0] * u[0] + d[1] * u[1]).abs() <= b.width / 2. && (d[0] * v[0] + d[1] * v[1]).abs() <= b.height / 2.
 }
 pub(crate) fn draw(app: &RustGisApp, painter: &Painter, rect: Rect, accent: Color32) {
     if !ready(app) {
@@ -512,6 +528,86 @@ mod tests {
         drag_stop(&mut app);
         assert_eq!(app.session.map().layer(id).unwrap().dataset.features.len(), 3);
     }
+    #[test]
+    fn box_edit_cycles_past_ordinary_polygons_and_moves_the_selected_overlap() {
+        let mut app = app();
+        let (id, first, b) = create(&mut app);
+        app.run("edit.addBox", json!({"box":b})).unwrap();
+        app.run("edit.addFeature", json!({"geometry":rustgis_engine::data::io::geometry_to_geojson(&b.geometry().unwrap())})).unwrap();
+        let c = b.frame.to_lonlat(b.center).unwrap();
+        click(&mut app, c, false, false);
+        assert_eq!(app.session.map().layer(id).unwrap().selection, vec![2]);
+        assert!(selected(&app).is_none());
+        click(&mut app, c, false, true);
+        assert_eq!(selected(&app).unwrap().1, 1);
+        click(&mut app, c, false, true);
+        assert_eq!(selected(&app).unwrap().1, first);
+        let p = at(&app, rect(), &b.frame, b.center).unwrap();
+        assert!(drag_start(&mut app, rect(), p, false));
+        drag_to(&mut app, rect(), p + vec2(20., 10.), false);
+        drag_stop(&mut app);
+        assert_eq!(selected(&app).unwrap().1, first);
+        assert_ne!(app.session.box_spec(id, first).unwrap().center, b.center);
+        assert_eq!(app.session.box_spec(id, 1), Some(b));
+    }
+
+    #[test]
+    fn box_edit_ignores_another_layers_template_and_keeps_valid_defaults() {
+        let mut app = app();
+        let target = app.session.map_mut().add_dataset(Dataset::new(
+            "Target",
+            GeometryType::Polygon,
+            vec![rustgis_engine::data::Field::new("class", rustgis_engine::data::FieldType::Text)],
+        ));
+        app.forms.template = "Previous layer template".into();
+        app.session.active_layer = Some(target);
+        cancel_stale(&mut app);
+        assert!(app.forms.template.is_empty());
+        assert!(drag_start(&mut app, rect(), Pos2::new(400., 350.), false));
+        drag_to(&mut app, rect(), Pos2::new(600., 450.), false);
+        app.forms.template = "Previous layer template".into();
+        drag_stop(&mut app);
+        assert_eq!(app.session.map().layer(target).unwrap().dataset.features.len(), 1);
+        app.session.map_mut().layer_mut(target).unwrap().design.templates.push(rustgis_engine::map::design::FeatureTemplate {
+            name: "Vehicle".into(),
+            description: String::new(),
+            defaults: vec![("class".into(), rustgis_engine::data::Value::Text("vehicle".into()))],
+        });
+        app.forms.template = "Vehicle".into();
+        assert!(drag_start(&mut app, rect(), Pos2::new(400., 350.), true));
+        drag_to(&mut app, rect(), Pos2::new(600., 450.), false);
+        drag_stop(&mut app);
+        assert_eq!(app.session.map().layer(target).unwrap().dataset.value(1, 0), &rustgis_engine::data::Value::Text("vehicle".into()));
+    }
+
+    #[test]
+    fn box_edit_context_menu_wins_over_a_stale_ordinary_map_menu() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = app();
+        let (id, row, b) = create(&mut app);
+        app.map.menu_lonlat = Some(b.frame.to_lonlat(b.center).unwrap());
+        let mut h = harness(app);
+        for _ in 0..6 {
+            h.step();
+        }
+        let view = h.state().map.view_rect.unwrap().0;
+        let p = at(h.state(), view, &b.frame, b.center).unwrap();
+        h.input_mut().events.push(egui::Event::PointerMoved(p));
+        for pressed in [true, false] {
+            h.input_mut().events.push(egui::Event::PointerButton {
+                pos: p,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+            h.step();
+        }
+        h.step();
+        assert!(h.query_by_label("Delete Selected Box").is_some());
+        assert!(h.query_by_label("Edit Box Dimensions").is_some());
+        assert_eq!(h.state().session.map().layer(id).unwrap().selection, vec![row]);
+    }
+
     #[test]
     fn box_edit_space_pan_returns_to_editing_without_an_identify_popup_or_new_feature() {
         let mut app = app();

@@ -2368,6 +2368,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustc-hash"
+version = "2.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
+
+[[package]]
 name = "rustc_version"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2420,6 +2426,7 @@ dependencies = [
  "ruzstd",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "shapefile",
  "sysinfo",
  "tempfile",
@@ -2524,7 +2531,9 @@ dependencies = [
  "rustgis-map",
  "rustgis-tiles",
  "serde_json",
+ "subsetter",
  "tiny-skia",
+ "ttf-parser",
  "unicode-segmentation",
  "web-time",
 ]
@@ -2972,6 +2981,15 @@ dependencies = [
  "unicode-bidi",
  "unicode-normalization",
  "unicode-properties",
+]
+
+[[package]]
+name = "subsetter"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38803281d1c23166c5ebcb455439a5d2afe711cc909cf88af72448c297756ad6"
+dependencies = [
+ "rustc-hash",
 ]
 
 [[package]]

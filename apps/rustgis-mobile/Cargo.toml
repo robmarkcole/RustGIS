@@ -1,0 +1,41 @@
+[package]
+name = "rustgis-mobile"
+description = "RustGIS on Android (#1902): the desktop front end in a NativeActivity, with the phone's file picker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# The library Android's NativeActivity loads (`android.app.lib_name` in AndroidManifest.xml).
+# On every other target it is empty.
+[lib]
+crate-type = ["cdylib"]
+
+# `android_main` is exported by name, which the workspace's `forbid` can't allow: keep the
+# other workspace lints in step here, as the desktop app does.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+too_many_arguments = "allow"
+type_complexity = "allow"
+
+[target.'cfg(target_os = "android")'.dependencies]
+# Without the `geolibre` feature: a phone can't run the `geolibre` program.
+rustgis-engine = { workspace = true }
+rustgis-ui-egui = { workspace = true }
+# NativeActivity's soft keyboard support is poor: a real app moves to
+# GameActivity (`android-game-activity`), which also allows `accesskit`.
+eframe = { workspace = true, features = ["default_fonts", "wgpu", "android-native-activity"] }
+egui = { workspace = true }
+# `AndroidApp`, handed to eframe. Keep the version in step with eframe's (`cargo tree -i winit`
+# lists one winit).
+winit = { version = "0.30", default-features = false, features = ["android-native-activity"] }
+log = { workspace = true }
+# Calls into the activity's Java half (`src/phone.rs`). The version `android-activity` uses, so
+# both share one `JavaVM`.
+jni = "0.22"
+# `log` records to logcat.
+android_logger = "0.15"

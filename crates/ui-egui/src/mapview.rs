@@ -3303,7 +3303,9 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
         app.map.menu_text = resp.interact_pointer_pos().and_then(|p| text_graphic_at(app, ui.ctx(), rect, p));
     }
     // No menu off the Earth (a globe's corners): there is no place for it to act on.
-    if let Some(c) = app.map.menu_lonlat {
+    if tool != Tool::RotatedBox
+        && let Some(c) = app.map.menu_lonlat
+    {
         resp.context_menu(|ui| crate::mapmenu::show(app, ui, c));
     }
     if hover.is_some() && (matches!(tool, Tool::Measure | Tool::MeasureArea) || tool.draws_edit()) && !app.map.sketch.is_empty() {

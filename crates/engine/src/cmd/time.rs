@@ -385,6 +385,10 @@ fn frames(s: &mut Session, steps: &[f64], w: f64, h: f64, gif: Option<u32>) -> R
             // rustgis_render::render_complete) fetches the tiles it lacks and waits for them
             // before it draws, so each frame shows its own date's imagery.
             let png = super::share::map_png(s, Some(w), Some(h), Some(96.0))?;
+            // What this date's file left out, said while its header is surely in (a cleared tile
+            // cache could drop it before the export ends): the slider moves on before the
+            // command's own landing check.
+            s.notice_landed_rasters();
             match (&mut enc, gif) {
                 (Some(e), Some(ms)) => {
                     let img = image::load_from_memory_with_format(&png, image::ImageFormat::Png).map_err(|e| e.to_string())?.to_rgba8();

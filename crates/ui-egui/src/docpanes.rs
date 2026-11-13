@@ -598,13 +598,13 @@ pub fn shares(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     #[cfg(not(target_arch = "wasm32"))]
     ui.horizontal(|ui| {
         if ui.button(tl!("Add Data Store…")).clicked()
-            && let Some(dir) = rfd::FileDialog::new().pick_folder()
+            && let Some(dir) = crate::filedialog::FileDialog::new().pick_folder()
         {
             run(app, "share.dataStore", json!({"path": dir.display().to_string()}));
         }
         if !stores.is_empty()
             && ui.button(tl!("Upload File…")).clicked()
-            && let Some(f) = rfd::FileDialog::new().pick_file()
+            && let Some(f) = crate::filedialog::FileDialog::new().pick_file()
         {
             run(app, "share.upload", json!({"path": f.display().to_string()}));
         }

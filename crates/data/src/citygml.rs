@@ -1,4 +1,4 @@
-//! CityGML 1.0 and 2.0 (OGC 08-007r1 and 12-019), read as 2D like every city model: each city
+//! CityGML 1.0, 2.0 and 3.0 (OGC 08-007r1, 12-019 and 21-006), read as 2D like every city model: each city
 //! object becomes a row of a layer per object type and geometry family, its surfaces and solids a
 //! footprint with its heights in `z_min`, `z_max` and `height` (see [`crate::citymodel`]). Written
 //! from the standards and their XML schemas.
@@ -12,7 +12,17 @@
 //! converted from the system the `srsName`s name (on geometries and envelopes, often the only place
 //! a file names it), by its horizontal part; the URN and URL forms of a geographic system are
 //! latitude first, as GML 3 says. Names that disagree are refused, unless a system is given in
-//! their place, which reads them all and says how many named another.
+//! their place, which reads them all and says how many named another. Heights are kept as the
+//! file has them: a compound URN's vertical part that isn't a height in metres (feet, a depth, or
+//! one RustGIS doesn't know) is said, each one the file names once, the system given or not; a
+//! vertical part named says the heights' unit in place of the horizontal system's.
+//!
+//! 3.0 is read by the same names where they stay (its geometry properties, `cityObjectMember`), and
+//! by its own where they change: thematic surfaces in `boundary`, openings in `fillingSurface`, a
+//! prototype in `relativeGeometry`, parts linked by `buildingPart` (and a bridge's or tunnel's),
+//! generic attributes named by a `gen:name`, and a group member inside its `Role`. Its spaces (a
+//! `BuildingRoom`, a `Storey`) are objects like any other. Those names are read only in 3.0's
+//! namespaces ([`in_3_0`]): an extension of a 1.0 or 2.0 model that uses one keeps its own meaning.
 //!
 //! Attributes: generic attributes (`gen:stringAttribute` and its kin) typed by their element, the
 //! measures and counts the standard types so (`measuredHeight`, `storeysAboveGround`, …) and any
@@ -38,13 +48,13 @@
 //! links read is bounded by the member's size, and what links copy and read from other members by
 //! the file's. A geometry that can't be read is said once, whichever object or link reads it first.
 //!
-//! An implicit geometry (`ImplicitGeometry`) is its prototype (`relativeGMLGeometry`, written in
+//! An implicit geometry (`ImplicitGeometry`) is its prototype ([`PROTOTYPES`], written in
 //! place or given by a link), placed by its matrix at its reference point (OGC 12-019 §8.3), in the
 //! file's axis order: the prototype is read once, in its own system, and placed for each instance,
 //! the points placed in all as many as the file could write out.
 //!
 //! A part, a group's member or a group's parent given by a link (`consistsOfBuildingPart`,
-//! `groupMember`, a `CityObjectGroup`'s `parent`) makes the objects it names a child and its parent,
+//! `buildingPart`, `bridgePart`, `tunnelPart`, `groupMember`, a `CityObjectGroup`'s `parent`) makes the objects it names a child and its parent,
 //! as if one were written in the other, once every member is read; the link is kept as an attribute
 //! too.
 //!
@@ -56,7 +66,8 @@
 //! geometry whose prototype is in another file (`libraryObject`) or whose matrix isn't 16 numbers
 //! with `0 0 0 1` last (drawn at its reference point); a group member's role; appearances,
 //! addresses, TIN reliefs, and the properties of thematic surfaces and openings (a name, generic
-//! attributes); curve arcs and splines are read as straight lines. CityGML 3.0 is refused.
+//! attributes); 3.0's relations between objects (`CityObjectRelation`) and its versions
+//! (`versionMember`, `versionTransitionMember`); curve arcs and splines are read as straight lines.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, hash_map::Entry};
@@ -70,7 +81,7 @@ use serde_json::{Map, Value as Json};
 
 use crate::citymodel::*;
 use crate::footprint::P3;
-use crate::gml::{horizontal, lat_first, local};
+use crate::gml::{horizontal, lat_first, local, vertical};
 use crate::raster::Crs;
 use crate::{DataError, Dataset, ReadReport, Result};
 
@@ -90,12 +101,54 @@ const LINK_READS: usize = 4;
 /// The namespace every CityGML version's core namespace starts with.
 const CITYGML: &str = "http://www.opengis.net/citygml/";
 
+/// CityGML 3.0's core namespace.
+const CITYGML_3: &str = "http://www.opengis.net/citygml/3.0";
+
 /// The CityGML versions read, by their core namespace.
-const VERSIONS: [&str; 2] = ["http://www.opengis.net/citygml/1.0", "http://www.opengis.net/citygml/2.0"];
+const VERSIONS: [&str; 3] = ["http://www.opengis.net/citygml/1.0", "http://www.opengis.net/citygml/2.0", CITYGML_3];
 
 /// The properties whose features are surfaces of their object (thematic surfaces, openings, traffic
 /// areas), not objects of their own.
 const SURFACE_PROPERTIES: [&str; 4] = ["boundedBy", "opening", "trafficArea", "auxiliaryTrafficArea"];
+
+/// 3.0's names for them, read only in its namespaces ([`in_3_0`]): a thematic surface's
+/// `boundary`, an opening's `fillingSurface`.
+const SURFACE_PROPERTIES_3: [&str; 2] = ["boundary", "fillingSurface"];
+
+/// The property holding an implicit geometry's prototype: `relativeGMLGeometry` in 1.0 and 2.0,
+/// `relativeGeometry` in 3.0 (read only there, see [`in_3_0`]).
+const PROTOTYPES: [&str; 2] = ["relativeGMLGeometry", "relativeGeometry"];
+
+/// 3.0's properties linking a part to its object, which 1.0 and 2.0 call `consistsOf…` (read only
+/// in its namespaces, see [`in_3_0`]).
+const PARTS: [&str; 3] = ["buildingPart", "bridgePart", "tunnelPart"];
+
+/// Whether an element is in one of CityGML 3.0's namespaces. The names 3.0 adds (`boundary`,
+/// `fillingSurface`, `relativeGeometry`, `buildingPart`, `genericAttribute`, `relatedTo`, a group
+/// member's `Role`) are read only there: an extension (ADE) of a 1.0 or 2.0 model may give one of
+/// them to a property of its own, which keeps the meaning it had.
+fn in_3_0(n: &Node) -> bool {
+    n.tag_name().namespace().is_some_and(|ns| ns.starts_with(CITYGML) && ns.ends_with("/3.0"))
+}
+
+/// Whether a property's features are surfaces of its object ([`SURFACE_PROPERTIES`],
+/// [`SURFACE_PROPERTIES_3`]).
+fn surface_property(p: &Node) -> bool {
+    let name = local(p);
+    SURFACE_PROPERTIES.contains(&name) || (SURFACE_PROPERTIES_3.contains(&name) && in_3_0(p))
+}
+
+/// Whether a property holds an implicit geometry's prototype ([`PROTOTYPES`]), by its name and, in
+/// the index, which doesn't resolve namespaces, whether the model is 3.0 (`three`).
+fn prototype_name(name: &str, three: bool) -> bool {
+    let [old, new] = PROTOTYPES;
+    name == old || (three && name == new)
+}
+
+/// Whether an element holds an implicit geometry's prototype ([`PROTOTYPES`]).
+fn prototype_property(n: &Node) -> bool {
+    prototype_name(local(n), in_3_0(n))
+}
 
 /// Features written in UpperCamelCase that are a property's value, not a city object.
 const VALUES: [&str; 4] = ["Envelope", "Null", "Address", "Appearance"];
@@ -131,7 +184,7 @@ const GEOMETRIES: [&str; 22] = [
 const COUNTS: [&str; 4] = ["storeysAboveGround", "storeysBelowGround", "yearOfConstruction", "yearOfDemolition"];
 
 /// Whether a file is a CityGML city model, by its root: a `CityModel` in one of CityGML's
-/// namespaces (3.0's too, which [`read`] refuses by name). Other GML, a WFS answer that only
+/// namespaces. Other GML, a WFS answer that only
 /// mentions CityGML's namespaces, isn't.
 pub fn looks_like_citygml(bytes: &[u8]) -> bool {
     let head = String::from_utf8_lossy(bytes.get(..HEAD_BYTES).unwrap_or(bytes));
@@ -192,6 +245,7 @@ fn read_with(file_name: &str, bytes: &[u8], given: Option<Crs>, keep_named: bool
     let (link_bytes, placing) = (text.len().saturating_mul(LINK_READS), text.len() / POINT_BYTES);
     let mut reading = Reading { budget: MAX_FILE_FACES, swap, link_bytes, placing, ..Reading::default() };
     reading.said.appearances = index.appearances;
+    reading.said.versions = index.versions;
     reading.said.links = index.links;
     reading.said.repeated_geometry_ids = index.repeated;
     let (mut wrapped, mut far) = (String::new(), Vec::new());
@@ -287,7 +341,7 @@ fn read_with(file_name: &str, bytes: &[u8], given: Option<Crs>, keep_named: bool
     let Reading { counts, mut built, rows, reach, mut said, relations, .. } = reading;
     said.object_links += relate(&mut built, relations);
     let mut notes = Vec::new();
-    let crs = coordinate_system(file_name, given, named, &reach, &mut notes)?;
+    let crs = coordinate_system(file_name, given, named, index.vertical_named, &reach, &mut notes)?;
     if let Some(other) = &index.other {
         notes.push(format!(
             "{} geometries or envelopes name a coordinate system other than the file's first ({other}), and are read in {}, the coordinate system given",
@@ -295,9 +349,20 @@ fn read_with(file_name: &str, bytes: &[u8], given: Option<Crs>, keep_named: bool
             crs.label()
         ));
     }
+    notes.extend(index.verticals.iter().filter_map(|(_, v)| vertical_note(v)));
+    if index.verticals_past > 0 {
+        notes.push(format!(
+            "{} geometries or envelopes name a vertical system, past the first {VERTICALS} said, that isn't a height in metres: their heights are kept as the file has them",
+            index.verticals_past
+        ));
+    }
     notes.extend(said.notes(index.cut));
     finish(file_name, stem, rows, built, counts, notes, crs)
 }
+
+/// Most vertical systems a file's `srsName`s name that are said one by one, so crafted names can't
+/// make the notices grow with their number: past them, the `srsName`s naming another are counted.
+const VERTICALS: usize = 8;
 
 /// Where a document's members lie, the namespaces its root declares, and the system it names.
 #[derive(Default)]
@@ -312,6 +377,15 @@ struct Index {
     namespaces: String,
     /// The first `srsName`.
     system: Option<String>,
+    /// The vertical parts compound `srsName`s name that aren't heights in metres, each once by its
+    /// EPSG code (by its name when it names none), at most [`VERTICALS`]: the horizontal part alone
+    /// decides whether names agree, so each is said for itself. Past them, the `srsName`s naming
+    /// another are counted (`verticals_past`).
+    verticals: Vec<(Option<u32>, String)>,
+    verticals_past: usize,
+    /// Whether an `srsName` names a vertical part, in metres or not: its unit is the heights', so
+    /// the horizontal system's isn't said as theirs.
+    vertical_named: bool,
     /// A system is given in place of those the file names, so `srsName`s that disagree are kept to
     /// the first rather than refused.
     overridden: bool,
@@ -324,6 +398,10 @@ struct Index {
     other: Option<String>,
     /// The appearances the model holds, which aren't read.
     appearances: usize,
+    /// The versions the model holds (3.0), which aren't read.
+    versions: usize,
+    /// Whether the model is CityGML 3.0, whose own names the index reads only then.
+    three: bool,
     /// Members given only by a link that the index alone meets (an empty `featureMembers`), which
     /// aren't followed.
     links: usize,
@@ -362,7 +440,7 @@ struct Spot {
 enum Kind {
     /// A geometry a link reads where it stands.
     Geometry,
-    /// A geometry in an implicit geometry's prototype (`relativeGMLGeometry`), read only placed.
+    /// A geometry in an implicit geometry's prototype ([`PROTOTYPES`]), read only placed.
     Prototype,
     /// Anything else: an object, a surface, a ring, or a geometry where this reader draws nothing.
     Other,
@@ -552,7 +630,13 @@ fn linkable_name(name: &str) -> bool {
 /// Whether an element holds what this reader doesn't draw: an appearance, a terrain intersection
 /// curve, a TIN relief. A link to a geometry in one isn't followed.
 fn undrawn(name: &str) -> bool {
-    matches!(name, "appearance" | "appearanceMember" | "Appearance" | "TINRelief") || name.ends_with("TerrainIntersection")
+    matches!(name, "appearance" | "appearanceMember" | "Appearance" | "TINRelief") || terrain_intersection(name)
+}
+
+/// Whether a property is a terrain intersection, where an object meets the ground: an auxiliary
+/// line, not the object's shape (`lod2TerrainIntersection`, `lod2TerrainIntersectionCurve` in 3.0).
+fn terrain_intersection(name: &str) -> bool {
+    name.ends_with("TerrainIntersection") || name.ends_with("TerrainIntersectionCurve")
 }
 
 impl Index {
@@ -613,13 +697,13 @@ impl Index {
             scope: if own { scopes.stack.len() - 1 } else { around },
             own,
             dim: written_dim(e).or(dim),
-            prototype: prototype || name == "relativeGMLGeometry",
+            prototype: prototype || prototype_name(name, self.three),
             undrawn: hidden || undrawn(name),
         });
     }
 
-    /// Indexes a document in one pass, building no tree. Refuses one whose root isn't a CityGML 1.0
-    /// or 2.0 city model, and, unless `overridden` (a system is given in their place), one whose
+    /// Indexes a document in one pass, building no tree. Refuses one whose root isn't a CityGML 1.0,
+    /// 2.0 or 3.0 city model, and, unless `overridden` (a system is given in their place), one whose
     /// `srsName`s name different systems; `archive` for a member of one.
     fn of(file_name: &str, text: &str, overridden: bool, archive: bool) -> Result<Index> {
         let invalid = |e: quick_xml::Error| DataError::Format(format!("{file_name}: {e}"));
@@ -634,7 +718,7 @@ impl Index {
         // `featureMembers`'s), and the elements open in a member.
         let mut scopes = Scopes { stack: Vec::new(), left: text.len() };
         let (mut base, mut open) = (0, Vec::<Open>::new());
-        // The depth of the prototype being read (`relativeGMLGeometry`): its system is its own, not
+        // The depth of the prototype being read ([`PROTOTYPES`]): its system is its own, not
         // the file's.
         let mut prototype: Option<usize> = None;
         // Open elements, and whether the root has been seen.
@@ -701,6 +785,7 @@ impl Index {
                 }
                 rooted = true;
                 check_root(file_name, e)?;
+                index.three = root_namespace(e).as_deref().map(str::trim) == Some(CITYGML_3);
                 index.namespaces = declarations(e);
                 let gml = gml_prefixes(e);
                 let bytes = gml.iter().map(String::len).sum();
@@ -711,7 +796,7 @@ impl Index {
             {
                 index.see_system(file_name, srs.trim())?;
             }
-            if prototype.is_none() && !empty && e.local_name().into_inner() == "relativeGMLGeometry" {
+            if prototype.is_none() && !empty && prototype_name(e.local_name().into_inner(), index.three) {
                 prototype = Some(depth);
             }
             match (depth, holder) {
@@ -735,6 +820,7 @@ impl Index {
                         }
                     }
                     "appearanceMember" => index.appearances += 1,
+                    "versionMember" | "versionTransitionMember" => index.versions += 1,
                     _ => {}
                 },
                 // An object of a `featureMembers`.
@@ -777,15 +863,29 @@ impl Index {
     /// Takes in an `srsName`, on a geometry or on an envelope (often the only place a file names its
     /// system): the first names the file's system, and one naming another is an error, unless a
     /// system is given in their place. One system with its axes in different orders is an error
-    /// either way: the order a name gives is how its coordinates are read.
+    /// either way: the order a name gives is how its coordinates are read. Vertical parts don't
+    /// decide whether names agree; each one named is kept, to be said.
     fn see_system(&mut self, file_name: &str, srs: &str) -> Result<()> {
+        if self.system.as_deref() == Some(srs) {
+            return Ok(());
+        }
+        let named = vertical(srs);
+        self.vertical_named |= named.is_some();
+        // A part with an EPSG code is the same system as one with the same code, however spelled;
+        // one with none, as one of the same name.
+        if let Some((v, code)) = named.and_then(|v| Some((v, vertical_code(v)?)))
+            && !self.verticals.iter().any(|(c, seen)| *c == code && (code.is_some() || seen == v))
+        {
+            if self.verticals.len() < VERTICALS {
+                self.verticals.push((code, v.to_string()));
+            } else {
+                self.verticals_past += 1;
+            }
+        }
         let Some(first) = &self.system else {
             self.system = Some(srs.to_string());
             return Ok(());
         };
-        if first == srs {
-            return Ok(());
-        }
         let system = |name: &str| known_system(horizontal(name)).map(|crs| (crs, lat_first(name, crs)));
         let cut = |s: &str| s.chars().take(80).collect::<String>();
         match (system(first), system(srs)) {
@@ -814,17 +914,14 @@ impl Index {
     }
 }
 
-/// Refuses a root that isn't a CityGML 1.0 or 2.0 city model.
+/// Refuses a root that isn't a CityGML 1.0, 2.0 or 3.0 city model.
 fn check_root(file_name: &str, e: &BytesStart) -> Result<()> {
     if e.local_name().into_inner() != "CityModel" {
         return Err(DataError::Format(format!("{file_name}: not a CityGML city model (its root isn't CityModel)")));
     }
     match root_namespace(e).as_deref().map(str::trim) {
         Some(ns) if VERSIONS.contains(&ns) => Ok(()),
-        Some("http://www.opengis.net/citygml/3.0") => {
-            Err(DataError::Unsupported(format!("{file_name}: CityGML 3.0: RustGIS reads CityGML 1.0 and 2.0")))
-        }
-        _ => Err(DataError::Format(format!("{file_name}: not a CityGML 1.0 or 2.0 city model (its root's namespace isn't one)"))),
+        _ => Err(DataError::Format(format!("{file_name}: not a CityGML 1.0, 2.0 or 3.0 city model (its root's namespace isn't one)"))),
     }
 }
 
@@ -912,7 +1009,7 @@ fn undrawn_at(n: &Node) -> bool {
 /// Whether an element is in an implicit geometry's prototype, in its own system: only its implicit
 /// geometries place it.
 fn in_prototype(n: &Node) -> bool {
-    n.ancestors().skip(1).any(|a| local(&a) == "relativeGMLGeometry")
+    n.ancestors().skip(1).any(|a| prototype_property(&a))
 }
 
 /// Whether a line or ring holds a point or curve given only by a link, so it isn't whole.
@@ -945,10 +1042,10 @@ fn is_object(e: &Node) -> bool {
             || local(e) == "TINRelief"
             || elements(*e).any(|p| {
                 // A terrain intersection is an auxiliary line, not the feature's geometry.
-                !local(&p).ends_with("TerrainIntersection")
+                !terrain_intersection(local(&p))
                     && (property_lod(&p).is_some()
                         || elements(p).next().is_some_and(|g| is_geometry(&g))
-                        || (SURFACE_PROPERTIES.contains(&local(&p)) && elements(p).any(|s| !is_gml(&s)))
+                        || (surface_property(&p) && elements(p).any(|s| !is_gml(&s)))
                         // A wrapper with no id of its own, which carries the objects it holds.
                         || elements(p).any(|c| is_object(&c)))
             }))
@@ -982,11 +1079,15 @@ fn measure(text: &str, uom: Option<&str>) -> Option<Json> {
 /// `gen:measureAttribute` with its unit; the others are text), and a set's as an object of its
 /// attributes.
 fn generic_value(a: &Node) -> Json {
-    if local(a) == "genericAttributeSet" {
+    // 3.0 names them with a capital (`gen:IntAttribute`), and wraps each of a set's in a
+    // `genericAttribute`.
+    let kind = local(a);
+    if kind.eq_ignore_ascii_case("genericAttributeSet") {
         let mut set = Map::new();
         for member in elements(*a) {
-            if let Some(name) = attribute(&member, "name") {
-                insert(&mut set, name, generic_value(&member));
+            let member = if local(&member) == "genericAttribute" { elements(member).next() } else { Some(member) };
+            if let Some((member, name)) = member.and_then(|m| generic_name(&m).map(|n| (m, n))) {
+                insert(&mut set, &name, generic_value(&member));
             }
         }
         return Json::Object(set);
@@ -994,13 +1095,36 @@ fn generic_value(a: &Node) -> Json {
     let value = elements(*a).find(|v| local(v) == "value");
     let text = value.as_ref().map(text).unwrap_or_default();
     let text = text.trim();
-    let number = match local(a) {
-        "intAttribute" => text.parse::<i64>().ok().map(Json::from),
-        "doubleAttribute" => measure(text, None),
-        "measureAttribute" => measure(text, value.as_ref().and_then(|v| attribute(v, "uom")).or_else(|| attribute(a, "uom"))),
-        _ => None,
+    let number = if kind.eq_ignore_ascii_case("intAttribute") {
+        text.parse::<i64>().ok().map(Json::from)
+    } else if kind.eq_ignore_ascii_case("doubleAttribute") {
+        measure(text, None)
+    } else if kind.eq_ignore_ascii_case("measureAttribute") {
+        measure(text, value.as_ref().and_then(|v| attribute(v, "uom")).or_else(|| attribute(a, "uom")))
+    } else {
+        None
     };
     number.unwrap_or_else(|| Json::from(text))
+}
+
+/// A generic attribute's name: an attribute of it in 1.0 and 2.0 (kept as written), its `gen:name`
+/// in 3.0 (none when blank).
+fn generic_name(a: &Node) -> Option<String> {
+    if let Some(name) = attribute(a, "name") {
+        return Some(name.to_string());
+    }
+    elements(*a).find(|n| local(n) == "name").map(|n| text(&n).trim().to_string()).filter(|n| !n.is_empty())
+}
+
+/// 3.0's group member: a `groupMember` holding a `Role`, which holds the member (a `groupMember`)
+/// and its role (`role`). Gives the member, and whether the role is given.
+fn group_role<'a, 'i>(p: &Node<'a, 'i>) -> Option<(bool, Node<'a, 'i>)> {
+    if local(p) != "groupMember" || !in_3_0(p) {
+        return None;
+    }
+    let role = elements(*p).next().filter(|r| local(r) == "Role")?;
+    let member = elements(role).find(|m| local(m) == "groupMember")?;
+    Some((elements(role).any(|r| local(&r) == "role" && !text(&r).trim().is_empty()), member))
 }
 
 /// Whether a unit of measure is the metre.
@@ -1063,11 +1187,15 @@ struct Said {
     repeated_ids: usize,
     /// Geometries whose `gml:id`, which a link names, an earlier element of a member has too.
     repeated_geometry_ids: usize,
-    /// Links that would make one object another's part (`consistsOfBuildingPart`, `groupMember`, a
-    /// group's `parent`) naming no other object of the file, or made by an object with no id.
+    /// Links that would make one object another's part (`consistsOfBuildingPart`, 3.0's
+    /// `buildingPart`, `bridgePart` and `tunnelPart`, `groupMember`, a group's `parent`) naming no other object of the file, or made by an object with no id.
     object_links: usize,
     /// Group members with a role in their group (`role`), which isn't kept.
     group_roles: usize,
+    /// 3.0's relations between city objects (`relatedTo`, a `CityObjectRelation`), not read.
+    object_relations: usize,
+    /// 3.0's versions of the model (`versionMember`, `versionTransitionMember`), not read.
+    versions: usize,
     terrain_intersections: usize,
     appearances: usize,
     /// Curves with arcs or splines, read as straight lines through their points.
@@ -1078,6 +1206,8 @@ struct Said {
     not_objects: usize,
     /// Values naming the code list they are taken from (`codeSpace`), which isn't kept.
     code_spaces: usize,
+    /// Sets of generic attributes naming a code list (`codeSpace`), which isn't kept.
+    set_code_spaces: usize,
     /// Values with attributes other than their unit and code list (a language, `xml:lang`), which
     /// aren't kept.
     value_attributes: usize,
@@ -1159,11 +1289,19 @@ impl Said {
         say(
             self.object_links,
             format!(
-                "{} links between city objects (consistsOfBuildingPart, groupMember, a group's parent) name no other city object of the file, or are made by one with no gml:id: the link is kept as an attribute, but no parent is",
+                "{} links between city objects (consistsOfBuildingPart, buildingPart, bridgePart, tunnelPart, groupMember, a group's parent) name no other city object of the file, or are made by one with no gml:id: the link is kept as an attribute, but no parent is",
                 self.object_links
             ),
         );
         say(self.group_roles, format!("{} members of groups (groupMember) have a role in their group, which isn't kept", self.group_roles));
+        say(
+            self.object_relations,
+            format!("{} relations between city objects (CityObjectRelation) aren't read and are left out", self.object_relations),
+        );
+        say(
+            self.versions,
+            format!("the file's versions (versionMember, versionTransitionMember) aren't read: {} are left out", self.versions),
+        );
         say(
             self.terrain_intersections,
             format!(
@@ -1192,6 +1330,13 @@ impl Said {
             ),
         );
         say(
+            self.set_code_spaces,
+            format!(
+                "{} sets of generic attributes (genericAttributeSet) name a code list (codeSpace), which isn't kept",
+                self.set_code_spaces
+            ),
+        );
+        say(
             self.value_attributes,
             format!(
                 "{} values have attributes other than their unit (uom) or code list (codeSpace), such as a language (xml:lang), which aren't kept: the value is kept on its own",
@@ -1200,7 +1345,10 @@ impl Said {
         );
         say(
             self.unnamed_generic,
-            format!("{} generic attributes in a set (genericAttributeSet) have no name, and are left out", self.unnamed_generic),
+            format!(
+                "{} generic attributes (genericAttribute, or a member of a genericAttributeSet) have no name, and are left out",
+                self.unnamed_generic
+            ),
         );
         say(
             self.not_features,
@@ -1606,16 +1754,22 @@ impl Reading {
     /// set's members with no name.
     fn said_generic(&mut self, a: &Node) {
         for v in a.descendants().filter(|n| n.is_element() && local(n) == "value") {
-            let measure = v.parent_element().is_some_and(|p| local(&p) == "measureAttribute");
+            let measure = v.parent_element().is_some_and(|p| local(&p).eq_ignore_ascii_case("measureAttribute"));
             self.said.code_spaces += usize::from(attribute(&v, "codeSpace").is_some());
             self.said.value_attributes +=
                 usize::from(v.attributes().any(|at| !(at.name() == "codeSpace" || (measure && at.name() == "uom"))));
         }
-        self.said.unnamed_generic += a
-            .descendants()
-            .filter(|n| n.is_element() && n.parent_element().is_some_and(|p| local(&p) == "genericAttributeSet"))
-            .filter(|n| attribute(n, "name").is_none())
-            .count();
+        // A set's members with no name, and the code list a set names: 2.0 names a member by its
+        // `name` and a set's list by its `codeSpace`, attributes; 3.0 by `gen:name` and
+        // `gen:codeSpace` children, each member in a `genericAttribute`.
+        for set in a.descendants().filter(|n| n.is_element() && local(n).eq_ignore_ascii_case("genericAttributeSet")) {
+            self.said.set_code_spaces +=
+                usize::from(attribute(&set, "codeSpace").is_some() || elements(set).any(|c| local(&c) == "codeSpace"));
+            for member in elements(set).filter(|m| !matches!(local(m), "name" | "codeSpace")) {
+                let member = if local(&member) == "genericAttribute" { elements(member).next() } else { Some(member) };
+                self.said.unnamed_generic += usize::from(member.is_none_or(|m| generic_name(&m).is_none()));
+            }
+        }
     }
 
     /// Reads a city object into its rows, then the objects nested in it. Its links are followed
@@ -1638,16 +1792,36 @@ impl Reading {
         let mut heads = Vec::new();
         let mut address = false;
         for p in elements(e) {
+            // A group member's role in its group isn't kept; 3.0 writes the member inside it.
+            let p = match group_role(&p) {
+                Some((role, member)) => {
+                    self.said.group_roles += usize::from(role);
+                    member
+                }
+                None => p,
+            };
             let name = local(&p);
             let first = elements(p).next();
-            // A group member's role in its group isn't kept.
             self.said.group_roles += usize::from(name == "groupMember" && attribute(&p, "role").is_some());
             if (name.ends_with("Attribute") || name == "genericAttributeSet")
                 && let Some(key) = attribute(&p, "name")
             {
                 self.said_generic(&p);
                 insert(&mut attributes, key, generic_value(&p));
-            } else if name.ends_with("TerrainIntersection") {
+            } else if name == "genericAttribute" && in_3_0(&p) {
+                // 3.0's: the attribute inside, named by its `gen:name`.
+                for a in elements(p) {
+                    match generic_name(&a) {
+                        Some(key) => {
+                            self.said_generic(&a);
+                            insert(&mut attributes, &key, generic_value(&a));
+                        }
+                        None => self.said.unnamed_generic += 1,
+                    }
+                }
+            } else if name == "relatedTo" && in_3_0(&p) && first.is_some_and(|f| local(&f) == "CityObjectRelation") {
+                self.said.object_relations += 1;
+            } else if terrain_intersection(name) {
                 // Where the object meets the ground: an auxiliary line, not the object's shape.
                 self.said.terrain_intersections += 1;
             } else if let Some(rank) = property_lod(&p) {
@@ -1656,7 +1830,7 @@ impl Reading {
                 address = true;
             } else if name == "appearance" {
                 self.said.appearances += 1;
-            } else if only_link(&p) && SURFACE_PROPERTIES.contains(&name) {
+            } else if only_link(&p) && surface_property(&p) {
                 self.said.links += 1;
             } else if let Some(href) = attribute(&p, "href").filter(|_| first.is_none()) {
                 // A relation to another feature (a group's members, a generalization), kept as
@@ -1664,7 +1838,9 @@ impl Reading {
                 // link a child and its parent, as if written one in the other.
                 let other = fragment(href);
                 let relation = match name {
-                    _ if name.starts_with("consistsOf") || name == "groupMember" => Some((other, id)),
+                    _ if name.starts_with("consistsOf") || (PARTS.contains(&name) && in_3_0(&p)) || name == "groupMember" => {
+                        Some((other, id))
+                    }
                     "parent" if ty == "CityObjectGroup" => Some((id, other)),
                     _ => None,
                 };
@@ -1681,7 +1857,7 @@ impl Reading {
             } else if first.is_some_and(|f| is_gml(&f)) {
                 // A geometry in a property that names no level of detail (a group's, a relief's).
                 self.geometry(&p, At { lod: None, ground: false }, &mut parts, &mut links);
-            } else if first.is_some_and(|f| SURFACE_PROPERTIES.contains(&name) && local(&f).starts_with(char::is_uppercase)) {
+            } else if first.is_some_and(|f| surface_property(&p) && local(&f).starts_with(char::is_uppercase)) {
                 elements(p).for_each(|s| self.surface(&s, &mut parts, &mut links));
             } else if elements(p).any(|c| is_object(&c)) {
                 // The objects; a feature beside them with no id and no geometry is said. A group's
@@ -1969,7 +2145,7 @@ impl Reading {
         for p in elements(*s) {
             if let Some(rank) = property_lod(&p) {
                 self.geometry(&p, At { lod: Some(rank), ground }, parts, links);
-            } else if local(&p) == "opening" {
+            } else if local(&p) == "opening" || (local(&p) == "fillingSurface" && in_3_0(&p)) {
                 if only_link(&p) {
                     self.said.links += 1;
                 } else {
@@ -2414,7 +2590,7 @@ impl<'a, 'i> Walk<'_, 'a, 'i> {
         Some(())
     }
 
-    /// An implicit geometry: its prototype (`relativeGMLGeometry`), written in place or given by a
+    /// An implicit geometry: its prototype ([`PROTOTYPES`]), written in place or given by a
     /// link, placed by its matrix at its reference point once its object's own geometries are read.
     /// One whose prototype is in another file (`libraryObject`), or whose matrix isn't 16 numbers
     /// with `0 0 0 1` last, is its reference point, with no height.
@@ -2443,7 +2619,7 @@ impl<'a, 'i> Walk<'_, 'a, 'i> {
             }
             Placement::new(&v, reference)
         });
-        let shape = elements(*g).find(|c| local(c) == "relativeGMLGeometry");
+        let shape = elements(*g).find(prototype_property);
         let to = match shape {
             Some(rel) if only_link(&rel) => attribute(&rel, "href").map(To::Href),
             Some(rel) => elements(rel).next().map(To::Node),

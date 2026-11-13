@@ -177,11 +177,16 @@ box handles rather than silently fitting a new box; undo restores them. Saving/r
 sharing GeoJSON leaves **ordinary polygons** and ordinary feature properties. In-session edits
 preserve feature identity; import uses the normal GeoJSON reader. There is no automatic
 recognition of imported polygons. Use **Edit Vertices** to edit those polygons.
-Data exports include one counted note explaining that box construction does not round-trip.
-Polygons contain four transformed corners; curved grid edges are represented by straight
-polygon edges, as the export note explains.
+**Export Features** (`share.exportLayer`) includes one counted note explaining that box
+construction does not round-trip. Other shares and project saves do not currently emit this
+note; their saved output also has no box construction.
+Source polygons contain four transformed corners joined by straight edges; curved grid edges
+are approximated. The target format may further approximate or omit geometry: CSV writes
+representative points and GPX does not retain polygon areas, with their own format-specific notes.
 
-Commands use the same editing and undo paths:
+Commands use the same editing and undo paths. The follow-up examples assume `edit.addBox`
+returned `{"row":0,...}`; replace `0` with the returned row when the layer already has features.
+Pass that feature's ID as `featureId` when updating or deleting after other edits:
 
 ```text
 edit.addBox={"layer":"Training polygons","box":{"center":[1000,1000],"width":200,"height":100,"angle":30},"attributes":{"class":"vehicle"}}
@@ -192,8 +197,8 @@ edit.deleteBox={"layer":"Training polygons","row":0}
 
 `attributes` names must already exist in the layer. `edit.updateBox` and `edit.deleteBox` also
 accept `featureId` to refuse a stale row. `edit.boxInfo` returns the current construction;
-updates keep its frame and the feature's identity/attributes. An optional `box.frame` holds
-`epsg`, original `width`/`height` and the full GDAL-order `affine` array. Only recognised EPSG
+updates keep its frame when `box.frame` is omitted, and preserve the feature's identity/attributes.
+An optional `box.frame` holds `epsg`, original `width`/`height` and the full GDAL-order `affine` array. Only recognised EPSG
 frames with supported datum transformations are accepted. These parameters are command input,
 not GeoJSON properties or a new saved-file representation.
 

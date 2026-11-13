@@ -259,7 +259,7 @@ pub fn dialog(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
         go |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         #[cfg(not(target_arch = "wasm32"))]
         if ui.button(crate::tl!("Folder…")).clicked()
-            && let Some(d) = rfd::FileDialog::new().pick_folder()
+            && let Some(d) = crate::filedialog::FileDialog::new().pick_folder()
         {
             app.ui.zarr.address = d.display().to_string();
             go = true;

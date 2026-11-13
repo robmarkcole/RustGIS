@@ -96,9 +96,7 @@ pub(crate) fn add_geometry(s: &mut Session, id: u32, p: &Json, g: Geometry) -> C
     l.dataset.push(Some(g), attrs?);
     l.touch_geometry();
     let row = l.dataset.features.len() - 1;
-    let feature = l.dataset.features.get(row).map(|f| f.id).ok_or("feature was not added")?;
     l.selection = vec![row];
-    crate::box_edit::forget_feature(s, id, feature);
     super::design::apply(s, id, vec![super::design::Change { before: None, row: Some(row) }])?;
     for (field, key) in losses {
         s.notify_text(
@@ -329,11 +327,6 @@ fn delete(s: &mut Session, _: &Json) -> CmdResult {
         removed.push((l.id, changes));
     }
     for (id, changes) in removed {
-        for change in &changes {
-            if let Some(feature) = &change.before {
-                crate::box_edit::forget_feature(s, id, feature.id);
-            }
-        }
         super::design::apply(s, id, changes)?;
     }
     s.notify(format!("Deleted {n} features"), false);

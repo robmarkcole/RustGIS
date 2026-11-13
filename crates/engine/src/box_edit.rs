@@ -208,7 +208,7 @@ impl Cache {
                 count += 1;
             }
         }
-        Ok((count > 0).then(|| format!("{count} rotated box(es) exported as ordinary polygons with four transformed corners: box construction does not survive saving or reimport, and curved grid edges are represented by straight polygon edges")))
+        Ok((count > 0).then(|| format!("{count} rotated box(es): session-only construction is not included in this export and will not survive reimport; the source polygons use four transformed corners, with curved grid edges approximated by straight edges")))
     }
 }
 /// Newly inserted ordinary features must never inherit a deleted feature's construction if
@@ -255,8 +255,14 @@ pub fn check_layer(s: &Session, id: u32) -> Result<(), String> {
     }
     Ok(())
 }
-fn parsed(p: &Value) -> Result<BoxSpec, String> {
-    let mut b: BoxSpec = BoxSpec::deserialize(p.get("box").ok_or("box is required")?).map_err(|e| e.to_string())?;
+fn parsed(p: &Value, previous_frame: Option<&Frame>) -> Result<BoxSpec, String> {
+    let value = p.get("box").ok_or("box is required")?;
+    let mut b: BoxSpec = BoxSpec::deserialize(value).map_err(|e| e.to_string())?;
+    if value.get("frame").is_none()
+        && let Some(frame) = previous_frame
+    {
+        b.frame = frame.clone();
+    }
     if !b.angle.is_finite() || b.angle.abs() > 1e12 {
         return Err("box angle must be finite".into());
     }
@@ -271,7 +277,7 @@ fn add(s: &mut Session, p: &Value) -> CmdResult {
     let id = s.layer_id(p)?;
     check_layer(s, id)?;
     s.boxes.room()?;
-    let b = parsed(p)?;
+    let b = parsed(p, None)?;
     if let Some(attributes) = p.get("attributes") {
         let attributes = attributes.as_object().ok_or("attributes must be an object")?;
         let layer = s.map().layer(id).ok_or("no layer")?;
@@ -309,7 +315,7 @@ fn update(s: &mut Session, p: &Value) -> CmdResult {
     if p.get("featureId").is_some_and(|v| v.as_u64() != Some(key.3)) {
         return Err("the feature changed during this edit".into());
     }
-    let b = parsed(p)?;
+    let b = parsed(p, Some(&before.frame))?;
     if b.frame != before.frame {
         return Err("a box's construction grid is frozen; start another box to change grids".into());
     }
@@ -332,7 +338,6 @@ fn delete_box(s: &mut Session, p: &Value) -> CmdResult {
     let before = layer.dataset.features.remove(row);
     layer.selection = layer.selection.iter().copied().filter(|r| *r != row).map(|r| if r > row { r - 1 } else { r }).collect();
     layer.touch_geometry();
-    forget_feature(s, id, before.id);
     crate::cmd::design::apply(s, id, vec![crate::cmd::design::Change { before: Some(before), row: None }])?;
     Ok(json!({"deleted":1,"featureId":key.3}))
 }
@@ -524,6 +529,23 @@ mod tests {
         assert!(s.boxes.export_note(s.map().instance_id(), &ordinary).unwrap().is_none());
     }
     #[test]
+    fn box_edit_non_polygon_formats_keep_their_geometry_loss_notices() {
+        let (mut s, id) = session();
+        add(&mut s, &spec());
+        for ext in ["csv", "gpx"] {
+            let path = std::env::temp_dir().join(format!("rustgis-box-format-{}.{ext}", std::process::id()));
+            s.notices.clear();
+            s.run("share.exportLayer", &json!({"layer":id,"path":path})).unwrap();
+            let notes: Vec<_> = s.notices.iter().map(|n| n.text.as_str()).collect();
+            let construction = notes.iter().find(|n| n.starts_with("1 rotated box")).unwrap();
+            assert!(construction.contains("construction is not included"));
+            assert!(!construction.contains("exported as ordinary polygons"));
+            assert!(notes.iter().any(|n| if ext == "gpx" { n.contains("GPX has no areas") } else { n.contains("point") }));
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
     fn box_edit_delete_targets_one_object_and_row_id_reuse_never_adopts_a_polygon() {
         let (mut s, id) = session();
         let b = spec();
@@ -541,6 +563,55 @@ mod tests {
         s.run("edit.delete", &json!({})).unwrap();
         s.run("edit.addFeature", &json!({"geometry":rustgis_data::io::geometry_to_geojson(&b.geometry().unwrap())})).unwrap();
         assert!(s.box_spec(id, 0).is_none());
+    }
+
+    #[test]
+    fn box_edit_cut_paste_reused_ids_stay_ordinary_and_history_restores_only_originals() {
+        let (mut s, id) = session();
+        let b = spec();
+        let kept = add(&mut s, &b);
+        let cut = add(&mut s, &b);
+        let original = s.map().layer(id).unwrap().dataset.features[cut].clone();
+        s.run("edit.cut", &json!({})).unwrap();
+        assert_eq!(s.boxes.len, 1);
+        assert_eq!(s.box_spec(id, kept), Some(b.clone()));
+        s.run("edit.paste", &json!({"layer":id})).unwrap();
+        assert_eq!(s.map().layer(id).unwrap().dataset.features[cut], original);
+        assert!(s.box_spec(id, cut).is_none());
+        assert_eq!(s.box_spec(id, kept), Some(b.clone()));
+        s.run("edit.undo", &json!({})).unwrap();
+        assert_eq!(s.map().layer(id).unwrap().dataset.features.len(), 1);
+        s.run("edit.undo", &json!({})).unwrap();
+        assert_eq!(s.box_spec(id, cut), Some(b.clone()));
+        s.run("edit.redo", &json!({})).unwrap();
+        s.run("edit.redo", &json!({})).unwrap();
+        assert!(s.box_spec(id, cut).is_none());
+        assert_eq!(s.box_spec(id, kept), Some(b));
+    }
+
+    #[test]
+    fn box_edit_update_inherits_omitted_image_grid_before_geometry_validation() {
+        let (mut s, id) = session();
+        let grid = ImageGrid::new(400, 300, Crs::from_epsg(32633).unwrap(), [500_000., 0.8, 0.2, 1000., 0.1, -0.8]).unwrap();
+        let b = BoxSpec { frame: Frame::from_grid(&grid).unwrap(), center: [200., 150.], width: 60., height: 30., angle: 17. };
+        let row = add(&mut s, &b);
+        let mut next = b.clone();
+        next.width = 80.;
+        next.angle = 43.;
+        let mut value = serde_json::to_value(&next).unwrap();
+        value.as_object_mut().unwrap().remove("frame");
+        s.run("edit.updateBox", &json!({"row":row,"box":value})).unwrap();
+        assert_eq!(s.box_spec(id, row), Some(next.clone()));
+        assert_eq!(s.map().layer(id).unwrap().dataset.features[row].geometry, Some(next.geometry().unwrap()));
+        let depth = s.undo_depth();
+        for bad in [json!(Frame::default()), Value::Null, json!({"epsg":0})] {
+            value["frame"] = bad;
+            assert!(s.run("edit.updateBox", &json!({"row":row,"box":value})).is_err());
+            assert_eq!(s.box_spec(id, row), Some(next.clone()));
+            assert_eq!(s.undo_depth(), depth);
+        }
+        s.run("edit.undo", &json!({})).unwrap();
+        assert_eq!(s.box_spec(id, row), Some(b));
     }
 
     #[test]

@@ -327,6 +327,52 @@ pub(crate) fn horizontal_epsg(code: u32) -> u32 {
     }
 }
 
+/// Vertical systems that measure heights, upward, in metres, by EPSG code: no notice.
+const METRE_HEIGHTS: [u32; 31] = [
+    3855, 3900, 5613, 5621, 5701, 5703, 5705, 5709, 5710, 5711, 5713, 5714, 5717, 5720, 5728, 5729, 5730, 5731, 5732, 5773, 5776, 5783,
+    5797, 5799, 5941, 6638, 6647, 6695, 7837, 7839, 9389,
+];
+/// Vertical systems whose unit isn't the metre or whose axis points down (a depth), by EPSG code: the
+/// unit, and whether it measures depth.
+const OTHER_VERTICALS: [(u32, &str, bool); 10] = [
+    (5702, "US survey feet", false),
+    (6360, "US survey feet", false),
+    (8052, "US survey feet", false),
+    (8228, "feet", false),
+    (8050, "feet", false),
+    (5715, "metres", true),
+    (6357, "metres", true),
+    (6358, "US survey feet", true),
+    (8051, "feet", true),
+    (8053, "US survey feet", true),
+];
+
+/// What a compound system's vertical part (`system`, as a file names it) means for the heights, when
+/// it isn't a height in metres: a unit other than the metre, a depth, or a system RustGIS doesn't
+/// know. Heights are kept as the file has them, and Style › Extrusion reads metres upward.
+pub(crate) fn vertical_note(system: &str) -> Option<String> {
+    let code = vertical_code(system)?;
+    let shown: String = system.chars().take(80).collect();
+    Some(match OTHER_VERTICALS.iter().find(|(c, _, _)| Some(*c) == code) {
+        Some((_, unit, false)) => format!(
+            "a vertical system the file names ({shown}) measures heights in {unit}: z_min, z_max and height are kept as the file has them, and Style › Extrusion reads metres, so objects may stand at the wrong height"
+        ),
+        Some((_, unit, true)) => format!(
+            "a vertical system the file names ({shown}) measures depth, downward, in {unit}: z_min and z_max are kept as the file has them, so the lower value is the higher point, and Style › Extrusion reads heights in metres"
+        ),
+        None => format!(
+            "a vertical system the file names ({shown}) is one RustGIS doesn't know the unit or direction of: z_min, z_max and height are kept as the file has them, and Style › Extrusion reads heights in metres"
+        ),
+    })
+}
+
+/// A compound system's vertical part (`system`, as a file names it) by its EPSG code, the name
+/// standing for one that names none; none when it is a height in metres, which needs no notice.
+pub(crate) fn vertical_code(system: &str) -> Option<Option<u32>> {
+    let code = crate::ogc::warp::epsg_of(system);
+    (!code.is_some_and(|c| METRE_HEIGHTS.contains(&c))).then_some(code)
+}
+
 /// The system a name stands for, by its horizontal part, if RustGIS knows it.
 pub(crate) fn known_system(system: &str) -> Option<Crs> {
     crate::ogc::warp::epsg_of(system).and_then(|c| Crs::from_epsg(horizontal_epsg(c)))
@@ -355,11 +401,14 @@ impl Reach {
 
 /// The coordinate system: the one given, the one the file names (`named`), or longitude/latitude
 /// when it names none and every point (`reach`) can be one. Anything else is an error, not a guess.
-/// A file only names EPSG codes: what it says is never registered as a new definition.
+/// A file only names EPSG codes: what it says is never registered as a new definition. When it
+/// names a vertical system (`vertical_named`), that system's unit, said by the reader, is its
+/// heights', not the horizontal one's.
 pub(crate) fn coordinate_system(
     file_name: &str,
     given: Option<Crs>,
     named: Option<&str>,
+    vertical_named: bool,
     reach: &Reach,
     notes: &mut Vec<String>,
 ) -> Result<Crs> {
@@ -401,7 +450,7 @@ pub(crate) fn coordinate_system(
     if crs == Crs::LonLat && !reach.within(180.5, 90.5) {
         notes.push("coordinates are not longitude/latitude; RustGIS reads them as WGS 84 and they may draw out of place".into());
     }
-    if let Some(unit) = crs.height_unit_not_metre() {
+    if let Some(unit) = crs.height_unit_not_metre().filter(|_| !vertical_named) {
         notes.push(format!(
             "{} measures in {unit}: z_min, z_max and height are kept as the file has them, and Style › Extrusion reads metres, so objects may stand at the wrong height",
             crs.label()

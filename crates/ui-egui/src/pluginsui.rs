@@ -596,7 +596,7 @@ pub fn install_from_file(app: &mut RustGisApp, path: Option<&str>) {
     }
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(path) =
-        rfd::FileDialog::new().set_title(tl!("Install a plugin")).add_filter(tl!("RustGIS plugin"), &["rgplugin"]).pick_file()
+        crate::filedialog::FileDialog::new().set_title(tl!("Install a plugin")).add_filter(tl!("RustGIS plugin"), &["rgplugin"]).pick_file()
     {
         match std::fs::read(&path) {
             Ok(bytes) => received(app, bytes, None),
@@ -1045,7 +1045,7 @@ fn settings_tab(app: &mut RustGisApp, ui: &mut egui::Ui, t: &Tokens) {
                 .button(tl!("Add Plugin Folder…"))
                 .on_hover_text(tl!("Load an unpacked plugin from its folder while you develop it."))
                 .clicked()
-                && let Some(dir) = rfd::FileDialog::new().set_title(tl!("Plugin folder")).pick_folder()
+                && let Some(dir) = crate::filedialog::FileDialog::new().set_title(tl!("Plugin folder")).pick_folder()
             {
                 let r = app.run("plugin.install", json!({"path": dir.display().to_string()}));
                 app.plugins.message = Some(match r {

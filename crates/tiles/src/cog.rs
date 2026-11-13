@@ -14,6 +14,7 @@
 //! reads, tile counts and sizes are bounded (see [`rustgis_data::raster::cog`]).
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use rustgis_data::diagnostics::message_with_address;
@@ -369,6 +370,33 @@ pub fn info(url: &str) -> Result<Option<Arc<Info>>, String> {
     Ok(None)
 }
 
+/// A file's info if its header is already in, without asking for it (a layer the map doesn't
+/// draw starts no read): what has landed, for what is said once it has. `None` while it is being
+/// read, after a failed read, or where the address may not be read now (a login that ended).
+pub fn info_landed(url: &str) -> Option<Arc<Info>> {
+    crate::cache::check_still(&crate::cache::current_still()).ok()?;
+    crate::logins::check(url).ok()?;
+    let url = split(url).0;
+    match infos().lock().unwrap_or_else(|e| e.into_inner()).get(url) {
+        Some(State::Ready(info)) => Some(info.clone()),
+        _ => None,
+    }
+}
+
+/// Whether a file's header is being read now (asked for, not in yet), without asking for it.
+pub fn info_loading(url: &str) -> bool {
+    matches!(infos().lock().unwrap_or_else(|e| e.into_inner()).get(split(url).0), Some(State::Loading(_)))
+}
+
+/// How many headers have landed in this run: what looks for headers landed since it last looked
+/// (the files a dated series showed before the slider moved on) looks again only when it changes.
+static LANDED: AtomicU64 = AtomicU64::new(0);
+
+/// The count of headers landed so far ([`LANDED`]).
+pub fn landed_count() -> u64 {
+    LANDED.load(Ordering::Relaxed)
+}
+
 /// Shares parsed headers and loading waiters, retaining retry delays only for resource failures.
 fn with_info(url: &str, then: Box<dyn FnOnce(Result<Arc<Info>, String>) + Send>) {
     let then = caller_callback(then);
@@ -418,7 +446,10 @@ fn with_info(url: &str, then: Box<dyn FnOnce(Result<Arc<Info>, String>) + Send>)
             let waiting = {
                 let mut i = infos().lock().unwrap_or_else(|e| e.into_inner());
                 let old = match &r {
-                    Ok(info) => i.insert(key, State::Ready(info.clone())),
+                    Ok(info) => {
+                        LANDED.fetch_add(1, Ordering::Relaxed);
+                        i.insert(key, State::Ready(info.clone()))
+                    }
                     Err(_) if transient => i.remove(&key),
                     Err(e) => {
                         // Read again once its wait is over: the map draws again then (a 429

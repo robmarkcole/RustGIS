@@ -16,6 +16,7 @@ mod notice_text;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod observe;
 pub mod peer;
+pub mod platform;
 pub mod policy;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod prefs;
@@ -754,6 +755,9 @@ pub struct Session {
     /// Notices given in this session, including ones no longer kept (see [`Session::notices_since`]),
     /// less those a failed command withdrew.
     notices_given: u64,
+    /// The count of cloud-optimised GeoTIFF headers landed when [`Session::notice_landed_rasters`]
+    /// last looked back at the dates a dated series has shown (`cog::landed_count`).
+    cog_headers_seen: u64,
     /// Layer whose attribute table is open.
     pub table_layer: Option<u32>,
     /// The standalone table shown in the attribute table instead of a layer, by its id.
@@ -1175,6 +1179,7 @@ impl Session {
             bundled_roots_said: false,
             diagnostics: rustgis_data::diagnostics::History::default(),
             notices_given: 0,
+            cog_headers_seen: 0,
             table_layer: None,
             table_standalone: None,
             clipboard: None,
@@ -2043,8 +2048,10 @@ impl Session {
     /// read in place land later: in the browser, a project, an import): what the file's header
     /// left out (`Raster::lost`: a colour table missing or short, GDAL metadata that doesn't
     /// decode), an overview statistics and tools read, a layer read in place that couldn't be
-    /// read, and why. Once for each layer's pixels or failure, one notice of each kind; the app
-    /// calls it each frame.
+    /// read, and why; and what the header of a cloud-optimised GeoTIFF drawn as a tile layer
+    /// leaves out, once that header lands (each date's file of a dated series as it is shown).
+    /// Once for each layer's pixels, failure or file, one notice of each kind; the app calls it
+    /// each frame.
     pub fn notice_landed_rasters(&mut self) {
         // Streamed vector windows land after project opening too. Check each installed read
         // once, keeping the same counted notice channel as retained resident expressions.
@@ -2086,6 +2093,53 @@ impl Session {
                 let Some(d) = rl.pixels_unsaid() else { continue };
                 if let Some(what) = in_place.then(|| in_place_overview(&d)).flatten() {
                     held.push((l.name.clone(), what));
+                }
+            }
+        }
+        // A cloud-optimised GeoTIFF drawn as a tile layer (a dated series, a data cube's file,
+        // AlphaEarth) whose header wasn't in as it was added (the browser, a project opened):
+        // what its header leaves out, as adding it says it, once its header lands. Its header is
+        // asked for by the map drawing or exporting it, or by adding it, not here: a layer the map
+        // doesn't draw starts no read. A dated series' other dates' files it has shown (the slider
+        // moved on before a header landed, an export of the time steps) are looked at again only
+        // when a header has landed since the last look; those then neither said nor being read
+        // (not asked for yet: the slider passed over them, or their tiles still wait their turn)
+        // are let go, so the list holds only reads under way. A date let go draws nothing until it
+        // is shown again, and is said then, as the date shown.
+        use render::rustgis_tiles::cog;
+        let landed = cog::landed_count();
+        let look_back = landed != self.cog_headers_seen;
+        self.cog_headers_seen = landed;
+        for m in &mut self.project.maps {
+            for t in m.tiles.iter_mut().filter(|t| t.kind == rustgis_map::tiles::TileKind::Cog) {
+                // The address shown now, while its header is being read, is kept among those shown,
+                // whatever showed it (a dated series added, its project opened).
+                let dated = t.time_url.is_some() || !t.time_urls.is_empty();
+                if dated && cog::info_loading(&t.url) {
+                    t.note_shown();
+                }
+                let back = look_back.then_some(t.headers_shown.iter().filter(|u| **u != t.url)).into_iter().flatten();
+                // By its file: a look changed at the address's end (`#bands=…`) reads no new header.
+                let mut hits = Vec::new();
+                for address in std::iter::once(&t.url).chain(back) {
+                    let file = cog::split(address).0;
+                    if t.headers_said.iter().any(|f| f == file) || hits.iter().any(|(f, _, _): &(String, _, _)| f == file) {
+                        continue;
+                    }
+                    let Some(info) = cog::info_landed(address) else { continue };
+                    hits.push((file.to_string(), cmd::layer::cog_tile_where(t, address), info));
+                }
+                for (file, shown, info) in hits {
+                    t.headers_said.push(file);
+                    lost.extend(cmd::layer::cog_tile_losses(&info).into_iter().map(|line| (shown.clone(), line)));
+                }
+                if look_back {
+                    // Kept while unsaid and shown now (its read may start as it is drawn), being
+                    // read, or landed since this look (said on the next).
+                    let (said, now) = (&t.headers_said, &t.url);
+                    t.headers_shown.retain(|u| {
+                        !said.iter().any(|f| f == cog::split(u).0) && (u == now || cog::info_loading(u) || cog::info_landed(u).is_some())
+                    });
                 }
             }
         }
@@ -2150,6 +2204,12 @@ impl Session {
     fn say_bundled_roots(&mut self, bundled: bool) {
         if bundled && !self.bundled_roots_said {
             self.bundled_roots_said = true;
+            // Android: the bundled roots are the only source yet (`rustgis_data::http`).
+            #[cfg(target_os = "android")]
+            self.warn(
+                "HTTPS servers are checked against the Mozilla roots bundled with RustGIS, not this device's own certificates: a server trusted only by a certificate installed on the device is refused",
+            );
+            #[cfg(not(target_os = "android"))]
             self.warn(
                 "This system has no CA certificates, so HTTPS servers are checked against the Mozilla roots bundled with RustGIS: install the system's CA certificates (or set SSL_CERT_FILE or SSL_CERT_DIR) to use its trust instead",
             );
@@ -2456,6 +2516,7 @@ impl Session {
         self.reopen_layout(open, saved);
         self.keep_time_position(&cur);
         self.keep_tile_pick(&cur);
+        self.keep_headers_said(&cur);
         self.redo.push((cur, was, label, actor, std::mem::replace(&mut self.state, state), files, old_trust, old_boxes));
         self.touch_all_geometry();
         true
@@ -2481,6 +2542,7 @@ impl Session {
         self.reopen_layout(open, saved);
         self.keep_time_position(&cur);
         self.keep_tile_pick(&cur);
+        self.keep_headers_said(&cur);
         self.undo.push((cur, was, label, actor, std::mem::replace(&mut self.state, state), files, old_trust, old_boxes));
         self.touch_all_geometry();
         true
@@ -2522,6 +2584,39 @@ impl Session {
             };
             if let Some(t) = at.and_then(|at| like.get_mut(at)) {
                 t.selected = true;
+            }
+        }
+    }
+
+    /// After undo or redo swaps the project: a cloud-optimised GeoTIFF tile layer keeps the files
+    /// whose header losses were said and the dates' addresses it has shown (neither is an undo
+    /// step), found again on the map of its name by its kind and its name or file (a rename
+    /// undone), so a file said since the restored copy was made isn't said again, and one shown
+    /// since is still said once its header lands. The restored addresses are looked at again on
+    /// the next landing check, a header having landed meanwhile or not.
+    fn keep_headers_said(&mut self, before: &Project) {
+        use render::rustgis_tiles::cog::split;
+        self.cog_headers_seen = u64::MAX;
+        let names: Vec<String> = self.project.maps.iter().map(|m| m.name.clone()).collect();
+        for (i, m) in self.project.maps.iter_mut().enumerate() {
+            // By its name, else (a map rename undone) the map in the same place, when no map of
+            // the restored project has that one's name.
+            let renamed = || before.maps.get(i).filter(|o| !names.contains(&o.name));
+            let Some(old) = before.maps.iter().find(|o| o.name == m.name).or_else(renamed) else { continue };
+            for t in m.tiles.iter_mut().filter(|t| t.kind == rustgis_map::tiles::TileKind::Cog) {
+                let same =
+                    |o: &&rustgis_map::tiles::TileLayer| o.kind == t.kind && (o.name == t.name || split(&o.url).0 == split(&t.url).0);
+                let old: Vec<&rustgis_map::tiles::TileLayer> = old.tiles.iter().filter(same).collect();
+                for file in old.iter().flat_map(|o| &o.headers_said) {
+                    if !t.headers_said.contains(file) {
+                        t.headers_said.push(file.clone());
+                    }
+                }
+                for address in old.iter().flat_map(|o| &o.headers_shown) {
+                    if t.headers_shown.len() < rustgis_map::time::MAX_STEPS && !t.headers_shown.contains(address) {
+                        t.headers_shown.push(address.clone());
+                    }
+                }
             }
         }
     }

@@ -75,6 +75,14 @@ pub(crate) fn horizontal(name: &str) -> &str {
     }
 }
 
+/// The vertical system of a compound URN (`urn:ogc:def:crs,crs:EPSG::25832,crs:EPSG::5783`, its
+/// second part, trimmed), or none when the name isn't one or names no second part.
+pub(crate) fn vertical(name: &str) -> Option<&str> {
+    let name = name.trim();
+    let rest = name.get(..16).filter(|head| head.eq_ignore_ascii_case("urn:ogc:def:crs,")).and(name.get(16..))?;
+    rest.split(',').nth(1).map(str::trim).filter(|v| !v.is_empty())
+}
+
 /// GML geometry elements read.
 const GEOMETRIES: &[&str] = &[
     "Point",
@@ -725,6 +733,23 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A compound URN's second part, trimmed, whatever the case of its head; none for any other name.
+    #[test]
+    fn a_compound_urn_names_its_vertical_part() {
+        assert_eq!(vertical("urn:ogc:def:crs,crs:EPSG::25832,crs:EPSG::5783"), Some("crs:EPSG::5783"));
+        assert_eq!(vertical(" URN:OGC:DEF:CRS,crs:EPSG::25832, crs:EPSG::5783 "), Some("crs:EPSG::5783"));
+        for name in [
+            "EPSG:25832",
+            "urn:ogc:def:crs:EPSG::25832",
+            "urn:ogc:def:crs,crs:EPSG::4979",
+            "urn:ogc:def:crs,crs:EPSG::25832,",
+            "urn:ogc:def:crs,crs:EPSG::25832, ,x",
+            "",
+        ] {
+            assert_eq!(vertical(name), None, "{name}");
+        }
+    }
     use crate::FieldType;
 
     const WFS: &str = r#"<wfs:FeatureCollection xmlns:wfs="http://www.opengis.net/wfs/2.0" xmlns:gml="http://www.opengis.net/gml/3.2" xmlns:app="http://example.com/app">

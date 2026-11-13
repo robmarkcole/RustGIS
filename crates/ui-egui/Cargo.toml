@@ -29,8 +29,11 @@ sys-locale = { version = "0.3", features = ["js"] }
 # Pictures kept with features (photo thumbnails), shown in the identify popup.
 image = { workspace = true, features = ["gif", "jpeg", "webp"] }
 
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# The system's file dialogs. `rfd` has no Android backend: `filedialog.rs` stands in there.
+[target.'cfg(not(any(target_arch = "wasm32", target_os = "android")))'.dependencies]
 rfd = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # Help › Check for Updates checks a downloaded installer against the release's SHA256SUMS.
 sha2 = { workspace = true }
 

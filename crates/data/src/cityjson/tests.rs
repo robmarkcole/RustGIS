@@ -857,6 +857,27 @@ fn raising_parents_is_bounded() {
     assert_eq!((cycle[0].z, cycle[1].z), (Some((0.0, 2.0)), Some((0.0, 2.0))));
 }
 
+/// A compound URN is read by its horizontal part, not by its last code, and its vertical part gives
+/// the heights' unit: said when it isn't metres upward, in place of the horizontal system's.
+#[test]
+fn a_compound_urn_is_read_by_its_parts() {
+    let named = |system: &str| json!({"metadata": {"referenceSystem": system}});
+    let points = json!([[1000, 1000, 0], [1010, 1010, 30]]);
+    let objects = json!({"a": {"type": "Road", "geometry": [{"type": "MultiPoint", "boundaries": [0, 1]}]}});
+    let read_in = |system: &str| read("m.city.json", &doc_with(points.clone(), objects.clone(), named(system)), None).unwrap();
+    // Its last code, 7415, is RD New + NAP: the horizontal part, 25832, is what it is read in.
+    let out = read_in("urn:ogc:def:crs,crs:EPSG::25832,crs:EPSG::7415");
+    assert_eq!(out[0].0.crs, Some(Crs::Epsg(25832)));
+    let out = read_in("urn:ogc:def:crs,crs:EPSG::25832,crs:EPSG::5783");
+    assert!(!messages_of(&out).iter().any(|m| m.contains("vertical system") || m.contains("measures in")), "{:?}", messages_of(&out));
+    let out = read_in("urn:ogc:def:crs,crs:EPSG::25832,crs:EPSG::6360");
+    assert!(says(&out, "(crs:EPSG::6360) measures heights in US survey feet"), "{:?}", messages_of(&out));
+    // Feet across, metres up: the heights are metres, and nothing is said.
+    let out = read_in("urn:ogc:def:crs,crs:EPSG::2263,crs:EPSG::5703");
+    assert_eq!(out[0].0.crs, Some(Crs::Epsg(2263)));
+    assert!(!says(&out, "measures in"), "{:?}", messages_of(&out));
+}
+
 /// Heights in a system of feet are said, as extrusions read metres; a system in metres says nothing.
 #[test]
 fn heights_not_in_metres_are_said() {

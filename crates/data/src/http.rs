@@ -44,9 +44,18 @@ fn system_roots() -> RootCerts {
     })
 }
 
-#[cfg(not(all(unix, not(target_vendor = "apple"), not(target_os = "android"))))]
+#[cfg(not(any(all(unix, not(target_vendor = "apple")), target_os = "android")))]
 fn system_roots() -> RootCerts {
     RootCerts::PlatformVerifier
+}
+
+/// Android: the bundled Mozilla roots. The platform verifier there calls Android's trust manager
+/// through a Java class the app must ship and hand to it at start-up; the spike's `NativeActivity`
+/// has no Java (#1902). The session says the trust source was assumed, as on a Linux without
+/// certificates.
+#[cfg(target_os = "android")]
+fn system_roots() -> RootCerts {
+    RootCerts::WebPki
 }
 
 /// The roots on Linux and the BSDs: the bundled ones only when neither `SSL_CERT_FILE` nor
