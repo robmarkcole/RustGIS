@@ -34689,13 +34689,13 @@ fn geopackage_past_the_count_limit_streams_exports_and_reads_whole() {
     let output = fixture.dir.join("whole.csv");
     let exported = s.run("share.exportLayer", &json!({"layer": id, "path": output})).unwrap();
     assert_eq!(exported["features"].as_u64(), Some(count as u64));
-    // A header, then every row once and in order (the first column is the road's name).
+    // A header, then every row once and in order (the road's name after its coordinates).
     let mut lines = std::io::BufRead::lines(std::io::BufReader::new(std::fs::File::open(&output).unwrap()));
-    assert!(lines.next().unwrap().unwrap().starts_with("name,"));
+    assert!(lines.next().unwrap().unwrap().starts_with("longitude,latitude,name"));
     let mut rows = 0;
     for (k, line) in lines.enumerate() {
         let line = line.unwrap();
-        assert!(line.starts_with(&format!("road {},", k + 1)), "row {k}: {line}");
+        assert_eq!(line.split(',').nth(2), Some(format!("road {}", k + 1).as_str()), "row {k}: {line}");
         rows += 1;
     }
     assert_eq!(rows, count, "every row");

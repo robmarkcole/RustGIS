@@ -295,7 +295,7 @@ fn a_layer_without_a_declared_type_takes_its_first_geometrys() {
     let layer = Dataset::new("points", GeometryType::None, points.fields.clone());
     write_chunks_in(&Runs::new(&points, 2), &layer, &d.join("points.csv"), Crs::LonLat, 1).unwrap();
     let text = std::fs::read_to_string(d.join("points.csv")).unwrap();
-    assert!(text.starts_with("n,longitude,latitude"), "{text}");
+    assert!(text.starts_with("longitude,latitude,n"), "{text}");
 }
 
 /// Rows a source couldn't read are counted, so an export can say how many it left out; a clean
