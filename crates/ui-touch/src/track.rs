@@ -108,7 +108,7 @@ pub(crate) fn take(app: &mut RustGisApp, ctx: &egui::Context) {
     // Taken out of egui's memory while positions go in, so the points' `Arc` has one owner and
     // `make_mut` adds to it in place instead of copying the track.
     let mut state: Field = ctx.data_mut(|d| d.remove_temp(egui::Id::unique("touch_field"))).unwrap_or_default();
-    // More came than are kept between frames (a day of them, with the app out of sight): the
+    // More came than are kept between frames (more than two days of them, with the app out of sight): the
     // oldest are gone, which a track or an average being taken missed.
     let dropped = std::mem::take(&mut app.fixes_dropped);
     if dropped > 0 && (state.track.is_some() || state.averaging.is_some()) {

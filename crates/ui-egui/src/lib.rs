@@ -1114,8 +1114,10 @@ const CAPTURE_PIXELS: f64 = 16_000_000.0;
 /// The lowest dpi a layout is copied at: a page that would need less is an error.
 const CAPTURE_MIN_DPI: f64 = 36.0;
 
-/// The most positions [`RustGisApp::fixes`] keeps for an interface to take: a day of one a second.
-pub const FIXES_KEPT: usize = 86_400;
+/// The most positions [`RustGisApp::fixes`] keeps for an interface to take: more than two days of
+/// one a second, as many as a phone's shell keeps out of sight (its `MOST_EVENTS`), so a batch it
+/// hands over on coming back is taken whole into a track.
+pub const FIXES_KEPT: usize = 200_000;
 
 impl RustGisApp {
     /// Keeps a position the shell reported: the last one in [`RustGisApp::position`], and each in
@@ -1167,6 +1169,9 @@ pub struct RustGisApp {
     /// or an average needs each, including those that arrived together after the app was out of
     /// sight.
     pub fixes: std::collections::VecDeque<rustgis_engine::platform::Fix>,
+    /// Whether the interface wants positions while the app is out of sight too (a track being
+    /// recorded): a phone's shell keeps them coming then, with the notice its system requires.
+    pub keep_locating: bool,
     /// How many positions were dropped from [`RustGisApp::fixes`] past [`FIXES_KEPT`] since an
     /// interface last took them: the interface says so when a track or an average missed them.
     pub fixes_dropped: usize,
@@ -1440,6 +1445,7 @@ impl RustGisApp {
             locate: false,
             position: None,
             fixes: std::collections::VecDeque::new(),
+            keep_locating: false,
             fixes_dropped: 0,
             #[cfg(not(target_arch = "wasm32"))]
             watch_files: false,

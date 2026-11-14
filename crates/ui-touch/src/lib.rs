@@ -72,7 +72,8 @@ pub fn chrome(app: &mut RustGisApp, ui: &mut Ui) {
     let ctx = ui.ctx().clone();
     let t = Tokens::get(&ctx);
     let shown = sheet(&ctx);
-    // Each position the shell reported goes to the average and the track being taken.
+    // Each position the shell reported goes to the average and the track being taken; while a
+    // track is being recorded, positions keep coming with the app out of sight.
     track::take(app, &ctx);
     // With positioning off (Hide My Position, or Android ending it), an average being taken
     // stops: the sheet no longer shows it, and positions from before would mix into the next.
@@ -81,6 +82,13 @@ pub fn chrome(app: &mut RustGisApp, ui: &mut Ui) {
         if state.averaging.take().is_some() {
             track::set_field(&ctx, state);
         }
+    }
+    // Only while positioning is on: Android ending it (or Hide) needs no service out of sight.
+    // Changed, a frame follows at once, so the phone hears of it before the app leaves sight.
+    let keep = app.locate && track::field(&ctx).track.is_some();
+    if keep != app.keep_locating {
+        app.keep_locating = keep;
+        ctx.request_repaint();
     }
     let frame = egui::Frame::NONE.fill(t.pane).stroke(Stroke::new(1.0, t.border));
     egui::Panel::bottom("touch_bar").exact_size(BAR).frame(frame).show(ui, |ui| bar(app, ui, &t, shown));
@@ -1857,6 +1865,29 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn positions_are_kept_coming_out_of_sight_while_a_track_is_recorded() {
+        let ctx = egui::Context::default();
+        let mut app = RustGisApp::with_sample();
+        frame(&mut app, &ctx, Sheet::None);
+        assert!(!app.keep_locating);
+        start_track(&mut app, &ctx);
+        assert!(app.locate);
+        frame(&mut app, &ctx, Sheet::None);
+        assert!(app.keep_locating);
+        // Positioning ended by Android, the track still recording: no service out of sight.
+        app.locate = false;
+        frame(&mut app, &ctx, Sheet::None);
+        assert!(!app.keep_locating);
+        app.locate = true;
+        frame(&mut app, &ctx, Sheet::None);
+        assert!(app.keep_locating);
+        // Stopped: no longer, and the track (too short here) is said, not kept.
+        stop_track(&mut app, &ctx);
+        frame(&mut app, &ctx, Sheet::None);
+        assert!(!app.keep_locating);
     }
 
     #[test]

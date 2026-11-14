@@ -4,8 +4,8 @@ RustGIS on Android ([#1902](https://github.com/opengeos/RustGIS/issues/1902)). I
 front end (`rustgis-ui-egui`) in a `NativeActivity`, with the system's file picker for opening and
 saving, and the touch interface (`rustgis-ui-touch`) around its map, which can capture points,
 lines and polygons with their attributes, edit their shapes, snap, and show where the device is.
-It averages positions and records tracks. It is not a field app yet: there are no photos, and a
-track stops while the app is out of sight.
+It averages positions and records tracks, also out of sight. It is not a field app yet: there are
+no photos.
 
 ## Build
 
@@ -52,7 +52,7 @@ of the app.
 ## The phone, from Rust
 
 `rustgis_engine::platform::Platform` is what a front end asks a phone for: files from the system's
-picker, a place to save, and the device's position. The camera is added to it with its first
+picker, a place to save, the device's position, and positions kept coming out of sight. The camera is added to it with its first
 implementation. `src/phone.rs` implements it for Android by calling the activity's Java half,
 `java/org/rustgis/mobile/MainActivity.java`, which is the only code that can show the picker (the
 Storage Access Framework) and receive its answer.
@@ -124,6 +124,15 @@ named for when it started, with its count and length in minutes. A position less
 is left out, and the notice says how many were. Every position Android reports reaches the track,
 not only the last one each frame (`RustGisApp::fixes`). The track is kept in memory until it is
 stopped: an app the system ends loses it.
+
+A track goes on while the app is out of sight (the Home button, the screen off). Recording one
+starts `TrackService`, a foreground service of the location type, with the notice Android requires:
+"RustGIS is recording a track", which brings the app back when tapped. The activity's location
+listener then keeps receiving positions after the activity stops, and they wait in its events
+(at most 200,000; past that the oldest go, and the app says how many) until the app is back in
+sight and takes them all into the track. The first track asks for leave to show notifications
+(Android 13 and later); refused, the service still runs, its notice unseen. Stopping the track
+stops the service. Ending the app (swiping it away), or Android ending its activity, ends the track with it: the session goes with the process (see below).
 
 **Edit**, beside **Add** at the top of the Capture sheet, changes the shapes already on the
 map, the same way: the map is moved under the cross. **Pick Feature at Cross** picks the layer's

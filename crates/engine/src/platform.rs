@@ -115,6 +115,12 @@ pub trait Platform {
     /// it was asked, not that a position is known.
     fn locate(&self, on: bool) -> Result<(), String>;
 
+    /// Keeps positions coming while the app is out of sight (`on`), for a track being recorded,
+    /// or lets them stop there again. Where the system wants it, this shows a notice for as long
+    /// as it lasts (Android's foreground service). The positions found out of sight arrive
+    /// together when the app is back. Asked while the app is in sight.
+    fn keep_locating(&self, on: bool) -> Result<(), String>;
+
     /// What happened since the last call, oldest first.
     fn take_events(&self) -> Vec<Event>;
 }

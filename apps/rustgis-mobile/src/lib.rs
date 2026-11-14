@@ -92,6 +92,9 @@ mod android {
         poll: Option<u64>,
         /// Whether the phone was last asked for positions (`RustGisApp::locate`, as last seen).
         locating: bool,
+        /// Whether the phone was last asked to keep positions coming out of sight
+        /// (`RustGisApp::keep_locating`, as last seen).
+        keeping: bool,
         /// Whether the soft keyboard was up, where the phone says.
         keyboard: Option<bool>,
         /// Until when the window looks again for the soft keyboard's room: a moment after the
@@ -137,6 +140,13 @@ mod android {
                 self.app.session.notify(text, true);
             }
             let Some(phone) = self.phone.clone() else { return };
+            // Positions out of sight follow what the interface asks for (a track being recorded).
+            if self.app.keep_locating != self.keeping {
+                self.keeping = self.app.keep_locating;
+                if let Err(e) = phone.keep_locating(self.keeping) {
+                    self.app.session.notify(e, true);
+                }
+            }
             // Positioning follows what the interface asks for; off, the last position is let go.
             if self.app.locate != self.locating {
                 self.locating = self.app.locate;
@@ -521,6 +531,7 @@ mod android {
                     app,
                     poll: None,
                     locating: false,
+                    keeping: false,
                     typing: None,
                     keyboard: None,
                     bars_light: None,
