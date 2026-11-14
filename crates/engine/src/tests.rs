@@ -11191,6 +11191,99 @@ fn analysis_workflows_models_scripts_and_raster_functions() {
     assert!(g.as_array().unwrap().iter().any(|t| t["id"] == "raster.function"));
 }
 
+/// A web link chart past its limits says what it leaves out, to whoever shares it and on its page
+/// (#1947): links past a feature's 200, and features past the chart's 3,000. Within them,
+/// nothing is said.
+#[test]
+fn a_link_chart_says_what_its_limits_leave_out() {
+    let dir = std::env::temp_dir().join(format!("rustgis-link-chart-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut s = world();
+    s.run("share.dataStore", &json!({"name": "out", "path": dir.to_str().unwrap()})).unwrap();
+    use base64::Engine as _;
+    let add = |s: &mut Session, file: &str, keys: &[String]| {
+        let rows: String = keys.iter().enumerate().map(|(i, k)| format!("10,{},{k}\n", 45.0 + i as f64 * 0.0001)).collect();
+        let csv = format!("lon,lat,key\n{rows}");
+        s.run("layer.addDataBytes", &json!({"fileName": file, "data": base64::engine::general_purpose::STANDARD.encode(csv)})).unwrap();
+    };
+    let said = |s: &Session, mark: u64, name: &str| {
+        s.notices_since(mark)
+            .iter()
+            .map(|n| n.text.clone())
+            .filter(|t| t.starts_with(&format!("{name}: the link chart")))
+            .collect::<Vec<_>>()
+    };
+    // (links, features) the page draws: a link and a node each carry a field of their own.
+    let drawn = |name: &str| {
+        let html = std::fs::read_to_string(dir.join(format!("{name}.html"))).unwrap();
+        (html.matches("\"relationship\":").count(), html.matches("\"group\":").count(), html)
+    };
+    let limits = "a link chart takes at most 3000 features, 20000 links and 200 links from one feature";
+    // One feature related to 250: 200 links are drawn from it.
+    add(&mut s, "fan_one.csv", &["k".to_string()]);
+    add(&mut s, "fan_many.csv", &vec!["k".to_string(); 250]);
+    s.run(
+        "data.relate",
+        &json!({"name": "Fan", "origin": "fan_one", "originKey": "key", "destination": "fan_many", "destinationKey": "key"}),
+    )
+    .unwrap();
+    let mark = s.notice_mark();
+    s.run("share.linkChart", &json!({"relationship": "Fan"})).unwrap();
+    let (links, nodes, html) = drawn("Fan");
+    assert_eq!((links, nodes), (200, 201));
+    let shows = "201 of the 251 related features and 200 of the 250 links";
+    assert_eq!(said(&s, mark, "Fan"), [format!("Fan: the link chart shows {shows}; {limits}")]);
+    assert!(html.contains(&format!("Shows {shows}.")), "the page says it too");
+    // Said last, after "Shared …", so the status bar, which shows the last notice, keeps it.
+    assert!(s.notices.last().is_some_and(|n| n.text.starts_with("Fan: the link chart shows")), "{:?}", s.notices.last());
+    // 3,001 pairs: the chart's 3,000 features are the first 1,500 pairs.
+    let keys: Vec<String> = (0..3001).map(|i| format!("p{i}")).collect();
+    add(&mut s, "pair_a.csv", &keys);
+    add(&mut s, "pair_b.csv", &keys);
+    s.run(
+        "data.relate",
+        &json!({"name": "Pairs", "origin": "pair_a", "originKey": "key", "destination": "pair_b", "destinationKey": "key"}),
+    )
+    .unwrap();
+    let mark = s.notice_mark();
+    s.run("share.linkChart", &json!({"relationship": "Pairs"})).unwrap();
+    assert_eq!((drawn("Pairs").0, drawn("Pairs").1), (1500, 3000));
+    assert_eq!(
+        said(&s, mark, "Pairs"),
+        [format!("Pairs: the link chart shows 3000 of the 6002 related features and 1500 of the 3001 links; {limits}")]
+    );
+    // Within the limits: one feature related to 200, all drawn, nothing said or shown.
+    add(&mut s, "full_one.csv", &["f".to_string()]);
+    add(&mut s, "full_many.csv", &vec!["f".to_string(); 200]);
+    s.run(
+        "data.relate",
+        &json!({"name": "Full", "origin": "full_one", "originKey": "key", "destination": "full_many", "destinationKey": "key"}),
+    )
+    .unwrap();
+    let mark = s.notice_mark();
+    s.run("share.linkChart", &json!({"relationship": "Full"})).unwrap();
+    let (links, nodes, html) = drawn("Full");
+    assert_eq!((links, nodes), (200, 201));
+    assert!(said(&s, mark, "Full").is_empty() && !html.contains("Shows "));
+    // 101 features each related to the same 200: 20,200 links, each feature within its 200. The
+    // chart's 20,000 links are the first 100 features'; the 101st has no room.
+    add(&mut s, "mesh_one.csv", &vec!["m".to_string(); 101]);
+    add(&mut s, "mesh_many.csv", &vec!["m".to_string(); 200]);
+    s.run(
+        "data.relate",
+        &json!({"name": "Mesh", "origin": "mesh_one", "originKey": "key", "destination": "mesh_many", "destinationKey": "key"}),
+    )
+    .unwrap();
+    let mark = s.notice_mark();
+    s.run("share.linkChart", &json!({"relationship": "Mesh"})).unwrap();
+    let (links, nodes, html) = drawn("Mesh");
+    assert_eq!((links, nodes), (20_000, 300));
+    let shows = "300 of the 301 related features and 20000 of the 20200 links";
+    assert_eq!(said(&s, mark, "Mesh"), [format!("Mesh: the link chart shows {shows}; {limits}")]);
+    assert!(html.contains(&format!("Shows {shows}.")));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// A 100 × 80 scan whose value is `ramp(col, row)` (so a bilinear warp reproduces it exactly), with
 /// a bright pixel at (50, 40), added as a layer with a placeholder position.
 fn scan_layer(s: &mut Session, name: &str) -> (fn(f64, f64) -> f32, (f64, f64)) {
