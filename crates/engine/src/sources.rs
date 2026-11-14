@@ -255,7 +255,7 @@ pub fn holds_secret(params: &serde_json::Value) -> bool {
             }),
             Value::Array(a) if depth < 16 => a.iter().any(|v| walk(v, depth + 1)),
             Value::Object(_) | Value::Array(_) => true,
-            Value::String(t) => private_key(t) || redact(t) != *t,
+            Value::String(t) => private_key(t) || redact(t) != *t || crate::roles::sql_secrets_removed(t) != *t,
             _ => false,
         }
     }
@@ -433,6 +433,105 @@ pub fn redact(address: &str) -> String {
     let mut out = format!("{scheme}://{rest}");
     redact_query(&mut out);
     out
+}
+
+/// Strips runtime capability wrappers (`rustgis-login:` and `rustgis-s3:`) from an address or
+/// archive template while keeping its inner public/raw URL and any plain COG look.
+pub(crate) fn strip_capabilities(address: &str) -> String {
+    strip_capabilities_at(address, 0)
+}
+
+fn strip_capabilities_at(address: &str, depth: usize) -> String {
+    if depth >= 8 {
+        return String::new();
+    }
+    let text = address.trim_start();
+    if let Some((head, archive)) = template_archive(text) {
+        return format!("{head}{}", strip_capabilities_at(archive, depth + 1));
+    }
+    if text.starts_with(rustgis_data::login_address::PREFIX) {
+        return match rustgis_data::login_address::parse(text) {
+            Ok(Some(bound)) => strip_capabilities_at(bound.url, depth + 1),
+            _ => "[address omitted]".into(),
+        };
+    }
+    if let Some(inner) = text.strip_prefix(crate::render::rustgis_tiles::s3::ANONYMOUS) {
+        return format!("{}{}", crate::render::rustgis_tiles::s3::ANONYMOUS, strip_capabilities_at(inner, depth + 1));
+    }
+    if rustgis_data::s3_address::is_wrapper(text) {
+        let (file, look) = crate::durable::split_look(text);
+        return match rustgis_data::s3_address::parse(file) {
+            Ok(Some(bound)) => format!("{}{look}", strip_capabilities_at(bound.url, depth + 1)),
+            _ => "[address omitted]".into(),
+        };
+    }
+    address.to_string()
+}
+
+/// Redacts credentials AND strips all runtime capability wrappers (`rustgis-login:` and
+/// `rustgis-s3:`) for command results and untrusted callers.
+pub fn redact_output(address: &str) -> String {
+    redact(&strip_capabilities(address))
+}
+
+/// Replaces every `rustgis-s3:` capability wrapper in free text or serialized JSON strings with
+/// its inner address (or `[redacted]` when malformed), matching `rustgis_tiles::logins::scrub`.
+pub fn scrub_s3_wrappers(text: &str) -> String {
+    if !text.contains(rustgis_data::s3_address::PREFIX) {
+        return text.to_string();
+    }
+    let mut result = String::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        if let Some(wrapper) = rest.strip_prefix(rustgis_data::s3_address::PREFIX) {
+            let unwrapped = wrapper
+                .split_once(':')
+                .filter(|(b, _)| rustgis_data::s3_address::valid_binding(b))
+                .and_then(|(_, r)| r.split_once(':'))
+                .and_then(|(len, r)| {
+                    len.parse::<usize>().ok().filter(|&n| n <= rustgis_data::s3_address::MAX_ENDPOINT).and_then(|n| r.get(n..))
+                })
+                .and_then(|r| r.strip_prefix(':'))
+                .filter(|u| {
+                    !rustgis_data::s3_address::is_wrapper(u)
+                        && ["https://", "http://", "s3://"].iter().any(|p| u.get(..p.len()).is_some_and(|s| s.eq_ignore_ascii_case(p)))
+                });
+            if let Some(url) = unwrapped {
+                rest = url;
+                continue;
+            }
+            result.push_str("[redacted]");
+            rest = wrapper.split_once(char::is_whitespace).map_or("", |(_, r)| r);
+            continue;
+        }
+        let Some(ch) = rest.chars().next() else { break };
+        result.push(ch);
+        rest = rest.get(ch.len_utf8()..).unwrap_or("");
+    }
+    result
+}
+
+/// Recursively redacts known URL fields in a JSON value for non-User callers.
+pub(crate) fn redact_url_fields(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (k, v) in map.iter_mut() {
+                if matches!(k.as_str(), "url" | "next" | "source_url" | "tilesets" | "describe" | "capabilities")
+                    && let Some(s) = v.as_str()
+                {
+                    *v = Value::String(redact_output(s));
+                } else if k == "request" && v.is_string() {
+                    if let Some(s) = v.as_str() {
+                        *v = Value::String(redact_output(s));
+                    }
+                } else {
+                    redact_url_fields(v);
+                }
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(redact_url_fields),
+        _ => {}
+    }
 }
 
 fn text<'a>(p: &'a Value, k: &str) -> Option<&'a str> {

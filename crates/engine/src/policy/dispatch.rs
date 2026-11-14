@@ -307,6 +307,14 @@ impl Session {
     pub(crate) fn policy_user(&self) -> bool {
         self.policy.scopes.last().is_none_or(|s| matches!(s.kind, Kind::User))
     }
+    /// Whether the active scope may exercise reserved connection/account authority.
+    pub(crate) fn policy_allows_reserved(&self) -> bool {
+        match &self.scope().kind {
+            Kind::User | Kind::Agent { access: super::AgentAccess::Full, .. } => true,
+            Kind::Assistant => self.policy.nodes.last().is_some_and(|n| n.effects.contains(super::Effect::Reserved)),
+            Kind::Peer | Kind::Agent { .. } | Kind::Item { .. } | Kind::Plugin { .. } => false,
+        }
+    }
     /// Inherits the current named scope; absence is the documented trusted native convention.
     fn scope(&self) -> Scope {
         self.policy.scopes.last().cloned().unwrap_or_else(Scope::user)

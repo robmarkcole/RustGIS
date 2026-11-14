@@ -1735,10 +1735,13 @@ impl SourceLayer {
         if let Some(g) = gdal {
             out.push((R::GdalPath, g.path.as_str(), false, paths::is_local(&g.path)));
         }
-        if let Some(d) = duckdb
-            && let Some(p) = &d.database
-        {
-            out.push((R::DuckDbDatabase, p.as_str(), true, paths::is_local(p)));
+        if let Some(d) = duckdb {
+            if let Some(p) = &d.database {
+                out.push((R::DuckDbDatabase, p.as_str(), true, paths::is_local(p)));
+            }
+            if let Some(sql) = &d.sql {
+                out.push((R::DuckDbSql, sql.as_str(), true, false));
+            }
         }
         if let Some(pg) = postgis {
             out.push((R::PostgisDatabase, pg.database.as_str(), true, false));
@@ -1758,6 +1761,7 @@ impl SourceLayer {
             crate::LayerRole::Streamed => self.path.as_mut(),
             crate::LayerRole::GdalPath => Some(&mut self.gdal.as_mut()?.path),
             crate::LayerRole::DuckDbDatabase => self.duckdb.as_mut()?.database.as_mut(),
+            crate::LayerRole::DuckDbSql => self.duckdb.as_mut()?.sql.as_mut(),
             crate::LayerRole::PostgisDatabase => Some(&mut self.postgis.as_mut()?.database),
             crate::LayerRole::MysqlDatabase => Some(&mut self.mysql.as_mut()?.database),
             crate::LayerRole::SqlServerDatabase => Some(&mut self.sqlserver.as_mut()?.database),

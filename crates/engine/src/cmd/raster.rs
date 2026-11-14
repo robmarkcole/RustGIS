@@ -649,9 +649,22 @@ fn add_jpeg2000_bytes(s: &mut Session, p: &Value, name: &str, bytes: Vec<u8>, zo
     add_raster_after(s, &title, RasterLayer::from_bytes(r, file_name, c.tif), zoom)
 }
 
+/// Strips directory components from an uploaded/text `fileName`, keeping only a plain file name.
+pub(crate) fn bytes_file_name(raw: &str) -> Option<&str> {
+    let leaf = raw.trim().rsplit(['/', '\\']).next()?.trim();
+    let leaf = std::path::Path::new(leaf).file_name().and_then(|n| n.to_str()).unwrap_or(leaf).trim();
+    (!leaf.is_empty() && leaf != "." && leaf != "..").then_some(leaf)
+}
+
+/// Whether `layer.addDataBytes` names a JPEG 2000 upload (which runs `gdal_translate` via temp files).
+pub(crate) fn bytes_is_jpeg2000(p: &Value) -> bool {
+    ps(p, "fileName").is_some_and(|raw| raster::is_jpeg2000_name(raw.trim()) || bytes_file_name(raw).is_some_and(raster::is_jpeg2000_name))
+}
+
 fn add_bytes(s: &mut Session, p: &Value) -> CmdResult {
     use base64::Engine;
-    let name = ps(p, "fileName").ok_or("fileName is required")?.to_string();
+    let raw_name = ps(p, "fileName").ok_or("fileName is required")?;
+    let name = bytes_file_name(raw_name).ok_or("fileName is required")?.to_string();
     let data = ps(p, "data").ok_or("data is required")?;
     // Base64 is 4 characters per 3 bytes; refuse files past the upload limit before decoding.
     if data.len() / 4 * 3 > MAX_UPLOAD_BYTES {
@@ -700,7 +713,7 @@ pub(crate) fn add_named_bytes(s: &mut Session, p: &Value, name: String, bytes: V
     }
     // Files of several layers: zipped Shapefiles, KML/KMZ, GPX, GeoRSS, LandXML, CityJSON.
     if rustgis_data::io::is_multi_layer_name(&name) {
-        return super::layer::add_layers(s, p, &name, &bytes, zoom);
+        return super::layer::add_layers(s, p, &name, &bytes, zoom, false);
     }
     // GeoParquet and FlatGeobuf uploads (binary vector files).
     if rustgis_data::source::is_source_name(&name) {
@@ -940,10 +953,15 @@ fn bands(s: &mut Session, p: &Value) -> CmdResult {
 fn info(s: &mut Session, p: &Value) -> CmdResult {
     let (id, r) = get(s, p)?;
     let rl = s.map().layer(id).and_then(|l| l.raster.as_ref()).ok_or("no layer")?;
+    let source = match rl.path.as_deref() {
+        Some(path) if !s.policy_user() && rustgis_map::tiles::is_local_archive(path) => rl.file_name.clone(),
+        Some(path) => Some(crate::sources::redact_output(path)),
+        None => rl.file_name.clone(),
+    };
     let (cx, cy) = r.cell_size();
     Ok(json!({
         "name": r.name,
-        "source": rl.path.clone().or(rl.file_name.clone()),
+        "source": source,
         "width": r.width, "height": r.height,
         "overviewOf": r.overview.map(|(w, h)| json!([w, h])),
         "bands": r.bands.iter().map(|b| json!({

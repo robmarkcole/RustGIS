@@ -331,12 +331,12 @@ const MAX_DEPTH: usize = 16;
 /// to use a connection's login; the model and MCP clients get only the public ones. Active
 /// raw secrets are scrubbed too, including an echo with no wrapper in the result.
 fn public_text(text: String) -> String {
-    rustgis_engine::render::rustgis_tiles::logins::scrub(&text)
+    rustgis_engine::sources::scrub_s3_wrappers(&rustgis_engine::render::rustgis_tiles::logins::scrub(&text))
 }
 
 /// Generated errors may quote arbitrary addresses; successful values remain data.
 fn public_error(text: &str) -> String {
-    rustgis_engine::render::rustgis_tiles::logins::scrub_error(text)
+    rustgis_engine::sources::scrub_s3_wrappers(&rustgis_engine::render::rustgis_tiles::logins::scrub_error(text))
 }
 
 /// Publishes a completed result, reporting withheld subtrees before enforcing the response budget.

@@ -99,10 +99,11 @@ fn record_connection(s: &mut Session, layer: u32, request: &Value, anonymous: bo
 }
 
 fn plan(s: &mut Session, p: &Value) -> CmdResult {
-    if p.get("sourceOnly").and_then(Value::as_bool) == Some(true) {
-        return request(s, p);
+    let mut out = if p.get("sourceOnly").and_then(Value::as_bool) == Some(true) { request(s, p)? } else { listing(s, p)? };
+    if !s.policy_user() {
+        crate::sources::redact_url_fields(&mut out);
     }
-    listing(s, p)
+    Ok(out)
 }
 
 fn listing(s: &mut Session, p: &Value) -> CmdResult {

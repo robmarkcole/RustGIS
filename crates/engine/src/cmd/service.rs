@@ -942,6 +942,9 @@ pub(crate) fn layers(s: &mut Session, p: &Value) -> CmdResult {
     if let Some(next) = found.next {
         out["next"] = json!(next);
     }
+    if !s.policy_user() {
+        crate::sources::redact_url_fields(&mut out);
+    }
     Ok(out)
 }
 
@@ -1490,6 +1493,9 @@ fn coverage(s: &mut Session, p: &Value) -> CmdResult {
     if anonymous {
         out["anonymous"] = json!(true);
     }
+    if !s.policy_user() {
+        crate::sources::redact_url_fields(&mut out);
+    }
     Ok(out)
 }
 
@@ -1552,6 +1558,9 @@ pub(super) fn catalog_search(s: &mut Session, p: &Value) -> CmdResult {
     if dropped > 0 {
         out["notes"] =
             json!([format!("{dropped} links point to addresses RustGIS won't fetch for a catalogue on the web and are left out")]);
+    }
+    if !s.policy_user() {
+        crate::sources::redact_url_fields(&mut out);
     }
     Ok(out)
 }

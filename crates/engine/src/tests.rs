@@ -28,6 +28,9 @@ mod remembered_database_packets;
 #[path = "tests/service_logins.rs"]
 mod service_logins;
 
+#[path = "tests/scopes_and_redaction.rs"]
+mod scopes_and_redaction;
+
 /// Keeps tests away from the user's installed plugins.
 fn isolate_plugins() {
     static ONCE: std::sync::Once = std::sync::Once::new();
