@@ -838,6 +838,31 @@ mod tests {
         assert_eq!(query_box(&h), "name LIKE ");
     }
 
+    /// The Functions and Variables menus list the language's catalogs: a function is added open
+    /// for its arguments, and what follows it goes inside, not set apart from the bracket.
+    #[test]
+    fn the_functions_and_variables_menus_add_from_the_catalogs() {
+        use rustgis_engine::data::query::{VARS, functions};
+        let app = with_cities();
+        let mut h = harness(app);
+        h.run();
+        open_tab(&mut h, "Query");
+        type_query(&mut h, "name =");
+        // One that takes arguments, so it is added open.
+        let first = functions().find(|f| f.max > 0).unwrap();
+        h.get_by_role_and_label(Role::Button, "Functions ▾").click();
+        h.run();
+        h.get_by_role_and_label(Role::Button, first.signature).click();
+        h.run();
+        assert_eq!(query_box(&h), format!("name = {}(", first.name));
+        let var = VARS[0].names[0];
+        h.get_by_role_and_label(Role::Button, "Variables ▾").click();
+        h.run();
+        h.get_by_role_and_label(Role::Button, var).click();
+        h.run();
+        assert_eq!(query_box(&h), format!("name = {}({var} ", first.name));
+    }
+
     /// Ctrl+Enter applies the clause without breaking the line; Escape drops what was typed.
     #[test]
     fn ctrl_enter_applies_and_escape_drops_the_query() {
