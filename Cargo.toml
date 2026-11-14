@@ -111,6 +111,9 @@ laz = { version = "0.13", default-features = false }
 # build through parquet) and a zstd decoder.
 lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-decode", "checked-decode"] }
 ruzstd = { version = "0.9", default-features = false, features = ["std"] }
+# LERC (Esri's Limited Error Raster Compression), pure Rust: LERC-compressed GeoTIFF tiles (#1818).
+lerc-reader = { version = "0.5", default-features = false }
+lerc-core = { version = "0.5", default-features = false }
 # PMTiles archives compressed with Brotli, in pure Rust (the browser too).
 brotli-decompressor = { version = "~6.0.1", default-features = false, features = ["std"] }
 
