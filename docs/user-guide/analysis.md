@@ -1176,10 +1176,12 @@ layers.
 
 The suite is an optional download, so RustGIS itself stays small: the **GeoLibre runner**, a
 single `geolibre` program (about 20 MB to download). In the Tools pane, click
-**Install Whitebox and GeoLibre tools** under *Whitebox and GeoLibre tools*: RustGIS downloads the latest runner for your
-platform from the [geolibre-rust releases](https://github.com/opengeos/geolibre-rust/releases/latest),
-checks it against its published SHA-256 checksum (which catches a corrupted download; the
-release itself is trusted as when you download it by hand) and installs it in its data folder
+**Install Whitebox and GeoLibre tools** under *Whitebox and GeoLibre tools*: RustGIS downloads the runner for your
+platform from the geolibre-rust release it was built and tested with
+([1.8.0](https://github.com/opengeos/geolibre-rust/releases/tag/v1.8.0), the same runner the browser
+uses), checks it against its published SHA-256 checksum (which catches a corrupted download; the
+release itself is trusted as when you download it by hand), checks that it starts and reports a
+version RustGIS works with, and only then installs it in its data folder
 (by default `~/.local/share/rustgis/geolibre` on Linux, `~/Library/Application Support/RustGIS/geolibre`
 on macOS, `%LOCALAPPDATA%\RustGIS\geolibre` on Windows). `RUSTGIS_APP_DATA_DIR` overrides the
 data folder; Linux also honours `XDG_DATA_HOME`. From the command line, `gp.installGeolibre`
@@ -1203,6 +1205,12 @@ pane and the Browser's toolboxes, grouped by the category and subcategory the ru
 each tool (Conversion, Hydrology, LiDAR, Projection, Raster, Remote Sensing, Terrain, Vector,
 then e.g. **GeoLibre › Terrain › Derivatives**). A runner too old to list subcategories groups
 them by category only. Find Tools searches them.
+
+RustGIS works with GeoLibre runner 1.x (from 1.0.0, up to but not including 2.0.0). A runner
+outside that range, found or located, is passed over, and the Tools pane says which one and how to
+fix it (also when another runner is used instead; `gp.geolibre` gives it as `passedOver`): install
+the tools, or locate a runner in that range. A download that fails or is refused
+leaves an installed runner as it was.
 
 Field-name parameters (`field`, `*_field`, `fields` and `*_fields`) have a **Fields** menu beside
 the text box. Pick an input layer or table first, then choose one of its fields. For tools with

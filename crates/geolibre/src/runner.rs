@@ -11,8 +11,26 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-/// Where releases with the runner are published.
-pub const DOWNLOAD_URL: &str = "https://github.com/opengeos/geolibre-rust/releases/latest";
+/// The geolibre-rust release that one-click install fetches and the download link points to. It
+/// is the release the browser's runner is pinned to (`geolibre-wasm` in
+/// `apps/rustgis-web/src/geolibre.rs`): move both forward together, with the user guide's link
+/// (`docs/user-guide/analysis.md`), by a pull request, after checking the new runner against
+/// [`SUPPORTED_FROM`]..[`SUPPORTED_BEFORE`].
+pub const RELEASE: &str = "1.8.0";
+
+/// The oldest runner version RustGIS works with: the first 1.x release, which already answers
+/// `version`, `manifests` and `<tool> --k=v` as RustGIS asks them.
+pub const SUPPORTED_FROM: (u64, u64, u64) = (1, 0, 0);
+
+/// The first runner version RustGIS doesn't work with: the next major release, which may change
+/// how the runner is asked for its tools or runs them. A runner from there on is never installed
+/// and, when found, passed over with a note saying why ([`passed_over`]).
+pub const SUPPORTED_BEFORE: (u64, u64, u64) = (2, 0, 0);
+
+/// Where the pinned release's downloads are published.
+pub fn download_url() -> String {
+    format!("https://github.com/opengeos/geolibre-rust/releases/tag/v{RELEASE}")
+}
 
 /// The environment variable that names the runner, ahead of every other place.
 pub const ENV: &str = "RUSTGIS_GEOLIBRE";
@@ -30,6 +48,70 @@ struct Found {
     value: Option<Option<(PathBuf, String)>>,
 }
 static FOUND: Mutex<Found> = Mutex::new(Found { generation: 0, value: None });
+
+/// Why the last runner passed over (found, or chosen with Locate…) wasn't used: its version is
+/// outside the supported range. Kept while another runner is in use; cleared only when a choice
+/// is made (Locate… of a supported runner, or looking again).
+static PASSED_OVER: Mutex<Option<String>> = Mutex::new(None);
+
+/// Why a GeoLibre runner that was found or chosen isn't in use, when its version is outside the
+/// supported range: what was found and how to fix it, also while another runner is in use.
+/// `None` when nothing was passed over.
+pub fn passed_over() -> Option<String> {
+    PASSED_OVER.lock().ok().and_then(|p| p.clone())
+}
+
+/// [`check_supported`]'s reason with how to fix it, for a runner found or chosen.
+fn unsupported_with_fix(what: &str, version: &str) -> Result<(), String> {
+    check_supported(what, version).map_err(|e| {
+        format!("{e} Install the GeoLibre tools from the Tools pane (or `gp.installGeolibre`), which fetches runner {RELEASE}, or locate a runner in that range.")
+    })
+}
+
+/// Records discovery's reason for passing a runner over, if it has one and no reason is kept
+/// yet: a Locate… choice refused (say, the remembered one at startup) keeps its reason when
+/// discovery then passes over another runner or finds a supported one. Only a choice replaces or
+/// clears it ([`choose`]).
+fn add_passed_over(note: Option<String>) {
+    if let Ok(mut p) = PASSED_OVER.lock()
+        && p.is_none()
+    {
+        *p = note;
+    }
+}
+
+/// Records (or, with `None`, clears) the reason [`passed_over`] gives.
+fn set_passed_over(note: Option<String>) {
+    if let Ok(mut p) = PASSED_OVER.lock() {
+        *p = note;
+    }
+}
+
+/// The `major.minor.patch` a runner reports (`geolibre-cli 1.8.0`, maybe `v1.8.0` or with a
+/// `-pre`/`+build` suffix), or `None` when it can't be read.
+fn parse_version(text: &str) -> Option<(u64, u64, u64)> {
+    let word = text.strip_prefix("geolibre-cli")?.split_whitespace().next()?;
+    let core = word.trim_start_matches('v').split(['-', '+']).next()?;
+    let mut parts = core.split('.').map(|p| p.parse::<u64>().ok());
+    let v = (parts.next()??, parts.next()??, parts.next()??);
+    parts.next().is_none().then_some(v)
+}
+
+/// Checks that a runner (`what`: its path, or which download), which reported `version` (what
+/// [`version_of`] gives), is one RustGIS works with; the error says what was found and the range.
+pub fn check_supported(what: &str, version: &str) -> Result<(), String> {
+    let range = |(a, b, c): (u64, u64, u64)| format!("{a}.{b}.{c}");
+    let (from, before) = (range(SUPPORTED_FROM), range(SUPPORTED_BEFORE));
+    match parse_version(version) {
+        Some(v) if v >= SUPPORTED_FROM && v < SUPPORTED_BEFORE => Ok(()),
+        Some(_) => Err(format!(
+            "{what} is {version}, which this RustGIS can't use: it works with GeoLibre runner {from} up to, but not including, {before}."
+        )),
+        None => Err(format!(
+            "{what} reports its version as \"{version}\", which this RustGIS can't read: it works with GeoLibre runner {from} up to, but not including, {before}."
+        )),
+    }
+}
 
 /// The already discovered choice, without probing programs or searching the filesystem.
 /// None means unavailable or not yet explicitly discovered by trusted native code.
@@ -147,21 +229,44 @@ pub fn find() -> Option<(PathBuf, String)> {
         }
         found.generation
     };
-    let probed = candidates().into_iter().find_map(|p| version_of(&p).map(|v| (p, v)));
+    let (probed, note) = first_supported(candidates());
     let mut found = FOUND.lock().ok()?;
     if found.generation != generation {
         return found.value.clone().flatten();
     }
+    if found.value.is_none() {
+        add_passed_over(note);
+    }
     found.value.get_or_insert(probed).clone()
 }
 
+/// The first of `candidates` that is a runner of a supported version, and why the first runner
+/// before it was passed over (outside the supported range), if one was.
+fn first_supported(candidates: Vec<PathBuf>) -> (Option<(PathBuf, String)>, Option<String>) {
+    let mut note = None;
+    for p in candidates {
+        let Some(v) = version_of(&p) else { continue };
+        match unsupported_with_fix(&p.display().to_string(), &v) {
+            Ok(()) => return (Some((p, v)), note),
+            Err(e) => {
+                log::warn!("GeoLibre runner passed over: {e}");
+                note.get_or_insert(e);
+            }
+        }
+    }
+    (None, note)
+}
+
 /// Uses `exe` as the runner (`None`: look in the usual places again). Fails, keeping the
-/// current choice, when `exe` isn't a GeoLibre runner.
+/// current choice, when `exe` isn't a GeoLibre runner or its version is outside the supported
+/// range (that reason is also kept for [`passed_over`]); a choice made clears an earlier reason.
 pub fn choose(exe: Option<PathBuf>) -> Result<Option<(PathBuf, String)>, String> {
-    if let Some(p) = &exe
-        && version_of(p).is_none()
-    {
-        return Err(format!("{} is not a GeoLibre runner", p.display()));
+    if let Some(p) = &exe {
+        let version = version_of(p).ok_or_else(|| format!("{} is not a GeoLibre runner", p.display()))?;
+        if let Err(e) = unsupported_with_fix(&p.display().to_string(), &version) {
+            set_passed_over(Some(e.clone()));
+            return Err(e);
+        }
     }
     if let Ok(mut c) = CHOSEN.lock() {
         *c = exe;
@@ -169,6 +274,9 @@ pub fn choose(exe: Option<PathBuf>) -> Result<Option<(PathBuf, String)>, String>
     if let Ok(mut f) = FOUND.lock() {
         f.generation = f.generation.saturating_add(1);
         f.value = None;
+        // Cleared under the lock `find` records its note with, so a discovery that started
+        // before this choice can't record a stale note after it.
+        set_passed_over(None);
     }
     Ok(find())
 }
@@ -261,6 +369,61 @@ fn stop_reason(live: &dyn Fn() -> Result<(), String>) -> Option<String> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// Runner versions 1.x are used; anything else, or a version that can't be read, isn't, and
+    /// the reason names the runner, its version and the supported range.
+    #[test]
+    fn supported_runner_versions() {
+        for ok in ["geolibre-cli 1.0.0", "geolibre-cli 1.8.0", "geolibre-cli v1.8.2", "geolibre-cli 1.9.0-dev", "geolibre-cli 1.99.3+abc"] {
+            assert_eq!(check_supported("r", ok), Ok(()), "{ok}");
+        }
+        for bad in ["geolibre-cli 2.0.0", "geolibre-cli 2.0.0-rc.1", "geolibre-cli 0.11.0"] {
+            let e = check_supported("/opt/geolibre", bad).unwrap_err();
+            assert!(e.contains("/opt/geolibre") && e.contains(bad) && e.contains("1.0.0") && e.contains("2.0.0"), "{e}");
+        }
+        for unreadable in ["geolibre-cli", "geolibre-cli 1.8", "geolibre-cli 1.8.0.1", "geolibre-cli one"] {
+            assert!(check_supported("r", unreadable).unwrap_err().contains("can't read"), "{unreadable}");
+        }
+        assert!(download_url().ends_with(&format!("/releases/tag/v{RELEASE}")));
+        let pinned = parse_version(&format!("geolibre-cli {RELEASE}")).unwrap();
+        assert!(pinned >= SUPPORTED_FROM && pinned < SUPPORTED_BEFORE, "the pinned release is supported");
+    }
+
+    /// Discovery passes over a runner outside the supported range for the next supported one,
+    /// and says why; with only an unsupported one, there is no runner but the reason is given.
+    #[test]
+    fn discovery_passes_over_an_unsupported_runner_and_says_why() {
+        let dir = std::env::temp_dir().join(format!("rustgis-geolibre-find-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = |name: &str, line: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n[ \"$1\" = version ] && echo '{line}' && exit 0\nexit 1\n")).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        };
+        let (newer, works, other) =
+            (fake("newer", "geolibre-cli 2.0.0"), fake("works", "geolibre-cli 1.8.0"), fake("other", "other 1.0.0"));
+        let (found, note) = first_supported(vec![other.clone(), newer.clone(), works.clone()]);
+        assert_eq!(found, Some((works.clone(), "geolibre-cli 1.8.0".to_string())));
+        let note = note.unwrap();
+        assert!(note.contains(&newer.display().to_string()) && note.contains("2.0.0") && note.contains("gp.installGeolibre"), "{note}");
+        assert_eq!(first_supported(vec![other.clone(), works.clone()]), (Some((works.clone(), "geolibre-cli 1.8.0".to_string())), None));
+        let (found, note) = first_supported(vec![newer.clone()]);
+        assert!(found.is_none() && note.is_some());
+        // Locate… refuses it too, keeping the current choice, and its reason stays reported after
+        // discovery, both when that finds a runner to use and when it passes over another one.
+        let before = selected();
+        assert!(choose(Some(newer.clone())).is_err_and(|e| e.contains("2.0.0") && e.contains("locate a runner in that range")));
+        assert_eq!(selected(), before);
+        let older = fake("older", "geolibre-cli 0.11.0");
+        add_passed_over(first_supported(vec![works.clone()]).1);
+        add_passed_over(first_supported(vec![older.clone(), works.clone()]).1);
+        let kept = passed_over().unwrap_or_default();
+        assert!(kept.contains(&newer.display().to_string()) && !kept.contains(&older.display().to_string()), "{kept}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A program asked to stop is killed at once, not waited for (#1562): a GeoLibre step of a
     /// model run in the background stops with its Cancel.

@@ -7,7 +7,8 @@ use wasm_bindgen::JsCast as _;
 use wasm_bindgen::prelude::*;
 
 // The runner's version is pinned: the tool forms and the runner must come from the same
-// release. The JS module is jsDelivr's ES-module build of the package; the WASI binary is
+// release. The desktop installs the same release (`rustgis_geolibre::runner::RELEASE`): move
+// both together. The JS module is jsDelivr's ES-module build of the package; the WASI binary is
 // passed explicitly, since that build can't find it beside itself.
 //
 // Trust: this runs code from jsDelivr in the app's origin, only after the user asks for the

@@ -1,6 +1,8 @@
-//! One-click install of the `geolibre` runner: the latest geolibre-rust release's archive for
-//! this platform, downloaded over HTTPS, checked against its published SHA-256 and unpacked into
-//! RustGIS's data folder (where [`crate::runner`] looks for it).
+//! One-click install of the `geolibre` runner: the archive for this platform from the pinned
+//! geolibre-rust release ([`crate::runner::RELEASE`]), downloaded over HTTPS, checked against its
+//! published SHA-256, unpacked and tried, and only then put in RustGIS's data folder (where
+//! [`crate::runner`] looks for it). A download that fails any of these leaves an installed runner
+//! as it was.
 //!
 //! The checksum comes from the same release, so it guards against a corrupted or truncated
 //! download, not against a compromised release: trust rests on HTTPS and on the opengeos
@@ -12,8 +14,10 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-/// The GitHub API address of the latest release.
-const LATEST: &str = "https://api.github.com/repos/opengeos/geolibre-rust/releases/latest";
+/// The GitHub API address of the pinned release.
+fn release_api_url() -> String {
+    format!("https://api.github.com/repos/opengeos/geolibre-rust/releases/tags/v{}", crate::runner::RELEASE)
+}
 
 /// Archives larger than this are refused (the runner is about 19 MB).
 const MAX_BYTES: u64 = 300 * 1024 * 1024;
@@ -51,11 +55,11 @@ fn get(agent: &ureq::Agent, url: &str) -> Result<ureq::http::Response<ureq::Body
         .map_err(|e| rustgis_data::diagnostics::message_with_address(url, &e.to_string()))
 }
 
-/// The latest release's tag and the archive and checksum URLs for `target`.
+/// The pinned release's tag and the archive and checksum URLs for `target`.
 fn find_asset(agent: &ureq::Agent, target: &str) -> Result<(String, String, String, String), String> {
-    let text = get(agent, LATEST)?.body_mut().read_to_string().map_err(|e| e.to_string())?;
+    let text = get(agent, &release_api_url())?.body_mut().read_to_string().map_err(|e| e.to_string())?;
     let release: Value = serde_json::from_str(&text).map_err(|e| format!("unexpected release information: {e}"))?;
-    let tag = release.get("tag_name").and_then(Value::as_str).unwrap_or("latest").to_string();
+    let tag = format!("v{}", crate::runner::RELEASE);
     let assets = release.get("assets").and_then(Value::as_array).cloned().unwrap_or_default();
     let url_of = |name: &str| {
         assets
@@ -117,27 +121,32 @@ pub fn install(progress: &dyn Fn(u64, Option<u64>)) -> Result<PathBuf, String> {
     let unpacked = unpack(&bytes, target, &staging);
     let exe_name = if target.contains("windows") { "geolibre.exe" } else { "geolibre" };
     let found = unpacked.and_then(|_| find_file(&staging, exe_name, 3).ok_or_else(|| format!("{name} has no {exe_name}")));
-    let result = found.and_then(|exe| {
-        let dest = dir.join(exe_name);
-        // Replace an older install without ever losing it: set it aside, move the new one in,
-        // and put the old one back if that fails.
-        let old = dir.join(format!("{exe_name}.old"));
-        let _ = std::fs::remove_file(&old);
-        let had_old = dest.exists() && std::fs::rename(&dest, &old).is_ok();
-        if let Err(e) = std::fs::rename(&exe, &dest).map_err(|e| format!("{}: {e}", dest.display())).and_then(|_| make_executable(&dest)) {
-            if had_old {
-                let _ = std::fs::rename(&old, &dest);
-            }
-            return Err(e);
-        }
-        // A copy that's running (Windows) can't be deleted now; the next install clears it.
-        let _ = std::fs::remove_file(&old);
-        Ok(dest)
-    });
+    let result = found.and_then(|exe| put_in_place(&exe, &dir.join(exe_name), &tag));
     let _ = std::fs::remove_dir_all(&staging);
-    let dest = result?;
-    crate::runner::version_of(&dest).ok_or_else(|| format!("the installed {tag} runner doesn't start"))?;
-    Ok(dest)
+    result
+}
+
+/// Moves the unpacked runner `exe` to `dest`, replacing an installed one, but only once `exe`
+/// starts and reports a supported version ([`crate::runner::check_supported`]): a download that
+/// doesn't is refused and an installed runner is left as it was.
+fn put_in_place(exe: &Path, dest: &Path, tag: &str) -> Result<PathBuf, String> {
+    make_executable(exe)?;
+    let version = crate::runner::version_of(exe).ok_or_else(|| format!("the downloaded {tag} runner doesn't start"))?;
+    crate::runner::check_supported(&format!("the downloaded {tag} runner"), &version)?;
+    // Replace an older install without ever losing it: set it aside, move the new one in, and
+    // put the old one back if that fails.
+    let old = dest.with_file_name(format!("{}.old", crate::runner::exe_name()));
+    let _ = std::fs::remove_file(&old);
+    let had_old = dest.exists() && std::fs::rename(dest, &old).is_ok();
+    if let Err(e) = std::fs::rename(exe, dest).map_err(|e| format!("{}: {e}", dest.display())).and_then(|_| make_executable(dest)) {
+        if had_old {
+            let _ = std::fs::rename(&old, dest);
+        }
+        return Err(e);
+    }
+    // A copy that's running (Windows) can't be deleted now; the next install clears it.
+    let _ = std::fs::remove_file(&old);
+    Ok(dest.to_path_buf())
 }
 
 /// Whether `exe` is the runner [`install`] put in place (rather than one found elsewhere).
@@ -194,4 +203,63 @@ fn make_executable(p: &Path) -> Result<(), String> {
 #[cfg(not(unix))]
 fn make_executable(_: &Path) -> Result<(), String> {
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// A fresh folder for one test, removed afterwards.
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(tag: &str) -> std::io::Result<TempDir> {
+            let dir = std::env::temp_dir().join(format!("rustgis-geolibre-install-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir)?;
+            Ok(TempDir(dir))
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A stand-in runner at `path` that answers `version` with `line` (or fails, for `None`).
+    fn fake(path: &Path, line: Option<&str>) -> std::io::Result<()> {
+        let body = match line {
+            Some(l) => format!("#!/bin/sh\n[ \"$1\" = version ] && echo '{l}' && exit 0\nexit 1\n"),
+            None => "#!/bin/sh\nexit 1\n".to_string(),
+        };
+        std::fs::write(path, body)
+    }
+
+    /// A download from outside the supported range, or one that doesn't start, never replaces a
+    /// working installed runner (#1405); a supported one does, without leaving the old copy.
+    #[test]
+    fn only_a_supported_download_replaces_the_installed_runner() {
+        let tmp = TempDir::new("replace").unwrap();
+        let dest = tmp.0.join(crate::runner::exe_name());
+        fake(&dest, Some("geolibre-cli 1.8.0")).unwrap();
+        make_executable(&dest).unwrap();
+        let staged = tmp.0.join("staged");
+        for (line, says) in [(Some("geolibre-cli 2.0.0"), "2.0.0"), (None, "doesn't start"), (Some("geolibre-cli soon"), "can't read")] {
+            fake(&staged, line).unwrap();
+            let e = put_in_place(&staged, &dest, "v1.8.0").unwrap_err();
+            assert!(e.contains("the downloaded v1.8.0 runner") && e.contains(says), "{e}");
+            assert_eq!(crate::runner::version_of(&dest).as_deref(), Some("geolibre-cli 1.8.0"), "the installed runner is kept");
+        }
+        fake(&staged, Some("geolibre-cli 1.8.1")).unwrap();
+        assert_eq!(put_in_place(&staged, &dest, "v1.8.1").unwrap(), dest);
+        assert_eq!(crate::runner::version_of(&dest).as_deref(), Some("geolibre-cli 1.8.1"));
+        assert!(!staged.exists() && !tmp.0.join(format!("{}.old", crate::runner::exe_name())).exists());
+    }
+
+    /// The installer asks for the pinned release, never the latest one.
+    #[test]
+    fn the_installer_fetches_the_pinned_release() {
+        let url = release_api_url();
+        assert!(url.ends_with(&format!("/releases/tags/v{}", crate::runner::RELEASE)), "{url}");
+        assert!(!url.contains("latest"));
+    }
 }

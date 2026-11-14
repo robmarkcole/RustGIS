@@ -43,7 +43,11 @@ pub fn commands() -> Vec<C> {
             ))
         }).roles(&[]).effects(crate::policy::Effects::NONE)
         .view(),
-        C::new("gp.geolibre", "GeoLibre Tools", "Analyze › Geoprocessing", |_, _| Ok(geolibre_status())).roles(&[]).effects(crate::policy::Effects::NONE).view(),
+        C::new("gp.geolibre", "GeoLibre Tools", "Analyze › Geoprocessing", |_, _| {
+            let mut status = geolibre_status();
+            status["passedOver"] = json!(geolibre_passed_over());
+            Ok(status)
+        }).roles(&[]).effects(crate::policy::Effects::NONE).view(),
         C::new("gp.installGeolibre", "Install GeoLibre Tools", "Analyze › Geoprocessing", |_, _| {
             let path = install_geolibre(&|_, _| {})?;
             #[cfg(all(feature = "geolibre", not(target_arch = "wasm32")))]
@@ -106,7 +110,7 @@ pub fn geolibre_status() -> Value {
             "path": found.as_ref().map(|(p, _)| p.display().to_string()),
             "version": found.map(|(_, v)| v),
             "tools": geolibre_tools().len(),
-            "download": rustgis_geolibre::runner::DOWNLOAD_URL,
+            "download": rustgis_geolibre::runner::download_url(),
         })
     }
     #[cfg(all(feature = "geolibre", target_arch = "wasm32"))]
@@ -118,9 +122,22 @@ pub fn geolibre_status() -> Value {
     json!({"supported": false, "available": false})
 }
 
-/// Downloads and installs the latest GeoLibre runner for this platform; returns the program's
-/// path. `progress` gets the bytes received and the expected total. Blocks: the app calls it
-/// from a background thread, then picks the runner with `gp.setGeolibre`. Native only.
+/// Why a GeoLibre runner found or chosen isn't used, its version being outside the range this
+/// RustGIS works with (what, and how to fix it), also while another runner is in use: `gp.geolibre`
+/// reports it as `passedOver`. Kept out of [`geolibre_status`], which a run's approval compares,
+/// so a refused Locate… doesn't change it. `None` in the browser and builds without the suite.
+pub fn geolibre_passed_over() -> Option<String> {
+    #[cfg(all(feature = "geolibre", not(target_arch = "wasm32")))]
+    {
+        rustgis_geolibre::runner::passed_over()
+    }
+    #[cfg(not(all(feature = "geolibre", not(target_arch = "wasm32"))))]
+    None
+}
+
+/// Downloads and installs the pinned GeoLibre runner release for this platform; returns the
+/// program's path. `progress` gets the bytes received and the expected total. Blocks: the app
+/// calls it from a background thread, then picks the runner with `gp.setGeolibre`. Native only.
 pub fn install_geolibre(progress: &dyn Fn(u64, Option<u64>)) -> Result<String, String> {
     #[cfg(all(feature = "geolibre", not(target_arch = "wasm32")))]
     {
