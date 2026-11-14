@@ -1,9 +1,11 @@
 //! The UTM series in `rustgis-geom` (Karney's Krüger series) against proj4rs, which reprojects
 //! rasters and layers: the same places in every zone and band, both hemispheres, the Norway
-//! and Svalbard zones and the zones' edges, within a millimetre.
+//! and Svalbard zones and the zones' edges, within a millimeter. And UPS, the grid of the polar
+//! areas, against proj4rs's polar stereographic at UPS's scale of 0.994 and 2,000,000 m false
+//! origin (EPSG:5041 north, 5042 south), at random polar places and at the poles.
 
 use rustgis_data::raster::Crs;
-use rustgis_geom::{Coord, utm};
+use rustgis_geom::{Coord, ups, utm};
 
 /// A small deterministic generator (no dependency).
 struct Lcg(u64);
@@ -95,4 +97,43 @@ fn standard_zones_bands_and_exceptions_agree_with_proj4rs() {
         let by_code = Crs::from_epsg(epsg).unwrap().transformer().unwrap().from_lonlat(p).unwrap();
         assert!((by_code.x - want.x).abs() < 1e-6 && (by_code.y - want.y).abs() < 1e-6, "EPSG:{epsg}");
     }
+}
+
+fn ups_proj(north: bool) -> rustgis_data::raster::Transformer {
+    let lat = if north { 90 } else { -90 };
+    Crs::parse(&format!("+proj=stere +lat_0={lat} +lat_ts={lat} +k=0.994 +x_0=2000000 +y_0=2000000 +datum=WGS84 +units=m +no_defs"))
+        .unwrap()
+        .transformer()
+        .unwrap()
+}
+
+/// Compares one polar place both ways; returns the largest difference in meters.
+fn compare_ups(t: &rustgis_data::raster::Transformer, p: Coord, north: bool) -> f64 {
+    let (e, n) = ups::to_ups_in_zone(p, north).unwrap();
+    let want = t.from_lonlat(p).unwrap();
+    let dm = (e - want.x).abs().max((n - want.y).abs());
+    assert!(dm < 1e-3, "north {north} at {p:?}: ours {e} {n}, proj4rs {} {}", want.x, want.y);
+    let back = ups::from_ups(north, want.x, want.y).unwrap();
+    let theirs = t.to_lonlat(want).unwrap();
+    // Compare on the ground: near the pole a millimeter is many degrees of longitude.
+    let (x, y) = ups::to_ups_in_zone(back, north).unwrap();
+    let (tx, ty) = ups::to_ups_in_zone(theirs, north).unwrap();
+    assert!((x - tx).abs().max((y - ty).abs()) < 1e-3, "north {north} at {p:?}: ours {back:?}, proj4rs {theirs:?}");
+    dm
+}
+
+#[test]
+fn random_polar_places_agree_with_proj4rs() {
+    let mut r = Lcg(2026);
+    let (north_t, south_t) = (ups_proj(true), ups_proj(false));
+    let mut worst = 0.0f64;
+    for _ in 0..5_000 {
+        let lon = -180.0 + r.next() * 360.0;
+        worst = worst.max(compare_ups(&north_t, Coord::new(lon, 84.0 + r.next() * 6.0), true));
+        worst = worst.max(compare_ups(&south_t, Coord::new(lon, -80.0 - 1e-9 - r.next() * (10.0 - 2e-9)), false));
+    }
+    for (p, north) in [(Coord::new(0.0, 90.0), true), (Coord::new(0.0, -90.0), false), (Coord::new(180.0, 84.0), true)] {
+        worst = worst.max(compare_ups(if north { &north_t } else { &south_t }, p, north));
+    }
+    assert!(worst < 1e-3, "worst {worst} m");
 }

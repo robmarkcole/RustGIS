@@ -69,9 +69,9 @@ impl CoordReadout {
         matches!(self, CoordReadout::Utm | CoordReadout::Mgrs)
     }
 
-    /// The place in this format; for UTM and MGRS `None` outside their latitudes (80° S to
-    /// 84° N) and on another body's map (`earth` false), and for every format `None` for a
-    /// non-finite place.
+    /// The place in this format; for UTM and MGRS, UPS in the polar areas (north of 84° N and
+    /// south of 80° S) and `None` on another body's map (`earth` false), and for every format
+    /// `None` for a non-finite place.
     pub fn format(self, c: Coord, earth: bool) -> Option<String> {
         if !c.is_finite() || (self.earth_only() && !earth) {
             return None;
@@ -84,10 +84,9 @@ impl CoordReadout {
         }
     }
 
-    /// The status bar's readout of the pointer: `—` off the map, and a short statement where UTM
-    /// and MGRS have no zone (the polar areas, which use UPS, and other bodies) rather than a
-    /// wrong grid reference; the [`hover`](Self::hover) text says why. It is no wider than a
-    /// reference, so the status bar keeps its room.
+    /// The status bar's readout of the pointer: `—` off the map, and a short statement on another
+    /// body's map, where the Earth's grids name no place, rather than a wrong grid reference. It is
+    /// no wider than a reference, so the status bar keeps its room.
     pub fn readout(self, c: Option<Coord>, earth: bool) -> String {
         match c {
             None => "—".to_string(),
@@ -96,11 +95,11 @@ impl CoordReadout {
         }
     }
 
-    /// The status bar readout's hover text: the current format, what a click does, and where
-    /// UTM and MGRS read.
+    /// The status bar readout's hover text: the current format, what a click does, and how UTM
+    /// and MGRS read near the poles.
     pub fn hover(self) -> String {
         i18n::fmt(
-            "Coordinates in {format}. Click to switch: decimal degrees, DMS, UTM, MGRS. UTM and MGRS cover the Earth from 80° S to 84° N.",
+            "Coordinates in {format}. Click to switch: decimal degrees, DMS, UTM, MGRS. UTM and MGRS are grids of the Earth, read in UPS north of 84° N and south of 80° S.",
             &[("format", self.label())],
         )
     }
@@ -150,15 +149,14 @@ mod tests {
     }
 
     #[test]
-    fn polar_places_say_they_are_outside_utm() {
+    fn polar_places_read_in_ups() {
         let pole = Coord::new(10.0, 86.0);
+        // GeographicLib's `GeoConvert -u -l` and `-m` for the same place.
+        assert_eq!(CoordReadout::Utm.readout(Some(pole), true), "north 2077146 1562481");
+        assert_eq!(CoordReadout::Mgrs.readout(Some(pole), true), "Z AC 77146 62481");
         for f in [CoordReadout::Utm, CoordReadout::Mgrs] {
-            assert_eq!(f.format(pole, true), None);
-            let r = f.readout(Some(pole), true);
-            assert_eq!(r, format!("No {} here", f.label()));
-            // No wider than the reference it stands for, in the status bar.
-            assert!(r.chars().count() <= f.readout(Some(Coord::new(44.4, 33.3)), true).chars().count(), "{r}");
-            assert!(f.hover().contains("80° S to 84° N"));
+            assert_eq!(f.format(pole, true).as_deref(), Some(f.readout(Some(pole), true).as_str()));
+            assert!(f.hover().contains("UPS"));
         }
         // Decimal and DMS read there as anywhere.
         assert_eq!(CoordReadout::Dms.readout(Some(pole), true), "10°00′00.0″ E  86°00′00.0″ N");
@@ -170,7 +168,10 @@ mod tests {
         let p = Coord::new(44.4, 33.3);
         for f in [CoordReadout::Utm, CoordReadout::Mgrs] {
             assert_eq!(f.format(p, false), None);
-            assert_eq!(f.readout(Some(p), false), format!("No {} here", f.label()));
+            let r = f.readout(Some(p), false);
+            assert_eq!(r, format!("No {} here", f.label()));
+            // No wider than the reference it stands for, in the status bar.
+            assert!(r.chars().count() <= f.readout(Some(p), true).chars().count(), "{r}");
             assert!(f.earth_only());
         }
         for f in [CoordReadout::Decimal, CoordReadout::Dms] {

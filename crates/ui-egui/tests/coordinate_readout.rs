@@ -120,12 +120,15 @@ fn the_status_bar_reads_the_pointer_in_the_chosen_format_and_a_click_switches() 
     h.get_by_label(&mgrs).click();
     hover_map(&mut h);
     assert_eq!(h.state().map.coord_format, CoordReadout::Decimal);
-    // Where UTM has no zone the readout says so rather than showing a wrong reference.
+    // Where UTM has no zone the readout gives the polar grid, UPS (MGRS without a zone number).
     h.state_mut().run("ui.coordinateFormat", json!({"format": "mgrs"})).unwrap();
     h.state_mut().run("map.goToXY", json!({"lon": 10.0, "lat": 84.5, "scale": 10000})).unwrap();
     hover_map(&mut h);
-    assert!(h.state().map.pointer_lonlat.is_some_and(|c| c.y > 84.0));
-    h.get_by_label("No MGRS here");
+    let at = h.state().map.pointer_lonlat.unwrap();
+    assert!(at.y > 84.0, "{at:?}");
+    let polar = rustgis_engine::geom::format_mgrs(at).unwrap();
+    assert!(polar.starts_with("Z "), "{polar}");
+    h.get_by_label(&polar);
     // On another body's map UTM and MGRS, the Earth's grids, read nothing either.
     h.state_mut().run("map.body", json!({"name": "mars", "basemap": false})).unwrap();
     h.state_mut().run("map.goToXY", json!({"lon": 44.4, "lat": 33.3, "scale": 10000})).unwrap();

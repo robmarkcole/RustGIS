@@ -106,8 +106,10 @@ pub fn had_focus(st: &State, pass: u64) -> bool {
     st.focus_pass.is_some_and(|p| p + 1 == pass)
 }
 
+/// Whether the query reads as a coordinate and nothing else, so looking it up as a place is no
+/// use. A polar reference may as well be a name or a code (`BAG123456`), so it isn't.
 fn is_coordinate(st: &State) -> bool {
-    matches!(st.results.hits.first(), Some(Hit::Coordinate { .. }))
+    matches!(st.results.hits.first(), Some(Hit::Coordinate { .. })) && !st.results.coordinate_may_be_text
 }
 
 /// The box, at the bottom of the left pane (`ui` is the pane).
@@ -386,7 +388,9 @@ fn grid_error_text(e: rustgis_engine::geom::GridError) -> String {
         G::Syntax => tl_raw!("not a UTM or MGRS grid reference"),
         G::Zone => tl_raw!("the UTM zone must be 1 to 60"),
         G::Band => tl_raw!("the latitude band must be a letter from C to X (not I or O)"),
-        G::Polar => tl_raw!("polar (UPS) grid references, north of 84° N or south of 80° S, aren't supported"),
+        G::Polar => tl_raw!(
+            "north of 84° N and south of 80° S the grid is UPS, which has no zone number: write north 2000000 2444268, south 2000000 1555732, or polar MGRS such as Z AM 00000 44268"
+        ),
         G::Square => tl_raw!("the 100 km square letters aren't used in this zone"),
         G::Digits => tl_raw!("the grid digits must be an even count of 0 to 10, half for the easting and half for the northing"),
         G::BandMismatch => tl_raw!("the northing doesn't fall in the latitude band given"),
