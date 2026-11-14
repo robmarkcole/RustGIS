@@ -22,14 +22,19 @@
 //! null, a division by zero or an overflow gives null; `+` joins text that isn't a number.
 //!
 //! The vocabulary lives in catalogs the parser reads, with a signature and description for
-//! each entry: [`functions`], [`VARS`] and [`Kw`]. Whatever helps write expressions reads them too.
+//! each entry: [`functions`], [`VARS`] and [`Kw`]. Whatever helps write expressions reads them too,
+//! and [`complete_at`] asks the parser itself what may come next at a point of the text.
 
 use crate::{Dataset, Measure, Value};
 use std::borrow::Cow;
-use std::cell::{Cell, OnceCell};
+use std::cell::{Cell, OnceCell, RefCell};
+use std::ops::Range;
 
+mod complete;
 #[cfg(test)]
 mod legacy;
+
+pub use complete::{Completion, Place, complete_at};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
@@ -496,12 +501,38 @@ const MAX_ARGS: usize = 32;
 pub const MAX_TEXT: usize = 64 * 1024;
 
 fn lex(s: &str) -> Result<Vec<Tok>, String> {
+    lex_spans(s, false).map(|l| l.toks)
+}
+
+/// A quote left open at the end of what was read, by [`lex_spans`] when it tolerates one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Open {
+    /// `'text`.
+    Text,
+    /// `"field` or `!field`, with its quote.
+    Field(char),
+}
+
+/// Tokens with where each is in the text (in characters), and a quote left open at the end.
+struct Lexed {
+    toks: Vec<Tok>,
+    spans: Vec<Range<usize>>,
+    /// The quote's kind and where it starts.
+    open: Option<(Open, usize)>,
+}
+
+/// Reads `s` into tokens. `tolerant` reads text being typed: a quote left open at the end, or an
+/// `@` or `$` that is the last character, ends it instead of being an error. Anything else that
+/// can't be read is an error either way.
+fn lex_spans(s: &str, tolerant: bool) -> Result<Lexed, String> {
     if s.chars().count() > MAX_LEN {
         return Err("the expression is too long".into());
     }
     let cs: Vec<char> = s.chars().collect();
     let mut i = 0;
     let mut out = Vec::new();
+    let mut spans = Vec::new();
+    let mut open = None;
     let word = |i: &mut usize| -> String {
         let st = *i;
         while cs.get(*i).is_some_and(|c| c.is_alphanumeric() || *c == '_') {
@@ -510,6 +541,8 @@ fn lex(s: &str) -> Result<Vec<Tok>, String> {
         cs.get(st..*i).map(|s| s.iter().collect()).unwrap_or_default()
     };
     while let Some(&c) = cs.get(i) {
+        let start = i;
+        let before = out.len();
         match c {
             c if c.is_whitespace() => i += 1,
             '(' => {
@@ -530,6 +563,10 @@ fn lex(s: &str) -> Result<Vec<Tok>, String> {
                 i += 1;
                 loop {
                     match cs.get(i) {
+                        None if tolerant => {
+                            open = Some((if q == '"' { Open::Field(q) } else { Open::Text }, start));
+                            break;
+                        }
                         None => return Err("unterminated quote".into()),
                         Some(&ch) if ch == q => {
                             if cs.get(i + 1) == Some(&q) {
@@ -546,11 +583,20 @@ fn lex(s: &str) -> Result<Vec<Tok>, String> {
                         }
                     }
                 }
+                if open.is_some() {
+                    break;
+                }
                 out.push(if q == '"' { Tok::QuotedIdent(v) } else { Tok::Str(v) });
             }
             '!' if cs.get(i + 1) != Some(&'=') => {
                 let st = i + 1;
-                let end = cs.get(st..).and_then(|r| r.iter().position(|c| *c == '!')).ok_or("unexpected '!'")?;
+                let Some(end) = cs.get(st..).and_then(|r| r.iter().position(|c| *c == '!')) else {
+                    if tolerant {
+                        open = Some((Open::Field('!'), start));
+                        break;
+                    }
+                    return Err("unexpected '!'".into());
+                };
                 out.push(Tok::QuotedIdent(cs.get(st..st + end).map(|s| s.iter().collect()).unwrap_or_default()));
                 i = st + end + 1;
             }
@@ -601,7 +647,8 @@ fn lex(s: &str) -> Result<Vec<Tok>, String> {
             '@' | '$' => {
                 i += 1;
                 let name = word(&mut i);
-                if name.is_empty() {
+                // A sigil alone is a variable's name being typed.
+                if name.is_empty() && !(tolerant && i == cs.len()) {
                     return Err(format!("unexpected '{c}'"));
                 }
                 out.push(Tok::Var(format!("{c}{name}")));
@@ -609,8 +656,11 @@ fn lex(s: &str) -> Result<Vec<Tok>, String> {
             c if c.is_alphanumeric() || c == '_' => out.push(Tok::Ident(word(&mut i))),
             other => return Err(format!("unexpected '{other}'")),
         }
+        if out.len() > before {
+            spans.push(start..i);
+        }
     }
-    Ok(out)
+    Ok(Lexed { toks: out, spans, open })
 }
 
 /// A number literal: whole numbers are integers.
@@ -625,13 +675,83 @@ struct Parser<'a> {
     depth: usize,
     area_check: OnceCell<Option<String>>,
     validate_areas: bool,
+    /// Set by [`complete_at`]: what the parser looks for at the end of the tokens is noted
+    /// there, and what is wrong in what was typed before (a field no layer has, a date against
+    /// a number) doesn't stop it. `None` everywhere else, which changes nothing.
+    probe: Option<RefCell<Probe>>,
+    /// The calls being read, innermost last: the function (`None` for a name no function has)
+    /// and which argument.
+    calls: Vec<(Option<Func>, usize)>,
 }
 
+/// What the parser looked for at the end of the tokens: what may come next there.
+#[derive(Debug, Default)]
+struct Probe {
+    reached: bool,
+    operand: bool,
+    keywords: Vec<Kw>,
+    symbols: Vec<&'static str>,
+    /// The call the end is in, when it was first reached.
+    call: Option<(Option<Func>, usize)>,
+    /// The field a value at the end is compared with (`name = ▮`, `name IN (▮`).
+    field: Option<usize>,
+}
+
+/// How a token is written, for the symbols [`Probe`] notes.
+fn symbol(t: &Tok) -> Option<&'static str> {
+    Some(match t {
+        Tok::LParen => "(",
+        Tok::RParen => ")",
+        Tok::Comma => ",",
+        Tok::Concat => "||",
+        Tok::Arith(a) => arith_symbol(*a),
+        _ => return None,
+    })
+}
+
+fn arith_symbol(a: Arith) -> &'static str {
+    match a {
+        Arith::Add => "+",
+        Arith::Sub => "-",
+        Arith::Mul => "*",
+        Arith::Div => "/",
+        Arith::Mod => "%",
+        Arith::Pow => "^",
+    }
+}
+
+/// The comparison operators, as [`Probe`] offers them.
+const COMPARISONS: [&str; 6] = ["=", "<>", "<", "<=", ">", ">="];
+
 impl Parser<'_> {
+    /// Notes in the probe, when there is one and `i` is the end of the tokens, what the parser
+    /// looks for there.
+    fn note(&self, i: usize, what: impl FnOnce(&mut Probe)) {
+        if i == self.toks.len()
+            && let Some(probe) = &self.probe
+        {
+            let mut p = probe.borrow_mut();
+            if !p.reached {
+                p.reached = true;
+                p.call = self.calls.last().copied();
+            }
+            what(&mut p);
+        }
+    }
+    /// Notes that a value at the end would be compared with `l`, when `l` is a field.
+    fn note_compared(&self, l: &Expr) {
+        if let Expr::Field(f) = l {
+            self.note(self.pos, |p| p.field = Some(*f));
+        }
+    }
+    fn probing(&self) -> bool {
+        self.probe.is_some()
+    }
     fn peek_kw(&self, kw: Kw) -> bool {
         self.kw_at(self.pos, kw)
     }
     fn kw_at(&self, i: usize, kw: Kw) -> bool {
+        self.note(i, |p| p.keywords.push(kw));
         matches!(self.toks.get(i), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case(kw.word()))
     }
     fn eat_kw(&mut self, kw: Kw) -> bool {
@@ -642,6 +762,9 @@ impl Parser<'_> {
         y
     }
     fn eat(&mut self, t: &Tok) -> bool {
+        if let Some(s) = symbol(t) {
+            self.note(self.pos, |p| p.symbols.push(s));
+        }
         let y = self.toks.get(self.pos) == Some(t);
         if y {
             self.pos += 1;
@@ -724,6 +847,7 @@ impl Parser<'_> {
         }
         let negate = self.eat_kw(Kw::Not);
         if self.eat_kw(Kw::Like) || self.eat_kw(Kw::Ilike) {
+            self.note_compared(&l);
             let p = self.concat()?;
             return Ok(match (l, p) {
                 (Expr::Field(field), Expr::Lit(Value::Text(pattern))) => Expr::Like { field, pattern, negate },
@@ -732,10 +856,15 @@ impl Parser<'_> {
         }
         if self.eat_kw(Kw::In) {
             self.expect(Tok::LParen, "'(' after IN")?;
+            self.note_compared(&l);
             let mut list = vec![self.item()?];
             loop {
+                self.note(self.pos, |p| p.symbols.extend([",", ")"]));
                 match self.next() {
-                    Some(Tok::Comma) => list.push(self.item()?),
+                    Some(Tok::Comma) => {
+                        self.note_compared(&l);
+                        list.push(self.item()?)
+                    }
                     Some(Tok::RParen) => break,
                     other => return Err(format!("expected ',' or ')', found {}", show(other.as_ref()))),
                 }
@@ -752,10 +881,12 @@ impl Parser<'_> {
             });
         }
         if self.eat_kw(Kw::Between) {
+            self.note_compared(&l);
             let lo = self.concat()?;
             if !self.eat_kw(Kw::And) {
                 return Err("expected AND after BETWEEN …".into());
             }
+            self.note_compared(&l);
             let hi = self.concat()?;
             self.date_against_number(&l, &lo)?;
             self.date_against_number(&l, &hi)?;
@@ -764,6 +895,7 @@ impl Parser<'_> {
         if negate {
             return Err("expected LIKE, IN or BETWEEN after NOT".into());
         }
+        self.note(self.pos, |p| p.symbols.extend(COMPARISONS));
         let op = match self.toks.get(self.pos) {
             Some(Tok::Op(o)) => match o.as_str() {
                 "=" | "==" => Op::Eq,
@@ -777,6 +909,7 @@ impl Parser<'_> {
             _ => return Ok(l),
         };
         self.pos += 1;
+        self.note_compared(&l);
         let r = self.concat()?;
         self.date_against_number(&l, &r)?;
         Ok(match (l, r) {
@@ -819,6 +952,8 @@ impl Parser<'_> {
     fn chain(&mut self, ops: &[Arith], term: fn(&mut Self) -> Result<Expr, String>) -> Result<Expr, String> {
         let first = term(self)?;
         let mut rest = Vec::new();
+        let note = |p: &Self| p.note(p.pos, |probe| probe.symbols.extend(ops.iter().map(|a| arith_symbol(*a))));
+        note(self);
         while let Some(Tok::Arith(a)) = self.toks.get(self.pos).cloned()
             && ops.contains(&a)
         {
@@ -827,6 +962,7 @@ impl Parser<'_> {
                 return Err("the expression has too many terms".into());
             }
             rest.push((a, term(self)?));
+            note(self);
         }
         if rest.is_empty() { Ok(first) } else { self.arithmetic(first, rest) }
     }
@@ -835,7 +971,9 @@ impl Parser<'_> {
     /// nulls.
     fn arithmetic(&self, first: Expr, rest: Vec<(Arith, Expr)>) -> Result<Expr, String> {
         for e in std::iter::once(&first).chain(rest.iter().map(|(_, e)| e)) {
-            if let Some(f) = self.date_field(e) {
+            if !self.probing()
+                && let Some(f) = self.date_field(e)
+            {
                 return Err(format!("'{}' holds dates, and arithmetic on dates isn't supported yet", f.name));
             }
         }
@@ -845,6 +983,9 @@ impl Parser<'_> {
     /// `issued > year`), which would compare the date's text with the number's digits and match
     /// the wrong rows.
     fn date_against_number(&self, a: &Expr, b: &Expr) -> Result<(), String> {
+        if self.probing() {
+            return Ok(());
+        }
         // Each way round: either side can be the date, whatever the other is.
         let date_against = |d: &Expr, other: &Expr| if self.text_or_date(other) { None } else { self.date_field(d) };
         let date = date_against(a, b).or_else(|| date_against(b, a));
@@ -944,11 +1085,18 @@ impl Parser<'_> {
             || [Kw::Is, Kw::Like, Kw::Ilike, Kw::In, Kw::Not, Kw::Between].into_iter().any(|k| self.kw_at(i, k))
     }
     fn field(&self, name: &str) -> Result<Expr, String> {
-        self.ds.field_index(name).map(Expr::Field).ok_or_else(|| format!("no field named '{name}'"))
+        match self.ds.field_index(name) {
+            Some(i) => Ok(Expr::Field(i)),
+            None if self.probing() => Ok(Expr::Lit(Value::Null)),
+            None => Err(format!("no field named '{name}'")),
+        }
     }
     /// `m` in units of `size`, on a layer of the kind it measures.
     fn measure(&self, name: &str, m: Measure, size: f64) -> Result<Expr, String> {
         let want = m.geometry_type();
+        if self.probing() {
+            return Ok(Expr::Var(Var::Measure(m, size)));
+        }
         if self.ds.geometry_type != want {
             let hint = if m == Measure::Length { " (use perimeter on polygons)" } else { "" };
             return Err(format!("'{name}' measures {} layers{hint}", want.label().to_ascii_lowercase()));
@@ -965,9 +1113,11 @@ impl Parser<'_> {
     /// A value: a literal, a field, a variable (a measure only on a layer it fits), a call, a
     /// `CASE` or a bracketed expression.
     fn primary(&mut self) -> Result<Expr, String> {
+        self.note(self.pos, |p| p.operand = true);
         match self.next() {
             Some(Tok::LParen) => {
                 let e = self.or()?;
+                self.note(self.pos, |p| p.symbols.push(")"));
                 if self.next() != Some(Tok::RParen) {
                     return Err("missing ')'".into());
                 }
@@ -981,6 +1131,7 @@ impl Parser<'_> {
             Some(Tok::Var(v)) => match VARS.iter().find(|s| s.names.iter().any(|n| n.eq_ignore_ascii_case(&v))).map(|s| s.var) {
                 Some(Var::Measure(m, size)) => self.measure(&v, m, size),
                 Some(var) => Ok(Expr::Var(var)),
+                None if self.probing() => Ok(Expr::Lit(Value::Null)),
                 None => Err(format!("unknown variable '{v}'")),
             },
             Some(Tok::Ident(s)) => {
@@ -1007,16 +1158,23 @@ impl Parser<'_> {
     /// A call of the function `name`, its arguments counted; a measure's call becomes the
     /// variable it reads, its unit (fixed text) checked here.
     fn call(&mut self, name: &str) -> Result<Expr, String> {
-        let FuncSpec { name: fname, func: f, min, max, .. } =
-            functions().find(|s| s.name.eq_ignore_ascii_case(name)).ok_or_else(|| format!("unknown function '{name}'"))?;
+        let spec = functions().find(|s| s.name.eq_ignore_ascii_case(name));
+        if spec.is_none() && !self.probing() {
+            return Err(format!("unknown function '{name}'"));
+        }
         self.pos += 1; // '('
+        self.calls.push((spec.map(|s| s.func), 0));
         let mut args = Vec::new();
         if !self.eat(&Tok::RParen) {
             loop {
                 if args.len() >= MAX_ARGS {
-                    return Err(format!("{fname} has too many arguments"));
+                    return Err(format!("{} has too many arguments", spec.map_or(name, |s| s.name)));
+                }
+                if let Some(c) = self.calls.last_mut() {
+                    c.1 = args.len();
                 }
                 args.push(self.or()?);
+                self.note(self.pos, |p| p.symbols.extend([",", ")"]));
                 match self.next() {
                     Some(Tok::Comma) => {}
                     Some(Tok::RParen) => break,
@@ -1024,6 +1182,11 @@ impl Parser<'_> {
                 }
             }
         }
+        self.calls.pop();
+        // What was typed is only being read for what may come next: its arguments aren't checked.
+        let Some(FuncSpec { name: fname, func: f, min, max, .. }) = spec.filter(|_| !self.probing()) else {
+            return Ok(Expr::Lit(Value::Null));
+        };
         if args.len() < min || args.len() > max {
             let n = if min == max {
                 min.to_string()
@@ -1166,7 +1329,7 @@ fn parse_expression(text: &str, ds: &Dataset, validate_areas: bool) -> Result<Ex
     if toks.is_empty() {
         return Err("the expression is empty".into());
     }
-    let mut p = Parser { toks, pos: 0, ds, depth: 0, area_check: OnceCell::new(), validate_areas };
+    let mut p = Parser { toks, pos: 0, ds, depth: 0, area_check: OnceCell::new(), validate_areas, probe: None, calls: Vec::new() };
     let e = p.or()?;
     if p.pos < p.toks.len() {
         return Err(format!("unexpected {}", show(p.toks.get(p.pos))));
