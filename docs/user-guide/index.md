@@ -397,6 +397,75 @@ can't check it.
 On the desktop, make the layer active and choose **Source File State** in Command Search; what it
 found shows in the status bar. CLI and Python: `source.syncState` with `{"layer":"parcels"}`.
 
+### Publish to source
+
+`source.publish` writes a layer's edits back over the Shapefile it was read from, so the file
+that other people and programs read holds them. A Shapefile can't change one row in place, so
+the whole file is written again, and RustGIS first makes sure that only the edits change. It
+refuses, with nothing written, when:
+
+- the file changed since the layer was read (`source.syncState` would say `sourceChanged` or
+  `both`): writing would overwrite that change;
+- the layer was read otherwise than the file reads now (by an older RustGIS), so rows that
+  weren't edited could change;
+- the file, read and written again, wouldn't be the same file: shapes with Z or M values, records
+  without a shape, multipatches, records marked deleted, text with spaces before it, numbers with
+  more digits than RustGIS holds exactly, columns of a type RustGIS doesn't write (memo, binary),
+  text in a code page RustGIS can't write. The message names what would change and where;
+- the file can't hold the layer as it is: a feature without a shape, a field name longer than 10
+  bytes, text in characters the file's code page lacks.
+
+The file keeps its code page (its `.cpg` and the language driver in its `.dbf`), each column's
+width, decimals and type where the values still fit, and its `.prj`. A column that can't hold
+an edited value gets one that can, and a notice names it with its old and new form; a field
+deleted or renamed in the layer leaves its column out of the file, and a notice names it too. A layer read in another
+coordinate system than its `.prj` names, including one assigned with Define Projection, gets a
+`.prj` for that system, said too. A shape that wasn't edited is
+written with the coordinates the file holds, so a projected file's untouched shapes stay as they
+were to the bit. An edited shape in a projected system is converted from longitude/latitude, as
+RustGIS holds it, and read back: publishing refuses one that would move by more than one part in
+10¹¹ of its coordinates (a tenth of a millimetre at ten thousand kilometres). A notice
+names the file, counts shapes with projection round-off and identifies the first feature and
+the largest coordinate difference in degrees; exact round trips give no such notice.
+
+Publishing refuses symbolic links in any source part: add the actual source files instead.
+This keeps each link and its target unchanged.
+
+The new parts are written beside the old ones, with the old parts' file permissions, checked,
+and then renamed into place, the `.shp` last. An OS lock prevents two RustGIS processes from
+publishing the same source at once; a competing publish refuses immediately. The empty
+`.filename.shp.rustgis-lock` sidecar stays beside the source for reuse; the OS releases its lock
+when the publisher finishes or exits. On Unix, this empty file permits read/write access across
+accounts so users sharing the source directory can reopen it for locking, including on NFS.
+Other programs do not follow this locking protocol: changes they make after RustGIS's final
+source check can be overwritten by the publish. Stop other writers before publishing.
+If one part fails to land, the old parts are put back;
+should putting one back fail too, the message names the temporary file that holds it, beside the
+Shapefile, so it can be renamed back by hand. Sidecars RustGIS doesn't write, such as `.shp.xml`
+metadata, are left alone. The spatial indexes that would no longer match (`.qix`, `.sbn`, `.sbx`)
+are removed where they can be; one that can't be (held open by another program) is left, and
+should be deleted before that program uses the file.
+
+This rollback needs RustGIS to keep running. Replacing several Shapefile parts is not atomic:
+a process crash or power loss between renames can leave a mixed or incomplete set. Keep an
+independent backup before publishing. After such an interruption, preserve the whole directory,
+including hidden `.<part-name>.<process-id>.<number>.tmp` files (for example,
+`.parcels.dbf.1234.5.tmp`); these can contain both staged new parts and displaced old parts.
+Restore a complete, consistent Shapefile from your backup before opening or publishing it again.
+Do not restore an arbitrary temporary file or mix parts from different versions. Temporary
+files may help with manual recovery, but are not a crash-safe backup.
+
+Once published, the layer holds its rows as the file reads them, which differs only where a
+Shapefile can't tell values apart (an empty text reads as no value, a column of whole numbers as
+integers, date-time fields as ISO 8601 text). A double field becoming integer or a date-time field
+becoming text produces a notice. The layer reads `inSync`; the project has a change to save. Undo doesn't change the file:
+undoing an edit made before publishing shows the layer as `edited` again. A layer with no edits writes nothing. GeoJSON and layers read in place can't
+be published yet.
+
+On the desktop, make the layer active and choose **Publish to Source** in Command Search; it runs
+in the background, with progress and Cancel in the status bar. CLI and Python: `source.publish`
+with `{"layer":"parcels"}`.
+
 ## Keyboard shortcuts
 
 | Keys | Action |

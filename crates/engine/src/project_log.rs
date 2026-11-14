@@ -35,8 +35,8 @@ pub(crate) fn now_ms() -> u64 {
 }
 
 /// Whether command `id`, run by itself with `params`, goes into the log: one that changes the
-/// project (all but those built with `.view()`; a plugin's when its manifest asks for the Edit
-/// permission), undo and redo, a save, the log's own clearing and switching, and a command whose
+/// project (automatic edits or an explicit `Edits` effect; a plugin's when its manifest asks for
+/// the Edit permission), undo and redo, a save, the log's own clearing and switching, and a command whose
 /// parameters name a file, folder, address or connection (an export), as the plugin permission
 /// gate reads them. Reading and looking around (listing, describing, moving the view) is left
 /// out: agents, scripts and plugins call those hundreds of times, and they would push the changes
@@ -60,7 +60,7 @@ pub(crate) fn is_logged(s: &Session, id: &str, params: &Value) -> bool {
         rustgis_plugins::command(id).is_some_and(|c| c.mutates())
     } else {
         match s.registry.get(id) {
-            Some(spec) => spec.mutates,
+            Some(spec) => spec.changes_project(),
             None => return false,
         }
     };

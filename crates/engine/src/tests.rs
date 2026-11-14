@@ -44779,6 +44779,10 @@ fn long_commands_stop_when_cancelled_while_they_run() {
     s.run("layer.addDataText", &json!({"fileName": "training.geojson", "text": training.to_string()})).unwrap();
     s.run("layout.new", &json!({"page": "a4", "orientation": "landscape", "template": "blank"})).unwrap();
     s.run("layout.addFrame", &json!({"x": 20, "y": 20, "w": 150, "h": 150})).unwrap();
+    // A layer read from a Shapefile, edited, to publish.
+    s.run("share.exportLayer", &json!({"layer": "Cities", "path": out("towns.shp")})).unwrap();
+    s.run("layer.addData", &json!({"path": out("towns.shp"), "name": "towns"})).unwrap();
+    s.run("edit.setValue", &json!({"layer": "towns", "row": 0, "field": "name", "value": "Renamed"})).unwrap();
 
     // What didn't stop, and how often it looked.
     let mut kept_going = Vec::new();
@@ -44835,6 +44839,7 @@ fn long_commands_stop_when_cancelled_while_they_run() {
         ("share.exportMap", json!({"path": out("map.png"), "width": 320, "height": 200})),
         ("layout.export", json!({"path": out("layout.pdf"), "dpi": 72})),
         ("report.export", json!({"path": out("report.pdf"), "dpi": 72})),
+        ("source.publish", json!({"layer": "towns"})),
     ];
     s.run("report.new", &json!({"layer": "Cities"})).unwrap();
     let registered = crate::cmd::exports::IN_BACKGROUND.iter().map(|(c, ..)| *c).collect::<std::collections::BTreeSet<_>>();
@@ -45513,6 +45518,168 @@ fn change_detection_leaves_out_see_through_cells() {
         "{:?}",
         kept.iter().find(|i| r.bands[0].data[**i] != 5.0)
     );
+}
+
+/// A layer read from a Shapefile publishes its edits to the file (#1385): the file then holds
+/// them, the layer reads `inSync`, and undoing an edit made before shows it as an edit again,
+/// as the file keeps it. A layer without edits writes nothing; a file changed since it was read,
+/// or one read from a GeoJSON file, is refused with nothing written.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_layer_publishes_its_edits_to_its_shapefile() {
+    // Removed however the test ends.
+    struct Dir(std::path::PathBuf);
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    impl Dir {
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    let dir = Dir(std::env::temp_dir().join(format!("rustgis-engine-publish-{}", std::process::id())));
+    let _ = std::fs::remove_dir_all(dir.path());
+    std::fs::create_dir_all(dir.path()).unwrap();
+    let path = dir.path().join("towns.shp");
+    let mut s = world();
+    s.run("share.exportLayer", &json!({"layer": "Cities", "path": path})).unwrap();
+    let id = s.run("layer.addData", &json!({"path": path, "name": "towns"})).unwrap()["layer"].as_u64().unwrap();
+    let state = |s: &mut Session| s.run("source.syncState", &json!({"layer": id})).unwrap()["state"].clone();
+    let dbf = || std::fs::read(dir.path().join("towns.dbf")).unwrap();
+    let before = dbf();
+    let out = s.run("source.publish", &json!({"layer": id})).unwrap();
+    assert_eq!(out["published"], false);
+    assert_eq!(dbf(), before, "nothing to write");
+    s.run("edit.setValue", &json!({"layer": id, "row": 0, "field": "name", "value": "Renamed"})).unwrap();
+    s.mark_saved();
+    let undo_before_publish = s.undo_depth();
+    let out = s.run("source.publish", &json!({"layer": id})).unwrap();
+    assert_eq!(s.undo_depth(), undo_before_publish, "publishing cannot be undone separately from the edits");
+    assert!(s.log.entries().any(|e| e.command == "source.publish" && e.ok));
+    assert_eq!(out["published"], true);
+    assert!(s.dirty(), "the layer's new record is a change to save");
+    let (read, _) = rustgis_data::io::read_path(&path).unwrap();
+    let name = read.fields.iter().position(|f| f.name == "name").unwrap();
+    assert_eq!(read.features.iter().next().unwrap().attrs[name], rustgis_data::Value::Text("Renamed".into()));
+    assert_eq!(state(&mut s), "inSync");
+    // Undo doesn't change the file: the layer now lacks an edit the file has.
+    s.run("edit.undo", &Value::Null).unwrap();
+    assert_eq!(state(&mut s), "edited");
+    s.run("edit.redo", &Value::Null).unwrap();
+    assert_eq!(state(&mut s), "inSync");
+    // An empty text, which the file holds as no value: the layer takes it as the file reads it,
+    // and is in step with it.
+    {
+        let l = s.map_mut().layer_mut(id as u32).unwrap();
+        l.dataset.fields.iter_mut().find(|f| f.name == "name").unwrap().alias = Some("Town name".into());
+    }
+    s.run("edit.setValue", &json!({"layer": id, "row": 2, "field": "name", "value": ""})).unwrap();
+    s.run("source.publish", &json!({"layer": id})).unwrap();
+    assert_eq!(state(&mut s), "inSync");
+    let l = s.map().layer(id as u32).unwrap();
+    let name = l.dataset.fields.iter().position(|f| f.name == "name").unwrap();
+    assert!(l.dataset.features.get(2).unwrap().attrs[name].is_null());
+    assert_eq!(l.dataset.fields[name].alias.as_deref(), Some("Town name"));
+    // Cancel arriving after the final .shp rename cannot turn a committed publish into an
+    // error or leave its old sync record. The probe observes the real file, not an internal hook.
+    struct CancelAfterPlacement {
+        path: std::path::PathBuf,
+        before: Vec<u8>,
+    }
+    impl rustgis_data::progress::Probe for CancelAfterPlacement {
+        /// Changes only after the last .shp rename, the publication commit point.
+        fn cancelled(&self) -> bool {
+            std::fs::read(&self.path).is_ok_and(|bytes| bytes != self.before)
+        }
+        fn begin(&self, _: u64) {}
+        fn advance(&self, _: u64) {}
+    }
+    s.run("edit.setGeometry", &json!({"layer": id, "row": 0, "geometry": {"type": "Point", "coordinates": [1, 2]}})).unwrap();
+    {
+        let probe = std::sync::Arc::new(CancelAfterPlacement { path: path.clone(), before: std::fs::read(&path).unwrap() });
+        let _installed = rustgis_data::progress::install(Some(probe.clone()));
+        // Run the real worker directly: synchronous Session dispatch installs its own probe.
+        let work = crate::cmd::publish::publish_work(&s, &json!({"layer": id})).unwrap();
+        let mut wrote = work().unwrap();
+        assert_eq!(wrote.answer["published"], true);
+        wrote.then.take().unwrap()(&mut s, &mut wrote.answer).unwrap();
+        assert!(rustgis_data::progress::Probe::cancelled(probe.as_ref()), "the probe saw the committed shape");
+    }
+    assert_eq!(state(&mut s), "inSync");
+    // Define Projection makes the geographic CRS explicit. Publishing normalizes it as
+    // the reader does, so the live layer and its new sync point agree after completion.
+    s.run("layer.defineProjection", &json!({"layer": id, "crs": "EPSG:4326"})).unwrap();
+    assert_eq!(state(&mut s), "edited");
+    assert_eq!(s.run("source.publish", &json!({"layer": id})).unwrap()["published"], true);
+    assert_eq!(state(&mut s), "inSync");
+    assert_eq!(s.run("source.publish", &json!({"layer": id})).unwrap()["published"], false);
+    // A later script failure rolls project edits back, but not its committed file or baseline,
+    // including when the script removed the published layer before failing.
+    for (n, (edited_inside, removed)) in [(false, false), (true, false), (true, true)].into_iter().enumerate() {
+        if !edited_inside {
+            s.run("edit.setValue", &json!({"layer": id, "row": 1, "field": "name", "value": "Committed"})).unwrap();
+        }
+        s.mark_saved();
+        let undo = s.undo_depth();
+        let mut lines = Vec::new();
+        let value = if edited_inside { format!("In script {n}") } else { "Committed".into() };
+        if edited_inside {
+            lines.push(format!("edit.setValue {}", json!({"layer":id,"row":1,"field":"name","value":value})));
+        }
+        lines.push(format!("source.publish {}", json!({"layer":id})));
+        if removed {
+            lines.push(format!("layer.remove {}", json!({"layer":id})));
+        }
+        lines.push("layer.remove {\"layer\":\"missing-layer\"}".into());
+        assert!(s.run("script.run", &json!({"script":lines.join("\n")})).is_err());
+        let checked = s.run("source.syncState", &json!({"layer":id})).unwrap();
+        assert_eq!(checked["changed"], json!([]), "the committed file retains its current baseline");
+        assert_eq!(checked["state"], if edited_inside { "edited" } else { "inSync" });
+        assert!(s.dirty(), "the committed baseline still needs saving after rollback");
+        assert_eq!(s.undo_depth(), undo, "a failed script adds no undo step");
+        let (back, _) = rustgis_data::io::read_path(&path).unwrap();
+        assert_eq!(back.features.get(1).unwrap().attrs[name], rustgis_data::Value::Text(value));
+    }
+    s.run("source.publish", &json!({"layer":id})).unwrap();
+    assert_eq!(state(&mut s), "inSync");
+    // A successful script can remove a layer after publication too. Undo restores its old
+    // rows against the committed file baseline; redo and a second undo keep that baseline.
+    let script = [
+        format!("edit.setValue {}", json!({"layer":id,"row":1,"field":"name","value":"Published and removed"})),
+        format!("source.publish {}", json!({"layer":id})),
+        format!("layer.remove {}", json!({"layer":id})),
+    ]
+    .join("\n");
+    s.run("script.run", &json!({"script":script})).unwrap();
+    assert!(s.map().layer(id as u32).is_none());
+    for again in [false, true] {
+        if again {
+            s.run("edit.redo", &Value::Null).unwrap();
+            assert!(s.map().layer(id as u32).is_none());
+        }
+        s.run("edit.undo", &Value::Null).unwrap();
+        let checked = s.run("source.syncState", &json!({"layer":id})).unwrap();
+        assert_eq!(checked["changed"], json!([]));
+        assert_eq!(checked["state"], "edited");
+        let (back, _) = rustgis_data::io::read_path(&path).unwrap();
+        assert_eq!(back.features.get(1).unwrap().attrs[name], rustgis_data::Value::Text("Published and removed".into()));
+    }
+    // Changed since: refused, the file left as it was.
+    s.run("edit.setValue", &json!({"layer": id, "row": 1, "field": "name", "value": "Mine"})).unwrap();
+    let mut theirs = dbf();
+    *theirs.last_mut().unwrap() ^= 1;
+    std::fs::write(dir.path().join("towns.dbf"), &theirs).unwrap();
+    let e = s.run("source.publish", &json!({"layer": id})).unwrap_err();
+    assert!(e.contains("towns.dbf changed since the layer was read") && e.contains("nothing was written"), "{e}");
+    assert_eq!(dbf(), theirs);
+    // GeoJSON isn't published yet.
+    let geojson = dir.path().join("towns.geojson");
+    s.run("share.exportLayer", &json!({"layer": "Cities", "path": geojson})).unwrap();
+    s.run("layer.addData", &json!({"path": geojson, "name": "towns.geojson"})).unwrap();
+    let e = s.run("source.publish", &json!({"layer": "towns.geojson"})).unwrap_err();
+    assert!(e.contains("only a layer read from a Shapefile"), "{e}");
 }
 
 /// A layer read whole from a Shapefile or GeoJSON file remembers the files and its rows as read

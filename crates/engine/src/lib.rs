@@ -86,7 +86,8 @@ pub struct CommandSpec {
     pub shortcut: &'static str,
     /// Parameter description for scripts and agents.
     pub params: &'static str,
-    /// Whether it changes the project (and so takes an undo snapshot).
+    /// Whether it takes an automatic project-edit transaction (undo snapshot and dirty marking).
+    /// Changes committed without that transaction declare `Effect::Edits` explicitly.
     pub mutates: bool,
     /// `None` = enabled; `Some(reason)` = disabled.
     pub enabled: fn(&Session) -> Option<&'static str>,
@@ -109,6 +110,12 @@ impl CommandSpec {
     /// the description is not a `{"key": …}` object (nothing to check against).
     pub fn param_keys(&self) -> Option<Vec<&'static str>> {
         param_keys(self.params)
+    }
+
+    /// Whether it can change the project, including external commits that update metadata
+    /// without an automatic undo snapshot. Logging and command discovery use this contract.
+    pub const fn changes_project(&self) -> bool {
+        self.mutates || self.effects.contains(policy::Effect::Edits)
     }
 
     /// Whether the parameter description includes a required top-level input.
@@ -163,7 +170,8 @@ impl CommandSpec {
         self.params = p;
         self
     }
-    /// Doesn't change the project (no undo snapshot, not dirtying).
+    /// Suppresses automatic undo snapshots and dirty marking. Usually read-only; a command
+    /// committing external changes can update metadata itself and declares `Effect::Edits`.
     pub const fn view(mut self) -> Self {
         self.mutates = false;
         self
@@ -821,6 +829,9 @@ pub struct Session {
     /// How many of the commands running now restore the project if they fail: a replacement is
     /// put aside only under one of them, as only then can it be rolled back.
     restorable: u32,
+    /// File writes committed inside the outer command, retained through layer removal or a
+    /// project replacement so its rollback can restore the current source-file record.
+    published_syncs: Vec<(u64, String, rustgis_data::sync::Synced)>,
     /// Who runs commands now: `None` is the user; the MCP relay names an attached agent around
     /// its calls. Each undo step remembers who made it ([`Session::undo_actor`]).
     pub actor: Option<String>,
@@ -1201,6 +1212,7 @@ impl Session {
             depth: 0,
             diagnostic_source: None,
             restorable: 0,
+            published_syncs: Vec::new(),
             actor: None,
             back: Vec::new(),
             forward: Vec::new(),
@@ -1796,6 +1808,10 @@ impl Session {
             // session's own flag says so, not the answer, which a plugin's command could forge.
             (Ok(_), Some(_)) if std::mem::take(&mut self.request_only) => {}
             (Ok(_), Some(mut snap)) => {
+                // A successful script may publish and then remove the layer. Its undo
+                // snapshot still needs the committed file record, even without a live layer
+                // from which undo could carry that record forward.
+                self.keep_published_syncs(&mut snap);
                 fresh_source_ids(&snap, &mut self.project);
                 forget_label_state_of_removed_features(&snap, &mut self.project);
                 // An edit may change the dates the time slider's window filters on: bound layers
@@ -1849,7 +1865,8 @@ impl Session {
                 let failed_history = if self.opened == opened { std::mem::take(&mut self.project.gp_history) } else { Vec::new() };
                 // The project as it was before the command, so the layout open then, whatever
                 // the command opened on the way (a task's steps).
-                self.project = snap;
+                let committed = std::mem::replace(&mut self.project, snap);
+                let sync_changed = self.keep_synced(&committed);
                 (self.trusted_tasks, self.trusted_models, self.trusted_notebooks) = trust;
                 self.active_layout = open_layout;
                 // Replaced during the command: what it held beside itself (its undo history, its
@@ -1882,7 +1899,11 @@ impl Session {
                     self.push_gp_record(record);
                     recorded_failure = true;
                 }
-                if recorded_failure {
+                if sync_changed {
+                    self.mark_unsaved();
+                    self.warn("Source-file records were kept: rolling back a command does not undo its file writes");
+                }
+                if recorded_failure || sync_changed {
                     if self.depth == 0 && self.project.gp_history.len() > 500 {
                         let excess = self.project.gp_history.len() - 500;
                         self.project.gp_history.drain(..excess);
@@ -1907,6 +1928,7 @@ impl Session {
         // The command, and those it ran, are done: a replaced project stays replaced.
         if self.depth == 0 {
             self.put_aside = None;
+            self.published_syncs.clear();
         }
         self.fix_active_layer();
         self.revision = self.revision.wrapping_add(1);
@@ -2543,6 +2565,7 @@ impl Session {
         self.keep_time_position(&cur);
         self.keep_tile_pick(&cur);
         self.keep_headers_said(&cur);
+        self.keep_synced(&cur);
         self.redo.push((cur, was, label, actor, std::mem::replace(&mut self.state, state), files, old_trust));
         self.touch_all_geometry();
         true
@@ -2568,6 +2591,7 @@ impl Session {
         self.keep_time_position(&cur);
         self.keep_tile_pick(&cur);
         self.keep_headers_said(&cur);
+        self.keep_synced(&cur);
         self.undo.push((cur, was, label, actor, std::mem::replace(&mut self.state, state), files, old_trust));
         self.touch_all_geometry();
         true
@@ -2584,6 +2608,51 @@ impl Session {
         }
         // Zarr layers that follow the slider read the step it is back at.
         cmd::zarr::follow_time(self);
+    }
+
+    /// Remembers a physical source write only while a command can still roll its project back.
+    /// The outer guard clears these records on success or failure; they never go in a project.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn remember_source_write(&mut self, instance: u64, path: String, synced: rustgis_data::sync::Synced) {
+        if self.restorable > 0 {
+            self.published_syncs.retain(|(i, p, _)| *i != instance || *p != path);
+            self.published_syncs.push((instance, path, synced));
+        }
+    }
+
+    /// Gives a command's undo snapshot the records of files it physically wrote, including
+    /// layers the command removed after publishing. The records belong to these instances only.
+    fn keep_published_syncs(&self, project: &mut Project) {
+        for l in project.maps.iter_mut().flat_map(|m| m.layers.iter_mut()) {
+            if let Some((_, _, synced)) =
+                self.published_syncs.iter().rev().find(|(i, p, _)| *i == l.instance_id() && l.dataset.source.as_deref() == Some(p.as_str()))
+            {
+                l.synced = Some(synced.clone());
+            }
+        }
+    }
+
+    /// After undo, redo or failed-command rollback swaps the project: each layer keeps its
+    /// file record (`synced`), as restoring the project doesn't change the file. A published
+    /// layer keeps the record of what was written, so restored edits compare with that file.
+    /// Returns whether the restored project took a different record and needs saving.
+    fn keep_synced(&mut self, before: &Project) -> bool {
+        let mut changed = false;
+        for l in self.project.maps.iter_mut().flat_map(|m| m.layers.iter_mut()) {
+            let old = before.maps.iter().flat_map(|m| &m.layers).find(|o| o.instance_id() == l.instance_id());
+            let synced = old.filter(|o| o.dataset.source == l.dataset.source).map(|o| o.synced.clone()).or_else(|| {
+                self.published_syncs
+                    .iter()
+                    .rev()
+                    .find(|(i, p, _)| *i == l.instance_id() && l.dataset.source.as_deref() == Some(p.as_str()))
+                    .map(|(_, _, synced)| Some(synced.clone()))
+            });
+            if let Some(synced) = synced {
+                changed |= l.synced != synced;
+                l.synced = synced;
+            }
+        }
+        changed
     }
 
     /// After undo or redo swaps the project: the tile layer picked in the Layers pane stays the one

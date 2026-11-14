@@ -37,6 +37,8 @@ pub mod ogc;
 pub mod osm;
 pub mod photo;
 pub mod progress;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod publish;
 pub mod query;
 pub mod raster;
 pub mod s3_address;

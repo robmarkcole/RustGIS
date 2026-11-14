@@ -52,7 +52,7 @@ pub fn defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "run_command",
-            description: "Run a RustGIS command by id with JSON parameters (see search_commands for ids and parameters). Each run is one undo step. Commands that read or write files, use the network or replace the project ask the user first.",
+            description: "Run a RustGIS command by id with JSON parameters (see search_commands for ids and parameters). Project edits are undoable. Source publication and other external file writes cannot be undone. Commands that read or write files, use the network or replace the project ask the user first.",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -648,6 +648,7 @@ fn words(a: &Value) -> Result<Vec<String>, String> {
     Ok(words)
 }
 
+/// Ranks command descriptions and reports project changes independently of undo snapshots.
 fn search_commands(s: &Session, a: &Value) -> Result<Value, String> {
     let words = words(a)?;
     let limit = limit_arg(a, 12, 40);
@@ -664,7 +665,7 @@ fn search_commands(s: &Session, a: &Value) -> Result<Value, String> {
                 (c.id.to_lowercase(), c.label.to_lowercase(), c.location.to_lowercase(), c.params.to_lowercase());
             let sc = score(&words, &[&id, &label, &loc, &params]);
             (sc > 0).then(|| {
-                (sc, json!({"id": c.id, "label": c.label, "location": c.location, "params": c.params, "changesProject": c.mutates}))
+                (sc, json!({"id": c.id, "label": c.label, "location": c.location, "params": c.params, "changesProject": c.changes_project()}))
             })
         })
         .collect();
@@ -1088,6 +1089,17 @@ mod tests {
         }
         let data = public_addresses(json!({"id":"private field"}), 0, &mut Withheld::default());
         assert_eq!(data["[redacted]"], "private field");
+    }
+
+    /// Command discovery distinguishes publishing's project change from a read-only query.
+    #[test]
+    fn publishing_reports_a_project_change_in_command_search() {
+        let s = Session::new(rustgis_engine::Project::default());
+        for (id, changes) in [("source.publish", true), ("source.syncState", false)] {
+            let out = search_commands(&s, &json!({"query":id, "limit":40})).unwrap();
+            let command = out["commands"].as_array().unwrap().iter().find(|c| c["id"] == id).unwrap();
+            assert_eq!(command["changesProject"], changes, "{id}");
+        }
     }
 
     #[test]
