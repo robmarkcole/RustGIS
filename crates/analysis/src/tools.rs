@@ -5073,7 +5073,7 @@ fn lonlat_line(coords: &[Coord]) -> geo::LineString<f64> {
 /// lon/lat polygon geometry on the WGS 84 ellipsoid, as Calculate Geometry Attributes gives them;
 /// zero for any other geometry.
 fn ground_area_perimeter(g: &Geometry) -> (f64, f64) {
-    use geo::GeodesicArea;
+    use geo::{BoundingRect, GeodesicArea};
     let (mut a, mut per) = (0.0, 0.0);
     let Geometry::Polygon(polys) = g else { return (a, per) };
     for rings in polys {
@@ -5101,10 +5101,14 @@ fn ground_area_perimeter(g: &Geometry) -> (f64, f64) {
             let polar = ring.0.first().zip(ring.0.last()).is_some_and(|(a, b)| (a.x - b.x).abs() > 180.0);
             let orientable = !polar && ring.0.iter().all(|c| c.x.is_finite() && (-90.0..=90.0).contains(&c.y));
             let polygon = geo::Polygon::new(ring, vec![]);
-            let (rp, ra) = if orientable {
+            // Within a longitude span of 180°, the ring cannot enclose more than a hemisphere.
+            // Use signed magnitude there: a tiny overlay sliver can have opposite planar and
+            // geodesic windings, making its unsigned area nearly the whole Earth (#1966).
+            let wide = polygon.bounding_rect().is_some_and(|bounds| bounds.width() > 180.0);
+            let (rp, ra) = if orientable && wide {
                 polygon.orient(Direction::Default).geodesic_perimeter_area_unsigned()
             } else {
-                // Keep smaller polar caps; invalid coordinates bypass planar orientation.
+                // Keep smaller local rings and polar caps; invalid coordinates bypass orientation.
                 let (perimeter, area) = polygon.geodesic_perimeter_area_signed();
                 (perimeter, area.abs())
             };
