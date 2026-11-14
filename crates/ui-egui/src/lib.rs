@@ -1138,6 +1138,12 @@ pub struct RustGisApp {
     /// bar (the touch interface, `rustgis-ui-touch`). `None` is the desktop interface. Dialogs
     /// and the Project menu's page are drawn either way.
     pub chrome: Option<Chrome>,
+    /// Whether the user wants the device's position shown: a shell that can report one (a
+    /// phone's) starts and stops its positioning by this, and fills in [`RustGisApp::position`].
+    pub locate: bool,
+    /// Where the device is, as the shell last reported it; `None` until it has, and again once
+    /// positioning is off. An interface draws it on the map and can capture at it.
+    pub position: Option<rustgis_engine::platform::Fix>,
     /// Watches linked local files for changes made outside RustGIS and offers Reload Data
     /// (the desktop app; see [`diskwatch`]). Off for tests, unless one turns it on (as `ui_shot`'s
     /// `watchFiles` does).
@@ -1405,6 +1411,8 @@ impl RustGisApp {
             reads: readjob::Reads::default(),
             reads_off_frame: false,
             chrome: None,
+            locate: false,
+            position: None,
             #[cfg(not(target_arch = "wasm32"))]
             watch_files: false,
             #[cfg(not(target_arch = "wasm32"))]
