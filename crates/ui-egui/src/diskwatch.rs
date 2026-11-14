@@ -1259,7 +1259,7 @@ mod tests {
         app.run("layer.addData", json!({"path": geojson, "stream": true})).unwrap();
         let table = app.run("gpkg.addLayer", json!({"path": package, "table": "rows"})).unwrap()["layer"].as_u64().unwrap() as u32;
         let table = Target::Layer { map: app.session.map().instance_id(), layer: app.session.map().layer(table).unwrap().instance_id() };
-        let mut standalone = rustgis_engine::project::Table { id: 7, dataset: Dataset::new("rows", GeometryType::None, vec![]) };
+        let mut standalone = rustgis_engine::project::Table::new(7, Dataset::new("rows", GeometryType::None, vec![]));
         standalone.dataset.name = "rows".into();
         app.session.project.tables.push(standalone);
         tick(&mut app, &egui::Context::default());
@@ -1373,6 +1373,13 @@ mod tests {
         // second's read was prepared before the first replaced the source, so the engine refuses
         // it when it lands (nothing is discarded).
         app.run("ui.reloadData", json!({"layer": id})).unwrap();
+        // Wait for the first read to be done on its thread before the file changes again: a read
+        // that began after the change would see it, and the mark would rightly clear.
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !app.reads.read_finished_for_tests() {
+            assert!(std::time::Instant::now() < end, "the first reload never finished reading");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         replace(3);
         app.run("ui.reloadData", json!({"layer": id})).unwrap();
         let land_all = |app: &mut RustGisApp| {

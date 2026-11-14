@@ -83,6 +83,14 @@ mod android {
         app: RustGisApp,
         /// The files pushed to the app's folder ([`pushed`]), until the first frame takes them.
         pushed: Vec<std::path::PathBuf>,
+        /// How soon (milliseconds) the window draws again to take what is still to arrive from
+        /// Android; `None` when nothing is.
+        poll: Option<u64>,
+        /// Whether the phone was last asked for positions (`RustGisApp::locate`, as last seen).
+        locating: bool,
+        /// Whether the system bars' icons were last asked to be dark (a light ground); `None`
+        /// before the first frame.
+        bars_light: Option<bool>,
         /// The phone's file picker, where its Java half is there.
         phone: Option<Rc<Phone>>,
         /// Picked files the front end reads as bytes (`Services::inbox`).
@@ -120,11 +128,33 @@ mod android {
                 self.app.session.notify(text, true);
             }
             let Some(phone) = self.phone.clone() else { return };
+            // Positioning follows what the interface asks for; off, the last position is let go.
+            if self.app.locate != self.locating {
+                self.locating = self.app.locate;
+                if let Err(e) = phone.locate(self.locating) {
+                    self.app.session.notify(e, true);
+                    self.app.locate = false;
+                    self.locating = false;
+                }
+                if !self.locating {
+                    self.app.position = None;
+                }
+            }
             for event in phone.take_events() {
                 match event {
                     Event::Picked { purpose, name, path } => self.waiting.push((purpose, name, path)),
                     Event::Cancelled => {}
                     Event::Saved { name } => self.app.session.notify(i18n::fmt("Saved {name}.", &[("name", &name)]), false),
+                    Event::Position(fix) if self.locating => self.app.position = Some(fix),
+                    // A fix that was on its way when positioning was turned off.
+                    Event::Position(_) => {}
+                    // Android ended positioning itself (its reason is a failure beside this): the
+                    // interface goes back to offering to show the position.
+                    Event::Stopped => {
+                        self.app.locate = false;
+                        self.locating = false;
+                        self.app.position = None;
+                    }
                     Event::Failed(text) => self.app.session.notify(text, true),
                 }
             }
@@ -153,9 +183,17 @@ mod android {
             if !busy && !self.waiting.is_empty() {
                 self.open_waiting(ctx, raw_input);
             }
-            if busy || self.reading.load(Ordering::Relaxed) > 0 {
-                ctx.request_repaint_after(std::time::Duration::from_millis(250));
-            }
+            // Positions arrive on a thread of Android's too: looked for while they are wanted.
+            // Asked for from inside the frame (`ui`): asked from here, before it, it isn't kept.
+            // Soon for what is quick (a file being copied or read); once a second for positions,
+            // which come no faster: redrawing the map more often than that would only cost battery.
+            self.poll = if busy || self.reading.load(Ordering::Relaxed) > 0 {
+                Some(250)
+            } else if self.locating {
+                Some(1000)
+            } else {
+                None
+            };
         }
 
         /// Opens the picked files, now that every picker has answered in full, what was picked
@@ -250,6 +288,14 @@ mod android {
         }
     }
 
+    /// The room the system's bars take at the window's edges (the status bar, the navigation bar,
+    /// a camera cutout), in points: egui keeps every panel out of it. `None` when the phone
+    /// can't say, which leaves egui's last answer in place.
+    fn insets(phone: Option<&Phone>, pixels_per_point: f32) -> Option<egui::SafeAreaInsets> {
+        let [left, top, right, bottom] = phone?.insets()?.map(|edge| edge.max(0.0) / pixels_per_point.max(0.1));
+        Some(egui::SafeAreaInsets(egui::epaint::MarginF32 { left, top, right, bottom }))
+    }
+
     /// What starts the name of a file from the picker for `purpose` in the inbox, as the browser's
     /// shell marks them: the front end sends a marked file to the dialog that asked for it.
     fn mark(purpose: &str) -> &'static str {
@@ -287,10 +333,27 @@ mod android {
         }
 
         fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-            self.app.ui(ui);
+            // The window runs under the system's bars; the interface keeps to what they leave
+            // (`insets`), over a ground of its own colour so the bars read as part of it.
+            let ctx = ui.ctx().clone();
+            let tokens = rustgis_ui_egui::theme::Tokens::get(&ctx);
+            // The bars' icons are drawn to be read on that ground, whichever theme it is.
+            if self.bars_light != Some(!tokens.dark) {
+                self.bars_light = Some(!tokens.dark);
+                if let Some(phone) = &self.phone {
+                    phone.bars_light(!tokens.dark);
+                }
+            }
+            ui.painter().rect_filled(ctx.viewport_rect(), 0.0, tokens.pane);
+            ui.scope_builder(egui::UiBuilder::new().max_rect(ctx.content_rect()), |ui| self.app.ui(ui));
+            // Something of Android's is still to arrive (a picked file, a position): look again.
+            if let Some(wait) = self.poll {
+                ctx.request_repaint_after(std::time::Duration::from_millis(wait));
+            }
         }
 
         fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+            raw_input.safe_area_insets = insets(self.phone.as_deref(), ctx.pixels_per_point());
             self.take_phone_events(ctx, raw_input);
             // The pushed files open as files dropped on the desktop window do: once the window
             // runs, read off its thread with progress and Cancel, each failure said in the window.
@@ -406,6 +469,8 @@ mod android {
                 None
             }
         };
+        // A phone gets the touch interface; its More sheet has the desktop one.
+        app.chrome = Some(rustgis_ui_touch::chrome);
         let pushed = pushed(&android, &mut app);
         app.session.mark_saved();
         let mut wgpu_options = eframe::egui_wgpu::WgpuConfiguration::default();
@@ -420,6 +485,9 @@ mod android {
             Box::new(move |_cc| {
                 Ok(Box::new(App {
                     app,
+                    poll: None,
+                    locating: false,
+                    bars_light: None,
                     pushed,
                     phone,
                     inbox,

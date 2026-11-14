@@ -521,7 +521,7 @@ fn set_tool(s: &mut Session, p: &Value) -> CmdResult {
         return Err("editing is turned off (Edit › Edit)".into());
     }
     if t == Tool::RotatedBox {
-        crate::box_edit::check_layer(s, s.layer_id(&Value::Null)?)?;
+        crate::box_edit::check_tool(s, s.layer_id(&Value::Null)?)?;
     }
     s.tool = t;
     Ok(Value::Null)

@@ -1,0 +1,14 @@
+[package]
+name = "rustgis-ui-touch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "RustGIS L7: the touch interface for phones, drawn around the egui front end's map (large targets, no ribbon)"
+
+[lints]
+workspace = true
+
+[dependencies]
+rustgis-ui-egui = { workspace = true }
+egui = { workspace = true }
+serde_json = { workspace = true }

@@ -89,6 +89,24 @@ not lifted onto the relief yet, and identify and selection still pick on the fla
   <figcaption>Mount Rainier: USGS imagery draped over Terrarium elevation tiles.</figcaption>
 </figure>
 
+**Export Orbit** (`map.exportOrbit`, on desktop) writes a turn of the view about its centre as an
+animation: a tilted map with relief reads best when it moves. It turns the bearing by `"turn"`
+degrees (default 360, once round; negative turns the other way) over `"frames"` frames (default
+60), keeping the centre, the scale and the pitch, and draws each frame as Export Map draws the
+view, at `"width"` × `"height"` points (default 640 × 400) and `"dpi"` (default 96). A path
+ending in `.gif` gives an animated GIF that loops, each frame shown for `"speed"` milliseconds
+(default 50; a GIF keeps times to the hundredth of a second, so 55 shows as 50 or 60); one ending in `.zip` gives the frames as PNGs (`frame_0001.png`…), to build a video
+with another tool, since a GIF's 256 colours can band a smooth relief. A turn of 360° stops one
+step short of where it began, so the loop has no frame twice; a part of a turn ends on its last
+bearing. The light of a shaded relief stays with the ground, not the camera. The view comes back
+to where it was afterwards. The export runs to its end before the command answers; the frames
+count against a limit of 300 million pixels in all (170 frames at 1600 × 1100, say), and a size
+past it is refused:
+
+```bash
+rustgis-cli run --cmd 'project.open={"path":"massif.rgis"}' --cmd 'map.setPitch={"pitch":60}' --cmd 'map.exportOrbit={"path":"massif.gif","frames":72,"width":800,"height":500}'
+```
+
 MapLibre map links carry a view in their address, as
 `#zoom/latitude/longitude/bearing/pitch` (`https://…/#15.5/40.7484/-73.9857/30/60`). **Go To Map
 Link** (`map.goToLink {"url": …}`) takes such a link, or the part after its `#`, to that place,
@@ -130,9 +148,9 @@ rustgis-cli run --sample --cmd 'map.search={"query":"Tokyo","go":true}'
 
 **Right-click the map** for a menu about that place. Its first row shows the place in the status
 bar's coordinate format (latitude and longitude as `40.712800, -74.006000` for decimal degrees);
-click it to copy it. North of 84° N and south of 80° S, where UTM and MGRS have no zone, and on
-the map of another body than the Earth, it shows and copies the latitude and longitude, and its
-hover text says why. Below it, **Copy As GeoJSON**
+click it to copy it. North of 84° N and south of 80° S it gives the polar grid, UPS (see
+[Coordinate readouts](#coordinate-readouts)). On the map of another body than the Earth it shows
+and copies the latitude and longitude, and its hover text says why. Below it, **Copy As GeoJSON**
 copies the place as a point feature, **Center Map Here** and **Zoom In Here** move the view, and **Directions To Here** and
 **Directions From Here** open the [Directions](#directions) pane. **Quick Analysis** runs a tool
 at the place: a buffer of 500 m, 1 km or 5 km (¼, 1 or 5 miles when the Directions pane is set
@@ -159,15 +177,21 @@ UTM states the hemisphere, as GeographicLib's `GeoConvert -u -l` writes it, not 
 in plain UTM a letter after the zone is commonly read as the hemisphere, so `38S` (band S, 32° N
 to 40° N) would be taken for the southern hemisphere, 10,000 km away. Latitude bands are MGRS's.
 UTM and MGRS are on WGS 84, with the zone exceptions for southern Norway (32V) and Svalbard (31X,
-33X, 35X and 37X), and cover 80° S to 84° N. Nearer the poles they would need the Universal Polar
-Stereographic grid, which RustGIS doesn't have: there the readout shows *No UTM here* (or
-*No MGRS here*) rather than a wrong reference, and so it does on the map of another body than
-the Earth, where degrees still read. Scripts set the format with
+33X, 35X and 37X), and cover 80° S up to 84° N. North of 84° N and south of 80° S the readouts
+use the Universal Polar Stereographic grid (UPS), as NGA defines it (NGA.SIG.0012): the UTM
+readout gives the zone spelled out and the easting and northing rounded to the meter,
+`north 2077146 1562481`, as GeographicLib writes it, and the MGRS readout gives the polar
+reference, which has no zone number: a letter for the half (Y for western longitudes and Z for
+eastern ones in the north, A and B in the south, with the 0° and 180° meridians in Z and B),
+the 100 km square and the digits, truncated, `Z AC 77146 62481`. 84° N itself is UPS, 80° S
+itself is UTM. On the map of another body than the Earth the readout shows *No UTM here*
+(or *No MGRS here*) rather than a wrong reference, and degrees still read. Scripts set the format with
 `ui.coordinateFormat={"format":"utm"}` (`decimal`, `dms`, `utm` or `mgrs`); without `format`
 it steps to the next one. A saved format this version doesn't know, say from a newer RustGIS,
 reads as decimal degrees with a notice, and stays saved until you pick a format.
 
-The [search box](#navigating) takes the same grid references, in any case:
+The [search box](#navigating) takes the same grid references, in any case (polar references have
+their own rules, below):
 
 - **MGRS** with or without spaces: `33UWR2156621996`, `33U WR 21566 21996`, `33UWR 2156 2199`,
   or a 100 km square alone, `33UWR`; a zone below 10 with or without its leading zero (`04QFJ`,
@@ -182,12 +206,33 @@ The [search box](#navigating) takes the same grid references, in any case:
   `S` after the zone is always band S (32° N to 40° N), as in `11S 384629 3768405` (Los
   Angeles); with a northing outside band S it could mean the southern hemisphere, so it finds
   nothing: write `south` instead.
+- **UPS and polar MGRS**, north of 84° N and south of 80° S, which have no zone number: UPS as
+  the readout writes it, `north 2077146 1562481` or `south 2096454 1452981`, or with the half's
+  letter, `Z 2077146 1562481` or `Y, 1735147, 2243078`. Polar MGRS has no zone number, so three
+  letters and a few digits look like a word or a code (`ATL`, `Bay 12`, the flight `BAW1234`);
+  search reads one only as a reference is written: as the readout writes it, with a space after
+  the half's letter and the square in capitals, then no digits or two equal groups (`Z AC`,
+  `Z AC 77 62`, `Z AC 77146 62481`; `A ST 12` is an address), as
+  one word with at least six digits (`ZAC7714662481`, 100 m or finer), or in capitals before
+  two equal groups of at least three digits (`ZAC 771 624`, `ZAC 77146 62481`). A UPS position
+  (`north 2077146 1562481`, `Z 2077146 1562481`) and a reference written exactly as the readout
+  writes it (`Z AC 77146 62481`) are plainly places. Any
+  other polar text may also be a name or a code, so the attribute tables are still searched,
+  their hits come before the polar place, and **Search places** is still offered; with room
+  for one hit (`limit: 1`), a matching feature is the hit. A UTM zone's position past 84° N or
+  80° S, or a polar letter after a zone number (`38ZMB`), finds nothing and the list says how UPS
+  is written.
 
 A reference that doesn't exist (square letters the zone doesn't use, a northing or a square
 outside the band, an odd number of digits, a place outside the zone) finds nothing rather than a
-place somewhere else, and the list says why; `map.search` returns the reason as `gridError`. A
-100 km square written with spaces, such as `5 Ave` or `4K TV`, is as likely ordinary text, so one
-that names no square gives no reason; written as one word, `38TMJ`, it does. On the map of
+place somewhere else, and the list says why; `map.search` returns the reason as `gridError`, and
+adds `"coordinateMayBeText": true` when a polar place among its hits may as well be a name or a
+code. A 100 km square written with spaces, such as `5 Ave`, `4K TV` or `A TO`, is as likely
+ordinary text, so one that names no square gives no reason; written as one word, `38TMJ`, it does. Polar
+MGRS written compactly (`ZDA1234512345`) may be a code too, so one that names no place gives no
+reason either; written as the readout writes it (`Z DA 12345 12345`), it does. A UPS position
+after `n` or `s` may be a State Plane pair (`N 1350000 1350000`), so it gives no reason; after
+`north`, `south` or the half's letter (`Y 2392768 1607232`), it does. On the map of
 another body, grid references find nothing.
 
 ### Directions

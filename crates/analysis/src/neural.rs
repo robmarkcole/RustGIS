@@ -157,14 +157,18 @@ pub fn training_samples(
 /// Band values of the pixels inside a polygon (`rings`, longitude/latitude), up to `max`. Only
 /// the pixels under the polygon's outline are visited, every `step`-th one in each direction when
 /// there are many more than `max`, so the samples spread across the polygon. A cancelled run
-/// stops between rows, with the pixels found so far.
+/// stops between rows, with the pixels found so far. If an outline vertex can't be placed,
+/// search the whole raster instead of bounding the polygon by only its surviving vertices.
 pub fn polygon_samples(r: &Raster, bands: &[usize], rings: &[Vec<Coord>], max: usize) -> Vec<Vec<f32>> {
     let mut out = Vec::new();
     let tr = r.transformer();
     // The pixel window under the outline (its vertices, projected into the raster).
     let (mut c0, mut r0, mut c1, mut r1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
     for v in rings.iter().flatten().take(1_000_000) {
-        let Some(w) = tr.from_lonlat(*v) else { continue };
+        let Some(w) = tr.from_lonlat(*v) else {
+            (c0, r0, c1, r1) = (0.0, 0.0, f64::from(r.width), f64::from(r.height));
+            break;
+        };
         let (c, rw) = r.transform.to_pixel(w);
         if c.is_finite() && rw.is_finite() {
             (c0, r0, c1, r1) = (c0.min(c), r0.min(rw), c1.max(c), r1.max(rw));
@@ -480,6 +484,22 @@ fn classify_on(r: &Raster, model: &Mlp, nodata: f32, threads: Option<usize>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refused outline vertex cannot narrow the search past a valid pixel inside the polygon.
+    #[test]
+    fn polygon_samples_keep_a_pixel_when_outline_vertices_are_refused() {
+        use rustgis_data::raster::{ColorHint, Crs, GeoTransform};
+        let crs = Crs::from_epsg(32617).unwrap();
+        let t = crs.transformer().unwrap();
+        let at = Coord::new(-169.0, 10.5);
+        let native = t.from_lonlat(at).unwrap();
+        let gt = GeoTransform { origin_x: native.x - 0.5, origin_y: native.y + 0.5, pixel_width: 1.0, pixel_height: -1.0 };
+        let r = Raster::new("pixel", 1, 1, vec![vec![42.0]], gt, crs, None, ColorHint::Gray, "Float32").unwrap();
+        let ring = vec![Coord::new(-170.0, 0.0), Coord::new(10.0, 0.0), Coord::new(10.0, 50.0), Coord::new(-170.0, 50.0)];
+        assert!(t.from_lonlat(ring[0]).is_none());
+        assert!(rustgis_data::geometry::polygon_contains(std::slice::from_ref(&ring), at));
+        assert_eq!(polygon_samples(&r, &[0], &[ring], 10), [vec![42.0]]);
+    }
 
     /// Rows classified on several threads give the same classes and probabilities, bit for bit,
     /// as one thread (#1252), no-data pixels included.

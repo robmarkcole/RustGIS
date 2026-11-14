@@ -1,5 +1,5 @@
 //! L0: coordinates, extents, the Web Mercator projection, geodesic measurement, map scale, and
-//! UTM and MGRS coordinates ([`utm`]).
+//! UTM and MGRS coordinates ([`utm`]), and UPS for the polar areas ([`ups`]).
 //!
 //! Everything here is plain math with no I/O. Longitude/latitude are WGS 84 degrees; projected
 //! coordinates are Web Mercator meters (EPSG:3857), which [`lonlat_to_plane`] continues beyond
@@ -10,12 +10,14 @@ pub mod body;
 pub mod eqc;
 pub mod sinusoidal;
 pub mod triangulate;
+pub mod ups;
 pub mod utm;
 pub mod world;
 
 pub use body::{BODIES, Body};
 pub use eqc::EquidistantCylindrical;
 pub use sinusoidal::Sinusoidal;
+pub use ups::{Ups, format_ups, from_ups, parse_ups, to_ups};
 pub use utm::{GridError, Mgrs, Utm, format_mgrs, format_utm, parse_mgrs, parse_utm, to_mgrs, to_utm};
 
 use std::sync::LazyLock;

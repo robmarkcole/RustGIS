@@ -77,9 +77,11 @@ to English until the catalogs are updated; see [Languages](i18n.md).
 
 ### Saved-file compatibility
 
-`crates/engine/src/project.rs::FORMAT` is the saved-document compatibility version, separate
-from the application release version. Project, map, layer and style imports check a top-level
-`format` before interpreting their payloads. Missing metadata remains supported legacy content;
+`crates/engine/src/project.rs::FORMAT` is the saved-document compatibility version that
+RustGIS writes, separate from the application release version; `READ_FORMAT` is the newest it
+reads. Project, map, layer and style imports check a top-level `format`, and a top-level
+`requires` (the capabilities a document needs, `CAPABILITIES` listing those this RustGIS knows),
+before interpreting their payloads. Missing metadata remains supported legacy content;
 style files currently remain arrays. Current companion writers keep their existing output.
 Every project serialization, including templates and packages, writes the current `FORMAT`,
 even when the project was loaded from an older supported file.
@@ -87,10 +89,14 @@ These reader checks prepare for future writers; they do not protect already rele
 or detect new information in files that omit the required version.
 
 When a future change would cause an older reader to misinterpret or lose meaningful saved
-information on resaving, advance `FORMAT` and declare it in each affected document's top-level
-`format`. This includes additive fields that parse successfully but disappear when an older
-writer saves. For a style file that needs metadata, the future writer must use an object rather
-than the legacy array; readers with this guard refuse its newer format before interpreting it.
+information on resaving, name it in the document's `requires` and add the name to `CAPABILITIES`
+where it is read; a format beyond `READ_FORMAT` is for a change a capability can't describe. This
+includes additive fields that parse successfully but disappear when an older writer saves. Task,
+presentation, notebook and model documents don't check `requires` yet: a change to them that an
+older reader would lose needs that check first (see
+[maintaining](maintaining.md#saved-files-and-settings)). For a style file that needs metadata,
+the future writer must use an object rather than the legacy array; readers with this guard refuse
+its newer format before interpreting it.
 A payload or wrapper for such a new format belongs in that future change. Keep existing legacy
 readers and test that unsupported versions fail before typed deserialization, normalization or
 source reopening, including alternate import and package paths.

@@ -1882,9 +1882,13 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
             // Each polygon simplified to a tenth of a millimetre on the disc (its scale in metres),
             // so the project keeps a sketch of the layers for it, not a second full copy of them.
             let tolerance_m = globe * 1e-4;
+            // What Simplify left alone or changed beyond simplifying in what the sketch keeps (a
+            // latitude past a pole taken as the pole, a polygon left as it was): said in the
+            // warnings, one per kind (#1811).
+            let notes = std::cell::Cell::new(rustgis_analysis::SimplifyNotes::default());
             // On the locator, sub-tolerance rings keep their outline rather than becoming triangles.
             let sketch = |g: &rustgis_data::Geometry| {
-                let mut simple = rustgis_analysis::simplify_geometry(g, tolerance_m);
+                let (mut simple, mut said) = rustgis_analysis::simplify_geometry(g, tolerance_m);
                 if let (rustgis_data::Geometry::Polygon(original), rustgis_data::Geometry::Polygon(reduced)) = (g, &mut simple) {
                     for (original, reduced) in original.iter().flatten().zip(reduced.iter_mut().flatten()) {
                         let mut extent = Extent::EMPTY;
@@ -1898,13 +1902,27 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
                         let size_m =
                             projected.width().hypot(projected.height()) * extent.center().y.clamp(-85.0, 85.0).to_radians().cos().max(0.01);
                         if size_m < tolerance_m {
+                            // The ring as it was: its vertices past a pole stay where they were.
+                            said.past_pole = said.past_pole.saturating_sub(rustgis_analysis::past_pole(original.iter()));
                             *reduced = original.clone();
                         }
                     }
                 }
                 match &simple {
-                    rustgis_data::Geometry::Polygon(polys) if polys.iter().flatten().all(|ring| ring.len() >= 4) => simple,
-                    _ => g.clone(),
+                    rustgis_data::Geometry::Polygon(polys) if polys.iter().flatten().all(|ring| ring.len() >= 4) => {
+                        let mut all = notes.get();
+                        all.add(&said);
+                        notes.set(all);
+                        simple
+                    }
+                    // The polygon as it was: nothing Simplify did is kept, but one it left as it was
+                    // (a missing coordinate) is still said.
+                    _ => {
+                        let mut all = notes.get();
+                        all.add(&rustgis_analysis::SimplifyNotes { broken: said.broken, capped: said.capped, ..Default::default() });
+                        notes.set(all);
+                        g.clone()
+                    }
                 }
             };
             m.layers = src
@@ -1937,6 +1955,8 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
                     layer
                 })
                 .collect();
+            // All but reaching beyond 85.05°, which any world map does (`without_polar`).
+            warnings.extend(notes.get().without_polar().messages("the globe locator, simplifying its polygons"));
             let name = m.name.clone();
             match orphan.and_then(|i| s.project.maps.get_mut(i)) {
                 Some(old) => {

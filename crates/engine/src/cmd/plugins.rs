@@ -537,14 +537,14 @@ impl Bridge<'_> {
         {
             return Err(format!("plugins can't use a saved web-service connection's login ('{id}')"));
         }
-        let spec = self.s.registry.get(id).ok_or_else(|| format!("unknown command '{id}'"))?;
-        let (enabled, label, mutates) = (spec.enabled, spec.label, spec.mutates);
+        let spec = *self.s.registry.get(id).ok_or_else(|| format!("unknown command '{id}'"))?;
+        let (label, mutates) = (spec.label, spec.mutates);
         let named = params.get("layer").and_then(|_| self.s.layer_id(params).ok());
         let active = self.s.active_layer;
         if named.is_some() {
             self.s.active_layer = named;
         }
-        let blocked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| enabled(self.s))).unwrap_or(Some("unavailable"));
+        let blocked = self.s.check_conditions(&spec, params).0.unwrap_or(Some("unavailable"));
         self.s.active_layer = active;
         if let Some(why) = blocked {
             return Err(format!("{label}: {why}"));

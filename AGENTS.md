@@ -66,7 +66,8 @@ is out of scope.
 | L4 | `engine` | `Session`, undo, command registry, sample project |
 | L5 | `assistant` | the AI Assistant: a chat agent (sans I/O: `provider` builds and reads OpenAI Chat Completions/Responses, Anthropic and Gemini requests, `chatgpt` signs in with ChatGPT to use the user's plan, `agent` loops, `tools` run commands; file, network and plugin commands wait for the user's approval) |
 | L6 | `ui-egui` | ribbon, panes, map view, attribute table, dialogs (swappable) |
-| apps | `rustgis`, `rustgis-cli`, `rustgis-web`, `rustgis-python` | desktop app, command line, browser (WebAssembly), the `rustgis` Python package (PyO3, built with maturin) |
+| L7 | `ui-touch` | the touch interface for phones: a bar of large buttons and sheets around `ui-egui`'s map view (`RustGisApp::chrome`) |
+| apps | `rustgis`, `rustgis-cli`, `rustgis-web`, `rustgis-python`, `rustgis-mobile` | desktop app, command line, browser (WebAssembly), the `rustgis` Python package (PyO3, built with maturin), Android (a `NativeActivity`; see its README) |
 
 - **Everything is a command**: a `CommandSpec` in `crates/engine/src/cmd/*.rs`. UI-only
   commands (`ui.*`) live in `crates/ui-egui/src/lib.rs`. The ribbon, shortcuts, command search
@@ -92,6 +93,10 @@ is out of scope.
   maintainer translates them before each release (format in `docs/i18n.md`). Command ids, data
   and the CLI are never translated.
 - **Layering** is enforced by `cargo xtask layers`: nothing below L6 depends on egui/eframe/rfd.
+- **The expression language has one vocabulary**: a new function, variable or keyword goes in
+  the catalogs in `crates/data/src/query.rs` (`Func::spec`, `VARS`, `Kw`), which the parser
+  reads, and in `docs/user-guide/expressions.md`; the `query` tests fail when the guide misses
+  a signature, unit, variable or keyword, or names a function that doesn't exist.
 
 ## Assets
 - No third-party vendor icons, images, styles, fonts, help text or code. Icons are drawn in

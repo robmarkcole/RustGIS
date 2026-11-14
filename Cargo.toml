@@ -19,6 +19,7 @@ rustgis-analysis = { path = "crates/analysis" }
 rustgis-render = { path = "crates/render" }
 rustgis-engine = { path = "crates/engine" }
 rustgis-ui-egui = { path = "crates/ui-egui" }
+rustgis-ui-touch = { path = "crates/ui-touch" }
 rustgis-geolibre = { path = "crates/geolibre" }
 rustgis-plugins = { path = "crates/plugins" }
 rustgis-tiles = { path = "crates/tiles" }
@@ -119,7 +120,7 @@ egui-wgpu = "0.37"
 egui_extras = { version = "0.37", default-features = false }
 eframe = { version = "0.37", default-features = false }
 egui_kittest = "0.37"
-rfd = "0.17"
+rfd = "0.18"
 pollster = "1.0"
 
 [workspace.lints.rust]

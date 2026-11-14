@@ -340,7 +340,7 @@ fn a_project_from_a_newer_rustgis_opens_only_when_this_version_can_keep_it() {
             insert_at(&mut file, &mut place, &format!("futureField{i}"));
         }
         if let Some(k) = raised {
-            file["format"] = json!(u64::from(rustgis_engine::project::FORMAT) + k);
+            file["format"] = json!(u64::from(rustgis_engine::project::READ_FORMAT) + k);
         }
         std::fs::write(&newer, file.to_string()).unwrap();
         let mut a = Session::new(Project::new("Other"));
@@ -361,7 +361,8 @@ fn a_project_from_a_newer_rustgis_opens_only_when_this_version_can_keep_it() {
             (Err(e), None) if seen(&b) != before => Err(TestCaseError::fail(format!("a refused file changed the open project: {e}"))),
             (Ok(_), None) => {
                 // Fields this version doesn't know are left out, as a newer RustGIS that writes
-                // something an older one would lose raises the format (docs/maintaining.md).
+                // something an older one would lose raises the format, or lists it in `requires`
+                // (docs/maintaining.md).
                 let mut changed = Vec::new();
                 diff("", &seen(&a), &seen(&b), &mut changed);
                 changed.retain(|c| !declared(c));

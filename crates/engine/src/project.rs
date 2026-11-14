@@ -53,9 +53,32 @@ pub fn open_command(path: &str) -> &'static str {
         "layer.addData"
     }
 }
-/// Saved-document compatibility version, independent of the RustGIS release version.
-/// Advance it when an older reader would lose meaningful saved information on resaving.
+/// The format this RustGIS writes: the saved-document compatibility version, independent of the
+/// RustGIS release version. Advance it when an older reader would lose meaningful saved
+/// information on resaving; within format 2, such an addition is named in `requires` instead
+/// (see [`READ_FORMAT`] and [`CAPABILITIES`]).
 pub const FORMAT: u32 = 1;
+/// The newest format this RustGIS reads. Format 2 is read a release before anything writes it
+/// (#1853): a document of format 2 opens when this RustGIS knows every capability it `requires`,
+/// so what a later RustGIS adds to format 2, and an older one would lose, is listed there and
+/// refused by name instead.
+pub const READ_FORMAT: u32 = 2;
+/// The capabilities a saved document may require that this RustGIS reads. None yet: format 2 is
+/// format 1's content, and each later addition an older reader would lose comes with its name.
+pub const CAPABILITIES: &[&str] = &[];
+/// The most entries a document's `requires` may list: past it the document is refused without
+/// the rest being read.
+const MAX_REQUIRES: usize = 256;
+/// The longest capability name kept whole, in bytes: a longer one can't be a known capability
+/// (none is longer, held below), so only its start is kept, marked `…`, for the refusal to show.
+const MAX_CAPABILITY_BYTES: usize = 128;
+const _: () = {
+    let mut i = 0;
+    while i < CAPABILITIES.len() {
+        assert!(CAPABILITIES[i].len() <= MAX_CAPABILITY_BYTES, "a known capability's name is at most MAX_CAPABILITY_BYTES");
+        i += 1;
+    }
+};
 /// Largest project file read or saved in the browser, or on a computer whose memory isn't known
 /// (512 MiB): the floor of [`max_bytes`].
 pub const BYTES_FLOOR: u64 = 512 << 20;
@@ -394,6 +417,28 @@ pub struct Table {
     pub id: u32,
     #[serde(flatten)]
     pub dataset: Dataset,
+    /// Runtime identity of these contents; snapshots retain it, wholesale replacements renew it.
+    #[serde(skip)]
+    instance_id: u64,
+}
+
+/// A fresh runtime identity, independent of reusable project-local table ids.
+fn next_table_instance() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+impl Table {
+    /// Wraps a dataset under its project-local id with a fresh, unsaved runtime identity.
+    pub fn new(id: u32, dataset: Dataset) -> Self {
+        Self { id, dataset, instance_id: next_table_instance() }
+    }
+
+    /// Identifies these live contents across ordinary edits and undo snapshots, but not replacement.
+    pub fn instance_id(&self) -> u64 {
+        self.instance_id
+    }
 }
 
 /// A table as a file holds it: the dataset's fields beside the id (absent from files written
@@ -419,10 +464,12 @@ struct TableFile {
 }
 
 impl From<TableFile> for Table {
+    /// Loads stored data under a fresh runtime identity, never one supplied by the file.
     fn from(t: TableFile) -> Self {
         let TableFile { id, name, geometry_type, fields, features, source, crs, crs_incomplete, zm_dropped } = t;
         Table {
             id,
+            instance_id: next_table_instance(),
             dataset: Dataset {
                 name,
                 geometry_type,
@@ -683,11 +730,200 @@ fn plain_web_address(path: &str) -> bool {
 struct FileFormat {
     #[serde(default)]
     format: u64,
+    #[serde(default)]
+    requires: Requires,
+}
+
+/// What a document's `requires` holds, read without keeping anything else: the names it lists
+/// (at most [`MAX_REQUIRES`]), or that it lists more, or something that isn't a list of names.
+#[derive(Default)]
+enum Requires {
+    #[default]
+    Nothing,
+    Names(Vec<String>),
+    TooMany,
+    NotNames,
+}
+
+impl<'de> Deserialize<'de> for Requires {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_any(RequiresVisitor)
+    }
+}
+
+/// One entry of `requires`: a name, or anything else, skipped without being kept.
+enum RequiredName {
+    Name(String),
+    Other,
+}
+
+impl<'de> Deserialize<'de> for RequiredName {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_any(RequiredNameVisitor)
+    }
+}
+
+/// Skips the rest of a list without keeping any of it.
+fn skip_seq<'de, A: serde::de::SeqAccess<'de>>(mut seq: A) -> Result<(), A::Error> {
+    while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+    Ok(())
+}
+
+/// Skips the rest of an object without keeping any of it.
+fn skip_map<'de, A: serde::de::MapAccess<'de>>(mut map: A) -> Result<(), A::Error> {
+    while map.next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?.is_some() {}
+    Ok(())
+}
+
+/// Implements the visitor methods for the JSON values that are neither a list nor a name: each
+/// gives `$other`.
+macro_rules! other_values {
+    ($other:expr) => {
+        fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> {
+            Ok($other)
+        }
+        fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> {
+            Ok($other)
+        }
+        fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self::Value, E> {
+            Ok($other)
+        }
+        fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> {
+            Ok($other)
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+            skip_map(map)?;
+            Ok($other)
+        }
+    };
+}
+
+struct RequiredNameVisitor;
+
+impl<'de> serde::de::Visitor<'de> for RequiredNameVisitor {
+    type Value = RequiredName;
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a capability name")
+    }
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+        // A long name keeps its first bytes (on a character's boundary) and `…` for the refusal;
+        // longer than any known name (held by the assertion above), it can't be taken for one.
+        if v.len() > MAX_CAPABILITY_BYTES {
+            let mut end = MAX_CAPABILITY_BYTES;
+            while !v.is_char_boundary(end) {
+                end -= 1;
+            }
+            Ok(RequiredName::Name(format!("{}…", v.get(..end).unwrap_or_default())))
+        } else {
+            Ok(RequiredName::Name(v.to_string()))
+        }
+    }
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok(RequiredName::Other)
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
+        skip_seq(seq)?;
+        Ok(RequiredName::Other)
+    }
+    other_values!(RequiredName::Other);
+}
+
+struct RequiresVisitor;
+
+impl<'de> serde::de::Visitor<'de> for RequiresVisitor {
+    type Value = Requires;
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a list of capability names")
+    }
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok(Requires::Nothing)
+    }
+    fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Self::Value, E> {
+        Ok(Requires::NotNames)
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let mut names = Vec::new();
+        loop {
+            if names.len() >= MAX_REQUIRES {
+                // One more entry is one too many; the rest is skipped unread.
+                if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                    skip_seq(seq)?;
+                    return Ok(Requires::TooMany);
+                }
+                return Ok(Requires::Names(names));
+            }
+            match seq.next_element::<RequiredName>()? {
+                None => return Ok(Requires::Names(names)),
+                Some(RequiredName::Name(n)) => names.push(n),
+                // Not a list of names, whatever else it holds: the rest is skipped unread.
+                Some(RequiredName::Other) => {
+                    skip_seq(seq)?;
+                    return Ok(Requires::NotNames);
+                }
+            }
+        }
+    }
+    other_values!(Requires::NotNames);
+}
+
+/// The capabilities a document requires that this RustGIS doesn't know, each once, or why its
+/// `requires` can't be read.
+fn unknown_capabilities(requires: &Requires, kind: &str) -> Result<Vec<String>, String> {
+    let names = match requires {
+        Requires::Nothing => return Ok(Vec::new()),
+        Requires::Names(names) => names,
+        Requires::TooMany => {
+            return Err(format!(
+                "this {kind} lists more than {MAX_REQUIRES} things it needs (`requires`), more than this RustGIS reads. It may be damaged, or from a newer RustGIS: update RustGIS to open it."
+            ));
+        }
+        Requires::NotNames => {
+            return Err(format!(
+                "this {kind} lists what it needs (`requires`) as something other than names, so this RustGIS can't tell whether it reads it. It may be damaged, or from a newer RustGIS: update RustGIS to open it."
+            ));
+        }
+    };
+    let mut unknown: Vec<String> = Vec::new();
+    for name in names {
+        if !CAPABILITIES.contains(&name.as_str()) && !unknown.contains(name) {
+            unknown.push(name.clone());
+        }
+    }
+    Ok(unknown)
+}
+
+/// A capability name as a refusal says it: line breaks, other control characters and the
+/// characters that reorder text as spaces, and `(unnamed)` for one with nothing else.
+fn capability_said(name: &str) -> String {
+    let shown: String = name.chars().map(rustgis_data::io::dbf_notice_char).collect();
+    let shown = shown.trim();
+    if shown.is_empty() { "(unnamed)".to_string() } else { shown.to_string() }
+}
+
+/// Whether a saved document's text, read for its format, is one to keep as written rather than
+/// rewrite through RustGIS's types. For a kind whose reader looks at `requires` and reads format 2
+/// (`reads_format_2`: projects and maps): of a format past [`READ_FORMAT`], or requiring anything,
+/// as the typed copy wouldn't keep the list, even of capabilities it knows. For the others (tasks,
+/// presentations, notebooks, models), whose typed copies drop what they don't know: of a format
+/// past [`FORMAT`]. A list (a legacy style file), or text whose `format` isn't a number, isn't one.
+pub(crate) fn kept_as_written(text: &str, reads_format_2: bool) -> bool {
+    if text.trim_start().starts_with('[') {
+        return false;
+    }
+    serde_json::from_str::<FileFormat>(text).is_ok_and(|h| {
+        let requires_nothing = match &h.requires {
+            Requires::Nothing => true,
+            Requires::Names(names) => names.is_empty(),
+            Requires::TooMany | Requires::NotNames => false,
+        };
+        if reads_format_2 { h.format > u64::from(READ_FORMAT) || !requires_nothing } else { h.format > u64::from(FORMAT) }
+    })
 }
 
 /// Refuse future document formats before typed deserialization or normalization. Missing
-/// metadata is legacy content; arrays include legacy style files. Writers remain unchanged
-/// until a change needs a newer format, at which point it must declare that format.
+/// metadata is legacy content; arrays include legacy style files. Up to [`READ_FORMAT`] is read,
+/// unless the document requires a capability this RustGIS doesn't know: that refusal names them.
+/// A change an older reader would lose names a capability in `requires` (see [`CAPABILITIES`]).
 pub(crate) fn check_format(text: &str, kind: &str) -> Result<(), String> {
     let max = max_bytes();
     if text.len() as u64 > max {
@@ -697,8 +933,18 @@ pub(crate) fn check_format(text: &str, kind: &str) -> Result<(), String> {
         return Ok(());
     }
     let header: FileFormat = serde_json::from_str(text).map_err(|e| format!("not a RustGIS {kind}: {e}"))?;
-    if header.format > u64::from(FORMAT) {
+    if header.format > u64::from(READ_FORMAT) {
         return Err(format!("this {kind} was saved by a newer RustGIS (format {}). Update RustGIS to open it.", header.format));
+    }
+    let unknown = unknown_capabilities(&header.requires, kind)?;
+    if !unknown.is_empty() {
+        let mut said: Vec<String> = Vec::new();
+        for name in unknown.iter().map(|n| capability_said(n)) {
+            if !said.contains(&name) {
+                said.push(name);
+            }
+        }
+        return Err(format!("this {kind} needs what this RustGIS can't read: {}. Update RustGIS to open it.", crate::names_said(&said)));
     }
     Ok(())
 }
@@ -858,19 +1104,20 @@ impl Project {
     /// Adds a standalone table, and returns the id it got.
     pub fn add_table(&mut self, dataset: Dataset) -> u32 {
         let id = self.new_table_id();
-        self.tables.push(Table { id, dataset });
+        self.tables.push(Table::new(id, dataset));
         id
     }
 
     /// Adds a tool's output table in place of the tables of its name, as running the tool again
-    /// replaces its result: the first of them keeps its id, so a view open on it stays on it.
+    /// replaces its result: the first keeps its id, so an open view stays on it, but the fresh
+    /// runtime identity invalidates drafts that belonged to the previous contents.
     pub fn put_table(&mut self, dataset: Dataset) -> u32 {
         let id = match self.tables.iter().find(|t| t.name == dataset.name) {
             Some(t) => t.id,
             None => self.new_table_id(),
         };
         self.tables.retain(|t| t.name != dataset.name);
-        self.tables.push(Table { id, dataset });
+        self.tables.push(Table::new(id, dataset));
         id
     }
 
@@ -1311,7 +1558,8 @@ impl Project {
             }
         })?;
         p.ensure_imports_complete().map_err(|_| "a project file cannot contain runtime GeoLibre download reservations".to_string())?;
-        if p.format > FORMAT {
+        // (A backstop: `check_format` has refused it already.)
+        if p.format > READ_FORMAT {
             return Err(format!("this project was saved by a newer RustGIS (format {}). Update RustGIS to open it.", p.format));
         }
         if restore {
@@ -1966,7 +2214,7 @@ impl Durable for Project {
 impl Durable for Table {
     /// Offers classified whole fields once, before any live mutation.
     fn prepare(&self, p: &mut Prepare<'_>) {
-        let Self { id: _, dataset } = self;
+        let Self { id: _, dataset, instance_id: _ } = self;
         let Dataset {
             name: _,
             geometry_type: _,
@@ -2066,6 +2314,31 @@ impl Durable for ModelGraph {
 fn project_text(p: &Project) -> Result<String, String> {
     let max = max_bytes();
     json_within(p, max)?.ok_or_else(|| format!("the project is too large to save (maximum {})", limit_said(max)))
+}
+
+#[cfg(test)]
+mod requires_tests {
+    use super::*;
+
+    fn requires(names: serde_json::Value) -> Requires {
+        serde_json::from_value::<FileFormat>(serde_json::json!({"format": 2, "requires": names})).map(|h| h.requires).unwrap_or_default()
+    }
+
+    /// At most [`MAX_REQUIRES`] entries are read, and a long name keeps only its start.
+    #[test]
+    fn requires_is_read_within_its_bounds() {
+        let names = |n: usize| serde_json::Value::from((0..n).map(|i| format!("c{i}")).collect::<Vec<_>>());
+        assert!(matches!(requires(names(MAX_REQUIRES)), Requires::Names(n) if n.len() == MAX_REQUIRES));
+        assert!(matches!(requires(names(MAX_REQUIRES + 1)), Requires::TooMany));
+        // A name of a million characters is kept as its first 128 bytes and `…`; a long name of
+        // characters of three bytes is cut on a boundary, and a short one kept whole.
+        let Requires::Names(n) = requires(serde_json::json!(["y".repeat(1_000_000), "名".repeat(50), "名".repeat(42)])) else { panic!() };
+        assert_eq!(n[0], format!("{}…", "y".repeat(MAX_CAPABILITY_BYTES)));
+        assert_eq!(n[1], format!("{}…", "名".repeat(42)));
+        assert_eq!(n[2], "名".repeat(42));
+        // The first entry that isn't a name ends the reading.
+        assert!(matches!(requires(serde_json::json!(["a", 1, "b"])), Requires::NotNames));
+    }
 }
 
 #[cfg(test)]

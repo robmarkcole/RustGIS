@@ -394,13 +394,27 @@ pub const PROJECTED_FORMATS: [&str; 4] = ["gpkg", "shp", "zip", "fgb"];
 
 /// The coordinate system an export to extension `ext` is written in when none is asked for: the
 /// one the dataset was read in, for a format that can say it, else WGS 84. A system without an
-/// EPSG code goes only into a Shapefile, whose `.prj` gives it in full; GeoPackage and FlatGeobuf
-/// readers (RustGIS's among them) go by the code.
+/// EPSG code goes into a GeoPackage or FlatGeobuf by its WKT definition, as into a Shapefile's
+/// `.prj`; one WKT can't describe goes into a Shapefile (without a `.prj`, said) and not into the
+/// others ([`default_export_note`] says which system is written instead).
 pub fn default_export_crs(ds: &Dataset, ext: &str) -> Crs {
     let ext = ext.to_ascii_lowercase();
-    ds.crs
-        .filter(|c| PROJECTED_FORMATS.contains(&ext.as_str()) && (c.epsg() > 0 || matches!(ext.as_str(), "shp" | "zip")))
-        .unwrap_or(Crs::LonLat)
+    ds.crs.filter(|&c| PROJECTED_FORMATS.contains(&ext.as_str()) && check_projected(&ext, c).is_ok()).unwrap_or(Crs::LonLat)
+}
+
+/// What is said when an export to `path` is written in WGS 84 where the layer has a system of
+/// its own that the format can't hold ([`default_export_crs`]); `None` when it keeps its system
+/// or has none to keep.
+pub fn default_export_note(ds: &Dataset, path: &str) -> Option<String> {
+    let ext = Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    let own = ds.crs.filter(|&c| c != Crs::LonLat && PROJECTED_FORMATS.contains(&ext.as_str()))?;
+    (default_export_crs(ds, &ext) == Crs::LonLat).then(|| {
+        format!(
+            "{path}: the coordinate system of {} ({}) has no EPSG code and no WKT definition RustGIS can write, so it is written in WGS 84 (EPSG:4326); give a \"crs\" to write another",
+            ds.name,
+            own.label()
+        )
+    })
 }
 
 /// The dataset (in longitude/latitude, as every dataset is) in `crs`'s coordinates. Fails on a
@@ -476,11 +490,15 @@ pub fn define_projection(ds: &Dataset, crs: Crs) -> Result<Dataset> {
     Ok(out)
 }
 
-/// Refuses a system without an EPSG code for a GeoPackage or FlatGeobuf: their readers (RustGIS's
-/// among them) go by the code, and would read the file as longitude/latitude.
+/// Refuses a system for a GeoPackage or FlatGeobuf that the file couldn't declare: one without an
+/// EPSG code is declared by its WKT definition, and without one (a projection WKT1 has no name
+/// for) the file would read as longitude/latitude.
 pub(crate) fn check_projected(ext: &str, crs: Crs) -> Result<()> {
-    if crs.epsg() == 0 && matches!(ext, "gpkg" | "fgb") {
-        return Err(DataError::Unsupported(format!(".{ext} in {}: give the system as an EPSG code", crs.label())));
+    if crs.epsg() == 0 && matches!(ext, "gpkg" | "fgb") && crate::raster::wkt::to_wkt(crs).is_none() {
+        return Err(DataError::Unsupported(format!(
+            ".{ext} in {}: it has no EPSG code or WKT definition; give the system as an EPSG code",
+            crs.label()
+        )));
     }
     Ok(())
 }
@@ -2339,6 +2357,7 @@ fn read_shapefile_parts(mut parts: ShapefileParts, name: &str, crs: Option<Crs>)
     let encoding = crate::dbf::encoding(parts.cpg.as_deref(), parts.dbf.get(29).copied().unwrap_or(0), &mut encoding_notes);
     crate::dbf::readable_header_date(&mut parts.dbf);
     let date_columns = crate::dbf::dates_as_text(&mut parts.dbf);
+    crate::dbf::floats_as_numeric(&mut parts.dbf);
     let dbf = shapefile::dbase::ReaderBuilder::new()
         .with_encoding(encoding.decoder())
         .build(Cursor::new(parts.dbf))
@@ -2383,6 +2402,8 @@ fn read_shapefile_parts(mut parts: ShapefileParts, name: &str, crs: Option<Crs>)
     };
     let (mut converted, mut unconverted, mut zm_shapes) = (0usize, 0usize, 0usize);
     let mut unread_dates = vec![0usize; ds.fields.len()];
+    // Numbers that aren't finite (`nan`, `inf`), read as empty and counted for a notice.
+    let mut nonfinite = vec![0usize; ds.fields.len()];
     let mut source_kind = GeometryType::None;
     let pt = |x: f64, y: f64| Coord::new(x, y);
     for item in reader.iter_shapes_and_records() {
@@ -2438,8 +2459,8 @@ fn read_shapefile_parts(mut parts: ShapefileParts, name: &str, crs: Option<Crs>)
         let attrs = ds
             .fields
             .iter()
-            .zip(&mut unread_dates)
-            .map(|(f, unread)| match record.get(&f.name) {
+            .zip(unread_dates.iter_mut().zip(nonfinite.iter_mut()))
+            .map(|(f, (unread, nonfinite))| match record.get(&f.name) {
                 Some(FieldValue::Character(Some(s))) if f.ty == FieldType::Date => match crate::dbf::date(s.as_bytes()) {
                     Ok(d) => d.map_or(Value::Null, Value::Date),
                     Err(()) => {
@@ -2449,7 +2470,10 @@ fn read_shapefile_parts(mut parts: ShapefileParts, name: &str, crs: Option<Crs>)
                 },
                 Some(FieldValue::Character(Some(s))) => Value::Text(s.trim().to_string()),
                 Some(FieldValue::Numeric(Some(n))) if n.is_finite() => Value::Float(*n),
-                Some(FieldValue::Float(Some(n))) => Value::Float(f64::from(*n)),
+                Some(FieldValue::Numeric(Some(_))) => {
+                    *nonfinite += 1;
+                    Value::Null
+                }
                 Some(FieldValue::Integer(i)) => Value::Int(i64::from(*i)),
                 Some(FieldValue::Double(d)) => Value::Float(*d),
                 Some(FieldValue::Currency(d)) => Value::Float(*d),
@@ -2463,6 +2487,15 @@ fn read_shapefile_parts(mut parts: ShapefileParts, name: &str, crs: Option<Crs>)
     ds.drop_zm(&mut report, zm_shapes);
     report.unread_dates = crate::source::unread_dates_note(&ds.fields, &unread_dates);
     report.messages.extend(report.unread_dates.iter().map(|n| format!("{name}: {n}")));
+    let nonfinite_total: usize = nonfinite.iter().sum();
+    if nonfinite_total > 0 {
+        let what = if nonfinite_total == 1 {
+            "1 number isn't finite (nan or inf) and was".to_string()
+        } else {
+            format!("{nonfinite_total} numbers aren't finite (nan or inf) and were")
+        };
+        report.messages.push(format!("{name}: {what} read as empty, in {}", named_fields(&ds.fields, &nonfinite)));
+    }
     ds.geometry_type = dominant_type(&ds);
     // A bad .prj must not turn a spatial layer into an attribute-only table and hide the
     // conversion warning. Its shapes can be recovered by importing with an override.
@@ -4589,6 +4622,67 @@ mod tests {
         assert_eq!(names(&crate::source::materialize(&src).unwrap().0), rows);
         // The file itself is left as it was.
         assert_eq!(std::fs::read(&dbf).unwrap(), bytes);
+    }
+
+    /// A floating point (`F`) field is read at full `f64` precision, as GDAL reads it, not rounded
+    /// through `f32` (`1809878594` as `1809878656`): read from a file, from a zip, and streamed.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn shapefile_float_fields_keep_f64_precision() {
+        use shapefile::dbase::{FieldValue, Record, TableWriterBuilder};
+        let dir = tempfile::tempdir().unwrap();
+        let shp = dir.path().join("parcels.shp");
+        {
+            let table = TableWriterBuilder::new().add_numeric_field("valuation".try_into().unwrap(), 12, 0).add_numeric_field(
+                "lat".try_into().unwrap(),
+                19,
+                9,
+            );
+            let mut w = shapefile::Writer::from_path(&shp, table).unwrap();
+            let mut r = Record::default();
+            r.insert("valuation".into(), FieldValue::Numeric(Some(1_809_878_594.0)));
+            r.insert("lat".into(), FieldValue::Numeric(Some(35.373_575_453)));
+            w.write_shape_and_record(&shapefile::Point::new(1.0, 2.0), &r).unwrap();
+        }
+        // The writer has no `f64` floating point field: relabel the two columns `F`, as GDAL writes them.
+        let dbf = shp.with_extension("dbf");
+        let mut bytes = std::fs::read(&dbf).unwrap();
+        for column in 0..2 {
+            bytes[32 + column * 32 + 11] = b'F';
+        }
+        std::fs::write(&dbf, &bytes).unwrap();
+        let exact = |ds: &Dataset| {
+            assert_eq!(ds.value(0, 0).as_f64(), Some(1_809_878_594.0));
+            assert_eq!(ds.value(0, 1).as_f64(), Some(35.373_575_453));
+        };
+        let (ds, rep) = read_path(&shp).unwrap();
+        exact(&ds);
+        assert!(rep.messages.is_empty(), "{:?}", rep.messages);
+        let entries: Vec<(String, Vec<u8>)> =
+            ["shp", "shx", "dbf"].iter().map(|e| (format!("parcels.{e}"), std::fs::read(shp.with_extension(e)).unwrap())).collect();
+        exact(&read_zip("parcels.zip", &crate::zip::write(&entries).unwrap()).unwrap()[0].0);
+        let src = crate::source::shp::ShpSource::open_path(&shp, "parcels").unwrap();
+        exact(&crate::source::materialize(&src).unwrap().0);
+
+        // A value that isn't finite is read as empty, and a notice counts it.
+        let odd = dir.path().join("odd.shp");
+        {
+            let table = TableWriterBuilder::new().add_numeric_field("lat".try_into().unwrap(), 19, 9);
+            let mut w = shapefile::Writer::from_path(&odd, table).unwrap();
+            for v in [f64::NAN, 1.5] {
+                let mut r = Record::default();
+                r.insert("lat".into(), FieldValue::Numeric(Some(v)));
+                w.write_shape_and_record(&shapefile::Point::new(1.0, 2.0), &r).unwrap();
+            }
+        }
+        let dbf = odd.with_extension("dbf");
+        let mut bytes = std::fs::read(&dbf).unwrap();
+        bytes[32 + 11] = b'F';
+        std::fs::write(&dbf, &bytes).unwrap();
+        let (ds, rep) = read_path(&odd).unwrap();
+        assert_eq!(ds.value(0, 0), &Value::Null);
+        assert_eq!(ds.value(1, 0).as_f64(), Some(1.5));
+        assert!(rep.messages.iter().any(|m| m.contains("1 number isn't finite") && m.contains("'lat'")), "{:?}", rep.messages);
     }
 
     /// A projected Shapefile is converted to longitude/latitude by its `.prj` (issue #84).

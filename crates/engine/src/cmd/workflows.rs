@@ -677,7 +677,7 @@ pub(crate) fn ahead_on_copy(s: &Session, command: &'static str, p: &Value) -> su
     let (project, trusted) = (s.project.clone(), s.trusted_models.clone());
     // The copy follows the extensions turned on or off here (#1752).
     let extensions = s.extensions().clone();
-    let (view_size, active_layer, p) = (s.view_size, s.active_layer, p.clone());
+    let (view_size, active_layer, opened, p) = (s.view_size, s.active_layer, s.opened, p.clone());
     // What its tools ask of servers and files goes in this session's Diagnostics, as when they
     // run here: the run here takes their results and asks nothing.
     let requests = s.diagnostics.capture();
@@ -688,6 +688,8 @@ pub(crate) fn ahead_on_copy(s: &Session, command: &'static str, p: &Value) -> su
         copy.set_extensions(extensions);
         copy.view_size = view_size;
         copy.active_layer = active_layer;
+        copy.opened = opened;
+        copy.sync_policy_generation();
         copy.tools_ahead = Some(super::gp::Ahead::Recording(Vec::new()));
         copy.files_ahead = Some(super::gp::FilesAhead::Recording(Vec::new()));
         copy.zones_ahead = Some(super::imagery::ZonesAhead::Recording(Vec::new()));
@@ -697,22 +699,75 @@ pub(crate) fn ahead_on_copy(s: &Session, command: &'static str, p: &Value) -> su
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-/// A script's run on a copy of the session ([`ahead_on_copy`]), unless its first line would stop
-/// the copy at once, or the script has no lines or doesn't parse: then it runs here, with no copy
-/// made.
-pub(crate) fn script_ahead(s: &Session, p: &Value) -> Option<super::reads::ReadWork> {
-    let lines = script_commands(ps(p, "script")?).ok()?;
-    let (_, id, params) = lines.first()?;
-    runs_on_a_copy(s, id, params).then(|| ahead_on_copy(s, SCRIPT_AHEAD, p))
+/// Prepares a native script's replayable prefix. Every table write must fit within that prefix;
+/// otherwise refuse before any line runs, so a desktop table edit never falls back to the frame.
+/// Restricted callers keep their existing authority and must dispatch table writes individually.
+pub(crate) fn script_ahead(s: &Session, p: &Value, native: bool) -> Result<Option<super::reads::ReadWork>, String> {
+    let Some(script) = ps(p, "script") else { return Ok(None) };
+    let Ok(lines) = script_commands(script) else { return Ok(None) };
+    let table = |id: &str, p: &Value| super::edit::table_edit_in_background(id).is_some() && p.get("table").is_some_and(|t| !t.is_null());
+    if lines.iter().any(|(_, id, p)| table(id, p)) {
+        if !native {
+            return Err(
+                "this script cannot prepare table writes under its current permissions: run the table edit commands directly".into()
+            );
+        }
+        check_table_prefix(s, &lines)?;
+    }
+    let Some((_, id, params)) = lines.first() else { return Ok(None) };
+    Ok((native && runs_on_a_copy(s, id, params)).then(|| ahead_on_copy(s, SCRIPT_AHEAD, p)))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+/// Refuses an unrecordable prefix before any live line can run ahead of a table write. Inspect
+/// model tool metadata too: their command id alone does not reveal file-producing or plugin steps.
+/// Recheck at landing, since a named model may have changed while the script worker ran.
+fn check_table_prefix(s: &Session, lines: &[(usize, String, Value)]) -> Result<(), String> {
+    let Some(last) = lines
+        .iter()
+        .rposition(|(_, id, p)| super::edit::table_edit_in_background(id).is_some() && p.get("table").is_some_and(|t| !t.is_null()))
+    else {
+        return Ok(());
+    };
+    let recordable_tool = |id: &str| {
+        rustgis_analysis::resolve_published(id)
+            .is_some_and(|tool| tool.source() != Some(rustgis_plugins::tools::SOURCE) && !super::gp::writes_files(tool.spec()))
+    };
+    for (n, id, p) in lines.iter().take(last + 1) {
+        let nested = match id.as_str() {
+            "model.run" => model_graph(s, p).is_ok_and(|(_, graph, _)| {
+                graph
+                    .nodes
+                    .iter()
+                    .filter(|node| node.kind == crate::project::ModelNodeKind::Tool)
+                    .all(|node| node.tool.as_deref().is_some_and(recordable_tool))
+            }),
+            "gp.batch" => ps(p, "tool").is_some_and(recordable_tool),
+            _ => true,
+        };
+        if !nested || !runs_on_a_copy(s, id, p) {
+            return Err(format!(
+                "line {n} ({id}) cannot be prepared before the table writes: run the setup and table writes as separate scripts"
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 /// The commands a script's line may run on a copy of the session ([`runs_on_a_copy`]): those
 /// whose results are taken (a tool, a model, a batch) and those that change only what the taking compares
 /// by value (a selection, a layer's name or query, the environment, the projection). A line that
-/// makes rows of its own (an edit, a layer from a selection) isn't one: the rows it made on the
-/// copy are never the run here's, so every tool after it would run again.
+/// makes rows of its own (a layer edit, a layer from a selection) isn't one. Table edits are the
+/// exception: their rows are recorded and taken, so later tools retain their shared input.
 pub(crate) const ON_A_COPY: &[&str] = &[
+    "edit.enable",
+    "edit.setValue",
+    "edit.addFeature",
+    "edit.addField",
+    "edit.deleteField",
+    "edit.convertField",
+    "edit.calculateField",
     "model.run",
     "gp.batch",
     "gp.run",
@@ -742,6 +797,9 @@ pub(crate) const ON_A_COPY: &[&str] = &[
 /// other line stops the copy there, Add Data and Load All among them (they would read their
 /// files and servers twice).
 fn runs_on_a_copy(s: &Session, id: &str, params: &Value) -> bool {
+    if super::edit::table_edit_in_background(id).is_some() {
+        return params.get("table").is_some_and(|t| !t.is_null()) && params.get("layer").is_none_or(Value::is_null);
+    }
     // A model's own tools are checked as they run, and so are a batch's: a batch writes no file
     // (it runs tools that add layers), and the files it reads are read once, on the copy, for the
     // run here to take ([`super::gp::FilesAhead`]). Any other line by what its parameters name.
@@ -884,18 +942,25 @@ fn wire(v: &mut Value, outputs: &[String], step: usize, depth: usize) -> Result<
 pub(crate) fn run_script(s: &mut Session, p: &Value) -> CmdResult {
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(ran) = super::reads::take::<super::gp::RanAheads>(s, SCRIPT_AHEAD) {
-        return super::gp::taking(s, ran, |s| run_script_here(s, p));
+        return super::gp::taking(s, ran, |s| run_script_here(s, p, true));
     }
-    run_script_here(s, p)
+    run_script_here(s, p, false)
 }
 
-/// Runs a script's lines in order ([`run_script`]).
-fn run_script_here(s: &mut Session, p: &Value) -> CmdResult {
+/// Runs a script's lines in order ([`run_script`]); a prepared desktop run requires every table
+/// write to consume its recorded worker result under the live line's ordinary authorization.
+fn run_script_here(s: &mut Session, p: &Value, prepared: bool) -> CmdResult {
+    let _ = prepared;
     let script = ps(p, "script").ok_or("script is required")?;
+    let lines = script_commands(script)?;
+    #[cfg(not(target_arch = "wasm32"))]
+    if prepared {
+        check_table_prefix(s, &lines)?;
+    }
     let mut out = Vec::new();
-    for (n, id, params) in script_commands(script)? {
-        let spec = s.registry.get(&id).ok_or_else(|| format!("line {n}: unknown command '{id}'"))?;
-        let (enabled, mutates, label) = (spec.enabled, spec.mutates, spec.label);
+    for (n, id, params) in lines {
+        let spec = *s.registry.get(&id).ok_or_else(|| format!("line {n}: unknown command '{id}'"))?;
+        let (mutates, label) = (spec.mutates, spec.label);
         // On a copy of the session ([`ahead_on_copy`]): from a line that may reach outside it,
         // the run here runs the rest.
         #[cfg(not(target_arch = "wasm32"))]
@@ -908,15 +973,27 @@ fn run_script_here(s: &mut Session, p: &Value) -> CmdResult {
         {
             s.active_layer = Some(lid);
         }
-        if let Some(why) = enabled(s) {
+        // And a line naming a standalone table, against that table.
+        let (blocked, table) = s.check_conditions(&spec, &params);
+        if let Some(why) = blocked.unwrap_or_else(|panic| std::panic::resume_unwind(panic)) {
             return Err(format!("line {n}: {id}: {why}"));
         }
-        // As Session::run does: an edit to a layer read in place would be lost at its next read.
-        if let Some(e) = s.streamed_edit(&id, mutates, label, s.active_layer) {
+        // As Session::run does: an edit to a layer read in place would be lost at its next read
+        // (an edit of a table edits no layer).
+        if let Some(e) = s.streamed_edit(&id, mutates, label, if table.is_some() { None } else { s.active_layer }) {
             return Err(format!("line {n}: {e}"));
         }
         let op = s.authorize(&id, &params).map_err(|e| format!("line {n} ({id}): {e}"))?;
-        let r = steps_of(s, |s| s.invoke(op, crate::policy::Txn::Shared)).map_err(|e| format!("line {n}: {id}: {e}"))?;
+        let invoke = |s: &mut Session| steps_of(s, |s| s.invoke(op, crate::policy::Txn::Shared));
+        #[cfg(not(target_arch = "wasm32"))]
+        let r = if super::edit::table_edit_in_background(&id).is_some() && params.get("table").is_some_and(|t| !t.is_null()) {
+            super::edit::script_table(s, &id, &params, prepared, invoke)
+        } else {
+            invoke(s)
+        };
+        #[cfg(target_arch = "wasm32")]
+        let r = invoke(s);
+        let r = r.map_err(|e| format!("line {n}: {id}: {e}"))?;
         out.push(json!({"line": n, "command": id, "result": r}));
     }
     Ok(json!({"ran": out}))

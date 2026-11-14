@@ -1906,6 +1906,7 @@ impl Reading {
             ty: ty.to_string(),
             parent_ids: parent.map(str::to_string).into_iter().collect(),
             z: made.z,
+            ground: None,
             solid: made.solid,
             attributes: attributes.into_iter().collect(),
         });

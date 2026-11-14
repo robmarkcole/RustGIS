@@ -173,29 +173,24 @@ fn editor(
     apply
 }
 
-/// The layer's fields and the common operators, each added to the clause where it ends.
+/// The layer's fields, the common operators and the language's functions and variables, each
+/// added to the clause where it ends.
 fn chips(ui: &mut Ui, text: &mut String, ds: &Dataset) {
-    let add = |text: &mut String, word: &str| {
-        if !text.is_empty() && !text.ends_with(' ') {
-            text.push(' ');
-        }
-        text.push_str(word);
-        text.push(' ');
-    };
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new(tl!("Fields:")).small().weak());
         for f in ds.fields.iter().take(MAX_CHIPS) {
             if ui.small_button(&f.name).clicked() {
-                add(text, &field_ref(&f.name));
+                crate::dialogs::add_word(text, &field_ref(&f.name));
             }
         }
     });
     ui.horizontal_wrapped(|ui| {
         for op in ["=", "<>", ">", "<", ">=", "<=", "LIKE", "IN", "IS NULL", "AND", "OR", "NOT"] {
             if ui.small_button(op).clicked() {
-                add(text, op);
+                crate::dialogs::add_word(text, op);
             }
         }
+        crate::dialogs::expr_menus(ui, text);
     });
 }
 

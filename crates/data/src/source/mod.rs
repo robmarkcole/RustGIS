@@ -211,6 +211,7 @@ impl SourceInfo {
 }
 
 /// A read: the features intersecting `extent` (longitude/latitude; `None` = all), at most `limit`.
+/// A zero-limit count may be refused when matching would require a full geometry scan.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Request {
     pub extent: Option<Extent>,
@@ -222,6 +223,12 @@ impl Request {
     pub fn all() -> Self {
         Request { extent: None, limit: MAX_LIMIT }
     }
+}
+
+/// Refuses an unknown count rather than reporting an unbounded view as empty. A zero-limit
+/// request does not start the full geometry scan needed to determine its matches.
+pub(crate) fn unbounded_count() -> DataError {
+    DataError::Format("A zero-limit read cannot count a view that cannot be bounded in the source coordinate system; request a nonzero limit to count matching features".into())
 }
 
 /// The answer to a [`Request`].
@@ -249,6 +256,19 @@ pub(crate) fn unread_date(counts: &mut Vec<usize>, k: usize) {
     if let Some(n) = counts.get_mut(k) {
         *n = n.saturating_add(1);
     }
+}
+
+/// The value of the date field at `k` from a database server's ISO 8601 text (PostgreSQL, MySQL,
+/// SQL Server): null for none. Text that isn't a date of the field's type RustGIS holds
+/// (`infinity`, a year BC or past 9999, MySQL's `0000-00-00`) is null too, counted in `unread`
+/// ([`Batch::unread_dates`]).
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn server_date(text: Option<&str>, ty: crate::FieldType, unread: &mut Vec<usize>, k: usize) -> crate::Value {
+    let Some(text) = text else { return crate::Value::Null };
+    gpkg_blob::temporal(Some(text), ty).unwrap_or_else(|| {
+        unread_date(unread, k);
+        crate::Value::Null
+    })
 }
 
 /// Adds the counts of a later read to `counts` ([`Batch::unread_dates`]).
@@ -830,17 +850,40 @@ impl Reproject {
         }
     }
 
-    /// A longitude/latitude extent in native coordinates.
-    pub(crate) fn extent_from_lonlat(&self, e: &Extent) -> Extent {
+    /// A database's query box: refuse an unbounded view before any whole-table sampling.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn database_extent(&self, e: &Extent) -> Result<Extent> {
+        self.extent_from_lonlat(e)
+            .filter(|n| !n.is_empty() && [n.min_x, n.min_y, n.max_x, n.max_y].iter().all(|v| v.is_finite()))
+            .ok_or_else(unbounded_database_view)
+    }
+
+    /// A longitude/latitude extent in native coordinates, or `None` when the system refuses a
+    /// place on its edge (one it can't bring back, #1925): the edge's other places no longer bound
+    /// what's inside it. Local reads scan and filter geometry; database reads refuse explicitly
+    /// rather than sample the whole table before filtering.
+    pub(crate) fn extent_from_lonlat(&self, e: &Extent) -> Option<Extent> {
         match &self.t {
-            None => *e,
+            None => Some(*e),
             Some(t) => {
                 // Clamp to the valid range first: projections fail near the poles.
                 let c = Extent::new(e.min_x.max(-180.0), e.min_y.max(-89.9), e.max_x.min(180.0), e.max_y.min(89.9));
-                around(&c, |p| t.from_lonlat(p))
+                let refused = std::cell::Cell::new(false);
+                let out = around(&c, |p| {
+                    let q = t.from_lonlat(p);
+                    refused.set(refused.get() || q.is_none());
+                    q
+                });
+                (!refused.get()).then_some(out)
             }
         }
     }
+}
+
+/// A refused database view must not become a whole-table sample before local filtering.
+#[cfg(not(target_arch = "wasm32"))]
+fn unbounded_database_view() -> DataError {
+    DataError::Format("the requested view can't be bounded in the database's coordinate system; choose a smaller view".into())
 }
 
 /// A GeoPackage table's `gpkg_spatial_ref_sys` row: organization, its code, and its WKT

@@ -48,8 +48,8 @@ pub use density::{
 pub use parallel::scratch_budget;
 pub use parameters::StatisticList;
 pub use tools::{
-    TOOLS, find_field_case_insensitive, holds_coordinates, in_its_units, layer_raster_crs, max_buffer_bytes, min_pad, param_applies,
-    points_in, projected_crs, raster_crs, simplify_geometry, zonal_bands,
+    SimplifyNotes, TOOLS, find_field_case_insensitive, holds_coordinates, in_its_units, layer_raster_crs, max_buffer_bytes, min_pad,
+    param_applies, past_pole, points_in, projected_crs, raster_crs, simplify_geometry, zonal_bands,
 };
 
 use rustgis_data::Dataset;
@@ -171,7 +171,8 @@ pub trait Inputs {
     fn table(&self, _id: u32) -> Option<&Dataset> {
         None
     }
-    /// Selected rows of a layer; tools honour a selection like desktop GIS does.
+    /// The rows of a layer a tool reads: its selection, and the features its definition query
+    /// keeps. Empty means every row.
     fn selection(&self, layer: &str) -> &[usize];
     /// A raster layer by name.
     fn raster(&self, _layer: &str) -> Option<RasterInput<'_>> {

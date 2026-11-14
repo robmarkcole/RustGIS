@@ -605,7 +605,7 @@ Inside a request, `host::call(op, params)` sends one of these to RustGIS:
 | `host.view` | `{center: [lon, lat], scale, projection, bearing, pitch}` (bearing and pitch in degrees, 0 for a flat north-up map) |
 | `host.notify` `{text, error?}` | shows a message in the status bar |
 | `host.addLayer` `{name, geojson}` | adds a layer (`edit`) |
-| `host.fetch` `{url}` | `{url, text, json?}`: the document at a web address (`network`; see [Fetching a document](#fetching-a-document)) |
+| `host.fetch` `{url, json?}` | `{url, text, json?}`: the document at a web address; `json: false` leaves out `json` (`network`; see [Fetching a document](#fetching-a-document)) |
 | `map.addTiles` `{url, kind?, name?, attribution?, maxZoom?, overlay?, replace?, blend?, …}` | adds a tile layer (`edit` and `network`); accepts the built-in command's parameters |
 | any command id (`layer.zoomTo`, `select.byAttributes`, `layer.symbology`…) | what the command returns, within the plugin's permissions |
 
@@ -675,6 +675,15 @@ answer, with a GET request. It needs the `network` permission. The answer is
 `{"url", "text", "json"?}`: `url` is the address fetched, `text` the document, and `json` the
 document parsed when it is a JSON object or array.
 
+`"json": false` leaves `json` out of the answer: `{"url", "text"}`. A plugin that only passes
+`text` on, to `service.layers` or `catalog.search` say, or parses it in its own way, then
+doesn't spend its fuel reading a parsed copy of a large document it never uses. Without
+`json`, or with `"json": true`, the answer is as above. Any
+other value is an error. Each address is kept once for both: a call with `"json": false` and
+one without answer from the same kept document. `json` is new in RustGIS 0.7.0: earlier
+versions ignore it and answer `json` anyway, so set `minRustgisVersion` to `0.7.0` for a plugin
+that needs it left out.
+
 - Only `http://` and `https://` addresses on the internet: not this computer, the local network
   or cloud metadata addresses, and no redirect may lead there or from `https` to `http`. Names
   are checked as written and again where they resolve, on every redirect too, so a name that
@@ -701,7 +710,8 @@ document parsed when it is a JSON object or array.
   address taken from the one before, runs once per step, up to 64 times. The browser follows
   redirects itself, and the server must allow requests from web pages (CORS).
 
-Use `host::call("host.fetch", json!({"url": url}))` in the Rust SDK.
+Use `host::call("host.fetch", json!({"url": url}))` in the Rust SDK, or
+`host::call("host.fetch", json!({"url": url, "json": false}))` for the text only.
 
 Tools work differently. A tool receives its layer parameters' features as GeoJSON (only the
 selected features when a layer has a selection), and its `file` parameters' files. It returns

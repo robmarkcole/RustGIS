@@ -214,7 +214,7 @@ pub fn commands() -> Vec<C> {
                 Ok(proj) => proj,
                 Err(error) => {
                     super::connections::restore_active(s);
-                    return Err(error.replace("RustGIS project", "RustGIS template"));
+                    return Err(error.replace("RustGIS project", "RustGIS template").replace("this project ", "this template "));
                 }
             };
             proj.name = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).unwrap_or("Untitled").chars().take(200).collect();
@@ -727,13 +727,21 @@ fn package_map(s: &mut Session, mobile: bool, tol: f64) -> Result<Vec<u8>, Strin
         let hidden: Vec<u32> = m.layers.iter().filter(|l| !kept(l)).map(|l| l.id).collect();
         m.release_tiles(&hidden);
         m.layers.retain(|l| kept(l));
+    }
+    // What Simplify left alone or changed beyond simplifying (a latitude past a pole taken as the
+    // pole, a one-vertex line part left out, a feature left as it was or too intricate), over all
+    // the layers: said once the package is made, one notice per kind (#1811).
+    let mut notes = rustgis_analysis::SimplifyNotes::default();
+    if mobile {
         for l in &mut m.layers {
             if l.is_raster() || tol <= 0.0 {
                 continue;
             }
             for f in &mut l.dataset.features {
                 if let Some(g) = &f.geometry {
-                    f.geometry = Some(rustgis_analysis::simplify_geometry(g, tol * 111_320.0));
+                    let (simple, said) = rustgis_analysis::simplify_geometry(g, tol * 111_320.0);
+                    notes.add(&said);
+                    f.geometry = Some(simple);
                 }
             }
             l.touch_geometry();
@@ -745,7 +753,12 @@ fn package_map(s: &mut Session, mobile: bool, tol: f64) -> Result<Vec<u8>, Strin
     crate::durable::notify(s, &report);
     let kind = if mobile { "mobile map package" } else { "map package" };
     let readme = format!("{} — a RustGIS {kind}.\nAdd it to a project with Data › Import.\n", name);
-    rustgis_data::zip::write(&[(format!("{}.rgismap", safe(&name)), text.into_bytes()), ("README.txt".into(), readme.into_bytes())])
+    let archive =
+        rustgis_data::zip::write(&[(format!("{}.rgismap", safe(&name)), text.into_bytes()), ("README.txt".into(), readme.into_bytes())])?;
+    for said in notes.without_polar().messages("Mobile map package, simplifying") {
+        s.notify(said, false);
+    }
+    Ok(archive)
 }
 
 /// The geoprocessing history with the layers its runs made, as GeoJSON.
@@ -869,15 +882,17 @@ fn run_task_steps(s: &mut Session, p: &Value) -> CmdResult {
                 st.command
             ));
         }
-        let spec = s.registry.get(&st.command).ok_or_else(|| format!("step {} runs an unknown command '{}'", i + 1, st.command))?;
-        let (enabled, mutates) = (spec.enabled, spec.mutates);
+        let spec = *s.registry.get(&st.command).ok_or_else(|| format!("step {} runs an unknown command '{}'", i + 1, st.command))?;
+        let mutates = spec.mutates;
         // As when run directly, a step naming a layer is checked against that layer.
         if st.params.get("layer").is_some()
             && let Ok(id) = s.layer_id(&st.params)
         {
             s.active_layer = Some(id);
         }
-        if let Some(why) = enabled(s) {
+        // And a step naming a standalone table, against that table.
+        let blocked = s.check_conditions(&spec, &st.params).0.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        if let Some(why) = blocked {
             return Err(format!("step {} ({}): {why}", i + 1, st.title));
         }
         // These handlers share the task's one outer transaction. A final request must not

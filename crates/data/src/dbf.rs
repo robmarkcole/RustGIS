@@ -174,20 +174,33 @@ pub(crate) fn readable_header_date(dbf: &mut [u8]) {
 /// bytes over as text for [`date`] to read instead of failing the whole record on a date it can't
 /// read (`20260230`, `00000000`). Returns the positions of those columns.
 pub(crate) fn dates_as_text(dbf: &mut [u8]) -> Vec<usize> {
+    retype_columns(dbf, b'D', b'C')
+}
+
+/// Marks a `.dbf`'s floating point (`F`) columns as numeric (`N`) in its header: `dbase` reads the
+/// same text of both, but an `F` column only as an `f32`, which rounds `1809878594` to
+/// `1809878656` and a latitude after its seventh digit. As `N` it is read as an `f64`, as GDAL does.
+pub(crate) fn floats_as_numeric(dbf: &mut [u8]) {
+    retype_columns(dbf, b'F', b'N');
+}
+
+/// Changes the type of the `.dbf` columns whose type letter is `from` (either case) to `to` in the
+/// header, and returns their positions among the columns.
+fn retype_columns(dbf: &mut [u8], from: u8, to: u8) -> Vec<usize> {
     let header_len = usize::from(u16::from_le_bytes([dbf.get(8).copied().unwrap_or(0), dbf.get(9).copied().unwrap_or(0)]));
-    let mut dates = Vec::new();
+    let mut changed = Vec::new();
     for (k, start) in (32..header_len.min(dbf.len())).step_by(32).enumerate() {
         if dbf.get(start).is_none_or(|b| *b == 0x0D) {
             break;
         }
         if let Some(ty) = dbf.get_mut(start + 11)
-            && ty.eq_ignore_ascii_case(&b'D')
+            && ty.eq_ignore_ascii_case(&from)
         {
-            *ty = b'C';
-            dates.push(k);
+            *ty = to;
+            changed.push(k);
         }
     }
-    dates
+    changed
 }
 
 /// A date (`D`) field's value, `YYYYMMDD`: `Ok(None)` when it's blank or zeros, as writers leave
@@ -265,6 +278,20 @@ mod tests {
         assert_eq!(dates_as_text(&mut dbf), [1, 2]);
         assert_eq!([dbf[43], dbf[75], dbf[107]], [b'C', b'C', b'C']);
         assert!(dates_as_text(&mut [0u8; 10]).is_empty());
+    }
+
+    /// Floating point columns are marked as numeric, so `dbase` reads them as `f64`; others are kept.
+    #[test]
+    fn float_columns_read_as_numeric() {
+        let mut dbf = vec![0u8; 32 + 3 * 32 + 1];
+        dbf[8] = (dbf.len()) as u8;
+        for (k, ty) in b"NFf".iter().copied().enumerate() {
+            dbf[32 + k * 32 + 11] = ty;
+        }
+        dbf[32 + 3 * 32] = 0x0D;
+        floats_as_numeric(&mut dbf);
+        assert_eq!([dbf[43], dbf[75], dbf[107]], [b'N', b'N', b'N']);
+        floats_as_numeric(&mut [0u8; 10]);
     }
 
     /// A header date that isn't one gets a placeholder; a real one, and a header cut too short

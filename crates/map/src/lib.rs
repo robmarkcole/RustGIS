@@ -1255,14 +1255,16 @@ impl Layer {
 
     /// Rows passing the definition query (all rows when none or invalid).
     pub fn visible_rows(&self) -> Vec<bool> {
-        let n = self.dataset.features.len();
-        match self.definition_query.as_deref().filter(|q| !q.trim().is_empty()) {
-            Some(q) => match rustgis_data::query::parse_fields(q, &self.dataset) {
-                Ok(e) => (0..n).map(|r| rustgis_data::query::eval(&e, &self.dataset, r)).collect(),
-                Err(_) => vec![true; n],
-            },
-            None => vec![true; n],
-        }
+        self.query_rows(&self.dataset).unwrap_or_else(|| vec![true; self.dataset.features.len()])
+    }
+
+    /// Which rows of `dataset` (this layer's features, or the whole source it streams) its
+    /// definition query keeps. `None` when it has no query, or one that doesn't read: every feature
+    /// is drawn then.
+    pub fn query_rows(&self, dataset: &Dataset) -> Option<Vec<bool>> {
+        let query = self.definition_query.as_deref().filter(|q| !q.trim().is_empty())?;
+        let expr = rustgis_data::query::parse_fields(query, dataset).ok()?;
+        Some((0..dataset.features.len()).map(|r| rustgis_data::query::eval(&expr, dataset, r)).collect())
     }
 
     /// Extent in longitude/latitude.

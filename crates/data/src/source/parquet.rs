@@ -15,7 +15,7 @@ use super::remote::{self, Remote};
 use super::{Batch, FeatureSource, Reproject, Request, Sampler, SourceInfo, clamp_limit, in_request};
 use crate::{DataError, Feature, Field, FieldType, GeometryType, Result, Value, wkb};
 use bytes::Bytes;
-use parquet::basic::{ConvertedType, LogicalType, Type as Physical};
+use parquet::basic::{ConvertedType, Encoding, LogicalType, Type as Physical};
 use parquet::column::reader::{ColumnReader, ColumnReaderImpl};
 use parquet::data_type::DataType as PqType;
 use parquet::file::metadata::ParquetMetaData;
@@ -32,6 +32,9 @@ const BATCH: usize = 8192;
 
 /// Most rows read from one row group (fewer in the browser, whose memory is smaller).
 const MAX_GROUP_ROWS: usize = if cfg!(target_arch = "wasm32") { 1 << 21 } else { 1 << 24 };
+
+/// Conservative decoded-column budget for one group scanned without native view bounds.
+const MAX_SCAN_BYTES: u64 = if cfg!(target_arch = "wasm32") { 64 << 20 } else { 256 << 20 };
 
 /// A GeoParquet file.
 pub struct ParquetSource {
@@ -53,6 +56,8 @@ pub struct ParquetSource {
     exact: bool,
     /// The most rows read from one row group: `MAX_GROUP_ROWS`, lowered by tests.
     group_rows: usize,
+    /// Decoded-column budget for an unbounded spatial scan; lowered by tests.
+    scan_bytes: u64,
     /// Declared after `reader`: Windows must close its file before removing the workspace.
     #[cfg(not(target_arch = "wasm32"))]
     _workspace: Option<Arc<super::duckdb::ReloadWorkspace>>,
@@ -297,6 +302,7 @@ impl ParquetSource {
             remote,
             exact: false,
             group_rows: MAX_GROUP_ROWS,
+            scan_bytes: MAX_SCAN_BYTES,
             #[cfg(not(target_arch = "wasm32"))]
             _workspace: None,
         };
@@ -340,6 +346,13 @@ impl ParquetSource {
         self
     }
 
+    /// A lower decoded-column budget, for tests without large allocations.
+    #[cfg(test)]
+    pub(crate) fn with_scan_bytes(mut self, bytes: u64) -> Self {
+        self.scan_bytes = bytes;
+        self
+    }
+
     /// The rows of row group `g` read. Row counts come from the file: bounded by what the
     /// geometry column chunk holds, and by a cap, so a crafted count can't size a huge allocation.
     fn rows_in(&self, md: &ParquetMetaData, g: usize) -> usize {
@@ -347,6 +360,54 @@ impl ParquetSource {
         let rows = usize::try_from(rg.num_rows()).unwrap_or(0);
         let values = rg.columns().get(self.geom_col).and_then(|c| usize::try_from(c.num_values()).ok()).unwrap_or(0);
         rows.min(values).min(self.group_rows)
+    }
+
+    /// Bounds the group's decoded columns with six copies for decoding/UTF-8 conversion and
+    /// 128 bytes per row/column for value slots and temporary vectors. Plain binary is linear
+    /// in its encoded size. Dictionaries use their longest entry times the row count; prefix
+    /// encoding retains a conservative whole-payload bound. The initial metadata-only pass
+    /// runs before remote fetching; `dictionaries` adds expansion checks once chunks are present.
+    fn check_scan_bytes(&self, md: &ParquetMetaData, g: usize, dictionaries: bool) -> Result<()> {
+        let group = md.row_group(g);
+        let rows = u64::try_from(group.num_rows()).unwrap_or(u64::MAX);
+        let over = || {
+            DataError::Format(format!(
+                "GeoParquet: row group {g} exceeds the {} byte decoded-column budget for an unbounded view; choose a smaller view or rewrite the file with smaller row groups",
+                self.scan_bytes
+            ))
+        };
+        let mut bytes = rows.saturating_mul(2);
+        for c in [self.geom_col].into_iter().chain(self.field_cols.iter().copied()) {
+            let Some(column) = group.columns().get(c) else {
+                return Err(DataError::Format(format!("GeoParquet: row group {g} has a missing column")));
+            };
+            let encoded = u64::try_from(column.uncompressed_size()).unwrap_or(u64::MAX);
+            bytes = bytes.saturating_add(encoded.saturating_mul(6)).saturating_add(rows.saturating_mul(128));
+            if bytes > self.scan_bytes {
+                return Err(over());
+            }
+            if column.column_descr().physical_type() == Physical::BYTE_ARRAY {
+                let expansion = if column.encodings().any(|e| e == Encoding::DELTA_BYTE_ARRAY) {
+                    encoded.saturating_mul(rows)
+                } else if dictionaries && column.encodings().any(|e| matches!(e, Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY)) {
+                    let rg = self.reader.get_row_group(g).map_err(err)?;
+                    let mut pages = rg.get_column_page_reader(c).map_err(err)?;
+                    match pages.get_next_page().map_err(err)? {
+                        Some(parquet::column::page::Page::DictionaryPage { buf, num_values, .. }) => {
+                            binary_dictionary_max(&buf, num_values)?.saturating_mul(rows)
+                        }
+                        _ => return Err(DataError::Format("GeoParquet: missing binary dictionary page".into())),
+                    }
+                } else {
+                    0
+                };
+                bytes = bytes.saturating_add(expansion.saturating_mul(6));
+                if bytes > self.scan_bytes {
+                    return Err(over());
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Whether inferred bounds may omit or count rows that only their geometry can test.
@@ -389,10 +450,17 @@ impl FeatureSource for ParquetSource {
     }
 
     /// Keeps rows with null geometry in whole reads; they have no location to match an extent.
+    /// Unbounded spatial scans bound retained row masks and refuse groups over the decoded-column
+    /// budget before decoding, count rows and check Cancel between them. They decode every selected group's geometry
+    /// and fields before sampling matches; a refused view therefore scans the selected file.
     fn read(&self, req: &Request) -> Result<Batch> {
         let limit = clamp_limit(req.limit);
         let md = self.reader.metadata();
-        let native = req.extent.map(|e| self.reproject.extent_from_lonlat(&e));
+        let native = req.extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
+        // Preserve ordinary candidate counts; a refused view needs a geometry scan to count.
+        if limit == 0 && req.extent.is_some() && native.is_none() {
+            return Err(super::unbounded_count());
+        }
         let rows_in = |g: usize| self.rows_in(md, g);
         // Row groups whose bounding box meets the extent.
         let mut groups: Vec<usize> = (0..md.num_row_groups())
@@ -415,17 +483,54 @@ impl FeatureSource for ParquetSource {
             _ => true,
         };
         let mut thinned = 1usize;
+        // Without native bounds every group may contain view matches. Scan within the budget,
+        // or refuse explicitly: thinning groups first could discard all of a nonempty view.
+        let unbounded = req.extent.is_some() && native.is_none();
+        if unbounded {
+            // Keep/take headers and one bool per candidate row stay live across all groups.
+            // A per-group decode bound and a compressed-byte budget do not bound their sum.
+            let headers = groups.len().saturating_mul(std::mem::size_of::<Option<Vec<bool>>>() + std::mem::size_of::<Vec<bool>>());
+            let mask_bytes = groups.iter().try_fold(headers as u64, |n, &g| {
+                crate::progress::check()?;
+                Ok::<_, DataError>(n.saturating_add(rows_in(g) as u64))
+            })?;
+            if mask_bytes > self.scan_bytes {
+                return Err(DataError::Format(format!(
+                    "GeoParquet: the unbounded view exceeds the {} byte row-mask budget; choose a view that can be bounded in the file's coordinate system",
+                    self.scan_bytes
+                )));
+            }
+            // Every selected group must be scanned before sampling its view matches.
+            for &g in &groups {
+                crate::progress::check()?;
+                self.check_scan_bytes(md, g, false)?;
+                let declared = u64::try_from(md.row_group(g).num_rows()).unwrap_or(0);
+                if declared > self.group_rows as u64 {
+                    return Err(DataError::Format(format!(
+                        "GeoParquet: row group {g} has {declared} rows, more than the {} read from one",
+                        self.group_rows
+                    )));
+                }
+                if declared > rows_in(g) as u64 {
+                    return Err(DataError::Format(format!("GeoParquet: row group {g} has columns shorter than its rows")));
+                }
+            }
+        }
         if let Some(file) = &self.remote {
             // Far more rows than the read takes: a sample of row groups evenly spread over them
             // (the read samples their rows), so what is fetched stays near what is shown. No more
             // bytes than a read may fetch.
             let rows: u64 = groups.iter().map(|&g| rows_in(g) as u64).sum();
-            if rows > (limit as u64).saturating_mul(8) && !groups.is_empty() && !self.exact {
+            if rows > (limit as u64).saturating_mul(8) && !groups.is_empty() && !self.exact && !unbounded {
                 thinned = usize::try_from(rows.div_ceil((limit as u64).saturating_mul(4).max(1))).unwrap_or(usize::MAX).max(2);
             }
-            let cols: Vec<usize> = self.covering.map(|c| c.to_vec()).unwrap_or_default();
+            // A read without native bounds never fetches the covering columns.
+            let cols: Vec<usize> = if native.is_some() { self.covering.map(|c| c.to_vec()).unwrap_or_default() } else { Vec::new() };
             let all: Vec<usize> = cols.iter().copied().chain([self.geom_col]).chain(self.field_cols.iter().copied()).collect();
             let cost: u64 = groups.iter().step_by(thinned).map(|&g| chunks_size(md, g, &all)).sum();
+            if cost > remote::READ_BUDGET && unbounded {
+                return Err(remote::view_budget());
+            }
             if cost > remote::READ_BUDGET && self.exact {
                 return Err(DataError::Format(format!(
                     "GeoParquet: the extent needs {} MB of the file, more than one read takes",
@@ -458,7 +563,8 @@ impl FeatureSource for ParquetSource {
             groups.iter().zip(&keep).map(|(&g, k)| k.as_ref().map(|k| k.iter().filter(|&&b| b).count()).unwrap_or(rows_in(g)) as u64).sum();
         // Without a covering, or with nullable inferred bounds, test geometry before sampling
         // for the whole request. Otherwise the match count is known, and every `step`-th is read.
-        let late = native.is_some() && groups.iter().any(|&g| self.needs_geometry_filter(md, g));
+        // An extent the file's system couldn't bound (`native` is `None`) is tested on every row.
+        let late = req.extent.is_some() && (native.is_none() || groups.iter().any(|&g| self.needs_geometry_filter(md, g)));
         let mut sample = if late { Sampler::new(limit) } else { Sampler::with_total(limit, matched) };
         // The rows of each group the sample takes, decided before anything else is read.
         let takes: Vec<Vec<bool>> = groups
@@ -485,9 +591,18 @@ impl FeatureSource for ParquetSource {
             starts.push(first_row);
             first_row = first_row.saturating_add(u64::try_from(md.row_group(g).num_rows()).unwrap_or(0));
         }
+        if unbounded {
+            crate::progress::begin(usize::try_from(matched).unwrap_or(0));
+        }
         for (&g, take) in groups.iter().zip(&takes) {
+            if unbounded {
+                crate::progress::check()?;
+            }
             if !take.iter().any(|&t| t) {
                 continue;
+            }
+            if unbounded {
+                self.check_scan_bytes(md, g, true)?;
             }
             let rg = self.reader.get_row_group(g).map_err(err)?;
             let geoms = read_bytes(rg.as_ref(), self.geom_col, take)?;
@@ -501,6 +616,9 @@ impl FeatureSource for ParquetSource {
             let base = starts.get(g).copied().unwrap_or(0);
             // The columns hold the taken rows only, in order: the k-th is row `r`.
             for (k, (r, _)) in take.iter().enumerate().filter(|(_, t)| **t).enumerate() {
+                if unbounded {
+                    crate::progress::step(1)?;
+                }
                 // Null geometry is valid; malformed non-null WKB is skipped and counted.
                 let geometry = match geoms.get(k).and_then(|b| b.as_deref()) {
                     Some(bytes) => {
@@ -537,6 +655,8 @@ impl FeatureSource for ParquetSource {
     /// read of the same extent. The taken rows of one row group are decoded together before
     /// they are chunked, so the peak is a row group's columns plus a chunk. Null geometry is
     /// retained without an extent filter, keeping its row and attributes in whole exports.
+    /// Checks Cancel between groups and scanned rows; each group's column decoding finishes
+    /// before the next check. An unbounded view also checks the decoded-column budget first.
     fn visit_chunks(&self, extent: Option<Extent>, bytes: usize, visit: &mut dyn FnMut(Vec<Feature>) -> Result<()>) -> Result<Batch> {
         let mut chunks = super::chunk_memory::Chunker::new(bytes, visit)?;
         if self.remote.is_some() {
@@ -544,10 +664,12 @@ impl FeatureSource for ParquetSource {
         }
         let req = Request { extent, limit: usize::MAX };
         let md = self.reader.metadata();
-        let native = extent.map(|e| self.reproject.extent_from_lonlat(&e));
+        let native = extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
         let mut out = Batch { complete: true, ..Batch::default() };
         let mut base = 0u64;
+        crate::progress::begin(usize::try_from(md.file_metadata().num_rows()).unwrap_or(0));
         for g in 0..md.num_row_groups() {
+            crate::progress::check()?;
             // From the declared row counts, as a read numbers them.
             let start = base;
             let declared = u64::try_from(md.row_group(g).num_rows()).unwrap_or(0);
@@ -565,6 +687,9 @@ impl FeatureSource for ParquetSource {
             // A read takes at most `MAX_GROUP_ROWS` of a row group, and no more than its geometry
             // column holds. A traversal promises every row, so a group it can't read whole is an
             // error, not a quietly shorter export; it is refused before this group is read.
+            if extent.is_some() && native.is_none() {
+                self.check_scan_bytes(md, g, true)?;
+            }
             let readable = self.rows_in(md, g);
             if declared > self.group_rows as u64 {
                 return Err(DataError::Format(format!(
@@ -590,6 +715,7 @@ impl FeatureSource for ParquetSource {
                 return Err(DataError::Format(format!("GeoParquet: row group {g} has columns shorter than its rows")));
             }
             for (k, (r, _)) in take.iter().enumerate().filter(|(_, t)| **t).enumerate() {
+                crate::progress::step(1)?;
                 let geometry = match geoms.get(k).and_then(|b| b.as_deref()) {
                     Some(bytes) => {
                         let Some(geometry) = wkb::decode(bytes).and_then(|geom| self.reproject.geometry(geom)) else {
@@ -1156,6 +1282,28 @@ fn read_values(rg: &dyn RowGroupReader, col: usize, take: &[bool]) -> Result<Col
         _ => Vec::new(),
     };
     Ok(ColumnValues { values, invalid })
+}
+
+/// Longest plain-encoded binary dictionary entry without copying values. Validate lengths
+/// and count against the page bytes before using them to bound expansion into owned rows.
+/// Checks Cancel between batches of dictionary entries.
+fn binary_dictionary_max(bytes: &[u8], count: u32) -> Result<u64> {
+    let invalid = || DataError::Format("GeoParquet: invalid binary dictionary".into());
+    if u64::from(count) > bytes.len() as u64 / 4 {
+        return Err(invalid());
+    }
+    let mut at = 0usize;
+    let mut longest = 0u64;
+    for i in 0..count {
+        if (i as usize).is_multiple_of(BATCH) {
+            crate::progress::check()?;
+        }
+        let length =
+            bytes.get(at..at.saturating_add(4)).and_then(|b| <[u8; 4]>::try_from(b).ok()).map(u32::from_le_bytes).ok_or_else(invalid)?;
+        at = at.checked_add(4).and_then(|n| n.checked_add(length as usize)).filter(|&n| n <= bytes.len()).ok_or_else(invalid)?;
+        longest = longest.max(u64::from(length));
+    }
+    Ok(longest)
 }
 
 /// Reads a binary column (the WKB geometry), for the rows `take` marks, in order.

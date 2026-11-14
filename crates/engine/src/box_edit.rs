@@ -232,15 +232,26 @@ pub(crate) fn commands() -> Vec<C> {
     let roles: &[crate::ParamRole] =
         &[crate::ParamRole { key: "box", role: crate::Role::Opaque }, crate::ParamRole { key: "attributes", role: crate::Role::Opaque }];
     vec![
-        C::new("edit.addBox", "Add Rotated Box", "Edit › Features", add).inputs(crate::cmd::design::new_feature_inputs).roles(roles).effects(crate::policy::Effects::NONE)
+        C::new("edit.addBox", "Add Rotated Box", "Edit › Features", add).inputs(new_box_inputs).roles(roles).effects(crate::policy::Effects::NONE)
             .when(crate::cmd::design::need_editable).params(r#"{"layer"?: name|id, "box": {"center":[x,y],"width":number,"height":number,"angle":clockwise degrees,"frame"?:{"epsg":number,"width":pixels,"height":pixels,"affine":[x0,xc,xr,y0,yc,yr]}},"attributes"?:{field:value},"template"?:string}"#),
-        C::new("edit.updateBox", "Update Rotated Box", "Edit › Features", update).roles(roles).effects(crate::policy::Effects::NONE)
+        C::new("edit.updateBox", "Update Rotated Box", "Edit › Features", update).roles(&[crate::ParamRole { key: "box", role: crate::Role::Opaque }]).effects(crate::policy::Effects::NONE)
             .when(crate::cmd::design::need_editable).params(r#"{"layer"?:name|id,"row":number,"featureId"?:number,"box":as edit.addBox}"#),
         C::new("edit.deleteBox", "Delete Box", "Edit › Features", delete_box).roles(&[]).effects(crate::policy::Effects::NONE)
             .when(crate::cmd::design::need_editable).params(r#"{"layer"?:name|id,"row":number,"featureId"?:number}"#),
         C::new("edit.boxInfo", "Box Construction", "Edit › Features", info).roles(&[]).effects(crate::policy::Effects::NONE).view()
             .params(r#"{"layer"?:name|id,"row":number}"#),
     ]
+}
+// Shared feature intake also supports standalone tables; a box always targets a layer.
+fn reject_table(p: &Value) -> Result<(), String> {
+    if p.get("table").is_some_and(|t| !t.is_null()) {
+        return Err("rotated boxes require a polygon layer; the 'table' parameter is unsupported".into());
+    }
+    Ok(())
+}
+fn new_box_inputs(input: &crate::cmd::InputContext<'_>, p: &Value) -> Result<crate::cmd::Inputs, String> {
+    reject_table(p)?;
+    crate::cmd::design::new_feature_inputs(input, p)
 }
 pub fn check_layer(s: &Session, id: u32) -> Result<(), String> {
     if s.map().body != "earth" {
@@ -252,6 +263,15 @@ pub fn check_layer(s: &Session, id: u32) -> Result<(), String> {
     let l = s.map().layer(id).ok_or("select an editable polygon layer")?;
     if l.is_streamed() || l.graphics || l.raster.is_some() || !matches!(l.geometry_type(), GeometryType::Polygon | GeometryType::None) {
         return Err("choose a loaded editable polygon layer".into());
+    }
+    Ok(())
+}
+/// Interactive activation additionally requires a view the pointer-based editor supports.
+/// Geometry commands only check the layer: their frozen construction grid is view-independent.
+pub fn check_tool(s: &Session, id: u32) -> Result<(), String> {
+    check_layer(s, id)?;
+    if s.map().projection.is_globe() || s.map().camera.pitch != 0. {
+        return Err("the Rotated Box tool requires a flat Earth map with zero pitch".into());
     }
     Ok(())
 }
@@ -274,6 +294,7 @@ fn row(p: &Value) -> Result<usize, String> {
     p.get("row").and_then(Value::as_u64).and_then(|r| usize::try_from(r).ok()).ok_or_else(|| "row is required".into())
 }
 fn add(s: &mut Session, p: &Value) -> CmdResult {
+    reject_table(p)?;
     let id = s.layer_id(p)?;
     check_layer(s, id)?;
     s.boxes.room()?;
@@ -308,6 +329,9 @@ fn remember(s: &mut Session, id: u32, row: usize, spec: BoxSpec) -> Result<(), S
 fn update(s: &mut Session, p: &Value) -> CmdResult {
     let id = s.layer_id(p)?;
     check_layer(s, id)?;
+    if p.get("attributes").is_some() {
+        return Err("edit.updateBox changes the shape only; set attributes with edit.setValue".into());
+    }
     let row = row(p)?;
     let key = Cache::key(s, id, row).ok_or("no such feature")?;
     let g = s.map().layer(id).and_then(|l| l.dataset.features.get(row)).and_then(|f| f.geometry.as_ref()).ok_or("missing box geometry")?;
@@ -612,6 +636,67 @@ mod tests {
         }
         s.run("edit.undo", &json!({})).unwrap();
         assert_eq!(s.box_spec(id, row), Some(b));
+    }
+
+    #[test]
+    fn box_edit_interactive_activation_requires_a_flat_view_but_geometry_does_not() {
+        let (mut s, id) = session();
+        let flat = s.map().projection.clone();
+        let b = spec();
+        for (projection, pitch) in [(rustgis_map::Projection::Globe, 0.), (flat.clone(), 30.)] {
+            s.map_mut().projection = projection;
+            s.map_mut().camera.pitch = pitch;
+            let error = s.run("tool.set", &json!({"tool":"rotatedBox"})).unwrap_err();
+            assert!(error.contains("zero pitch"));
+            assert_eq!(s.tool, crate::Tool::Explore);
+            let row = add(&mut s, &b);
+            assert_eq!(s.map().layer(id).unwrap().dataset.features[row].geometry, Some(b.geometry().unwrap()));
+            let mut changed = b.clone();
+            changed.angle = 70.;
+            s.run("edit.updateBox", &json!({"row":row,"box":changed})).unwrap();
+            assert_eq!(s.box_spec(id, row), Some(changed));
+            s.run("edit.deleteBox", &json!({"row":row})).unwrap();
+            assert!(s.map().layer(id).unwrap().dataset.features.is_empty());
+        }
+        s.map_mut().projection = flat;
+        s.map_mut().camera.pitch = 0.;
+        s.run("tool.set", &json!({"tool":"rotatedBox"})).unwrap();
+        assert_eq!(s.tool, crate::Tool::RotatedBox);
+    }
+
+    #[test]
+    fn box_edit_update_refuses_attributes_without_mutation_and_points_to_set_value() {
+        let (mut s, id) = session();
+        let b = spec();
+        let row = add(&mut s, &b);
+        let before = s.map().layer(id).unwrap().dataset.features[row].clone();
+        let depth = s.undo_depth();
+        let mut changed = b.clone();
+        changed.angle = 70.;
+        for attributes in [json!({"class":"other"}), json!({}), Value::Null] {
+            let error = s.run("edit.updateBox", &json!({"row":row,"box":changed,"attributes":attributes})).unwrap_err();
+            assert!(error.contains("edit.setValue"));
+            assert_eq!(s.map().layer(id).unwrap().dataset.features[row], before);
+            assert_eq!(s.box_spec(id, row), Some(b.clone()));
+            assert_eq!(s.undo_depth(), depth);
+        }
+        s.run("edit.setValue", &json!({"row":row,"field":"class","value":"other"})).unwrap();
+        assert_eq!(s.map().layer(id).unwrap().dataset.value(row, 0), &rustgis_data::Value::Text("other".into()));
+        assert_eq!(s.box_spec(id, row), Some(b));
+    }
+
+    #[test]
+    fn box_edit_add_refuses_standalone_table_targets_before_intake_or_mutation() {
+        let (mut s, id) = session();
+        let depth = s.undo_depth();
+        for mut p in [json!({"table":"Rows"}), json!({"layer":id,"table":"Rows"})] {
+            p["box"] = json!(spec());
+            let error = s.run("edit.addBox", &p).unwrap_err();
+            assert!(error.contains("polygon layer"), "{error}");
+            assert!(s.map().layer(id).unwrap().dataset.features.is_empty());
+            assert_eq!(s.undo_depth(), depth);
+            assert_eq!(s.boxes.len, 0);
+        }
     }
 
     #[test]

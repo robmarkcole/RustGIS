@@ -474,6 +474,12 @@ pub fn need() -> DataError {
     DataError::Format(NEED.into())
 }
 
+/// A refused native view needs geometry matching before sampling, but that scan cannot fit.
+/// Returning a partial sample here could wrongly make a nonempty view look empty.
+pub(crate) fn view_budget() -> DataError {
+    DataError::Format("the requested view can't be bounded in the file's coordinate system, and matching it would exceed the remote read budget; download the file or choose a smaller view".into())
+}
+
 /// Runs `work` until it needs nothing it hasn't got: each run that finds bytes missing fetches
 /// them (in one round of requests) and runs again. `done` gets the last run's result. Off the
 /// caller's thread: the rounds run as the fetches land.

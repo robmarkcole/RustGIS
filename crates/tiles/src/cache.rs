@@ -1179,7 +1179,7 @@ fn decode_with(
 
 /// Marks the part of an address that asks for a byte range, `#rustgis-range=<first>-<last>`:
 /// a fragment, so it never reaches the server, which gets a `Range` header instead.
-pub(crate) const RANGE: &str = "#rustgis-range=";
+pub const RANGE: &str = "#rustgis-range=";
 
 /// Splits an address into the address to fetch and the byte range it asks for, if any.
 pub fn split_range(url: &str) -> (&str, Option<(u64, u64)>) {

@@ -1288,14 +1288,8 @@ pub(crate) fn process_work(s: &Session, p: &Value) -> Result<super::workflows::W
                     e
                 }
             };
-            // The pixel window covering the extent's corners.
-            let corners =
-                [Coord::new(e.min_x, e.min_y), Coord::new(e.max_x, e.max_y), Coord::new(e.min_x, e.max_y), Coord::new(e.max_x, e.min_y)];
-            let px: Vec<(f64, f64)> =
-                corners.iter().filter_map(|c| r.transformer().from_lonlat(*c)).map(|w| r.transform.to_pixel(w)).collect();
-            if px.is_empty() {
-                return Err("the extent can't be placed on the raster".into());
-            }
+            // The pixel window covering the extent's edges.
+            let px = edge_pixels(&r, &e).ok_or("the extent can't be placed on the raster")?;
             let c0 = px.iter().map(|p| p.0).fold(f64::INFINITY, f64::min).floor().max(0.0) as u32;
             let c1 = px.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max).ceil().min(r.width as f64) as u32;
             let r0 = px.iter().map(|p| p.1).fold(f64::INFINITY, f64::min).floor().max(0.0) as u32;
@@ -1659,15 +1653,38 @@ fn point(v: &Value) -> Result<Coord, String> {
     }
 }
 
-/// The columns and rows of a raster under a longitude/latitude box, or `None` when it misses.
+/// The pixel positions of places along a longitude/latitude box's edges (17 on each, corners
+/// included: in a curved grid such as Robinson's the widest point of an edge can lie between its
+/// corners), or `None` when the raster's system refuses one (a place it can't bring back, #1925).
+/// A window made from the places left would leave out part of the box, so a box reaching that far
+/// is first cut to the raster's own bounds, where its system takes places.
+fn edge_pixels(r: &Raster, e: &Extent) -> Option<Vec<(f64, f64)>> {
+    const N: u32 = 16;
+    let at = |e: &Extent| -> Option<Vec<(f64, f64)>> {
+        (0..=N)
+            .flat_map(|i| {
+                let t = f64::from(i) / f64::from(N);
+                let (x, y) = (e.min_x + t * (e.max_x - e.min_x), e.min_y + t * (e.max_y - e.min_y));
+                [Coord::new(x, e.min_y), Coord::new(x, e.max_y), Coord::new(e.min_x, y), Coord::new(e.max_x, y)]
+            })
+            // Robinson's widest parallel is the equator, even when the uniform samples miss it.
+            .chain([Coord::new(e.min_x, 0.0_f64.max(e.min_y).min(e.max_y)), Coord::new(e.max_x, 0.0_f64.max(e.min_y).min(e.max_y))])
+            .map(|c| r.transformer().from_lonlat(c).map(|w| r.transform.to_pixel(w)))
+            .collect()
+    };
+    at(e).or_else(|| {
+        let b = r.extent();
+        let (w, s, east, n) = (e.min_x.max(b.min_x), e.min_y.max(b.min_y), e.max_x.min(b.max_x), e.max_y.min(b.max_y));
+        (w <= east && s <= n).then(|| at(&Extent::new(w, s, east, n))).flatten()
+    })
+}
+
+/// The columns and rows of a raster under a longitude/latitude box, or `None` when it misses
+/// (or can't be placed on it, [`edge_pixels`]).
 fn pixel_window(r: &Raster, e: &Extent) -> Option<(std::ops::Range<u32>, std::ops::Range<u32>)> {
-    let tr = r.transformer();
     let (mut c0, mut r0, mut c1, mut r1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
-    for corner in [Coord::new(e.min_x, e.min_y), Coord::new(e.max_x, e.min_y), Coord::new(e.max_x, e.max_y), Coord::new(e.min_x, e.max_y)] {
-        if let Some(w) = tr.from_lonlat(corner) {
-            let (c, rr) = r.transform.to_pixel(w);
-            (c0, r0, c1, r1) = (c0.min(c), r0.min(rr), c1.max(c), r1.max(rr));
-        }
+    for (c, rr) in edge_pixels(r, e)? {
+        (c0, r0, c1, r1) = (c0.min(c), r0.min(rr), c1.max(c), r1.max(rr));
     }
     if c0 > c1 || c1 < 0.0 || r1 < 0.0 || c0 > f64::from(r.width) || r0 > f64::from(r.height) {
         return None;
@@ -2368,5 +2385,22 @@ fn project_grid(p: &Value) -> Result<Option<&str>, String> {
     match p.get("grid") {
         None | Some(Value::Null) => Ok(None),
         Some(v) => v.as_str().map(Some).ok_or_else(|| "grid is a raster layer's name".into()),
+    }
+}
+
+/// A Robinson box crossing the equator keeps its widest parallel, even when neither its
+/// corners nor the uniformly sampled latitudes lie on that parallel.
+#[test]
+fn robinson_pixel_window_keeps_the_equatorial_edges() {
+    use rustgis_data::raster::{ColorHint, Crs, GeoTransform};
+    let crs = Crs::parse("+proj=robin +datum=WGS84 +units=m").unwrap();
+    let transform = GeoTransform { origin_x: -20_000_000.0, origin_y: 10_000_000.0, pixel_width: 100_000.0, pixel_height: -100_000.0 };
+    let r = Raster::new("world", 400, 200, vec![vec![1.0; 80_000]], transform, crs, None, ColorHint::Gray, "Float32").unwrap();
+    let (columns, rows) = pixel_window(&r, &Extent::new(-120.0, -60.0, 120.0, 80.0)).unwrap();
+    for lon in [-120.0, 120.0] {
+        let native = r.transformer().from_lonlat(Coord::new(lon, 0.0)).unwrap();
+        let (col, row) = transform.to_pixel(native);
+        assert!(f64::from(columns.start) <= col && f64::from(columns.end) >= col);
+        assert!(f64::from(rows.start) <= row && f64::from(rows.end) >= row);
     }
 }

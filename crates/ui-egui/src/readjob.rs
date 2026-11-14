@@ -24,6 +24,8 @@ pub struct Reads {
     job: Option<ReadJob>,
     /// The commands waiting for the read before, in order.
     waiting: VecDeque<Asked>,
+    #[cfg(test)]
+    fail_spawn: bool,
 }
 
 /// A command asked for, with where it was asked: the project, map and layer then open.
@@ -366,6 +368,10 @@ fn start(app: &mut RustGisApp, mut asked: Asked, p: Value) -> Result<Value, Stri
     let Some(ahead) = asked.ahead.take() else {
         return complete_here(app, asked, p, Err(tl!("This read was already started").to_string()));
     };
+    let ahead = match ahead.refresh_table_input(&app.session) {
+        Ok(ahead) => ahead,
+        Err(why) => return complete_here(app, asked, p, Err(why)),
+    };
     let name = ahead.name;
     let reload = matches!(asked.command, "layer.reloadData" | "map.reloadTiles");
     let control = Control::stoppable();
@@ -391,17 +397,24 @@ fn start(app: &mut RustGisApp, mut asked: Asked, p: Value) -> Result<Value, Stri
     *held.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ahead);
     let work = held.clone();
     let diagnostics = app.session.diagnostics.capture();
-    let spawned = std::thread::Builder::new().name(name.into()).spawn(move || {
-        let _diagnostics = diagnostics.enter();
-        if let Some(path) = look_path {
-            *look_out.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(crate::diskwatch::observe(&path));
-        }
-        let ahead = work.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
-        let read = ahead.ok_or_else(|| tl!("This read was already started").to_string()).and_then(|ahead| ahead.run(&ctl));
-        *out.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(read);
-    });
+    let spawn = || {
+        std::thread::Builder::new().name(name.into()).spawn(move || {
+            let _diagnostics = diagnostics.enter();
+            if let Some(path) = look_path {
+                *look_out.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(crate::diskwatch::observe(&path));
+            }
+            let ahead = work.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+            let read = ahead.ok_or_else(|| tl!("This read was already started").to_string()).and_then(|ahead| ahead.run(&ctl));
+            *out.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(read);
+        })
+    };
+    #[cfg(test)]
+    let spawn = || if app.reads.fail_spawn { Err(std::io::Error::other("worker start refused for test")) } else { spawn() };
+    let spawned = spawn();
     if let Err(e) = spawned {
-        if matches!(asked.command, "map.reloadTiles" | "map.repairTiles" | "service.add" | "service.layers") {
+        if matches!(asked.command, "map.reloadTiles" | "map.repairTiles" | "service.add" | "service.layers" | "script.run")
+            || rustgis_engine::cmd::edit::table_edit_in_background(asked.command).is_some()
+        {
             let why = crate::i18n::fmt("The background worker could not start ({error}). Retry the command.", &[("error", &e.to_string())]);
             app.session.notify(why.clone(), true);
             not_run_asked(app, &asked, why.clone());
@@ -588,6 +601,11 @@ impl Reads {
         if let Some(job) = &self.job {
             job.control.cancel();
         }
+    }
+
+    /// Whether the run under way has finished reading on its thread (its answer waits to land).
+    pub fn read_finished_for_tests(&self) -> bool {
+        self.job.as_ref().is_some_and(|job| job.slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some())
     }
 }
 
@@ -1233,6 +1251,268 @@ mod tests {
         assert_eq!(annotation.dataset.features.len(), 2);
         let l = app.session.map().layer(id).unwrap();
         assert!(l.is_streamed() && !l.labels.enabled);
+    }
+
+    /// Task steps cannot bypass the worker through direct or scripted table writes.
+    #[test]
+    fn a_task_refuses_table_writes_before_scanning_rows() {
+        let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        let csv = format!("n\n{}", "1\n".repeat(20_000));
+        app.run("layer.addDataText", json!({"fileName": "records.csv", "text": csv})).unwrap();
+        app.run("edit.enable", json!({"on": true})).unwrap();
+        app.reads_off_frame = true;
+        for (command, params) in [
+            ("edit.calculateField", json!({"table": "records", "field": "n", "expression": "n + 1"})),
+            ("edit.deleteField", json!({"table": "records", "field": "n"})),
+            ("script.run", json!({"script": "edit.calculateField {\"table\":\"records\",\"field\":\"n\",\"expression\":\"n + 1\"}"})),
+        ] {
+            app.run("task.new", json!({"name": "Edit records", "steps": [{"title": "Write table", "command": command, "params": params}]}))
+                .unwrap();
+            let before = serde_json::to_value(&app.session.project.tables).unwrap();
+            let depth = app.session.undo_depth();
+            let error = app.run_by_user("task.run", json!({"task": "Edit records"})).unwrap_err();
+            assert!(error.contains("run the table edit directly"), "{error}");
+            assert_eq!(serde_json::to_value(&app.session.project.tables).unwrap(), before);
+            assert_eq!(app.session.undo_depth(), depth);
+            app.run("task.remove", json!({"task": "Edit records"})).unwrap();
+        }
+    }
+
+    /// The actual app dispatch schedules a table calculation and installs it once with Undo.
+    /// A cell edited while it runs prevents stale results from overwriting the new value.
+    #[test]
+    fn table_calculation_runs_off_frame_and_refuses_changed_input() {
+        let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        app.run("layer.addDataText", json!({"fileName": "calc.csv", "text": "n\n1\n2\n"})).unwrap();
+        app.run("edit.enable", json!({"on": true})).unwrap();
+        app.reads_off_frame = true;
+        let p = json!({"table": "calc", "field": "n", "expression": "n / 2"});
+        let depth = app.session.undo_depth();
+        assert_eq!(app.run_by_user("edit.calculateField", p.clone()).unwrap()["started"], "Calculate Field");
+        assert_eq!(app.session.undo_depth(), depth);
+        assert_eq!(app.session.project.tables[0].dataset.value(0, 0).as_f64(), Some(1.0));
+        landed(&mut app, 60);
+        assert_eq!(app.session.project.tables[0].dataset.value(0, 0).as_f64(), Some(0.0));
+        assert_eq!(app.session.undo_depth(), depth + 1);
+        assert!(app.session.notices.iter().any(|n| n.text.contains("fraction")));
+        app.run("edit.undo", json!({})).unwrap();
+        assert_eq!(app.session.project.tables[0].dataset.value(0, 0).as_f64(), Some(1.0));
+        app.run_by_user("edit.calculateField", p).unwrap();
+        app.session.run("edit.setValue", &json!({"table": "calc", "row": 0, "field": "n", "value": 9})).unwrap();
+        let depth = app.session.undo_depth();
+        landed(&mut app, 60);
+        assert_eq!(app.session.project.tables[0].dataset.value(0, 0).as_f64(), Some(9.0));
+        assert_eq!(app.session.undo_depth(), depth);
+        assert!(app.session.notices.iter().any(|n| n.text.contains("table changed")));
+    }
+
+    /// The Script pane dispatch prepares table writes off frame and lands them as one undo step.
+    #[test]
+    fn a_table_script_runs_off_frame() {
+        let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        app.run("layer.addDataText", json!({"fileName": "records.csv", "text": "n\n1\n2\n"})).unwrap();
+        app.reads_off_frame = true;
+        let before = serde_json::to_value(&app.session.project.tables).unwrap();
+        let depth = app.session.undo_depth();
+        let p = json!({"script": "edit.addField {\"table\":\"records\",\"name\":\"result\",\"type\":\"long\"}\nedit.enable {\"on\":true}\nedit.calculateField {\"table\":\"records\",\"field\":\"result\",\"expression\":\"n + 1\"}"});
+        assert_eq!(run(&mut app, "script.run", p.clone()).unwrap()["started"], "Run Script");
+        assert_eq!(serde_json::to_value(&app.session.project.tables).unwrap(), before);
+        landed(&mut app, 60);
+        let data = &app.session.project.tables[0].dataset;
+        assert_eq!(data.value(1, data.field_index("result").unwrap()).as_f64(), Some(3.0));
+        assert_eq!(app.session.undo_depth(), depth + 1);
+        app.run("edit.undo", Value::Null).unwrap();
+        assert_eq!(serde_json::to_value(&app.session.project.tables).unwrap(), before);
+        // A live edit invalidates the prepared script rather than rerunning its calculation.
+        app.run("edit.enable", json!({"on": true})).unwrap();
+        run(&mut app, "script.run", p.clone()).unwrap();
+        app.session.run("edit.setValue", &json!({"table": "records", "row": 0, "field": "n", "value": 9})).unwrap();
+        let current = (serde_json::to_value(&app.session.project.tables).unwrap(), app.session.undo_depth());
+        landed(&mut app, 60);
+        assert_eq!((serde_json::to_value(&app.session.project.tables).unwrap(), app.session.undo_depth()), current);
+        assert!(app.session.notices.iter().any(|n| n.text.contains("table changed")));
+        // An unsafe prefix is refused before the desktop script can reach a table write.
+        let mixed = json!({"script": "project.new {}\nedit.addField {\"table\":\"records\",\"name\":\"extra\",\"type\":\"long\"}"});
+        assert!(run(&mut app, "script.run", mixed).unwrap_err().contains("separate scripts"));
+        assert_eq!((serde_json::to_value(&app.session.project.tables).unwrap(), app.session.undo_depth()), current);
+        app.reads.fail_spawn = true;
+        assert!(run(&mut app, "script.run", p).unwrap_err().contains("worker could not start"));
+        assert_eq!((serde_json::to_value(&app.session.project.tables).unwrap(), app.session.undo_depth()), current);
+    }
+
+    /// A file-producing model before a table write must be refused before its file is written.
+    #[test]
+    fn a_table_script_refuses_a_file_model_before_any_live_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("model.pmtiles");
+        let mut app = RustGisApp::with_sample();
+        app.run("layer.addDataText", json!({"fileName": "records.csv", "text": "n\n1\n2\n"})).unwrap();
+        app.run("model.new", json!({"name": "File", "steps": [{"tool": "vectorToPmtiles", "params": {"input": "Cities", "minZoom": 0, "maxZoom": 0, "output": output}}]})).unwrap();
+        app.reads_off_frame = true;
+        let before = (serde_json::to_value(&app.session.project.tables).unwrap(), app.session.undo_depth());
+        let p = json!({"script": "model.run {\"name\":\"File\"}\nedit.addField {\"table\":\"records\",\"name\":\"extra\"}"});
+        let result = run(&mut app, "script.run", p);
+        if result.is_ok() {
+            landed(&mut app, 60);
+        }
+        assert!(!output.exists(), "the model must not write before a missing table result is refused");
+        assert_eq!((serde_json::to_value(&app.session.project.tables).unwrap(), app.session.undo_depth()), before);
+        assert!(result.is_err() || app.session.notices.iter().any(|n| n.text.contains("separate scripts")));
+    }
+
+    /// A failed worker start refuses every registered table write without installing or undoing data.
+    #[test]
+    fn a_table_worker_failure_does_not_run_on_the_frame() {
+        for (command, p) in [
+            ("edit.setValue", json!({"table": "records", "row": 0, "field": "n", "value": 9})),
+            ("edit.addFeature", json!({"table": "records", "attributes": {"n": 3}})),
+            ("edit.addField", json!({"table": "records", "name": "extra", "type": "text"})),
+            ("edit.deleteField", json!({"table": "records", "field": "day"})),
+            ("edit.convertField", json!({"table": "records", "field": "day", "type": "date"})),
+            ("edit.calculateField", json!({"table": "records", "field": "n", "expression": "n + 1"})),
+        ] {
+            let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+            app.run("layer.addDataText", json!({"fileName": "records.csv", "text": "n,day\n1,2026-01-01\n2,2026-01-02\n"})).unwrap();
+            app.run("edit.enable", json!({"on": true})).unwrap();
+            app.reads_off_frame = true;
+            app.reads.fail_spawn = true;
+            let before = (serde_json::to_value(&app.session.project.tables).unwrap(), app.session.undo_depth());
+            let error = app.run_by_user(command, p).unwrap_err();
+            assert!(error.contains("worker could not start"), "{command}: {error}");
+            assert_eq!((serde_json::to_value(&app.session.project.tables).unwrap(), app.session.undo_depth()), before, "{command}");
+            assert!(!showing(&app));
+        }
+    }
+
+    /// Waiting writes consume their predecessor's output, with one undo step per command.
+    #[test]
+    fn queued_table_writes_land_in_order() {
+        let fixture = || {
+            let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+            app.run("layer.addDataText", json!({"fileName": "records.csv", "text": "n\n1\n2\n"})).unwrap();
+            app.run("edit.enable", json!({"on": true})).unwrap();
+            app
+        };
+        let (mut app, mut expected) = (fixture(), fixture());
+        app.reads_off_frame = true;
+        let before = serde_json::to_value(&app.session.project.tables).unwrap();
+        let depth = app.session.undo_depth();
+        let commands = [
+            ("edit.addFeature", json!({"table": "records", "attributes": {"n": 3}})),
+            ("edit.addFeature", json!({"table": "records", "attributes": {"n": 4}})),
+            ("edit.setValue", json!({"table": "records", "row": 3, "field": "n", "value": 9})),
+            ("edit.addField", json!({"table": "records", "name": "extra", "type": "long"})),
+            ("edit.calculateField", json!({"table": "records", "field": "extra", "expression": "n + 1"})),
+        ];
+        for (i, (command, p)) in commands.iter().enumerate() {
+            expected.session.run(command, p).unwrap();
+            let answer = app.run_by_user(command, p.clone()).unwrap();
+            if i == 0 {
+                assert!(answer.get("started").is_some());
+            } else {
+                assert_eq!(answer["waiting"], i);
+            }
+        }
+        landed(&mut app, 60);
+        assert_eq!(
+            serde_json::to_value(&app.session.project.tables).unwrap(),
+            serde_json::to_value(&expected.session.project.tables).unwrap()
+        );
+        assert_eq!(app.session.undo_depth(), depth + commands.len());
+        assert!(app.session.notices.is_empty(), "{:?}", app.session.notices);
+        for _ in commands {
+            app.run("edit.undo", Value::Null).unwrap();
+        }
+        assert_eq!(serde_json::to_value(&app.session.project.tables).unwrap(), before);
+        // Refreshing input must not retarget a waiting command, even if put_table keeps its id.
+        for keeps_id in [false, true] {
+            let mut app = fixture();
+            app.reads_off_frame = true;
+            let p = json!({"table": "records", "attributes": {"n": 3}});
+            app.run_by_user("edit.addFeature", p.clone()).unwrap();
+            app.run_by_user("edit.addFeature", p).unwrap();
+            if keeps_id {
+                let mut data = app.session.project.tables[0].dataset.clone();
+                data.features[0].attrs[0] = rustgis_engine::data::Value::Int(7);
+                app.session.project.put_table(data);
+            } else {
+                app.session.run("table.remove", &json!({"table": "records"})).unwrap();
+                app.session.run("layer.addDataText", &json!({"fileName": "records.csv", "text": "n\n7\n"})).unwrap();
+            }
+            let replacement = (serde_json::to_value(&app.session.project.tables).unwrap(), app.session.undo_depth());
+            landed(&mut app, 60);
+            assert_eq!((serde_json::to_value(&app.session.project.tables).unwrap(), app.session.undo_depth()), replacement);
+            assert!(app.session.notices.iter().any(|n| n.text.contains("table changed while the edit was waiting")));
+        }
+    }
+
+    /// Landing rechecks the current editing setting before installing any queued row edit.
+    #[test]
+    fn table_row_writes_are_refused_if_editing_is_turned_off_before_landing() {
+        for (command, p) in [
+            ("edit.setValue", json!({"table": "records", "row": 0, "field": "n", "value": 9})),
+            ("edit.addFeature", json!({"table": "records", "attributes": {"n": 3}})),
+            ("edit.calculateField", json!({"table": "records", "field": "n", "expression": "n + 1"})),
+        ] {
+            let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+            app.run("layer.addDataText", json!({"fileName": "records.csv", "text": "n\n1\n2\n"})).unwrap();
+            app.run("edit.enable", json!({"on": true})).unwrap();
+            app.reads_off_frame = true;
+            let before = serde_json::to_value(&app.session.project.tables).unwrap();
+            assert!(app.run_by_user(command, p).unwrap().get("started").is_some(), "{command}");
+            app.run("edit.enable", json!({"on": false})).unwrap();
+            let depth = app.session.undo_depth();
+            let mark = app.session.notice_mark();
+            landed(&mut app, 60);
+            assert_eq!(serde_json::to_value(&app.session.project.tables).unwrap(), before, "{command}");
+            assert_eq!(app.session.undo_depth(), depth, "{command}");
+            assert!(app.session.notices_since(mark).iter().any(|n| n.text.contains("editing is turned off")), "{command}");
+        }
+    }
+
+    /// Every table write uses the actual app worker path and lands the same fields, rows and
+    /// notices as synchronous dispatch, as one undo step. Field edits still work with editing off.
+    #[test]
+    fn table_writes_run_off_frame_with_undo_and_notices() {
+        use rustgis_engine::data::{Dataset, Field, FieldType, GeometryType, Value as Attr};
+        let fixture = || {
+            let mut data =
+                Dataset::new("records", GeometryType::None, vec![Field::new("n", FieldType::Integer), Field::new("day", FieldType::Text)]);
+            data.push(None, vec![Attr::Int(1), Attr::Text("2026-01-02".into())]);
+            data.push(None, vec![Attr::Int(2), Attr::Text("bad date".into())]);
+            let mut project = rustgis_engine::Project::default();
+            project.add_table(data);
+            RustGisApp::new(rustgis_engine::Session::new(project))
+        };
+        for (command, p, editing) in [
+            ("edit.setValue", json!({"table": "records", "row": 0, "field": "n", "value": 9.5}), true),
+            ("edit.addFeature", json!({"table": "records", "attributes": {"n": 3}}), true),
+            ("edit.addField", json!({"table": "records", "name": "extra", "type": "text"}), false),
+            ("edit.deleteField", json!({"table": "records", "field": "day"}), false),
+            ("edit.convertField", json!({"table": "records", "field": "day", "type": "date"}), false),
+            ("edit.calculateField", json!({"table": "records", "field": "n", "expression": "n / 2"}), true),
+        ] {
+            let (mut app, mut expected) = (fixture(), fixture());
+            for app in [&mut app, &mut expected] {
+                app.run("edit.enable", json!({"on": editing})).unwrap();
+            }
+            let before = serde_json::to_value(&app.session.project.tables).unwrap();
+            let depth = app.session.undo_depth();
+            expected.session.run(command, &p).unwrap();
+            app.reads_off_frame = true;
+            assert!(app.run_by_user(command, p).unwrap().get("started").is_some(), "{command}");
+            assert_eq!(serde_json::to_value(&app.session.project.tables).unwrap(), before, "not installed on this frame: {command}");
+            landed(&mut app, 60);
+            assert_eq!(
+                serde_json::to_value(&app.session.project.tables).unwrap(),
+                serde_json::to_value(&expected.session.project.tables).unwrap(),
+                "{command}"
+            );
+            assert_eq!(app.session.notices, expected.session.notices, "{command}");
+            assert_eq!(app.session.undo_depth(), depth + 1, "{command}");
+            app.run("edit.undo", json!({})).unwrap();
+            assert_eq!(serde_json::to_value(&app.session.project.tables).unwrap(), before, "{command}");
+        }
     }
 
     /// Source File State hashes the file on a thread of its own and says what it found once

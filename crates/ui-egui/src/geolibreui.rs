@@ -251,7 +251,7 @@ mod tests {
         let mut metadata = metadata();
         metadata["metadata"]["value/.zarray"]["chunks"] = json!([1, 2]);
         let store = zarr::parse_store(&[(".zmetadata".into(), metadata.to_string().into_bytes())]).unwrap();
-        let plan = zarr::plan(&store, &zarr::Selection { variable: "value".into(), index: Vec::new() }).unwrap();
+        let plan = zarr::plan(&store, &zarr::Selection { variable: "value".into(), index: Vec::new(), window: None }).unwrap();
         let mut read = reader(vec![("value/1.0", Err("HTTP 403".into()))]);
         for (key, values) in [("value/0.0", vec![1.0f64, 2.0]), ("lat/0", vec![0.5, 1.5]), ("lon/0", vec![0.5, 1.5])] {
             read.got.insert(key.into(), values.iter().flat_map(|v| v.to_le_bytes()).collect());
@@ -265,7 +265,7 @@ mod tests {
         let mut metadata = metadata();
         metadata["metadata"]["value/.zarray"]["chunks"] = json!([1, 2]);
         let store = zarr::parse_store(&[(".zmetadata".into(), metadata.to_string().into_bytes())]).unwrap();
-        let plan = zarr::plan(&store, &zarr::Selection { variable: "value".into(), index: Vec::new() }).unwrap();
+        let plan = zarr::plan(&store, &zarr::Selection { variable: "value".into(), index: Vec::new(), window: None }).unwrap();
         let mut read = reader(vec![("value/1.0", Err("HTTP 404".into()))]);
         for (key, values) in [("value/0.0", vec![1.0f64, 2.0]), ("lat/0", vec![0.5, 1.5]), ("lon/0", vec![0.5, 1.5])] {
             read.got.insert(key.into(), values.iter().flat_map(|v| v.to_le_bytes()).collect());
@@ -278,7 +278,7 @@ mod tests {
     fn geolibre_zarr_completion_replaces_reserved_layer_after_map_switch() {
         let metadata = metadata();
         let store = zarr::parse_store(&[(".zmetadata".into(), metadata.to_string().into_bytes())]).unwrap();
-        let plan = zarr::plan(&store, &zarr::Selection { variable: "value".into(), index: Vec::new() }).unwrap();
+        let plan = zarr::plan(&store, &zarr::Selection { variable: "value".into(), index: Vec::new(), window: None }).unwrap();
         let mut got = HashMap::new();
         for (key, values) in [("value/0.0", vec![1.0f64, 2.0, 3.0, 4.0]), ("lat/0", vec![0.5, 1.5]), ("lon/0", vec![0.5, 1.5])] {
             got.insert(key.into(), values.iter().flat_map(|v| v.to_le_bytes()).collect());

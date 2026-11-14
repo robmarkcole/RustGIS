@@ -13,9 +13,10 @@ Mercator stops, is measured on the ground instead, so it may be selected outside
 stops at 85.05°, or left out inside it. The main Select button remains click/rectangle selection.
 All selection tools take only features that are drawn, in selectable layers: a definition query or
 a display filter hiding a feature keeps it out, and a click picks the feature drawn on top among the
-selectable layers. **Select By Attributes** takes a SQL clause and checks it as you type; **Select By
-Location** picks features that touch another layer's features or lie within a search distance of them (or,
-inverted, those that don't). Selected features draw in
+selectable layers. **Select By Attributes** takes a SQL clause and checks it as you type (buttons
+add a field or an operator, and the **Functions** and **Variables** menus add the language's
+functions and variables); **Select By Location** picks features that touch another layer's features or lie
+within a search distance of them (or, inverted, those that don't). Selected features draw in
 cyan and are highlighted in the attribute table, and the selection is synced both ways. Switch,
 clear or zoom to the selection, or make a new layer from it (**Make Layer From Selected
 Features**, `select.layerFromSelection`).
@@ -44,6 +45,51 @@ value is read as ISO 8601 (`2026-03-05`; `2026-03-05T14:30:00+02:00`, or with a 
 few; undo brings the text back. Use it for dates from CSV, GeoJSON or other files that hold them as
 text. A field with a domain, subtypes or contingent values, or one a definition query or display
 filter would no longer read as dates (comparing it with a number), is refused.
+
+#### Editing a standalone table
+
+A standalone table opens from its right-click menu in Layers and is edited as a layer is:
+double-click a cell to change it, and use the toolbar to add a row, add a field or calculate a
+field over every row; a column's menu converts its field or deletes it (**Delete Field**).
+Cells, new rows and Calculate Field need editing on (**Edit › Edit**); adding, converting and
+deleting fields don't, as for a layer. Each edit is one undo step. On the desktop, table writes
+run in the background with progress or a busy indicator and **Cancel**. Queued edits run in
+order, each using the preceding edit's result. If the table changes independently while an edit
+runs, its result is refused; run the edit again to use the new values. A schema change clears
+the view's sort when it lands, including a sort picked while an edit waits. Replacing a table
+with a tool result discards its open cell draft and waiting writes. Field edits that change the
+schema also discard open drafts; ordinary row edits keep them.
+
+Desktop scripts also prepare table writes off the frame and keep the script as one undo step.
+If an earlier line cannot be prepared safely (for example, opening a file or saving a project),
+run that setup separately from the table-writing script. Models and batches before a table
+write are checked for file-producing and plugin tools too; those steps must run separately.
+Native restricted callers must prepare table writes in the background; synchronous table writes
+are refused. Run those edits from the table view or an ordinary Script pane script instead.
+A failed worker start refuses the edit instead of running it on the window thread. The command
+line continues to run scripts synchronously. Native tasks and notebooks cannot write standalone
+tables, including through script steps: run those edits directly or as a separate script so the
+desktop can offer progress and Cancel.
+Calculate Field lists only columns reachable by name; a later column whose name differs only
+by case cannot be changed there.
+
+The `edit.*` commands take the table as `"table"` (its name or id) instead of `"layer"`:
+`edit.setValue`, `edit.addField`, `edit.deleteField`, `edit.convertField`, `edit.calculateField`,
+and `edit.addFeature` with `"attributes"` and no geometry, which adds a row. As for a layer, a
+notice says when a field can't hold a value whole (a fraction in a whole-number field), and when
+an attribute names no field. A new row's attributes match exact field names first, then a unique
+match ignoring case; an ambiguous name is refused. When two keys reach the same field, a notice
+names the key left out.
+
+A table's rows live in the project, as they were copied in when it was added: edits change the
+project, not the CSV or other file the table came from. **Export Table** (`share.exportTable`)
+writes the edited table to a file. Tables have no selection yet, so rows can't be deleted.
+
+```text
+edit.setValue={"table":"sites","row":0,"field":"street","value":"Rue Cler"}
+edit.addFeature={"table":"sites","attributes":{"id":3,"street":"Quai Branly"}}
+edit.calculateField={"table":"sites","field":"visits","expression":"visits + 1"}
+```
 
 <figure markdown="span">
   ![The attribute table docked under the map: the 14 African countries of more than 30 million people, selected by attributes, highlighted on the map and in the table](https://assets.rustgis.app/images/attribute-table.webp)
@@ -311,7 +357,8 @@ origins are restored when a project replacement is undone or redone. Browser dow
 check the eventual save destination; choose a different file in the browser's save dialog to
 avoid replacing an input.
 An active selection is exported; otherwise the geoprocessing extent applies, and streamed
-sources are read in full rather than limited to the visible map window. It exports points,
+sources are read in full rather than limited to the visible map window. A layer's definition
+query leaves out the features it hides in either case. It exports points,
 lines and polygons, including multipart geometry, attributes and feature IDs—not the map's
 style or labels. Antimeridian paths are unwrapped and clipped with an 8/4096-tile buffer;
 latitudes beyond Web Mercator's limit are clamped and reported. Geometry parts collapsed by
@@ -382,11 +429,18 @@ size so points are not missed between cell centres.
 The search radius must be at least the pixel size. The extent can optionally be overridden via `extent`
 as `xmin,ymin,xmax,ymax` text or a four-number array. The output is written as a single-band Float32 GeoTIFF.
 
-Most feature tools process only the selected rows when an input has a selection. Selection tools
-instead replace the input's selection; Select Layer By Location honours the selecting layer's
-selection. Summarize Within counts the selected points against **all** input polygons, and
-Calculate Geometry Attributes updates **all** rows. For tools that create a map layer, `output`
-is the layer name; `vectorToPmtiles` uses it as a file destination.
+Most feature tools process only the selected rows when an input has a selection, and only the
+features a layer's definition query keeps (with the selection cut to them): a Clip by a layer
+filtered to one country uses that country, and a Buffer of a filtered layer buffers the features
+the filter keeps. Tools go by the definition query alone: the time slider's window and display
+filters, which follow the map's time and scale, don't change what a tool reads. A feature tool
+refuses a layer whose definition query hides every feature it would read. Selection tools instead
+replace the input's selection with features the map draws, leaving out the ones its definition
+query, time window or display filters hide and saying how many (none, if they hide every match);
+Select Layer By Location honours the selecting layer's selection. Summarize Within counts the
+selected points against **all** input polygons, and Calculate Geometry Attributes updates **all**
+rows, including the ones a definition query hides: the run says how many. For tools that create a map layer, `output` is the layer name; `vectorToPmtiles`
+uses it as a file destination.
 
 **Buffer** distances, and the distance of **Select Layer By Location**, are measured on the Earth
 (the WGS 84 ellipsoid, as PROJ and GeographicLib measure it), not in the map's display
@@ -457,8 +511,8 @@ type (points, lines or polygons) into a new layer. It needs no GeoLibre runner. 
 Layers** and **Preserve Attributes** in the tool pane, or pass names separated by `;` or a JSON
 array. Desktop runs can also name local vector files without adding them to the map first.
 In the browser, load the files as layers first. Each layer contributes its selection, or all its
-features when it has no selection; read-in-place layers without a selection contribute their
-complete source.
+features when it has no selection (only the ones its definition query keeps); read-in-place
+layers without a selection contribute their complete source.
 
 ```json
 {"tool":"merge","params":{"inputs":["Survey A","Survey B"],"attributes":true,"output":"Combined survey"}}
@@ -1175,10 +1229,12 @@ layers.
 
 The suite is an optional download, so RustGIS itself stays small: the **GeoLibre runner**, a
 single `geolibre` program (about 20 MB to download). In the Tools pane, click
-**Install Whitebox and GeoLibre tools** under *Whitebox and GeoLibre tools*: RustGIS downloads the latest runner for your
-platform from the [geolibre-rust releases](https://github.com/opengeos/geolibre-rust/releases/latest),
-checks it against its published SHA-256 checksum (which catches a corrupted download; the
-release itself is trusted as when you download it by hand) and installs it in its data folder
+**Install Whitebox and GeoLibre tools** under *Whitebox and GeoLibre tools*: RustGIS downloads the runner for your
+platform from the geolibre-rust release it was built and tested with
+([1.8.0](https://github.com/opengeos/geolibre-rust/releases/tag/v1.8.0), the same runner the browser
+uses), checks it against its published SHA-256 checksum (which catches a corrupted download; the
+release itself is trusted as when you download it by hand), checks that it starts and reports a
+version RustGIS works with, and only then installs it in its data folder
 (by default `~/.local/share/rustgis/geolibre` on Linux, `~/Library/Application Support/RustGIS/geolibre`
 on macOS, `%LOCALAPPDATA%\RustGIS\geolibre` on Windows). `RUSTGIS_APP_DATA_DIR` overrides the
 data folder; Linux also honours `XDG_DATA_HOME`. From the command line, `gp.installGeolibre`
@@ -1202,6 +1258,12 @@ pane and the Browser's toolboxes, grouped by the category and subcategory the ru
 each tool (Conversion, Hydrology, LiDAR, Projection, Raster, Remote Sensing, Terrain, Vector,
 then e.g. **GeoLibre › Terrain › Derivatives**). A runner too old to list subcategories groups
 them by category only. Find Tools searches them.
+
+RustGIS works with GeoLibre runner 1.x (from 1.0.0, up to but not including 2.0.0). A runner
+outside that range, found or located, is passed over, and the Tools pane says which one and how to
+fix it (also when another runner is used instead; `gp.geolibre` gives it as `passedOver`): install
+the tools, or locate a runner in that range. A download that fails or is refused
+leaves an installed runner as it was.
 
 Field-name parameters (`field`, `*_field`, `fields` and `*_fields`) have a **Fields** menu beside
 the text box. Pick an input layer or table first, then choose one of its fields. For tools with

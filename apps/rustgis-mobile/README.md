@@ -2,7 +2,10 @@
 
 RustGIS on Android ([#1902](https://github.com/opengeos/RustGIS/issues/1902)). It runs the desktop
 front end (`rustgis-ui-egui`) in a `NativeActivity`, with the system's file picker for opening and
-saving. It is not a field app yet: there is no touch interface and no location.
+saving, and the touch interface (`rustgis-ui-touch`) around its map, which can capture points,
+lines and polygons with their attributes and show where the device is. It is not a field app yet:
+a captured shape can't be edited by touch afterwards, positions aren't averaged or logged as a
+track, and there are no photos.
 
 ## Build
 
@@ -49,8 +52,8 @@ of the app.
 ## The phone, from Rust
 
 `rustgis_engine::platform::Platform` is what a front end asks a phone for: files from the system's
-picker and a place to save. Location and the camera are added to it with their
-first implementation. `src/phone.rs` implements it for Android by calling the activity's Java half,
+picker, a place to save, and the device's position. The camera is added to it with its first
+implementation. `src/phone.rs` implements it for Android by calling the activity's Java half,
 `java/org/rustgis/mobile/MainActivity.java`, which is the only code that can show the picker (the
 Storage Access Framework) and receive its answer.
 
@@ -66,6 +69,44 @@ Rust calls Java and never the other way: each frame the app collects what happen
   app's storage.
 - **Not yet.** Choosing a folder (Add Folder, a Zarr store) says it isn't available. The copies of
   data and projects in `files/picked` are never removed (a dialog's file is removed once read). Bringing edits back to the original file is phase 3.
+
+## The touch interface
+
+A phone starts in the touch interface: the map, a bar of four large buttons under it (Layers, Add
+Data, Capture, More) and sheets that rise over the map. The Layers sheet shows and hides layers,
+zooms to one and makes one the active layer; the More sheet has Full Extent, the project, undo
+and redo, and **Use the Desktop Interface**, which brings back the ribbon and panes until the app
+is started again.
+
+**Capture** adds a feature to one of the map's point, line or polygon layers. A cross marks the
+middle of the map: the map is moved under it, and the sheet's fields are filled in (one for each
+of the layer's attributes). For a point layer, **Add Point Here** puts the point at the cross.
+For a line or polygon layer, **Add Vertex Here** places a vertex at the cross, the shape so far
+is drawn over the map with a thin line on to the cross, **Undo Vertex** and **Start Over** take
+vertices back, and **Finish Line** or **Finish Polygon** adds the feature once it has enough of
+them (two for a line, three for a polygon). The sheet stays up, emptied, for the next feature.
+Editing is turned on for the map when it was off, and the sheet says so.
+
+The form follows the layer's data design. A field with a list of values (a coded-value domain,
+the layer's subtypes, or yes and no) shows a chip for each: one is tapped to choose it, and
+tapped again to leave the field empty. A field with a range says its limits. When the layer has
+feature templates, a **Template** row chooses one, and its defaults fill what the form leaves
+empty; the template stays chosen for the next feature.
+
+**Show My Position**, in the More sheet, asks Android for the device's position (and the user,
+the first time, for leave to use it). The position is drawn on the map as a dot in a ring as wide
+as it is good to, and follows the device about once a second. **Go to My Position**, in the More
+sheet and at the top of the Capture sheet, moves the map so the capture cross is on it: a point
+or a vertex added then is at the device's position. **Hide My Position** stops asking, which
+spares the battery.
+
+What it doesn't do yet: moving or deleting a vertex once the feature is added, snapping, a new
+layer to capture into, marking which fields a rule requires, and keeping the field being typed in
+above the soft keyboard (the keyboard covers the lower fields: close it to reach them).
+
+The interface keeps out of the room the system's bars take: the activity's Java half reports the
+insets, and the bars' icons are drawn dark over a light theme's ground and light over a dark
+one's.
 
 ## What differs from the desktop
 
@@ -97,7 +138,7 @@ On the Android 15 emulator (x86_64, software GPU), from this crate as it is:
 
 What it showed is wrong or missing:
 
-- The window draws under the status bar and the navigation bar: the app ignores the system's insets.
+- (Fixed since.) The window drew under the status bar and the navigation bar.
 - The desktop ribbon and panes are unusable at a phone's width, as expected. Phase 2 is a new front end.
 - The map draws on the CPU here (the emulator has no GPU). Frame rates need a phone.
 - Not tried on a phone: arm64, a real GPU, pinch zoom, the soft keyboard, memory limits.

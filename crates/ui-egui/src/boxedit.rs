@@ -36,14 +36,10 @@ enum Handle {
 }
 
 pub(crate) fn ready(app: &RustGisApp) -> bool {
-    supported(app)
-        && app.session.active_layer.is_some_and(|id| {
-            rustgis_engine::box_edit::check_layer(&app.session, id).is_ok()
-                && app.session.map().layer(id).is_some_and(|l| app.session.map().draws_at(l, app.session.scale()))
-        })
-}
-fn supported(app: &RustGisApp) -> bool {
-    app.session.map().camera.pitch == 0. && !app.session.map().projection.is_globe() && app.session.map().body == "earth"
+    app.session.active_layer.is_some_and(|id| {
+        rustgis_engine::box_edit::check_tool(&app.session, id).is_ok()
+            && app.session.map().layer(id).is_some_and(|l| app.session.map().draws_at(l, app.session.scale()))
+    })
 }
 fn selected(app: &RustGisApp) -> Option<(u32, usize, BoxSpec)> {
     let id = app.session.active_layer?;

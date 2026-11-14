@@ -104,7 +104,13 @@ pub(super) fn command(s: &crate::cmd::InputContext<'_>, spec: &CommandSpec, para
     });
     if matches!(
         spec.id,
-        "layout.export" | "presentation.export" | "share.exportMap" | "animation.export" | "project.thumbnail" | "map.thumbnail"
+        "layout.export"
+            | "presentation.export"
+            | "share.exportMap"
+            | "animation.export"
+            | "map.exportOrbit"
+            | "project.thumbnail"
+            | "map.thumbnail"
     ) && let Some(select) = spec.inputs
         && let Ok(inputs) = select(s, params)
     {

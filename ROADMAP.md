@@ -118,10 +118,10 @@ features build on.
 - What a project holds by default, its own data or links to it
   ([poll #1660](https://github.com/opengeos/RustGIS/discussions/1660)), and storage that opens a
   large project without reading it whole. _Decide first._
-- Dates read and written as dates by database providers (the field types and file readers are in;
-  [#853](https://github.com/opengeos/RustGIS/issues/853) has the plan); afterwards time zones (a
-  time without a zone stays as written; where an instant is needed, an assumed zone is saved in
-  the project, never written into the data) and recovering a project with an invalid date.
+- Time zones for dates (the date types, files and database providers are in;
+  [#853](https://github.com/opengeos/RustGIS/issues/853) has the plan): a time without a zone
+  stays as written; where an instant is needed, an assumed zone is saved in the project, never
+  written into the data. Then recovering a project with an invalid date.
 - Z coordinates kept from the data and written back, Phase 1 of
   [#726](https://github.com/opengeos/RustGIS/issues/726). _Decide first_ (it changes `Coord`).
 - Persistent attribute joins and virtual fields. _Decide first_ (they change `Feature`; needs an
@@ -245,7 +245,7 @@ And alongside it:
 ### Edit
 - Save edits back to Shapefile and GeoJSON layers, as GeoPackage and PostGIS do
   ([#1385](https://github.com/opengeos/RustGIS/issues/1385)). _Coordinate first._
-- Editable standalone tables (they are read-only today).
+- Selecting and deleting rows of a standalone table (its cells, rows and fields are editable).
 - Shared edges, so that moving one polygon boundary moves its neighbour's too
   ([#872](https://github.com/opengeos/RustGIS/issues/872)). Coincident vertices already move
   together (`edit.moveSharedVertex`, with Shared Vertices on); boundaries with different vertex

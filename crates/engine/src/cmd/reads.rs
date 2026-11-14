@@ -44,6 +44,8 @@ pub struct ReadAhead {
     owner: Continuation,
     source: Option<rustgis_map::source::SourceLayer>,
     work: Option<ReadWork>,
+    /// A table write retains its admitted project and table identity across queue waits.
+    table: Option<(u64, u32, u64)>,
 }
 
 impl ReadAhead {
@@ -59,11 +61,28 @@ impl ReadAhead {
         self.work.is_some()
     }
 
+    /// Refreshes a table write's input immediately before its worker starts, so queued writes
+    /// see earlier writes' output. The admitted operation, owner and table contents identity stay fixed;
+    /// landing still rejects changes made while the worker runs. Other reads keep their input.
+    pub fn refresh_table_input(mut self, s: &Session) -> Result<Self, String> {
+        let Some((opened, table, instance)) = self.table else { return Ok(self) };
+        self.owner.check()?;
+        let CommandOp::Registered { spec, params } = self.op.op() else { return Err("not a registered read command".into()) };
+        if s.opened != opened
+            || s.named_table(spec, params) != Some(table)
+            || s.project.table(table).is_none_or(|t| t.instance_id() != instance)
+        {
+            return Err("the table changed while the edit was waiting: run the edit again".into());
+        }
+        self.work = super::edit::table_ahead(s, spec.id, params)?;
+        Ok(self)
+    }
+
     /// Reads, blocking until it's done; `control` stops it and counts its progress (see
     /// [`rustgis_analysis::control`]). A read that fails gives its failure to the command, which
     /// says it as it would have; only a cancelled run (or a bug in a reader) is an error here.
     pub fn run(self, control: &std::sync::Arc<rustgis_analysis::control::Control>) -> Result<Read, String> {
-        let ReadAhead { name, op, owner, source, work } = self;
+        let ReadAhead { name, op, owner, source, work, table: _ } = self;
         owner.check()?;
         let current = owner.clone();
         let still = std::sync::Arc::new(move || current.check().is_ok());
@@ -146,7 +165,7 @@ pub(crate) fn prepare(s: &mut Session, op: Authorized<CommandOp>, owner: Continu
         }
         "script.run" => {
             #[cfg(not(target_arch = "wasm32"))]
-            let work = if owner.native_tool_owner() { super::workflows::script_ahead(s, params) } else { None };
+            let work = super::workflows::script_ahead(s, params, owner.native_tool_owner())?;
             #[cfg(target_arch = "wasm32")]
             let work = None;
             ("Run Script", work, None)
@@ -159,12 +178,16 @@ pub(crate) fn prepare(s: &mut Session, op: Authorized<CommandOp>, owner: Continu
             let name = if spec.id == "map.repairTiles" { "Repair Data Source" } else { "Reload Data" };
             (name, work, None)
         }
+        id if super::edit::table_edit_in_background(id).is_some() => ("Edit Table", super::edit::table_ahead(s, spec.id, params)?, None),
         "topology.validate" => ("Error Inspector", super::design::topology_ahead(s, params), None),
         "source.syncState" => ("Source File State", super::publish::sync_ahead(s, params), None),
         _ => return Err("only Add Data, Load All, Repair/Reload Data, Convert To Annotation, models, scripts, tile archives, service listings, topology and Source File State prepare background work".into()),
     };
     let name = work.as_ref().map_or(name, |work| work.name);
-    Ok(ReadAhead { name, op, owner, source, work })
+    let table = super::edit::table_edit_in_background(spec.id)
+        .and_then(|_| s.named_table(spec, params))
+        .and_then(|id| s.project.table(id).map(|t| (s.opened, id, t.instance_id())));
+    Ok(ReadAhead { name, op, owner, source, work, table })
 }
 
 /// Consumes a completed read under its initiating owner, with ordinary command history and undo.
@@ -184,6 +207,16 @@ pub fn archive_target(s: &Session, p: &Value) -> Option<(usize, rustgis_map::Til
 /// `work` as a read for the command to take under `key`.
 pub(crate) fn ahead<T: Send + 'static>(name: &'static str, key: String, work: impl FnOnce() -> T + Send + 'static) -> ReadWork {
     ReadWork { name, key, work: Box::new(move || Box::new(work()) as Box<dyn Any + Send>) }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+/// Makes one script line's prepared result available only to its ordinary admitted invocation.
+/// Restore the enclosing read on every path, including a panic raised again for its caller.
+pub(crate) fn taking<T: Send + 'static>(s: &mut Session, key: &str, value: T, run: impl FnOnce(&mut Session) -> CmdResult) -> CmdResult {
+    let previous = s.read_ahead.replace(Ready { key: key.into(), value: Box::new(value) });
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(s)));
+    s.read_ahead = previous;
+    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
 
 /// The read placed for `key`, taken: `None` when none was, so the caller reads here.

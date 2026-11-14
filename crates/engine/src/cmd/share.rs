@@ -215,6 +215,14 @@ pub fn map_png(s: &mut Session, width: Option<f64>, height: Option<f64>, dpi: Op
     saying_shadows(s, "The map image", |s| png_of(s.map_mut(), view_size, width, height, dpi))
 }
 
+/// [`map_png`] for a caller that draws several frames inside one [`saying_shadows`], which says
+/// what they all said of their cast shadows once. Only the desktop's animation exports draw so.
+#[cfg(not(target_arch = "wasm32"))]
+pub(super) fn map_png_unsaid(s: &mut Session, width: Option<f64>, height: Option<f64>, dpi: Option<f64>) -> Result<Vec<u8>, String> {
+    let view_size = s.view_size;
+    png_of(s.map_mut(), view_size, width, height, dpi)
+}
+
 /// Runs `draw`, which draws maps or pages for `s` (an image, an export, a shared item), and says
 /// as warnings about `what` what its frames said of their cast shadows once it drew (see
 /// [`shadow_warnings`]). Whatever the engine draws for someone goes through it, or through
@@ -724,6 +732,9 @@ fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, gpkg: Gpk
     // raster layer's extent is its raster's, which the file doesn't hold.
     let extent = if chunks.is_some() { l.extent() } else { ds.extent() };
     let mut notes = rustgis_data::export_notes([(ds, extent)], path, crs);
+    if asked.is_none() {
+        notes.extend(rustgis_data::io::default_export_note(ds, path));
+    }
     notes.extend(moved);
     // A Shapefile (`.shp`, or zipped to `.zip`) cuts field names to dBase's.
     let shapefile = matches!(ext.as_str(), "shp" | "zip");

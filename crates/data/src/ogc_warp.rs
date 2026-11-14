@@ -194,15 +194,15 @@ pub fn usable(epsg: u32) -> Option<Crs> {
 
 /// A longitude/latitude box (west, south, east, north) in a system: the bounds of a grid of
 /// points over it worked out there (a projected box's corners aren't its extremes, and a world's
-/// edges meet at the poles and the antimeridian: its inside says where it is).
+/// edges meet at the poles and the antimeridian: its inside says where it is). If a grid point
+/// is refused, the box is unknown: surviving points must not exclude imagery inside the area.
 pub fn native_box(t: &Transformer, [w, s, e, n]: [f64; 4]) -> Option<[f64; 4]> {
     let mut out: Option<[f64; 4]> = None;
     for i in 0..=8 {
         for j in 0..=8 {
             let (x, y) = (w + (e - w) * f64::from(i) / 8.0, s + (n - s) * f64::from(j) / 8.0);
-            if let Some(c) = t.from_lonlat(Coord::new(x, y)).filter(|c| c.x.is_finite() && c.y.is_finite()) {
-                out = Some(out.map_or([c.x, c.y, c.x, c.y], |b| [b[0].min(c.x), b[1].min(c.y), b[2].max(c.x), b[3].max(c.y)]));
-            }
+            let c = t.from_lonlat(Coord::new(x, y)).filter(|c| c.x.is_finite() && c.y.is_finite())?;
+            out = Some(out.map_or([c.x, c.y, c.x, c.y], |b| [b[0].min(c.x), b[1].min(c.y), b[2].max(c.x), b[3].max(c.y)]));
         }
     }
     out
@@ -604,6 +604,17 @@ mod tests {
         assert_eq!(epsg_of("AUTO:42001"), None);
         assert!(usable(2056).is_some() && usable(4326).is_some());
         assert!(usable(3857).is_none(), "Web Mercator is drawn as it is");
+    }
+
+    /// A partial projected box must not cull valid imagery inside the service's geographic area.
+    #[test]
+    fn refused_grid_points_do_not_make_a_partial_culling_box() {
+        let t = transformer(32617).unwrap();
+        let view = [-170.0, 0.0, 10.0, 50.0];
+        let place = t.from_lonlat(Coord::new(-170.0, 10.5)).unwrap();
+        assert!(t.from_lonlat(Coord::new(-170.0, 0.0)).is_none());
+        let bounds = native_box(&t, view);
+        assert!(bounds.is_none(), "partial bounds {bounds:?} can cull valid imagery at {place:?}");
     }
 
     #[test]

@@ -53,4 +53,13 @@ pub struct Saved {
     pub versions: Vec<(u64, i64)>,
     /// The layer's fields the table has no column for, which weren't saved.
     pub skipped_fields: Vec<String>,
+    /// For each of the layer's fields, the date-times at an offset other than UTC's written to a
+    /// column that holds instants in UTC: the moment is kept, the offset isn't.
+    pub utc_dates: Vec<usize>,
+    /// For each of the layer's fields, the date-times with an offset written to a column without
+    /// a time zone: the clock time is kept, the offset isn't.
+    pub zoneless_dates: Vec<usize>,
+    /// For each of the layer's fields, the date-times without a zone written to a column that
+    /// holds instants: taken as UTC.
+    pub assumed_utc: Vec<usize>,
 }

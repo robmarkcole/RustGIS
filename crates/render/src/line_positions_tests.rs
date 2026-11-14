@@ -210,6 +210,7 @@ fn terrain_and_roofs_translate_ready_and_deferred_places_without_changing_glyph_
         face_culling: true,
         lighting: true,
         shadows: true,
+        ..Default::default()
     });
     for roof in [false, true] {
         let mut c = curved(&[(20.0, 150.0), (380.0, 150.0)]);

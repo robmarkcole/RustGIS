@@ -27,8 +27,8 @@ pub(crate) const MAX_FACES: usize = 200_000;
 pub(crate) const MAX_FILE_FACES: usize = if cfg!(target_arch = "wasm32") { 500_000 } else { 4_000_000 };
 /// The rounds of passing heights up to parents always allowed. The specification has two levels.
 pub(crate) const MIN_PARENT_ROUNDS: usize = 8;
-/// Most objects and parent links visited passing heights up: past it, a crafted chain stops, with a
-/// notice, rather than costing the square of its length. [`MIN_PARENT_ROUNDS`] are run whatever it
+/// Most objects and parent links visited passing heights up, and again taking grounds from the
+/// topmost objects: past it, a crafted chain stops, with a notice, rather than costing the square of its length. [`MIN_PARENT_ROUNDS`] are run whatever it
 /// says, so a file with more links than it pays for eight rounds of costs those eight.
 pub(crate) const MAX_PARENT_VISITS: usize = if cfg!(target_arch = "wasm32") { 50_000_000 } else { 200_000_000 };
 /// Most characters of an object type shown in a layer's name.
@@ -36,7 +36,7 @@ pub(crate) const MAX_TYPE_IN_NAME: usize = 64;
 /// The fields every row starts with.
 const LEAD: [&str; 4] = ["id", "type", "parent", "lod"];
 /// The fields every row ends with.
-const HEIGHTS: [&str; 3] = ["z_min", "z_max", "height"];
+const HEIGHTS: [&str; 4] = ["z_min", "z_max", "height", "base_height"];
 /// Most names listed in one notice.
 const MAX_LISTED: usize = 16;
 
@@ -82,6 +82,9 @@ pub(crate) struct Built {
     pub(crate) ty: String,
     pub(crate) parent_ids: Vec<String>,
     pub(crate) z: Option<(f64, f64)>,
+    /// The lowest Z of the topmost object it is part of, its own when it is part of none ([`set_grounds`]):
+    /// its `base_height` is how far above it it starts.
+    pub(crate) ground: Option<f64>,
     /// It has solids, so it is 3D however flat its heights.
     pub(crate) solid: bool,
     pub(crate) attributes: Vec<(String, Json)>,
@@ -106,10 +109,15 @@ pub(crate) struct Counts {
     pub(crate) tin_reliefs: usize,
     pub(crate) unconverted: usize,
     pub(crate) bad_heights: usize,
-    /// Objects whose lowest and highest Z are too far apart for their difference to be a number.
+    /// Objects whose lowest and highest Z, or lowest Z and ground, are too far apart for their
+    /// difference to be a number.
     pub(crate) height_overflows: usize,
     /// The rounds after which passing heights up to parents stopped, when it did.
     pub(crate) parent_rounds: usize,
+    /// The rounds after which taking parts' grounds from their topmost objects stopped, when it did.
+    pub(crate) ground_rounds: usize,
+    /// Objects naming a parent that isn't among those read: their grounds leave it out.
+    pub(crate) unknown_parents: usize,
     pub(crate) unknown: BTreeSet<String>,
     pub(crate) renamed: BTreeSet<String>,
     /// Objects drawn from another geometry or level of detail than one whose X or Y can't be drawn.
@@ -355,13 +363,13 @@ pub(crate) fn vertical_note(system: &str) -> Option<String> {
     let shown: String = system.chars().take(80).collect();
     Some(match OTHER_VERTICALS.iter().find(|(c, _, _)| Some(*c) == code) {
         Some((_, unit, false)) => format!(
-            "a vertical system the file names ({shown}) measures heights in {unit}: z_min, z_max and height are kept as the file has them, and Style › Extrusion reads metres, so objects may stand at the wrong height"
+            "a vertical system the file names ({shown}) measures heights in {unit}: z_min, z_max, height and base_height are kept as the file has them, and Style › Extrusion reads metres, so objects may stand at the wrong height"
         ),
         Some((_, unit, true)) => format!(
-            "a vertical system the file names ({shown}) measures depth, downward, in {unit}: z_min and z_max are kept as the file has them, so the lower value is the higher point, and Style › Extrusion reads heights in metres"
+            "a vertical system the file names ({shown}) measures depth, downward, in {unit}: z_min and z_max are kept as the file has them, so the lower value is the higher point, and base_height is how far an object's top is below its topmost object's top; Style › Extrusion reads heights in metres"
         ),
         None => format!(
-            "a vertical system the file names ({shown}) is one RustGIS doesn't know the unit or direction of: z_min, z_max and height are kept as the file has them, and Style › Extrusion reads heights in metres"
+            "a vertical system the file names ({shown}) is one RustGIS doesn't know the unit or direction of: z_min, z_max, height and base_height are kept as the file has them, and Style › Extrusion reads heights in metres"
         ),
     })
 }
@@ -452,7 +460,7 @@ pub(crate) fn coordinate_system(
     }
     if let Some(unit) = crs.height_unit_not_metre().filter(|_| !vertical_named) {
         notes.push(format!(
-            "{} measures in {unit}: z_min, z_max and height are kept as the file has them, and Style › Extrusion reads metres, so objects may stand at the wrong height",
+            "{} measures in {unit}: z_min, z_max, height and base_height are kept as the file has them, and Style › Extrusion reads metres, so objects may stand at the wrong height",
             crs.label()
         ));
     }
@@ -530,7 +538,13 @@ pub(crate) fn finish(
         counts.unconverted += objects.len();
     }
     counts.parent_rounds = raise_parents(&mut built, MAX_PARENT_VISITS).unwrap_or(0);
-    counts.height_overflows = built.iter().filter(|b| b.z.is_some_and(|(lo, hi)| !(hi - lo).is_finite())).count();
+    counts.ground_rounds = set_grounds(&mut built, MAX_PARENT_VISITS).unwrap_or(0);
+    counts.unknown_parents = {
+        let ids: HashSet<&str> = built.iter().map(|b| b.id.as_str()).collect();
+        built.iter().filter(|b| b.parent_ids.iter().any(|p| !ids.contains(p.as_str()))).count()
+    };
+    let overflows = |b: &Built| b.z.is_some_and(|(lo, hi)| !(hi - lo).is_finite() || b.ground.is_some_and(|g| !(lo - g).is_finite()));
+    counts.height_overflows = built.iter().filter(|b| overflows(b)).count();
     let is_3d = |b: &Built| b.solid || b.z.is_some_and(|(lo, hi)| hi > lo);
     counts.footprints = rows
         .iter()
@@ -811,6 +825,44 @@ pub(crate) fn raise_parents(built: &mut [Built], visits: usize) -> Option<usize>
     Some(rounds)
 }
 
+/// Each object's ground: the lowest Z of the topmost object it is part of (of the lowest, when it is
+/// part of several), so a part over a building's roof starts at its lowest point's height above the
+/// building's lowest point (its basement's, when it has one), and a building at 0. A group's
+/// members aren't parts of the group: their ground is their own. Heights are passed up first
+/// ([`raise_parents`]), so each object's lowest Z is at most its parts', and the ground is the
+/// least of its own and its parents'. Run in as many rounds as passing heights up, and bounded the
+/// same way; gives the rounds it stopped after, when grounds were still moving. Not looking at
+/// Cancel: like passing heights up, a pass over objects already read.
+pub(crate) fn set_grounds(built: &mut [Built], visits: usize) -> Option<usize> {
+    let links: Vec<Vec<usize>> = {
+        let index: HashMap<&str, usize> = built.iter().enumerate().map(|(i, b)| (b.id.as_str(), i)).collect();
+        let group = |p: &usize| built.get(*p).is_some_and(|b| b.ty == "CityObjectGroup");
+        built.iter().map(|b| b.parent_ids.iter().filter_map(|p| index.get(p.as_str()).copied()).filter(|p| !group(p)).collect()).collect()
+    };
+    for b in built.iter_mut() {
+        b.ground = b.z.map(|(lo, _)| lo);
+    }
+    let per_round = links.iter().map(|l| l.len() + 1).sum::<usize>().max(1);
+    let rounds = built.len().min(visits / per_round).max(MIN_PARENT_ROUNDS);
+    for _ in 0..rounds {
+        let mut changed = false;
+        for (i, parents) in links.iter().enumerate() {
+            let lowest = parents.iter().filter_map(|&p| built.get(p).and_then(|b| b.ground)).fold(f64::INFINITY, f64::min);
+            if let Some(b) = built.get_mut(i)
+                && let Some(ground) = b.ground
+                && lowest < ground
+            {
+                b.ground = Some(lowest);
+                changed = true;
+            }
+        }
+        if !changed {
+            return None;
+        }
+    }
+    Some(rounds)
+}
+
 /// A row's properties, its attributes under their layer's `names` (unique, as [`attribute_names`]
 /// makes them), sorted by name as a GeoJSON feature's are. Attributes are borrowed, not copied.
 fn properties<'a>(b: &'a Built, lod: Option<&'a str>, names: &'a HashMap<String, String>) -> BTreeMap<&'a str, Cow<'a, Json>> {
@@ -822,7 +874,12 @@ fn properties<'a>(b: &'a Built, lod: Option<&'a str>, names: &'a HashMap<String,
         ("parent", parent.map_or(Json::Null, Json::from)),
         ("lod", lod.map_or(Json::Null, Json::from)),
     ];
-    let heights = [("z_min", number(lo)), ("z_max", number(hi)), ("height", number(lo.zip(hi).map(|(l, h)| h - l)))];
+    let heights = [
+        ("z_min", number(lo)),
+        ("z_max", number(hi)),
+        ("height", number(lo.zip(hi).map(|(l, h)| h - l))),
+        ("base_height", number(lo.zip(b.ground).map(|(l, g)| l - g))),
+    ];
     let own = b.attributes.iter().map(|(k, v)| (names.get(k).map_or(k.as_str(), String::as_str), Cow::Borrowed(v)));
     fixed.into_iter().map(|(k, v)| (k, Cow::Owned(v))).chain(own).chain(heights.into_iter().map(|(k, v)| (k, Cow::Owned(v)))).collect()
 }
@@ -965,7 +1022,7 @@ fn listed(names: &BTreeSet<String>) -> String {
 }
 
 /// One notice per kind, with a count.
-fn messages(c: &Counts) -> Vec<String> {
+pub(crate) fn messages(c: &Counts) -> Vec<String> {
     let mut out = Vec::new();
     let mut say = |n: usize, text: String| {
         if n > 0 {
@@ -976,7 +1033,7 @@ fn messages(c: &Counts) -> Vec<String> {
     say(
         c.footprints,
         format!(
-            "{} 3D city objects are drawn as their footprints, with their lowest and highest Z in z_min and z_max, and the difference in height",
+            "{} 3D city objects are drawn as their footprints, with their lowest and highest Z in z_min and z_max, the difference in height, and in base_height how far their lowest point is above the lowest point of the topmost object they are part of (0 for that object)",
             c.footprints
         ),
     );
@@ -1044,7 +1101,7 @@ fn messages(c: &Counts) -> Vec<String> {
     say(
         c.height_overflows,
         format!(
-            "{} city objects have a lowest and highest Z too far apart for their difference to be a number: their height is left empty",
+            "{} city objects have Z values too far apart for their difference to be a number: their height or base_height is left empty",
             c.height_overflows
         ),
     );
@@ -1053,6 +1110,20 @@ fn messages(c: &Counts) -> Vec<String> {
         format!(
             "parent chains go deeper than {} levels: the heights of some parents don't take in all their descendants'",
             c.parent_rounds
+        ),
+    );
+    say(
+        c.ground_rounds,
+        format!(
+            "parent chains go deeper than {} levels: some parts' base_height is measured from a parent, not from the topmost object they are part of",
+            c.ground_rounds
+        ),
+    );
+    say(
+        c.unknown_parents,
+        format!(
+            "{} city objects name a parent that isn't in the file or couldn't be read: their base_height leaves it out",
+            c.unknown_parents
         ),
     );
     if !c.unknown.is_empty() {

@@ -162,6 +162,10 @@ fn complete_gp_file(result: Result<Value, String>, id: u64, completed: &Result<V
     Ok(result)
 }
 
+/// Another shell's interface around the map ([`RustGisApp::chrome`]): it lays out its own panels
+/// in the window's `Ui` and draws the map with [`RustGisApp::map_view`] in what is left.
+pub type Chrome = fn(&mut RustGisApp, &mut egui::Ui);
+
 /// Files read asynchronously (browser uploads, drops) waiting to be opened: (file name, bytes).
 pub type Inbox = std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
 
@@ -1132,6 +1136,16 @@ pub struct RustGisApp {
     /// Add Data and Load All Features read on a thread of their own (the desktop app; see
     /// [`readjob`]). Off, as for tests and the examples, they read as the command runs.
     pub reads_off_frame: bool,
+    /// What another shell draws around the map in place of the ribbon, the panes and the status
+    /// bar (the touch interface, `rustgis-ui-touch`). `None` is the desktop interface. Dialogs
+    /// and the Project menu's page are drawn either way.
+    pub chrome: Option<Chrome>,
+    /// Whether the user wants the device's position shown: a shell that can report one (a
+    /// phone's) starts and stops its positioning by this, and fills in [`RustGisApp::position`].
+    pub locate: bool,
+    /// Where the device is, as the shell last reported it; `None` until it has, and again once
+    /// positioning is off. An interface draws it on the map and can capture at it.
+    pub position: Option<rustgis_engine::platform::Fix>,
     /// Watches linked local files for changes made outside RustGIS and offers Reload Data
     /// (the desktop app; see [`diskwatch`]). Off for tests, unless one turns it on (as `ui_shot`'s
     /// `watchFiles` does).
@@ -1399,6 +1413,9 @@ impl RustGisApp {
             #[cfg(not(target_arch = "wasm32"))]
             reads: readjob::Reads::default(),
             reads_off_frame: false,
+            chrome: None,
+            locate: false,
+            position: None,
             #[cfg(not(target_arch = "wasm32"))]
             watch_files: false,
             #[cfg(not(target_arch = "wasm32"))]
@@ -2353,6 +2370,32 @@ impl RustGisApp {
         readjob::stop(self, std::time::Duration::from_secs(5));
     }
 
+    /// Draws the map into `ui`, with its own controls (zoom, compass, scale bar): for a shell
+    /// that lays out its own interface ([`RustGisApp::chrome`]).
+    pub fn map_view(&mut self, ui: &mut egui::Ui) {
+        mapview::show(self, ui);
+    }
+
+    /// Where a longitude and latitude is on screen (points), in the map as it was last drawn: for
+    /// a shell that draws over the map ([`RustGisApp::chrome`]). `None` before the map is drawn,
+    /// and for a place the view doesn't show (behind the globe, off the projection).
+    pub fn lonlat_to_screen(&self, lon: f64, lat: f64) -> Option<egui::Pos2> {
+        let (rect, _) = self.map.view_rect?;
+        mapview::lonlat_to_screen(self, rect, rustgis_engine::geom::Coord::new(lon, lat))
+    }
+
+    /// Whether background work is running that the user is shown, with its Cancel: an export, a
+    /// file or a layer being read, a download. A shell that draws its own interface
+    /// ([`RustGisApp::chrome`]) shows [`RustGisApp::background_status`] while it is.
+    pub fn background_busy(&self) -> bool {
+        chrome::background_busy(self)
+    }
+
+    /// Draws that work's progress and Cancel into `ui`, as the desktop's status bar does.
+    pub fn background_status(&mut self, ui: &mut egui::Ui) {
+        chrome::background_status(self, ui);
+    }
+
     /// Whether this shell opens files by path (the desktop app; the web app picks them in the
     /// browser instead).
     pub(crate) fn opens_files(&self) -> bool {
@@ -2464,6 +2507,11 @@ impl RustGisApp {
                 _ => None,
             };
             if let Some(command) = archive {
+                return readjob::run(self, command, params);
+            }
+            if params.get("table").is_some_and(|t| !t.is_null())
+                && let Some((command, _)) = rustgis_engine::cmd::edit::table_edit_in_background(id)
+            {
                 return readjob::run(self, command, params);
             }
             // The topology check's work grows with the layers: on a thread of its own (#1291).
@@ -2719,6 +2767,11 @@ impl RustGisApp {
         if id == "stac.search"
             && !params.get("intersects").and_then(Value::as_str).is_some_and(|v| v.trim().eq_ignore_ascii_case("selection"))
         {
+            return None;
+        }
+        // An edit of a standalone table acts on the table, not the active layer: a step naming
+        // both would be refused when it runs again.
+        if id.starts_with("edit.") && params.get("table").is_some_and(|t| !t.is_null()) {
             return None;
         }
         let spec = self.session.registry.get(id).filter(|c| c.mutates && params.get("layer").is_none_or(Value::is_null)).copied()?;
@@ -4621,6 +4674,13 @@ impl RustGisApp {
                     }
                     return Ok(Value::Null);
                 }
+                // Add Field and Calculate Field from a standalone table's view act on that table.
+                if p.get("table").is_some_and(|t| !t.is_null()) {
+                    let i = self.session.table_index(p)?;
+                    let id = self.session.project.tables.get(i).map(|t| t.id).ok_or("no such table")?;
+                    self.dialogs.open_on_table(which, &self.session, id)?;
+                    return Ok(Value::Null);
+                }
                 self.dialogs.open(which, &self.session)?;
                 // Rename Map / Rename Layout remember which one (`target`, by name; default the
                 // one in view), so renaming another from the Browser leaves the view alone.
@@ -5887,6 +5947,8 @@ impl RustGisApp {
         }
         if self.ui.backstage {
             backstage::show(self, ui);
+        } else if let Some(chrome) = self.chrome {
+            chrome(self, ui);
         } else {
             chrome::header(self, ui);
             ribbon::show(self, ui);

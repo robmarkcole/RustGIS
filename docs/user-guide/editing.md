@@ -165,9 +165,12 @@ rules continue to apply. Box tools do not create annotation or class fields.
   press it again to leave the tool.
 
 The interactive tool starts in Web Mercator grid metres, **not ground metres**; angles run
-clockwise from grid east. Flat Earth maps are supported; tilted/globe views, boxes crossing the
-antimeridian, the polar editing limit, and unsupported projection or datum transformations are
-refused. The grid is frozen for an existing box. Scripts can supply an original image grid
+clockwise from grid east. Activating the interactive tool, including through `tool.set`, requires
+an untilted, non-globe Earth view. The geometry commands (`edit.addBox`, `edit.updateBox` and
+`edit.deleteBox`) work independently of the map's projection and pitch, using the construction
+grid on an Earth map. Boxes crossing the antimeridian, the polar editing limit, and unsupported
+projection or datum transformations are refused. The grid is frozen for an existing box.
+Scripts can supply an original image grid
 from `raster::geotiff::read_image_grid` through `rustgis_engine::box_edit::Frame::from_grid`;
 then the box dimensions and centre are original image pixels, including for rotated/skewed
 GeoTIFFs. This does not bind a layer to an image or save image metadata.
@@ -198,6 +201,8 @@ edit.deleteBox={"layer":"Training polygons","row":0}
 `attributes` names must already exist in the layer. `edit.updateBox` and `edit.deleteBox` also
 accept `featureId` to refuse a stale row. `edit.boxInfo` returns the current construction;
 updates keep its frame when `box.frame` is omitted, and preserve the feature's identity/attributes.
+`edit.updateBox` changes only the shape and rejects an `attributes` parameter; use `edit.setValue`
+to change attribute values.
 An optional `box.frame` holds `epsg`, original `width`/`height` and the full GDAL-order `affine` array. Only recognised EPSG
 frames with supported datum transformations are accepted. These parameters are command input,
 not GeoJSON properties or a new saved-file representation.

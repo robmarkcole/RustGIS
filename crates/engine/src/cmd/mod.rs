@@ -364,6 +364,12 @@ pub(crate) fn need_layer(s: &Session) -> Option<&'static str> {
     }
 }
 
+/// A layer is active, or the command's parameters name a standalone table (`"table"`,
+/// [`Session::named_table`]).
+pub(crate) fn need_layer_or_table(s: &Session) -> Option<&'static str> {
+    if s.condition_table.is_some() { None } else { need_layer(s) }
+}
+
 /// A feature (vector) layer is active.
 pub(crate) fn need_feature_layer(s: &Session) -> Option<&'static str> {
     match s.active_layer.and_then(|id| s.map().layer(id)) {

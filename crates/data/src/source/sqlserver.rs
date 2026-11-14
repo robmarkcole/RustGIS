@@ -447,6 +447,17 @@ fn text_of(v: &ColumnData<'static>) -> Option<String> {
         _ => None,
     }
 }
+/// ISO text with its fraction of a second cut to microseconds, as a date-time holds it:
+/// `datetime2` and `datetimeoffset` give up to seven digits (100 ns). [`SqlServerSource::open`]
+/// says which columns hold more.
+fn to_micros(s: &str) -> std::borrow::Cow<'_, str> {
+    let Some(dot) = s.find('.') else { return s.into() };
+    let digits = s.get(dot + 1..).map_or(0, |f| f.bytes().take_while(u8::is_ascii_digit).count());
+    match (s.get(..dot + 7), s.get(dot + 1 + digits..)) {
+        (Some(head), Some(zone)) if digits > 6 => format!("{head}{zone}").into(),
+        _ => s.into(),
+    }
+}
 fn bytes_of<'a>(v: &'a ColumnData<'static>) -> Option<&'a [u8]> {
     if let ColumnData::Binary(Some(v)) = v { Some(v) } else { None }
 }
@@ -529,15 +540,23 @@ impl std::fmt::Debug for SqlServerSource {
     }
 }
 
+/// How a column of a SQL Server type is read (`col`: its alias in the select): as itself or cast.
+/// `None` leaves it out (geometry, binary, row versions).
 fn field_cast(data_type: &str, col: &str) -> Option<(FieldType, String)> {
     Some(match data_type {
         "geometry" | "geography" | "image" | "binary" | "varbinary" | "timestamp" | "rowversion" => return None,
         "bit" => (FieldType::Boolean, col.to_string()),
         "tinyint" | "smallint" | "int" | "bigint" => (FieldType::Integer, format!("CAST({col} AS BIGINT)")),
         "real" | "float" | "decimal" | "numeric" | "money" | "smallmoney" => (FieldType::Double, format!("CAST({col} AS FLOAT)")),
-        "date" | "datetime" | "datetime2" | "smalldatetime" | "datetimeoffset" | "time" => {
-            (FieldType::Text, format!("CONVERT(NVARCHAR(40), {col}, 126)"))
+        // As ISO 8601 text (style 126), which a date field parses: wall-clock times, and a
+        // `datetimeoffset` as its own clock time followed by its offset (`+02:00`), which style
+        // 126 isn't documented to give. A time of day stays text.
+        "date" => (FieldType::Date, format!("CONVERT(NVARCHAR(40), {col}, 126)")),
+        "datetime" | "datetime2" | "smalldatetime" => (FieldType::DateTime, format!("CONVERT(NVARCHAR(40), {col}, 126)")),
+        "datetimeoffset" => {
+            (FieldType::DateTime, format!("CONVERT(NVARCHAR(40), CAST({col} AS DATETIME2), 126) + DATENAME(TZOFFSET, {col})"))
         }
+        "time" => (FieldType::Text, format!("CONVERT(NVARCHAR(40), {col}, 126)")),
         _ => (FieldType::Text, format!("CAST({col} AS NVARCHAR(MAX))")),
     })
 }
@@ -578,6 +597,64 @@ fn projection(geometry: &str, columns: impl IntoIterator<Item = (String, String)
     (fields, Projection { select, numbered, order, raw: raw.join(", ") })
 }
 
+/// How many rows [`fine_times_note`] looks at.
+const FINE_TIMES_SAMPLE: u64 = 100_000;
+
+/// What a layer says of `datetime2` and `datetimeoffset` columns that hold 100-nanosecond digits
+/// (`fine`), which are read to the microsecond: the columns where a row looked at (up to 100,000,
+/// whichever the server returns) has one, and those that may when the rows looked at have none but
+/// weren't all of them (or the look failed).
+fn fine_times_note(conn: &Conn, from: &str, fine: &[String]) -> Vec<String> {
+    if fine.is_empty() {
+        return Vec::new();
+    }
+    let checks: Vec<String> =
+        fine.iter().map(|c| format!("MAX(CASE WHEN DATEPART(NANOSECOND, {}) % 1000 <> 0 THEN 1 ELSE 0 END)", ident(c))).collect();
+    let cols: Vec<String> = fine.iter().map(|c| ident(c)).collect();
+    let sql = format!(
+        "SELECT COUNT_BIG(*), {} FROM (SELECT TOP ({}) {} FROM {from}) s",
+        checks.join(", "),
+        FINE_TIMES_SAMPLE + 1,
+        cols.join(", ")
+    );
+    let row = conn.query_within(&sql, &[], PROBE_TIMEOUT).ok().flatten().and_then(|rows| rows.into_iter().next());
+    let complete = row.as_ref().and_then(|r| int_of(at(r, 0))).is_some_and(|n| n.unsigned_abs() <= FINE_TIMES_SAMPLE);
+    let found: Option<Vec<usize>> = row.map(|r| (0..fine.len()).map(|i| usize::from(int_of(at(&r, i + 1)) == Some(1))).collect());
+    fine_times_said(fine, found.as_deref(), complete)
+}
+
+/// [`fine_times_note`]'s text: `found` counts, for each column of `fine`, whether a row looked at
+/// has a 100-nanosecond digit (`None` when the look failed); `complete` is whether the rows looked
+/// at were all of them.
+fn fine_times_said(fine: &[String], found: Option<&[usize]>, complete: bool) -> Vec<String> {
+    if fine.is_empty() {
+        return Vec::new();
+    }
+    let fields: Vec<Field> = fine.iter().map(|c| Field::new(c.clone(), FieldType::DateTime)).collect();
+    let Some(found) = found else {
+        return vec![format!(
+            "date-times in {} may hold 100-nanosecond digits (they couldn't be checked): any are read to the microsecond, the last digit left out",
+            crate::io::named_fields(&fields, &vec![1; fine.len()])
+        )];
+    };
+    let has = |i: usize| found.get(i).is_some_and(|&n| n > 0);
+    let mut notes = Vec::new();
+    if (0..fine.len()).any(has) {
+        notes.push(format!(
+            "date-times in {} hold 100-nanosecond digits: they're read to the microsecond, the last digit left out",
+            crate::io::named_fields(&fields, found)
+        ));
+    }
+    let rest: Vec<usize> = (0..fine.len()).map(|i| usize::from(!has(i))).collect();
+    if !complete && rest.contains(&1) {
+        notes.push(format!(
+            "date-times in {} may hold 100-nanosecond digits (the rows looked at have none): any are read to the microsecond, the last digit left out",
+            crate::io::named_fields(&fields, &rest)
+        ));
+    }
+    notes
+}
+
 impl SqlServerSource {
     /// Opens one family of a spatial column. `crs` supplies the coordinate system for SRID 0.
     pub fn open(conn: Arc<Conn>, table: Table, family: Option<Family>, crs: Option<&str>) -> Result<Self> {
@@ -612,7 +689,16 @@ impl SqlServerSource {
             notes.push("the server's certificate isn't checked (trust-server-certificate=true)".into());
         }
         let reproject = Reproject::from_epsg(Some(srid), &mut notes);
-        let cols = conn.query("SELECT COLUMN_NAME, LOWER(DATA_TYPE) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = @P1 AND TABLE_NAME = @P2 ORDER BY ORDINAL_POSITION", &[&table.schema, &table.name])?;
+        let cols = conn.query("SELECT COLUMN_NAME, LOWER(DATA_TYPE), DATETIME_PRECISION FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = @P1 AND TABLE_NAME = @P2 ORDER BY ORDINAL_POSITION", &[&table.schema, &table.name])?;
+        // Date-times a column holds finer than RustGIS's microseconds.
+        let fine: Vec<String> = cols
+            .iter()
+            .filter(|r| {
+                text_of(at(r, 1)).is_some_and(|t| t == "datetime2" || t == "datetimeoffset") && int_of(at(r, 2)).is_some_and(|p| p > 6)
+            })
+            .filter_map(|r| text_of(at(r, 0)))
+            .collect();
+        notes.extend(fine_times_note(&conn, &from, &fine));
         let keys = conn.query("SELECT k.COLUMN_NAME FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS c JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE k ON k.CONSTRAINT_SCHEMA = c.CONSTRAINT_SCHEMA AND k.CONSTRAINT_NAME = c.CONSTRAINT_NAME WHERE c.CONSTRAINT_TYPE = 'PRIMARY KEY' AND c.TABLE_SCHEMA = @P1 AND c.TABLE_NAME = @P2", &[&table.schema, &table.name])?;
         let key = if keys.len() == 1 { keys.first().and_then(|r| text_of(at(r, 0))) } else { None };
         let columns = cols.iter().filter_map(|r| Some((text_of(at(r, 0))?, text_of(at(r, 1))?)));
@@ -716,7 +802,10 @@ impl SqlServerSource {
         w
     }
 
-    fn row_feature(&self, r: &Row) -> Option<Feature> {
+    /// A row read as a feature: the id, the geometry and the fields, in the order of the select.
+    /// `None` without an id or a geometry RustGIS reads. A value of a date field that isn't a date
+    /// RustGIS holds is null, counted in `unread` ([`Batch::unread_dates`]).
+    fn row_feature(&self, r: &Row, unread: &mut Vec<usize>) -> Option<Feature> {
         let id = id_of(at(r, 0))?;
         let geometry: Geometry = self.reproject.geometry(wkb::decode(bytes_of(at(r, 1))?)?)?;
         let attrs = self
@@ -724,14 +813,16 @@ impl SqlServerSource {
             .fields
             .iter()
             .enumerate()
-            .map(|(i, f)| {
-                let v = at(r, i + 2);
+            .map(|(k, f)| {
+                let v = at(r, k + 2);
                 match f.ty {
                     FieldType::Integer => int_of(v).map(Value::Int),
                     FieldType::Double => float_of(v).map(Value::Float),
                     FieldType::Boolean => bool_of(v).map(Value::Bool),
-                    // This reader gives no date fields yet: their values come as text.
-                    FieldType::Text | FieldType::Date | FieldType::DateTime => text_of(v).map(Value::Text),
+                    FieldType::Text => text_of(v).map(Value::Text),
+                    FieldType::Date | FieldType::DateTime => {
+                        Some(super::server_date(text_of(v).as_deref().map(to_micros).as_deref(), f.ty, unread, k))
+                    }
                 }
                 .unwrap_or(Value::Null)
             })
@@ -739,12 +830,12 @@ impl SqlServerSource {
         Some(Feature { id, geometry: Some(geometry), attrs })
     }
 
+    /// Reads what a request asks for, each statement timing out after `timeout` seconds (else the
+    /// statement timeout); values that aren't dates are counted in the rows kept.
+    /// A bounded server sample; an unplaceable view errors before any whole-table shortcut.
     fn read_within(&self, req: &Request, timeout: Option<u64>) -> Result<Batch> {
         let limit = clamp_limit(req.limit);
         let mut out = Batch::default();
-        if limit == 0 {
-            return Ok(out);
-        }
         if self.reproject.is_lonlat()
             && let Some(e) = req.extent
             && !e.intersects(&Extent::new(-180.0, -90.0, 180.0, 90.0))
@@ -753,7 +844,10 @@ impl SqlServerSource {
         }
         let secs = timeout.unwrap_or(STATEMENT_TIMEOUT);
         let query = |sql: &str| self.conn.query_within(sql, &[], secs)?.ok_or_else(|| timed_out(secs));
-        let window = native_window(req, self.info.extent, &self.reproject, self.geography, self.conn.compatibility);
+        let window = native_window(req, self.info.extent, &self.reproject, self.geography, self.conn.compatibility)?;
+        if limit == 0 {
+            return Ok(out);
+        }
         let filter = self.filter(window.as_deref());
         let from = self.table.sql_from();
         let cols = self.projection.select.iter().enumerate().map(|(i, e)| format!("{e} AS c{i}")).collect::<Vec<_>>().join(", ");
@@ -783,11 +877,14 @@ impl SqlServerSource {
         };
         out.matched = matched;
         for r in &rows {
-            let Some(f) = self.row_feature(r) else {
+            // Dates that aren't ones are counted in the rows kept.
+            let mut unread = Vec::new();
+            let Some(f) = self.row_feature(r, &mut unread) else {
                 out.skipped += 1;
                 continue;
             };
             if f.geometry.as_ref().is_some_and(|g| in_request(g, req)) {
+                super::add_unread_dates(&mut out.unread_dates, &unread);
                 out.features.push(f);
             }
         }
@@ -822,16 +919,19 @@ fn first_count(rows: &[Row]) -> Option<u64> {
     rows.first().and_then(|r| int_of(at(r, 0))).and_then(|n| u64::try_from(n).ok())
 }
 
-fn native_window(req: &Request, all: Extent, reproject: &Reproject, geography: bool, compatibility: u32) -> Option<String> {
+/// A server predicate for a boundable view, or an intentional whole-table read. Projection
+/// refusal is an error before compatibility and whole-table shortcuts can discard the predicate.
+fn native_window(req: &Request, all: Extent, reproject: &Reproject, geography: bool, compatibility: u32) -> Result<Option<String>> {
+    let Some(e) = req.extent else { return Ok(None) };
+    let native = reproject.database_extent(&e)?;
     // At level 100 geography polygons cannot exceed a hemisphere; use local filtering instead.
     if geography && compatibility <= 100 {
-        return None;
+        return Ok(None);
     }
-    let e = req.extent?;
     if !all.is_empty() && e.min_x <= all.min_x && e.min_y <= all.min_y && e.max_x >= all.max_x && e.max_y >= all.max_y {
-        return None;
+        return Ok(None);
     }
-    box_text(&reproject.extent_from_lonlat(&e), geography)
+    Ok(box_text(&native, geography))
 }
 
 /// A finite polygon literal. Geography needs a counter-clockwise ring, clear of poles and the
@@ -947,6 +1047,37 @@ mod tests {
         assert_eq!(text_of(&ColumnData::String(Some("Tōkyō".into()))).as_deref(), Some("Tōkyō"));
         assert_eq!(bool_of(&ColumnData::Bit(Some(true))), Some(true));
         assert_eq!(bytes_of(&ColumnData::Binary(Some((&b"wkb"[..]).into()))), Some(&b"wkb"[..]));
+        // Columns whose rows hold 100-nanosecond digits are named; the rest, and a table read
+        // whole without any, say nothing; a larger table without any in the rows looked at may.
+        let fine = ["seen".to_string(), "logged".to_string()];
+        assert_eq!(
+            fine_times_said(&fine, Some(&[0, 1]), true),
+            ["date-times in 'logged' hold 100-nanosecond digits: they're read to the microsecond, the last digit left out"]
+        );
+        assert!(fine_times_said(&fine, Some(&[0, 0]), true).is_empty());
+        let notes = fine_times_said(&fine, Some(&[0, 0]), false);
+        assert!(notes.len() == 1 && notes[0].starts_with("date-times in 'seen', 'logged' may hold"), "{notes:?}");
+        // Columns that have them are named apart from those that may.
+        let notes = fine_times_said(&fine, Some(&[1, 0]), false);
+        assert!(
+            notes.len() == 2
+                && notes[0].starts_with("date-times in 'seen' hold")
+                && notes[1].starts_with("date-times in 'logged' may hold"),
+            "{notes:?}"
+        );
+        assert!(fine_times_said(&fine, Some(&[1, 1]), false).len() == 1);
+        // A look that failed says so, naming every column.
+        let notes = fine_times_said(&fine, None, true);
+        assert!(
+            notes.len() == 1 && notes[0].starts_with("date-times in 'seen', 'logged' may hold") && notes[0].contains("couldn't be checked"),
+            "{notes:?}"
+        );
+        assert!(fine_times_said(&[], Some(&[]), false).is_empty() && fine_times_said(&[], None, false).is_empty());
+        // A seventh digit of a second is cut; the offset after it stays.
+        assert_eq!(to_micros("2026-03-05T14:30:00.1234567+02:00"), "2026-03-05T14:30:00.123456+02:00");
+        assert_eq!(to_micros("2026-03-05T14:30:00.1234567"), "2026-03-05T14:30:00.123456");
+        assert_eq!(to_micros("2026-03-05T14:30:00.997"), "2026-03-05T14:30:00.997");
+        assert_eq!(to_micros("2026-03-05"), "2026-03-05");
     }
 
     #[test]
@@ -962,10 +1093,26 @@ mod tests {
         for t in ["real", "float", "decimal", "numeric", "money", "smallmoney"] {
             assert_eq!(field_cast(t, "[c]"), Some((FieldType::Double, "CAST([c] AS FLOAT)".into())));
         }
-        for t in ["date", "datetime", "datetime2", "smalldatetime", "datetimeoffset", "time"] {
-            assert_eq!(field_cast(t, "[c]"), Some((FieldType::Text, "CONVERT(NVARCHAR(40), [c], 126)".into())));
+        assert_eq!(field_cast("date", "[c]"), Some((FieldType::Date, "CONVERT(NVARCHAR(40), [c], 126)".into())));
+        for t in ["datetime", "datetime2", "smalldatetime"] {
+            assert_eq!(field_cast(t, "[c]"), Some((FieldType::DateTime, "CONVERT(NVARCHAR(40), [c], 126)".into())));
         }
+        assert_eq!(
+            field_cast("datetimeoffset", "[c]"),
+            Some((FieldType::DateTime, "CONVERT(NVARCHAR(40), CAST([c] AS DATETIME2), 126) + DATENAME(TZOFFSET, [c])".into()))
+        );
+        assert_eq!(field_cast("time", "[c]"), Some((FieldType::Text, "CONVERT(NVARCHAR(40), [c], 126)".into())));
         assert_eq!(field_cast("uniqueidentifier", "[c]"), Some((FieldType::Text, "CAST([c] AS NVARCHAR(MAX))".into())));
+    }
+
+    #[test]
+    fn refused_database_view_is_not_a_whole_table_sample() {
+        let r = Reproject::from_crs(Crs::from_epsg(32617).unwrap(), &mut Vec::new());
+        let req = Request { extent: Some(Extent::new(-120.0, -30.0, 10.0, 30.0)), limit: 10 };
+        let all = Extent::new(-84.0, 0.0, -78.0, 25.0);
+        assert!(native_window(&req, all, &r, false, 160).unwrap_err().to_string().contains("can't be bounded"));
+        let clean = Request { extent: Some(Extent::new(-84.0, 30.0, -78.0, 40.0)), limit: 10 };
+        assert!(native_window(&clean, Extent::EMPTY, &r, false, 160).unwrap().is_some());
     }
 
     #[test]
@@ -973,21 +1120,21 @@ mod tests {
         let reproject = Reproject::from_crs(Crs::LonLat, &mut Vec::new());
         let req = Request { extent: Some(Extent::new(-180.0, -90.0, 180.0, 90.0)), limit: 100 };
         for compatibility in [0, 80, 90, 100] {
-            assert_eq!(native_window(&req, Extent::EMPTY, &reproject, true, compatibility), None);
+            assert_eq!(native_window(&req, Extent::EMPTY, &reproject, true, compatibility).unwrap(), None);
         }
         for compatibility in [110, 120, 160] {
-            let window = native_window(&req, Extent::EMPTY, &reproject, true, compatibility).unwrap_or_default();
+            let window = native_window(&req, Extent::EMPTY, &reproject, true, compatibility).unwrap().unwrap_or_default();
             assert!(window.starts_with("POLYGON((-179.9999 -89.9999, "), "{window}");
             assert!(window.ends_with(", -179.9999 -89.9999))"), "{window}");
         }
         for compatibility in [0, 80, 90, 100, 110, 120, 160] {
             assert_eq!(
-                native_window(&req, Extent::EMPTY, &reproject, false, compatibility).as_deref(),
+                native_window(&req, Extent::EMPTY, &reproject, false, compatibility).unwrap().as_deref(),
                 Some("POLYGON((-180 -90, 180 -90, 180 90, -180 90, -180 -90))"),
             );
         }
-        assert_eq!(native_window(&req, Extent::new(-10.0, -10.0, 10.0, 10.0), &reproject, true, 110), None);
-        assert_eq!(native_window(&Request { extent: None, limit: 100 }, Extent::EMPTY, &reproject, true, 110), None);
+        assert_eq!(native_window(&req, Extent::new(-10.0, -10.0, 10.0, 10.0), &reproject, true, 110).unwrap(), None);
+        assert_eq!(native_window(&Request { extent: None, limit: 100 }, Extent::EMPTY, &reproject, true, 110).unwrap(), None);
     }
 
     #[test]

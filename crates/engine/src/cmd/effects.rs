@@ -182,8 +182,7 @@ fn extrusion(s: &mut Session, p: &Value) -> CmdResult {
             } else {
                 None
             };
-            let keep =
-                prev.unwrap_or(Extrusion { field: None, height: 0.0, factor: 1.0, face_culling: true, lighting: true, shadows: false });
+            let keep = prev.unwrap_or_default();
             Some(Extrusion {
                 field,
                 height: f(p, "height").unwrap_or(keep.height.max(1000.0)).clamp(0.0, 1e7),

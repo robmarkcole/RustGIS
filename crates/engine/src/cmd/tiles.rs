@@ -676,13 +676,34 @@ pub(crate) fn render_inputs(map: &rustgis_map::Map) -> super::Inputs {
         inputs.review_places.push(crate::sources::redact(&tile.url));
         inputs.review_places.extend(tile.legends.iter().map(|l| crate::sources::redact(&l.url)));
     }
+    if let Some(url) = terrain_tiles(map) {
+        inputs.state["terrain"] = json!(url);
+        inputs.review_places.push(crate::sources::redact(url));
+    }
     inputs
 }
 
-/// Source reach of tiles a referenced map draws, including their web legend pictures.
-/// The map's built-in basemap is a drawn palette and has no external source.
+/// The address a map's terrain reads its heights from, when they come as elevation tiles: a
+/// tilted frame fetches them as it fetches a tile layer's.
+pub(super) fn terrain_tiles(map: &rustgis_map::Map) -> Option<&str> {
+    match &map.view.terrain.as_ref()?.source {
+        rustgis_map::view::TerrainSource::Tiles { url, .. } => Some(url),
+        rustgis_map::view::TerrainSource::Layer(_) => None,
+    }
+}
+
+/// Source reach of a map's terrain: elevation tiles come from the network, a DEM layer's
+/// heights are the layer's own.
+pub(crate) fn terrain_reach(map: &rustgis_map::Map) -> crate::policy::Effects {
+    let reach = crate::policy::Effects::NONE;
+    if terrain_tiles(map).is_some() { reach.with(crate::policy::Effect::Network) } else { reach }
+}
+
+/// Source reach of tiles a referenced map draws, including their web legend pictures and the
+/// elevation tiles of its terrain. The map's built-in basemap is a drawn palette and has no
+/// external source.
 pub(crate) fn render_reach(map: &rustgis_map::Map) -> crate::policy::Effects {
-    map.tiles.iter().fold(crate::policy::Effects::NONE, |reach, tile| reach.union(render_tile_reach(tile)))
+    map.tiles.iter().fold(terrain_reach(map), |reach, tile| reach.union(render_tile_reach(tile)))
 }
 
 /// A resolved frame's tile uses the same drawing and source rules as an ordinary map export.

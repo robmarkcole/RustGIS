@@ -2123,6 +2123,11 @@ mod tests {
     /// Blocks standing apart, lit, casting shadows, in a tilted view: the GPU's depth-tested
     /// roofs and walls match the CPU's far-to-near ones.
     fn blocks_map() -> Map {
+        blocks_map_from(0.0)
+    }
+
+    /// [`blocks_map`] with its blocks standing `base` metres up.
+    fn blocks_map_from(base: f64) -> Map {
         use rustgis_engine::data::{Dataset, Geometry, GeometryType};
         let mut m = Map::new("Map");
         let mut ds = Dataset::new("blocks", GeometryType::Polygon, vec![]);
@@ -2133,14 +2138,7 @@ mod tests {
         }
         let id = m.add_dataset(ds);
         if let Some(l) = m.layer_mut(id) {
-            l.extrusion = Some(rustgis_engine::map::effects::Extrusion {
-                field: None,
-                height: 60_000.0,
-                factor: 1.0,
-                face_culling: true,
-                lighting: true,
-                shadows: true,
-            });
+            l.extrusion = Some(rustgis_engine::map::effects::Extrusion { height: 60_000.0, base, shadows: true, ..Default::default() });
         }
         m
     }
@@ -2156,6 +2154,14 @@ mod tests {
             |shadows: bool| scene.cmds.iter().filter(|c| matches!(c, DrawCmd::Extrusion { shadows: s, .. } if *s == shadows)).count();
         assert_eq!((solid(false), solid(true)), (1, 1), "the blocks and their shadows");
         assert_parity_within("tilted extrusions", blocks_map, &view, wgpu::Backends::all(), TILTED_OUTLIERS);
+    }
+
+    #[test]
+    fn parity_tilted_extrusions_standing_on_a_base() {
+        let camera =
+            Camera { center: rustgis_engine::geom::lonlat_to_merc(Coord::new(10.5, 47.0)), res: 2_500.0, bearing: 25.0, pitch: 60.0 };
+        let view = View { camera, ..world_view() };
+        assert_parity_within("raised extrusions", || blocks_map_from(40_000.0), &view, wgpu::Backends::all(), TILTED_OUTLIERS);
     }
 
     /// A turned or tilted view that needs pictures drawn on the CPU (here a see-through layer,

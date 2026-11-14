@@ -2671,17 +2671,8 @@ fn drape_terrain(pm: &mut Pixmap, view: &View, map: &Map, bands: &[(View, (f64, 
         let Some([p, q, r]) = triangles(grid, n, cell % n, cell / n).and_then(|t| t.get(at as usize % 2).copied()) else { continue };
         let (dst, src) = ([p.0, q.0, r.0], [p.1, q.1, r.1]);
         let Some(t) = affine(src, dst) else { continue };
-        // A hair larger all round, so neighbours leave no seam.
-        let (cx, cy) = ((dst[0].0 + dst[1].0 + dst[2].0) / 3.0, (dst[0].1 + dst[1].1 + dst[2].1) / 3.0);
-        let mut pb = PathBuilder::new();
-        for (i, (x, y)) in dst.iter().enumerate() {
-            let (dx, dy) = (x - cx, y - cy);
-            let len = dx.hypot(dy).max(1e-9);
-            let (x, y) = ((x + dx / len * 0.6) as f32, (y + dy / len * 0.6) as f32);
-            if i == 0 { pb.move_to(x, y) } else { pb.line_to(x, y) }
-        }
-        pb.close();
-        let Some(path) = pb.finish() else { continue };
+        // Each edge moved a hair outward along its normal, so neighbours overlap and leave no seam.
+        let Some(path) = grown_triangle(dst) else { continue };
         let shader = tiny_skia::Pattern::new(pic.as_ref(), SpreadMode::Pad, tiny_skia::FilterQuality::Bilinear, 1.0, t);
         pm.fill_path(&path, &Paint { shader, anti_alias: true, ..Paint::default() }, FillRule::Winding, Transform::identity(), None);
         // Fog from halfway to the reach.
@@ -2700,6 +2691,74 @@ fn triangles<V: Copy>(grid: &[Option<V>], n: usize, i: usize, j: usize) -> Optio
     let at = |i: usize, j: usize| grid.get(j * (n + 1) + i).copied().flatten();
     let (a, b, c, d) = (at(i, j)?, at(i + 1, j)?, at(i, j + 1)?, at(i + 1, j + 1)?);
     Some([[a, b, d], [a, d, c]])
+}
+
+/// How far [`grown_triangle`] moves each edge of a draped triangle outward (physical pixels):
+/// two neighbours then overlap, and their anti-aliased edges leave no seam for the sky to show
+/// through (#1881).
+const DRAPE_GROWTH: f64 = 0.6;
+/// The most [`grown_triangle`] moves an edge, as a share of the triangle's height over it. A
+/// slope seen edge on is a triangle a fraction of a pixel high, and its picture is stretched
+/// across it: moved out the full [`DRAPE_GROWTH`], its margin showed the picture from far
+/// beyond the triangle, a dotted line along the ridge.
+const DRAPE_GROWTH_SHARE: f64 = 0.5;
+/// The farthest away from a corner [`grown_triangle`] puts it (physical pixels); a corner whose
+/// moved edges meet farther gets a bevel. A sliver's sharp corner reaching farther stood out of a
+/// ridge against the sky.
+const DRAPE_CORNER_REACH: f64 = 1.0;
+
+/// The outline of the triangle `t` (either winding) with each edge moved outward along its own
+/// normal, the corners where the moved edges meet. An edge moves [`DRAPE_GROWTH`], or
+/// [`DRAPE_GROWTH_SHARE`] of the triangle's height over it if that's less: an edge with the
+/// triangle at least 1.2 px high over it overlaps its neighbour by the full [`DRAPE_GROWTH`],
+/// whether the triangle is long and thin or not (unless a bevel at its ends holds it down, see
+/// below), and one under a lower triangle by less. Two moves over a shared edge that sum to under
+/// 1 px can leave a faint seam, as when a neighbour is under 0.8 px high over it or both are under
+/// 1 px high. Moving the corners away from the centroid instead barely moved a long thin
+/// triangle's long edges, the ones perspective makes of far cells. Where the moved edges would
+/// meet farther than
+/// [`DRAPE_CORNER_REACH`] from the corner (sharper than about 74° between edges moved in full,
+/// or nearly straight between edges moved unequally), both stop across from it by the smaller
+/// of their two moves, joined by a bevel: no point of the outline lies farther out from an edge
+/// than that edge's own move. So a bevel holds its edge down to the smaller move at that corner,
+/// along the whole edge when both its ends bevel (a tall edge beside a low one can then grow only
+/// the low one's move along its length). `None` for a triangle with no area.
+fn grown_triangle(t: [(f64, f64); 3]) -> Option<tiny_skia::Path> {
+    // Twice the signed area: positive when the corners turn from +x towards +y.
+    let area2 = (t[1].0 - t[0].0) * (t[2].1 - t[0].1) - (t[2].0 - t[0].0) * (t[1].1 - t[0].1);
+    if area2.abs() < 1e-12 || !area2.is_finite() {
+        return None;
+    }
+    let sign = area2.signum();
+    // The edge from corner i to the next: its outward normal (its direction turned a quarter
+    // away from the triangle, which lies on the side `sign` says) and how far it moves. With
+    // some area, no edge has zero length.
+    let edge = |i: usize| {
+        let (a, b) = (t[i], t[(i + 1) % 3]);
+        let (ex, ey) = (b.0 - a.0, b.1 - a.1);
+        let l = ex.hypot(ey);
+        ((sign * ey / l, -sign * ex / l), DRAPE_GROWTH.min(DRAPE_GROWTH_SHARE * area2.abs() / l))
+    };
+    let edges = [edge(0), edge(1), edge(2)];
+    // Each corner's place, or the two ends of its bevel.
+    let corner = |i: usize| -> [Option<(f64, f64)>; 2] {
+        let v = t[i];
+        let ((n1, d1), (n2, d2)) = (edges[(i + 2) % 3], edges[i]);
+        // The moved edges meet at v + x, where x · n1 = d1 and x · n2 = d2.
+        let det = n1.0 * n2.1 - n1.1 * n2.0;
+        let x = ((d1 * n2.1 - d2 * n1.1) / det, (n1.0 * d2 - n2.0 * d1) / det);
+        if det.abs() > 1e-9 && x.0.hypot(x.1) <= DRAPE_CORNER_REACH {
+            return [Some((v.0 + x.0, v.1 + x.1)), None];
+        }
+        let d = d1.min(d2);
+        [Some((v.0 + d * n1.0, v.1 + d * n1.1)), Some((v.0 + d * n2.0, v.1 + d * n2.1))]
+    };
+    let mut pb = PathBuilder::new();
+    for (k, (x, y)) in [corner(0), corner(1), corner(2)].into_iter().flatten().flatten().enumerate() {
+        if k == 0 { pb.move_to(x as f32, y as f32) } else { pb.line_to(x as f32, y as f32) }
+    }
+    pb.close();
+    pb.finish()
 }
 
 /// The affine map taking the triangle `src` onto `dst` (physical pixels); `None` for a
@@ -3029,7 +3088,9 @@ fn raise_labels(map: &Map, view: &View, candidates: &mut [Candidate]) {
                 by_id.get(&fid).copied()
             })
             .unwrap_or(usize::MAX);
-        let metres = effects::extrusion_metres(&layer.dataset, x, row);
+        let columns = x.columns(&layer.dataset);
+        // The roof stands on the walls: a height below the ground is none, as the walls draw it.
+        let metres = x.base_metres_at(&layer.dataset, row, columns) + x.metres_at(&layer.dataset, row, columns).max(0.0);
         let offset = |x: f32, y: f32| {
             let m = cam.try_to_map(f64::from(x), f64::from(y), w, h)?;
             let up = (metres / (flat.ground_per_unit(m) * map.body().ratio()).max(1e-9) / cam.res.max(1e-9)).clamp(0.0, 1e7);
@@ -3081,6 +3142,9 @@ pub struct ExtrudedShape {
     /// ground toward the poles).
     pub metres: f64,
     pub height: f64,
+    /// Where its walls start: in metres, and in the camera's units at its place.
+    pub base_metres: f64,
+    pub base_height: f64,
     pub fill: Rgba,
     pub stroke: Rgba,
     /// The layer's extrusion settings: walls facing away culled, walls lit, shadows cast.
@@ -3129,17 +3193,21 @@ pub fn extruded_shapes(map: &mut Map, view: &View) -> Vec<ExtrudedShape> {
         let layer: &rustgis_map::Layer = layer;
         let styler = layer.styler(Some(scale));
         let extents = layer.projected_extents();
+        let columns = x.columns(&layer.dataset);
         for (row, g) in layer.thinned_cache(tol).iter().enumerate() {
             let Some(Geometry::Polygon(polys)) = g else { continue };
             if rows.get(row) != Some(&true) {
                 continue;
             }
             let Some(origin) = polys.iter().flatten().flatten().find(|c| c.is_finite()).copied() else { continue };
-            let metres = effects::extrusion_metres(&layer.dataset, &x, row);
-            let height = metres / (flat.ground_per_unit(origin) * body).max(1e-9);
-            // Off the ground the view shows, even by its height: a tall building just off screen
+            let metres = x.metres_at(&layer.dataset, row, columns);
+            let base_metres = x.base_metres_at(&layer.dataset, row, columns);
+            let per_unit = (flat.ground_per_unit(origin) * body).max(1e-9);
+            let height = metres / per_unit;
+            let base_height = base_metres / per_unit;
+            // Off the ground the view shows, even by its top: a tall building just off screen
             // still stands up into view.
-            let reach = if height.is_finite() { height.clamp(0.0, 1e9) } else { 0.0 };
+            let reach = [height, base_height].iter().filter(|v| v.is_finite()).map(|v| v.clamp(0.0, 1e9)).sum::<f64>();
             if extents.get(row).is_some_and(|e| !e.padded(0.0, reach).intersects(&cull)) {
                 continue;
             }
@@ -3158,6 +3226,8 @@ pub fn extruded_shapes(map: &mut Map, view: &View) -> Vec<ExtrudedShape> {
                 holes: polys.iter().flat_map(|p| p.iter().skip(1)).filter(|r| r.len() >= 3).cloned().collect(),
                 metres,
                 height,
+                base_metres,
+                base_height,
                 fill: sym.fill.with_alpha(alpha),
                 stroke: sym.stroke,
                 face_culling: x.face_culling,
@@ -3170,7 +3240,7 @@ pub fn extruded_shapes(map: &mut Map, view: &View) -> Vec<ExtrudedShape> {
 }
 
 pub use effects::LIGHT as EXTRUSION_LIGHT;
-pub use effects::{TiltedWall, clip_near, shadow_shift, tilted_shadow_quads, tilted_walls};
+pub use effects::{TiltedWall, base_within, clip_near, shadow_shift, tilted_shadow_quads, tilted_walls};
 
 /// Extruded features as GPU commands, relative to `origin`: the shadows they cast (when any
 /// do), then their roofs and walls, which the depth buffer sorts out. Walls carry their outward
@@ -3188,13 +3258,16 @@ fn extrusion_cmds(shapes: &[ExtrudedShape], origin: [f64; 2]) -> Option<Vec<gpu_
     let (mut shade, mut shade_i) = (Vec::new(), Vec::<u32>::new());
     let shadow = mesh::premul(Rgba::new(0, 0, 0, 60));
     for s in shapes {
+        // The walls stand from their base, the roof at the base plus the height, together within
+        // 1e9; a height or base that is no number (hostile attributes) is the ground.
+        let foot = base_within(s.base_height, 1e9);
+        let h = if s.height.is_finite() { s.height.clamp(0.0, 1e9 - foot) } else { 0.0 };
+        let top = foot + h;
         let more =
             s.roof.len().saturating_mul(2).saturating_add(s.rings.iter().chain(&s.holes).map(Vec::len).sum::<usize>().saturating_mul(8));
         if solid.len().saturating_add(shade.len()).saturating_add(more) > MAX_VERTICES {
             return None;
         }
-        // A height that is no number (hostile attributes) stands no higher than the ground.
-        let h = if s.height.is_finite() { s.height.clamp(0.0, 1e9) } else { 0.0 };
         // Roof indices beyond its vertices (never from the tessellator) would draw garbage.
         if s.roof_indices.iter().any(|i| *i as usize >= s.roof.len()) {
             continue;
@@ -3204,12 +3277,12 @@ fn extrusion_cmds(shapes: &[ExtrudedShape], origin: [f64; 2]) -> Option<Vec<gpu_
         let roof_at = |p: &[f32; 2]| Coord::new(s.origin.x + f64::from(p[0]), s.origin.y + f64::from(p[1]));
         // The roof.
         let base = solid.len() as u32;
-        solid.extend(s.roof.iter().map(|p| vertex(rel(roof_at(p), h), [0.0; 2], color, [1.0, EXTRUDE_ROOF, lit, 0.0])));
+        solid.extend(s.roof.iter().map(|p| vertex(rel(roof_at(p), top), [0.0; 2], color, [1.0, EXTRUDE_ROOF, lit, 0.0])));
         solid_i.extend(s.roof_indices.iter().map(|i| base + i));
         if s.shadows {
             // The footprint moved away from the light (in the shader).
             let base = shade.len() as u32;
-            shade.extend(s.roof.iter().map(|p| vertex(rel(roof_at(p), 0.0), [0.0; 2], shadow, [0.0, EXTRUDE_SHADOW, 0.0, h as f32])));
+            shade.extend(s.roof.iter().map(|p| vertex(rel(roof_at(p), 0.0), [0.0; 2], shadow, [0.0, EXTRUDE_SHADOW, 0.0, top as f32])));
             shade_i.extend(s.roof_indices.iter().map(|i| base + i));
         }
         // The walls; a hole's face into it (a courtyard).
@@ -3225,13 +3298,15 @@ fn extrusion_cmds(shapes: &[ExtrudedShape], origin: [f64; 2]) -> Option<Vec<gpu_
                 let n =
                     if (area2 > 0.0) != hole { [(dy / len) as f32, (-dx / len) as f32] } else { [(-dy / len) as f32, (dx / len) as f32] };
                 let k = solid.len() as u32;
-                for (c, z, t) in [(a, 0.0, 0.0), (b, 0.0, 0.0), (b, h, 1.0), (a, h, 1.0)] {
+                for (c, z, t) in [(a, foot, 0.0), (b, foot, 0.0), (b, top, 1.0), (a, top, 1.0)] {
                     solid.push(vertex(rel(c, z), n, color, [t, EXTRUDE_WALL, lit, 0.0]));
                 }
                 solid_i.extend([k, k + 1, k + 2, k, k + 2, k + 3]);
-                if s.shadows && !hole {
+                // Raised, a hole's walls cast too: the footprint moved by the base, which no longer
+                // sits under the roof, is the top one's and every edge's sweep between them.
+                if s.shadows && (!hole || foot > 0.0) {
                     let k = shade.len() as u32;
-                    for (c, fall) in [(a, 0.0), (b, 0.0), (b, h), (a, h)] {
+                    for (c, fall) in [(a, foot), (b, foot), (b, top), (a, top)] {
                         shade.push(vertex(rel(c, 0.0), [0.0; 2], shadow, [0.0, EXTRUDE_SHADOW, 0.0, fall as f32]));
                     }
                     shade_i.extend([k, k + 1, k + 2, k, k + 2, k + 3]);
@@ -8945,6 +9020,178 @@ mod tests {
         assert!(render(&mut hilly, &view).is_some());
     }
 
+    /// The outline's points and, for each edge a → b of `t`, the farthest any of them lies
+    /// outside it.
+    fn grown_reach(t: [(f64, f64); 3]) -> (Vec<(f64, f64)>, [f64; 3]) {
+        let path = grown_triangle(t).expect("a triangle with area");
+        let pts: Vec<(f64, f64)> = path.points().iter().map(|p| (f64::from(p.x), f64::from(p.y))).collect();
+        let centre = ((t[0].0 + t[1].0 + t[2].0) / 3.0, (t[0].1 + t[1].1 + t[2].1) / 3.0);
+        let out = |i: usize| {
+            let (a, b) = (t[i], t[(i + 1) % 3]);
+            let l = (b.0 - a.0).hypot(b.1 - a.1);
+            let side = |p: (f64, f64)| ((b.0 - a.0) * (p.1 - a.1) - (b.1 - a.1) * (p.0 - a.0)) / l;
+            let s = -side(centre).signum();
+            pts.iter().map(|p| s * side(*p)).fold(f64::MIN, f64::max)
+        };
+        let reach = [out(0), out(1), out(2)];
+        (pts, reach)
+    }
+
+    #[test]
+    fn a_thin_draped_triangle_moves_its_long_edges_out_in_full() {
+        // #1881: half of a far cell, 100 px wide and 4 high. Moving its corners 0.6 px away from
+        // the centroid moved the long edge (0, 0)–(100, 4) out by 0.02 px.
+        for t in [[(0.0, 0.0), (100.0, 0.0), (100.0, 4.0)], [(0.0, 0.0), (100.0, 4.0), (100.0, 0.0)]] {
+            let (_, reach) = grown_reach(t);
+            for r in reach {
+                assert!((r - DRAPE_GROWTH).abs() < 1e-3, "{reach:?} for {t:?}");
+            }
+        }
+        // A right triangle the same way: the right angle where the moved edges meet, 0.85 px
+        // out; the 45° corners, whose meeting points lie 1.6 px out, bevelled.
+        let (pts, reach) = grown_reach([(0.0, 0.0), (10.0, 0.0), (0.0, 10.0)]);
+        assert_eq!(pts.len(), 5, "{pts:?}");
+        assert!(reach.iter().all(|r| (r - DRAPE_GROWTH).abs() < 1e-3), "{reach:?}");
+        assert!((pts[0].0 + DRAPE_GROWTH).abs() < 1e-4 && (pts[0].1 + DRAPE_GROWTH).abs() < 1e-4, "{pts:?}");
+        // No area, nothing to draw.
+        assert!(grown_triangle([(0.0, 0.0), (5.0, 5.0), (10.0, 10.0)]).is_none());
+    }
+
+    #[test]
+    fn a_draped_slivers_sharp_corner_is_bevelled() {
+        // The corner at (0, 0) is 1.1° sharp: its moved edges would meet 60 px out. They stop
+        // across from it instead, joined by a bevel.
+        let t = [(0.0, 0.0), (100.0, 0.0), (100.0, 2.0)];
+        let (pts, reach) = grown_reach(t);
+        assert_eq!(pts.len(), 4, "{pts:?}");
+        assert!(reach.iter().all(|r| (r - DRAPE_GROWTH).abs() < 1e-3), "{reach:?}");
+        assert!(pts.iter().all(|p| p.0 > -DRAPE_GROWTH), "{pts:?}");
+        assert_eq!(pts.iter().filter(|p| p.0.hypot(p.1) < DRAPE_GROWTH + 1e-3).count(), 2, "{pts:?}");
+        // The right angle at (100, 0) moves 0.6 px each way; the 88.9° one at (100, 2) where its
+        // moved edges meet, 0.6 px out from both.
+        let near = |x: f64, y: f64| pts.iter().any(|p| (p.0 - x).abs() < 1e-3 && (p.1 - y).abs() < 1e-3);
+        assert!(near(100.6, -0.6), "{pts:?}");
+        assert!(near(100.6, 2.0 + 0.6 * (2.0_f64.hypot(100.0) + 2.0) / 100.0), "{pts:?}");
+    }
+
+    /// Fills `path` with `paint` as `drape_terrain` does.
+    fn fill_drape(pm: &mut Pixmap, path: &tiny_skia::Path, paint: &Paint) {
+        pm.fill_path(path, paint, FillRule::Winding, Transform::identity(), None);
+    }
+
+    /// A far cell, long and thin as perspective makes it, its two halves drawn over black as
+    /// `drape_terrain` draws them: white, then `fog` black over each if given. The pixmap, and
+    /// the pixels lying a pixel or more inside the cell.
+    fn drawn_cell(fog: Option<f32>) -> (Pixmap, Vec<(u32, u32)>) {
+        let mut pm = Pixmap::new(64, 16).expect("pixmap");
+        pm.fill(tiny_skia::Color::BLACK);
+        let (a, b, c, d) = ((2.3, 4.2), (61.7, 5.1), (4.1, 10.6), (59.2, 11.3));
+        let picture = Paint { anti_alias: true, ..paint(Rgba::rgb(255, 255, 255), 1.0) };
+        for half in [[a, b, d], [a, d, c]] {
+            let path = grown_triangle(half).expect("area");
+            fill_drape(&mut pm, &path, &picture);
+            if let Some(f) = fog {
+                fill_drape(&mut pm, &path, &Paint { anti_alias: true, ..paint(Rgba::rgb(0, 0, 0), f) });
+            }
+        }
+        let quad = [a, b, d, c];
+        let inside = |p: (f64, f64)| {
+            (0..4).all(|i| {
+                let (s, e) = (quad[i], quad[(i + 1) % 4]);
+                let l = (e.0 - s.0).hypot(e.1 - s.1);
+                ((e.0 - s.0) * (p.1 - s.1) - (e.1 - s.1) * (p.0 - s.0)) / l >= 1.0
+            })
+        };
+        let pixels = (0..16u32)
+            .flat_map(|y| (0..64u32).map(move |x| (x, y)))
+            .filter(|&(x, y)| inside((f64::from(x) + 0.5, f64::from(y) + 0.5)))
+            .collect();
+        (pm, pixels)
+    }
+
+    #[test]
+    fn fog_over_two_draped_halves_is_laid_once_where_they_overlap() {
+        // Each triangle is filled with its picture, then its fog, on the grown outline: where the
+        // halves overlap, the nearer one's picture covers the farther one's fogged picture before
+        // its own fog, so the fog isn't laid twice. Only the nearer half's anti-aliased edge
+        // mixes the two, by at most a quarter of f² of the picture's difference from the fog
+        // (f = 0.5: 16 levels here; laid twice: 64).
+        let (pm, pixels) = drawn_cell(Some(0.5));
+        let off = |&(x, y): &(u32, u32)| (i32::from(pm.pixel(x, y).expect("in the pixmap").red()) - 128).abs();
+        let worst = pixels.iter().map(off).max().unwrap_or(0);
+        assert!(worst <= 17, "fog laid twice: {worst} levels off");
+        assert!(pixels.iter().filter(|p| off(p) <= 1).count() > 150);
+    }
+
+    #[test]
+    fn a_draped_slope_seen_edge_on_grows_by_half_its_height_at_most() {
+        // A triangle 0.05 px high, its picture stretched across it: moved out 0.6 px, its margin
+        // would show the picture from twelve times its height away. No point of the outline lies
+        // farther out from an edge than that edge's own move, also at a corner bevelled between
+        // a short edge moved in full and a long one moved 0.025 px.
+        for t in [[(0.0, 0.0), (40.0, 0.05), (80.0, 0.0)], [(0.0, 0.0), (1.0, 0.05), (80.0, 0.0)]] {
+            let (_, reach) = grown_reach(t);
+            for (i, r) in reach.iter().enumerate() {
+                let (a, b) = (t[i], t[(i + 1) % 3]);
+                let limit = DRAPE_GROWTH.min(DRAPE_GROWTH_SHARE * 0.05 * 80.0 / (b.0 - a.0).hypot(b.1 - a.1));
+                assert!(*r > 0.0 && *r <= limit + 1e-6, "edge {i} of {t:?}: {r} out, {limit} at most");
+            }
+        }
+    }
+
+    #[test]
+    fn the_two_halves_of_a_draped_cell_leave_no_seam() {
+        // #1881: moving the halves' corners away from their centroids left the diagonal's pixels
+        // grey. Every pixel lying a pixel or more inside the cell is white.
+        let (pm, pixels) = drawn_cell(None);
+        assert!(pixels.len() > 100, "{}", pixels.len());
+        for (x, y) in pixels {
+            let px = pm.pixel(x, y).expect("in the pixmap");
+            assert!(px.red() == 255 && px.green() == 255 && px.blue() == 255, "a seam at ({x}, {y}): {px:?}");
+        }
+    }
+
+    #[test]
+    fn two_low_draped_triangles_leave_at_most_a_faint_seam() {
+        // Two triangles under 1.2 px high over the edge they share move it less than 0.6 px each,
+        // together under the pixel their anti-aliased edges need to cover each other. Compared
+        // with the pair drawn as one shape, the shared edge's pixels come out at most a little
+        // darker: 16 levels of 255 at 0.6 px, none at 0.1–0.4, 0.8 and 1 px here.
+        let (p, q): ((f64, f64), (f64, f64)) = ((2.0, 7.3), (62.0, 9.1));
+        let l = (q.0 - p.0).hypot(q.1 - p.1);
+        let n = (-(q.1 - p.1) / l, (q.0 - p.0) / l);
+        let m = ((p.0 + q.0) / 2.0, (p.1 + q.1) / 2.0);
+        let white = Paint { anti_alias: true, ..paint(Rgba::rgb(255, 255, 255), 1.0) };
+        for h in [0.1, 0.2, 0.3, 0.4, 0.6, 0.8, 1.0] {
+            let (up, down) = ((m.0 + h * n.0, m.1 + h * n.1), (m.0 - h * n.0, m.1 - h * n.1));
+            let mut apart = Pixmap::new(64, 16).expect("pixmap");
+            apart.fill(tiny_skia::Color::BLACK);
+            for t in [[p, q, up], [p, down, q]] {
+                fill_drape(&mut apart, &grown_triangle(t).expect("area"), &white);
+            }
+            let mut one = Pixmap::new(64, 16).expect("pixmap");
+            one.fill(tiny_skia::Color::BLACK);
+            let mut pb = PathBuilder::new();
+            pb.move_to(p.0 as f32, p.1 as f32);
+            for c in [down, q, up] {
+                pb.line_to(c.0 as f32, c.1 as f32);
+            }
+            pb.close();
+            fill_drape(&mut one, &pb.finish().expect("path"), &white);
+            let mut worst = 0;
+            for y in 0..16u32 {
+                for x in 8..56u32 {
+                    let (cx, cy) = (f64::from(x) + 0.5 - p.0, f64::from(y) + 0.5 - p.1);
+                    if (cx * n.0 + cy * n.1).abs() <= 0.7 {
+                        let red = |pm: &Pixmap| i32::from(pm.pixel(x, y).expect("in the pixmap").red());
+                        worst = worst.max(red(&one) - red(&apart));
+                    }
+                }
+            }
+            assert!(worst <= 20, "{h} px high: the shared edge {worst} levels darker");
+        }
+    }
+
     #[test]
     fn a_narrow_ridge_stands_in_a_settled_tilted_frame() {
         // #1523: an east-west ridge narrower than a row of the moving drape's mesh, lying between
@@ -9175,6 +9422,7 @@ mod tests {
                 face_culling: true,
                 lighting: true,
                 shadows: false,
+                ..Default::default()
             });
         }
         let flat =
@@ -9225,6 +9473,7 @@ mod tests {
                 face_culling: true,
                 lighting: true,
                 shadows: true,
+                ..Default::default()
             });
         }
         let camera = Camera { center: Coord::new(0.0, 0.0), res: 2000.0, bearing: 30.0, pitch: 60.0 };
@@ -9304,6 +9553,7 @@ mod tests {
             face_culling: true,
             lighting: true,
             shadows: true,
+            ..Default::default()
         });
         let camera = Camera { center: Coord::new(0.0, 0.0), res: 2000.0, bearing: 0.0, pitch: 60.0 };
         let view = View { width: 400.0, height: 300.0, pixels_per_point: 1.0, camera, sky: false };
@@ -9315,6 +9565,109 @@ mod tests {
         raise_labels(&m, &view, &mut c);
         assert!(c[0].label.y < 150.0 - 15.0, "the tall one rises onto its roof: {}", c[0].label.y);
         assert!((c[1].label.y - 150.0).abs() < 1.0, "the low one stays on the ground: {}", c[1].label.y);
+    }
+
+    /// A square about 200 km a side at the centre, extruded `height` m from `base` m.
+    fn raised_square(height: f64, base: f64, shadows: bool) -> Map {
+        let mut m = Map::new("Map");
+        m.basemap = rustgis_map::Basemap::Blank;
+        let mut d = Dataset::new("blocks", GeometryType::Polygon, vec![Field::new("name", FieldType::Text)]);
+        let s = 0.9;
+        let ring = vec![Coord::new(-s, -s), Coord::new(s, -s), Coord::new(s, s), Coord::new(-s, s), Coord::new(-s, -s)];
+        d.push(Some(Geometry::Polygon(vec![vec![ring]])), vec![Value::Text("Block".into())]);
+        let id = m.add_dataset(d);
+        if let Some(l) = m.layer_mut(id) {
+            l.labels.enabled = true;
+            l.extrusion = Some(rustgis_map::effects::Extrusion { height, base, shadows, ..Default::default() });
+        }
+        m
+    }
+
+    /// The first and last rows (over the middle columns) that differ from the background.
+    fn ink_rows(r: &Rendered) -> (u32, u32) {
+        let bg = r.pixmap.pixel(5, 295).unwrap();
+        let ink = |y: &u32| (150..250).any(|x| r.pixmap.pixel(x, *y).is_some_and(|p| p != bg));
+        ((0..300u32).find(ink).unwrap(), (0..300u32).rev().find(ink).unwrap())
+    }
+
+    #[test]
+    fn a_raised_part_starts_at_its_base_in_a_flat_view() {
+        let view =
+            View { width: 400.0, height: 300.0, pixels_per_point: 1.0, camera: Camera::new(Coord::new(0.0, 0.0), 2000.0), sky: false };
+        let (top, bottom) = ink_rows(&render(&mut raised_square(50_000.0, 0.0, false), &view).unwrap());
+        let (top_up, bottom_up) = ink_rows(&render(&mut raised_square(50_000.0, 50_000.0, false), &view).unwrap());
+        // 50 km is 25 px at this scale: the roof and the whole part rise by about that.
+        assert!(top_up + 15 < top, "roof from row {top_up}, from {top} without a base");
+        assert!(bottom_up + 15 < bottom, "foot at row {bottom_up}, at {bottom} without a base");
+        // A base that is no use (negative) draws what no base does.
+        let plain = render(&mut raised_square(50_000.0, 0.0, false), &view).unwrap();
+        let junk = render(&mut raised_square(50_000.0, -9.0, false), &view).unwrap();
+        assert_eq!(plain.pixmap.data(), junk.pixmap.data());
+    }
+
+    #[test]
+    fn a_raised_part_stands_higher_in_a_tilted_view() {
+        let camera = Camera { center: Coord::new(0.0, 0.0), res: 2000.0, bearing: 30.0, pitch: 60.0 };
+        let view = View { width: 400.0, height: 300.0, pixels_per_point: 1.0, camera, sky: false };
+        let (top, _) = ink_rows(&render(&mut raised_square(50_000.0, 0.0, true), &view).unwrap());
+        let (top_up, _) = ink_rows(&render(&mut raised_square(50_000.0, 50_000.0, true), &view).unwrap());
+        assert!(top_up + 10 < top, "roof from row {top_up}, from {top} without a base");
+        let plain = render(&mut raised_square(50_000.0, 0.0, true), &view).unwrap();
+        let junk = render(&mut raised_square(50_000.0, f64::NAN, true), &view).unwrap();
+        assert_eq!(plain.pixmap.data(), junk.pixmap.data(), "a base that is no number is the ground");
+    }
+
+    /// A label sits on the roof, at the base plus the height (it rose by the height alone).
+    #[test]
+    fn a_raised_label_sits_at_base_plus_height() {
+        let camera = Camera { center: Coord::new(0.0, 0.0), res: 2000.0, bearing: 0.0, pitch: 60.0 };
+        let view = View { width: 400.0, height: 300.0, pixels_per_point: 1.0, camera, sky: false };
+        let lifted = |height: f64, base: f64| {
+            let m = raised_square(height, base, false);
+            let id = m.layers[0].id;
+            let mut c: Vec<Candidate> = vec![(PlacedLabel { y: 150.0, ..label("Block", 200.0, None, 0.0) }, 1.0, (id, 1, 0, 0)).into()];
+            raise_labels(&m, &view, &mut c);
+            c[0].label.y
+        };
+        let (on_stilts, whole, short) = (lifted(50_000.0, 50_000.0), lifted(100_000.0, 0.0), lifted(50_000.0, 0.0));
+        assert!((on_stilts - whole).abs() < 0.5, "base + height is the roof: {on_stilts} vs {whole}");
+        assert!(on_stilts < short - 10.0, "higher than the height alone: {on_stilts} vs {short}");
+        // A height below the ground (a hand-edited file) is none, as the walls draw it: the label
+        // sits on the roof at the base.
+        assert!((lifted(-50_000.0, 50_000.0) - short).abs() < 0.5, "at the base, where the roof is");
+    }
+
+    /// The GPU's commands stand the walls on the base, the roof at the base plus the height, and
+    /// the shadow falls from the base's to the top's.
+    #[test]
+    fn gpu_extrusions_stand_on_their_base() {
+        let camera = Camera { center: Coord::new(0.0, 0.0), res: 2000.0, bearing: 30.0, pitch: 60.0 };
+        let view = View { width: 400.0, height: 300.0, pixels_per_point: 1.0, camera, sky: false };
+        let z_range = |height: f64, base: f64| {
+            let shapes = extruded_shapes(&mut raised_square(height, base, true), &view);
+            assert_eq!(shapes.len(), 1);
+            assert!((shapes[0].base_metres - base).abs() < 1e-9);
+            let (b, h) = (shapes[0].base_height, shapes[0].height);
+            let (mut zs, mut falls) = (Vec::new(), Vec::new());
+            for cmd in extrusion_cmds(&shapes, [0.0, 0.0]).expect("within the budget") {
+                let gpu_scene::DrawCmd::Extrusion { vertices, shadows, .. } = cmd else { panic!("an extrusion") };
+                if shadows {
+                    falls.extend(vertices.iter().map(|v| f64::from(v.info[3])));
+                } else {
+                    zs.extend(vertices.iter().map(|v| f64::from(v.position[2])));
+                }
+            }
+            let range = |v: &[f64]| (v.iter().cloned().fold(f64::MAX, f64::min), v.iter().cloned().fold(f64::MIN, f64::max));
+            (b, h, range(&zs), range(&falls))
+        };
+        let (b, h, (zlo, zhi), (flo, fhi)) = z_range(50_000.0, 50_000.0);
+        assert!(b > 0.0 && h > 0.0);
+        let near = |a: f64, e: f64| (a - e).abs() <= e.abs() * 1e-5 + 1e-3;
+        assert!(near(zlo, b) && near(zhi, b + h), "walls from {zlo} to {zhi}, not {b} to {}", b + h);
+        assert!(near(flo, b) && near(fhi, b + h), "shadow falls from {flo} to {fhi}, not {b} to {}", b + h);
+        // No base: from the ground, as before.
+        let (_, h, (zlo, zhi), (flo, fhi)) = z_range(50_000.0, 0.0);
+        assert!(zlo == 0.0 && near(zhi, h) && flo == 0.0 && near(fhi, h), "{zlo} {zhi} {flo} {fhi}");
     }
 
     /// Extruded features with junk heights or roof indices (hostile data) give finite geometry
@@ -9331,6 +9684,8 @@ mod tests {
             holes: vec![],
             metres: height,
             height,
+            base_metres: 0.0,
+            base_height: 0.0,
             fill: Rgba::rgb(200, 100, 50),
             stroke: Rgba::rgb(0, 0, 0),
             face_culling: true,
@@ -9343,6 +9698,126 @@ mod tests {
             assert!(vertices.iter().all(|v| v.position.iter().chain(&v.info).all(|x| x.is_finite())));
             assert!(indices.iter().all(|i| (*i as usize) < vertices.len()));
         }
+        // A base and a height at the cap stand within it together.
+        let tall = ExtrudedShape { base_metres: 1e12, base_height: 1e12, ..shape(1e12, vec![0, 1, 2, 0, 2, 3]) };
+        for cmd in extrusion_cmds(&[tall], [0.0, 0.0]).expect("within the budget") {
+            let gpu_scene::DrawCmd::Extrusion { vertices, .. } = cmd else { panic!("an extrusion") };
+            assert!(vertices.iter().all(|v| v.position[2] <= 1e9 && v.info[3] <= 1e9));
+        }
+    }
+
+    /// A raised footprint's shadow also covers where the base's shifted footprint falls inside a
+    /// hole of the top one: the hole's walls cast their sweep too. A solid block needs nothing more.
+    #[test]
+    fn a_raised_part_with_a_hole_casts_its_holes_walls_too() {
+        let c = Coord::new;
+        let ring = |a: f64| vec![c(-a, -a), c(a, -a), c(a, a), c(-a, a)];
+        let shape = |base: f64, holes: Vec<Vec<Coord>>| ExtrudedShape {
+            origin: c(0.0, 0.0),
+            center: c(0.0, 0.0),
+            roof: vec![[-10.0, -10.0], [10.0, -10.0], [10.0, 10.0], [-10.0, 10.0]],
+            roof_indices: vec![0, 1, 2, 0, 2, 3],
+            rings: vec![ring(10.0)],
+            holes,
+            metres: 5.0,
+            height: 5.0,
+            base_metres: base,
+            base_height: base,
+            fill: Rgba::rgb(200, 100, 50),
+            stroke: Rgba::rgb(0, 0, 0),
+            face_culling: true,
+            lighting: true,
+            shadows: true,
+        };
+        let falls = |base: f64, holes: Vec<Vec<Coord>>| -> Vec<f32> {
+            let cmds = extrusion_cmds(&[shape(base, holes)], [0.0, 0.0]).expect("within the budget");
+            cmds.into_iter()
+                .filter_map(|cmd| match cmd {
+                    gpu_scene::DrawCmd::Extrusion { vertices, shadows: true, .. } => Some(vertices),
+                    _ => None,
+                })
+                .flatten()
+                .map(|v| v.info[3])
+                .collect()
+        };
+        let (ground, raised) = (falls(0.0, vec![ring(4.0)]), falls(10.0, vec![ring(4.0)]));
+        // The roof's 4 vertices come first, then the sides: the outer ring's, and (raised) the hole's.
+        assert_eq!(raised.len(), ground.len() + 16, "the hole's 4 walls cast their sweep");
+        assert_eq!(raised.get(..4), Some(&[15.0f32; 4][..]), "the roof from the top");
+        assert_eq!(raised.iter().filter(|f| **f == 10.0).count(), 16, "8 sides, each from the base");
+        assert_eq!(ground.get(..4), Some(&[5.0f32; 4][..]));
+        assert_eq!(ground.iter().filter(|f| **f == 0.0).count(), 8, "no base: the outer sides' feet alone fall from the ground");
+        // A solid block casts as many vertices raised as on the ground.
+        assert_eq!(falls(10.0, vec![]).len(), falls(0.0, vec![]).len());
+    }
+
+    fn ring_px(cam: &Camera) -> Vec<(f64, f64)> {
+        let (u, v) = cam.ground_px(cam.center);
+        vec![(u - 60.0, v - 60.0), (u + 60.0, v - 60.0), (u + 60.0, v + 60.0), (u - 60.0, v + 60.0)]
+    }
+
+    /// The walls' feet stand at the base (projected raised by it), not on the ground.
+    #[test]
+    fn tilted_walls_stand_on_their_base() {
+        let cam = Camera { center: Coord::new(0.0, 0.0), res: 2000.0, bearing: 30.0, pitch: 60.0 };
+        let (w, h) = (400.0, 300.0);
+        let ring = ring_px(&cam);
+        let feet = |base: f64| -> Vec<(f64, f64)> {
+            tilted_walls(&cam, w, h, std::slice::from_ref(&ring), &[], base, 40.0, false, false)
+                .iter()
+                .flat_map(|wall| [wall.quad[0], wall.quad[1]])
+                .collect()
+        };
+        let near = |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() < 1e-9;
+        let at = |base: f64| -> Vec<(f64, f64)> { ring.iter().filter_map(|p| cam.project_raised(p.0, p.1, base, w, h)).collect() };
+        let (grounded, raised) = (feet(0.0), feet(30.0));
+        assert_eq!(raised.len(), 8, "four walls, two feet each");
+        let (on_ground, on_base) = (at(0.0), at(30.0));
+        assert!(grounded.iter().all(|f| on_ground.iter().any(|p| near(*f, *p))));
+        assert!(raised.iter().all(|f| on_base.iter().any(|p| near(*f, *p))), "{raised:?} vs {on_base:?}");
+        assert!(!raised.iter().any(|f| on_ground.iter().any(|p| near(*f, *p))), "no foot left on the ground");
+    }
+
+    /// The shadow's sides start from the outline moved by the base's shift, not from the outline.
+    #[test]
+    fn tilted_shadow_quads_start_from_the_base_shadow() {
+        let cam = Camera { center: Coord::new(0.0, 0.0), res: 2000.0, bearing: 30.0, pitch: 60.0 };
+        let (w, h) = (400.0, 300.0);
+        let ring = ring_px(&cam);
+        let quads = tilted_shadow_quads(&cam, w, h, std::slice::from_ref(&ring), 30.0, 40.0);
+        assert_eq!(quads.len(), 4);
+        let (bu, bv) = shadow_shift(30.0);
+        assert!(bu != 0.0 || bv != 0.0);
+        let near = |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() < 1e-9;
+        for (i, q) in quads.iter().enumerate() {
+            let (a, b) = (ring[i], ring[(i + 1) % ring.len()]);
+            let ground = |p: (f64, f64)| cam.project_raised(p.0, p.1, 0.0, w, h).unwrap();
+            assert!(near(q[0], ground((a.0 + bu, a.1 + bv))) && near(q[1], ground((b.0 + bu, b.1 + bv))), "side {i}: {q:?}");
+            assert!(!near(q[0], ground(a)), "not the outline itself");
+        }
+    }
+
+    /// The flat shadow falls from the base's to the top's: raising a part moves the ink it casts.
+    #[test]
+    fn a_raised_part_casts_its_flat_shadow_further_away() {
+        let view =
+            View { width: 400.0, height: 300.0, pixels_per_point: 1.0, camera: Camera::new(Coord::new(0.0, 0.0), 2000.0), sky: false };
+        // The corner of the pixels a shadow changes (the far south-east of them).
+        let reach = |base: f64| {
+            let lit = render(&mut raised_square(50_000.0, base, false), &view).unwrap();
+            let dark = render(&mut raised_square(50_000.0, base, true), &view).unwrap();
+            let width = lit.pixmap.width() as usize;
+            let (mut x, mut y) = (0usize, 0usize);
+            for (i, (a, b)) in lit.pixmap.data().chunks(4).zip(dark.pixmap.data().chunks(4)).enumerate() {
+                if a != b {
+                    (x, y) = (x.max(i % width), y.max(i / width));
+                }
+            }
+            (x, y)
+        };
+        let (grounded, raised) = (reach(0.0), reach(50_000.0));
+        assert!(grounded.0 > 0 && grounded.1 > 0, "the shadow shows: {grounded:?}");
+        assert!(raised.0 > grounded.0 + 4 && raised.1 > grounded.1 + 2, "{raised:?} vs {grounded:?}");
     }
 
     #[test]
@@ -9376,6 +9851,7 @@ mod tests {
                 face_culling: true,
                 lighting: true,
                 shadows: false,
+                ..Default::default()
             });
         }
         let camera = Camera { center: Coord::new(0.0, 0.0), res: 2_000.0, bearing: 0.0, pitch: 30.0 };
@@ -9415,6 +9891,7 @@ mod tests {
                 face_culling: true,
                 lighting: true,
                 shadows: true,
+                ..Default::default()
             });
         }
         let camera = Camera { center: Coord::new(0.0, 0.0), res: 2_000.0, bearing: 0.0, pitch: 60.0 };

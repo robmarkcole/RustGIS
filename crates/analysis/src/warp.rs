@@ -283,25 +283,26 @@ pub fn warp(r: &Raster, fit: &Fit, o: &Options) -> Result<Raster, String> {
 
 /// The bounds `[min x, min y, max x, max y]` of a `w` × `h` image whose pixel positions `place`
 /// puts in output coordinates: its edge and a lattice inside it (a pole inside the image is no
-/// extreme of its edge). `None` when too little of it can be placed.
+/// extreme of its edge). Refuses an unplaceable edge instead of returning partial bounds;
+/// interior samples that cannot be placed are skipped.
 fn footprint(w: f64, h: f64, place: &dyn Fn(f64, f64) -> Option<(f64, f64)>) -> Option<[f64; 4]> {
     let (mut min_x, mut min_y, mut max_x, mut max_y) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
     let mut placed = 0;
     let mut add = |c: f64, row: f64| {
-        if let Some((x, y)) = place(c, row) {
-            (min_x, min_y, max_x, max_y) = (min_x.min(x), min_y.min(y), max_x.max(x), max_y.max(y));
-            placed += 1;
-        }
+        let (x, y) = place(c, row)?;
+        (min_x, min_y, max_x, max_y) = (min_x.min(x), min_y.min(y), max_x.max(x), max_y.max(y));
+        placed += 1;
+        Some(())
     };
     for i in 0..=EDGE_POINTS {
         let t = i as f64 / EDGE_POINTS as f64;
         for (c, row) in [(t * w, 0.0), (t * w, h), (0.0, t * h), (w, t * h)] {
-            add(c, row);
+            add(c, row)?;
         }
     }
     for i in 0..=INTERIOR_POINTS {
         for j in 0..=INTERIOR_POINTS {
-            add(i as f64 / INTERIOR_POINTS as f64 * w, j as f64 / INTERIOR_POINTS as f64 * h);
+            let _ = add(i as f64 / INTERIOR_POINTS as f64 * w, j as f64 / INTERIOR_POINTS as f64 * h);
         }
     }
     (placed >= 4 && [min_x, min_y, max_x, max_y].iter().all(|v| v.is_finite())).then_some([min_x, min_y, max_x, max_y])
@@ -1486,6 +1487,22 @@ mod tests {
         let far = Grid::snapped(crs, [-1e308, 0.0, 0.0, 10.0], (1e300, 1.0), (1e308, 0.0)).unwrap_err();
         assert!(far.contains("can't make a grid"), "{far}");
         assert!(Grid::snapped(crs, [0.0, 0.0, 10.0, 10.0], (1.0, 1.0), (f64::NAN, 0.0)).is_err());
+    }
+
+    /// Refusing either far edge must not narrow the requested area or the raster's output grid.
+    #[test]
+    fn a_refused_footprint_edge_is_not_a_partial_grid() {
+        let crs = Crs::from_epsg(32617).unwrap();
+        for (bounds, valid) in [([-180.0, -30.0, 18.0, 30.0], false), ([-84.0, 0.0, -78.0, 25.0], true)] {
+            let [west, south, east, north] = bounds;
+            // Small pixels at the centre are placeable, so the edge determines the refusal.
+            let gt =
+                GeoTransform { origin_x: west, origin_y: north, pixel_width: (east - west) / 32.0, pixel_height: (south - north) / 2.0 };
+            let r = Raster::new("area", 32, 2, vec![vec![1.0; 64]], gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
+            let area = bounds_in(bounds, crs);
+            let image = footprint_in(&r, crs);
+            assert_eq!((area.is_ok(), image.is_ok()), (valid, valid), "bounds: {area:?}; footprint: {image:?}");
+        }
     }
 
     /// Rows made on several threads are those made on one, bit for bit, for every method: each

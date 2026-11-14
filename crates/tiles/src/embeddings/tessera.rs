@@ -103,7 +103,8 @@ impl Plan {
 }
 
 /// The window of a box (longitude/latitude) for a year: the box's pixels in its zone, cut to the
-/// shard at its centre and to [`MAX_CHUNKS`] chunks around it.
+/// shard at its centre and to [`MAX_CHUNKS`] chunks around it. Refuses an unplaceable boundary
+/// sample rather than shrinking the requested area to only the surviving samples.
 pub fn plan(grid: Grid, bbox: [f64; 4], year: i32) -> Result<Plan, String> {
     if !(FIRST_YEAR..=LAST_YEAR).contains(&year) {
         return Err(format!("Tessera has the years {FIRST_YEAR}–{LAST_YEAR}"));
@@ -114,7 +115,9 @@ pub fn plan(grid: Grid, bbox: [f64; 4], year: i32) -> Result<Plan, String> {
     let mut cols = (f64::MAX, f64::MIN);
     let mut rows = (f64::MAX, f64::MIN);
     for (x, y) in [(w, s), (w, n), (e, s), (e, n), ((w + e) / 2.0, s), ((w + e) / 2.0, n)] {
-        let Some(c) = t.from_lonlat(Coord::new(x, y)) else { continue };
+        let c = t
+            .from_lonlat(Coord::new(x, y))
+            .ok_or_else(|| format!("the area's boundary at ({x}, {y}) can't be placed in Tessera's zone; choose a smaller area"))?;
         let (cx, ry) = ((c.x - grid.x0) / grid.dx, (c.y - grid.y0) / grid.dy);
         cols = (cols.0.min(cx), cols.1.max(cx));
         rows = (rows.0.min(ry), rows.1.max(ry));
@@ -372,6 +375,13 @@ mod tests {
         let (t, all) = tiles([-90.0, 35.0, -54.0, 36.0], 2024);
         assert_eq!(t.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), vec!["utm18", "utm19", "utm20"]);
         assert!(!all);
+    }
+
+    /// A request with refused corners must not become a partial window from the surviving ones.
+    #[test]
+    fn a_refused_view_is_not_a_partial_window() {
+        let error = plan(grid(), [-170.0, 0.0, -80.0, 40.0], 2024).unwrap_err();
+        assert!(error.contains("can't be placed"), "{error}");
     }
 
     #[test]

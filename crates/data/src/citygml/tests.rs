@@ -241,11 +241,16 @@ fn a_vertical_system_that_isnt_metres_upward_is_said() {
     assert_eq!(
         notes(&compound("25832", "6360"), &["EPSG:25832"], None),
         [
-            "a vertical system the file names (crs:EPSG::6360) measures heights in US survey feet: z_min, z_max and height are kept as the file has them, and Style › Extrusion reads metres, so objects may stand at the wrong height"
+            "a vertical system the file names (crs:EPSG::6360) measures heights in US survey feet: z_min, z_max, height and base_height are kept as the file has them, and Style › Extrusion reads metres, so objects may stand at the wrong height"
         ]
     );
     let depth = notes(&compound("25832", "5715"), &["EPSG:25832"], None);
-    assert!(depth.len() == 1 && depth[0].contains("(crs:EPSG::5715) measures depth, downward, in metres"), "{depth:?}");
+    assert!(
+        depth.len() == 1
+            && depth[0].contains("(crs:EPSG::5715) measures depth, downward, in metres")
+            && depth[0].contains("base_height is how far an object's top is below its topmost object's top"),
+        "{depth:?}"
+    );
     let unknown = notes(&compound("25832", "9999"), &["EPSG:25832"], None);
     assert!(unknown.len() == 1 && unknown[0].contains("(crs:EPSG::9999) is one RustGIS doesn't know"), "{unknown:?}");
     // A geometry whose vertical part differs from the root's is said too; one system is said once,
@@ -273,6 +278,43 @@ fn a_vertical_system_that_isnt_metres_upward_is_said() {
     let said = notes("EPSG:25832", &many, Some(Crs::Epsg(25832)));
     assert_eq!(said.len(), VERTICALS + 1, "{said:?}");
     assert!(said[VERTICALS].starts_with("2 geometries or envelopes name a vertical system, past the first 8 said"), "{said:?}");
+}
+
+/// A part starts at its lowest point's height above its building's lowest point, written in it or
+/// linked to it; a group's member starts at 0, whatever the group's other members.
+#[test]
+fn a_part_above_its_building_starts_there() {
+    let raised = |id: &str, z: f64| {
+        [
+            surface("GroundSurface", &[polygon(&format!("{id}-g"), &square(0.0, 0.0, 4.0, z))]),
+            surface("RoofSurface", &[polygon(&format!("{id}-r"), &square(0.0, 0.0, 4.0, z + 1.0))]),
+        ]
+        .concat()
+    };
+    let inner = format!(
+        r##"<bldg:consistsOfBuildingPart><bldg:BuildingPart gml:id="p1">{}</bldg:BuildingPart></bldg:consistsOfBuildingPart>
+        <bldg:consistsOfBuildingPart xlink:href="#p2"/>"##,
+        box_surfaces("p1")
+    );
+    let linked = format!(
+        r#"<core:cityObjectMember><bldg:BuildingPart gml:id="p2">{}</bldg:BuildingPart></core:cityObjectMember>"#,
+        raised("p2", 7.0)
+    );
+    let far = building("c1", &raised("c1", 40.0));
+    let group = r##"<core:cityObjectMember><grp:CityObjectGroup gml:id="g1">
+        <grp:groupMember xlink:href="#b1"/><grp:groupMember xlink:href="#c1"/></grp:CityObjectGroup></core:cityObjectMember>"##;
+    let out = read("model.gml", &lonlat(&[building("b1", &inner), linked, far, group.to_string()].concat()), None).unwrap();
+    let base = |id: &str| {
+        out.iter()
+            .find_map(|(ds, _)| {
+                (0..ds.features.len()).find(|&r| value(ds, r, "id") == Value::Text(id.into())).map(|r| value(ds, r, "base_height"))
+            })
+            .unwrap()
+    };
+    assert_eq!(base("p1"), Value::Float(0.0));
+    assert_eq!(base("p2"), Value::Float(7.0), "a linked part starts 7 m above its building's lowest point");
+    assert_eq!(base("b1"), Value::Float(0.0));
+    assert_eq!(base("c1"), Value::Float(0.0), "not 40 m above the group's lowest member");
 }
 
 /// A part is an object of its own, with its parent's id, and lends its parent its heights.

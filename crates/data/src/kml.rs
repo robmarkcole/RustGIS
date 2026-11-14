@@ -9,7 +9,7 @@
 //! is bounded, and a malformed placemark is skipped and counted.
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use roxmltree::{Node, ParsingOptions};
 use rustgis_geom::Coord;
@@ -78,6 +78,8 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<Layer>> {
         maps: HashMap::new(),
         inline: HashMap::new(),
         dropped_keys: 0,
+        duplicate_entries: 0,
+        duplicate_placemarks: 0,
         rows: Vec::new(),
         keys: Vec::new(),
         skipped: 0,
@@ -186,6 +188,8 @@ struct Reader {
     keys: Vec<String>,
     /// Extended data entries past the column cap.
     dropped_keys: usize,
+    duplicate_entries: usize,
+    duplicate_placemarks: usize,
     skipped: usize,
 }
 
@@ -427,6 +431,8 @@ impl Reader {
             geometry(&g, &mut parts, 0);
         }
         let mut data = Vec::new();
+        let mut seen = HashSet::new();
+        let mut duplicates = 0usize;
         if let Some(ext) = child(pm, "ExtendedData") {
             for d in ext.descendants().filter(|d| d.is_element()) {
                 let pair = match local(&d) {
@@ -435,6 +441,13 @@ impl Reader {
                     _ => None,
                 };
                 if let Some((k, v)) = pair.filter(|(k, _)| !k.trim().is_empty()) {
+                    // The attribute reader uses the first entry for a key. Count and discard
+                    // later entries here, including duplicates across Data and SimpleData and
+                    // names past the column cap.
+                    if !seen.insert(k.clone()) {
+                        duplicates += 1;
+                        continue;
+                    }
                     if !self.keys.contains(&k) {
                         // At most MAX_KEYS columns of extended data; the rest are dropped.
                         if self.keys.len() >= MAX_KEYS {
@@ -479,6 +492,9 @@ impl Reader {
         }
         if !any {
             self.skipped += 1;
+        } else if duplicates > 0 {
+            self.duplicate_entries += duplicates;
+            self.duplicate_placemarks += 1;
         }
     }
 
@@ -556,6 +572,12 @@ impl Reader {
                 if self.skipped > 0 {
                     report.messages.push(format!("{name}: {} placemarks without a geometry RustGIS draws were skipped", self.skipped));
                 }
+                if self.duplicate_entries > 0 {
+                    report.messages.push(format!(
+                        "{name}: {} repeated ExtendedData entries in {} placemarks were left out",
+                        self.duplicate_entries, self.duplicate_placemarks
+                    ));
+                }
                 if self.dropped_keys > 0 {
                     report.messages.push(format!("{name}: extended data past {MAX_KEYS} distinct names was left out"));
                 }
@@ -615,6 +637,66 @@ mod tests {
   <Placemark><name>Nothing</name></Placemark>
   <GroundOverlay><Icon><href>map.png</href></Icon></GroundOverlay>
 </Document></kml>"##;
+
+    #[test]
+    fn duplicate_extended_data_is_counted_once_per_document() {
+        let xml = r#"<kml><Document>
+<Placemark><ExtendedData><Data name="n"><value>0</value></Data><Data name="n"><value>5</value></Data>
+<SchemaData><SimpleData name="n">9</SimpleData><SimpleData name="kind">first</SimpleData>
+<SimpleData name="kind">later</SimpleData></SchemaData></ExtendedData>
+<MultiGeometry><Point><coordinates>1,2</coordinates></Point><LineString><coordinates>1,2 2,3</coordinates></LineString></MultiGeometry></Placemark>
+<Placemark><ExtendedData><Data name="n"><value>7</value></Data><Data name="n"><value>8</value></Data></ExtendedData>
+<Point><coordinates>3,4</coordinates></Point></Placemark>
+</Document></kml>"#;
+        let layers = read("duplicates.kml", xml.as_bytes()).unwrap();
+        assert_eq!(layers.len(), 2);
+        let messages: Vec<_> = layers.iter().flat_map(|l| &l.report.messages).collect();
+        assert_eq!(messages, ["duplicates: 4 repeated ExtendedData entries in 2 placemarks were left out"]);
+        for layer in &layers {
+            let ds = &layer.dataset;
+            assert_eq!(ds.value(0, ds.field_index("n").unwrap()), &Value::Int(0));
+            assert_eq!(ds.value(0, ds.field_index("kind").unwrap()), &Value::Text("first".into()));
+        }
+        assert_eq!(layers[0].dataset.value(1, layers[0].dataset.field_index("n").unwrap()), &Value::Int(7));
+    }
+
+    #[test]
+    fn repeated_names_past_the_column_cap_are_counted() {
+        let mut first = String::from("<Placemark><ExtendedData>");
+        for i in 0..MAX_KEYS {
+            first.push_str(&format!("<Data name=\"k{i}\"><value>1</value></Data>"));
+        }
+        first.push_str("</ExtendedData><Point><coordinates>1,2</coordinates></Point></Placemark>");
+        let over = |extra: &str| {
+            format!(
+                "<kml><Document>{first}<Placemark><ExtendedData>{extra}</ExtendedData>\
+                 <Point><coordinates>3,4</coordinates></Point></Placemark></Document></kml>"
+            )
+        };
+        let twice = over("<Data name=\"extra\"><value>1</value></Data><Data name=\"extra\"><value>2</value></Data>");
+        let layers = read("cap.kml", twice.as_bytes()).unwrap();
+        let messages: Vec<_> = layers.iter().flat_map(|l| &l.report.messages).collect();
+        assert!(messages.iter().any(|m| m.contains("1 repeated ExtendedData entries in 1 placemarks")), "{messages:?}");
+        assert!(messages.iter().any(|m| m.contains("distinct names")), "the cap is still said: {messages:?}");
+        assert_eq!(layers[0].dataset.fields.len() - layers[0].dataset.field_index("k0").unwrap(), MAX_KEYS);
+        // Once past the cap is the cap only, not a repeat.
+        let once = over("<Data name=\"extra\"><value>1</value></Data>");
+        let layers = read("cap.kml", once.as_bytes()).unwrap();
+        let messages: Vec<_> = layers.iter().flat_map(|l| &l.report.messages).collect();
+        assert!(!messages.iter().any(|m| m.contains("repeated")), "{messages:?}");
+        assert!(messages.iter().any(|m| m.contains("distinct names")), "{messages:?}");
+    }
+
+    #[test]
+    fn distinct_extended_data_keys_across_placemarks_are_clean() {
+        let xml = r#"<kml><Document><Placemark><ExtendedData><Data name="n"><value>0</value></Data>
+<SchemaData><SimpleData name="kind">cafe</SimpleData></SchemaData></ExtendedData><Point><coordinates>1,2</coordinates></Point></Placemark>
+<Placemark><ExtendedData><Data name="n"><value>5</value></Data></ExtendedData><Point><coordinates>3,4</coordinates></Point></Placemark>
+</Document></kml>"#;
+        let layers = read("clean.kml", xml.as_bytes()).unwrap();
+        assert!(layers.iter().all(|l| l.report.messages.is_empty()));
+        assert_eq!(layers[0].dataset.features.len(), 2);
+    }
 
     #[test]
     fn digits_a_number_cannot_hold_stay_text() {

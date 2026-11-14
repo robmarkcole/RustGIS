@@ -20,7 +20,7 @@ pub fn commands() -> Vec<C> {
     vec![
         C::new("raster.zarrInfo", "Zarr Variables", "Home › Add › Add Data › Zarr", info).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network).with(crate::policy::Effect::Files))
             .view()
-            .params(r#"{"path": "a Zarr store's folder" | "url": "https://… a store with consolidated metadata"}"#),
+            .params(r#"{"path": "a Zarr store's folder" | "url": "https://… a store with consolidated metadata", "bbox"?: [west, south, east, north] (in the grid's coordinates: the window of cells it is in a variable's grid, for layer.addZarr's cells), "variable"?: (with bbox; default the first)} → variables with their dimensions and chunks"#),
         C::new("zarr.series", "Time Series at a Point", "View › Time Series", series).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network).with(crate::policy::Effect::Files)).view().params(
             r#"{"lon", "lat", "layer"? (a Zarr layer: its store, variable and steps; default the active layer) | "path": folder | "url": "https://…", "variable"?, "index"?: {"level": 0} (the other dimensions' steps), "start"?, "end"?: dates (default: the layer's period, else the whole axis), "crs"?: for a projected store that doesn't say} → dates, values (null for no data) and labels along the variable's time dimension at the cell holding the point (desktop)"#,
         ),
@@ -28,7 +28,7 @@ pub fn commands() -> Vec<C> {
             r#"{"layer"? (a Zarr layer: its store, variable and steps; default the active layer) | "path": folder | "url": "https://…", "variable"?, "index"?, "stat": "mean"|"min"|"max"|"sum"|"std" (the population standard deviation, n)|"count"|"countAbove", "above"?: number (countAbove's threshold), "start"?, "end"?: dates (default: the layer's period, else the whole axis), "months"?: [1–12] (a season across years: [12, 1, 2]), "minValid"?: 0–1 (a cell with a smaller share of values is left empty; default 0), "name"?: text, "crs"?} → a raster layer of the statistic (desktop)"#,
         ),
         C::new("layer.addZarr", "Add Zarr Variable", "Home › Add › Add Data", add).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network).with(crate::policy::Effect::Files)).params(
-            r#"{"path": folder | "url": "https://…", "variable"?: "its path in the store (default: the first)", "index"?: {"time": 3, "level": 0} (other dimensions' steps, default 0), "crs"?: "EPSG:… for a store that doesn't say", "name"?: text, "time"?: bool (follow the time slider: the layer shows the step the slider is at, and turns the slider on over the variable's dates when it is off; desktop), "start"?, "end"?: dates (with time: the period to take, for an axis longer than the slider's 20,000 steps), "ran"?: (internal: a slice the app has read), "summary"?: bool (internal: with ran, a summary over time rather than a slice)}"#,
+            r#"{"path": folder | "url": "https://…", "variable"?: "its path in the store (default: the first)", "index"?: {"time": 3, "level": 0} (other dimensions' steps, default 0), "cells"?: [first column, first row, end column, end row] (a window of the map's cells as stored, the ends not included, at least 2 × 2: only the chunks it touches are read, and only its coordinates) | "bbox"?: [west, south, east, north] (a window by the grid's coordinates: degrees for a longitude/latitude grid; its coordinates are read to place it), "crs"?: "EPSG:… for a store that doesn't say", "name"?: text, "time"?: bool (follow the time slider: the layer shows the step the slider is at, and turns the slider on over the variable's dates when it is off; desktop), "start"?, "end"?: dates (with time: the period to take, for an axis longer than the slider's 20,000 steps), "ran"?: (internal: a slice the app has read), "summary"?: bool (internal: with ran, a summary over time rather than a slice)}"#,
         ),
     ]
 }
@@ -55,7 +55,7 @@ pub fn selection(p: &Value) -> zarr::Selection {
         Some(Value::Object(m)) => m.iter().filter_map(|(k, v)| Some((k.clone(), v.as_u64()?))).take(32).collect(),
         _ => Vec::new(),
     };
-    zarr::Selection { variable: ps(p, "variable").map(str::trim).unwrap_or("").to_string(), index }
+    zarr::Selection { variable: ps(p, "variable").map(str::trim).unwrap_or("").to_string(), index, window: None }
 }
 
 /// A store's root as a layer's first name: its folder or address's last part, without `.zarr`.
@@ -84,6 +84,36 @@ pub fn is_absent(error: &str) -> bool {
 /// (access denied) isn't taken for an empty one.
 #[cfg(not(target_arch = "wasm32"))]
 fn fetch(root: &str, keys: &[String]) -> Result<(HashMap<String, Vec<u8>>, usize), String> {
+    fetch_items(root, &keys.iter().map(|k| (k.clone(), k.clone())).collect::<Vec<_>>())
+}
+
+/// Fetches bytes of a store's files ([`zarr::Part`]s, by range), each kept by its id, as [`fetch`].
+#[cfg(not(target_arch = "wasm32"))]
+fn fetch_parts(root: &str, parts: &[zarr::Part]) -> Result<(HashMap<String, Vec<u8>>, usize), String> {
+    use crate::render::rustgis_tiles::cache::RANGE;
+    let items: Vec<(String, String)> = parts
+        .iter()
+        .map(|p| {
+            let zarr::Span::Bytes(a, b) = p.span;
+            (p.id.clone(), format!("{}{RANGE}{a}-{b}", p.key))
+        })
+        .collect();
+    fetch_items(root, &items)
+}
+
+/// Fetches what a slice's plan reads: its whole files, then its bytes of files. A file refused
+/// (HTTP 403) is counted.
+#[cfg(not(target_arch = "wasm32"))]
+fn fetch_plan(root: &str, plan: &zarr::Plan) -> Result<(HashMap<String, Vec<u8>>, usize), String> {
+    let (mut got, forbidden) = fetch(root, &plan.keys)?;
+    let (parts, f) = fetch_parts(root, &plan.parts)?;
+    got.extend(parts);
+    Ok((got, forbidden + f))
+}
+
+/// [`fetch`] of `(id, file)` pairs: each file (a key, with a byte range's mark) kept by its id.
+#[cfg(not(target_arch = "wasm32"))]
+fn fetch_items(root: &str, keys: &[(String, String)]) -> Result<(HashMap<String, Vec<u8>>, usize), String> {
     use std::sync::Mutex;
     let out = Mutex::new(HashMap::new());
     let forbidden = std::sync::atomic::AtomicUsize::new(0);
@@ -101,7 +131,7 @@ fn fetch(root: &str, keys: &[String]) -> Result<(HashMap<String, Vec<u8>>, usize
                     let _diagnostic_scope = capture.enter();
                     loop {
                         let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let Some(k) = keys.get(i) else { break };
+                        let Some((id, k)) = keys.get(i) else { break };
                         if failure.lock().is_ok_and(|f| f.is_some()) {
                             break;
                         }
@@ -121,7 +151,7 @@ fn fetch(root: &str, keys: &[String]) -> Result<(HashMap<String, Vec<u8>>, usize
                                     break;
                                 }
                                 if let Ok(mut o) = out.lock() {
-                                    o.insert(k.clone(), b);
+                                    o.insert(id.clone(), b);
                                 }
                             }
                             Err(e) if is_absent(&e) => {
@@ -131,7 +161,9 @@ fn fetch(root: &str, keys: &[String]) -> Result<(HashMap<String, Vec<u8>>, usize
                             }
                             Err(e) => {
                                 if let Ok(mut f) = failure.lock() {
-                                    f.get_or_insert(crate::sources::message_with_address(&format!("{root}/{k}"), &e));
+                                    // Said by the file's address, without a byte range's mark.
+                                    let file = k.split_once('#').map_or(k.as_str(), |(f, _)| f);
+                                    f.get_or_insert(crate::sources::message_with_address(&format!("{root}/{file}"), &e));
                                 }
                             }
                         }
@@ -212,6 +244,11 @@ fn store_at(url: &str) -> Result<zarr::Store, String> {
     zarr::parse_store(&docs).map_err(|e| crate::sources::message_with_address(url, &e.to_string()))
 }
 
+/// `raster.zarrInfo`. It reads the store's metadata and coordinates on the UI thread, with no
+/// Cancel, as it did before windows: the Add Data › Zarr dialog reads them off the frame, and none
+/// of the background paths takes a command that answers with what a store holds yet. A `"bbox"`
+/// adds the variable's two map coordinates, read whole: at most `MAX_COORDS` values each (32 MB
+/// as Float64), each file a download of at most 60 s.
 fn info(_s: &mut Session, p: &Value) -> CmdResult {
     #[cfg(target_arch = "wasm32")]
     {
@@ -219,6 +256,28 @@ fn info(_s: &mut Session, p: &Value) -> CmdResult {
         Err("in the web app, open Zarr stores with Home › Add › Add Data › Zarr…".into())
     }
     #[cfg(not(target_arch = "wasm32"))]
+    {
+        let (root, store, mut v) = info_of(p)?;
+        // A bbox: the window of cells it is in a variable's grid, for layer.addZarr's cells.
+        if let Some(asked) = asked_window(p)? {
+            // Cells are given to layer.addZarr, which checks them against the grid; here only a
+            // box is placed.
+            if matches!(asked, Asked::Cells(_)) {
+                return Err("raster.zarrInfo takes a bbox, which it gives as cells: give cells to layer.addZarr".into());
+            }
+            let mut sel = zarr::Selection { variable: ps(p, "variable").map(str::trim).unwrap_or("").to_string(), ..Default::default() };
+            pick_variable(&store, &mut sel)?;
+            let cut = place_window(&root, &store, &mut sel, Some(asked))?;
+            let w = sel.window.unwrap_or_default();
+            v["window"] = serde_json::json!({"variable": sel.variable, "cells": [w.x0, w.y0, w.x1, w.y1], "notes": cut});
+        }
+        Ok(v)
+    }
+}
+
+/// [`info`] of the store a command names: its root, metadata and what it holds.
+#[cfg(not(target_arch = "wasm32"))]
+fn info_of(p: &Value) -> Result<(String, zarr::Store, Value), String> {
     match source(p)? {
         Source::Dir(d) => {
             let store = zarr::read_metadata(Path::new(&d)).map_err(|e| format!("{d}: {e}"))?;
@@ -239,12 +298,14 @@ fn info(_s: &mut Session, p: &Value) -> CmdResult {
                     chunks.insert(k, b);
                 }
             }
-            Ok(zarr::info(&store, &chunks))
+            let v = zarr::info(&store, &chunks);
+            Ok((d, store, v))
         }
         Source::Url(u) => {
             let store = store_at(&u)?;
             let (chunks, _) = fetch(&u, &zarr::info_keys(&store))?;
-            Ok(zarr::info(&store, &chunks))
+            let v = zarr::info(&store, &chunks);
+            Ok((u, store, v))
         }
     }
 }
@@ -274,8 +335,78 @@ fn crs_lost(r: &mut raster::Raster, text: Option<&str>, store: &zarr::Store, var
     }
 }
 
+/// The window a command asks for: `"cells"`, or `"bbox"` in the grid's coordinates.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+enum Asked {
+    Cells(zarr::Window),
+    Bbox([f64; 4]),
+}
+
+fn asked_window(p: &Value) -> Result<Option<Asked>, String> {
+    let four = |k: &str| -> Result<Option<Vec<f64>>, String> {
+        match p.get(k) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::Array(v)) if v.len() == 4 && v.iter().all(Value::is_number) => {
+                Ok(Some(v.iter().filter_map(Value::as_f64).collect()))
+            }
+            Some(_) => Err(format!("{k} is four numbers")),
+        }
+    };
+    match (four("cells")?, four("bbox")?) {
+        (Some(_), Some(_)) => Err("give cells or bbox, not both".into()),
+        (Some(c), None) => {
+            let whole = |v: f64| (v >= 0.0 && v.fract() == 0.0 && v < u64::MAX as f64).then_some(v as u64);
+            match c.iter().map(|v| whole(*v)).collect::<Option<Vec<u64>>>().as_deref() {
+                Some(&[x0, y0, x1, y1]) => Ok(Some(Asked::Cells(zarr::Window { x0, y0, x1, y1 }))),
+                _ => Err("cells is [first column, first row, end column, end row], whole numbers from 0".into()),
+            }
+        }
+        (None, Some(b)) => Ok(Some(Asked::Bbox([b[0], b[1], b[2], b[3]]))),
+        (None, None) => Ok(None),
+    }
+}
+
+/// Puts the window asked for on `sel`: a box placed by the variable's coordinates (read from the
+/// store at `root`). What is said of it: a box reaching past the grid, read only within it; a box
+/// within one cell along an axis, read as two there.
+#[cfg(not(target_arch = "wasm32"))]
+fn place_window(root: &str, store: &zarr::Store, sel: &mut zarr::Selection, asked: Option<Asked>) -> Result<Vec<String>, String> {
+    let at = |e: rustgis_data::DataError| crate::sources::message_with_address(root, &e.to_string());
+    match asked {
+        None => Ok(Vec::new()),
+        Some(Asked::Cells(w)) => {
+            sel.window = Some(w);
+            Ok(Vec::new())
+        }
+        Some(Asked::Bbox(bbox)) => {
+            let coords = store_files(root, &zarr::window_keys(store, &sel.variable).map_err(at)?)?;
+            let (w, cut, widened) = zarr::window_of(store, &sel.variable, &coords, bbox).map_err(at)?;
+            sel.window = Some(w);
+            let cells = format!("columns {}–{} and rows {}–{}", w.x0, w.x1, w.y0, w.y1);
+            let mut said = Vec::new();
+            if cut {
+                said.push(format!("the bbox reaches past the grid: only {cells} within it are read"));
+            }
+            if widened {
+                said.push(format!("the bbox is within one cell along an axis, and a window is 2 × 2 cells at least: {cells} are read"));
+            }
+            Ok(said)
+        }
+    }
+}
+
+/// `layer.addZarr`. By a folder or web address it reads the slice on the UI thread, with no Cancel,
+/// as it did before windows: the Add Data › Zarr dialog reads its slices off the frame and hands
+/// them over (`"ran"`), and none of the background paths takes a command that adds a layer from a
+/// store yet. A window bounds the read: `"cells"` reads only the chunks it touches and its part of
+/// the coordinates; `"bbox"` first reads the variable's two map coordinates whole, at most
+/// `MAX_COORDS` values each (32 MB as Float64), each file a download of at most 60 s.
 pub(crate) fn add(s: &mut Session, p: &Value) -> CmdResult {
+    let asked = asked_window(p)?;
     if b(p, "time") == Some(true) {
+        if asked.is_some() {
+            return Err("a window (cells or bbox) isn't read with time yet: leave time out to read it".into());
+        }
         return add_following(s, p);
     }
     let src = source(p)?;
@@ -307,7 +438,7 @@ pub(crate) fn add(s: &mut Session, p: &Value) -> CmdResult {
     }
     #[cfg(target_arch = "wasm32")]
     {
-        let _ = (crs_parsed, src);
+        let _ = (crs_parsed, src, asked);
         Err("in the web app, add Zarr variables with Home › Add › Add Data › Zarr…".into())
     }
     #[cfg(not(target_arch = "wasm32"))]
@@ -315,12 +446,28 @@ pub(crate) fn add(s: &mut Session, p: &Value) -> CmdResult {
         Source::Dir(d) => {
             let store = zarr::read_metadata(Path::new(&d)).map_err(|e| format!("{d}: {e}"))?;
             pick_variable(&store, &mut sel)?;
+            let cut = place_window(&d, &store, &mut sel, asked)?;
             let mut r = zarr::read_dir_in(&store, Path::new(&d), &sel.label(), crs).map_err(|e| format!("{d}: {e}"))?;
+            r.lost.extend(cut);
             crs_lost(&mut r, crs, &store, &sel.variable);
             let name = ps(p, "name").map(str::to_string).unwrap_or_else(|| r.name.clone());
             // Absolute, so the project finds the store again from anywhere.
             let full = std::path::absolute(&d).map(|p| p.display().to_string()).unwrap_or(d);
-            let mut layer = RasterLayer::from_path(r, full);
+            // A window is kept in the project as a GeoTIFF, as a web store's slice is, and its
+            // label only names it: an older RustGIS reading the folder again by the label would
+            // read the whole slice and save it back without the window. The layer is read from
+            // its GeoTIFF (embedded bytes come before a path, in older versions too); its path
+            // only keeps where the store is, for a series or summary from the layer once the
+            // project opens again.
+            let mut layer = if sel.window.is_some() {
+                r.source = Some(full.clone());
+                let tif = raster::geotiff::write(&r, 0).map_err(|e| e.to_string())?;
+                let mut layer = RasterLayer::from_bytes(r, format!("{}.tif", store_name(&full)), tif);
+                layer.path = Some(full);
+                layer
+            } else {
+                RasterLayer::from_path(r, full)
+            };
             layer.subdataset = Some(sel.label());
             layer.crs = crs.map(str::to_string);
             super::raster::add_raster(s, &name, layer)
@@ -328,8 +475,9 @@ pub(crate) fn add(s: &mut Session, p: &Value) -> CmdResult {
         Source::Url(u) => {
             let store = store_at(&u)?;
             pick_variable(&store, &mut sel)?;
+            let cut = place_window(&u, &store, &mut sel, asked)?;
             let plan = zarr::plan(&store, &sel).map_err(|e| crate::sources::message_with_address(&u, &e.to_string()))?;
-            let (chunks, forbidden) = fetch(&u, &plan.keys)?;
+            let (chunks, forbidden) = fetch_plan(&u, &plan)?;
             if forbidden > 0 {
                 return Err(crate::sources::message_with_address(
                     &u,
@@ -339,6 +487,7 @@ pub(crate) fn add(s: &mut Session, p: &Value) -> CmdResult {
             let name = ps(p, "name").map(str::to_string).unwrap_or_else(|| layer_name(&u, &sel, &[]));
             let mut r = zarr::assemble(&store, &plan, &chunks, &name, crs_parsed)
                 .map_err(|e| crate::sources::message_with_address(&u, &e.to_string()))?;
+            r.lost.extend(cut);
             crs_lost(&mut r, crs, &store, &sel.variable);
             r.source = Some(u.clone());
             // Kept in the project as a GeoTIFF: a web store isn't fetched again when it opens.
@@ -1150,9 +1299,9 @@ fn add_following(s: &mut Session, p: &Value) -> CmdResult {
             }
         }
         zt.shown = want;
-        let name = ps(p, "name")
-            .map(str::to_string)
-            .unwrap_or_else(|| layer_name(&root, &zarr::Selection { variable: zt.variable.clone(), index: zt.index.clone() }, &[]));
+        let name = ps(p, "name").map(str::to_string).unwrap_or_else(|| {
+            layer_name(&root, &zarr::Selection { variable: zt.variable.clone(), index: zt.index.clone(), window: None }, &[])
+        });
         // A long axis taken in part (no period given): said, with the period taken.
         let part = cut.then(|| {
             let day = |d: Option<&f64>| d.map_or_else(String::new, |d| rustgis_data::time::format(*d, "YYYY-MM-DD HH:mm"));
@@ -1198,7 +1347,7 @@ fn series_source(s: &Session, p: &Value) -> Result<SeriesSource, String> {
         if let Some(zt) = &rl.time_zarr {
             return Ok(SeriesSource {
                 root: zt.store.clone(),
-                sel: zarr::Selection { variable: zt.variable.clone(), index: zt.index.clone() },
+                sel: zarr::Selection { variable: zt.variable.clone(), index: zt.index.clone(), window: None },
                 period: Some((zt.offset, zt.dates.len())),
                 crs: zt.crs.clone(),
                 read_generation: zt.read_generation,
@@ -1533,6 +1682,13 @@ pub struct ZarrCube {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn zarr_cube(s: &Session, p: &Value) -> Result<ZarrCube, String> {
     let mut src = series_source(s, p)?;
+    // A layer that is a window of its variable: its steps over time would be read whole.
+    if src.sel.window.is_some() {
+        return Err(format!(
+            "{} is a window of its variable: add the variable without a window to summarise it over time",
+            src.sel.label()
+        ));
+    }
     let store = if is_web(&src.root) {
         cached_store(&src.root)?
     } else {

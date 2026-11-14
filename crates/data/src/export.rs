@@ -143,7 +143,7 @@ fn write_chunks_as(
         null_numbers = 0;
         csv = crate::io::CsvLosses::default();
         utc_dates.clear();
-        // The writers count the features; a source that doesn't know how many leaves the total at 0.
+        // The source counts scanned rows; nested writers only check Cancel, so rows count once.
         crate::progress::begin(src.info().count.map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX)));
         let batch = src.visit_chunks(None, bytes, &mut |mut chunk| {
             // Counted from the longitude/latitude, before projecting. Every vertex is written:
@@ -155,7 +155,7 @@ fn write_chunks_as(
                 }
             }
             if let Some(t) = &t {
-                // Counted as the writer writes them, so only stopped on a cancel here.
+                // Counted by the source scan, so only stopped on a cancel here.
                 project_each(&mut chunk, t, crs, false)?;
             }
             total = total.saturating_add(chunk.len());
@@ -166,7 +166,7 @@ fn write_chunks_as(
             if ext == "gpkg" {
                 crate::source::add_unread_dates(&mut utc_dates, &crate::io::offset_dates(chunk.iter(), &layer.fields));
             }
-            add(&chunk)
+            crate::progress::without_counting(|| add(&chunk))
         })?;
         skipped = batch.skipped;
         unread_dates = batch.unread_dates;

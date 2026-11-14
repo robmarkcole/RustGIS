@@ -148,10 +148,22 @@ pub fn set(s: &mut Session, id: u32, rows: Vec<usize>, m: Mode) {
 fn by_attributes(s: &mut Session, p: &Value) -> CmdResult {
     let id = s.layer_id(p)?;
     let w = ps(p, "where").ok_or("where is required")?;
-    let rows = rustgis_data::query::select(w, &s.map().layer(id).ok_or("no layer")?.dataset)?;
+    // As every selection tool, only the features drawn: the definition query, time window and
+    // display filters hide the rest (#1995).
+    let layer = s.map().layer(id).ok_or("no layer")?;
+    let drawn = layer.drawn_rows(s.scale());
+    let mut rows = rustgis_data::query::select(w, &layer.dataset)?;
+    let matched = rows.len();
+    rows.retain(|r| drawn.get(*r).is_none_or(|d| *d));
     let n = rows.len();
     set(s, id, rows, mode(p));
     s.notify(format!("{n} features selected"), false);
+    if matched > n {
+        s.notify(
+            format!("{} more features match but aren't drawn (the layer's definition query, time window or display filters hide them), and aren't selected", matched - n),
+            false,
+        );
+    }
     Ok(json!({"selected": n}))
 }
 

@@ -2853,22 +2853,40 @@ fn exports_are_written_in_the_system_the_layer_was_read_in() {
         let prj = std::fs::read_to_string(shp.with_extension("prj")).unwrap();
         assert!(prj.starts_with("PROJCS[") && prj.ends_with(&format!("AUTHORITY[\"EPSG\",\"{code}\"]]")), "{prj}");
     }
-    // By default an export keeps the layer's system where the format can say it; a system without
-    // an EPSG code only where its WKT is read back (a Shapefile's .prj).
+    // By default an export keeps the layer's system where the format can say it. A system without
+    // an EPSG code goes in by its WKT definition, read back as the same system; one WKT can't
+    // describe only into a Shapefile (which says so), else the layer is written in WGS 84, said.
     let mut ds = utm_squares(25832);
     let utm = Crs::from_epsg(25832).unwrap();
     assert_eq!(crate::io::default_export_crs(&ds, "GPKG"), utm);
     assert_eq!(crate::io::default_export_crs(&ds, "geojson"), Crs::LonLat);
+    assert_eq!(crate::io::default_export_note(&ds, "a.gpkg"), None);
     let wkt = crate::raster::wkt::to_wkt(utm).unwrap().replace(",AUTHORITY[\"EPSG\",\"25832\"]", "").replace("EPSG:25832", "My grid");
     let custom = crate::raster::wkt::crs_from_wkt(&wkt).unwrap();
     assert_eq!(custom.epsg(), 0);
     ds.crs = Some(custom);
-    assert_eq!(crate::io::default_export_crs(&ds, "shp"), custom);
-    assert_eq!(crate::io::default_export_crs(&ds, "fgb"), Crs::LonLat);
-    // Asked for, it goes into a Shapefile, but not a file that would read back as longitude/latitude.
-    assert!(crate::io::write_path_in(&ds, &d.join("custom.shp"), custom).is_ok());
-    assert!(crate::io::write_path_in(&ds, &d.join("custom.gpkg"), custom).is_err());
-    assert!(crate::io::write_bytes_in(&ds, "fgb", custom).is_err());
+    for ext in ["shp", "gpkg", "fgb"] {
+        assert_eq!(crate::io::default_export_crs(&ds, ext), custom, "{ext}");
+        let p = d.join(format!("custom.{ext}"));
+        crate::io::write_path_in(&ds, &p, custom).unwrap();
+        if ext != "shp" {
+            let (back, _) = materialize(open_path(&p, None).unwrap().as_ref()).unwrap();
+            assert_eq!(back.crs, Some(custom), "{ext}");
+        }
+        assert_eq!(crate::io::default_export_note(&ds, &p.display().to_string()), None, "{ext}");
+    }
+    let gnomonic = Crs::parse("+proj=gnom +lat_0=51 +lon_0=9 +datum=WGS84 +units=m +no_defs").unwrap();
+    assert!(crate::raster::wkt::to_wkt(gnomonic).is_none());
+    ds.crs = Some(gnomonic);
+    assert_eq!(crate::io::default_export_crs(&ds, "shp"), gnomonic);
+    for ext in ["gpkg", "fgb"] {
+        assert_eq!(crate::io::default_export_crs(&ds, ext), Crs::LonLat, "{ext}");
+        let note = crate::io::default_export_note(&ds, &format!("a.{ext}")).unwrap();
+        assert!(note.contains("WGS 84") && note.contains(&gnomonic.label()), "{note}");
+        // Asked for, it is refused: the file would read back as longitude/latitude.
+        assert!(crate::io::write_path_in(&ds, &d.join(format!("gnom.{ext}")), gnomonic).is_err(), "{ext}");
+    }
+    assert_eq!(crate::io::default_export_note(&ds, "a.shp"), None);
     // GeoJSON is longitude/latitude only.
     let ds = utm_squares(25832);
     assert!(crate::io::write_path_in(&ds, &d.join("squares.geojson"), Crs::from_epsg(25832).unwrap()).is_err());
@@ -4017,4 +4035,318 @@ fn a_feature_just_outside_an_extent_is_left_out_of_its_read() {
     let geojson = geojson::GeoJsonSource::open_path(&geojson_path, "edge").unwrap();
     assert!(geojson.read(&req).unwrap().features.is_empty());
     std::fs::remove_dir_all(&d).unwrap();
+}
+
+/// A view the layer's projection refuses part of the edge of (#1925): the box queried in the
+/// layer's coordinates must still hold every place in the view the projection takes, or a read
+/// leaves out features without a word. Here, a UTM zone 17 layer and views reaching past 90°
+/// from its meridian, where transverse Mercator refuses places: such a view isn't bounded.
+#[test]
+fn a_query_box_leaves_out_nothing_in_view_when_its_edge_is_refused() {
+    let r = Reproject::from_crs(Crs::from_epsg(32617).unwrap(), &mut Vec::new());
+    let t = r.transformer().unwrap();
+    for view in [
+        Extent::new(-120.0, -30.0, 10.0, 30.0),
+        Extent::new(-180.0, -60.0, 180.0, 60.0),
+        Extent::new(-81.5, -5.0, 15.0, 5.0),
+        Extent::new(-175.0, -1.0, -60.0, 1.0),
+    ] {
+        // Unbounded (`None`) reads everything in view.
+        let Some(native) = r.extent_from_lonlat(&view) else { continue };
+        for i in 0..=40 {
+            for j in 0..=40 {
+                let p = Coord::new(view.min_x + view.width() * f64::from(i) / 40.0, view.min_y + view.height() * f64::from(j) / 40.0);
+                if let Some(q) = t.from_lonlat(p) {
+                    assert!(native.contains(q), "{view:?}: {p:?} goes to {q:?}, outside the box queried, {native:?}");
+                }
+            }
+        }
+    }
+    // A view in the zone is still a box.
+    assert!(r.extent_from_lonlat(&Extent::new(-84.0, 30.0, -78.0, 40.0)).is_some_and(|e| !e.is_empty()));
+}
+
+/// The ISO text database servers give for dates (PostgreSQL with `DateStyle` ISO and `TimeZone`
+/// UTC, MySQL's casts with `Z` added for a `TIMESTAMP`, SQL Server's style 126 cut to
+/// microseconds) reads as dates without a count. What RustGIS can't hold (`infinity`, a year BC
+/// or past 9999, MySQL's zero and partial dates) is null and counted, and none is null uncounted.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn database_date_text_reads_as_dates_and_counts_the_rest() {
+    let mut unread = Vec::new();
+    let clean = [
+        (Some("2026-03-05"), FieldType::Date, "2026-03-05"),
+        (Some("2026-03-05 14:30:00.25"), FieldType::DateTime, "2026-03-05T14:30:00.250"),
+        (Some("2026-03-05 14:30:00+00"), FieldType::DateTime, "2026-03-05T14:30:00Z"),
+        (Some("2026-03-05 14:30:00.123456Z"), FieldType::DateTime, "2026-03-05T14:30:00.123456Z"),
+        (Some("2026-03-05T14:30:00.123456+02:00"), FieldType::DateTime, "2026-03-05T14:30:00.123456+02:00"),
+        (None, FieldType::Date, "<Null>"),
+    ];
+    for (text, ty, shown) in clean {
+        assert_eq!(server_date(text, ty, &mut unread, 1).to_string(), shown, "{text:?}");
+    }
+    assert!(unread.is_empty(), "clean text counts nothing: {unread:?}");
+    for text in ["infinity", "-infinity", "0044-03-15 BC", "12026-01-01", "0000-00-00", "2026-03-00", "0000-00-00 00:00:00Z"] {
+        assert_eq!(server_date(Some(text), FieldType::DateTime, &mut unread, 1).to_string(), "<Null>", "{text}");
+    }
+    assert_eq!(unread, [0, 7]);
+}
+
+/// A read of a view whose box the layer's system can't bound (#1925) still matches the view: a
+/// UTM zone 17 layer with 200 points in view, 2000 in the zone outside it and a row without
+/// geometry, read with a limit of 10, gives a sample of the points in view and not the row. Sampling
+/// the whole layer before testing the view would keep about one.
+#[test]
+fn a_view_its_system_cant_bound_reads_what_is_in_view() {
+    let d = dir().join("unbounded-view");
+    std::fs::create_dir_all(&d).unwrap();
+    let mut ds = Dataset::new("pts", GeometryType::Point, vec![Field::new("n", FieldType::Integer)]);
+    for i in 0..2200 {
+        let (lat, k) = if i < 200 { (0.0, 25.0 * f64::from(i) / 200.0) } else { (40.0, 40.0 * f64::from(i - 200) / 2000.0) };
+        let lon = -84.0 + 6.0 * f64::from(i % 37) / 37.0;
+        ds.push(Some(Geometry::Point(Coord::new(lon, lat + k))), vec![Value::Int(i64::from(i))]);
+    }
+    ds.push(None, vec![Value::Int(-1)]);
+    let view = Extent::new(-120.0, -30.0, 10.0, 30.0);
+    let r = Reproject::from_crs(Crs::from_epsg(32617).unwrap(), &mut Vec::new());
+    assert!(r.extent_from_lonlat(&view).is_none(), "the view's edge is refused");
+    for ext in ["shp", "fgb", "gpkg", "parquet", "geojson"] {
+        let p = d.join(format!("pts.{ext}"));
+        write_unbounded_view_fixture(&ds, &p);
+        let source = open_path(&p, None).unwrap();
+        let mut sources: Vec<&dyn FeatureSource> = vec![source.as_ref()];
+        let memory = if ext == "gpkg" {
+            let bytes = Shared(std::sync::Arc::new(std::fs::read(&p).unwrap()));
+            Some(gpkg_mem::GpkgMemSource::open_shared(bytes, None).unwrap())
+        } else {
+            None
+        };
+        if let Some(memory) = &memory {
+            sources.push(memory);
+        }
+        let fetched = if matches!(ext, "fgb" | "parquet") {
+            let url = format!("https://test.example/unbounded-view.{ext}");
+            remote::testing::serve(&url, std::fs::read(&p).unwrap());
+            Some(open_driven(&url))
+        } else {
+            None
+        };
+        if let Some(fetched) = &fetched {
+            sources.push(fetched);
+        }
+        for source in sources {
+            {
+                // A zero limit cannot give a count for a view requiring a complete geometry scan.
+                let probe = crate::progress::tests::Counted::cancelling_after(0);
+                let _guard = crate::progress::install(Some(probe.clone()));
+                let error = source.read(&Request { extent: Some(view), limit: 0 }).unwrap_err().to_string();
+                assert!(error.contains("zero-limit") && error.contains("count"), "{ext}: {error}");
+                assert_eq!(probe.done.load(std::sync::atomic::Ordering::Relaxed), 0, "{ext}");
+            }
+            for limit in [10, 2201] {
+                let read = source.read(&Request { extent: Some(view), limit }).unwrap();
+                assert_eq!(read.matched, 200, "{ext}: count only view matches before sampling");
+                if limit == 10 {
+                    // Adaptive sampling keeps between half the limit and the limit.
+                    assert!((5..=10).contains(&read.features.len()), "{ext}: {} features", read.features.len());
+                } else {
+                    // A full view read excludes the null-geometry row and all out-of-view points.
+                    assert_eq!(read.features.len(), 200, "{ext}");
+                    assert!(read.complete, "{ext}");
+                }
+                for f in &read.features {
+                    let g = f.geometry.as_ref().unwrap_or_else(|| panic!("{ext}: feature {} has no geometry", f.id));
+                    assert!(g.extent().intersects(&view), "{ext}: feature {} is outside the view", f.id);
+                }
+            }
+            {
+                // Cancel while scanning, not before the read starts; the view needs a complete scan.
+                let probe = crate::progress::tests::Counted::cancelling_after(3);
+                let _guard = crate::progress::install(Some(probe.clone()));
+                assert!(matches!(source.read(&Request { extent: Some(view), limit: 10 }), Err(DataError::Cancelled)), "{ext}");
+                assert_eq!(probe.done.load(std::sync::atomic::Ordering::Relaxed), 3, "{ext}");
+            }
+            if source.visits_chunks() {
+                let probe = crate::progress::tests::Counted::cancelling_after(3);
+                let _guard = crate::progress::install(Some(probe.clone()));
+                assert!(matches!(source.visit_chunks(Some(view), 1 << 20, &mut |_| Ok(())), Err(DataError::Cancelled)));
+                assert_eq!(probe.done.load(std::sync::atomic::Ordering::Relaxed), 3);
+            }
+        }
+    }
+}
+
+/// A view match after the row cap must not disappear from an unbounded GeoParquet read.
+#[test]
+fn unbounded_parquet_view_refuses_a_capped_group() {
+    let p = dir().join("capped-view.parquet");
+    let mut ds = Dataset::new("pts", GeometryType::Point, vec![Field::new("n", FieldType::Integer)]);
+    ds.push(Some(Geometry::Point(Coord::new(-81.0, 40.0))), vec![Value::Int(0)]);
+    ds.push(Some(Geometry::Point(Coord::new(-81.0, 0.0))), vec![Value::Int(1)]);
+    write_unbounded_view_fixture(&ds, &p);
+    let source = parquet::ParquetSource::open_path(&p, "pts").unwrap().with_group_rows(1);
+    let req = Request { extent: Some(Extent::new(-120.0, -30.0, 10.0, 30.0)), limit: 10 };
+    let error = source.read(&req).unwrap_err().to_string();
+    assert!(error.contains("more than the 1 read from one"), "{error}");
+}
+
+/// Repeated text can expand from a small dictionary into one owned string per scanned row.
+#[test]
+fn unbounded_parquet_view_refuses_decoded_columns_over_budget() {
+    let p = dir().join("decoded-view.parquet");
+    let mut ds = Dataset::new("pts", GeometryType::Point, vec![Field::new("label", FieldType::Text)]);
+    for _ in 0..20 {
+        ds.push(Some(Geometry::Point(Coord::new(-81.0, 0.0))), vec![Value::Text("x".repeat(1024))]);
+    }
+    write_unbounded_view_fixture(&ds, &p);
+    let source = parquet::ParquetSource::open_path(&p, "pts").unwrap().with_scan_bytes(16 << 10);
+    let req = Request { extent: Some(Extent::new(-120.0, -30.0, 10.0, 30.0)), limit: 1 };
+    let error = source.read(&req).unwrap_err().to_string();
+    assert!(error.contains("decoded-column budget"), "{error}");
+    let error = source.visit_chunks(req.extent, 4096, &mut |_| Ok(())).unwrap_err().to_string();
+    assert!(error.contains("decoded-column budget"), "{error}");
+    let clean = Request { extent: Some(Extent::new(-84.0, -1.0, -78.0, 1.0)), limit: 1 };
+    assert_eq!(source.read(&clean).unwrap().features.len(), 1);
+    let source = parquet::ParquetSource::open_path(&p, "pts").unwrap();
+    let batch = source.read(&req).unwrap();
+    assert_eq!(batch.matched, 20);
+    assert_eq!(batch.features[0].attrs[0], Value::Text("x".repeat(1024)));
+}
+
+/// The same small file must remain readable with plain or dictionary-encoded binary columns.
+#[test]
+fn unbounded_parquet_scan_accepts_two_thousand_distinct_points() {
+    let p = dir().join("ordinary-view.parquet");
+    let mut ds = Dataset::new("pts", GeometryType::Point, vec![]);
+    for i in 0..2000 {
+        ds.push(Some(Geometry::Point(Coord::new(-82.0 + f64::from(i) / 2000.0, 0.0))), vec![]);
+    }
+    write_projected_parquet_fixture(&ds, &p, 2000, true);
+    let source = parquet::ParquetSource::open_path(&p, "pts").unwrap();
+    let req = Request { extent: Some(Extent::new(-120.0, -30.0, 10.0, 30.0)), limit: 10 };
+    let batch = source.read(&req).unwrap();
+    assert_eq!(batch.matched, 2000);
+    assert!((5..=10).contains(&batch.features.len()));
+    drop(source);
+    write_projected_parquet_fixture(&ds, &p, 2000, false);
+    let source = parquet::ParquetSource::open_path(&p, "pts").unwrap();
+    assert_eq!(source.read(&req).unwrap().matched, 2000);
+}
+
+/// Streamed sources own the scan count; nested export writers must still observe Cancel.
+#[test]
+fn streamed_export_progress_counts_each_source_row_once() {
+    use std::sync::atomic::Ordering;
+    let d = dir();
+    let mut ds = Dataset::new("pts", GeometryType::Point, vec![]);
+    for i in 0..10 {
+        ds.push(Some(Geometry::Point(Coord::new(f64::from(i), 0.0))), vec![]);
+    }
+    for input in ["shp", "fgb", "gpkg", "parquet"] {
+        let path = d.join(format!("input.{input}"));
+        crate::io::write_path(&ds, &path).unwrap();
+        let source = open_path(&path, None).unwrap();
+        let memory = if input == "gpkg" {
+            Some(gpkg_mem::GpkgMemSource::open_shared(Shared(Arc::new(std::fs::read(&path).unwrap())), None).unwrap())
+        } else {
+            None
+        };
+        let mut sources: Vec<&dyn FeatureSource> = vec![source.as_ref()];
+        if let Some(memory) = &memory {
+            sources.push(memory);
+        }
+        for (i, source) in sources.into_iter().enumerate() {
+            for output in ["geojson", "csv", "gpkg"] {
+                let progress = Arc::new(crate::progress::tests::Counted::default());
+                let _guard = crate::progress::install(Some(progress.clone()));
+                let out = d.join(format!("output-{input}-{i}.{output}"));
+                assert_eq!(crate::export::write_source_in(source, &ds, &out, Crs::LonLat).unwrap().written, 10);
+                assert_eq!(progress.total.load(Ordering::Relaxed), 10, "{input} to {output}");
+                assert_eq!(progress.done.load(Ordering::Relaxed), 10, "{input} to {output}");
+            }
+        }
+    }
+}
+
+/// Per-group limits do not bound the sum of the masks retained across many small groups.
+#[test]
+fn unbounded_parquet_view_bounds_aggregate_row_masks() {
+    let p = dir().join("many-groups.parquet");
+    let mut ds = Dataset::new("pts", GeometryType::Point, vec![]);
+    ds.features =
+        (0..40_000).map(|id| crate::Feature { id, geometry: Some(Geometry::Point(Coord::new(-81.0, 0.0))), attrs: vec![] }).collect();
+    write_projected_parquet_fixture(&ds, &p, 100, true);
+    let source = parquet::ParquetSource::open_path(&p, "pts").unwrap().with_scan_bytes(32 << 10);
+    let req = Request { extent: Some(Extent::new(-120.0, -30.0, 10.0, 30.0)), limit: 10 };
+    let error = source.read(&req).unwrap_err().to_string();
+    assert!(error.contains("row-mask budget"), "{error}");
+    let source = parquet::ParquetSource::open_path(&p, "pts").unwrap();
+    assert_eq!(source.read(&req).unwrap().matched, 40_000);
+}
+
+/// Writes the projected reader fixture, including formats whose public writer accepts only WGS 84.
+fn write_unbounded_view_fixture(ds: &Dataset, path: &Path) {
+    let crs = Crs::from_epsg(32617).unwrap();
+    match path.extension().and_then(|s| s.to_str()).unwrap() {
+        "geojson" => {
+            let projected = crate::io::project(ds, crs).unwrap();
+            let mut json = crate::io::to_geojson(&projected);
+            json["crs"] = serde_json::json!({"type": "name", "properties": {"name": "EPSG:32617"}});
+            std::fs::write(path, serde_json::to_vec(&json).unwrap()).unwrap();
+        }
+        "parquet" => write_projected_parquet_fixture(ds, path, 100, true),
+        _ => {
+            crate::io::write_path_in(ds, path, crs).unwrap();
+        }
+    }
+}
+
+/// A UTM fixture with selectable row-group size and binary encoding, using the same covering.
+fn write_projected_parquet_fixture(ds: &Dataset, path: &Path, rows: usize, dictionary: bool) {
+    let crs = Crs::from_epsg(32617).unwrap();
+    use arrow_array::{BinaryArray, Float64Array, RecordBatch, StringArray, StructArray};
+    use arrow_schema::{DataType, Field as AField, Schema};
+    let projected = crate::io::project(ds, crs).unwrap();
+    let wkbs: Vec<_> = projected.features.iter().map(|f| f.geometry.as_ref().map(wkb::encode)).collect();
+    let geometry = BinaryArray::from(wkbs.iter().map(|w| w.as_deref()).collect::<Vec<_>>());
+    let bbox_fields = ["xmin", "ymin", "xmax", "ymax"].map(|n| Arc::new(AField::new(n, DataType::Float64, true)));
+    let coord = |at: fn(Extent) -> f64| -> arrow_array::ArrayRef {
+        Arc::new(Float64Array::from(projected.features.iter().map(|f| f.geometry.as_ref().map(|g| at(g.extent()))).collect::<Vec<_>>()))
+    };
+    let bbox = StructArray::new(
+        bbox_fields.iter().cloned().collect(),
+        vec![coord(|e| e.min_x), coord(|e| e.min_y), coord(|e| e.max_x), coord(|e| e.max_y)],
+        None,
+    );
+    let mut fields = vec![
+        AField::new("geometry", DataType::Binary, true),
+        AField::new("bbox", DataType::Struct(bbox_fields.iter().cloned().collect()), false),
+    ];
+    let mut columns: Vec<arrow_array::ArrayRef> = vec![Arc::new(geometry), Arc::new(bbox)];
+    for (i, field) in ds.fields.iter().enumerate().filter(|(_, f)| f.ty == FieldType::Text) {
+        fields.push(AField::new(&field.name, DataType::Utf8, true));
+        columns.push(Arc::new(StringArray::from(
+            ds.features
+                .iter()
+                .map(|f| match f.attrs.get(i) {
+                    Some(Value::Text(s)) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+        )));
+    }
+    let schema = Arc::new(Schema::new(fields));
+    let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+    let geo = serde_json::json!({"version": "1.1.0", "primary_column": "geometry", "columns": {"geometry": {
+        "encoding": "WKB", "geometry_types": ["Point"], "crs": {"type": "ProjectedCRS", "id": {"authority": "EPSG", "code": 32617}},
+        "covering": {"bbox": {"xmin": ["bbox", "xmin"], "ymin": ["bbox", "ymin"], "xmax": ["bbox", "xmax"], "ymax": ["bbox", "ymax"]}}
+    }}});
+    let props = ::parquet::file::properties::WriterProperties::builder()
+        .set_max_row_group_row_count(Some(rows))
+        .set_dictionary_enabled(dictionary)
+        .set_key_value_metadata(Some(vec![::parquet::file::metadata::KeyValue::new("geo".into(), geo.to_string())]))
+        .build();
+    let mut writer = ::parquet::arrow::ArrowWriter::try_new(std::fs::File::create(path).unwrap(), schema, Some(props)).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
 }

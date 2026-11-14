@@ -50,6 +50,33 @@ impl Phone {
             .map_err(|e| i18n::fmt("Android refused: {error}", &[("error", &e.to_string())]))
     }
 
+    /// The room the system's bars and a camera cutout take at the window's edges, in pixels:
+    /// left, top, right, bottom. `None` before the window is laid out, or when the activity
+    /// can't be asked.
+    pub fn insets(&self) -> Option<[f32; 4]> {
+        let text = self
+            .java(|env, activity| {
+                let taken = env.call_method(activity, jni_str!("insets"), jni_sig!(() -> JString), &[])?.l()?;
+                if taken.is_null() {
+                    return Ok(String::new());
+                }
+                env.cast_local::<JString>(taken)?.try_to_string(env)
+            })
+            .ok()?;
+        let edges: Vec<f32> = text.split(' ').filter_map(|edge| edge.parse().ok()).collect();
+        <[f32; 4]>::try_from(edges).ok()
+    }
+
+    /// Draws the system bars' icons dark (`light` ground under them) or light (a dark one).
+    pub fn bars_light(&self, light: bool) {
+        let asked = self.java(|env, activity| {
+            env.call_method(activity, jni_str!("barsLight"), jni_sig!((light: boolean) -> void), &[JValue::Bool(light)])?.v()
+        });
+        if let Err(e) = asked {
+            log::warn!("{e}");
+        }
+    }
+
     /// Whether something asked for is still to be reported: the window keeps asking while it is.
     pub fn busy(&self) -> bool {
         self.java(|env, activity| env.call_method(activity, jni_str!("busy"), jni_sig!(() -> boolean), &[])?.z()).unwrap_or(false)
@@ -76,6 +103,10 @@ impl Platform for Phone {
             )?
             .v()
         })
+    }
+
+    fn locate(&self, on: bool) -> Result<(), String> {
+        self.java(|env, activity| env.call_method(activity, jni_str!("locate"), jni_sig!((on: boolean) -> void), &[JValue::Bool(on)])?.v())
     }
 
     fn take_events(&self) -> Vec<Event> {

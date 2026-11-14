@@ -82,7 +82,7 @@ fn a_solid_is_its_footprint_with_its_heights() {
     assert_eq!(ds.name, "model", "the only layer takes the file's name");
     assert_eq!(ds.geometry_type, GeometryType::Polygon);
     let names: Vec<&str> = ds.fields.iter().map(|f| f.name.as_str()).collect();
-    assert_eq!(names, ["id", "type", "parent", "lod", "floors", "name", "z_min", "z_max", "height"]);
+    assert_eq!(names, ["id", "type", "parent", "lod", "floors", "name", "z_min", "z_max", "height", "base_height"]);
     assert_eq!(value(ds, 0, "id"), crate::Value::Text("b1".into()));
     assert_eq!(value(ds, 0, "lod"), crate::Value::Text("2".into()));
     assert_eq!(value(ds, 0, "floors"), crate::Value::Int(2));
@@ -92,6 +92,8 @@ fn a_solid_is_its_footprint_with_its_heights() {
     let said = messages_of(&out);
     assert_eq!(said.len(), 1, "a clean solid says only that: {said:?}");
     assert!(said[0].starts_with("1 3D city objects are drawn as their footprints"), "{said:?}");
+    assert!(said[0].ends_with("the lowest point of the topmost object they are part of (0 for that object)"), "{said:?}");
+    assert_eq!(value(ds, 0, "base_height"), crate::Value::Float(0.0), "a building alone starts where it stands");
 }
 
 /// A clean 2D model says nothing.
@@ -273,7 +275,7 @@ fn an_instance_kept_without_geometry_isnt_said_to_be_drawn() {
 fn an_attribute_named_as_a_field_is_renamed_and_said() {
     let bytes = doc(
         box_vertices(),
-        json!({"b": {"type": "Building", "attributes": {"height": 99, "Type": "x"},
+        json!({"b": {"type": "Building", "attributes": {"height": 99, "Type": "x", "base_height": 7},
             "geometry": [{"type": "Solid", "lod": "2", "boundaries": box_shell()}]}}),
     );
     let out = read("m.city.json", &bytes, None).unwrap();
@@ -281,7 +283,12 @@ fn an_attribute_named_as_a_field_is_renamed_and_said() {
     assert_eq!(value(ds, 0, "height_1"), crate::Value::Int(99));
     assert_eq!(value(ds, 0, "height"), crate::Value::Float(5.0));
     assert_eq!(value(ds, 0, "Type_1"), crate::Value::Text("x".into()));
-    assert!(says(&out, "attributes renamed with a number, as these fields are the reader's own: Type, height"), "{:?}", messages_of(&out));
+    assert_eq!(value(ds, 0, "base_height_1"), crate::Value::Int(7));
+    assert!(
+        says(&out, "attributes renamed with a number, as these fields are the reader's own: Type, base_height, height"),
+        "{:?}",
+        messages_of(&out)
+    );
     // Renamed, it keeps clear of the object's other attributes.
     let bytes = doc(
         box_vertices(),
@@ -825,9 +832,41 @@ fn built(id: &str, parent: Option<&str>, z: Option<(f64, f64)>) -> Built {
         ty: "Building".into(),
         parent_ids: parent.into_iter().map(String::from).collect(),
         z,
+        ground: None,
         solid: false,
         attributes: Vec::new(),
     }
+}
+
+/// Taking grounds from the topmost objects stops past what the visits allow, and says after how many
+/// rounds; a cycle settles to its lowest.
+#[test]
+fn setting_grounds_is_bounded() {
+    let chain = || -> Vec<Built> {
+        (0..20)
+            .map(|i| {
+                let parent = (i < 19).then(|| format!("o{}", i + 1));
+                built(&format!("o{i}"), parent.as_deref(), Some((f64::from(19 - i), 30.0)))
+            })
+            .collect()
+    };
+    let mut objects = chain();
+    assert_eq!(set_grounds(&mut objects, 0), Some(MIN_PARENT_ROUNDS));
+    assert!(objects[0].ground > Some(0.0), "the top's ground isn't reached: {:?}", objects[0].ground);
+    let mut objects = chain();
+    assert_eq!(set_grounds(&mut objects, MAX_PARENT_VISITS), None, "with room, it settles");
+    assert_eq!(objects[0].ground, Some(0.0));
+    let mut cycle = vec![built("a", Some("b"), Some((1.0, 2.0))), built("b", Some("a"), Some((0.0, 1.0)))];
+    assert_eq!(set_grounds(&mut cycle, MAX_PARENT_VISITS), None);
+    assert_eq!((cycle[0].ground, cycle[1].ground), (Some(0.0), Some(0.0)));
+    let said = |c: &Counts| messages(c).into_iter().filter(|m| m.contains("base_height is measured")).collect::<Vec<_>>();
+    assert_eq!(
+        said(&Counts { ground_rounds: 3, ..Counts::default() }),
+        [
+            "parent chains go deeper than 3 levels: some parts' base_height is measured from a parent, not from the topmost object they are part of"
+        ]
+    );
+    assert!(said(&Counts::default()).is_empty(), "grounds that settled say nothing");
 }
 
 /// Past what the visits allow it stops and says after how many rounds; a cycle settles.
@@ -855,6 +894,70 @@ fn raising_parents_is_bounded() {
     let mut cycle = vec![built("a", Some("b"), Some((1.0, 2.0))), built("b", Some("a"), Some((0.0, 1.0)))];
     assert_eq!(raise_parents(&mut cycle, MAX_PARENT_VISITS), None);
     assert_eq!((cycle[0].z, cycle[1].z), (Some((0.0, 2.0)), Some((0.0, 2.0))));
+}
+
+/// `base_height` is how far above the lowest point of the topmost object it is part of an object
+/// starts: 0 for a building, its own height for a part over the building's roof, and a basement's
+/// depth for a part over a basement. A group's members aren't parts of the group.
+#[test]
+fn a_part_starts_at_its_height_above_its_building() {
+    let points = |lo: f64, hi: f64| [[0.0, 0.0, lo], [0.0001, 0.0001, hi]];
+    let z = [(10.0, 20.0), (13.0, 14.0), (50.0, 60.0), (0.0, 10.0), (-3.0, 0.0), (0.0, 10.0), (-3.0, 0.0), (5.0, 6.0)];
+    let vertices: Vec<[f64; 3]> = z.iter().flat_map(|&(lo, hi)| points(lo, hi)).collect();
+    let at = |k: usize| json!([{"type": "MultiPoint", "boundaries": [2 * k, 2 * k + 1]}]);
+    let objects = json!({
+        "g": {"type": "CityObjectGroup", "children": ["b", "c"]},
+        "b": {"type": "Building", "parents": ["g"], "children": ["b0", "b1"]},
+        "b0": {"type": "BuildingPart", "parents": ["b"], "geometry": at(0)},
+        "b1": {"type": "BuildingPart", "parents": ["b"], "geometry": at(1)},
+        "c": {"type": "Building", "parents": ["g"], "geometry": at(2)},
+        "d": {"type": "Building", "children": ["d0", "d1"]},
+        "d0": {"type": "BuildingPart", "parents": ["d"], "geometry": at(3)},
+        "d1": {"type": "BuildingPart", "parents": ["d"], "geometry": at(4)},
+        // Three levels, listed child first (by their ids): the ground comes from the top, through the
+        // middle, in more than one round.
+        "z": {"type": "Building", "children": ["y0", "y1"]},
+        "y0": {"type": "BuildingPart", "parents": ["z"], "children": ["x"], "geometry": at(5)},
+        "y1": {"type": "BuildingPart", "parents": ["z"], "geometry": at(6)},
+        "x": {"type": "BuildingPart", "parents": ["y0"], "geometry": at(7)},
+    });
+    let out = read("m.city.json", &doc(json!(vertices), objects), None).unwrap();
+    let base = |id: &str| {
+        out.iter()
+            .find_map(|(ds, _)| {
+                (0..ds.features.len()).find(|&r| value(ds, r, "id") == crate::Value::Text(id.into())).map(|r| value(ds, r, "base_height"))
+            })
+            .unwrap()
+    };
+    let float = crate::Value::Float;
+    assert_eq!(base("b0"), float(0.0));
+    assert_eq!(base("b1"), float(3.0), "the balcony starts 3 m above its building's lowest point");
+    assert_eq!(base("b"), float(0.0));
+    assert_eq!(base("c"), float(0.0), "not 40 m above the group's lowest member");
+    assert_eq!(base("g"), float(0.0));
+    assert_eq!(base("d1"), float(0.0));
+    assert_eq!(base("d0"), float(3.0), "over a basement, it starts at the basement's depth");
+    assert_eq!(base("x"), float(8.0), "from its topmost object's lowest point, not its parent's");
+    assert!(!says(&out, "name a parent"), "{:?}", messages_of(&out));
+}
+
+/// A part whose parent isn't in the file, or couldn't be read, is measured from itself, and said.
+#[test]
+fn a_part_whose_parent_is_missing_is_said() {
+    let vertices = json!([[0.0, 0.0, 10.0], [0.0001, 0.0001, 20.0]]);
+    let at = json!([{"type": "MultiPoint", "boundaries": [0, 1]}]);
+    let objects = json!({
+        "p": {"type": "BuildingPart", "parents": ["nowhere"], "geometry": at},
+        "q": {"type": "BuildingPart", "parents": ["broken"], "geometry": at},
+        "broken": {"type": 7},
+    });
+    let out = read("m.city.json", &doc(vertices, objects), None).unwrap();
+    assert_eq!(value(&out[0].0, 0, "base_height"), crate::Value::Float(0.0));
+    assert!(
+        says(&out, "2 city objects name a parent that isn't in the file or couldn't be read: their base_height leaves it out"),
+        "{:?}",
+        messages_of(&out)
+    );
 }
 
 /// A compound URN is read by its horizontal part, not by its last code, and its vertical part gives
@@ -977,11 +1080,22 @@ fn lines_and_points_keep_their_highest_lod() {
 fn a_height_too_large_to_be_a_number_is_said() {
     let objects = json!({"a": {"type": "Road", "geometry": [{"type": "MultiPoint", "boundaries": [0, 1]}]}});
     let out = read("m.city.json", &doc(json!([[0, 0, -1e308], [1, 1, 1e308]]), objects.clone()), None).unwrap();
-    assert!(says(&out, "1 city objects have a lowest and highest Z too far apart"), "{:?}", messages_of(&out));
+    assert!(says(&out, "1 city objects have Z values too far apart for their difference to be a number"), "{:?}", messages_of(&out));
     assert_eq!(value(&out[0].0, 0, "height"), crate::Value::Null);
     assert_eq!(value(&out[0].0, 0, "z_max"), crate::Value::Float(1e308));
-    let out = read("m.city.json", &doc(json!([[0, 0, -10], [1, 1, 20]]), objects), None).unwrap();
+    let out = read("m.city.json", &doc(json!([[0, 0, -10], [1, 1, 20]]), objects.clone()), None).unwrap();
     assert!(!says(&out, "too far apart"), "{:?}", messages_of(&out));
+    // A part too far above its building's lowest point: its base_height is left empty, and said.
+    let parts = json!({
+        "b": {"type": "Building", "children": ["p", "q"]},
+        "p": {"type": "BuildingPart", "parents": ["b"], "geometry": [{"type": "MultiPoint", "boundaries": [0]}]},
+        "q": {"type": "BuildingPart", "parents": ["b"], "geometry": [{"type": "MultiPoint", "boundaries": [1]}]},
+    });
+    let out = read("m.city.json", &doc(json!([[0, 0, -1e308], [1, 1, 1e308]]), parts), None).unwrap();
+    let ds = out.iter().map(|(ds, _)| ds).find(|ds| ds.features.len() == 2).unwrap();
+    let q = (0..2).find(|&r| value(ds, r, "id") == crate::Value::Text("q".into())).unwrap();
+    assert_eq!(value(ds, q, "base_height"), crate::Value::Null);
+    assert!(says(&out, "2 city objects have Z values too far apart"), "the building and its part: {:?}", messages_of(&out));
 }
 
 /// A line of one point at a higher level doesn't take the place of a line drawn at a lower one, and
@@ -1353,7 +1467,24 @@ fn attributes_are_typed_by_every_value_in_their_layer() {
     let names: Vec<&str> = ds.fields.iter().map(|f| f.name.as_str()).collect();
     assert_eq!(
         names,
-        ["id", "type", "parent", "lod", "big", "count", "exact", "flag", "mixed", "nested", "none", "share", "z_min", "z_max", "height"]
+        [
+            "id",
+            "type",
+            "parent",
+            "lod",
+            "big",
+            "count",
+            "exact",
+            "flag",
+            "mixed",
+            "nested",
+            "none",
+            "share",
+            "z_min",
+            "z_max",
+            "height",
+            "base_height"
+        ]
     );
 }
 

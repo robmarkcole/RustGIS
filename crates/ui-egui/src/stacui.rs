@@ -179,6 +179,11 @@ pub struct State {
     /// link), and the one the search under way asks for, which takes its place when its items land.
     searched_area: Option<[f64; 4]>,
     asked_area: Option<[f64; 4]>,
+    /// The sort the search under way was sent with (the dropdown may change while it waits).
+    asked_sort: Option<String>,
+    /// Whether `sortby` is the one a preset set up and the user has not touched the dropdown
+    /// since: only that sort goes with the preset (see [`drop_preset_sort`]).
+    sort_is_default: bool,
     /// The asset chosen for each item.
     pub chosen: Vec<String>,
     /// The item whose properties are shown.
@@ -227,6 +232,8 @@ impl Default for State {
             items: Vec::new(),
             searched_area: None,
             asked_area: None,
+            asked_sort: None,
+            sort_is_default: false,
             chosen: Vec::new(),
             details: None,
             counted: false,
@@ -404,11 +411,22 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
         Asked::Search(url, _) => match r.and_then(|b| Ok((stac::parse_items(&b, &url)?, stac::parse_matched(&b), stac::has_next(&b)))) {
             Ok(((items, next), matched, has_next)) => {
                 let n = items.len().to_string();
-                st.info = Some(match matched.filter(|m| *m as usize > items.len()) {
-                    Some(m) => i18n::fmt("Showing {n} of {m} items (narrow the search for others)", &[("n", &n), ("m", &m.to_string())]),
+                // Logical order until the line is whole: `fmt` puts a finished message in display
+                // form, so it runs once, over the count and the note together.
+                let count = match matched.filter(|m| *m as usize > items.len()) {
+                    Some(m) => {
+                        i18n::fmt_raw("Showing {n} of {m} items (narrow the search for others)", &[("n", &n), ("m", &m.to_string())])
+                    }
                     // A POST search's `next` link has no address to give, so `next` is none for it.
-                    None if next.is_some() || has_next => i18n::fmt("Showing {n} items (more match: narrow the search)", &[("n", &n)]),
-                    None => i18n::fmt("Showing {n} items", &[("n", &n)]),
+                    None if next.is_some() || has_next => i18n::fmt_raw("Showing {n} items (more match: narrow the search)", &[("n", &n)]),
+                    None => i18n::fmt_raw("Showing {n} items", &[("n", &n)]),
+                };
+                // An API that can't sort may ignore the sort instead of refusing it: say so.
+                // The sort that was sent, not the dropdown's value now.
+                let asked = st.asked_sort.as_deref();
+                st.info = Some(match sort_ignored_note(&items, asked).or_else(|| sort_unchecked_note(&items, asked)) {
+                    Some(note) => i18n::fmt("{count}. {note}", &[("count", &count), ("note", &note)]),
+                    None => i18n::fmt("{count}", &[("count", &count)]),
                 });
                 st.details = None;
                 st.counted = true;
@@ -528,7 +546,7 @@ pub fn open_preset(app: &mut RustGisApp, preset: Option<Preset>, p: &serde_json:
             }
             Preset::Sentinel2 => {
                 st.collection = "sentinel-2-c1-l2a".into();
-                st.sortby = "eo:cloud_cover".into();
+                (st.sortby, st.sort_is_default) = (PRESET_SORT.into(), true);
                 st.from = days_ago(90);
             }
             Preset::UsgsLidar => {
@@ -540,7 +558,11 @@ pub fn open_preset(app: &mut RustGisApp, preset: Option<Preset>, p: &serde_json:
             browse(app, None);
         }
     } else if preset.is_none() {
+        // A preset's own sort goes with the preset, unless a search is under way with it (its area
+        // being made, or sent and not answered): `keeps_preset_sort` is the one rule for that, so
+        // the dropdown and the next search follow it.
         app.ui.stac.preset = None;
+        keep_preset_sort_for_its_api(&mut app.ui.stac);
     }
     // A catalog or collection below the static catalog's top, by its address.
     if let Some(url) = p.get("catalog").and_then(serde_json::Value::as_str).map(str::trim).filter(|u| !u.is_empty()) {
@@ -771,6 +793,60 @@ fn fetch_children(app: &mut RustGisApp) {
     app.ui.stac.waiting = Some((Asked::Children(url), slot));
 }
 
+/// The orders the dialog offers an API's items in: the sort field (`-` first for descending) and its label.
+const SORTS: [(&str, &str); 4] =
+    [("", "API's own order"), ("-datetime", "Newest first"), ("datetime", "Oldest first"), ("eo:cloud_cover", "Least cloud first")];
+
+/// The sort the Sentinel-2 preset starts with.
+const PRESET_SORT: &str = "eo:cloud_cover";
+
+/// Drops the sort a preset set up, if the user has not picked one since: a sort the user chose
+/// (even the same one) is theirs and stays.
+fn drop_preset_sort(st: &mut State) {
+    if std::mem::take(&mut st.sort_is_default) {
+        st.sortby.clear();
+    }
+}
+
+/// A preset's own sort goes only to the preset's API (another may reject it): dropped when the
+/// dialog is on another API. Typing in the API field doesn't call this, so deleting a character
+/// of the address and typing it back keeps the sort; it is judged when a search is sent and when
+/// another API is picked.
+fn keep_preset_sort_for_its_api(st: &mut State) {
+    if !keeps_preset_sort(st) {
+        drop_preset_sort(st);
+    }
+}
+
+/// Whether a preset's own sort still stands: the dialog is on the preset's API, or a search is
+/// having its area made and will go out with that sort, whatever the dialog is switched to
+/// meanwhile. The dropdown, and what drops the sort, follow this one rule so they never disagree.
+fn keeps_preset_sort(st: &State) -> bool {
+    shown_preset(st).is_some() || st.preparing.is_some() || matches!(st.waiting, Some((Asked::Search(..), _)))
+}
+
+/// The sort a search sends: the one picked, none for the API's own order or a static catalog.
+fn sort_of(st: &State, is_static: bool) -> Option<&str> {
+    Some(st.sortby.trim()).filter(|b| !b.is_empty() && !is_static)
+}
+
+/// What to say when the items an API answered are visibly not in the order asked for: an API
+/// without the sort extension may ignore a sort rather than refuse it. None when they are in
+/// order or it can't be told.
+fn sort_ignored_note(items: &[stac::Item], sortby: Option<&str>) -> Option<String> {
+    (stac::sort_followed(items, sortby) == Some(false))
+        .then(|| i18n::fmt_raw("The API did not sort them by {sort}: they are in its own order", &[("sort", sortby.unwrap_or("").trim())]))
+}
+
+/// What to say when a sort was asked for and the items can't show whether the API followed it
+/// (dates that can't be compared, or a field that isn't compared): the order is the API's, and
+/// not known to be the one asked for. None for a page of one, or no sort.
+fn sort_unchecked_note(items: &[stac::Item], sortby: Option<&str>) -> Option<String> {
+    stac::sort_unchecked(items, sortby).then(|| {
+        i18n::fmt_raw("The order by {sort} could not be checked: it is the API's own order", &[("sort", sortby.unwrap_or("").trim())])
+    })
+}
+
 /// The preset the dialog is showing, if it is still on its API or catalog.
 fn shown_preset(st: &State) -> Option<Preset> {
     st.preset.filter(|p| st.api.trim().trim_end_matches('/') == p.address())
@@ -787,6 +863,7 @@ pub(crate) fn switch_api(st: &mut State, url: &str) {
     st.api = url.to_string();
     st.api_from_document = false;
     drop_listing(st);
+    keep_preset_sort_for_its_api(st);
 }
 
 /// Forgets what was listed for the last API or catalog, and what is still on its way from it: a
@@ -814,9 +891,15 @@ fn drop_listing(st: &mut State) {
     }
 }
 
+/// Whether a search is being made, sent or walked: what it asked for is fixed by then, so the
+/// buttons that ask again, and the sort that was sent, stay as they are until it is done.
+fn busy(st: &State) -> bool {
+    st.waiting.is_some() || st.walk.is_some() || st.preparing.is_some()
+}
+
 /// The dialog.
 pub fn dialog(app: &mut RustGisApp, ui: &mut egui::Ui) {
-    let busy = app.ui.stac.waiting.is_some() || app.ui.stac.walk.is_some() || app.ui.stac.preparing.is_some();
+    let busy = busy(&app.ui.stac);
     let is_static = catalog::is_static(&app.ui.stac.api);
     let mut list = false;
     let mut search = false;
@@ -946,6 +1029,24 @@ pub fn dialog(app: &mut RustGisApp, ui: &mut egui::Ui) {
         ui.add(egui::TextEdit::singleline(&mut st.max_cloud).hint_text(tl!("any")).desired_width(ui.available_width().clamp(70.0, 110.0)))
             .labelled_by(input_label.id);
         ui.end_row();
+        if !is_static {
+            // A static catalog is walked in its own order, so it has no sort.
+            ui.label(tl!("Sort by"));
+            let current = if st.sort_is_default && !keeps_preset_sort(st) { String::new() } else { st.sortby.trim().to_string() };
+            let shown = SORTS.iter().find(|(v, _)| *v == current).map_or(current.clone(), |(_, l)| tl!(l).to_string());
+            // Not while a search is being made: its sort is already chosen, and a pick now would
+            // show in the dropdown without being the one sent.
+            ui.add_enabled_ui(!busy, |ui| {
+                egui::ComboBox::from_id_salt("stac_sortby").selected_text(shown).show_ui(ui, |ui| {
+                    for (v, label) in SORTS {
+                        if ui.selectable_value(&mut st.sortby, v.to_string(), tl!(label)).clicked() {
+                            st.sort_is_default = false;
+                        }
+                    }
+                });
+            });
+            ui.end_row();
+        }
         if is_static && (st.preset == Some(Preset::Vantor) || !st.phase.is_empty()) {
             ui.label(tl!("Phase"));
             ui.horizontal(|ui| {
@@ -1473,6 +1574,7 @@ fn paint_dot(p: &egui::Painter, at: &[egui::Pos2], color: egui::Color32) {
 
 /// Finds items: an API's search, or a walk of a static catalog from the node picked.
 fn find_items(app: &mut RustGisApp) {
+    keep_preset_sort_for_its_api(&mut app.ui.stac);
     let st = &app.ui.stac;
     // A catalog's children still coming don't hold a search up.
     if st.walk.is_some() || st.preparing.is_some() || st.waiting.as_ref().is_some_and(|(a, _)| !matches!(a, Asked::Children(_))) {
@@ -1500,10 +1602,9 @@ fn find_items(app: &mut RustGisApp) {
     if let Ok(c) = st.max_cloud.trim().parse::<f64>() {
         p["maxCloud"] = json!(c);
     }
-    // A preset's sort order, only while the dialog is still on the preset's API (another API
-    // may not sort).
-    if !st.sortby.trim().is_empty() && shown_preset(st).is_some() {
-        p["sortby"] = json!(st.sortby.trim());
+    // The sort picked in the dialog (a preset starts with its own); a static catalog has none.
+    if let Some(by) = sort_of(st, is_static) {
+        p["sortby"] = json!(by);
     }
     let buffer = st.buffer.trim().to_string();
     if !st.parts.is_empty() {
@@ -1532,19 +1633,23 @@ fn find_items(app: &mut RustGisApp) {
     send_search(app, p, is_static);
 }
 
-/// An area being made for a search, and the search to send with it.
+/// An area being made for a search, and the search to send with it, built for `api` (the one
+/// the dialog was on): the API picker stays usable meanwhile, and the search (its collection and
+/// sort are that API's) must not go to another.
 struct Preparing {
     slot: Slot<Result<Option<Prepared>, String>>,
     params: serde_json::Value,
     is_static: bool,
+    api: String,
 }
 
 /// Makes the search area of `geometries` widened by `metres` on a thread of its own (here and now
 /// in the browser, which has one), then sends the search `params` describes with it.
 fn start_preparing(app: &mut RustGisApp, geometries: Vec<Geometry>, metres: f64, params: serde_json::Value, is_static: bool) {
     let job = move || rustgis_engine::cmd::stac_area::prepare(&geometries, metres);
+    let api = app.ui.stac.api.trim().to_string();
     if cfg!(target_arch = "wasm32") {
-        land_prepared(app, job(), params, is_static);
+        land_prepared(app, job(), params, is_static, &api);
         return;
     }
     let slot: Slot<Result<Option<Prepared>, String>> = Slot::default();
@@ -1557,7 +1662,7 @@ fn start_preparing(app: &mut RustGisApp, geometries: Vec<Geometry>, metres: f64,
         Ok(_) => {
             app.ui.stac.error = None;
             app.ui.stac.info = Some(tl!("Making the search area…").to_string());
-            app.ui.stac.preparing = Some(Preparing { slot, params, is_static });
+            app.ui.stac.preparing = Some(Preparing { slot, params, is_static, api });
         }
         Err(e) => app.ui.stac.error = Some(i18n::fmt("Couldn't start the search: {e}", &[("e", &e.to_string())])),
     }
@@ -1570,12 +1675,24 @@ fn poll_preparing(app: &mut RustGisApp, ctx: &egui::Context) {
         return;
     };
     let Some(preparing) = app.ui.stac.preparing.take() else { return };
-    land_prepared(app, answer, preparing.params, preparing.is_static);
+    land_prepared(app, answer, preparing.params, preparing.is_static, &preparing.api);
     ctx.request_repaint();
 }
 
-/// The area made: what it left out is said, and the search goes with it.
-fn land_prepared(app: &mut RustGisApp, answer: Result<Option<Prepared>, String>, mut params: serde_json::Value, is_static: bool) {
+/// The area made: what it left out is said, and the search goes with it, to the API it was built
+/// for (`api`): if the dialog is on another now, the search is dropped and that is said.
+fn land_prepared(
+    app: &mut RustGisApp,
+    answer: Result<Option<Prepared>, String>,
+    mut params: serde_json::Value,
+    is_static: bool,
+    api: &str,
+) {
+    if app.ui.stac.api.trim() != api {
+        app.ui.stac.error = None;
+        app.ui.stac.info = Some(tl!("The API changed while the search area was being made: press Find Items to search it").to_string());
+        return;
+    }
     match answer {
         Ok(Some(prepared)) => {
             for n in prepared.notices {
@@ -1633,6 +1750,7 @@ fn send_search(app: &mut RustGisApp, p: serde_json::Value, is_static: bool) {
                 Some(body) => post_service(app, &url, body),
                 None => fetch_service(app, &url),
             };
+            app.ui.stac.asked_sort = p["sortby"].as_str().map(str::to_string);
             app.ui.stac.waiting = Some((Asked::Search(url, get), slot));
         }
         Err(e) => app.ui.stac.error = Some(e),
@@ -1801,6 +1919,163 @@ mod tests {
         let p = cube_params(&st, "2024-01-01".into(), "2024-02-01".into(), Some("picked".into())).unwrap();
         assert_eq!(p["connection"], "picked");
         assert!(cube_params(&st, "a".into(), "b".into(), None).unwrap().get("connection").is_none());
+    }
+
+    #[test]
+    fn the_sort_picked_is_sent_to_an_api_only() {
+        let mut st = State::default();
+        assert_eq!(sort_of(&st, false), None);
+        for (v, _) in SORTS.iter().filter(|(v, _)| !v.is_empty()) {
+            st.sortby = format!(" {v} ");
+            assert_eq!(sort_of(&st, false), Some(*v));
+            assert_eq!(sort_of(&st, true), None);
+        }
+        // Newest first is a field the search can sort on.
+        assert!(SORTS.iter().any(|(v, _)| *v == "-datetime") && SORTS.iter().any(|(v, _)| *v == "datetime"));
+        // An API that ignored the sort is said so (and only then): the items tell.
+        let page = |dates: [&str; 3]| {
+            let f: Vec<_> = dates
+                .iter()
+                .enumerate()
+                .map(|(n, d)| json!({"type": "Feature", "id": format!("i{n}"), "bbox": [0, 0, 1, 1], "properties": {"datetime": d}}))
+                .collect();
+            stac::parse_items(json!({"type": "FeatureCollection", "features": f}).to_string().as_bytes(), "https://x.org/search").unwrap().0
+        };
+        let sorted = page(["2024-06-03T00:00:00Z", "2024-06-02T00:00:00Z", "2024-06-01T00:00:00Z"]);
+        assert_eq!(sort_ignored_note(&sorted, Some("-datetime")), None);
+        assert_eq!(sort_ignored_note(&sorted, None), None);
+        assert!(sort_ignored_note(&sorted, Some("datetime")).is_some_and(|n| n.contains("datetime")));
+        // A sort the items can't show is said so, and only then: not for one the items show, no
+        // sort, or a page of one.
+        assert!(sort_unchecked_note(&sorted, Some("platform")).is_some_and(|n| n.contains("platform")));
+        assert_eq!(sort_unchecked_note(&sorted, Some("-datetime")), None);
+        assert_eq!(sort_unchecked_note(&sorted, Some("datetime")), None, "ignored is the other note's to say");
+        assert_eq!(sort_unchecked_note(&sorted, None), None);
+        assert_eq!(sort_unchecked_note(&sorted[..1], Some("platform")), None);
+    }
+
+    #[test]
+    fn opening_stac_search_while_an_area_is_made_keeps_the_presets_sort() {
+        let mut app = RustGisApp::with_sample();
+        app.run("ui.stac.sentinel2", serde_json::Value::Null).unwrap();
+        assert_eq!((app.ui.stac.sortby.as_str(), app.ui.stac.sort_is_default), (PRESET_SORT, true));
+        // The search is being made with the preset's sort, and the ribbon's STAC Search is opened.
+        let api = app.ui.stac.api.clone();
+        app.ui.stac.preparing = Some(Preparing { slot: Slot::default(), params: json!({"sortby": PRESET_SORT}), is_static: false, api });
+        open_preset(&mut app, None, &serde_json::Value::Null).unwrap();
+        assert!(app.ui.stac.preset.is_none());
+        assert_eq!((app.ui.stac.sortby.as_str(), app.ui.stac.sort_is_default), (PRESET_SORT, true), "it goes out with that sort");
+        assert!(keeps_preset_sort(&app.ui.stac), "and the dropdown keeps reading it");
+        keep_preset_sort_for_its_api(&mut app.ui.stac);
+        assert_eq!(app.ui.stac.sortby, PRESET_SORT);
+        // Once the area has landed the preset is gone, and so is its sort.
+        app.ui.stac.preparing = None;
+        assert!(!keeps_preset_sort(&app.ui.stac));
+        keep_preset_sort_for_its_api(&mut app.ui.stac);
+        assert_eq!((app.ui.stac.sortby.as_str(), app.ui.stac.sort_is_default), ("", false));
+    }
+
+    #[test]
+    fn opening_stac_search_while_a_search_is_in_flight_keeps_the_presets_sort() {
+        let mut app = RustGisApp::with_sample();
+        app.run("ui.stac.sentinel2", serde_json::Value::Null).unwrap();
+        // The search went out with the preset's sort and is not answered yet.
+        app.ui.stac.waiting = Some((Asked::Search("https://x.org/search".into(), None), Slot::default()));
+        open_preset(&mut app, None, &serde_json::Value::Null).unwrap();
+        assert!(app.ui.stac.preset.is_none());
+        assert_eq!((app.ui.stac.sortby.as_str(), app.ui.stac.sort_is_default), (PRESET_SORT, true), "it went out with that sort");
+        assert!(keeps_preset_sort(&app.ui.stac), "and the dropdown keeps reading it");
+        // Answered: the preset is gone, and so is its sort.
+        app.ui.stac.waiting = None;
+        keep_preset_sort_for_its_api(&mut app.ui.stac);
+        assert_eq!((app.ui.stac.sortby.as_str(), app.ui.stac.sort_is_default), ("", false));
+        // Any other wait (a listing of collections) isn't a search with that sort.
+        app.run("ui.stac.sentinel2", serde_json::Value::Null).unwrap();
+        app.ui.stac.waiting = Some((Asked::Collections("https://x.org".into()), Slot::default()));
+        open_preset(&mut app, None, &serde_json::Value::Null).unwrap();
+        assert_eq!((app.ui.stac.sortby.as_str(), app.ui.stac.sort_is_default), ("", false));
+    }
+
+    #[test]
+    fn a_presets_sort_stays_with_the_presets_api() {
+        let mut app = RustGisApp::with_sample();
+        app.run("ui.stac.sentinel2", serde_json::Value::Null).unwrap();
+        assert_eq!(app.ui.stac.sortby, PRESET_SORT);
+        // Staying on the preset's API keeps it; leaving for another drops it.
+        let api = app.ui.stac.api.clone();
+        switch_api(&mut app.ui.stac, &api);
+        assert_eq!(app.ui.stac.sortby, PRESET_SORT);
+        switch_api(&mut app.ui.stac, "https://example.org/stac/v1");
+        assert_eq!(app.ui.stac.sortby, "");
+        // A sort the user picked on another API is theirs: it stays when the API changes again.
+        app.ui.stac.sortby = "-datetime".into();
+        switch_api(&mut app.ui.stac, "https://other.example.org/stac/v1");
+        assert_eq!(app.ui.stac.sortby, "-datetime");
+        // The same sort picked by hand on the preset is the user's: it stays (a click in the
+        // dropdown clears `sort_is_default`).
+        let mut app = RustGisApp::with_sample();
+        app.run("ui.stac.sentinel2", serde_json::Value::Null).unwrap();
+        (app.ui.stac.sortby, app.ui.stac.sort_is_default) = (PRESET_SORT.into(), false);
+        switch_api(&mut app.ui.stac, "https://example.org/stac/v1");
+        assert_eq!(app.ui.stac.sortby, PRESET_SORT);
+        // A sort picked on the USGS LiDAR preset (which sets none) stays too.
+        let mut app = RustGisApp::with_sample();
+        app.run("ui.stac.usgsLidar", serde_json::Value::Null).unwrap();
+        app.ui.stac.sortby = PRESET_SORT.into();
+        switch_api(&mut app.ui.stac, "https://example.org/stac/v1");
+        assert_eq!(app.ui.stac.sortby, PRESET_SORT);
+    }
+
+    /// A search whose area was being made when another API was picked is not sent to that API
+    /// (its collection and sort were the first one's): it is dropped, and the pane says so.
+    #[test]
+    fn an_area_made_for_one_api_is_not_searched_on_another() {
+        let mut app = RustGisApp::with_sample();
+        app.run("ui.stac.sentinel2", serde_json::Value::Null).unwrap();
+        let made_for = app.ui.stac.api.clone();
+        let params = json!({"limit": 50, "collections": "sentinel-2-c1-l2a", "sortby": PRESET_SORT});
+        let area = rustgis_engine::cmd::stac_area::prepare(&[rectangle([5.0, 45.0, 6.0, 46.0])], 0.0).unwrap();
+        // Another API was picked while the area was being made: nothing is sent, and it is said.
+        switch_api(&mut app.ui.stac, "https://example.org/stac/v1");
+        land_prepared(&mut app, Ok(area), params, false, &made_for);
+        assert!(app.ui.stac.waiting.is_none(), "the search went to the other API");
+        assert!(app.ui.stac.error.is_none());
+        assert!(app.ui.stac.info.as_deref().is_some_and(|i| i.contains("API changed")), "{:?}", app.ui.stac.info);
+    }
+
+    /// Typing in the API field doesn't touch the sort: deleting a character of the preset's
+    /// address and typing it back keeps the preset's default. It is dropped when a search is sent
+    /// (or another API is picked) while the dialog is on another API.
+    #[test]
+    fn editing_the_address_and_retyping_it_keeps_the_presets_sort() {
+        let mut app = RustGisApp::with_sample();
+        app.run("ui.stac.sentinel2", serde_json::Value::Null).unwrap();
+        let address = app.ui.stac.api.clone();
+        // What the text field does on each keystroke: change the text and drop the listing.
+        app.ui.stac.api.pop();
+        drop_listing(&mut app.ui.stac);
+        assert_eq!((app.ui.stac.sortby.as_str(), app.ui.stac.sort_is_default), (PRESET_SORT, true));
+        app.ui.stac.api = address;
+        drop_listing(&mut app.ui.stac);
+        assert_eq!((app.ui.stac.sortby.as_str(), app.ui.stac.sort_is_default), (PRESET_SORT, true));
+        assert_eq!(shown_preset(&app.ui.stac), Some(Preset::Sentinel2));
+        // Left on another address, the check made when a search is sent drops it.
+        app.ui.stac.api = "https://example.org/stac/v1".into();
+        keep_preset_sort_for_its_api(&mut app.ui.stac);
+        assert_eq!((app.ui.stac.sortby.as_str(), app.ui.stac.sort_is_default), ("", false));
+    }
+
+    /// Reopening STAC Search from the ribbon (no preset) takes the preset's default sort with it,
+    /// so it can't go on to another API typed in afterwards.
+    #[test]
+    fn reopening_the_dialog_without_a_preset_drops_the_presets_sort() {
+        let mut app = RustGisApp::with_sample();
+        app.run("ui.stac.sentinel2", serde_json::Value::Null).unwrap();
+        assert_eq!(app.ui.stac.sortby, PRESET_SORT);
+        app.run("ui.stac", serde_json::Value::Null).unwrap();
+        assert_eq!(app.ui.stac.sortby, "");
+        switch_api(&mut app.ui.stac, "https://example.org/stac/v1");
+        assert_eq!(app.ui.stac.sortby, "");
     }
 
     #[test]
@@ -2172,6 +2447,23 @@ mod tests {
         find_items(&mut app);
         clear_area(&mut app);
         assert!(app.ui.stac.preparing.is_none() && app.ui.stac.parts.is_empty());
+    }
+
+    #[test]
+    fn the_sort_is_fixed_while_the_area_is_made_and_the_search_goes_out_with_it() {
+        let mut app = RustGisApp::with_sample();
+        app.ui.stac.api = "http://127.0.0.1:1/stac".into();
+        app.ui.stac.collection = "c".into();
+        app.ui.stac.sortby = "-datetime".into();
+        app.ui.stac.parts.push(rectangle([7.0, 46.0, 8.0, 47.0]));
+        assert!(!busy(&app.ui.stac), "nothing is under way before Find Items");
+        find_items(&mut app);
+        // The dialog is busy while the area is made: the Sort by dropdown is off then, as Find
+        // Items is, so a pick can't show in it without being the one sent.
+        assert!(app.ui.stac.preparing.is_some() && busy(&app.ui.stac));
+        wait_for_the_area(&mut app);
+        assert_eq!(app.ui.stac.asked_sort.as_deref(), Some("-datetime"));
+        assert!(busy(&app.ui.stac) || app.ui.stac.error.is_some(), "the search is under way until it is answered");
     }
 
     #[test]

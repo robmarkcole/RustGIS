@@ -557,3 +557,54 @@ fn refuses_inputs_it_cannot_tabulate() {
         "the sum field 'pop' can't also be a class field"
     );
 }
+
+/// Issue #1966: two touching class boundaries leave tiny interior rings in the combined cut.
+/// The area stays near the sum of the individual cuts, without a warning for valid input.
+#[test]
+fn touching_classes_keep_a_positive_ground_area() {
+    let polygon = |points: &[(f64, f64)]| Some(Geometry::Polygon(vec![vec![points.iter().map(|&(x, y)| Coord::new(x, y)).collect()]]));
+    let mut z = Dataset::new("zones", GeometryType::Polygon, vec![Field::new("zone", FieldType::Text)]);
+    z.push_next(
+        polygon(&[(-89.73323, 35.02434), (-89.73186, 35.03686), (-89.72338, 35.02649), (-89.73323, 35.02434)]),
+        vec![Value::Text("zone".into())],
+    );
+    let mut c = Dataset::new("classes", GeometryType::Polygon, vec![]);
+    c.push_next(
+        polygon(&[
+            (-89.72515, 35.02759),
+            (-89.72513, 35.02759),
+            (-89.72513, 35.0276),
+            (-89.72512, 35.0276),
+            (-89.72511, 35.0275),
+            (-89.72515, 35.02759),
+        ]),
+        vec![],
+    );
+    c.push_next(
+        polygon(&[
+            (-89.69212, 35.03669),
+            (-89.72512, 35.0276),
+            (-89.72513, 35.0276),
+            (-89.72513, 35.02759),
+            (-89.72515, 35.02759),
+            (-89.73252, 35.02294),
+            (-89.73463, 35.02829),
+            (-89.69213, 35.03686),
+            (-89.69212, 35.03669),
+        ]),
+        vec![],
+    );
+    let result = rustgis_analysis::run(
+        "tabulateIntersection",
+        &layers(z, c),
+        &json!({"zones": "zones", "zoneFields": "zone", "classes": "classes"}),
+    )
+    .unwrap();
+    assert_eq!(result.messages, ["Tabulate Intersection: 1 row"]);
+    let out = table(result);
+    assert_eq!(out.features.len(), 1);
+    let area = out.value(0, out.field_index("area_km2").unwrap()).as_f64().unwrap();
+    let percentage = out.value(0, out.field_index("percentage").unwrap()).as_f64().unwrap();
+    assert!((area - 0.29858434).abs() < 1e-5, "area_km2 = {area}");
+    assert!((percentage - 48.99970001).abs() < 1e-5, "percentage = {percentage}");
+}

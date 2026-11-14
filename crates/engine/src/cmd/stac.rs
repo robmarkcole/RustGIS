@@ -203,6 +203,10 @@ fn search(s: &mut Session, p: &Value) -> CmdResult {
         } else {
             next
         };
+        // An API without the sort extension may ignore a sort instead of refusing it.
+        if let Some(note) = sort_ignored(&items, search.sortby.as_deref()).or_else(|| sort_unchecked(&items, search.sortby.as_deref())) {
+            s.warn(note);
+        }
         let all = b(p, "properties").unwrap_or(false);
         let mut out =
             json!({"count": items.len(), "items": items.iter().map(|i| stac::item_json_with(i, all)).collect::<Vec<_>>(), "next": next});
@@ -219,6 +223,33 @@ fn search(s: &mut Session, p: &Value) -> CmdResult {
         }
         Ok(out)
     }
+}
+
+/// What to warn when the items an API answered are visibly not in the order asked for (an API
+/// without the sort extension may ignore a sort rather than refuse it); none when they are in
+/// order or it can't be told. Only the desktop searches here (the web app searches from its pane).
+#[cfg(not(target_arch = "wasm32"))]
+fn sort_ignored(items: &[Item], sortby: Option<&str>) -> Option<String> {
+    (stac::sort_followed(items, sortby) == Some(false)).then(|| {
+        format!(
+            "sortby {} was not followed: the items are not in that order, so this API may not sort (its first {} items are shown in its own order)",
+            sortby.unwrap_or("").trim(),
+            items.len()
+        )
+    })
+}
+
+/// What to say when a sort was asked for and the items can't show whether the API followed it
+/// (the sort is on a field that isn't compared, or the dates can't be compared): the order is
+/// the API's, and not known to be the one asked for.
+#[cfg(not(target_arch = "wasm32"))]
+fn sort_unchecked(items: &[Item], sortby: Option<&str>) -> Option<String> {
+    stac::sort_unchecked(items, sortby).then(|| {
+        format!(
+            "sortby {} could not be checked: the items' order can't be told, so it is not known whether this API sorted them",
+            sortby.unwrap_or("").trim()
+        )
+    })
 }
 
 /// A search of a static catalog: a walk from its document, keeping the items that match.
@@ -800,16 +831,18 @@ pub fn stac_cube(s: &mut Session, p: &Value) -> Result<StacCube, String> {
     };
     let read_tile_rows = layout.levels.get(read).map_or(1, |l| l.tile_height).div_ceil(factor).max(1);
     // The area, in the files' coordinates: the box's edges, each at 32 points, as a curved grid
-    // (MODIS's sinusoidal) bends them.
+    // (MODIS's sinusoidal) bends them. A point the system refuses (one it can't bring back,
+    // #1925) is an error: the points left would bound less than the box.
     let tr = layout.crs.transformer()?;
     let (mut x0, mut y0, mut x1, mut y1) = (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
     let [w, so, e, n] = bbox;
     for k in 0..=32 {
         let t = f64::from(k) / 32.0;
         for (lon, lat) in [(w + (e - w) * t, so), (w + (e - w) * t, n), (w, so + (n - so) * t), (e, so + (n - so) * t)] {
-            if let Some(c) = tr.from_lonlat(rustgis_geom::Coord::new(lon, lat)) {
-                (x0, y0, x1, y1) = (x0.min(c.x), y0.min(c.y), x1.max(c.x), y1.max(c.y));
-            }
+            let c = tr.from_lonlat(rustgis_geom::Coord::new(lon, lat)).ok_or_else(|| {
+                format!("the area reaches ({lon:.3}, {lat:.3}), which {} can't hold; choose a smaller area", layout.crs.label())
+            })?;
+            (x0, y0, x1, y1) = (x0.min(c.x), y0.min(c.y), x1.max(c.x), y1.max(c.y));
         }
     }
     if !(x0 < x1 && y0 < y1) {
@@ -1361,6 +1394,34 @@ enum Sample {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use rustgis_data::raster::GeoTransform;
+
+    /// A search sorted by date warns when the API's items are not in that order, and only then.
+    #[test]
+    fn a_sort_the_api_ignored_is_warned_and_one_it_followed_is_not() {
+        let features: Vec<_> = ["2024-06-03T00:00:00Z", "2024-06-02T00:00:00Z", "2024-06-01T00:00:00Z"]
+            .iter()
+            .enumerate()
+            .map(
+                |(n, d)| serde_json::json!({"type": "Feature", "id": format!("i{n}"), "bbox": [0, 0, 1, 1], "properties": {"datetime": d}}),
+            )
+            .collect();
+        let body = serde_json::json!({"type": "FeatureCollection", "features": features}).to_string();
+        let items = crate::render::rustgis_tiles::stac::parse_items(body.as_bytes(), "https://x.org/v1/search").unwrap().0;
+        // Newest first, as answered: nothing to say. Asked oldest first: the API did not sort.
+        assert_eq!(super::sort_ignored(&items, Some("-datetime")), None);
+        assert_eq!(super::sort_ignored(&items, None), None);
+        assert_eq!(super::sort_ignored(&items, Some("platform")), None);
+        let note = super::sort_ignored(&items, Some(" datetime ")).unwrap();
+        assert!(note.contains("sortby datetime was not followed") && note.contains("3 items"), "{note}");
+        // A sort the items can't show is said so, and only then: not for one the items show, no
+        // sort, or one item.
+        let unknown = super::sort_unchecked(&items, Some(" platform ")).unwrap();
+        assert!(unknown.contains("sortby platform could not be checked"), "{unknown}");
+        assert_eq!(super::sort_unchecked(&items, Some("-datetime")), None);
+        assert_eq!(super::sort_unchecked(&items, Some("datetime")), None, "ignored is the other note's to say");
+        assert_eq!(super::sort_unchecked(&items, None), None);
+        assert_eq!(super::sort_unchecked(&items[..1], Some("platform")), None);
+    }
 
     /// A piece's rows: as many as fit, whole tiles of rows when one fits, at least one; none when
     /// a single row is too many. Piauí at ~1 km over 25 years of 16-day composites (645 × 984

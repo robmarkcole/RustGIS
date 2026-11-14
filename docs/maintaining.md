@@ -70,6 +70,12 @@ same files. New and changed code follows these rules; not every existing reader 
   misread.
 - Where a change allows it, reading a new version ships at least one release before anything
   writes it.
+- A project, map or layer file lists in `requires` each capability it needs that an older reader
+  would lose or misread: a reader refuses one it doesn't know, naming it. Task, presentation,
+  notebook and model readers don't check `requires` yet. A release reads
+  `.rgis` format 2 before any writes it (`READ_FORMAT` and `CAPABILITIES` in
+  `crates/engine/src/project.rs`), so what is added to format 2 after that comes with a capability
+  name, added to `CAPABILITIES` where it is read.
 - RustGIS releases, file formats, the plugin ABI and the GeoLibre runner protocol are versioned
   separately.
 - A program RustGIS installs from elsewhere, such as the native GeoLibre runner, is pinned to a

@@ -51,6 +51,9 @@ pub fn commands() -> Vec<C> {
         C::new("map.terrain", "Terrain", "View › Scene", terrain).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network)).params(
             r#"{"layer"?: a DEM raster layer (heights in metres; without layer or tiles, and no terrain yet, the active layer when it is a raster) | "tiles"?: elevation tile URL with {z}/{x}/{y}, "encoding"?: "terrarium"|"mapbox" (tiles; default terrarium), "exaggeration"?: 0 to 20 (default 1, or the terrain's), "off"?: true}"#,
         ),
+        C::new("map.exportOrbit", "Export Orbit", "View › Scene", export_orbit).inputs(orbit_inputs).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
+            .view()
+            .params(r#"{"path": "*.gif" | "*.zip" (PNG frames), "frames"?: 1 to 2000 (default 60), "turn"?: degrees the bearing turns by over the frames (default 360, once round; negative turns the other way), "width"?, "height"?: points, 64 to 4096 (default 640 × 400), "dpi"?: 48 to 600 (default 96), "speed"?: milliseconds a GIF frame shows for (default 50; a GIF keeps it to the hundredth of a second)}"#),
         C::new("map.displayType", "Display Type", "View › Options", |s, p| {
             let fast = match ps(p, "mode").ok_or("mode is required")? {
                 "quality" => false,
@@ -169,6 +172,82 @@ fn camera(s: &mut Session, p: &Value) -> CmdResult {
     }
     let c = s.map().center_lonlat();
     Ok(json!({"lon": c.x, "lat": c.y, "scale": s.scale(), "projection": s.map().projection.label()}))
+}
+
+/// The most degrees an orbit export turns by: ten times round.
+const MAX_TURN: f64 = 3600.0;
+
+/// The bearing of frame `i` of the `n` of an orbit that turns by `turn` degrees from `start`.
+/// Whole turns stop one step short of where they began, so the animation loops with no frame
+/// shown twice; a part of a turn ends on its last bearing.
+fn orbit_bearing(start: f64, turn: f64, i: usize, n: usize) -> f64 {
+    let steps = if turn.rem_euclid(360.0) == 0.0 { n } else { n.saturating_sub(1).max(1) };
+    start + turn * i as f64 / steps as f64
+}
+
+/// An orbit draws the map's own sources at every bearing: the renderer's bindings.
+fn orbit_inputs(input: &super::InputContext<'_>, _: &Value) -> Result<super::Inputs, String> {
+    Ok(super::tiles::render_inputs(input.map()))
+}
+
+/// Turns the view about its centre, keeping its scale and pitch, and writes a frame a step as an
+/// animated GIF or a zip of PNGs (the writer `time.export` uses). The view comes back to where
+/// it was however the frames end.
+///
+/// It runs to its end where it is called, the interface's thread in the app, as `time.export`
+/// and `animation.export` do: each frame is drawn from the session's own map, which the camera
+/// turns, while a background export (`exports::IN_BACKGROUND`) reads the session once and draws
+/// without it. Drawing the frames from a copy of the map, with progress and Cancel, is part 2 of
+/// #1916.
+fn export_orbit(s: &mut Session, p: &Value) -> CmdResult {
+    use super::time::{MAX_FRAMES, MAX_PIXELS};
+    // Files are written by the desktop app; the browser's go through its services.
+    if cfg!(target_arch = "wasm32") {
+        return Err("exporting an orbit needs the desktop app".into());
+    }
+    let path = ps(p, "path").ok_or("path is required (a .gif, or a .zip of PNG frames)")?.to_string();
+    let lower = path.to_ascii_lowercase();
+    let gif = lower.ends_with(".gif");
+    if !gif && !lower.ends_with(".zip") {
+        return Err("path must end in .gif (an animation) or .zip (PNG frames)".into());
+    }
+    // A number outside its range is refused, never drawn at the nearest one unsaid.
+    let within = |k: &str, default: f64, (least, most): (f64, f64)| match p.get(k) {
+        None | Some(Value::Null) => Ok(default),
+        Some(v) => v.as_f64().filter(|x| (least..=most).contains(x)).ok_or_else(|| format!("{k} must be a number from {least} to {most}")),
+    };
+    let frames = within("frames", 60.0, (1.0, MAX_FRAMES as f64))?;
+    if frames.fract() != 0.0 {
+        return Err("frames must be a whole number".into());
+    }
+    let turn = within("turn", 360.0, (-MAX_TURN, MAX_TURN))?;
+    if turn == 0.0 {
+        return Err("turn must not be 0: it is the degrees the view turns by".into());
+    }
+    let (w, h) = (within("width", 640.0, (64.0, 4096.0))?, within("height", 400.0, (64.0, 4096.0))?);
+    let dpi = within("dpi", 96.0, (48.0, 600.0))?;
+    let speed = within("speed", 50.0, (16.0, 60_000.0))? as u32;
+    // Rendering blocks while it runs, and every frame is held until the file is written: a
+    // bound on the work, as time.export's.
+    let pixels = frames * w * h * (dpi / 96.0).powi(2);
+    if pixels > MAX_PIXELS {
+        return Err(format!(
+            "{frames} frames at {w} × {h} points and {dpi} dpi is {:.0} million pixels, more than the {:.0} million an orbit draws: lower the frames, the size or the dpi",
+            pixels / 1e6,
+            MAX_PIXELS / 1e6
+        ));
+    }
+    let n = frames as usize;
+    let saved = s.map().camera;
+    let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        super::time::frames(s, "The orbit", n, (w, h, dpi), gif.then_some(speed), |s, i| {
+            s.map_mut().camera.set_bearing(orbit_bearing(saved.bearing, turn, i, n));
+        })
+    }));
+    s.map_mut().camera = saved;
+    let bytes = made.map_err(|_| "exporting the orbit failed unexpectedly".to_string())??;
+    rustgis_data::io::write_atomic(std::path::Path::new(&path), &bytes).map_err(|e| format!("{path}: {e}"))?;
+    Ok(json!({"path": path, "frames": n, "turn": turn, "bytes": bytes.len()}))
 }
 
 /// One first-person step: a tenth of the view, forward (north), right (east) or up (zooming out).

@@ -895,6 +895,8 @@ impl Raster {
         let nd = self.nodata.map(|v| v as f32);
         let valid = move |v: f32| v.is_finite() && nd.is_none_or(|d| v != d);
         let overview = self.overview.is_some();
+        // Bands whose attribute table's class names aren't used: the file names their classes.
+        let mut unused_tables = 0usize;
         // Worked out before the bands change, as a colour band's take its alpha band's values.
         let (alpha, opaque) = (self.color.alpha(self.bands.len()), alpha_max(&self.data_type));
         let mut measured: Vec<Option<BandStats>> = (0..self.bands.len())
@@ -910,8 +912,13 @@ impl Raster {
             if let Some(d) = p.and_then(|p| p.description.as_ref()) {
                 band.name = d.clone();
             }
+            // A table's names don't replace those the file's own metadata gave.
             if let Some(p) = p.filter(|p| !p.categories.is_empty()) {
-                band.classes = p.categories.clone();
+                if p.from_table && !band.classes.is_empty() {
+                    unused_tables += 1;
+                } else {
+                    band.classes = p.categories.clone();
+                }
             }
             if let Some(w) = p.and_then(|p| p.wavelength) {
                 band.wavelength = Some(w);
@@ -919,6 +926,11 @@ impl Raster {
             if let Some(stats) = measured.get_mut(i).and_then(Option::take) {
                 band.stats = stats;
             }
+        }
+        if unused_tables > 0 {
+            self.lost.push(format!(
+                "{from}: {unused_tables} attribute table(s) of class names not read: the file's own metadata names those bands' classes"
+            ));
         }
     }
 
@@ -1814,6 +1826,38 @@ pub(crate) mod tests {
         std::fs::write(dir.join("dem.tif.aux.xml"), "<PAMDataset><PAMRasterBand").unwrap();
         assert_eq!(read_path(&tif).unwrap().bands[0].name, "Band 1");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gdal_sidecars_name_classes_from_an_attribute_table() {
+        let dir = std::env::temp_dir().join(format!("rustgis-pam-rat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let gt = GeoTransform { origin_x: 10.0, origin_y: 50.0, pixel_width: 0.5, pixel_height: -0.5 };
+        let r = Raster::new("lc", 2, 2, vec![vec![1.0, 3.0, 3.0, 1.0]], gt, Crs::LonLat, None, ColorHint::Gray, "UInt8").unwrap();
+        let tif = dir.join("lc.tif");
+        std::fs::write(&tif, geotiff::write(&r, 0).unwrap()).unwrap();
+        let xml = r#"<PAMDataset><PAMRasterBand band="1"><GDALRasterAttributeTable Row0Min="0" BinSize="1">
+<FieldDefn index="0"><Name>Value</Name><Type>0</Type><Usage>5</Usage></FieldDefn>
+<FieldDefn index="1"><Name>Class_Name</Name><Type>2</Type><Usage>2</Usage></FieldDefn>
+<Row index="0"><F>1</F><F>Water</F></Row><Row index="1"><F>3</F><F>Forest</F></Row>
+</GDALRasterAttributeTable></PAMRasterBand></PAMDataset>"#;
+        std::fs::write(dir.join("lc.tif.aux.xml"), xml).unwrap();
+        let back = read_path(&tif).unwrap();
+        let b = &back.bands[0];
+        assert_eq!(b.classes, ["", "Water", "", "Forest"]);
+        assert_eq!((b.class_name(1.0), b.class_name(3.0), b.class_name(2.0)), (Some("Water"), Some("Forest"), None));
+        assert!(back.lost.is_empty(), "{:?}", back.lost);
+        // Class names the GeoTIFF gives itself are kept over the table's, and that is said.
+        let mut named = r.clone();
+        named.bands[0].classes = vec![String::new(), "Lake".into()];
+        std::fs::write(&tif, geotiff::write(&named, 0).unwrap()).unwrap();
+        let own = read_path(&tif).unwrap();
+        assert_eq!(own.bands[0].classes, ["", "Lake"]);
+        assert_eq!(
+            own.lost,
+            ["its .aux.xml sidecar: 1 attribute table(s) of class names not read: the file's own metadata names those bands' classes"]
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -3995,9 +3995,110 @@ fn simplify_ring(ring: &geo::LineString<f64>, tol_m: f64, run: &SimplifyRun) -> 
 }
 
 /// A geometry simplified (Douglas–Peucker) to a tolerance in meters, converted at each vertex's
-/// latitude ([`simplify_coords`]).
-pub fn simplify_geometry(g: &Geometry, tol_m: f64) -> Geometry {
-    simplify_checked(g, tol_m).geometry
+/// latitude ([`simplify_coords`]), with what Simplify says about it ([`SimplifyNotes`]): a caller
+/// outside the Simplify tool says them too (#1811).
+pub fn simplify_geometry(g: &Geometry, tol_m: f64) -> (Geometry, SimplifyNotes) {
+    let s = simplify_checked(g, tol_m);
+    let mut notes = SimplifyNotes { broken: usize::from(s.broken), capped: usize::from(s.capped), ..SimplifyNotes::default() };
+    // A line or polygon with a coordinate missing, or a longitude too far out for the analysis
+    // plane, is left exactly as it was (`simplify_checked`), and the feature is counted. Otherwise
+    // a latitude past ±90° (bad data), infinite ones included, is taken as that pole by the plane,
+    // and the vertices are counted; a line part of fewer than 2 vertices has no line to keep
+    // (`from_line`), and is counted. Points aren't simplified.
+    if tol_m > 0.0 && !s.broken && !matches!(g, Geometry::Point(_) | Geometry::MultiPoint(_)) {
+        let mut beyond = false;
+        g.for_each_coord(|c| beyond |= !c.y.is_nan() && c.y.abs() > rustgis_geom::MAX_LAT);
+        notes.polar = usize::from(beyond);
+        // The vertices taken to a pole are those in what's kept: a line's parts of 2 vertices or
+        // more, a polygon's rings. A line whose parts are all that short is kept as it was
+        // (`from_line` has none to give), so only the short parts beside a longer one go.
+        (notes.past_pole, notes.short) = match g {
+            Geometry::Line(parts) if parts.iter().any(|p| p.len() >= 2) => {
+                (past_pole(parts.iter().filter(|p| p.len() >= 2).flatten()), parts.iter().filter(|p| p.len() < 2).count())
+            }
+            Geometry::Line(_) => (0, 0),
+            Geometry::Polygon(polygons) => (past_pole(polygons.iter().flatten().flatten()), 0),
+            _ => (0, 0),
+        };
+        // A geometry given back as it was (nothing to keep in the plane, or canceled) moved nothing
+        // and left nothing out: looked at only when there's something to say.
+        if (notes.past_pole > 0 || notes.short > 0) && s.geometry == *g {
+            (notes.past_pole, notes.short) = (0, 0);
+        }
+    }
+    (s.geometry, notes)
+}
+
+/// The vertices with a latitude past a pole (bad data), infinite ones included: Simplify takes
+/// them as that pole ([`SimplifyNotes::past_pole`]).
+pub fn past_pole<'a>(coords: impl IntoIterator<Item = &'a Coord>) -> usize {
+    coords.into_iter().filter(|c| !c.y.is_nan() && c.y.abs() > 90.0).count()
+}
+
+/// What Simplify left alone or changed beyond simplifying, counted over the geometries it was
+/// given ([`simplify_geometry`]); [`SimplifyNotes::messages`] says it, one notice per kind.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SimplifyNotes {
+    /// Lines and polygons reaching beyond 85.05°, where the tolerance is taken east–west at 85°'s
+    /// scale (less is simplified away there than asked, #1033).
+    pub polar: usize,
+    /// Lines and polygons left as they were: a coordinate missing, or a longitude too far out.
+    pub broken: usize,
+    /// Features too intricate to simplify whole within the work allowed ([`SIMPLIFY_WORK`]).
+    pub capped: usize,
+    /// Line parts of fewer than 2 vertices left out.
+    pub short: usize,
+    /// Vertices with a latitude past a pole, taken as that pole before simplifying.
+    pub past_pole: usize,
+}
+
+impl SimplifyNotes {
+    /// Counts `other`'s too.
+    pub fn add(&mut self, other: &SimplifyNotes) {
+        self.polar += other.polar;
+        self.broken += other.broken;
+        self.capped += other.capped;
+        self.short += other.short;
+        self.past_pole += other.past_pole;
+    }
+
+    /// All but [`SimplifyNotes::polar`], for a caller that simplifies to its own tolerance (a
+    /// package, a locator's sketch): reaching beyond 85.05° only simplifies a little less there, and
+    /// any world map reaches it (Antarctica, to -90°), so saying it would be said every time.
+    pub fn without_polar(&self) -> SimplifyNotes {
+        SimplifyNotes { polar: 0, ..*self }
+    }
+
+    /// One notice per kind counted, each starting with `lead` (who simplified: "Simplify"); none
+    /// when nothing was.
+    pub fn messages(&self, lead: &str) -> Vec<String> {
+        let SimplifyNotes { polar, broken, capped, short, past_pole } = *self;
+        let mut said = Vec::new();
+        if polar > 0 {
+            said.push(format!(
+                "{lead}: {polar} line or polygon feature(s) reach beyond 85.05°, where the tolerance is taken east–west at 85°'s scale: less is simplified away there than asked"
+            ));
+        }
+        if broken > 0 {
+            said.push(format!(
+                "{lead}: {broken} line or polygon feature(s) have a coordinate missing, or a longitude too far out to place: they are left as they were"
+            ));
+        }
+        if capped > 0 {
+            said.push(format!(
+                "{lead}: {capped} feature(s) were too intricate to simplify whole within the work allowed: parts of them keep more vertices than asked"
+            ));
+        }
+        if short > 0 {
+            said.push(format!("{lead}: {short} line part(s) of fewer than 2 vertices left out"));
+        }
+        if past_pole > 0 {
+            said.push(format!(
+                "{lead}: {past_pole} vertex(es) with a latitude past a pole found (taken as that pole before simplifying, so some may then go)"
+            ));
+        }
+        said
+    }
 }
 
 /// What [`simplify_checked`] made of a geometry, and what it said no to.
@@ -4085,7 +4186,8 @@ fn simplify_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result<Too
     let ds = input(inp, p, "input")?;
     let tol = num(p, "tolerance").ok_or("Tolerance must be a number")?.abs() * 1000.0;
     let mut out = copy_schema(ds, out_name(p, format!("{}_Simplified", ds.name)), ds.geometry_type);
-    let (mut before, mut after, mut polar) = (0usize, 0usize, 0usize);
+    let (mut before, mut after, mut without) = (0usize, 0usize, 0usize);
+    let mut notes = SimplifyNotes::default();
     let input_rows = rows(inp, p, "input", ds);
     crate::control::begin(input_rows.len());
     let threads = threads.unwrap_or_else(|| crate::parallel::threads_for(input_rows.len(), PARALLEL_FEATURES));
@@ -4094,86 +4196,28 @@ fn simplify_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result<Too
         threads,
         || (),
         |_, _, &r| {
-            let made = ds.features.get(r).and_then(|f| f.geometry.as_ref()).map(|g| {
-                // Each vertex's tolerance is taken at its own latitude, at most 85°'s (`merc_scale`):
-                // a line or polygon reaching beyond 85.05° has it east–west there at 85°'s, where the
-                // ground is far narrower, so less is taken out there than asked (#1033). Points
-                // aren't simplified.
-                // A line or polygon with a coordinate missing, or a longitude too far out for the
-                // analysis plane, is left exactly as it was (`simplify_checked`), and the feature is
-                // counted. Otherwise a latitude past ±90° (bad data), infinite ones included, is
-                // taken as that pole by the plane, and the vertices are counted; a line part of fewer
-                // than 2 vertices has no line to keep (`from_line`), and is counted.
-                let s = simplify_checked(g, tol);
-                let (mut beyond, mut past_pole, mut short) = (false, 0usize, 0usize);
-                // A geometry given back as it was (nothing to keep in the plane) moved nothing.
-                let changed = s.geometry != *g;
-                if tol > 0.0 && !s.broken && !matches!(g, Geometry::Point(_) | Geometry::MultiPoint(_)) {
-                    let past = |c: &Coord| !c.y.is_nan() && c.y.abs() > 90.0;
-                    g.for_each_coord(|c| beyond |= !c.y.is_nan() && c.y.abs() > rustgis_geom::MAX_LAT);
-                    // The vertices taken to a pole are those in what's kept: a line's parts of 2
-                    // vertices or more, a polygon's rings.
-                    past_pole = match g {
-                        _ if !changed => 0,
-                        Geometry::Line(parts) => parts.iter().filter(|p| p.len() >= 2).flatten().filter(|c| past(c)).count(),
-                        _ => {
-                            let mut n = 0;
-                            g.for_each_coord(|c| n += usize::from(past(&c)));
-                            n
-                        }
-                    };
-                    // A line whose parts are all that short is kept as it was (`from_line` has none
-                    // to give), so only the short parts beside a longer one go.
-                    if let Geometry::Line(parts) = g
-                        && parts.iter().any(|p| p.len() >= 2)
-                    {
-                        short = parts.iter().filter(|p| p.len() < 2).count();
-                    }
-                }
-                (g.coord_count(), beyond, past_pole, short, s)
-            });
+            // Each vertex's tolerance is taken at its own latitude, at most 85°'s (`merc_scale`): a
+            // line or polygon reaching beyond 85.05° has it east–west there at 85°'s, where the
+            // ground is far narrower, so less is taken out there than asked (#1033). What it left
+            // alone or changed is counted ([`SimplifyNotes`]).
+            let made = ds.features.get(r).and_then(|f| f.geometry.as_ref()).map(|g| (g.coord_count(), simplify_geometry(g, tol)));
             Ok::<_, String>(made)
         },
     )?;
-    let (mut broken, mut without, mut past_pole, mut short, mut capped) = (0usize, 0usize, 0usize, 0usize, 0usize);
     for (r, made) in input_rows.into_iter().zip(simplified) {
         let Some(f) = ds.features.get(r) else { continue };
         // A feature without geometry has nothing to simplify: left out, and counted.
-        let Some((count, beyond, past, parts, s)) = made else {
+        let Some((count, (geometry, said))) = made else {
             without += 1;
             continue;
         };
         before += count;
-        polar += usize::from(beyond);
-        broken += usize::from(s.broken);
-        capped += usize::from(s.capped);
-        past_pole += past;
-        short += parts;
-        after += s.geometry.coord_count();
-        out.push(Some(s.geometry), f.attrs.clone());
+        notes.add(&said);
+        after += geometry.coord_count();
+        out.push(Some(geometry), f.attrs.clone());
     }
     let mut messages = vec![format!("Simplify: {before} → {after} vertices")];
-    if polar > 0 {
-        messages.push(format!(
-            "Simplify: {polar} line or polygon feature(s) reach beyond 85.05°, where the tolerance is taken east–west at 85°'s scale: less is simplified away there than asked"
-        ));
-    }
-    if broken > 0 {
-        messages.push(format!(
-            "Simplify: {broken} line or polygon feature(s) have a coordinate missing, or a longitude too far out to place: they are left as they were"
-        ));
-    }
-    if capped > 0 {
-        messages.push(format!(
-            "Simplify: {capped} feature(s) were too intricate to simplify whole within the work allowed: parts of them keep more vertices than asked"
-        ));
-    }
-    if short > 0 {
-        messages.push(format!("Simplify: {short} line part(s) of fewer than 2 vertices left out"));
-    }
-    if past_pole > 0 {
-        messages.push(format!("Simplify: {past_pole} vertex(es) with a latitude past a pole found (taken as that pole before simplifying, so some may then go)"));
-    }
+    messages.extend(notes.messages("Simplify"));
     if without > 0 {
         messages.push(format!("Simplify: {without} feature(s) left out: they have no geometry to simplify"));
     }
@@ -5073,7 +5117,7 @@ fn lonlat_line(coords: &[Coord]) -> geo::LineString<f64> {
 /// lon/lat polygon geometry on the WGS 84 ellipsoid, as Calculate Geometry Attributes gives them;
 /// zero for any other geometry.
 fn ground_area_perimeter(g: &Geometry) -> (f64, f64) {
-    use geo::GeodesicArea;
+    use geo::{BoundingRect, GeodesicArea};
     let (mut a, mut per) = (0.0, 0.0);
     let Geometry::Polygon(polys) = g else { return (a, per) };
     for rings in polys {
@@ -5101,10 +5145,14 @@ fn ground_area_perimeter(g: &Geometry) -> (f64, f64) {
             let polar = ring.0.first().zip(ring.0.last()).is_some_and(|(a, b)| (a.x - b.x).abs() > 180.0);
             let orientable = !polar && ring.0.iter().all(|c| c.x.is_finite() && (-90.0..=90.0).contains(&c.y));
             let polygon = geo::Polygon::new(ring, vec![]);
-            let (rp, ra) = if orientable {
+            // Within a longitude span of 180°, the ring cannot enclose more than a hemisphere.
+            // Use signed magnitude there: a tiny overlay sliver can have opposite planar and
+            // geodesic windings, making its unsigned area nearly the whole Earth (#1966).
+            let wide = polygon.bounding_rect().is_some_and(|bounds| bounds.width() > 180.0);
+            let (rp, ra) = if orientable && wide {
                 polygon.orient(Direction::Default).geodesic_perimeter_area_unsigned()
             } else {
-                // Keep smaller polar caps; invalid coordinates bypass planar orientation.
+                // Keep smaller local rings and polar caps; invalid coordinates bypass orientation.
                 let (perimeter, area) = polygon.geodesic_perimeter_area_signed();
                 (perimeter, area.abs())
             };
@@ -7739,7 +7787,7 @@ mod tests {
         let inputs = Map(HashMap::from([("zones".into(), ds)]));
         let mut previous = original.coord_count();
         for tolerance in [0.0, 100.0, 500.0, 1000.0, 2000.0, 5000.0, 25000.0, 100000.0] {
-            let simple = simplify_geometry(&original, tolerance);
+            let simple = simplify_geometry(&original, tolerance).0;
             assert!(simple.coord_count() <= previous, "{tolerance} m: {} > {previous}", simple.coord_count());
             previous = simple.coord_count();
             let Geometry::Polygon(parts) = &simple else { panic!("polygon required") };
@@ -7781,7 +7829,7 @@ mod tests {
             let ring = [(-30.0, 60.0), (0.0, 60.0 + dy), (30.0, 60.0), (30.0, 89.0), (0.0, 89.0), (-30.0, 89.0), (-30.0, 60.0)]
                 .map(|(x, y)| Coord::new(x, y))
                 .to_vec();
-            let g = simplify_geometry(&Geometry::Polygon(vec![vec![ring]]), 3_000.0);
+            let g = simplify_geometry(&Geometry::Polygon(vec![vec![ring]]), 3_000.0).0;
             let Geometry::Polygon(p) = g else { return false };
             p.iter().flatten().flatten().any(|c| c.x.abs() < 1e-9 && c.y < 61.0)
         };
@@ -7954,7 +8002,7 @@ mod tests {
         let control = crate::control::Control::new();
         control.cancel();
         let _installed = crate::control::install(Some(control));
-        assert_eq!(simplify_geometry(&polygon, 1_000.0), polygon);
+        assert_eq!(simplify_geometry(&polygon, 1_000.0).0, polygon);
     }
 
     /// The bound holds on WGS 84, not only on the sphere: at 60°N, a vertex 0.01795° east of a
@@ -8121,13 +8169,51 @@ mod tests {
         assert!(res.messages.iter().all(|m| !m.contains("beyond 85.05°")), "{:?}", res.messages);
     }
 
+    /// [`simplify_geometry`] gives what Simplify says with the geometry, for callers outside the
+    /// tool (#1811): a line reaching 95° (bad data) with a part of one vertex is counted as reaching
+    /// beyond 85.05°, its vertex past the pole and its short part; a clean line has nothing to say.
+    /// The notices are the tool's, each led by who simplified.
+    #[test]
+    fn simplify_geometry_says_what_it_did() {
+        let bad =
+            Geometry::Line(vec![vec![Coord::new(0.0, 80.0), Coord::new(1.0, 95.0), Coord::new(2.0, 80.0)], vec![Coord::new(5.0, 5.0)]]);
+        let (_, notes) = simplify_geometry(&bad, 100.0);
+        assert_eq!(notes, SimplifyNotes { polar: 1, short: 1, past_pole: 1, ..SimplifyNotes::default() });
+        // All but reaching beyond 85.05°, for callers simplifying to their own tolerance.
+        assert_eq!(notes.without_polar(), SimplifyNotes { short: 1, past_pole: 1, ..SimplifyNotes::default() });
+        // Canceled (a part whose set-up alone reaches a look at Cancel), the line is given back as
+        // it was: its short part didn't go, so it isn't said to.
+        let long: Vec<Coord> = (0..(crate::control::PACE_WORK / SETUP_WORK + 1)).map(|i| Coord::new(i as f64 * 1e-6, 0.0)).collect();
+        let canceled_line = Geometry::Line(vec![long, vec![Coord::new(5.0, 5.0)]]);
+        let control = crate::control::Control::new();
+        control.cancel();
+        {
+            let _installed = crate::control::install(Some(control));
+            let (back, notes) = simplify_geometry(&canceled_line, 100.0);
+            assert_eq!(back, canceled_line);
+            assert_eq!(notes, SimplifyNotes::default());
+        }
+        let mut all = SimplifyNotes::default();
+        all.add(&notes);
+        all.add(&notes);
+        let said = all.messages("Packaging");
+        assert_eq!(said.len(), 3, "{said:?}");
+        assert!(said.iter().all(|m| m.starts_with("Packaging: ")), "{said:?}");
+        assert!(said.contains(&"Packaging: 2 line part(s) of fewer than 2 vertices left out".to_string()), "{said:?}");
+        let clean = Geometry::Line(vec![vec![Coord::new(0.0, 40.0), Coord::new(1.0, 40.001), Coord::new(2.0, 40.0)]]);
+        let (simple, notes) = simplify_geometry(&clean, 1_000.0);
+        assert_eq!(simple.coord_count(), 2);
+        assert_eq!(notes, SimplifyNotes::default());
+        assert!(notes.messages("Packaging").is_empty());
+    }
+
     #[test]
     fn simplify_keeps_points_lines_and_degenerate_rings() {
         use geo::Area;
         let point = Geometry::Point(Coord::new(10.0, 46.0));
-        assert_eq!(simplify_geometry(&point, 1e6), point);
+        assert_eq!(simplify_geometry(&point, 1e6).0, point);
         let line = Geometry::Line(vec![vec![Coord::new(10.0, 46.0), Coord::new(10.1, 46.0), Coord::new(10.2, 46.0)]]);
-        assert_eq!(simplify_geometry(&line, 1e6).coord_count(), 2);
+        assert_eq!(simplify_geometry(&line, 1e6).0.coord_count(), 2);
         let repeated = geo::LineString::new(vec![geo::Coord { x: 1.0, y: 1.0 }; 6]);
         assert_eq!(simplify_ring(&repeated, 1e6, &SimplifyRun::default()), repeated);
         let collinear = geo::LineString::from(vec![(0.0, 0.0), (1.0, 0.0), (2.0, 0.0), (3.0, 0.0), (0.0, 0.0)]);

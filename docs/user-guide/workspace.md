@@ -29,6 +29,13 @@ smaller one is loaded whole.
 command line. A package opens as a new, unsaved project; Save writes a plain `.rgis` file.
 Opening or creating a project clears undo history; saving does not.
 
+This version already reads format 2, a newer `.rgis` format
+([#1853](https://github.com/opengeos/RustGIS/issues/1853)), when the file needs nothing this
+version lacks, and saves it in the format it writes today. A project, package, template, map or
+layer file that needs something this version can't read (what it lists under `requires`) is
+refused, naming what it needs, rather than opened without it; one of a newer format still asks
+you to update RustGIS.
+
 A `•` after the project's name in the title bar means it has unsaved changes. Undoing or redoing
 back to the state you last saved clears it. Before the desktop app discards unsaved changes, it
 asks **Save changes to…?** That happens when you quit or close the window, and when New, Open, the

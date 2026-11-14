@@ -657,3 +657,119 @@ fn where_clauses_compare_dates() {
     assert!(parse("-ts", &d).is_err());
     assert_eq!(value(&parse("issued || ''", &d).unwrap(), &d, 0, &Env::default()), Value::Text("2025-12-31".into()));
 }
+
+/// Layers every catalog example fits on: a table, a polygon and a line, each with one feature.
+fn catalog_layers() -> Vec<Dataset> {
+    use crate::Geometry;
+    use rustgis_geom::Coord;
+    let ring = vec![Coord::new(0.0, 0.0), Coord::new(0.01, 0.0), Coord::new(0.01, 0.01), Coord::new(0.0, 0.01), Coord::new(0.0, 0.0)];
+    let mut table = Dataset::new("table", GeometryType::None, vec![]);
+    table.push(None, vec![]);
+    let mut polygons = Dataset::new("polygons", GeometryType::Polygon, vec![]);
+    polygons.push(Some(Geometry::Polygon(vec![vec![ring]])), vec![]);
+    let mut lines = Dataset::new("lines", GeometryType::Polyline, vec![]);
+    lines.push(Some(Geometry::Line(vec![vec![Coord::new(0.0, 0.0), Coord::new(0.01, 0.0)]])), vec![]);
+    vec![table, polygons, lines]
+}
+
+/// The value `text` gives on the first layer of `layers` it parses on.
+fn catalog_value(text: &str, layers: &[Dataset]) -> Option<Value> {
+    let env = Env { map_scale: Some(25_000.0) };
+    layers.iter().find_map(|d| parse(text, d).ok().map(|e| value(&e, d, 0, &env)))
+}
+
+#[test]
+fn every_function_has_one_catalog_entry_that_works() {
+    let layers = catalog_layers();
+    let mut names = std::collections::HashSet::new();
+    for &f in Func::ALL {
+        let s = f.spec();
+        assert_eq!(s.func, f);
+        assert!(names.insert(s.name), "{} is listed twice", s.name);
+        assert_eq!(s.name, s.name.to_ascii_lowercase());
+        assert!(s.signature.starts_with(&format!("{}(", s.name)) && s.signature.ends_with(')'), "{}", s.signature);
+        assert!(s.min <= s.max && s.max <= MAX_ARGS, "{}", s.name);
+        assert!(!s.description.is_empty(), "{} has no description", s.name);
+        assert!(s.example.starts_with(&format!("{}(", s.name)), "{}'s example calls another function", s.name);
+        // The example parses where the function fits and gives a value.
+        let v = catalog_value(s.example, &layers);
+        assert!(v.is_some_and(|v| v != Value::Null), "{} gives nothing", s.example);
+    }
+    // A call resolves through the catalog, in any letter case.
+    assert!(catalog_value("ROUND(1.5)", &layers).is_some());
+    assert!(parse("nonesuch(1)", &layers[0]).is_err_and(|e| e.contains("unknown function")));
+}
+
+#[test]
+fn every_variable_has_one_catalog_entry_that_works() {
+    let layers = catalog_layers();
+    let mut names = std::collections::HashSet::new();
+    for s in VARS {
+        assert!(!s.names.is_empty() && !s.description.is_empty());
+        for name in s.names {
+            assert!(names.insert(name.to_ascii_lowercase()), "{name} is listed twice");
+            assert!(name.starts_with(['@', '$']), "{name}");
+            assert!(catalog_value(name, &layers).is_some_and(|v| v != Value::Null), "{name} gives nothing");
+            assert!(catalog_value(&name.to_ascii_uppercase(), &layers).is_some(), "{name} in upper case");
+        }
+    }
+    assert!(parse("@nonesuch", &layers[0]).is_err_and(|e| e.contains("unknown variable")));
+}
+
+#[test]
+fn every_keyword_is_listed_once_and_read() {
+    let mut words = std::collections::HashSet::new();
+    for k in Kw::ALL {
+        assert!(words.insert(k.word()), "{} is listed twice", k.word());
+        assert_eq!(k.word(), k.word().to_ascii_uppercase());
+        assert!(!k.description().is_empty());
+    }
+    // Each one in a clause that uses it, in lower case.
+    let d = ds();
+    let clause = "NOT pop IS NULL AND (name LIKE 'p%' OR name ILIKE 'l%') AND pop IN (1, 2100000) \
+                  AND pop BETWEEN 1 AND 3000000 AND TRUE AND NOT FALSE \
+                  AND CASE WHEN pop > 1 THEN TRUE ELSE FALSE END";
+    let used: Vec<Kw> =
+        Kw::ALL.iter().copied().filter(|k| clause.split_whitespace().any(|w| w.trim_matches(['(', ')']) == k.word())).collect();
+    assert_eq!(used, Kw::ALL, "the clause should use every keyword");
+    assert_eq!(select(&clause.to_ascii_lowercase(), &d).unwrap(), vec![0]);
+}
+
+/// The user guide's section headed `## {heading}`, up to the next one. A Windows checkout may
+/// give the guide CRLF line endings (`core.autocrlf`), so they are read as LF.
+fn guide_section(heading: &str) -> String {
+    let guide = include_str!("../../../../docs/user-guide/expressions.md").replace("\r\n", "\n");
+    let start = guide.find(&format!("\n## {heading}\n")).unwrap_or_else(|| panic!("no {heading} section"));
+    let rest = guide.get(start + 1..).unwrap_or_default();
+    rest.get(3..).and_then(|r| r.find("\n## ")).map_or(rest, |end| rest.get(..end + 3).unwrap_or(rest)).to_string()
+}
+
+#[test]
+fn the_user_guide_lists_what_the_catalogs_hold() {
+    let listed = guide_section("Functions");
+    for s in super::functions() {
+        assert!(listed.contains(&format!("`{}`", s.signature)), "docs/user-guide/expressions.md: Functions should list `{}`", s.signature);
+    }
+    // And nothing else: every call written in the table's first column is a catalog function.
+    for row in listed.lines().filter(|l| l.starts_with("| `")) {
+        let first = row.split('|').nth(1).unwrap_or_default();
+        for call in first.split('`').skip(1).step_by(2) {
+            let name = call.split('(').next().unwrap_or_default();
+            assert!(super::functions().any(|s| s.name == name), "the guide lists `{call}`, which isn't a function");
+        }
+    }
+    // The units the measures take.
+    for m in [Measure::Area, Measure::Perimeter, Measure::Length] {
+        for (unit, _) in m.units() {
+            assert!(listed.contains(&format!("'{unit}'")), "Functions should name the unit '{unit}'");
+        }
+    }
+    let values = guide_section("Values");
+    for name in VARS.iter().flat_map(|s| s.names) {
+        assert!(values.contains(&format!("`{name}`")), "Values should list `{name}`");
+    }
+    let grammar = guide_section("Grammar");
+    for k in Kw::ALL {
+        assert!(grammar.contains(&format!("\"{}\"", k.word())), "the grammar should use \"{}\"", k.word());
+    }
+}
