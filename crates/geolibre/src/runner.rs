@@ -140,10 +140,33 @@ fn output_within(c: Command, limit: Duration) -> Option<Output> {
     output_until(c, &|| (start.elapsed() >= limit).then(|| "timed out".to_string())).ok()
 }
 
+/// Starts `c`, waiting out a program file that is still held open for writing ("text file
+/// busy"): a runner just written (installed, or replaced) can be held a moment longer by another
+/// process started at the same time, which inherits the open file until it runs its own program.
+/// Tried again for up to a second, unless `stop` gives a reason first (looked at before each
+/// try): then nothing is started and the reason is the error. Any other failure, or a file still
+/// busy after the second, is the error.
+fn spawn_when_free(c: &mut Command, stop: &dyn Fn() -> Option<String>) -> Result<std::process::Child, String> {
+    let start = Instant::now();
+    loop {
+        match c.spawn() {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && start.elapsed() < Duration::from_secs(1) => {
+                if let Some(why) = stop() {
+                    return Err(why);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => return Err(e.to_string()),
+            Ok(child) => return Ok(child),
+        }
+    }
+}
+
 /// Runs `c` to completion, unless `stop` gives a reason first (looked at every 20 ms): then the
 /// process is killed and the reason is the error. Both pipes are drained while it runs.
 fn output_until(mut c: Command, stop: &dyn Fn() -> Option<String>) -> Result<Output, String> {
-    let mut child = c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| e.to_string())?;
+    c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = spawn_when_free(&mut c, stop)?;
     // Drain both pipes on threads while the process runs: a full pipe (large manifests, or
     // many warnings) would otherwise block it until the time limit.
     fn drain(mut pipe: impl std::io::Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
