@@ -1323,6 +1323,11 @@ exports, and said when it can't be drawn (in the browser over 500,000 cells, or 
 GeoTIFF read in place) as cast shadows are. Terrain outside the raster, or farther than 100 cells,
 hides none of its sky.
 
+With **Resampling** set to bilinear, a Shaded Relief layer's light (its hillshade, cast shadows and
+sky visibility) is blended between the cells' centres, as its values are, so a cell drawn over many
+pixels shades smoothly instead of in squares; nearest keeps one light per cell, as before. A cell
+with no data, or masked, is left out of the blend, so it doesn't darken the relief next to it.
+
 **Masking**, at the foot of the Symbology pane (`raster.mask`), hides pixel values from view without
 changing the data: values to draw as no data (a background of 0 or −9999 the file doesn't flag, QA
 flags, land cover classes such as `0, 254, 255`), and values outside, or inside, a range. The
