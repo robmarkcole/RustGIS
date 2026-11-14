@@ -2671,17 +2671,8 @@ fn drape_terrain(pm: &mut Pixmap, view: &View, map: &Map, bands: &[(View, (f64, 
         let Some([p, q, r]) = triangles(grid, n, cell % n, cell / n).and_then(|t| t.get(at as usize % 2).copied()) else { continue };
         let (dst, src) = ([p.0, q.0, r.0], [p.1, q.1, r.1]);
         let Some(t) = affine(src, dst) else { continue };
-        // A hair larger all round, so neighbours leave no seam.
-        let (cx, cy) = ((dst[0].0 + dst[1].0 + dst[2].0) / 3.0, (dst[0].1 + dst[1].1 + dst[2].1) / 3.0);
-        let mut pb = PathBuilder::new();
-        for (i, (x, y)) in dst.iter().enumerate() {
-            let (dx, dy) = (x - cx, y - cy);
-            let len = dx.hypot(dy).max(1e-9);
-            let (x, y) = ((x + dx / len * 0.6) as f32, (y + dy / len * 0.6) as f32);
-            if i == 0 { pb.move_to(x, y) } else { pb.line_to(x, y) }
-        }
-        pb.close();
-        let Some(path) = pb.finish() else { continue };
+        // Each edge moved a hair outward along its normal, so neighbours overlap and leave no seam.
+        let Some(path) = grown_triangle(dst) else { continue };
         let shader = tiny_skia::Pattern::new(pic.as_ref(), SpreadMode::Pad, tiny_skia::FilterQuality::Bilinear, 1.0, t);
         pm.fill_path(&path, &Paint { shader, anti_alias: true, ..Paint::default() }, FillRule::Winding, Transform::identity(), None);
         // Fog from halfway to the reach.
@@ -2700,6 +2691,74 @@ fn triangles<V: Copy>(grid: &[Option<V>], n: usize, i: usize, j: usize) -> Optio
     let at = |i: usize, j: usize| grid.get(j * (n + 1) + i).copied().flatten();
     let (a, b, c, d) = (at(i, j)?, at(i + 1, j)?, at(i, j + 1)?, at(i + 1, j + 1)?);
     Some([[a, b, d], [a, d, c]])
+}
+
+/// How far [`grown_triangle`] moves each edge of a draped triangle outward (physical pixels):
+/// two neighbours then overlap, and their anti-aliased edges leave no seam for the sky to show
+/// through (#1881).
+const DRAPE_GROWTH: f64 = 0.6;
+/// The most [`grown_triangle`] moves an edge, as a share of the triangle's height over it. A
+/// slope seen edge on is a triangle a fraction of a pixel high, and its picture is stretched
+/// across it: moved out the full [`DRAPE_GROWTH`], its margin showed the picture from far
+/// beyond the triangle, a dotted line along the ridge.
+const DRAPE_GROWTH_SHARE: f64 = 0.5;
+/// The farthest away from a corner [`grown_triangle`] puts it (physical pixels); a corner whose
+/// moved edges meet farther gets a bevel. A sliver's sharp corner reaching farther stood out of a
+/// ridge against the sky.
+const DRAPE_CORNER_REACH: f64 = 1.0;
+
+/// The outline of the triangle `t` (either winding) with each edge moved outward along its own
+/// normal, the corners where the moved edges meet. An edge moves [`DRAPE_GROWTH`], or
+/// [`DRAPE_GROWTH_SHARE`] of the triangle's height over it if that's less: an edge with the
+/// triangle at least 1.2 px high over it overlaps its neighbour by the full [`DRAPE_GROWTH`],
+/// whether the triangle is long and thin or not (unless a bevel at its ends holds it down, see
+/// below), and one under a lower triangle by less. Two moves over a shared edge that sum to under
+/// 1 px can leave a faint seam, as when a neighbour is under 0.8 px high over it or both are under
+/// 1 px high. Moving the corners away from the centroid instead barely moved a long thin
+/// triangle's long edges, the ones perspective makes of far cells. Where the moved edges would
+/// meet farther than
+/// [`DRAPE_CORNER_REACH`] from the corner (sharper than about 74° between edges moved in full,
+/// or nearly straight between edges moved unequally), both stop across from it by the smaller
+/// of their two moves, joined by a bevel: no point of the outline lies farther out from an edge
+/// than that edge's own move. So a bevel holds its edge down to the smaller move at that corner,
+/// along the whole edge when both its ends bevel (a tall edge beside a low one can then grow only
+/// the low one's move along its length). `None` for a triangle with no area.
+fn grown_triangle(t: [(f64, f64); 3]) -> Option<tiny_skia::Path> {
+    // Twice the signed area: positive when the corners turn from +x towards +y.
+    let area2 = (t[1].0 - t[0].0) * (t[2].1 - t[0].1) - (t[2].0 - t[0].0) * (t[1].1 - t[0].1);
+    if area2.abs() < 1e-12 || !area2.is_finite() {
+        return None;
+    }
+    let sign = area2.signum();
+    // The edge from corner i to the next: its outward normal (its direction turned a quarter
+    // away from the triangle, which lies on the side `sign` says) and how far it moves. With
+    // some area, no edge has zero length.
+    let edge = |i: usize| {
+        let (a, b) = (t[i], t[(i + 1) % 3]);
+        let (ex, ey) = (b.0 - a.0, b.1 - a.1);
+        let l = ex.hypot(ey);
+        ((sign * ey / l, -sign * ex / l), DRAPE_GROWTH.min(DRAPE_GROWTH_SHARE * area2.abs() / l))
+    };
+    let edges = [edge(0), edge(1), edge(2)];
+    // Each corner's place, or the two ends of its bevel.
+    let corner = |i: usize| -> [Option<(f64, f64)>; 2] {
+        let v = t[i];
+        let ((n1, d1), (n2, d2)) = (edges[(i + 2) % 3], edges[i]);
+        // The moved edges meet at v + x, where x · n1 = d1 and x · n2 = d2.
+        let det = n1.0 * n2.1 - n1.1 * n2.0;
+        let x = ((d1 * n2.1 - d2 * n1.1) / det, (n1.0 * d2 - n2.0 * d1) / det);
+        if det.abs() > 1e-9 && x.0.hypot(x.1) <= DRAPE_CORNER_REACH {
+            return [Some((v.0 + x.0, v.1 + x.1)), None];
+        }
+        let d = d1.min(d2);
+        [Some((v.0 + d * n1.0, v.1 + d * n1.1)), Some((v.0 + d * n2.0, v.1 + d * n2.1))]
+    };
+    let mut pb = PathBuilder::new();
+    for (k, (x, y)) in [corner(0), corner(1), corner(2)].into_iter().flatten().flatten().enumerate() {
+        if k == 0 { pb.move_to(x as f32, y as f32) } else { pb.line_to(x as f32, y as f32) }
+    }
+    pb.close();
+    pb.finish()
 }
 
 /// The affine map taking the triangle `src` onto `dst` (physical pixels); `None` for a
@@ -8943,6 +9002,178 @@ mod tests {
             Some(rustgis_map::view::Terrain { source: rustgis_map::view::TerrainSource::Layer("none".into()), exaggeration: 1.0 });
         assert!(terrain::Ground::of(&hilly, &camera).is_none());
         assert!(render(&mut hilly, &view).is_some());
+    }
+
+    /// The outline's points and, for each edge a → b of `t`, the farthest any of them lies
+    /// outside it.
+    fn grown_reach(t: [(f64, f64); 3]) -> (Vec<(f64, f64)>, [f64; 3]) {
+        let path = grown_triangle(t).expect("a triangle with area");
+        let pts: Vec<(f64, f64)> = path.points().iter().map(|p| (f64::from(p.x), f64::from(p.y))).collect();
+        let centre = ((t[0].0 + t[1].0 + t[2].0) / 3.0, (t[0].1 + t[1].1 + t[2].1) / 3.0);
+        let out = |i: usize| {
+            let (a, b) = (t[i], t[(i + 1) % 3]);
+            let l = (b.0 - a.0).hypot(b.1 - a.1);
+            let side = |p: (f64, f64)| ((b.0 - a.0) * (p.1 - a.1) - (b.1 - a.1) * (p.0 - a.0)) / l;
+            let s = -side(centre).signum();
+            pts.iter().map(|p| s * side(*p)).fold(f64::MIN, f64::max)
+        };
+        let reach = [out(0), out(1), out(2)];
+        (pts, reach)
+    }
+
+    #[test]
+    fn a_thin_draped_triangle_moves_its_long_edges_out_in_full() {
+        // #1881: half of a far cell, 100 px wide and 4 high. Moving its corners 0.6 px away from
+        // the centroid moved the long edge (0, 0)–(100, 4) out by 0.02 px.
+        for t in [[(0.0, 0.0), (100.0, 0.0), (100.0, 4.0)], [(0.0, 0.0), (100.0, 4.0), (100.0, 0.0)]] {
+            let (_, reach) = grown_reach(t);
+            for r in reach {
+                assert!((r - DRAPE_GROWTH).abs() < 1e-3, "{reach:?} for {t:?}");
+            }
+        }
+        // A right triangle the same way: the right angle where the moved edges meet, 0.85 px
+        // out; the 45° corners, whose meeting points lie 1.6 px out, bevelled.
+        let (pts, reach) = grown_reach([(0.0, 0.0), (10.0, 0.0), (0.0, 10.0)]);
+        assert_eq!(pts.len(), 5, "{pts:?}");
+        assert!(reach.iter().all(|r| (r - DRAPE_GROWTH).abs() < 1e-3), "{reach:?}");
+        assert!((pts[0].0 + DRAPE_GROWTH).abs() < 1e-4 && (pts[0].1 + DRAPE_GROWTH).abs() < 1e-4, "{pts:?}");
+        // No area, nothing to draw.
+        assert!(grown_triangle([(0.0, 0.0), (5.0, 5.0), (10.0, 10.0)]).is_none());
+    }
+
+    #[test]
+    fn a_draped_slivers_sharp_corner_is_bevelled() {
+        // The corner at (0, 0) is 1.1° sharp: its moved edges would meet 60 px out. They stop
+        // across from it instead, joined by a bevel.
+        let t = [(0.0, 0.0), (100.0, 0.0), (100.0, 2.0)];
+        let (pts, reach) = grown_reach(t);
+        assert_eq!(pts.len(), 4, "{pts:?}");
+        assert!(reach.iter().all(|r| (r - DRAPE_GROWTH).abs() < 1e-3), "{reach:?}");
+        assert!(pts.iter().all(|p| p.0 > -DRAPE_GROWTH), "{pts:?}");
+        assert_eq!(pts.iter().filter(|p| p.0.hypot(p.1) < DRAPE_GROWTH + 1e-3).count(), 2, "{pts:?}");
+        // The right angle at (100, 0) moves 0.6 px each way; the 88.9° one at (100, 2) where its
+        // moved edges meet, 0.6 px out from both.
+        let near = |x: f64, y: f64| pts.iter().any(|p| (p.0 - x).abs() < 1e-3 && (p.1 - y).abs() < 1e-3);
+        assert!(near(100.6, -0.6), "{pts:?}");
+        assert!(near(100.6, 2.0 + 0.6 * (2.0_f64.hypot(100.0) + 2.0) / 100.0), "{pts:?}");
+    }
+
+    /// Fills `path` with `paint` as `drape_terrain` does.
+    fn fill_drape(pm: &mut Pixmap, path: &tiny_skia::Path, paint: &Paint) {
+        pm.fill_path(path, paint, FillRule::Winding, Transform::identity(), None);
+    }
+
+    /// A far cell, long and thin as perspective makes it, its two halves drawn over black as
+    /// `drape_terrain` draws them: white, then `fog` black over each if given. The pixmap, and
+    /// the pixels lying a pixel or more inside the cell.
+    fn drawn_cell(fog: Option<f32>) -> (Pixmap, Vec<(u32, u32)>) {
+        let mut pm = Pixmap::new(64, 16).expect("pixmap");
+        pm.fill(tiny_skia::Color::BLACK);
+        let (a, b, c, d) = ((2.3, 4.2), (61.7, 5.1), (4.1, 10.6), (59.2, 11.3));
+        let picture = Paint { anti_alias: true, ..paint(Rgba::rgb(255, 255, 255), 1.0) };
+        for half in [[a, b, d], [a, d, c]] {
+            let path = grown_triangle(half).expect("area");
+            fill_drape(&mut pm, &path, &picture);
+            if let Some(f) = fog {
+                fill_drape(&mut pm, &path, &Paint { anti_alias: true, ..paint(Rgba::rgb(0, 0, 0), f) });
+            }
+        }
+        let quad = [a, b, d, c];
+        let inside = |p: (f64, f64)| {
+            (0..4).all(|i| {
+                let (s, e) = (quad[i], quad[(i + 1) % 4]);
+                let l = (e.0 - s.0).hypot(e.1 - s.1);
+                ((e.0 - s.0) * (p.1 - s.1) - (e.1 - s.1) * (p.0 - s.0)) / l >= 1.0
+            })
+        };
+        let pixels = (0..16u32)
+            .flat_map(|y| (0..64u32).map(move |x| (x, y)))
+            .filter(|&(x, y)| inside((f64::from(x) + 0.5, f64::from(y) + 0.5)))
+            .collect();
+        (pm, pixels)
+    }
+
+    #[test]
+    fn fog_over_two_draped_halves_is_laid_once_where_they_overlap() {
+        // Each triangle is filled with its picture, then its fog, on the grown outline: where the
+        // halves overlap, the nearer one's picture covers the farther one's fogged picture before
+        // its own fog, so the fog isn't laid twice. Only the nearer half's anti-aliased edge
+        // mixes the two, by at most a quarter of f² of the picture's difference from the fog
+        // (f = 0.5: 16 levels here; laid twice: 64).
+        let (pm, pixels) = drawn_cell(Some(0.5));
+        let off = |&(x, y): &(u32, u32)| (i32::from(pm.pixel(x, y).expect("in the pixmap").red()) - 128).abs();
+        let worst = pixels.iter().map(off).max().unwrap_or(0);
+        assert!(worst <= 17, "fog laid twice: {worst} levels off");
+        assert!(pixels.iter().filter(|p| off(p) <= 1).count() > 150);
+    }
+
+    #[test]
+    fn a_draped_slope_seen_edge_on_grows_by_half_its_height_at_most() {
+        // A triangle 0.05 px high, its picture stretched across it: moved out 0.6 px, its margin
+        // would show the picture from twelve times its height away. No point of the outline lies
+        // farther out from an edge than that edge's own move, also at a corner bevelled between
+        // a short edge moved in full and a long one moved 0.025 px.
+        for t in [[(0.0, 0.0), (40.0, 0.05), (80.0, 0.0)], [(0.0, 0.0), (1.0, 0.05), (80.0, 0.0)]] {
+            let (_, reach) = grown_reach(t);
+            for (i, r) in reach.iter().enumerate() {
+                let (a, b) = (t[i], t[(i + 1) % 3]);
+                let limit = DRAPE_GROWTH.min(DRAPE_GROWTH_SHARE * 0.05 * 80.0 / (b.0 - a.0).hypot(b.1 - a.1));
+                assert!(*r > 0.0 && *r <= limit + 1e-6, "edge {i} of {t:?}: {r} out, {limit} at most");
+            }
+        }
+    }
+
+    #[test]
+    fn the_two_halves_of_a_draped_cell_leave_no_seam() {
+        // #1881: moving the halves' corners away from their centroids left the diagonal's pixels
+        // grey. Every pixel lying a pixel or more inside the cell is white.
+        let (pm, pixels) = drawn_cell(None);
+        assert!(pixels.len() > 100, "{}", pixels.len());
+        for (x, y) in pixels {
+            let px = pm.pixel(x, y).expect("in the pixmap");
+            assert!(px.red() == 255 && px.green() == 255 && px.blue() == 255, "a seam at ({x}, {y}): {px:?}");
+        }
+    }
+
+    #[test]
+    fn two_low_draped_triangles_leave_at_most_a_faint_seam() {
+        // Two triangles under 1.2 px high over the edge they share move it less than 0.6 px each,
+        // together under the pixel their anti-aliased edges need to cover each other. Compared
+        // with the pair drawn as one shape, the shared edge's pixels come out at most a little
+        // darker: 16 levels of 255 at 0.6 px, none at 0.1–0.4, 0.8 and 1 px here.
+        let (p, q): ((f64, f64), (f64, f64)) = ((2.0, 7.3), (62.0, 9.1));
+        let l = (q.0 - p.0).hypot(q.1 - p.1);
+        let n = (-(q.1 - p.1) / l, (q.0 - p.0) / l);
+        let m = ((p.0 + q.0) / 2.0, (p.1 + q.1) / 2.0);
+        let white = Paint { anti_alias: true, ..paint(Rgba::rgb(255, 255, 255), 1.0) };
+        for h in [0.1, 0.2, 0.3, 0.4, 0.6, 0.8, 1.0] {
+            let (up, down) = ((m.0 + h * n.0, m.1 + h * n.1), (m.0 - h * n.0, m.1 - h * n.1));
+            let mut apart = Pixmap::new(64, 16).expect("pixmap");
+            apart.fill(tiny_skia::Color::BLACK);
+            for t in [[p, q, up], [p, down, q]] {
+                fill_drape(&mut apart, &grown_triangle(t).expect("area"), &white);
+            }
+            let mut one = Pixmap::new(64, 16).expect("pixmap");
+            one.fill(tiny_skia::Color::BLACK);
+            let mut pb = PathBuilder::new();
+            pb.move_to(p.0 as f32, p.1 as f32);
+            for c in [down, q, up] {
+                pb.line_to(c.0 as f32, c.1 as f32);
+            }
+            pb.close();
+            fill_drape(&mut one, &pb.finish().expect("path"), &white);
+            let mut worst = 0;
+            for y in 0..16u32 {
+                for x in 8..56u32 {
+                    let (cx, cy) = (f64::from(x) + 0.5 - p.0, f64::from(y) + 0.5 - p.1);
+                    if (cx * n.0 + cy * n.1).abs() <= 0.7 {
+                        let red = |pm: &Pixmap| i32::from(pm.pixel(x, y).expect("in the pixmap").red());
+                        worst = worst.max(red(&one) - red(&apart));
+                    }
+                }
+            }
+            assert!(worst <= 20, "{h} px high: the shared edge {worst} levels darker");
+        }
     }
 
     #[test]
