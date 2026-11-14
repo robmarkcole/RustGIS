@@ -441,22 +441,30 @@ impl TiltDrape {
         order.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         type Rings = Vec<Vec<(f64, f64)>>;
         let to_ground = |rings: &[Vec<Coord>]| -> Rings { rings.iter().map(|r| r.iter().map(|c| cam.ground_px(*c)).collect()).collect() };
-        let shapes: Vec<(&ExtrudedShape, f64, f64, Rings, Rings)> = order
+        let shapes: Vec<(&ExtrudedShape, f64, f64, f64, Rings, Rings)> = order
             .iter()
             .filter_map(|&(_, depth, i)| {
                 let s = d.shapes.get(i)?;
-                Some((s, depth, (s.height / cam.res.max(1e-9)).clamp(0.0, 1e7), to_ground(&s.rings), to_ground(&s.holes)))
+                let foot = render::base_within(s.base_height / cam.res.max(1e-9), 1e7);
+                let up = (s.height / cam.res.max(1e-9)).clamp(0.0, 1e7 - foot);
+                Some((s, depth, foot, up, to_ground(&s.rings), to_ground(&s.holes)))
             })
             .collect();
         let mut mesh = Mesh::default();
         // Shadows on the ground first, under every feature.
-        for (s, _, up, rings, _) in shapes.iter().filter(|x| x.0.shadows) {
+        for (s, _, foot, up, rings, holes) in shapes.iter().filter(|x| x.0.shadows) {
             let shade = Color32::from_black_alpha((60 * u16::from(s.fill.a()) / 255) as u8);
-            for q in render::tilted_shadow_quads(cam, w, h, rings, *up) {
+            // Raised, a hole's walls cast too: the footprint moved by the base, which no longer sits
+            // under the roof, is the top one's and every edge's sweep between them.
+            let swept: &[Vec<(f64, f64)>] = if *foot > 0.0 { holes } else { &[] };
+            for q in render::tilted_shadow_quads(cam, w, h, rings, *foot, *up)
+                .into_iter()
+                .chain(render::tilted_shadow_quads(cam, w, h, swept, *foot, *up))
+            {
                 fan(&mut mesh, q.into_iter().map(|p| Some(pos(p))), shade);
             }
             // The footprint moved away from the light: the roof's triangles on the ground.
-            let (du, dv) = render::shadow_shift(*up);
+            let (du, dv) = render::shadow_shift(*foot + *up);
             for [a, b, c] in s.roof_indices.as_chunks::<3>().0 {
                 let tri: Option<Vec<(f64, f64)>> =
                     [a, b, c].iter().map(|&&k| s.roof.get(k as usize).map(|p| ground(s, p)).map(|(u, v)| (u + du, v + dv))).collect();
@@ -465,15 +473,15 @@ impl TiltDrape {
                 fan(&mut mesh, cut.into_iter().map(|(u, v)| cam.project_raised(u, v, 0.0, w, h).map(pos)), shade);
             }
         }
-        for (s, depth, up, rings, holes) in &shapes {
+        for (s, depth, foot, up, rings, holes) in &shapes {
             let t = ((depth - FAR * 0.5) / (FAR * 0.5)).clamp(0.0, 1.0);
             // Fog fades the colour, not the layer's transparency (the alpha stays).
             let base = s.fill.lerp(fog, t * t * (3.0 - 2.0 * t)).with_alpha(s.fill.a());
-            for wall in render::tilted_walls(cam, w, h, rings, holes, *up, s.face_culling, s.lighting) {
-                let (top, foot) = (c32(base.shade(wall.top)), c32(base.shade(wall.foot)));
+            for wall in render::tilted_walls(cam, w, h, rings, holes, *foot, *up, s.face_culling, s.lighting) {
+                let (top_colour, foot_colour) = (c32(base.shade(wall.top)), c32(base.shade(wall.foot)));
                 let [fa, fb, tb, ta] = wall.quad;
                 let k = mesh.vertices.len() as u32;
-                for (p, c) in [(fa, foot), (fb, foot), (tb, top), (ta, top)] {
+                for (p, c) in [(fa, foot_colour), (fb, foot_colour), (tb, top_colour), (ta, top_colour)] {
                     mesh.colored_vertex(pos(p), c);
                 }
                 mesh.add_triangle(k, k + 1, k + 2);
@@ -481,12 +489,13 @@ impl TiltDrape {
             }
             // The roof's triangles, each cut where it reaches behind the eye.
             let color = c32(base);
-            let v_max = cam.near_v(*up, h);
+            let roof = *foot + *up;
+            let v_max = cam.near_v(roof, h);
             for [a, b, c] in s.roof_indices.as_chunks::<3>().0 {
                 let tri: Option<Vec<(f64, f64)>> = [a, b, c].iter().map(|&&k| s.roof.get(k as usize).map(|p| ground(s, p))).collect();
                 let Some(tri) = tri else { continue };
                 let cut = render::clip_near(&tri, v_max);
-                fan(&mut mesh, cut.into_iter().map(|(u, v)| cam.project_raised(u, v, *up, w, h).map(pos)), color);
+                fan(&mut mesh, cut.into_iter().map(|(u, v)| cam.project_raised(u, v, roof, w, h).map(pos)), color);
             }
         }
         (!mesh.indices.is_empty()).then_some(mesh)
@@ -701,6 +710,7 @@ mod tests {
                 face_culling: true,
                 lighting: true,
                 shadows: false,
+                ..Default::default()
             });
         }
         let mut d = TiltDrape::default();
@@ -731,6 +741,68 @@ mod tests {
         let foot = m.camera.to_screen(rustgis_engine::geom::lonlat_to_merc(Coord::new(10.0, 47.0)), 800.0, 600.0).1 as f32;
         let top = mesh.vertices.iter().map(|v| v.pos.y).fold(f32::MAX, f32::min);
         assert!(top < foot - 20.0, "{top} vs {foot}");
+    }
+
+    #[test]
+    fn extrusions_stand_on_their_base_on_the_drape() {
+        use rustgis_engine::data::{Dataset, Geometry, GeometryType};
+        let ctx = egui::Context::default();
+        let top_of = |base: f64| {
+            let mut m = tilted(55.0);
+            let mut ds = Dataset::new("blocks", GeometryType::Polygon, vec![]);
+            let ring =
+                vec![Coord::new(9.0, 47.0), Coord::new(11.0, 47.0), Coord::new(11.0, 49.0), Coord::new(9.0, 49.0), Coord::new(9.0, 47.0)];
+            ds.push(Some(Geometry::Polygon(vec![vec![ring]])), vec![]);
+            let id = m.add_dataset(ds);
+            if let Some(l) = m.layer_mut(id) {
+                l.extrusion = Some(rustgis_engine::map::effects::Extrusion { height: 100_000.0, base, ..Default::default() });
+            }
+            let mut d = TiltDrape::default();
+            assert!(d.prepare(&ctx, &mut m, DrapeKey { rev: 0, sources: 0 }, 0, 800.0, 600.0, 1.0, 0.0));
+            let rect = Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+            let mesh = d.extrusions(rect, &m.camera, fog()).expect("the block stands up");
+            assert!(mesh.is_valid());
+            mesh.vertices.iter().map(|v| v.pos.y).fold(f32::MAX, f32::min)
+        };
+        let (grounded, raised) = (top_of(0.0), top_of(100_000.0));
+        assert!(raised < grounded - 20.0, "roof at {raised} on a base, {grounded} without");
+    }
+
+    #[test]
+    fn a_raised_block_with_a_hole_casts_its_holes_walls_too() {
+        use rustgis_engine::data::{Dataset, Geometry, GeometryType};
+        let ctx = egui::Context::default();
+        let size = |base: f64, with_hole: bool| {
+            let mut m = tilted(55.0);
+            let mut ds = Dataset::new("blocks", GeometryType::Polygon, vec![]);
+            let sq = |a: f64| {
+                vec![
+                    Coord::new(10.0 - a, 48.0 - a),
+                    Coord::new(10.0 + a, 48.0 - a),
+                    Coord::new(10.0 + a, 48.0 + a),
+                    Coord::new(10.0 - a, 48.0 + a),
+                ]
+            };
+            let (mut outer, mut hole) = (sq(1.0), sq(0.3));
+            outer.push(outer[0]);
+            hole.push(hole[0]);
+            let rings = if with_hole { vec![outer, hole] } else { vec![outer] };
+            ds.push(Some(Geometry::Polygon(vec![rings])), vec![]);
+            let id = m.add_dataset(ds);
+            if let Some(l) = m.layer_mut(id) {
+                l.extrusion =
+                    Some(rustgis_engine::map::effects::Extrusion { height: 100_000.0, base, shadows: true, ..Default::default() });
+            }
+            let mut d = TiltDrape::default();
+            assert!(d.prepare(&ctx, &mut m, DrapeKey { rev: 0, sources: 0 }, 0, 800.0, 600.0, 1.0, 0.0));
+            let rect = Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+            let mesh = d.extrusions(rect, &m.camera, fog()).expect("the block stands up");
+            mesh.vertices.len()
+        };
+        // Raised, the hole's 4 walls cast their sweep (a quad each, or more where cut near the eye);
+        // a solid block casts as much raised as on the ground.
+        assert!(size(100_000.0, true) >= size(0.0, true) + 16, "{} vs {}", size(100_000.0, true), size(0.0, true));
+        assert_eq!(size(100_000.0, false), size(0.0, false));
     }
 
     #[test]

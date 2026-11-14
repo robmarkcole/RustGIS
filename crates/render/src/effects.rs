@@ -93,8 +93,8 @@ impl AggregationBins {
     }
 }
 
-/// Polygons extruded upward on screen by their height (`px_per_m` pixels per metre), drawn far
-/// to near, with shadows first, then walls (lit by their facing), then roofs.
+/// Polygons extruded upward on screen from their base by their height (`px_per_m` pixels per
+/// metre), drawn far to near, with shadows first, then walls (lit by their facing), then roofs.
 pub(crate) fn extrude(
     pm: &mut Canvas,
     ctx: &Ctx,
@@ -109,7 +109,8 @@ pub(crate) fn extrude(
     paint_shapes(pm, ctx, x, &shapes, true, true);
 }
 
-type Shape = (f32, Vec<Vec<(f32, f32)>>, f32, Symbol);
+/// (base centre y, outer rings in pixels, height in pixels, base in pixels, symbol)
+type Shape = (f32, Vec<Vec<(f32, f32)>>, f32, f32, Symbol);
 
 fn shapes(
     ctx: &Ctx,
@@ -120,16 +121,18 @@ fn shapes(
     px_per_m: f64,
     symbol: impl Fn(usize) -> Symbol,
 ) -> Vec<Shape> {
-    let fi = x.field.as_deref().and_then(|f| ds.field_index(f));
-    // (base centre y, outer rings in pixels, height in pixels, row)
     let mut shapes: Vec<Shape> = Vec::new();
+    let columns = x.columns(ds);
     for (row, g) in geoms.iter().enumerate() {
         let Some(Geometry::Polygon(polys)) = g else { continue };
         if rows.get(row) != Some(&true) {
             continue;
         }
-        let metres = fi.and_then(|i| ds.value(row, i).as_f64()).filter(|v| v.is_finite()).unwrap_or(x.height) * x.factor;
-        let hp = (metres * px_per_m).clamp(0.0, 4000.0) as f32;
+        // The base and the height together stay within the 4000 px cap; a base that comes out no
+        // number (a scale with no size) is the ground, so the height's cap is never NaN.
+        let bp = base_within(x.base_metres_at(ds, row, columns) * px_per_m, 4000.0);
+        let hp = (x.metres_at(ds, row, columns) * px_per_m).clamp(0.0, 4000.0 - bp) as f32;
+        let bp = bp as f32;
         let rings: Vec<Vec<(f32, f32)>> = polys
             .iter()
             .filter_map(|p| p.first())
@@ -147,8 +150,10 @@ fn shapes(
         } else {
             (rings.iter().flatten().map(|p| f64::from(p.1)).sum::<f64>() / count as f64) as f32
         };
-        shapes.push((cy, rings, hp, symbol(row)));
+        shapes.push((cy, rings, hp, bp, symbol(row)));
     }
+    // Painted by where they stand on the ground: a part raised over a building behind it may be
+    // painted under it; the GPU's depth buffer has no such limit.
     shapes.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     shapes
 }
@@ -177,18 +182,20 @@ fn paint_shapes(pm: &mut Canvas, ctx: &Ctx, x: &Extrusion, shapes: &[Shape], sha
     if x.shadows && shadows {
         // Light from the north-west casts shadows to the south-east.
         let shade = paint(Rgba::new(0, 0, 0, 70), 1.0);
-        for (_, rings, hp, _) in shapes {
-            let (sx, sy) = (hp * 0.7, hp * 0.35);
+        for (_, rings, hp, bp, _) in shapes {
+            // From the shadow of the base to the shadow of the top.
+            let (ox, oy) = (bp * 0.7, bp * 0.35);
+            let (sx, sy) = ((bp + hp) * 0.7 - ox, (bp + hp) * 0.35 - oy);
             for r in rings {
                 for i in 0..r.len() {
                     if let (Some(a), Some(b)) = (r.get(i), r.get((i + 1) % r.len()))
-                        && let Some(p) = quad(*a, *b, sx, sy)
+                        && let Some(p) = quad((a.0 + ox, a.1 + oy), (b.0 + ox, b.1 + oy), sx, sy)
                     {
                         pm.fill_path(&p, &shade, FillRule::Winding, Transform::identity(), None);
                     }
                 }
             }
-            if let Some(p) = poly_path(rings, sx, sy) {
+            if let Some(p) = poly_path(rings, ox + sx, oy + sy) {
                 pm.fill_path(&p, &shade, FillRule::EvenOdd, Transform::identity(), None);
             }
         }
@@ -198,9 +205,9 @@ fn paint_shapes(pm: &mut Canvas, ctx: &Ctx, x: &Extrusion, shapes: &[Shape], sha
     if !solids {
         return;
     }
-    for (_, rings, hp, sym) in shapes {
+    for (_, rings, hp, bp, sym) in shapes {
         let base = sym.fill.with_alpha(255);
-        let up = -hp;
+        let (foot, up) = (-bp, -(bp + hp));
         // Walls: the back ones first (when drawn), then the ones facing the viewer.
         let mut walls: Vec<(bool, (f32, f32), (f32, f32), f32)> = Vec::new();
         for r in rings {
@@ -226,7 +233,7 @@ fn paint_shapes(pm: &mut Canvas, ctx: &Ctx, x: &Extrusion, shapes: &[Shape], sha
                 continue;
             }
             let f = if x.lighting { 0.55 + 0.4 * lit.max(0.0) as f64 } else { 0.75 };
-            if let Some(p) = quad(a, b, 0.0, up) {
+            if let Some(p) = quad((a.0, a.1 + foot), (b.0, b.1 + foot), 0.0, up - foot) {
                 pm.fill_path(&p, &paint(base.shade(f), 1.0), FillRule::Winding, Transform::identity(), None);
                 pm.stroke_path(&p, &paint(sym.stroke.with_alpha(45), 1.0), &edge_stroke, Transform::identity(), None);
             }
@@ -248,15 +255,16 @@ fn paint_shapes(pm: &mut Canvas, ctx: &Ctx, x: &Extrusion, shapes: &[Shape], sha
 // Store float bits as integers so JSON cannot turn a non-finite height or symbol into null.
 // This is a disposable internal payload, not a persisted file format.
 #[cfg(not(target_arch = "wasm32"))]
-type StoredShape = (u32, Vec<Vec<(u32, u32)>>, u32, Rgba, Rgba, u32, u32, rustgis_map::Marker);
+type StoredShape = (u32, Vec<Vec<(u32, u32)>>, u32, u32, Rgba, Rgba, u32, u32, rustgis_map::Marker);
 
 #[cfg(not(target_arch = "wasm32"))]
 fn encode_shape(shape: &Shape) -> rustgis_data::Result<Vec<u8>> {
-    let (cy, rings, hp, sym) = shape;
+    let (cy, rings, hp, bp, sym) = shape;
     let stored: StoredShape = (
         cy.to_bits(),
         rings.iter().map(|r| r.iter().map(|(x, y)| (x.to_bits(), y.to_bits())).collect()).collect(),
         hp.to_bits(),
+        bp.to_bits(),
         sym.fill,
         sym.stroke,
         sym.stroke_width.to_bits(),
@@ -268,12 +276,13 @@ fn encode_shape(shape: &Shape) -> rustgis_data::Result<Vec<u8>> {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn decode_shape(bytes: &[u8]) -> rustgis_data::Result<Shape> {
-    let (cy, rings, hp, fill, stroke, width, size, marker): StoredShape =
+    let (cy, rings, hp, bp, fill, stroke, width, size, marker): StoredShape =
         serde_json::from_slice(bytes).map_err(|e| rustgis_data::DataError::Format(e.to_string()))?;
     Ok((
         f32::from_bits(cy),
         rings.into_iter().map(|r| r.into_iter().map(|(x, y)| (f32::from_bits(x), f32::from_bits(y))).collect()).collect(),
         f32::from_bits(hp),
+        f32::from_bits(bp),
         Symbol { fill, stroke, stroke_width: f32::from_bits(width), size: f32::from_bits(size), marker },
     ))
 }
@@ -351,10 +360,10 @@ impl ExtrusionSpool {
     }
 }
 
-/// How high (metres) feature `row` of `ds` is extruded.
-pub(crate) fn extrusion_metres(ds: &Dataset, x: &Extrusion, row: usize) -> f64 {
-    let fi = x.field.as_deref().and_then(|f| ds.field_index(f));
-    fi.and_then(|i| ds.value(row, i).as_f64()).filter(|v| v.is_finite()).unwrap_or(x.height) * x.factor
+/// A base in pixels within 0..=`cap`, 0 when it is no number, so the height's cap above it is
+/// always a number.
+pub fn base_within(v: f64, cap: f64) -> f64 {
+    if v.is_nan() { 0.0 } else { v.clamp(0.0, cap.max(0.0)) }
 }
 
 /// The light of a tilted view's extrusions, as MapLibre's default: from the view's upper left,
@@ -407,15 +416,17 @@ pub struct TiltedWall {
 }
 
 /// The walls of a feature whose outer `rings` (ground px, [`rustgis_map::Camera::ground_px`])
-/// are raised `up` px, in a tilted `w`×`h` view of `cam`, far first: with `culling`, only those
-/// facing the eye; with `lighting`, lit by the way they face MapLibre's default light and
-/// darker toward their foot. Both the settled frame and the moving view's mesh draw these.
+/// stand from `base` px up to `base + up` px, in a tilted `w`×`h` view of `cam`, far first: with
+/// `culling`, only those facing the eye; with `lighting`, lit by the way they face MapLibre's
+/// default light and darker toward their foot. Both the settled frame and the moving view's
+/// mesh draw these.
 pub fn tilted_walls(
     cam: &rustgis_map::Camera,
     w: f64,
     h: f64,
     rings: &[Vec<(f64, f64)>],
     holes: &[Vec<(f64, f64)>],
+    base: f64,
     up: f64,
     culling: bool,
     lighting: bool,
@@ -424,7 +435,7 @@ pub fn tilted_walls(
     let light_len = LIGHT.0.hypot(LIGHT.1).max(1e-9);
     let at = |u: f64, v: f64, up: f64| cam.project_raised(u, v, up, w, h).filter(|p| p.0.is_finite() && p.1.is_finite());
     // Walls reaching behind the eye are cut where they still stand in front of it.
-    let v_max = cam.near_v(up, h);
+    let v_max = cam.near_v(base + up, h);
     let mut walls = Vec::new();
     // A hole's walls face into it (a courtyard).
     for (r, hole) in rings.iter().map(|r| (r, false)).chain(holes.iter().map(|r| (r, true))) {
@@ -445,7 +456,8 @@ pub fn tilted_walls(
             }
             let Some((a, b)) = clip_segment(a, b, v_max) else { continue };
             let mid = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
-            let (Some(fa), Some(fb), Some(tb), Some(ta)) = (at(a.0, a.1, 0.0), at(b.0, b.1, 0.0), at(b.0, b.1, up), at(a.0, a.1, up))
+            let (Some(fa), Some(fb), Some(tb), Some(ta)) =
+                (at(a.0, a.1, base), at(b.0, b.1, base), at(b.0, b.1, base + up), at(a.0, a.1, base + up))
             else {
                 continue;
             };
@@ -464,12 +476,20 @@ pub fn shadow_shift(up: f64) -> (f64, f64) {
     (-LIGHT.0 / LIGHT.2 * up, -LIGHT.1 / LIGHT.2 * up)
 }
 
-/// The sides of the shadow a feature raised `up` px casts on the ground in a tilted view: a
-/// convex polygon (screen, logical px) between each edge of its outer `rings` (ground px) and the
-/// edge moved by [`shadow_shift`], cut where it reaches behind the eye. Its footprint moved by
-/// the same shift completes it.
-pub fn tilted_shadow_quads(cam: &rustgis_map::Camera, w: f64, h: f64, rings: &[Vec<(f64, f64)>], up: f64) -> Vec<Vec<(f64, f64)>> {
-    let (du, dv) = shadow_shift(up);
+/// The sides of the shadow a feature standing from `base` px up to `base + up` px casts on the
+/// ground in a tilted view: a convex polygon (screen, logical px) between each edge of its outer
+/// `rings` (ground px) moved by [`shadow_shift`] of `base` and moved by that of `base + up`, cut
+/// where it reaches behind the eye. Its footprint moved by the shift of `base + up` completes it.
+pub fn tilted_shadow_quads(
+    cam: &rustgis_map::Camera,
+    w: f64,
+    h: f64,
+    rings: &[Vec<(f64, f64)>],
+    base: f64,
+    up: f64,
+) -> Vec<Vec<(f64, f64)>> {
+    let (bu, bv) = shadow_shift(base);
+    let (du, dv) = shadow_shift(base + up);
     let at = |p: (f64, f64)| cam.project_raised(p.0, p.1, 0.0, w, h).filter(|p| p.0.is_finite() && p.1.is_finite());
     let v_max = cam.near_v(0.0, h);
     let mut out = Vec::new();
@@ -477,7 +497,7 @@ pub fn tilted_shadow_quads(cam: &rustgis_map::Camera, w: f64, h: f64, rings: &[V
         for i in 0..r.len() {
             let (Some(&a), Some(&b)) = (r.get(i), r.get((i + 1) % r.len())) else { continue };
             // On the ground, cut where it reaches behind the eye.
-            let side = clip_near(&[a, b, (b.0 + du, b.1 + dv), (a.0 + du, a.1 + dv)], v_max);
+            let side = clip_near(&[(a.0 + bu, a.1 + bv), (b.0 + bu, b.1 + bv), (b.0 + du, b.1 + dv), (a.0 + du, a.1 + dv)], v_max);
             let pts: Option<Vec<_>> = side.into_iter().map(at).collect();
             if let Some(pts) = pts.filter(|p| p.len() >= 3) {
                 out.push(pts);
@@ -488,11 +508,11 @@ pub fn tilted_shadow_quads(cam: &rustgis_map::Camera, w: f64, h: f64, rings: &[V
 }
 
 /// Polygons extruded in perspective in a tilted view, as MapLibre's fill extrusions: each
-/// feature's walls stand on its outline and its roof is raised by its height (converted at
-/// the feature's place by `m_per_unit`, the ground metres per map unit there). Features and
-/// walls are drawn far to near; walls facing away from the eye are culled, walls are lit by the way they face the light and
-/// shade darker toward their base, and features fade into `fog` with distance as the ground
-/// does.
+/// feature's walls stand from its base (0 on the ground) and its roof is raised by its height
+/// above them (converted at the feature's place by `m_per_unit`, the ground metres per map unit
+/// there). Features and walls are drawn far to near; walls facing away from the eye are culled,
+/// walls are lit by the way they face the light and shade darker toward their base, and
+/// features fade into `fog` with distance as the ground does.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn extrude_tilted(
     pm: &mut Pixmap,
@@ -510,9 +530,10 @@ pub(crate) fn extrude_tilted(
     let ppp = view.pixels_per_point as f32;
     let far = rustgis_map::camera::FAR;
     type Rings = Vec<Vec<(f64, f64)>>;
-    // (centroid depth along the view, outer rings and holes in ground px, height in ground px,
-    // fog, row)
-    let mut shapes: Vec<(f64, Rings, Rings, f64, f64, usize)> = Vec::new();
+    // (centroid depth along the view, outer rings and holes in ground px, base and height in
+    // ground px, fog, row)
+    let mut shapes: Vec<(f64, Rings, Rings, f64, f64, f64, usize)> = Vec::new();
+    let columns = x.columns(ds);
     for (row, g) in geoms.iter().enumerate() {
         let Some(Geometry::Polygon(polys)) = g else { continue };
         if rows.get(row) != Some(&true) {
@@ -553,11 +574,13 @@ pub(crate) fn extrude_tilted(
         }
         let centroid = rustgis_geom::Coord::new(sum.x / n, sum.y / n);
         // At the feature's own scale (Web Mercator stretches the ground toward the poles).
-        let up = (extrusion_metres(ds, x, row) / m_per_unit(centroid).max(1e-9) / cam.res.max(1e-9)).clamp(0.0, 1e7);
+        let (unit, res) = (m_per_unit(centroid).max(1e-9), cam.res.max(1e-9));
+        let base = base_within(x.base_metres_at(ds, row, columns) / unit / res, 1e7);
+        let up = (x.metres_at(ds, row, columns) / unit / res).clamp(0.0, 1e7 - base);
         // Fog on the way to the view's reach, by the middle of the feature.
         let depth = cam.depth_scale(centroid, h).map_or(1.0, |k| 1.0 / k.max(1e-9));
         let t = ((depth - far * 0.5) / (far * 0.5)).clamp(0.0, 1.0);
-        shapes.push((cam.ground_px(centroid).1, rings, holes, up, t * t * (3.0 - 2.0 * t), row));
+        shapes.push((cam.ground_px(centroid).1, rings, holes, base, up, t * t * (3.0 - 2.0 * t), row));
     }
     // Far (up the screen) first.
     shapes.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -577,14 +600,14 @@ pub(crate) fn extrude_tilted(
         // Cast on the ground away from the light: every piece opaque on a layer of its own, laid
         // over the map once, so where pieces (or neighbours' shadows) overlap it is no darker.
         let shade = paint(Rgba::new(0, 0, 0, 255), 1.0);
-        for (_, rings, _, up, _, _) in &shapes {
-            for q in tilted_shadow_quads(&cam, w, h, rings, *up) {
+        for (_, rings, _, base, up, _, _) in &shapes {
+            for q in tilted_shadow_quads(&cam, w, h, rings, *base, *up) {
                 let q: Vec<_> = q.into_iter().map(px).collect();
                 if let Some(p) = path(&q) {
                     shade_layer.fill_path(&p, &shade, FillRule::Winding, Transform::identity(), None);
                 }
             }
-            let (du, dv) = shadow_shift(*up);
+            let (du, dv) = shadow_shift(*base + *up);
             for r in rings {
                 let moved: Vec<_> = r.iter().map(|&(u, v)| (u + du, v + dv)).collect();
                 let shifted: Option<Vec<_>> = clip_near(&moved, cam.near_v(0.0, h)).into_iter().map(|(u, v)| at(u, v, 0.0)).collect();
@@ -596,12 +619,12 @@ pub(crate) fn extrude_tilted(
         let over = PixmapPaint { opacity: 60.0 / 255.0, ..PixmapPaint::default() };
         pm.draw_pixmap(0, 0, shade_layer.as_ref(), &over, Transform::identity(), None);
     }
-    for (_, rings, holes, up, fogged, row) in &shapes {
+    for (_, rings, holes, base, up, fogged, row) in &shapes {
         let sym = symbol(*row);
-        let base = sym.fill.with_alpha(255).lerp(fog, *fogged);
-        for wall in tilted_walls(&cam, w, h, rings, holes, *up, x.face_culling, x.lighting) {
+        let fill = sym.fill.with_alpha(255).lerp(fog, *fogged);
+        for wall in tilted_walls(&cam, w, h, rings, holes, *base, *up, x.face_culling, x.lighting) {
             let [fa, fb, tb, ta] = wall.quad.map(px);
-            let (top, foot) = (base.shade(wall.top), base.shade(wall.foot));
+            let (top, foot) = (fill.shade(wall.top), fill.shade(wall.foot));
             // A hair longer each way, so neighbouring walls leave no seam between them.
             let grow = |p: (f32, f32), q: (f32, f32)| {
                 let (dx, dy) = (p.0 - q.0, p.1 - q.1);
@@ -629,7 +652,8 @@ pub(crate) fn extrude_tilted(
         let mut pb = PathBuilder::new();
         for r in rings.iter().chain(holes) {
             // Cut where it reaches behind the eye.
-            let pts: Option<Vec<_>> = clip_near(r, cam.near_v(*up, h)).into_iter().map(|(u, v)| at(u, v, *up)).collect();
+            let top = *base + *up;
+            let pts: Option<Vec<_>> = clip_near(r, cam.near_v(top, h)).into_iter().map(|(u, v)| at(u, v, top)).collect();
             let pts = pts.filter(|p| p.len() >= 3);
             let Some(pts) = pts else { continue };
             for (i, p) in pts.iter().enumerate() {
@@ -638,7 +662,7 @@ pub(crate) fn extrude_tilted(
             pb.close();
         }
         if let Some(p) = pb.finish() {
-            pm.fill_path(&p, &paint(base, 1.0), FillRule::EvenOdd, Transform::identity(), None);
+            pm.fill_path(&p, &paint(fill, 1.0), FillRule::EvenOdd, Transform::identity(), None);
             let edge = sym.stroke.lerp(fog, *fogged).with_alpha(110);
             pm.stroke_path(&p, &paint(edge, 1.0), &Stroke { width: 0.6 * ppp, ..Stroke::default() }, Transform::identity(), None);
         }
@@ -651,14 +675,15 @@ mod spool_tests {
     #[test]
     fn spool_payload_preserves_all_float_bits_and_large_finite_centres() {
         let symbol = Symbol { stroke_width: f32::NAN, size: f32::INFINITY, ..Symbol::default_for(rustgis_data::GeometryType::Polygon, 1) };
-        let shape = (1.0, vec![vec![(f32::MAX, -0.0)]], f32::NAN, symbol);
+        let shape = (1.0, vec![vec![(f32::MAX, -0.0)]], f32::NAN, -0.0f32, symbol);
         let decoded = decode_shape(&encode_shape(&shape).unwrap()).unwrap();
         assert_eq!(decoded.0.to_bits(), shape.0.to_bits());
         assert_eq!(decoded.1[0][0].0.to_bits(), f32::MAX.to_bits());
         assert_eq!(decoded.1[0][0].1.to_bits(), (-0.0f32).to_bits());
         assert_eq!(decoded.2.to_bits(), shape.2.to_bits());
-        assert_eq!(decoded.3.stroke_width.to_bits(), symbol.stroke_width.to_bits());
-        assert_eq!(decoded.3.size.to_bits(), symbol.size.to_bits());
+        assert_eq!(decoded.3.to_bits(), shape.3.to_bits(), "the base keeps its bits");
+        assert_eq!(decoded.4.stroke_width.to_bits(), symbol.stroke_width.to_bits());
+        assert_eq!(decoded.4.size.to_bits(), symbol.size.to_bits());
         let view = View {
             width: 100.0,
             height: 100.0,
@@ -682,7 +707,7 @@ mod spool_tests {
             rustgis_geom::Coord::new(0.0, -2e38),
         ]]]);
         let ds = Dataset::new("large", rustgis_data::GeometryType::Polygon, vec![]);
-        let x = Extrusion { height: 1.0, field: None, factor: 1.0, face_culling: true, lighting: true, shadows: true };
+        let x = Extrusion { height: 1.0, shadows: true, ..Extrusion::default() };
         let got = shapes(&ctx, &ds, &[Some(&geom)], &[true], &x, 1.0, |_| symbol);
         assert_eq!(got.len(), 1);
         assert!(got[0].0.is_finite());
@@ -694,5 +719,44 @@ mod spool_tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    #[test]
+    fn a_spooled_shape_keeps_its_base_within_the_cap() {
+        let symbol = Symbol::default_for(rustgis_data::GeometryType::Polygon, 1);
+        let view = View {
+            width: 100.0,
+            height: 100.0,
+            pixels_per_point: 1.0,
+            camera: rustgis_map::Camera::new(rustgis_geom::Coord::new(0.0, 0.0), 1.0),
+            sky: false,
+        };
+        let ctx = Ctx {
+            view: &view,
+            ppp: 1.0,
+            wireframe: false,
+            cull: rustgis_geom::Extent::EMPTY,
+            globe: None,
+            sprites: Default::default(),
+            bursts: Default::default(),
+        };
+        let c = rustgis_geom::Coord::new;
+        let geom = Geometry::Polygon(vec![vec![vec![c(0.0, 0.0), c(1.0, 0.0), c(1.0, 1.0), c(0.0, 1.0), c(0.0, 0.0)]]]);
+        let ds = Dataset::new("b", rustgis_data::GeometryType::Polygon, vec![]);
+        let shape = |x: &Extrusion| shapes(&ctx, &ds, &[Some(&geom)], &[true], x, 2.0, |_| symbol).remove(0);
+        let raised = shape(&Extrusion { height: 10.0, base: 5.0, ..Extrusion::default() });
+        assert_eq!((raised.2, raised.3), (20.0, 10.0), "20 px high from 10 px up");
+        let decoded = decode_shape(&encode_shape(&raised).unwrap()).unwrap();
+        assert_eq!((decoded.2, decoded.3), (20.0, 10.0));
+        let grounded = shape(&Extrusion { height: 10.0, ..Extrusion::default() });
+        assert_eq!((grounded.2, grounded.3), (20.0, 0.0));
+        // A base and height past the cap together stay within it.
+        let tall = shape(&Extrusion { height: 1e9, base: 1e9, ..Extrusion::default() });
+        assert!(tall.2 + tall.3 <= 4000.0 && tall.3 == 4000.0, "{} + {}", tall.3, tall.2);
+        // A scale with no size (infinite pixels a metre) and no base: 0 × ∞ is no number, and the
+        // base is the ground rather than a cap that isn't one.
+        let flat =
+            shapes(&ctx, &ds, &[Some(&geom)], &[true], &Extrusion { height: 10.0, ..Extrusion::default() }, f64::INFINITY, |_| symbol);
+        assert_eq!(flat.first().map(|s| s.3), Some(0.0));
     }
 }

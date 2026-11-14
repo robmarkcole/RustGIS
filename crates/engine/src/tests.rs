@@ -19854,6 +19854,38 @@ fn area_review_repair_checks_retained_classification_fields() {
     std::fs::remove_dir_all(dir).ok();
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn repair_source_checks_the_extrusion_base_field() {
+    use rustgis_data::{Coord, Dataset, Field, FieldType, Geometry, GeometryType, Value};
+    let c = Coord::new;
+    let square = || Some(Geometry::Polygon(vec![vec![vec![c(0.0, 0.0), c(1.0, 0.0), c(1.0, 1.0), c(0.0, 0.0)]]]));
+    let mut data = Dataset::new("Raised", GeometryType::Polygon, vec![Field::new("floor", FieldType::Double)]);
+    data.push(square(), vec![Value::Float(3.0)]);
+    let mut session = Session::new(Project::default());
+    let id = session.map_mut().add_dataset(data);
+    let layer = session.map_mut().layer_mut(id).unwrap();
+    layer.labels.default.field.clear();
+    layer.extrusion = Some(rustgis_map::effects::Extrusion { base_field: Some("floor".into()), ..Default::default() });
+    let dir = std::env::temp_dir().join(format!("rustgis-base-repair-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let old = dir.join("old.fgb");
+    std::fs::write(&old, rustgis_data::source::fgb::write(&layer.dataset).unwrap()).unwrap();
+    let handle = rustgis_data::source::open_path(&old, None).unwrap();
+    layer.source = Some(rustgis_map::source::SourceLayer::from_path(old.display().to_string(), None, handle));
+    let mut without = Dataset::new("Raised", GeometryType::Polygon, vec![]);
+    without.push(square(), vec![]);
+    let mut text = Dataset::new("Raised", GeometryType::Polygon, vec![Field::new("floor", FieldType::Text)]);
+    text.push(square(), vec![Value::Text("3".into())]);
+    for (name, replacement, expected) in [("without", without, "no field floor"), ("text", text, "field floor must remain numeric")] {
+        let new = dir.join(format!("{name}.fgb"));
+        std::fs::write(&new, rustgis_data::source::fgb::write(&replacement).unwrap()).unwrap();
+        let error = session.run("layer.repairSource", &json!({"layer":id,"path":new})).unwrap_err();
+        assert!(error.contains(expected), "{name}: {error}");
+    }
+    std::fs::remove_dir_all(dir).ok();
+}
+
 #[test]
 fn area_review_attribute_edits_keep_retained_display_expressions() {
     let (mut session, id) = area_review_fixture();
@@ -41717,6 +41749,52 @@ fn web_scene_fans_caps_it_cannot_triangulate_and_says_so() {
     let mut s = mesh_session(json!([mesh_feature(flat_far, 30.0), mesh_feature(square(0.0, false), 30.0)]));
     s.run("share.webScene", &json!({"path": path})).unwrap();
     assert!(!s.notices.iter().any(|n| n.text.contains("left out of the scene")), "{:?}", s.notices);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The y of every position in a glTF written by `share.webScene` (its first accessor of
+/// positions), in the order written.
+fn gltf_heights(path: &str) -> Vec<f64> {
+    let g: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let prim = &g["meshes"][0]["primitives"][0];
+    let at = &g["accessors"][prim["attributes"]["POSITION"].as_u64().unwrap() as usize];
+    let uri = g["buffers"][0]["uri"].as_str().unwrap();
+    let bytes = {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.decode(uri.split_once(",").unwrap().1).unwrap()
+    };
+    let view = &g["bufferViews"][at["bufferView"].as_u64().unwrap() as usize];
+    let start = (view["byteOffset"].as_u64().unwrap_or(0) + at["byteOffset"].as_u64().unwrap_or(0)) as usize;
+    let count = at["count"].as_u64().unwrap() as usize;
+    bytes[start..start + count * 12].chunks(12).map(|v| f64::from(f32::from_le_bytes(v[4..8].try_into().unwrap()))).collect()
+}
+
+#[test]
+fn a_raised_part_stands_on_its_base_in_a_web_scene() {
+    let dir = std::env::temp_dir().join(format!("rustgis-gltf-base-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("scene.gltf").display().to_string();
+    let scene = |base: f64| {
+        let mut s = mesh_session(json!([mesh_feature(square(0.0, false), 30.0)]));
+        if let Some(l) = s.map_mut().layers.first_mut() {
+            l.extrusion = Some(rustgis_map::effects::Extrusion { field: Some("h".into()), base, ..Default::default() });
+        }
+        s.run("share.webScene", &json!({"path": path})).unwrap();
+        gltf_heights(&path)
+    };
+    // The cap (written first, one position per corner of the ring) sits on the walls' top; the
+    // walls run from the base.
+    let raised = scene(20.0);
+    let (cap, walls) = raised.split_at(raised.len() - 16);
+    assert!(cap.iter().all(|y| *y == 50.0), "cap at base + height: {cap:?}");
+    assert_eq!(walls.iter().cloned().fold(f64::MAX, f64::min), 20.0, "wall foot at the base");
+    assert_eq!(walls.iter().cloned().fold(f64::MIN, f64::max), 50.0, "wall top at base + height");
+    // With no base the walls stand on the ground and the cap at the height, as before.
+    let grounded = scene(0.0);
+    assert_eq!(grounded.iter().cloned().fold(f64::MAX, f64::min), 0.0);
+    assert_eq!(grounded.iter().cloned().fold(f64::MIN, f64::max), 30.0);
+    // A base at the cap leaves no room for the height: the top stays within it.
+    assert_eq!(scene(1e9).iter().cloned().fold(f64::MIN, f64::max), 1e6);
     let _ = std::fs::remove_dir_all(dir);
 }
 

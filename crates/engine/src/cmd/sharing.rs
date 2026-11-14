@@ -1013,8 +1013,7 @@ fn gltf(m: &Map, view: (f64, f64)) -> Result<SceneBytes, String> {
         let mut tri: std::collections::BTreeMap<[u8; 4], (Vec<[f32; 3]>, Vec<u32>)> = Default::default();
         let mut lines: std::collections::BTreeMap<[u8; 4], Vec<[f32; 3]>> = Default::default();
         let ex = l.extrusion.as_ref();
-        let hf = ex.and_then(|e| e.field.as_deref()).and_then(|f| l.dataset.field_index(f));
-        let (base_h, factor) = ex.map_or((0.0, 0.0), |e| (e.height, e.factor));
+        let columns = ex.map(|e| e.columns(&l.dataset)).unwrap_or_default();
         let rows = l.visible_rows();
         let styler = l.styler(Some(m.scale()));
         // The bytes built so far: a feature only adds to its own colour, so each step adds what
@@ -1066,8 +1065,14 @@ fn gltf(m: &Map, view: (f64, f64)) -> Result<SceneBytes, String> {
                 return Err("the scene would be too large; share fewer features".into());
             }
             let sym = styler.symbol(row);
-            let h = (hf.and_then(|fi| l.dataset.value(row, fi).as_f64()).filter(|v| v.is_finite()).unwrap_or(base_h) * factor)
-                .clamp(0.0, 1e6) as f32;
+            // A layer without an extrusion stands flat on the ground; the base and the height
+            // together stay within 1e6 m (the base is never NaN, so the height's cap is a number).
+            let (h, foot) = ex.map_or((0.0, 0.0), |e| {
+                let foot = e.base_metres_at(&l.dataset, row, columns).clamp(0.0, 1e6);
+                ((e.metres_at(&l.dataset, row, columns).clamp(0.0, 1e6 - foot)) as f32, foot as f32)
+            });
+            // The walls stand from the base, the cap sits on them.
+            let top = foot + h;
             let key = [sym.fill.r(), sym.fill.g(), sym.fill.b(), sym.fill.a()];
             last = Some((key, size(&tri, &lines, &key)));
             match g {
@@ -1123,7 +1128,7 @@ fn gltf(m: &Map, view: (f64, f64)) -> Result<SceneBytes, String> {
                         let (pos, idx) = tri.entry(key).or_default();
                         let base = pos.len() as u32;
                         for (x, z) in flat.get(..cap).unwrap_or(&[]) {
-                            pos.push([*x as f32, h, *z as f32]);
+                            pos.push([*x as f32, top, *z as f32]);
                         }
                         for t in &tris {
                             // Seen from above (+y), with z pointing south: reverse the winding.
@@ -1137,7 +1142,7 @@ fn gltf(m: &Map, view: (f64, f64)) -> Result<SceneBytes, String> {
                                     let (a, b) = (flat.get(first + i).copied(), flat.get(first + (i + 1) % n).copied());
                                     let (Some(a), Some(b)) = (a, b) else { continue };
                                     let w = pos.len() as u32;
-                                    for (p, y) in [(a, 0.0), (b, 0.0), (b, h), (a, h)] {
+                                    for (p, y) in [(a, foot), (b, foot), (b, top), (a, top)] {
                                         pos.push([p.0 as f32, y, p.1 as f32]);
                                     }
                                     idx.extend([w, w + 1, w + 2, w, w + 2, w + 3]);
@@ -1153,24 +1158,24 @@ fn gltf(m: &Map, view: (f64, f64)) -> Result<SceneBytes, String> {
                         scene.single_vertex_lines += usize::from(part.len() == 1);
                         for w in part.windows(2) {
                             let ((ax, az), (bx, bz)) = (xy(w[0]), xy(w[1]));
-                            seg.push([ax, h, az]);
-                            seg.push([bx, h, bz]);
+                            seg.push([ax, top, az]);
+                            seg.push([bx, top, bz]);
                         }
                     }
                 }
                 Geometry::Point(p) => {
                     let (x, z) = xy(*p);
                     let seg = lines.entry(key).or_default();
-                    // A vertical stick, as tall as the feature (or 50 m).
-                    seg.push([x, 0.0, z]);
-                    seg.push([x, h.max(50.0), z]);
+                    // A vertical stick from the base, as tall as the feature (or 50 m).
+                    seg.push([x, foot, z]);
+                    seg.push([x, top.max(foot + 50.0), z]);
                 }
                 Geometry::MultiPoint(ps_) => {
                     let seg = lines.entry(key).or_default();
                     for p in ps_ {
                         let (x, z) = xy(*p);
-                        seg.push([x, 0.0, z]);
-                        seg.push([x, h.max(50.0), z]);
+                        seg.push([x, foot, z]);
+                        seg.push([x, top.max(foot + 50.0), z]);
                     }
                 }
             }

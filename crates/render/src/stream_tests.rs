@@ -147,14 +147,7 @@ fn complete_chunks_preserve_painter_order_filters_transparency_labels_and_select
     l.renderer = Renderer::Single(Symbol { fill: Rgba::new(210, 60, 25, 120), ..Symbol::default_for(GeometryType::Polygon, l.id) });
     let view = View { width: 320.0, height: 240.0, pixels_per_point: 1.0, camera: m.camera, sky: false };
     for extrusion in [None, Some(true), Some(false)] {
-        m.layers[0].extrusion = extrusion.map(|shadows| rustgis_map::effects::Extrusion {
-            height: 1500.0,
-            field: None,
-            factor: 1.0,
-            face_culling: true,
-            lighting: true,
-            shadows,
-        });
+        m.layers[0].extrusion = extrusion.map(|shadows| rustgis_map::effects::Extrusion { height: 1500.0, shadows, ..Default::default() });
         let expected = render(&mut m.clone(), &view).unwrap();
         for size in [1, 3, 11, 100] {
             let mut actual = m.clone();
@@ -664,6 +657,7 @@ fn extrusion_spool_failures_retain_the_actual_source_diagnostic() {
         face_culling: true,
         lighting: true,
         shadows: true,
+        ..Default::default()
     });
     let view = View { width: 120.0, height: 90.0, pixels_per_point: 1.0, camera: Camera::new(Coord::new(0.0, 0.0), 80.0), sky: false };
     for stage in ["create", "insert", "draw"] {
@@ -1413,6 +1407,7 @@ fn streamed_extrusions_keep_their_charts_on_top() {
         face_culling: true,
         lighting: true,
         shadows: false,
+        ..Default::default()
     });
     l.diagram = Some(rustgis_map::DiagramSettings {
         kind: rustgis_map::DiagramKind::Pie,

@@ -433,6 +433,7 @@ fn compatible(
     let mut required: Vec<&str> = l.renderer.field().into_iter().collect();
     required.extend(l.marker_rotation.as_ref().map(|m| m.field.as_str()));
     required.extend(l.extrusion.as_ref().and_then(|e| e.field.as_deref()));
+    required.extend(l.extrusion.as_ref().and_then(|e| e.base_field.as_deref()));
     if let Some(d) = &l.diagram {
         required.extend(d.categories.iter().map(|c| c.field.as_str()));
     }
@@ -455,6 +456,7 @@ fn compatible(
     }
     numeric.extend(l.marker_rotation.as_ref().map(|m| m.field.as_str()));
     numeric.extend(l.extrusion.as_ref().and_then(|e| e.field.as_deref()));
+    numeric.extend(l.extrusion.as_ref().and_then(|e| e.base_field.as_deref()));
     if let Some(d) = &l.diagram {
         numeric.extend(d.categories.iter().map(|c| c.field.as_str()));
     }
