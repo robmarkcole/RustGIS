@@ -363,6 +363,7 @@ fn read_with(file_name: &str, bytes: &[u8], given: Option<Crs>, keep_named: bool
             id: id.clone(),
             ty: type_name(&object.ty),
             parent_ids: object.parents,
+            ground: None,
             z: made.z,
             solid: made.solid,
             attributes,
