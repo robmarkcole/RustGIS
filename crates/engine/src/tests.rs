@@ -46359,6 +46359,129 @@ fn native_date_source_repair_and_reload_use_finished_candidates() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// A mobile map package says what simplifying its layers changed or left alone (#1811): a line
+/// reaching 95° (bad data) has its vertex taken as the pole, and a part of one vertex left out;
+/// lines with a longitude too far out are left as they were; one notice per kind. A clean layer,
+/// or one only reaching beyond 85.05°, is simplified with nothing to say.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_mobile_package_says_what_simplifying_did() {
+    use rustgis_data::{Coord, Dataset, Geometry, GeometryType};
+    struct Dir(std::path::PathBuf);
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let dir = Dir(std::env::temp_dir().join(format!("rustgis-mobile-notes-{}-{nanos}", std::process::id())));
+    std::fs::create_dir_all(&dir.0).unwrap();
+    let said =
+        |s: &Session| s.notices.iter().filter(|n| n.text.starts_with("Mobile map package")).map(|n| n.text.clone()).collect::<Vec<_>>();
+    let package_all = |lines: Vec<Vec<Vec<Coord>>>, name: &str| {
+        let mut s = Session::new(Project::default());
+        let mut ds = Dataset::new("ways", GeometryType::Polyline, vec![]);
+        for line in lines {
+            ds.push(Some(Geometry::Line(line)), vec![]);
+        }
+        s.map_mut().add_dataset(ds);
+        let path = dir.0.join(name);
+        s.run("map.package", &json!({"path": path.display().to_string(), "mobile": true})).unwrap();
+        s
+    };
+    let package = |line: Vec<Vec<Coord>>, name: &str| package_all(vec![line], name);
+    let bad =
+        package(vec![vec![Coord::new(0.0, 80.0), Coord::new(1.0, 95.0), Coord::new(2.0, 80.0)], vec![Coord::new(5.0, 5.0)]], "bad.rgismpk");
+    let notes = said(&bad);
+    assert_eq!(notes.len(), 2, "{notes:?}");
+    assert!(notes.contains(&"Mobile map package, simplifying: 1 line part(s) of fewer than 2 vertices left out".to_string()), "{notes:?}");
+    assert!(
+        notes.contains(
+            &"Mobile map package, simplifying: 1 vertex(es) with a latitude past a pole found (taken as that pole before simplifying, so some may then go)"
+                .to_string()
+        ),
+        "{notes:?}"
+    );
+    // Lines with a longitude too far out for the analysis plane are left as they were, and said.
+    // (A missing coordinate is too, but a package can't hold one: that's not Simplify's to say.)
+    let unplaced = package_all(
+        vec![
+            vec![vec![Coord::new(0.0, 10.0), Coord::new(-1e300, 10.5), Coord::new(2.0, 10.0)]],
+            vec![vec![Coord::new(0.0, 20.0), Coord::new(1e300, 20.0), Coord::new(2.0, 20.0)]],
+        ],
+        "unplaced.rgismpk",
+    );
+    assert_eq!(
+        said(&unplaced),
+        [
+            "Mobile map package, simplifying: 2 line or polygon feature(s) have a coordinate missing, or a longitude too far out to place: they are left as they were"
+        ]
+    );
+    // Clean, or only simplified less than asked (reaching 88°, as Antarctica does): nothing to say.
+    for (line, name) in [
+        (vec![vec![Coord::new(0.0, 40.0), Coord::new(1.0, 40.0001), Coord::new(2.0, 40.0)]], "clean.rgismpk"),
+        (vec![vec![Coord::new(0.0, -80.0), Coord::new(1.0, -88.0), Coord::new(2.0, -80.0)]], "south.rgismpk"),
+    ] {
+        let clean = package(line, name);
+        assert!(said(&clean).is_empty(), "{name}: {:?}", said(&clean));
+    }
+}
+
+/// A globe locator says what simplifying its polygons changed or left alone (#1811), in the
+/// layout's warnings: a ring's vertex at 95° (bad data) taken as the pole; a polygon with a
+/// coordinate missing left as it was, a ring of 3 too. A ring the sketch keeps as it was, or a
+/// clean layer, or one only reaching beyond 85.05°: nothing.
+#[test]
+fn a_globe_locator_says_what_simplifying_did() {
+    use rustgis_data::{Coord, Dataset, Geometry, GeometryType};
+    let warned = |ring: Vec<Coord>| {
+        let mut s = Session::new(Project::default());
+        let mut ds = Dataset::new("areas", GeometryType::Polygon, vec![]);
+        ds.push(Some(Geometry::Polygon(vec![vec![ring]])), vec![]);
+        s.map_mut().add_dataset(ds);
+        let r = s.run("layout.publication", &json!({"extent": [0, 60, 20, 85], "locator": "globe"})).unwrap();
+        r["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|w| w.as_str())
+            .filter(|w| w.starts_with("the globe locator"))
+            .map(String::from)
+            .collect::<Vec<_>>()
+    };
+    let c = Coord::new;
+    let bad = warned(vec![c(0.0, 70.0), c(20.0, 70.0), c(20.0, 80.0), c(10.0, 95.0), c(0.0, 80.0), c(0.0, 70.0)]);
+    assert!(
+        bad.contains(
+            &"the globe locator, simplifying its polygons: 1 vertex(es) with a latitude past a pole found (taken as that pole before simplifying, so some may then go)"
+                .to_string()
+        ),
+        "{bad:?}"
+    );
+    // A ring with a coordinate missing is left as it was, and said.
+    let unplaced = warned(vec![c(0.0, 70.0), c(20.0, 70.0), c(f64::NAN, 80.0), c(10.0, 82.0), c(0.0, 80.0), c(0.0, 70.0)]);
+    assert_eq!(
+        unplaced,
+        [
+            "the globe locator, simplifying its polygons: 1 line or polygon feature(s) have a coordinate missing, or a longitude too far out to place: they are left as they were"
+        ]
+    );
+    // A ring of 3 with a coordinate missing is too short for the sketch, kept as it was, and said.
+    assert_eq!(warned(vec![c(0.0, 70.0), c(f64::NAN, 80.0), c(0.0, 70.0)]), unplaced);
+    // A ring smaller than the tolerance keeps its vertices as they were, the one past the pole
+    // too, so nothing was taken to the pole: nothing said.
+    let tiny = warned(vec![c(10.0, 89.99999), c(10.00001, 89.99999), c(10.000005, 95.0), c(10.0, 89.99999)]);
+    assert!(tiny.is_empty(), "{tiny:?}");
+    // Clean, or only simplified less than asked (reaching 89°, as Antarctica's -90° does): nothing.
+    for ring in [
+        vec![c(0.0, 70.0), c(20.0, 70.0), c(20.0, 80.0), c(10.0, 82.0), c(0.0, 80.0), c(0.0, 70.0)],
+        vec![c(0.0, 70.0), c(20.0, 70.0), c(20.0, 80.0), c(10.0, 89.0), c(0.0, 80.0), c(0.0, 70.0)],
+    ] {
+        let clean = warned(ring);
+        assert!(clean.is_empty(), "{clean:?}");
+    }
+}
+
 /// An orbit draws the map at a bearing a frame and puts the view back: a whole turn stops one
 /// step short of where it began (it loops), a part of one ends on its last bearing.
 #[test]

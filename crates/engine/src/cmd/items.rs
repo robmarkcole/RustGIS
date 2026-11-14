@@ -727,13 +727,21 @@ fn package_map(s: &mut Session, mobile: bool, tol: f64) -> Result<Vec<u8>, Strin
         let hidden: Vec<u32> = m.layers.iter().filter(|l| !kept(l)).map(|l| l.id).collect();
         m.release_tiles(&hidden);
         m.layers.retain(|l| kept(l));
+    }
+    // What Simplify left alone or changed beyond simplifying (a latitude past a pole taken as the
+    // pole, a one-vertex line part left out, a feature left as it was or too intricate), over all
+    // the layers: said once the package is made, one notice per kind (#1811).
+    let mut notes = rustgis_analysis::SimplifyNotes::default();
+    if mobile {
         for l in &mut m.layers {
             if l.is_raster() || tol <= 0.0 {
                 continue;
             }
             for f in &mut l.dataset.features {
                 if let Some(g) = &f.geometry {
-                    f.geometry = Some(rustgis_analysis::simplify_geometry(g, tol * 111_320.0));
+                    let (simple, said) = rustgis_analysis::simplify_geometry(g, tol * 111_320.0);
+                    notes.add(&said);
+                    f.geometry = Some(simple);
                 }
             }
             l.touch_geometry();
@@ -745,7 +753,12 @@ fn package_map(s: &mut Session, mobile: bool, tol: f64) -> Result<Vec<u8>, Strin
     crate::durable::notify(s, &report);
     let kind = if mobile { "mobile map package" } else { "map package" };
     let readme = format!("{} — a RustGIS {kind}.\nAdd it to a project with Data › Import.\n", name);
-    rustgis_data::zip::write(&[(format!("{}.rgismap", safe(&name)), text.into_bytes()), ("README.txt".into(), readme.into_bytes())])
+    let archive =
+        rustgis_data::zip::write(&[(format!("{}.rgismap", safe(&name)), text.into_bytes()), ("README.txt".into(), readme.into_bytes())])?;
+    for said in notes.without_polar().messages("Mobile map package, simplifying") {
+        s.notify(said, false);
+    }
+    Ok(archive)
 }
 
 /// The geoprocessing history with the layers its runs made, as GeoJSON.

@@ -1480,10 +1480,12 @@ Packages are zip files. Project and map packages can newly embed a combined 512 
 raster files on the desktop (128 MiB in the web app); a raster that doesn't fit stays linked.
 Already embedded uploads are retained. Local streamed vector files, databases and web layers
 stay linked to their sources. A mobile map package keeps only the visible layers and simplifies their
-geometry, for phones and tablets. Styles can also be imported from the layers of a layer file,
-map file or project. Data › Layer Templates adds empty layers with ready-made schemas (places,
-routes, areas, observations…) to draw into. Add Folder connects a folder to the Browser, which
-also lists the project's layouts, styles and tasks. A task's steps each run a command; New Task
+geometry, for phones and tablets; what simplifying changes or leaves alone (a latitude past a pole
+taken as the pole, a one-vertex line part left out, a feature left as it was or too intricate to
+simplify whole) is said, as Simplify says it. Styles can also be imported from the layers of a
+layer file, map file or project. Data › Layer Templates adds empty layers with ready-made schemas
+(places, routes, areas, observations…) to draw into. Add Folder connects a folder to the Browser,
+which also lists the project's layouts, styles and tasks. A task's steps each run a command; New Task
 From History turns the geoprocessing history into a task you can replay.
 
 Saved projects, templates, map and layer files, and packages remove recognized credentials from
