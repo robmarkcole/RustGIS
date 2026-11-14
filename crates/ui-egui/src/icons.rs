@@ -465,6 +465,17 @@ pub fn paint(painter: &Painter, r: Rect, name: &str, ink: Color32, accent: Color
             p.line(&[(12.5, 7.0), (12.5, 12.0), (16.0, 14.0)], 1.6, ink);
             p.fill(&[(1.5, 9.5), (6.0, 9.5), (3.5, 13.5)], ink);
         }
+        "calendar" => {
+            // A page of a calendar: its rings over a band, and a day marked in the grid below.
+            p.rect(3.0, 5.0, 18.0, 16.0, Some(p.tint(30)), Some((1.4, ink)), 2.0);
+            p.line(&[(3.0, 9.5), (21.0, 9.5)], 1.4, ink);
+            p.line(&[(8.0, 3.0), (8.0, 7.0)], 1.6, ink);
+            p.line(&[(16.0, 3.0), (16.0, 7.0)], 1.6, ink);
+            for (x, y) in [(6.5, 13.0), (10.5, 13.0), (6.5, 17.0), (10.5, 17.0), (14.5, 17.0)] {
+                p.rect(x - 1.0, y - 1.0, 2.0, 2.0, Some(ink), None, 0.0);
+            }
+            p.rect(13.0, 11.5, 4.0, 3.5, Some(p.acc), None, 0.5);
+        }
         "time_slider" => {
             // A clock over a slider track with its thumb.
             p.circle(12.0, 9.0, 7.0, Some(p.tint(40)), Some((1.4, ink)));
@@ -1255,6 +1266,7 @@ pub const ALL: &[&str] = &[
     "modelbuilder",
     "python",
     "history",
+    "calendar",
     "time_slider",
     "time_off",
     "time_first",

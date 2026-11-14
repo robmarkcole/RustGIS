@@ -74,6 +74,10 @@ mod android {
     use std::sync::{Arc, Mutex};
     use winit::platform::android::activity::AndroidApp;
 
+    /// How long the window keeps looking for the soft keyboard's room after a field last wanted
+    /// it: long enough for the keyboard to finish closing.
+    const KEYBOARD_SETTLES: std::time::Duration = std::time::Duration::from_millis(1500);
+
     /// What a service couldn't do, kept until the next frame says it in the window (a service has
     /// no session to tell).
     type Refusals = Rc<RefCell<Vec<String>>>;
@@ -88,6 +92,11 @@ mod android {
         poll: Option<u64>,
         /// Whether the phone was last asked for positions (`RustGisApp::locate`, as last seen).
         locating: bool,
+        /// Whether the soft keyboard was up, where the phone says.
+        keyboard: Option<bool>,
+        /// Until when the window looks again for the soft keyboard's room: a moment after the
+        /// last frame a field wanted the keyboard.
+        typing: Option<std::time::Instant>,
         /// Whether the system bars' icons were last asked to be dark (a light ground); `None`
         /// before the first frame.
         bars_light: Option<bool>,
@@ -291,9 +300,11 @@ mod android {
     /// The room the system's bars take at the window's edges (the status bar, the navigation bar,
     /// a camera cutout), in points: egui keeps every panel out of it. `None` when the phone
     /// can't say, which leaves egui's last answer in place.
-    fn insets(phone: Option<&Phone>, pixels_per_point: f32) -> Option<egui::SafeAreaInsets> {
-        let [left, top, right, bottom] = phone?.insets()?.map(|edge| edge.max(0.0) / pixels_per_point.max(0.1));
-        Some(egui::SafeAreaInsets(egui::epaint::MarginF32 { left, top, right, bottom }))
+    /// With the room, whether the soft keyboard is up, where the phone says.
+    fn insets(phone: Option<&Phone>, pixels_per_point: f32) -> Option<(egui::SafeAreaInsets, Option<bool>)> {
+        let (edges, keyboard) = phone?.insets()?;
+        let [left, top, right, bottom] = edges.map(|edge| edge.max(0.0) / pixels_per_point.max(0.1));
+        Some((egui::SafeAreaInsets(egui::epaint::MarginF32 { left, top, right, bottom }), keyboard))
     }
 
     /// What starts the name of a file from the picker for `purpose` in the inbox, as the browser's
@@ -350,10 +361,33 @@ mod android {
             if let Some(wait) = self.poll {
                 ctx.request_repaint_after(std::time::Duration::from_millis(wait));
             }
+            // The soft keyboard comes and goes without waking the app: while a field wants it,
+            // and a moment after, the window looks again for the room it takes (`insets`).
+            let now = std::time::Instant::now();
+            if ctx.egui_wants_keyboard_input() {
+                self.typing = Some(now + KEYBOARD_SETTLES);
+            }
+            if self.typing.is_some_and(|until| now < until) {
+                ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            } else {
+                self.typing = None;
+            }
         }
 
         fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
-            raw_input.safe_area_insets = insets(self.phone.as_deref(), ctx.pixels_per_point());
+            let room = insets(self.phone.as_deref(), ctx.pixels_per_point());
+            raw_input.safe_area_insets = room.map(|(edges, _)| edges);
+            // The soft keyboard closed (Back, or its own button) while a field still has the
+            // focus: typing is over, so the field lets it go. Kept, the interface would stay laid
+            // out for typing until the next tap, and move what that tap was aimed at. Android 11
+            // and later say when the keyboard goes. Before, it isn't reported at all (nor its
+            // room), and the field keeps the focus until the next tap.
+            if let Some((_, keyboard)) = room {
+                if self.keyboard == Some(true) && keyboard == Some(false) && ctx.egui_wants_keyboard_input() {
+                    ctx.memory_mut(|m| m.stop_text_input());
+                }
+                self.keyboard = keyboard;
+            }
             self.take_phone_events(ctx, raw_input);
             // The pushed files open as files dropped on the desktop window do: once the window
             // runs, read off its thread with progress and Cancel, each failure said in the window.
@@ -487,6 +521,8 @@ mod android {
                     app,
                     poll: None,
                     locating: false,
+                    typing: None,
+                    keyboard: None,
                     bars_light: None,
                     pushed,
                     phone,

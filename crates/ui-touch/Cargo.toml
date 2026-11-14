@@ -12,3 +12,5 @@ workspace = true
 rustgis-ui-egui = { workspace = true }
 egui = { workspace = true }
 serde_json = { workspace = true }
+# Today's date and this moment, for the form's calendar.
+web-time = { workspace = true }

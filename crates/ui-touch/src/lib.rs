@@ -11,7 +11,10 @@
 //! lists, ranges and feature templates) and the More sheet (full extent, project, undo, the
 //! desktop interface, the device's position). Where a shell reports the device's position
 //! (`RustGisApp::position`), it is drawn on the map and the capture cross can be put on it.
-//! Not yet: editing a shape's vertices, snapping, and text input that suits a soft keyboard.
+//! The form marks the fields the layer's constraint rules require, narrows a field to the values
+//! its contingent value sets leave it, has a calendar for dates, and keeps the field being typed
+//! in above the soft keyboard (see [`form`]).
+//! Not yet: editing a shape's vertices and snapping.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 use egui::{Align, Color32, CornerRadius, Layout, Rect, RichText, Sense, Stroke, Ui, Vec2};
@@ -19,12 +22,17 @@ use rustgis_ui_egui::theme::Tokens;
 use rustgis_ui_egui::{RustGisApp, icons, tl};
 use serde_json::{Value, json};
 
+mod form;
+
 /// The smallest side of anything a finger taps, in points (Android's guidance is 48).
 pub const TARGET: f32 = 48.0;
 /// The bar's height: an icon over its label.
 const BAR: f32 = 64.0;
 /// The most of the window's height a sheet takes, so the map stays in view above it.
 const SHEET_SHARE: f32 = 0.55;
+/// The most a sheet takes while the soft keyboard is wanted: what is typed in matters more than
+/// the map then, and the keyboard has taken much of the window.
+const TYPING_SHARE: f32 = 0.9;
 /// The room above and below a sheet's rows.
 const SHEET_MARGIN: f32 = 4.0;
 /// The More sheet's rows with the position hidden.
@@ -78,7 +86,8 @@ pub fn chrome(app: &mut RustGisApp, ui: &mut Ui) {
         };
         let spacing = ui.spacing().item_spacing.y;
         let wanted = (rows + 1) as f32 * (TARGET + spacing) + 2.0 * SHEET_MARGIN;
-        let height = wanted.min(ui.available_height() * SHEET_SHARE);
+        let share = if ctx.egui_wants_keyboard_input() { TYPING_SHARE } else { SHEET_SHARE };
+        let height = wanted.min(ui.available_height() * share);
         let margin = egui::Margin::symmetric(8, SHEET_MARGIN as i8);
         egui::Panel::bottom("touch_sheet").resizable(false).exact_size(height).frame(frame.inner_margin(margin)).show(
             ui,
@@ -310,6 +319,11 @@ struct Form {
     template: Option<String>,
     /// The vertices of the line or polygon being drawn, as longitude and latitude, in order.
     vertices: Vec<(f64, f64)>,
+    /// The date field whose calendar is open, by name, and the month it shows.
+    calendar: Option<(String, form::Month)>,
+    /// The height of the window the sheet was last drawn in: when it changes (the soft keyboard
+    /// came or went), the field being typed in is scrolled back into view.
+    window: f32,
 }
 
 impl Form {
@@ -321,6 +335,7 @@ impl Form {
             self.values.clear();
             self.vertices.clear();
             self.template = None;
+            self.calendar = None;
             self.shown = Some(instance);
         }
         self
@@ -383,10 +398,21 @@ fn capture_layer(app: &RustGisApp, form: &Form) -> Option<Target> {
 /// The Capture sheet's rows, for its height: its layers, its fields, where the cross is, and
 /// its buttons (two rows of them for a line or polygon).
 fn capture_rows(app: &RustGisApp, ctx: &egui::Context) -> usize {
-    let Some(target) = capture_layer(app, &form(ctx)) else { return 2 };
+    let state = form(ctx);
+    let Some(target) = capture_layer(app, &state) else { return 2 };
     let layer = app.session.map().layer(target.id);
-    let fields = layer.map_or(0, |l| l.dataset.fields.len() + usize::from(!l.design.templates.is_empty()));
-    fields + if target.kind == GeometryType::Point { 3 } else { 4 } + usize::from(app.locate)
+    let fields = layer
+        .map_or(0, |l| l.dataset.fields.len() + usize::from(!l.design.templates.is_empty()) + usize::from(!form::required(l).is_empty()));
+    // A date and time's calendar has its Now row too.
+    let calendar = match (&state.calendar, layer) {
+        (Some((name, _)), Some(l)) => {
+            let timed =
+                l.dataset.fields.iter().any(|f| &f.name == name && f.ty == rustgis_ui_egui::rustgis_engine::data::FieldType::DateTime);
+            form::CALENDAR_ROWS + usize::from(timed)
+        }
+        _ => 0,
+    };
+    fields + calendar + if target.kind == GeometryType::Point { 3 } else { 4 } + usize::from(app.locate)
 }
 
 /// A value typed for a field, as the command takes it: a number for a field of numbers, a truth
@@ -482,6 +508,18 @@ fn add_feature(app: &mut RustGisApp, id: u32, form: &Form, geometry: Value) -> b
         );
         return false;
     }
+    // A field a rule requires, left empty and not filled by the template or the subtype chosen,
+    // is named here: the rule's own refusal would only quote its expression.
+    let empty: Vec<String> = form::required(layer)
+        .into_iter()
+        .filter(|name| !attributes.contains_key(name) && !defaulted(layer, form, name))
+        .map(|name| layer.dataset.fields.iter().find(|f| f.name == name).map_or(name.clone(), |f| f.display().to_string()))
+        .collect();
+    if !empty.is_empty() {
+        let fields = empty.join(", ");
+        app.session.notify(rustgis_ui_egui::i18n::fmt("Nothing was added. Fill in: {fields}.", &[("fields", &fields)]), true);
+        return false;
+    }
     if !app.session.map().editing.settings.enabled {
         if app.run_by_user("edit.enable", json!({"on": true})).is_err() {
             return false;
@@ -507,6 +545,25 @@ fn add_feature(app: &mut RustGisApp, id: u32, form: &Form, geometry: Value) -> b
     };
     app.session.notify(added, false);
     true
+}
+
+/// Whether the field `name` of a new feature takes a value from what the form chose: the default
+/// of the feature template chosen, or of the subtype its subtype field holds.
+fn defaulted(layer: &rustgis_ui_egui::rustgis_engine::map::Layer, form: &Form, name: &str) -> bool {
+    let has = |defaults: &[(String, rustgis_ui_egui::rustgis_engine::data::Value)]| {
+        defaults.iter().any(|(field, value)| field.eq_ignore_ascii_case(name) && !value.is_null())
+    };
+    let template = form.template.as_ref().and_then(|t| layer.design.templates.iter().find(|x| &x.name == t));
+    // The subtype the form chose, or else the one the template gives, as the engine reads it.
+    let subtype = layer.design.subtypes.as_ref().and_then(|s| {
+        let typed = form.values.iter().find(|(field, v)| field.eq_ignore_ascii_case(&s.field) && !v.trim().is_empty());
+        let code = match typed {
+            Some((_, v)) => v.trim().parse::<i64>().ok()?,
+            None => template?.defaults.iter().find(|(field, _)| field.eq_ignore_ascii_case(&s.field))?.1.as_f64()? as i64,
+        };
+        s.subtypes.iter().find(|x| x.code == code)
+    });
+    template.is_some_and(|t| has(&t.defaults)) || subtype.is_some_and(|s| has(&s.defaults))
 }
 
 /// Adds a point to layer `id` where the middle of the map is, with what the form holds. A cross
@@ -551,6 +608,16 @@ fn choices(
     }
     (field.ty == FieldType::Boolean)
         .then(|| vec![("true".to_string(), tl!("Yes").to_string()), ("false".to_string(), tl!("No").to_string())])
+}
+
+/// A coded domain's codes with their descriptions, as (what is stored, what is shown); none for a
+/// range.
+fn described(domain: &rustgis_ui_egui::rustgis_engine::map::design::Domain) -> Vec<(String, String)> {
+    use rustgis_ui_egui::rustgis_engine::map::design::DomainKind;
+    match &domain.kind {
+        DomainKind::Coded(codes) => codes.iter().map(|(code, says)| (form::stored(code), says.clone())).collect(),
+        DomainKind::Range { .. } => Vec::new(),
+    }
 }
 
 /// The limits of a field's range domain, when it has one.
@@ -716,15 +783,25 @@ fn capture(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             });
         });
         // Read first: the rows change the form, not the layer.
-        let (fields, templates, lists): (Vec<_>, Vec<String>, Vec<Option<Vec<(String, String)>>>) = match app.session.map().layer(target.id)
-        {
+        let layer = app.session.map().layer(target.id);
+        let (fields, templates, lists, required): (Vec<_>, Vec<String>, Vec<Option<Vec<(String, String)>>>, Vec<String>) = match layer {
             Some(l) => (
                 l.dataset.fields.clone(),
                 l.design.templates.iter().map(|template| template.name.clone()).collect(),
                 l.dataset.fields.iter().map(|f| choices(l, f)).collect(),
+                form::required(l),
             ),
             None => Default::default(),
         };
+        // What the contingent value sets leave each field, given what the others hold now.
+        let left: Vec<Option<Vec<String>>> =
+            fields.iter().map(|f| layer.and_then(|l| form::contingent(l, &f.name, &state.values))).collect();
+        let ranges: Vec<Option<(f64, f64)>> = fields.iter().map(|f| layer.and_then(|l| range_of(l, &f.name))).collect();
+        let described: Vec<Option<Vec<(String, String)>>> =
+            fields.iter().map(|f| layer.and_then(|l| l.design.domain(&f.name)).map(described)).collect();
+        if !required.is_empty() {
+            ui.label(RichText::new(tl!("Fields marked * need a value.")).size(13.0).color(t.text_dim));
+        }
         // The layer's feature templates: one fills in its defaults for what the form leaves empty.
         if !templates.is_empty() {
             ui.horizontal(|ui| {
@@ -739,19 +816,48 @@ fn capture(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 }
             });
         }
-        for (field, list) in fields.iter().zip(lists) {
+        // The soft keyboard came or went: the field being typed in is brought back into view.
+        let window = ctx.content_rect().height();
+        let resized = (window - state.window).abs() > 0.5;
+        state.window = window;
+        for (i, (field, list)) in fields.iter().zip(lists).enumerate() {
             use rustgis_ui_egui::rustgis_engine::data::FieldType;
-            let label = field.alias.clone().filter(|a| !a.trim().is_empty()).unwrap_or_else(|| field.name.clone());
+            let name = field.alias.clone().filter(|a| !a.trim().is_empty()).unwrap_or_else(|| field.name.clone());
+            let needed = required.contains(&field.name);
+            let label = if needed { format!("{name} *") } else { name };
+            let left = left.get(i).cloned().flatten();
+            // A list narrowed by the contingent values: what the domain lists and the sets leave,
+            // or, with no list of its own, the values the sets leave. The value chosen stays,
+            // marked, even when the others no longer fit it, so the conflict shows.
+            let list: Option<Vec<(String, String)>> = match (list, left.as_ref()) {
+                (Some(list), Some(left)) => Some(list.into_iter().filter(|(stored, _)| left.contains(stored)).collect()),
+                (None, Some(left)) => {
+                    let said = described.get(i).cloned().flatten().unwrap_or_default();
+                    Some(
+                        left.iter().map(|v| (v.clone(), said.iter().find(|(c, _)| c == v).map_or(v.clone(), |(_, d)| d.clone()))).collect(),
+                    )
+                }
+                (list, None) => list,
+            };
+            let chosen_from_list = list.is_some();
+            let dated = matches!(field.ty, FieldType::Date | FieldType::DateTime);
             ui.horizontal(|ui| {
                 ui.set_min_height(TARGET);
-                ui.add_sized([110.0, TARGET], egui::Label::new(RichText::new(&label).size(14.0).color(t.text_dim)).truncate());
+                let ink = if needed { t.text } else { t.text_dim };
+                ui.add_sized([110.0, TARGET], egui::Label::new(RichText::new(&label).size(14.0).color(ink)).truncate());
                 let value = state.values.entry(field.name.clone()).or_default();
-                if let Some(list) = list {
-                    // A list of values: one is tapped, and tapped again to leave the field empty.
-                    chips(ui, t, ("touch_capture_values", &field.name), &list, value);
+                if let Some(mut list) = list {
+                    if !value.is_empty() && !list.iter().any(|(stored, _)| stored == value) {
+                        list.insert(0, (value.clone(), value.clone()));
+                    }
+                    if list.is_empty() {
+                        ui.label(RichText::new(tl!("No value fits the others chosen.")).size(13.0).color(t.red));
+                    } else {
+                        // A list of values: one is tapped, and tapped again to leave the field empty.
+                        chips(ui, t, ("touch_capture_values", &field.name), &list, value);
+                    }
                 } else {
-                    let range = app.session.map().layer(target.id).and_then(|l| range_of(l, &field.name));
-                    let hint = match (field.ty, range) {
+                    let hint = match (field.ty, ranges.get(i).copied().flatten()) {
                         (_, Some((min, max))) => rustgis_ui_egui::i18n::fmt(
                             "a number from {min} to {max}",
                             &[("min", &min.to_string()), ("max", &max.to_string())],
@@ -765,9 +871,49 @@ fn capture(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                         .hint_text(hint)
                         .font(egui::FontId::proportional(15.0))
                         .margin(egui::Margin::symmetric(8, 10));
-                    ui.add_sized([ui.available_width(), TARGET - 6.0], edit);
+                    // A date field keeps room for the button that opens its calendar.
+                    let room = if dated { ui.available_width() - TARGET - ui.spacing().item_spacing.x } else { ui.available_width() };
+                    let typed = ui.add_sized([room.max(TARGET), TARGET - 6.0], edit);
+                    if typed.gained_focus() || (typed.has_focus() && resized) {
+                        typed.scroll_to_me(Some(Align::Center));
+                    }
+                    if dated {
+                        let open = state.calendar.as_ref().is_some_and(|(name, _)| name == &field.name);
+                        let hint = if open { tl!("Close the calendar") } else { tl!("Choose a date") };
+                        if toggle_button(ui, t, "calendar", hint, true) {
+                            state.calendar = if open {
+                                None
+                            } else {
+                                let day = form::day_of(value).or_else(form::today);
+                                // Without a clock, the calendar starts at 1970's first month.
+                                let month = day.map_or((1970, 1), |d| {
+                                    let (y, m, _) = d.ymd();
+                                    (y, m)
+                                });
+                                Some((field.name.clone(), month))
+                            };
+                        }
+                    }
                 }
             });
+            // The calendar, under its field, while it is open and the field is typed into: a field
+            // the contingent values narrowed to chips (its toggle gone) closes it.
+            if chosen_from_list && state.calendar.as_ref().is_some_and(|(name, _)| name == &field.name) {
+                state.calendar = None;
+            }
+            if let Some((name, month)) = state.calendar.as_mut().filter(|(name, _)| name == &field.name) {
+                let name = name.clone();
+                let value = state.values.entry(name).or_default();
+                if field.ty == FieldType::DateTime
+                    && let Some(now) = form::now()
+                    && action(ui, t, tl!("Now"), ui.available_width(), false, true)
+                {
+                    *value = now;
+                }
+                if form::calendar(ui, t, month, value, field.ty) {
+                    state.calendar = None;
+                }
+            }
         }
     });
     // The layer is kept only when a chip chose it: until then the sheet follows the active layer.
@@ -1145,6 +1291,72 @@ mod tests {
                 frame(&mut app, &ctx, shown);
             }
         }
+    }
+
+    #[test]
+    fn a_required_field_left_empty_is_named_and_a_default_fills_it() {
+        use rustgis_ui_egui::rustgis_engine::data::FieldType;
+        let ctx = egui::Context::default();
+        let mut app = RustGisApp::with_sample();
+        let cities = target(&mut app, GeometryType::Point);
+        let text =
+            app.session.map().layer(cities.id).unwrap().dataset.fields.iter().find(|f| f.ty == FieldType::Text).unwrap().name.clone();
+        let rule = json!({"layer": cities.id, "name": "named", "kind": "constraint", "expression": format!("{text} IS NOT NULL")});
+        run(&mut app, "data.attributeRule", rule);
+        assert_eq!(form::required(app.session.map().layer(cities.id).unwrap()), std::slice::from_ref(&text));
+        // Empty: nothing is added, and the field is named.
+        let before = count(&app, cities.id);
+        let mark = app.session.notice_mark();
+        assert!(!add_point(&mut app, cities.id, &Form::default()));
+        assert_eq!(count(&app, cities.id), before);
+        let said: Vec<_> = app.session.notices_since(mark).iter().filter(|n| n.error).map(|n| n.text.clone()).collect();
+        assert!(said.len() == 1 && said[0].contains(&text), "{said:?}");
+        // Filled, or filled by the template chosen: added.
+        let mut state = Form::default();
+        state.values.insert(text.clone(), "Camp".into());
+        assert!(add_point(&mut app, cities.id, &state));
+        run(&mut app, "edit.template", json!({"layer": cities.id, "name": "Camp", "defaults": {text.clone(): "Camp"}}));
+        assert!(add_point(&mut app, cities.id, &Form { template: Some("Camp".into()), ..Form::default() }));
+        assert_eq!(count(&app, cities.id), before + 2);
+        // The sheet draws the marked field, a contingent set's chips and an open calendar.
+        let number =
+            app.session.map().layer(cities.id).unwrap().dataset.fields.iter().find(|f| f.ty != FieldType::Text).unwrap().name.clone();
+        let set = json!({"layer": cities.id, "name": "pair", "fields": [text, number], "combos": [["Camp", 1], ["Town", 2]]});
+        run(&mut app, "data.contingentValues", set);
+        assert_eq!(form::contingent(app.session.map().layer(cities.id).unwrap(), &text, &state.values).map(|v| v.len()), Some(2));
+        // A calendar open on a field the contingent values narrow to chips closes: its toggle is
+        // gone with the text box.
+        set_form(&ctx, Form { shown: Some(cities.instance), calendar: Some((text, (2026, 3))), ..Form::default() });
+        frame(&mut app, &ctx, Sheet::Capture);
+        assert!(form(&ctx).calendar.is_none());
+        // On a date field typed into, it stays open and draws.
+        run(&mut app, "edit.addField", json!({"layer": cities.id, "name": "seen", "type": "date"}));
+        set_form(&ctx, Form { shown: Some(cities.instance), calendar: Some(("seen".into(), (2026, 3))), ..Form::default() });
+        frame(&mut app, &ctx, Sheet::Capture);
+        assert!(form(&ctx).calendar.is_some());
+    }
+
+    #[test]
+    fn a_subtype_the_template_chooses_fills_a_required_field_with_its_default() {
+        let mut app = RustGisApp::with_sample();
+        let cities = target(&mut app, GeometryType::Point);
+        run(&mut app, "edit.addField", json!({"layer": cities.id, "name": "kind", "type": "long"}));
+        run(&mut app, "edit.addField", json!({"layer": cities.id, "name": "status", "type": "text"}));
+        let subtypes =
+            json!({"layer": cities.id, "field": "kind", "subtypes": [{"code": 1, "name": "Well", "defaults": {"status": "active"}}]});
+        run(&mut app, "data.subtypes", subtypes);
+        run(
+            &mut app,
+            "data.attributeRule",
+            json!({"layer": cities.id, "name": "status", "kind": "constraint", "expression": "status IS NOT NULL"}),
+        );
+        run(&mut app, "edit.template", json!({"layer": cities.id, "name": "Well", "defaults": {"kind": 1}}));
+        let layer = app.session.map().layer(cities.id).unwrap();
+        // The template gives the subtype, whose default fills the required field.
+        let state = Form { template: Some("Well".into()), ..Form::default() };
+        assert!(defaulted(layer, &state, "status"));
+        assert!(!defaulted(layer, &Form::default(), "status"));
+        assert!(add_point(&mut app, cities.id, &state));
     }
 
     #[test]

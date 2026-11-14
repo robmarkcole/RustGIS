@@ -5062,6 +5062,7 @@ dependencies = [
  "egui",
  "rustgis-ui-egui",
  "serde_json",
+ "web-time",
 ]
 
 [[package]]

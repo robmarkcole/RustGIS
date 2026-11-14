@@ -50,10 +50,11 @@ impl Phone {
             .map_err(|e| i18n::fmt("Android refused: {error}", &[("error", &e.to_string())]))
     }
 
-    /// The room the system's bars and a camera cutout take at the window's edges, in pixels:
-    /// left, top, right, bottom. `None` before the window is laid out, or when the activity
-    /// can't be asked.
-    pub fn insets(&self) -> Option<[f32; 4]> {
+    /// The room the system's bars, a camera cutout and the soft keyboard take at the window's
+    /// edges, in pixels (left, top, right, bottom), and whether the keyboard is up where Android
+    /// says (11 and later). `None` before the window is laid out, or when the activity can't be
+    /// asked.
+    pub fn insets(&self) -> Option<([f32; 4], Option<bool>)> {
         let text = self
             .java(|env, activity| {
                 let taken = env.call_method(activity, jni_str!("insets"), jni_sig!(() -> JString), &[])?.l()?;
@@ -63,8 +64,9 @@ impl Phone {
                 env.cast_local::<JString>(taken)?.try_to_string(env)
             })
             .ok()?;
-        let edges: Vec<f32> = text.split(' ').filter_map(|edge| edge.parse().ok()).collect();
-        <[f32; 4]>::try_from(edges).ok()
+        let fields: Vec<f32> = text.split(' ').filter_map(|edge| edge.parse().ok()).collect();
+        let edges = <[f32; 4]>::try_from(fields.get(..4)?).ok()?;
+        Some((edges, fields.get(4).map(|up| *up > 0.5)))
     }
 
     /// Draws the system bars' icons dark (`light` ground under them) or light (a dark one).
