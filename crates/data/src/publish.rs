@@ -1,4 +1,4 @@
-//! Writing a layer kept in the project back over the Shapefile it was read from (#1385), so that
+//! Writing a layer kept in the project back over the source it was read from (#1385), so that
 //! the file shows its edits and keeps everything else it held.
 //!
 //! A Shapefile can't change one row in place: the whole file is written again. That is only
@@ -29,6 +29,9 @@ use crate::sync::{FileSync, Synced};
 use crate::{DataError, Dataset, Feature, FieldType, Geometry, Result, Value};
 use std::path::{Path, PathBuf};
 
+mod json;
+pub use json::geojson;
+
 /// How far an edited shape may read back from where the layer has it, relative to the size of its
 /// coordinates, in a file in another system than longitude/latitude: the layer's shape is
 /// projected to the file's system and read back through the inverse, which isn't exact to the
@@ -36,12 +39,10 @@ use std::path::{Path, PathBuf};
 /// a tenth of a millimetre at ten thousand kilometres; anything more is refused.
 const PROJECTED_TOLERANCE: f64 = 1e-11;
 
-/// A layer written back over its Shapefile: the files as they were written, and the layer as the
-/// file now reads (`read`: its rows in the same order, as a Shapefile holds them: an empty text as
-/// no value, a column of whole numbers as integers, date-times as text, an edited shape in another
-/// system back through its projection), to record as the layer's new sync point; the features
-/// written, and what it says (fields given other columns or left out, projection round-off,
-/// a changed `.prj`).
+/// A layer written back to its source: the files and rows as written, to record as the new sync
+/// point. `read` holds the rows in file order, with any format normalization (such as Shapefile
+/// empty text reading as null or date-times as text); the engine preserves layer feature ids.
+/// `notes` describes field changes, projection round-off and other format-specific effects.
 pub struct Published {
     pub files: FileSync,
     pub read: Dataset,

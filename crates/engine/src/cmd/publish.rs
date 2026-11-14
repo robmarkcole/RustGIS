@@ -12,7 +12,7 @@ pub fn commands() -> Vec<C> {
             r#"{"layer"?: "name|id (default: the active layer): one read whole from a Shapefile or .geojson file"} — whether it has edits its file lacks ("edited"), the file changed since it was read ("sourceChanged"), both ("both") or neither ("inSync"), and which of the file's parts changed"#,
         ),
         C::new("source.publish", "Publish to Source", "Data › Data Source", |s, p| super::exports::write_here(s, p, "source.publish")).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files).with(crate::policy::Effect::Edits)).view().params(
-            r#"{"layer"?: "name|id (default: the active layer): one read whole from a Shapefile"} — writes the layer's edits back over the Shapefile it was read from, keeping its code page, columns and .prj; refused, with nothing written, when the file changed since it was read or can't hold the layer as it is (Z or M values, features without shapes, text its code page lacks)"#,
+            r#"{"layer"?: "name|id (default: the active layer): one read whole from a Shapefile or .geojson file"} — writes the layer's edits back over its source; refused, with nothing written, when the source changed or a rewrite would lose data, metadata or number text. Shapefiles keep their code page, column layout and .prj; GeoJSON keeps its document kind, collection name and feature ids"#,
         ),
     ]
 }
@@ -39,8 +39,9 @@ fn record(l: &rustgis_map::Layer) -> Result<(&rustgis_data::sync::Synced, &str),
 }
 
 /// `source.publish`'s work, its inputs taken from the session ([`super::exports`]): writes layer
-/// `p` names back over the Shapefile it was read from ([`rustgis_data::publish::shapefile`],
-/// which says what it checks first), when it has edits the file lacks. Its work grows with the
+/// `p` names back over its source ([`rustgis_data::publish::shapefile`] or
+/// [`rustgis_data::publish::geojson`], which describe the fidelity checks), when it has edits
+/// the file lacks. Its work grows with the
 /// file (hashed, read, written twice in memory and read back): the desktop app runs it on a
 /// thread of its own with progress and Cancel. Once written, the layer holds its rows as the file
 /// reads them (the same, but for what a Shapefile can't tell apart: an empty text and no value),
@@ -50,12 +51,9 @@ pub(crate) fn publish_work(s: &Session, p: &Value) -> Result<super::exports::Wor
     let id = s.layer_id(p)?;
     let l = s.map().layer(id).ok_or("the layer no longer exists")?;
     let (synced, path) = record(l)?;
-    if !path.to_ascii_lowercase().ends_with(".shp") {
-        return Err(format!("{}: only a layer read from a Shapefile can be published to its file so far; {path} isn't one", l.name));
-    }
     #[cfg(target_arch = "wasm32")]
     {
-        let _ = synced;
+        let _ = (synced, path);
         Err("the web app can't write files on this computer".into())
     }
     #[cfg(not(target_arch = "wasm32"))]
@@ -82,7 +80,9 @@ pub(crate) fn publish_work(s: &Session, p: &Value) -> Result<super::exports::Wor
                     owner: None,
                 });
             }
-            let published = rustgis_data::publish::shapefile(&dataset, std::path::Path::new(&path), &synced).map_err(|e| e.to_string())?;
+            let publish =
+                if path.to_ascii_lowercase().ends_with(".shp") { rustgis_data::publish::shapefile } else { rustgis_data::publish::geojson };
+            let published = publish(&dataset, std::path::Path::new(&path), &synced).map_err(|e| e.to_string())?;
             // The layer as the file now reads it, its features keeping their ids: what the layer
             // holds once published, and its record (the file reads so next time too).
             let mut held = dataset.clone();

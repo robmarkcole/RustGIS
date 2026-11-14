@@ -399,8 +399,13 @@ found shows in the status bar. CLI and Python: `source.syncState` with `{"layer"
 
 ### Publish to source
 
-`source.publish` writes a layer's edits back over the Shapefile it was read from, so the file
-that other people and programs read holds them. A Shapefile can't change one row in place, so
+`source.publish` writes a layer's edits back over the Shapefile or `.geojson` file it was read
+from, so the file that other people and programs read holds them. Use **Source File State** in
+Command Search (`source.syncState`) to compare the layer and its file before publishing.
+
+#### Shapefile
+
+A Shapefile can't change one row in place, so
 the whole file is written again, and RustGIS first makes sure that only the edits change. It
 refuses, with nothing written, when:
 
@@ -458,9 +463,41 @@ files may help with manual recovery, but are not a crash-safe backup.
 Once published, the layer holds its rows as the file reads them, which differs only where a
 Shapefile can't tell values apart (an empty text reads as no value, a column of whole numbers as
 integers, date-time fields as ISO 8601 text). A double field becoming integer or a date-time field
-becoming text produces a notice. The layer reads `inSync`; the project has a change to save. Undo doesn't change the file:
-undoing an edit made before publishing shows the layer as `edited` again. A layer with no edits writes nothing. GeoJSON and layers read in place can't
-be published yet.
+becoming text produces a notice. The layer reads `inSync`; the project has a change to save.
+Undo doesn't change the file:
+undoing an edit made before publishing shows the layer as `edited` again. A layer with no edits
+writes nothing. Layers read in place remain read-only.
+
+#### GeoJSON
+
+For `.geojson`, publish also checks that the source is unchanged, that it still reads as it did
+at the last sync, and that both the original and the edited layer survive a read/write. It keeps
+the document's kind (FeatureCollection, Feature or bare geometry), a collection's name, and
+feature ids. Ordinary integer coordinate text stays integer text when the value is unchanged.
+Whitespace and member order may change.
+
+Publish refuses a rewrite that would change foreign members, a legacy `crs` member, Z values,
+a geometry the reader simplifies, nested properties it reads as text, duplicate object keys,
+or number text the writer would spell differently (such as `1.00` or `1E3`). The message says
+why; the original file stays unchanged. A file with feature ids requires the same internal row
+ids in the same order: adding, deleting or reordering rows is refused when their external ids
+couldn't be preserved, and the same holds for a layer without fields whose features mix absent,
+null and object `properties`. Absent or null `properties` are kept only in a layer without fields:
+a collection that mixes them with attributed features is refused. Use Export Features for a
+different document structure. A single Feature can't become a collection, a bare geometry can't
+gain attributes, and an empty collection can't retain a field schema.
+
+The new file is written beside the source with its existing permissions, synced and read back.
+The source is checked again immediately before the atomic replacement; cancellation or failure
+before replacement leaves it unchanged. The same OS lock as for Shapefile prevents concurrent
+RustGIS publishers; its empty `.filename.geojson.rustgis-lock` sidecar stays for reuse. Other
+programs do not follow this lock: changes they make after RustGIS's final source check can be
+overwritten by the publish. Stop other writers before publishing. A field removed or renamed in
+the layer produces a notice naming the properties left out. Afterward the
+layer takes the file's read-back values and its new sync point, without changing the project
+format. Undo changes the layer, and shows it as edited; it does not undo a write to the file.
+
+#### Running a publish
 
 On the desktop, make the layer active and choose **Publish to Source** in Command Search; it runs
 in the background, with progress and Cancel in the status bar. CLI and Python: `source.publish`

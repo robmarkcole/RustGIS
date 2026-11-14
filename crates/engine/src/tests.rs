@@ -45886,12 +45886,19 @@ fn a_layer_publishes_its_edits_to_its_shapefile() {
     let e = s.run("source.publish", &json!({"layer": id})).unwrap_err();
     assert!(e.contains("towns.dbf changed since the layer was read") && e.contains("nothing was written"), "{e}");
     assert_eq!(dbf(), theirs);
-    // GeoJSON isn't published yet.
+    // The same command and sync record work for a GeoJSON source.
     let geojson = dir.path().join("towns.geojson");
     s.run("share.exportLayer", &json!({"layer": "Cities", "path": geojson})).unwrap();
     s.run("layer.addData", &json!({"path": geojson, "name": "towns.geojson"})).unwrap();
-    let e = s.run("source.publish", &json!({"layer": "towns.geojson"})).unwrap_err();
-    assert!(e.contains("only a layer read from a Shapefile"), "{e}");
+    s.run("edit.setValue", &json!({"layer": "towns.geojson", "row": 0, "field": "name", "value": "Published"})).unwrap();
+    let out = s.run("source.publish", &json!({"layer": "towns.geojson"})).unwrap();
+    assert_eq!(out["published"], true);
+    let (read, _) = rustgis_data::io::read_path(&geojson).unwrap();
+    let name = read.fields.iter().position(|f| f.name == "name").unwrap();
+    assert_eq!(read.features.first().unwrap().attrs[name], rustgis_data::Value::Text("Published".into()));
+    assert_eq!(s.run("source.syncState", &json!({"layer": "towns.geojson"})).unwrap()["state"], "inSync");
+    s.run("edit.undo", &Value::Null).unwrap();
+    assert_eq!(s.run("source.syncState", &json!({"layer": "towns.geojson"})).unwrap()["state"], "edited");
 }
 
 /// A layer read whole from a Shapefile or GeoJSON file remembers the files and its rows as read
