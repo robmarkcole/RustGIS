@@ -36,7 +36,7 @@ pub fn commands() -> Vec<C> {
         C::new("layer.addDataBytes", "Add Data (from file contents)", "Home › Add", add_bytes).roles(&[]).effects(crate::policy::Effects::NONE)
             .params(r#"{"fileName": "name.tif|.tiff|.asc|.geojson|.csv|.zip|.kml|.kmz|.gpx|.parquet|.fgb|.gpkg|.mbtiles|.jp2|.j2k (JPEG 2000: desktop, through GDAL)", "data": base64, "zoom"?: bool, "layer"?: "one layer of a zip, KML or GPX by name", "name"?: text, "x"?, "y"?, "wkt"?, "crs"?, "delimiter"?, "paperSpace"?, "stream"?, "as"? (as layer.addData)}"#),
         C::new("raster.symbology", "Symbology", "Style › Rendering", symbology).when(need_raster).roles(&[]).effects(crate::policy::Effects::NONE).params(
-            r#"{"layer"?, "type": "stretch"|"rgb"|"classify"|"unique"|"colormap"|"shadedRelief", "band"?: 1.., "ramp"?, "invert"?: bool, "classes"?: 1..32, "method"?, "azimuth"?, "altitude"?, "zFactor"?, "shadow"?: 0..1 (shadedRelief: how dark the shadows the terrain casts are; left out, kept; 0 casts none), "sky"?: 0..1 (shadedRelief: how much the share of the sky each cell sees dims its ambient light; left out, kept; 0 leaves it whole), "grey"?: bool (shadedRelief without its colour ramp)}"#,
+            r#"{"layer"?, "type": "stretch"|"rgb"|"classify"|"unique"|"colormap"|"shadedRelief", "band"?: 1.., "ramp"?, "invert"?: bool, "classes"?: 1..32, "method"?, "azimuth"?, "altitude"?, "zFactor"?, "shadow"?: 0..1 (shadedRelief: how dark the shadows the terrain casts are; left out, kept; 0 casts none), "sky"?: 0..1 (shadedRelief: how much the share of the sky each cell sees dims its ambient light; left out, kept; 0 leaves it whole), "fill"?: 0..1 (shadedRelief: a fill light from the side opposite the sun that lightens the slopes turned toward it; left out, kept; 0 has none), "grey"?: bool (shadedRelief without its colour ramp)}"#,
         ),
         C::new("raster.stretch", "Stretch Type", "Style › Rendering", stretch).inputs(stretch_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
         .when(need_raster)
@@ -778,10 +778,10 @@ fn symbology(s: &mut Session, p: &Value) -> CmdResult {
                 RasterRenderer::Colormap
             }
             "shadedrelief" | "hillshade" => {
-                // Left out, a Shaded Relief keeps its own shadows and sky; a new one has neither.
-                let (cur_shadow, cur_sky) = match rl.style.renderer {
-                    RasterRenderer::ShadedRelief { shadow, sky, .. } => (shadow, sky),
-                    _ => (0.0, 0.0),
+                // Left out, a Shaded Relief keeps its own shadows, sky and fill light; a new one has none.
+                let (cur_shadow, cur_sky, cur_fill) = match rl.style.renderer {
+                    RasterRenderer::ShadedRelief { shadow, sky, fill, .. } => (shadow, sky, fill),
+                    _ => (0.0, 0.0, 0.0),
                 };
                 RasterRenderer::ShadedRelief {
                     band: bi,
@@ -791,6 +791,7 @@ fn symbology(s: &mut Session, p: &Value) -> CmdResult {
                     z_factor: f(p, "zFactor").unwrap_or(1.0).clamp(0.001, 1000.0),
                     shadow: f(p, "shadow").unwrap_or(cur_shadow).clamp(0.0, 1.0),
                     sky: f(p, "sky").unwrap_or(cur_sky).clamp(0.0, 1.0),
+                    fill: f(p, "fill").unwrap_or(cur_fill).clamp(0.0, 1.0),
                 }
             }
             other => return Err(format!("unknown raster symbology '{other}'")),

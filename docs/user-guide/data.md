@@ -1324,10 +1324,20 @@ exports, and said when it can't be drawn (in the browser over 500,000 cells, or 
 GeoTIFF read in place) as cast shadows are. Terrain outside the raster, or farther than 100 cells,
 hides none of its sky.
 
-With **Resampling** set to bilinear, a Shaded Relief layer's light (its hillshade, cast shadows and
-sky visibility) is blended between the cells' centres, as its values are, so a cell drawn over many
-pixels shades smoothly instead of in squares; nearest keeps one light per cell, as before. A cell
-with no data, or masked, is left out of the blend, so it doesn't darken the relief next to it.
+**Fill light**, on a Shaded Relief layer (`raster.symbology` `"fill"`, 0 to 1), opens the slopes
+turned away from the sun without lifting the rest of the map: a second, weaker light from the
+opposite side (the sun's azimuth plus 180°), 55° up, adds `fill × max(0, L − sin 55°)` of the
+colour to each cell, where `L` is how squarely the cell faces that light (the same slopes as the
+hillshade). Flat ground gets exactly `sin 55°` of it and so gains nothing, nor does a slope turned
+to the sun; the more a slope turns toward the fill, the more it gains, up to 0.18 of its colour
+with a fill of 1. Nothing shadows it, and it is drawn at once (nothing to work out). 0, the
+default, draws the relief as before, and it is saved with the project only when it isn't 0.
+
+With **Resampling** set to bilinear, a Shaded Relief layer's light (its hillshade, cast shadows,
+sky visibility and fill light) is blended between the cells' centres, as its values are, so a cell
+drawn over many pixels shades smoothly instead of in squares; nearest keeps one light per cell, as
+before. A cell with no data, or masked, is left out of the blend, so it doesn't darken the relief
+next to it.
 
 **Masking**, at the foot of the Symbology pane (`raster.mask`), hides pixel values from view without
 changing the data: values to draw as no data (a background of 0 or −9999 the file doesn't flag, QA

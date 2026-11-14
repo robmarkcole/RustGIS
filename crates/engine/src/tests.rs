@@ -4325,6 +4325,39 @@ fn shaded_relief_keeps_its_sky_visibility() {
     assert!(s.notices.iter().all(|n| !n.text.contains("sky")), "{:?}", s.notices);
 }
 
+/// Shaded Relief's fill light is set, clamped, kept when left out, saved with the project only
+/// when there is some, and back when the project is opened again.
+#[test]
+fn shaded_relief_keeps_its_fill_light() {
+    let mut s = with_raster();
+    let fill = |s: &Session| match s.map().layers.iter().find_map(|l| l.raster.as_ref()).map(|r| &r.style.renderer) {
+        Some(rustgis_map::RasterRenderer::ShadedRelief { fill, .. }) => *fill,
+        other => panic!("{other:?}"),
+    };
+    let fills_saved = |s: &mut Session| s.project.saved_text(None).unwrap().0.matches("\"fill\"").count();
+    let before = fills_saved(&mut s);
+    s.run("raster.symbology", &json!({"type": "shadedRelief"})).unwrap();
+    assert_eq!((fill(&s), fills_saved(&mut s)), (0.0, before), "none, and not saved");
+    s.run("raster.symbology", &json!({"type": "shadedRelief", "fill": 0.3})).unwrap();
+    s.run("raster.symbology", &json!({"type": "shadedRelief", "azimuth": 200})).unwrap();
+    assert_eq!(fill(&s), 0.3, "left out, kept");
+    assert_eq!(fills_saved(&mut s), before + 1);
+    s.run("raster.symbology", &json!({"type": "shadedRelief", "fill": -2})).unwrap();
+    assert_eq!(fill(&s), 0.0);
+    s.run("raster.symbology", &json!({"type": "shadedRelief", "fill": 7})).unwrap();
+    assert_eq!(fill(&s), 1.0);
+    s.run("raster.symbology", &json!({"type": "shadedRelief", "fill": 0.45})).unwrap();
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let dir = std::env::temp_dir().join(format!("rustgis-fill-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("fill.rgis");
+    s.run("project.saveAs", &json!({"path": path.display().to_string()})).unwrap();
+    let mut t = Session::new(Project::default());
+    t.run("project.open", &json!({"path": path.display().to_string()})).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(fill(&t), 0.45, "back when opened");
+}
+
 /// An export draws the sky a pit hides: its floor darker with `sky` 1 than with 0, the ground
 /// around it (which sees the whole sky) the same. The first export with the sky, from a cold
 /// cache, waits for the grid: it is the same image as one drawn once the grid is kept.

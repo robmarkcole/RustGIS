@@ -6756,10 +6756,13 @@ fn raster_symbology(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
         RasterRenderer::Colormap => {
             ui.label(egui::RichText::new(tl!("Colors from the raster's own color table.")).size(11.5).color(t.text_dim));
         }
-        RasterRenderer::ShadedRelief { band, ramp, azimuth, altitude, z_factor, shadow, sky } => {
-            let (az, alt, zf, sh, sk, rp) = (*azimuth, *altitude, *z_factor, *shadow, *sky, ramp.as_ref().map(|r| r.name().to_string()));
+        RasterRenderer::ShadedRelief { band, ramp, azimuth, altitude, z_factor, shadow, sky, fill } => {
+            let (az, alt, zf, sh, sk, fl) = (*azimuth, *altitude, *z_factor, *shadow, *sky, *fill);
+            let rp = ramp.as_ref().map(|r| r.name().to_string());
             let relief = move |band: usize, az: f64, alt: f64, zf: f64, sh: f64| {
-                let mut p = json!({"type": "shadedRelief", "band": band + 1, "azimuth": az, "altitude": alt, "zFactor": zf, "shadow": sh, "sky": sk});
+                let mut p = json!({
+                    "type": "shadedRelief", "band": band + 1, "azimuth": az, "altitude": alt, "zFactor": zf, "shadow": sh, "sky": sk, "fill": fl
+                });
                 match &rp {
                     Some(r) => p["ramp"] = json!(r),
                     None => p["grey"] = json!(true),
@@ -6774,6 +6777,7 @@ fn raster_symbology(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
                     ("Z factor", zf, 0.001..=1000.0, 0.01, 2),
                     ("Cast shadows", sh, 0.0..=1.0, 0.01, 3),
                     ("Sky visibility", sk, 0.0..=1.0, 0.01, 4),
+                    ("Fill light", fl, 0.0..=1.0, 0.01, 5),
                 ] {
                     let input_label = ui.label(tl!(label));
                     let mut x = v;
@@ -6787,6 +6791,9 @@ fn raster_symbology(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
                         4 => r.on_hover_text(tl!(
                             "How much the sky each cell sees, over the terrain around it, scales its ambient light, from 0 (not at all) to 1"
                         )),
+                        5 => r.on_hover_text(tl!(
+                            "A light from the side opposite the sun that lightens the slopes turned toward it, from 0 (none) to 1"
+                        )),
                         _ => r,
                     };
                     if drag.settled(ui, &r, &mut x) && x != v {
@@ -6798,8 +6805,10 @@ fn raster_symbology(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
                             _ => (az, alt, zf, sh),
                         };
                         let mut p = relief(*band, a, b, c, d);
-                        if which == 4 {
-                            p["sky"] = json!(x);
+                        match which {
+                            4 => p["sky"] = json!(x),
+                            5 => p["fill"] = json!(x),
+                            _ => {}
                         }
                         let _ = app.run("raster.symbology", p);
                     }

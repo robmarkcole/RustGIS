@@ -5119,8 +5119,16 @@ mod tests {
         let r = Raster::new("dem", 4, 4, vec![vec![0.0; 16]], gt, Crs::WebMercator, None, ColorHint::Gray, "Float32").unwrap();
         let mut map = Map::new("Relief");
         let id = map.add_raster("dem", RasterLayer::from_path(r, "dem.tif"));
-        let relief =
-            |shadow| RasterRenderer::ShadedRelief { band: 0, ramp: None, azimuth: 315.0, altitude: 30.0, z_factor: 1.0, shadow, sky: 0.0 };
+        let relief = |shadow| RasterRenderer::ShadedRelief {
+            band: 0,
+            ramp: None,
+            azimuth: 315.0,
+            altitude: 30.0,
+            z_factor: 1.0,
+            shadow,
+            sky: 0.0,
+            fill: 0.0,
+        };
         let set = |map: &mut Map, shadow: f64, visible: bool| {
             let l = map.layer_mut(id).unwrap();
             l.visible = visible;

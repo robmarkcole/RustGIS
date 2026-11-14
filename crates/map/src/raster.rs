@@ -1150,7 +1150,7 @@ impl Default for ZarrTime {
     }
 }
 
-fn is_no_shadow(v: &f64) -> bool {
+fn is_no_light(v: &f64) -> bool {
     *v == 0.0
 }
 
@@ -1356,17 +1356,21 @@ pub enum RasterRenderer {
     /// Hillshade, optionally tinted by elevation. `shadow` (0 to 1) is how dark the shadows the
     /// terrain casts are drawn (see [`crate::shadow`]); 0, the default, casts none. `sky` (0 to 1)
     /// is how much the share of the sky each cell sees scales its ambient light
-    /// ([`crate::shadow::sky`]); 0, the default, leaves it whole.
+    /// ([`crate::shadow::sky`]); 0, the default, leaves it whole. `fill` (0 to 1) is a fill light
+    /// from the side opposite the sun, 55° up, that lightens only the slopes turned toward it; 0,
+    /// the default, has none.
     ShadedRelief {
         band: usize,
         ramp: Option<Ramp>,
         azimuth: f64,
         altitude: f64,
         z_factor: f64,
-        #[serde(default, skip_serializing_if = "is_no_shadow")]
+        #[serde(default, skip_serializing_if = "is_no_light")]
         shadow: f64,
-        #[serde(default, skip_serializing_if = "is_no_shadow")]
+        #[serde(default, skip_serializing_if = "is_no_light")]
         sky: f64,
+        #[serde(default, skip_serializing_if = "is_no_light")]
+        fill: f64,
     },
 }
 
@@ -1925,16 +1929,17 @@ impl<'a> Colorizer<'a> {
     /// The colour of a pixel from its renderer band values (`NaN` = no data), or `None` for
     /// transparent. `hillshade` (0–255) is used by Shaded Relief.
     pub fn color(&self, vals: &[f32], hillshade: Option<u8>) -> Option<[u8; 4]> {
-        self.color_lit(vals, hillshade, None)
+        self.color_lit(vals, hillshade, None, None)
     }
 
     /// [`Colorizer::color`], with Shaded Relief's ambient light scaled by `ambient` (0–255, the
-    /// share of it the sky a cell sees leaves, see [`RasterRenderer::ShadedRelief`]'s `sky`).
-    pub fn color_lit(&self, vals: &[f32], hillshade: Option<u8>, ambient: Option<u8>) -> Option<[u8; 4]> {
+    /// share of it the sky a cell sees leaves, see [`RasterRenderer::ShadedRelief`]'s `sky`), and
+    /// `fill` (0–255, a share of the colour) added for its fill light (its `fill`).
+    pub fn color_lit(&self, vals: &[f32], hillshade: Option<u8>, ambient: Option<u8>, fill: Option<u8>) -> Option<[u8; 4]> {
         // The renderer masks values as it samples them (they arrive as NaN); this is for other callers.
         let mask = &self.style.mask;
         if mask.is_empty() || !vals.iter().any(|v| mask.hides(*v)) {
-            return self.paint(vals, hillshade, ambient);
+            return self.paint(vals, hillshade, ambient, fill);
         }
         // Masked values are no data. The renderer bands are at most three.
         let mut kept = [f32::NAN; 3];
@@ -1943,10 +1948,10 @@ impl<'a> Colorizer<'a> {
                 *k = *v;
             }
         }
-        self.paint(kept.get(..vals.len().min(3)).unwrap_or(&kept), hillshade, ambient)
+        self.paint(kept.get(..vals.len().min(3)).unwrap_or(&kept), hillshade, ambient, fill)
     }
 
-    fn paint(&self, vals: &[f32], hillshade: Option<u8>, ambient: Option<u8>) -> Option<[u8; 4]> {
+    fn paint(&self, vals: &[f32], hillshade: Option<u8>, ambient: Option<u8>, fill: Option<u8>) -> Option<[u8; 4]> {
         let v0 = *vals.first()?;
         let c = match &self.style.renderer {
             RasterRenderer::Rgb { .. } => {
@@ -1977,9 +1982,10 @@ impl<'a> Colorizer<'a> {
                 let h = hillshade.unwrap_or(180) as f64 / 255.0;
                 let base = if ramp.is_some() { *self.ramp_lut.get(self.byte(0, v0) as usize)? } else { [255, 255, 255, 255] };
                 // Multiply the tint by the hillshade, keeping some ambient light (less of it where
-                // the terrain hides part of the sky).
+                // the terrain hides part of the sky), and adding the fill light on its own.
                 let a = 0.25 * ambient.map_or(1.0, |a| f64::from(a) / 255.0);
-                let m = |c: u8| (c as f64 * (a + 0.75 * h)).round().clamp(0.0, 255.0) as u8;
+                let f = fill.map_or(0.0, |f| f64::from(f) / 255.0);
+                let m = |c: u8| (c as f64 * (a + 0.75 * h + f)).round().clamp(0.0, 255.0) as u8;
                 [m(base[0]), m(base[1]), m(base[2]), 255]
             }
         };
@@ -2788,7 +2794,7 @@ mod tests {
         let r = Raster::new("tower", 20, 20, vec![data], gt, Crs::WebMercator, None, ColorHint::Gray, "Float32").unwrap();
         let mut rl = RasterLayer::from_path(r, "tower.tif");
         rl.style.renderer =
-            RasterRenderer::ShadedRelief { band: 0, ramp: None, azimuth: 90.0, altitude: 30.0, z_factor: 1.0, shadow, sky: 0.0 };
+            RasterRenderer::ShadedRelief { band: 0, ramp: None, azimuth: 90.0, altitude: 30.0, z_factor: 1.0, shadow, sky: 0.0, fill: 0.0 };
         rl
     }
 
@@ -2846,8 +2852,16 @@ mod tests {
         let r = Raster::new("hills", 1200, 1200, vec![data], gt, Crs::WebMercator, None, ColorHint::Gray, "Float32").unwrap();
         let mut rl = RasterLayer::from_path(r, "hills.tif");
         let lit = |rl: &mut RasterLayer, az: f64| {
-            rl.style.renderer =
-                RasterRenderer::ShadedRelief { band: 0, ramp: None, azimuth: az, altitude: 10.0, z_factor: 1.0, shadow: 1.0, sky: 0.0 };
+            rl.style.renderer = RasterRenderer::ShadedRelief {
+                band: 0,
+                ramp: None,
+                azimuth: az,
+                altitude: 10.0,
+                z_factor: 1.0,
+                shadow: 1.0,
+                sky: 0.0,
+                fill: 0.0,
+            };
         };
         let other = |az: f64, rl: &RasterLayer| {
             let mut c = rl.clone();
@@ -2906,8 +2920,16 @@ mod tests {
         let data: Vec<f32> = (0..2000 * 2000).map(|i| ((i % 2000) as f32 * 0.01) + ((i / 2000) as f32 * 0.01)).collect();
         let r = Raster::new("plain", 2000, 2000, vec![data], gt, Crs::WebMercator, None, ColorHint::Gray, "Float32").unwrap();
         let mut rl = RasterLayer::from_path(r, "plain.tif");
-        rl.style.renderer =
-            RasterRenderer::ShadedRelief { band: 0, ramp: None, azimuth: 135.0, altitude: 2.0, z_factor: 1.0, shadow: 1.0, sky: 0.0 };
+        rl.style.renderer = RasterRenderer::ShadedRelief {
+            band: 0,
+            ramp: None,
+            azimuth: 135.0,
+            altitude: 2.0,
+            z_factor: 1.0,
+            shadow: 1.0,
+            sky: 0.0,
+            fill: 0.0,
+        };
         let (sent, landings) = std::sync::mpsc::channel::<()>();
         {
             let _cancelled = rustgis_data::progress::install(Some(std::sync::Arc::new(Cancelled)));
@@ -2935,8 +2957,16 @@ mod tests {
         let data: Vec<f32> = (0..800 * 800).map(|i| ((i % 800) as f32 * 0.01) + ((i / 800) as f32 * 0.01)).collect();
         let r = Raster::new("plain", 800, 800, vec![data], gt, Crs::WebMercator, None, ColorHint::Gray, "Float32").unwrap();
         let mut rl = RasterLayer::from_path(r, "plain.tif");
-        rl.style.renderer =
-            RasterRenderer::ShadedRelief { band: 0, ramp: None, azimuth: 135.0, altitude: 3.0, z_factor: 1.0, shadow: 1.0, sky: 0.0 };
+        rl.style.renderer = RasterRenderer::ShadedRelief {
+            band: 0,
+            ramp: None,
+            azimuth: 135.0,
+            altitude: 3.0,
+            z_factor: 1.0,
+            shadow: 1.0,
+            sky: 0.0,
+            fill: 0.0,
+        };
         let (sent, landings) = std::sync::mpsc::channel::<&'static str>();
         let told = |who: &'static str| {
             let tx = sent.clone();
