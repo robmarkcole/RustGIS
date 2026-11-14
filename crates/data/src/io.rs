@@ -394,13 +394,27 @@ pub const PROJECTED_FORMATS: [&str; 4] = ["gpkg", "shp", "zip", "fgb"];
 
 /// The coordinate system an export to extension `ext` is written in when none is asked for: the
 /// one the dataset was read in, for a format that can say it, else WGS 84. A system without an
-/// EPSG code goes only into a Shapefile, whose `.prj` gives it in full; GeoPackage and FlatGeobuf
-/// readers (RustGIS's among them) go by the code.
+/// EPSG code goes into a GeoPackage or FlatGeobuf by its WKT definition, as into a Shapefile's
+/// `.prj`; one WKT can't describe goes into a Shapefile (without a `.prj`, said) and not into the
+/// others ([`default_export_note`] says which system is written instead).
 pub fn default_export_crs(ds: &Dataset, ext: &str) -> Crs {
     let ext = ext.to_ascii_lowercase();
-    ds.crs
-        .filter(|c| PROJECTED_FORMATS.contains(&ext.as_str()) && (c.epsg() > 0 || matches!(ext.as_str(), "shp" | "zip")))
-        .unwrap_or(Crs::LonLat)
+    ds.crs.filter(|&c| PROJECTED_FORMATS.contains(&ext.as_str()) && check_projected(&ext, c).is_ok()).unwrap_or(Crs::LonLat)
+}
+
+/// What is said when an export to `path` is written in WGS 84 where the layer has a system of
+/// its own that the format can't hold ([`default_export_crs`]); `None` when it keeps its system
+/// or has none to keep.
+pub fn default_export_note(ds: &Dataset, path: &str) -> Option<String> {
+    let ext = Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    let own = ds.crs.filter(|&c| c != Crs::LonLat && PROJECTED_FORMATS.contains(&ext.as_str()))?;
+    (default_export_crs(ds, &ext) == Crs::LonLat).then(|| {
+        format!(
+            "{path}: the coordinate system of {} ({}) has no EPSG code and no WKT definition RustGIS can write, so it is written in WGS 84 (EPSG:4326); give a \"crs\" to write another",
+            ds.name,
+            own.label()
+        )
+    })
 }
 
 /// The dataset (in longitude/latitude, as every dataset is) in `crs`'s coordinates. Fails on a
@@ -476,11 +490,15 @@ pub fn define_projection(ds: &Dataset, crs: Crs) -> Result<Dataset> {
     Ok(out)
 }
 
-/// Refuses a system without an EPSG code for a GeoPackage or FlatGeobuf: their readers (RustGIS's
-/// among them) go by the code, and would read the file as longitude/latitude.
+/// Refuses a system for a GeoPackage or FlatGeobuf that the file couldn't declare: one without an
+/// EPSG code is declared by its WKT definition, and without one (a projection WKT1 has no name
+/// for) the file would read as longitude/latitude.
 pub(crate) fn check_projected(ext: &str, crs: Crs) -> Result<()> {
-    if crs.epsg() == 0 && matches!(ext, "gpkg" | "fgb") {
-        return Err(DataError::Unsupported(format!(".{ext} in {}: give the system as an EPSG code", crs.label())));
+    if crs.epsg() == 0 && matches!(ext, "gpkg" | "fgb") && crate::raster::wkt::to_wkt(crs).is_none() {
+        return Err(DataError::Unsupported(format!(
+            ".{ext} in {}: it has no EPSG code or WKT definition; give the system as an EPSG code",
+            crs.label()
+        )));
     }
     Ok(())
 }

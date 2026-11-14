@@ -1,6 +1,7 @@
 //! A layer on another body than the Earth (IAU 2015, opengeos/RustGIS#1448), added and exported
 //! through the commands: adding it says so once, exporting it says what is written instead of its
-//! system, and an export that would write other numbers than the layer's is refused.
+//! system or that its own is written without the body's name, and an export that would write other
+//! numbers than the layer's is refused.
 use rustgis_engine::{
     Project, Session,
     data::{Coord, Dataset, Field, FieldType, Geometry, GeometryType, Value, io, raster::Crs},
@@ -48,8 +49,9 @@ fn a_mars_layer_is_said_when_added_and_when_exported() {
         assert!(said(&s, mark, "few hundred metres").is_empty(), "stream {stream}");
         assert!(s.map().layer(id).unwrap().dataset.crs.is_some_and(Crs::is_planetary), "stream {stream}");
 
-        // As WGS 84 longitude/latitude: written, and said.
-        for ext in ["geojson", "gpkg"] {
+        // As WGS 84 longitude/latitude (GeoJSON has no other system): written, and said.
+        {
+            let ext = "geojson";
             let out = d.join(format!("out-{stream}.{ext}"));
             let _ = std::fs::remove_file(&out);
             let mark = s.notice_mark();
@@ -61,11 +63,18 @@ fn a_mars_layer_is_said_when_added_and_when_exported() {
             let (back, _) = io::read_path(&out).unwrap();
             assert_eq!(back.features.len(), 2, "{ext}");
         }
-        // In its own system, a Shapefile: its .prj names no body.
-        let out = d.join(format!("out-{stream}.shp"));
-        let mark = s.notice_mark();
-        s.run("share.exportLayer", &json!({"layer": id, "path": out})).unwrap();
-        assert_eq!(said(&s, mark, "only by the ellipsoid's axes").len(), 1, "{:?}", s.notices_since(mark));
+        // In its own system, a Shapefile and a GeoPackage: their WKT names no body.
+        for ext in ["shp", "gpkg"] {
+            let out = d.join(format!("out-{stream}.{ext}"));
+            let _ = std::fs::remove_file(&out);
+            let mark = s.notice_mark();
+            s.run("share.exportLayer", &json!({"layer": id, "path": out})).unwrap();
+            assert_eq!(said(&s, mark, "only by the ellipsoid's axes").len(), 1, "{ext}: {:?}", s.notices_since(mark));
+            assert!(said(&s, mark, "on another body than the Earth").is_empty(), "{ext}");
+            let (back, _) = io::read_path(&out).unwrap();
+            assert_eq!(back.features.len(), 2, "{ext}");
+            assert!(back.crs.is_some_and(Crs::is_planetary), "{ext}: {:?}", back.crs);
+        }
 
         // Projected onto the Earth, the numbers would be the Earth's metres: refused, nothing written.
         let out = d.join(format!("utm-{stream}.gpkg"));

@@ -2853,22 +2853,40 @@ fn exports_are_written_in_the_system_the_layer_was_read_in() {
         let prj = std::fs::read_to_string(shp.with_extension("prj")).unwrap();
         assert!(prj.starts_with("PROJCS[") && prj.ends_with(&format!("AUTHORITY[\"EPSG\",\"{code}\"]]")), "{prj}");
     }
-    // By default an export keeps the layer's system where the format can say it; a system without
-    // an EPSG code only where its WKT is read back (a Shapefile's .prj).
+    // By default an export keeps the layer's system where the format can say it. A system without
+    // an EPSG code goes in by its WKT definition, read back as the same system; one WKT can't
+    // describe only into a Shapefile (which says so), else the layer is written in WGS 84, said.
     let mut ds = utm_squares(25832);
     let utm = Crs::from_epsg(25832).unwrap();
     assert_eq!(crate::io::default_export_crs(&ds, "GPKG"), utm);
     assert_eq!(crate::io::default_export_crs(&ds, "geojson"), Crs::LonLat);
+    assert_eq!(crate::io::default_export_note(&ds, "a.gpkg"), None);
     let wkt = crate::raster::wkt::to_wkt(utm).unwrap().replace(",AUTHORITY[\"EPSG\",\"25832\"]", "").replace("EPSG:25832", "My grid");
     let custom = crate::raster::wkt::crs_from_wkt(&wkt).unwrap();
     assert_eq!(custom.epsg(), 0);
     ds.crs = Some(custom);
-    assert_eq!(crate::io::default_export_crs(&ds, "shp"), custom);
-    assert_eq!(crate::io::default_export_crs(&ds, "fgb"), Crs::LonLat);
-    // Asked for, it goes into a Shapefile, but not a file that would read back as longitude/latitude.
-    assert!(crate::io::write_path_in(&ds, &d.join("custom.shp"), custom).is_ok());
-    assert!(crate::io::write_path_in(&ds, &d.join("custom.gpkg"), custom).is_err());
-    assert!(crate::io::write_bytes_in(&ds, "fgb", custom).is_err());
+    for ext in ["shp", "gpkg", "fgb"] {
+        assert_eq!(crate::io::default_export_crs(&ds, ext), custom, "{ext}");
+        let p = d.join(format!("custom.{ext}"));
+        crate::io::write_path_in(&ds, &p, custom).unwrap();
+        if ext != "shp" {
+            let (back, _) = materialize(open_path(&p, None).unwrap().as_ref()).unwrap();
+            assert_eq!(back.crs, Some(custom), "{ext}");
+        }
+        assert_eq!(crate::io::default_export_note(&ds, &p.display().to_string()), None, "{ext}");
+    }
+    let gnomonic = Crs::parse("+proj=gnom +lat_0=51 +lon_0=9 +datum=WGS84 +units=m +no_defs").unwrap();
+    assert!(crate::raster::wkt::to_wkt(gnomonic).is_none());
+    ds.crs = Some(gnomonic);
+    assert_eq!(crate::io::default_export_crs(&ds, "shp"), gnomonic);
+    for ext in ["gpkg", "fgb"] {
+        assert_eq!(crate::io::default_export_crs(&ds, ext), Crs::LonLat, "{ext}");
+        let note = crate::io::default_export_note(&ds, &format!("a.{ext}")).unwrap();
+        assert!(note.contains("WGS 84") && note.contains(&gnomonic.label()), "{note}");
+        // Asked for, it is refused: the file would read back as longitude/latitude.
+        assert!(crate::io::write_path_in(&ds, &d.join(format!("gnom.{ext}")), gnomonic).is_err(), "{ext}");
+    }
+    assert_eq!(crate::io::default_export_note(&ds, "a.shp"), None);
     // GeoJSON is longitude/latitude only.
     let ds = utm_squares(25832);
     assert!(crate::io::write_path_in(&ds, &d.join("squares.geojson"), Crs::from_epsg(25832).unwrap()).is_err());

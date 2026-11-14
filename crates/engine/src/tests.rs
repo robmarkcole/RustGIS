@@ -21495,6 +21495,52 @@ fn layers_export_in_the_system_they_were_read_in() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A Shapefile whose `.prj` names its system without an EPSG code (State Plane by its parameters)
+/// exports to GeoPackage and FlatGeobuf in that system, as the guide says; a system with no WKT
+/// form is written in WGS 84, and a notice names it. Reads the files back for where they are.
+#[test]
+fn a_system_without_an_epsg_code_is_exported_in_its_own_system() {
+    let dir = std::env::temp_dir().join(format!("rustgis-engine-export-prj-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = |name: &str| dir.join(name).display().to_string();
+    // A point in Memphis, written to a Shapefile in EPSG:2274, whose `.prj` is then the text
+    // for NAD83 / Tennessee (ftUS) that has no `AUTHORITY`.
+    let prj = r#"PROJCS["NAD_1983_StatePlane_Tennessee_FIPS_4100_Feet",GEOGCS["GCS_North_American_1983",DATUM["D_North_American_1983",SPHEROID["GRS_1980",6378137.0,298.257222101]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]],PROJECTION["Lambert_Conformal_Conic"],PARAMETER["False_Easting",1968500.0],PARAMETER["False_Northing",0.0],PARAMETER["Central_Meridian",-86.0],PARAMETER["Standard_Parallel_1",35.25],PARAMETER["Standard_Parallel_2",36.41666666666666],PARAMETER["Latitude_Of_Origin",34.33333333333334],UNIT["Foot_US",0.3048006096012192]]"#;
+    std::fs::write(dir.join("sites.csv"), "name,longitude,latitude\nMemphis,-90.049,35.1495\n").unwrap();
+    let mut s = Session::new(Project::default());
+    s.run("layer.addData", &json!({"path": path("sites.csv"), "name": "seed"})).unwrap();
+    s.run("share.exportLayer", &json!({"layer": "seed", "path": path("sites.shp"), "crs": "EPSG:2274"})).unwrap();
+    std::fs::write(dir.join("sites.prj"), prj).unwrap();
+    s.run("layer.addData", &json!({"path": path("sites.shp"), "name": "sites"})).unwrap();
+    let own = s.map().layers.iter().find(|l| l.name == "sites").and_then(|l| l.dataset.crs).unwrap();
+    assert_eq!(own.epsg(), 0, "the .prj has no authority: {}", own.label());
+    for file in ["sites.gpkg", "sites.fgb", "again.shp"] {
+        let mark = s.notices.len();
+        let r = s.run("share.exportLayer", &json!({"layer": "sites", "path": path(file)})).unwrap();
+        assert_eq!(r["crs"], own.label(), "{file}");
+        let said: Vec<_> = s.notices[mark..].iter().map(|n| n.text.clone()).filter(|t| !t.starts_with("Exported ")).collect();
+        assert!(said.is_empty(), "{file}: {said:?}");
+        // Added back, the point is where it was and the layer is in the same system.
+        let r = s.run("layer.addData", &json!({"path": path(file)})).unwrap();
+        let l = s.map().layer(r["layer"].as_u64().unwrap() as u32).unwrap();
+        let ds = if l.is_streamed() { l.load_all().unwrap() } else { l.dataset.clone() };
+        assert_eq!(ds.crs.map(|c| c.label()), Some(own.label()), "{file}");
+        let at = ds.features[0].geometry.as_ref().unwrap().extent();
+        assert!((at.min_x + 90.049).abs() < 1e-6 && (at.min_y - 35.1495).abs() < 1e-6, "{file}: {at:?}");
+    }
+    // A system WKT1 has no name for can't be written into either: WGS 84, and the notice says so.
+    let gnomonic = "+proj=gnom +lat_0=35 +lon_0=-90 +datum=WGS84 +units=m +no_defs";
+    s.run("layer.addData", &json!({"path": path("sites.csv"), "name": "far", "x": "longitude", "y": "latitude", "crs": gnomonic})).unwrap();
+    for file in ["far.gpkg", "far.fgb"] {
+        let mark = s.notices.len();
+        let r = s.run("share.exportLayer", &json!({"layer": "far", "path": path(file)})).unwrap();
+        assert_eq!(r["crs"], "EPSG:4326", "{file}");
+        let said: Vec<_> = s.notices[mark..].iter().map(|n| n.text.clone()).collect();
+        assert!(said.iter().any(|t| t.contains("WGS 84") && t.contains(file) && t.contains("far")), "{file}: {said:?}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn zipped_shapefiles_add_as_layers() {
     use base64::Engine;

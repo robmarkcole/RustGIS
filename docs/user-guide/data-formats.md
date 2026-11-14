@@ -611,9 +611,11 @@ were rounded, and Export Raster, which writes the rounded values, says so again.
 | Web map, OGC API Features, MapLibre style | Publish › Share As | Open-format files that need no server: see [Sharing](sharing.md). |
 | Raster tiles | `imagery.hostedImagery` | A zip of `tiles/z/x/y.png` tiles, `tiles.json` and a viewer page; at most 5,000 tiles and 256 MiB of tile data. |
 
-GeoPackage, Shapefile and FlatGeobuf exports default to the layer's original coordinate system
-when it has an EPSG code. Shapefiles can also retain a custom WKT system; GeoPackage and FlatGeobuf
-need an EPSG code and otherwise default to WGS 84. A layer made in RustGIS defaults to WGS 84.
+GeoPackage, Shapefile and FlatGeobuf exports default to the layer's original coordinate system.
+A system with an EPSG code is written by its code; one without (a Shapefile whose `.prj` names
+State Plane by its parameters, say) is written by its WKT definition, which a GeoPackage and a
+FlatGeobuf carry too. A system WKT can't describe goes into a Shapefile in its own coordinates
+without a `.prj`, and into a GeoPackage or FlatGeobuf in WGS 84; a notice says which. A layer made in RustGIS defaults to WGS 84.
 `share.exportLayer` takes `"crs"` to choose
 another, such as `{"layer": "Parcels", "path": "parcels.gpkg", "crs": "EPSG:4647"}`. GeoJSON, KML,
 GPX, GeoParquet and CSV are always written in WGS 84.
@@ -676,9 +678,8 @@ When a Shapefile's `.prj` is missing or incorrect, right-click its layer and cho
 as `EPSG:2263` or a WKT/PROJ definition, then Apply. This reinterprets the native coordinate
 numbers: it changes the layer's position, preserves attributes and selection, and can be undone
 in one step. Use **Zoom To Layer** to see its corrected position. It does not modify the original
-file. Saving the project keeps the definition. Shapefile exports use it by default;
-GeoPackage and FlatGeobuf exports do so when the definition has an EPSG code. Custom
-definitions without an EPSG code can be exported in their native coordinates as Shapefiles.
+file. Saving the project keeps the definition. Shapefile, GeoPackage and FlatGeobuf exports use
+it by default (see [Writing](#writing)).
 
 This differs from changing the map's coordinate system, which only changes the display, or
 exporting to another CRS, which converts coordinate numbers while preserving locations.
