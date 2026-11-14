@@ -94,6 +94,15 @@ pub(crate) fn need_editable(s: &Session) -> Option<&'static str> {
     need_feature_layer(s)
 }
 
+/// Editing is on, and a feature layer is active or the command's parameters name a standalone
+/// table (`"table"`, [`Session::named_table`]).
+pub(crate) fn need_editable_or_table(s: &Session) -> Option<&'static str> {
+    if s.condition_table.is_some() && s.map().editing.settings.enabled {
+        return None;
+    }
+    need_editable(s)
+}
+
 /// Editing is on and features are selected.
 pub(crate) fn need_editable_selection(s: &Session) -> Option<&'static str> {
     if !s.map().editing.settings.enabled {
@@ -2361,6 +2370,13 @@ fn elevation_inputs(input: &super::InputContext<'_>, p: &Json) -> Result<super::
 /// Only new rows sample the stored elevation surface; ordinary attribute edits do not.
 pub(crate) fn new_feature_inputs(input: &super::InputContext<'_>, p: &Json) -> Result<super::Inputs, String> {
     let s = input;
+    // A row of a standalone table: the table, with no surface to read (it has no geometry).
+    if p.get("table").is_some_and(|t| !t.is_null()) && p.get("layer").is_none_or(Json::is_null) {
+        let id = s.project.tables.get(s.table_index(p)?).map(|t| t.id).ok_or("no such table")?;
+        let mut inputs = super::Inputs::layers(std::iter::empty());
+        inputs.tables.push(id);
+        return Ok(inputs);
+    }
     let mut inputs = super::Inputs::primary(s, p)?;
     if let Elevation::Surface(name) = &s.map().editing.settings.elevation {
         inputs.layers.extend(surface_layer(input, name).map(|l| (s.map().instance_id(), l.id)));

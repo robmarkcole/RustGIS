@@ -705,6 +705,9 @@ pub struct Session {
     pub tool: Tool,
     /// The layer selected in the Layers pane (the one the Style and Data tabs act on).
     pub active_layer: Option<u32>,
+    /// The standalone table a command's parameters name while its conditions are checked
+    /// ([`Session::named_table`]), as `active_layer` is the layer they name; None otherwise.
+    pub(crate) condition_table: Option<u32>,
     /// The layers picked together in the Layers pane, the active layer among them. Read through
     /// [`Session::selected_layers`]: it holds only while `layer_selection_of` is still the active
     /// layer, so setting `active_layer` on its own (adding data, a removal) starts over with that
@@ -1151,6 +1154,7 @@ impl Session {
             exchange: None,
             tool: Tool::Explore,
             active_layer: None,
+            condition_table: None,
             layer_selection: Vec::new(),
             layer_selection_of: None,
             view_size: (1200.0, 720.0),
@@ -1637,26 +1641,14 @@ impl Session {
                 self.warn(format!("{id} ignores {} (it reads {reads})", said.join(", ")));
             }
         }
-        // Layer conditions apply to the layer the parameters name (the first of a list), falling
-        // back to the active one.
-        let named = match params.get("layer") {
-            Some(serde_json::Value::Array(list)) => list.first().and_then(|v| self.layer_id(&serde_json::json!({"layer": v})).ok()),
-            Some(_) => self.layer_id(params).ok(),
-            None => None,
-        };
         let active = self.active_layer;
-        if named.is_some() {
-            self.active_layer = named;
-        }
-        // Restored on every path, even if a condition were to panic.
-        let enabled = spec.enabled;
-        let blocked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| enabled(self))).unwrap_or(Some("unavailable"));
-        self.active_layer = active;
+        let (blocked, named, table) = self.conditions(&spec, params);
         if let Some(why) = blocked {
             return Err(format!("{}: {why}", spec.label));
         }
         let (mutates, label) = (spec.mutates, spec.label);
-        if let Some(e) = self.streamed_edit(id, mutates, label, named.or(active)) {
+        // An edit of a table edits no layer: a streamed active layer doesn't stop it.
+        if let Some(e) = self.streamed_edit(id, mutates, label, if table.is_some() { None } else { named.or(active) }) {
             // Said, as a failure in `guarded` is: this returns before it (#468).
             self.notify(e.clone(), true);
             return Err(e);
@@ -1687,6 +1679,63 @@ impl Session {
         for (project, ..) in self.undo.iter_mut().chain(self.redo.iter_mut()) {
             project.discard_import_reservation(token);
         }
+    }
+
+    /// Why command `id` can't run with `params` now, judged as [`Session::run`] judges it: against
+    /// the layer or standalone table they name, else the active layer. None when it can (or isn't
+    /// a registered command), for a button whose parameters name what it acts on.
+    pub fn why_blocked(&mut self, id: &str, params: &Value) -> Option<&'static str> {
+        let spec = *self.registry.get(id)?;
+        self.conditions(&spec, params).0
+    }
+
+    /// Command `spec`'s conditions with `params`, and the layer and table they name. Layer
+    /// conditions apply to the layer the parameters name (the first of a list), falling back to
+    /// the active one; a command that takes a standalone table is checked against the one they
+    /// name.
+    fn conditions(&mut self, spec: &CommandSpec, params: &Value) -> (Option<&'static str>, Option<u32>, Option<u32>) {
+        let named = match params.get("layer") {
+            Some(serde_json::Value::Array(list)) => list.first().and_then(|v| self.layer_id(&serde_json::json!({"layer": v})).ok()),
+            Some(_) => self.layer_id(params).ok(),
+            None => None,
+        };
+        let active = self.active_layer;
+        if named.is_some() {
+            self.active_layer = named;
+        }
+        let (blocked, table) = self.check_conditions(spec, params);
+        self.active_layer = active;
+        (blocked.unwrap_or(Some("unavailable")), named, table)
+    }
+
+    /// Command `spec`'s conditions, checked against the standalone table `params` name, if any
+    /// ([`Session::named_table`]), and that table. Every dispatcher checks them this way (it makes
+    /// the layer the parameters name active itself), so `condition_table` is cleared on every path
+    /// and never lets the next command's conditions pass. A condition that panics is caught and
+    /// handed back: the dispatcher refuses the command or lets the panic go on, as it did before.
+    pub(crate) fn check_conditions(
+        &mut self,
+        spec: &CommandSpec,
+        params: &Value,
+    ) -> (std::thread::Result<Option<&'static str>>, Option<u32>) {
+        let table = self.named_table(spec, params);
+        self.condition_table = table;
+        let enabled = spec.enabled;
+        let blocked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| enabled(self)));
+        self.condition_table = None;
+        (blocked, table)
+    }
+
+    /// The standalone table `params` name for the conditions of command `spec`: their `"table"`,
+    /// when the command takes one (its parameters list `"table"`) and they name no layer. Only
+    /// the conditions of commands that edit a table read it (`need_editable_or_table`,
+    /// `need_layer_or_table`), so a `"table"` meaning something else (a GeoPackage's table)
+    /// changes nothing.
+    pub(crate) fn named_table(&self, spec: &CommandSpec, params: &Value) -> Option<u32> {
+        if params.get("layer").is_some_and(|l| !l.is_null()) || !spec.param_keys().is_some_and(|k| k.contains(&"table")) {
+            return None;
+        }
+        self.table_index(params).ok().and_then(|i| self.project.tables.get(i)).map(|t| t.id)
     }
 
     /// Why a command can't run on `layer`: it edits features, and the layer is read in place from

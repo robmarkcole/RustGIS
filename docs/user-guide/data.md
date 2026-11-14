@@ -214,8 +214,9 @@ the fallback. Keep the sidecar files together.
 
 Open a feature layer's table with ++ctrl+t++ (++cmd+t++ on macOS), **Home › Selection › Attributes**
 or **Attribute Table** on a feature layer's **Data** tab (`table.open`). Rows and map selections stay in sync.
-Standalone tables open from their right-click menu; their cells are read only. See [The attribute table](analysis.md#the-attribute-table) for
-sorting, filtering, selection and the SQL `WHERE` clause syntax used by **Select By Attributes**
+Standalone tables open from their right-click menu and are edited the same way
+([editing a standalone table](analysis.md#editing-a-standalone-table)). See
+[The attribute table](analysis.md#the-attribute-table) for sorting, filtering, selection and the SQL `WHERE` clause syntax used by **Select By Attributes**
 and **Definition Query** (the full grammar is in [Expressions](expressions.md)). These clauses filter a layer; they are not DuckDB queries.
 
 For an editable feature layer, double-click a cell to change it. The table's toolbar also adds

@@ -2871,7 +2871,7 @@ mod tests {
         let mut dataset = Dataset::new("Stats", GeometryType::None, vec![]);
         dataset.push(None, vec![]);
         dataset.push(None, vec![]);
-        app.session.project.tables.push(rustgis_engine::project::Table { id: 1, dataset });
+        app.session.project.tables.push(rustgis_engine::project::Table::new(1, dataset));
         app.session
             .run("labels.class.add", &serde_json::json!({"layer": "Cities", "name": "Large", "where": "pop_max > 1000000"}))
             .unwrap();

@@ -869,15 +869,17 @@ fn run_task_steps(s: &mut Session, p: &Value) -> CmdResult {
                 st.command
             ));
         }
-        let spec = s.registry.get(&st.command).ok_or_else(|| format!("step {} runs an unknown command '{}'", i + 1, st.command))?;
-        let (enabled, mutates) = (spec.enabled, spec.mutates);
+        let spec = *s.registry.get(&st.command).ok_or_else(|| format!("step {} runs an unknown command '{}'", i + 1, st.command))?;
+        let mutates = spec.mutates;
         // As when run directly, a step naming a layer is checked against that layer.
         if st.params.get("layer").is_some()
             && let Ok(id) = s.layer_id(&st.params)
         {
             s.active_layer = Some(id);
         }
-        if let Some(why) = enabled(s) {
+        // And a step naming a standalone table, against that table.
+        let blocked = s.check_conditions(&spec, &st.params).0.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        if let Some(why) = blocked {
             return Err(format!("step {} ({}): {why}", i + 1, st.title));
         }
         // These handlers share the task's one outer transaction. A final request must not

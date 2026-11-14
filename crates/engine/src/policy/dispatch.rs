@@ -155,7 +155,8 @@ impl Session {
                 | "service.layers"
                 | "service.add"
                 | "source.syncState"
-        ) {
+        ) && crate::cmd::edit::table_edit_in_background(command).is_none()
+        {
             return Err("only Add Data, Load All, Repair/Reload Data, Convert To Annotation, models, scripts, tile archives, service reads, topology and Source File State prepare background work".into());
         }
         let mut params = params.as_object().cloned().ok_or("read parameters must be an object")?;
@@ -224,7 +225,7 @@ impl Session {
             Err(panic) => std::panic::resume_unwind(panic),
         }
     }
-    /// Preserves ordinary command conditions for the admitted read's explicit layer selector.
+    /// Preserves ordinary command conditions for the admitted read's layer or table selector.
     fn check_read_command(&mut self, op: &Authorized<CommandOp>) -> Result<(), String> {
         let CommandOp::Registered { spec, params } = op.op() else { return Err("not a registered read command".into()) };
         let named = self.layer_id(params).ok();
@@ -232,12 +233,12 @@ impl Session {
         if named.is_some() {
             self.active_layer = named;
         }
-        let blocked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (spec.enabled)(self))).unwrap_or(Some("unavailable"));
+        let (blocked, table) = self.check_conditions(spec, params);
         self.active_layer = active;
-        if let Some(why) = blocked {
+        if let Some(why) = blocked.unwrap_or(Some("unavailable")) {
             return Err(format!("{}: {why}", spec.label));
         }
-        if let Some(why) = self.streamed_edit(spec.id, spec.mutates, spec.label, named.or(active)) {
+        if let Some(why) = self.streamed_edit(spec.id, spec.mutates, spec.label, if table.is_some() { None } else { named.or(active) }) {
             return Err(why);
         }
         Ok(())

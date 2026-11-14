@@ -1259,7 +1259,7 @@ mod tests {
         app.run("layer.addData", json!({"path": geojson, "stream": true})).unwrap();
         let table = app.run("gpkg.addLayer", json!({"path": package, "table": "rows"})).unwrap()["layer"].as_u64().unwrap() as u32;
         let table = Target::Layer { map: app.session.map().instance_id(), layer: app.session.map().layer(table).unwrap().instance_id() };
-        let mut standalone = rustgis_engine::project::Table { id: 7, dataset: Dataset::new("rows", GeometryType::None, vec![]) };
+        let mut standalone = rustgis_engine::project::Table::new(7, Dataset::new("rows", GeometryType::None, vec![]));
         standalone.dataset.name = "rows".into();
         app.session.project.tables.push(standalone);
         tick(&mut app, &egui::Context::default());

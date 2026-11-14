@@ -417,6 +417,28 @@ pub struct Table {
     pub id: u32,
     #[serde(flatten)]
     pub dataset: Dataset,
+    /// Runtime identity of these contents; snapshots retain it, wholesale replacements renew it.
+    #[serde(skip)]
+    instance_id: u64,
+}
+
+/// A fresh runtime identity, independent of reusable project-local table ids.
+fn next_table_instance() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+impl Table {
+    /// Wraps a dataset under its project-local id with a fresh, unsaved runtime identity.
+    pub fn new(id: u32, dataset: Dataset) -> Self {
+        Self { id, dataset, instance_id: next_table_instance() }
+    }
+
+    /// Identifies these live contents across ordinary edits and undo snapshots, but not replacement.
+    pub fn instance_id(&self) -> u64 {
+        self.instance_id
+    }
 }
 
 /// A table as a file holds it: the dataset's fields beside the id (absent from files written
@@ -442,10 +464,12 @@ struct TableFile {
 }
 
 impl From<TableFile> for Table {
+    /// Loads stored data under a fresh runtime identity, never one supplied by the file.
     fn from(t: TableFile) -> Self {
         let TableFile { id, name, geometry_type, fields, features, source, crs, crs_incomplete, zm_dropped } = t;
         Table {
             id,
+            instance_id: next_table_instance(),
             dataset: Dataset {
                 name,
                 geometry_type,
@@ -1080,19 +1104,20 @@ impl Project {
     /// Adds a standalone table, and returns the id it got.
     pub fn add_table(&mut self, dataset: Dataset) -> u32 {
         let id = self.new_table_id();
-        self.tables.push(Table { id, dataset });
+        self.tables.push(Table::new(id, dataset));
         id
     }
 
     /// Adds a tool's output table in place of the tables of its name, as running the tool again
-    /// replaces its result: the first of them keeps its id, so a view open on it stays on it.
+    /// replaces its result: the first keeps its id, so an open view stays on it, but the fresh
+    /// runtime identity invalidates drafts that belonged to the previous contents.
     pub fn put_table(&mut self, dataset: Dataset) -> u32 {
         let id = match self.tables.iter().find(|t| t.name == dataset.name) {
             Some(t) => t.id,
             None => self.new_table_id(),
         };
         self.tables.retain(|t| t.name != dataset.name);
-        self.tables.push(Table { id, dataset });
+        self.tables.push(Table::new(id, dataset));
         id
     }
 
@@ -2189,7 +2214,7 @@ impl Durable for Project {
 impl Durable for Table {
     /// Offers classified whole fields once, before any live mutation.
     fn prepare(&self, p: &mut Prepare<'_>) {
-        let Self { id: _, dataset } = self;
+        let Self { id: _, dataset, instance_id: _ } = self;
         let Dataset {
             name: _,
             geometry_type: _,

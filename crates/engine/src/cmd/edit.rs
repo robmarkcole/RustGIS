@@ -1,9 +1,10 @@
-//! Edit tab: create and delete features, edit attributes and fields.
+//! Edit tab: create and delete features, edit attributes and fields, of a layer or of a
+//! standalone table (`"table"`).
 
-use rustgis_data::{FieldType, Geometry, GeometryType, Value};
+use rustgis_data::{Dataset, Field, FieldType, Geometry, GeometryType, Value};
 use serde_json::{Value as Json, json};
 
-use super::{need_layer, ps};
+use super::{need_layer_or_table, ps};
 use crate::{CmdResult, CommandSpec as C, Session};
 
 pub fn commands() -> Vec<C> {
@@ -12,29 +13,105 @@ pub fn commands() -> Vec<C> {
             .when(super::design::need_editable)
             .params(r#"{"layer"?, "field": string, "create": bool, "overwrite": bool, "property": string, "unit": string, "epsg"?: number, "scope": "all"|"selected"}"#),
         C::new("edit.addFeature", "Create Feature", "Edit › Features", add_feature).inputs(super::design::new_feature_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
-            .when(super::design::need_editable)
-            .params(r#"{"layer"?, "geometry": GeoJSON geometry (lon/lat), "attributes"?: {field: value}, "template"?: feature template}"#),
+            .when(super::design::need_editable_or_table)
+            .params(r#"{"layer"?, "table"?: name|id (a standalone table: adds a row, without geometry or template), "geometry": GeoJSON geometry (lon/lat; left out for a table), "attributes"?: {field: value}, "template"?: feature template}"#),
         C::new("edit.delete", "Delete", "Edit › Features", delete).roles(&[]).effects(crate::policy::Effects::NONE).key("Delete").when(super::design::need_editable_selection),
         C::new("edit.setValue", "Edit Attribute", "Attribute Table", set_value).roles(&[]).effects(crate::policy::Effects::NONE)
-            .when(super::design::need_editable)
-            .params(r#"{"layer"?, "row": number, "field": string, "value": any}"#),
+            .when(super::design::need_editable_or_table)
+            .params(r#"{"layer"?, "table"?: name|id (a standalone table, instead of a layer), "row": number, "field": string, "value": any}"#),
         C::new("edit.addField", "Add Field", "Data › Data Design › Fields", add_field).roles(&[]).effects(crate::policy::Effects::NONE)
-            .when(need_layer)
-            .params(r#"{"layer"?, "name": string, "type": "long"|"double"|"text"|"boolean"|"date"|"datetime"}"#),
+            .when(need_layer_or_table)
+            .params(r#"{"layer"?, "table"?: name|id (a standalone table, instead of a layer), "name": string, "type": "long"|"double"|"text"|"boolean"|"date"|"datetime"}"#),
         C::new("edit.deleteField", "Delete Field", "Data › Data Design › Fields", delete_field).roles(&[]).effects(crate::policy::Effects::NONE)
-            .when(need_layer)
-            .params(r#"{"layer"?, "field": string}"#),
+            .when(need_layer_or_table)
+            .params(r#"{"layer"?, "table"?: name|id (a standalone table, instead of a layer), "field": string}"#),
         C::new("edit.convertField", "Convert Field to Dates", "Attribute Table", convert_field).roles(&[]).effects(crate::policy::Effects::NONE)
-            .when(need_layer)
-            .params(r#"{"layer"?, "field": string, "type": "date"|"datetime"}"#),
+            .when(need_layer_or_table)
+            .params(r#"{"layer"?, "table"?: name|id (a standalone table, instead of a layer), "field": string, "type": "date"|"datetime"}"#),
         C::new("edit.calculateField", "Calculate Field", "Attribute Table", calculate_field).roles(&[]).effects(crate::policy::Effects::NONE)
-            .when(super::design::need_editable)
-            .params(r#"{"layer"?, "field": string, "expression": "an expression: fields, 'text', numbers, + - * / % ^ ||, functions (see the Expressions page)"}"#),
+            .when(super::design::need_editable_or_table)
+            .params(r#"{"layer"?, "table"?: name|id (a standalone table, instead of a layer: every row), "field": string, "expression": "an expression: fields, 'text', numbers, + - * / % ^ ||, functions (see the Expressions page)"}"#),
     ]
 }
 
+/// What an edit command changes: a layer, or a standalone table (by its position among the
+/// project's tables).
+#[derive(Clone, Copy)]
+enum Target {
+    Layer(u32),
+    Table(usize),
+}
+
+/// The layer (`"layer"`, or the active one) or standalone table (`"table"`) the parameters name.
+/// Naming both is refused.
+fn target(s: &Session, p: &Json) -> Result<Target, String> {
+    if p.get("table").is_none_or(Json::is_null) {
+        return s.layer_id(p).map(Target::Layer);
+    }
+    if p.get("layer").is_some_and(|l| !l.is_null()) {
+        return Err("give a layer or a standalone table (\"table\"), not both".into());
+    }
+    // Native tasks invoke handlers inline, including through nested scripts. Refuse here,
+    // before any row scan; tasks have no worker to supply progress and Cancel.
+    #[cfg(not(target_arch = "wasm32"))]
+    if s.task_running {
+        return Err(
+            "tasks cannot write standalone tables: run the table edit directly or in a separate script for progress and Cancel".into()
+        );
+    }
+    s.table_index(p).map(Target::Table)
+}
+
+/// A synchronous edit's target. Native scoped callers and notebooks need an owned worker result,
+/// which handlers land before reaching here; an unprepared call must never scan live rows.
+fn write_target(s: &Session, p: &Json) -> Result<Target, String> {
+    let target = target(s, p)?;
+    #[cfg(not(target_arch = "wasm32"))]
+    if matches!(target, Target::Table(_)) && (!s.policy_user() || s.notebook_running) {
+        return Err("this caller must prepare the table edit on a worker; run it from the table view instead of synchronously".into());
+    }
+    Ok(target)
+}
+
+/// The data of `t`.
+fn data(s: &Session, t: Target) -> Result<&Dataset, String> {
+    match t {
+        Target::Layer(id) => s.map().layer(id).map(|l| &l.dataset).ok_or_else(|| "no layer".to_string()),
+        Target::Table(i) => s.project.tables.get(i).map(|t| &t.dataset).ok_or_else(|| "no such table".to_string()),
+    }
+}
+
+/// The data of `t`, to edit.
+fn data_mut(s: &mut Session, t: Target) -> Result<&mut Dataset, String> {
+    match t {
+        Target::Layer(id) => s.map_mut().layer_mut(id).map(|l| &mut l.dataset).ok_or_else(|| "no layer".to_string()),
+        Target::Table(i) => s.project.tables.get_mut(i).map(|t| &mut t.dataset).ok_or_else(|| "no such table".to_string()),
+    }
+}
+
+/// Field `name`'s index in the data of `t`: the first matching it ignoring case, as expressions
+/// and queries find fields.
+fn field_of(s: &Session, t: Target, name: &str) -> Result<usize, String> {
+    data(s, t)?.field_index(name).ok_or_else(|| format!("no field named '{name}'"))
+}
+
+/// A table's rows change only while editing is on, as a layer's features do
+/// ([`super::design::apply`]); its fields, as a layer's, change either way.
+fn editing_on(s: &Session) -> Result<(), String> {
+    if s.map().editing.settings.enabled { Ok(()) } else { Err("editing is turned off (Edit › Edit)".into()) }
+}
+
+/// `edit.addFeature`: a feature of the given geometry and attributes (else its template's
+/// defaults) in a layer, selected and checked against the layer's design; or a row of a
+/// standalone table ([`add_row`]), on the desktop table worker ([`table_ahead`]).
 pub(crate) fn add_feature(s: &mut Session, p: &Json) -> CmdResult {
-    let id = s.layer_id(p)?;
+    if let Some(result) = land_table_edit(s, p, "edit.addFeature") {
+        return result;
+    }
+    let id = match write_target(s, p)? {
+        Target::Table(i) => return add_row(s, p, i),
+        Target::Layer(id) => id,
+    };
     let g = geometry_param(p)?;
     let l = s.map_mut().layer_mut(id).ok_or("no layer")?;
     let want = l.geometry_type();
@@ -50,16 +127,115 @@ pub(crate) fn add_feature(s: &mut Session, p: &Json) -> CmdResult {
         }
         None => None,
     };
-    let mut losses = Vec::new();
     let layer = l.dataset.name.clone();
-    let attrs: Result<Vec<Value>, String> = l
-        .dataset
-        .fields
+    let defaults = template.as_ref().map_or(&[][..], |t| &t.defaults[..]);
+    let (attrs, losses, left_out) = new_row(&l.dataset.fields, p, defaults)?;
+    l.dataset.push(Some(g), attrs);
+    l.touch_geometry();
+    let row = l.dataset.features.len() - 1;
+    l.selection = vec![row];
+    super::design::apply(s, id, vec![super::design::Change { before: None, row: Some(row) }])?;
+    for (field, key) in losses {
+        notify_loss(s, key, &layer, field, row);
+    }
+    notify_left_out(s, &layer, &left_out);
+    Ok(json!({"row": row}))
+}
+
+/// `edit.addFeature` on standalone table `i`: a row of the given attributes, made only while
+/// editing is on, as a feature is. A table has no geometry, nor templates (a layer's design).
+fn add_row(s: &mut Session, p: &Json, i: usize) -> CmdResult {
+    if p.get("geometry").is_some_and(|g| !g.is_null()) {
+        return Err("a standalone table holds no geometry: leave out \"geometry\"".into());
+    }
+    if p.get("template").is_some_and(|t| !t.is_null()) {
+        return Err("feature templates belong to layers: give a table's values as \"attributes\"".into());
+    }
+    editing_on(s)?;
+    let t = data_mut(s, Target::Table(i))?;
+    let (attrs, losses, left_out) = new_row(&t.fields, p, &[])?;
+    t.push(None, attrs);
+    let row = t.features.len().saturating_sub(1);
+    let table = t.name.clone();
+    for (field, key) in losses {
+        notify_loss(s, key, &table, field, row);
+    }
+    notify_left_out(s, &table, &left_out);
+    Ok(json!({"row": row}))
+}
+
+/// The given attributes a new row leaves out: those naming no field, and those naming a field
+/// another attribute already gives ([`given_attributes`]).
+#[derive(Default)]
+struct LeftOut {
+    no_field: Vec<String>,
+    taken: Vec<String>,
+}
+
+/// Each field's value in `"attributes"`, by field. A key gives one field: the one named exactly
+/// so, else the only field named so ignoring case (ambiguous keys are refused); the keys named
+/// exactly go first, so `Name` fills `Name` even when `name` comes first. A key naming no field,
+/// or a field another key gives, is left out and said ([`notify_left_out`]). Non-object values
+/// other than null are refused before any row is inserted.
+fn given_attributes<'a>(fields: &[Field], p: &'a Json) -> Result<(Vec<Option<&'a Json>>, LeftOut), String> {
+    let mut given = vec![None; fields.len()];
+    let mut left = LeftOut::default();
+    let attributes = match p.get("attributes") {
+        None | Some(Json::Null) => return Ok((given, left)),
+        Some(Json::Object(attributes)) => attributes,
+        Some(_) => return Err("attributes is an object of field names and values".into()),
+    };
+    let exact = |k: &str| fields.iter().position(|f| f.name == k);
+    for (k, v) in attributes.iter().filter(|(k, _)| exact(k).is_some()) {
+        match exact(k).and_then(|i| given.get_mut(i)) {
+            Some(slot @ None) => *slot = Some(v),
+            _ => left.taken.push(k.clone()),
+        }
+    }
+    for (k, v) in attributes.iter().filter(|(k, _)| exact(k).is_none()) {
+        let mut matches = fields.iter().enumerate().filter(|(_, f)| f.name.eq_ignore_ascii_case(k));
+        let first = matches.next().map(|(i, _)| i);
+        if matches.next().is_some() {
+            return Err(format!("attribute '{k}' matches more than one field: use an exact field name"));
+        }
+        match first.map(|i| given.get_mut(i)) {
+            None => left.no_field.push(k.clone()),
+            Some(Some(slot @ None)) => *slot = Some(v),
+            Some(_) => left.taken.push(k.clone()),
+        }
+    }
+    Ok((given, left))
+}
+
+/// Says, once per kind, which given attributes a new row in layer or table `name` left out.
+fn notify_left_out(s: &mut Session, name: &str, left: &LeftOut) {
+    for (keys, why) in [(&left.no_field, "naming no field"), (&left.taken, "naming a field another attribute already gives")] {
+        if keys.is_empty() {
+            continue;
+        }
+        let shown: Vec<String> = keys.iter().take(5).map(|k| format!("'{}'", k.chars().take(40).collect::<String>())).collect();
+        let more = if keys.len() > 5 { format!(" and {} more", keys.len() - 5) } else { String::new() };
+        let n = if keys.len() == 1 { "1 attribute".to_string() } else { format!("{} attributes", keys.len()) };
+        s.notify(format!("{name}: the new row leaves out {n} {why}: {}{more}", shown.join(", ")), false);
+    }
+}
+
+/// What writing a value took from it, by field: a notice key ([`notify_loss`]).
+type Losses = Vec<(String, &'static str)>;
+
+/// A new row's values for `fields`: those given (`"attributes"`, [`given_attributes`]), else
+/// `defaults` (a feature template's), each as its field holds it, with what that took from each
+/// and the attributes left out. A value a field can't hold at all (`soon` in a date field) is
+/// refused.
+fn new_row(fields: &[Field], p: &Json, defaults: &[(String, Value)]) -> Result<(Vec<Value>, Losses, LeftOut), String> {
+    let mut losses = Vec::new();
+    let (given, left_out) = given_attributes(fields, p)?;
+    let attrs = fields
         .iter()
-        .map(|f| {
-            let given = p.get("attributes").and_then(|a| a.get(&f.name)).map(Value::from_json);
-            let default =
-                template.as_ref().and_then(|t| t.defaults.iter().find(|(k, _)| k.eq_ignore_ascii_case(&f.name))).map(|(_, v)| v.clone());
+        .zip(given)
+        .map(|(f, given)| {
+            let given = given.map(Value::from_json);
+            let default = defaults.iter().find(|(k, _)| k.eq_ignore_ascii_case(&f.name)).map(|(_, v)| v.clone());
             let value = given.or(default).unwrap_or(Value::Null);
             if non_finite_input(&value, f.ty) {
                 return Err(format!("field '{}' requires a finite number", f.name));
@@ -85,22 +261,19 @@ pub(crate) fn add_feature(s: &mut Session, p: &Json) -> CmdResult {
             }
             Ok(coerced)
         })
-        .collect();
-    l.dataset.push(Some(g), attrs?);
-    l.touch_geometry();
-    let row = l.dataset.features.len() - 1;
-    l.selection = vec![row];
-    super::design::apply(s, id, vec![super::design::Change { before: None, row: Some(row) }])?;
-    for (field, key) in losses {
-        s.notify_text(
-            crate::notice_text::NoticeText::format(
-                key,
-                [("layer", layer.clone().into()), ("field", field.into()), ("row", row.saturating_add(1).to_string().into())],
-            ),
-            false,
-        );
-    }
-    Ok(json!({"row": row}))
+        .collect::<Result<Vec<Value>, String>>()?;
+    Ok((attrs, losses, left_out))
+}
+
+/// Says what writing a value of `field`, in row `row` of layer or table `name`, took from it.
+fn notify_loss(s: &mut Session, key: &'static str, name: &str, field: String, row: usize) {
+    s.notify_text(
+        crate::notice_text::NoticeText::format(
+            key,
+            [("layer", name.to_string().into()), ("field", field.into()), ("row", row.saturating_add(1).to_string().into())],
+        ),
+        false,
+    );
 }
 
 /// The `geometry` parameter as a geometry. A GeometryCollection of more or fewer than one member
@@ -326,10 +499,6 @@ fn delete(s: &mut Session, _: &Json) -> CmdResult {
     Ok(json!({"deleted": n}))
 }
 
-fn field_index(s: &Session, id: u32, name: &str) -> Result<usize, String> {
-    s.map().layer(id).and_then(|l| l.dataset.field_index(name)).ok_or_else(|| format!("no field named '{name}'"))
-}
-
 /// A numeric conversion's loss, shared by edits and feature creation. Null entered explicitly is quiet.
 fn numeric_loss(input: &Value, v: &Value, ty: FieldType) -> Option<&'static str> {
     if ty.is_numeric() && v.is_null() && !input.asks_null() {
@@ -347,17 +516,59 @@ fn numeric_loss(input: &Value, v: &Value, ty: FieldType) -> Option<&'static str>
     }
 }
 
+/// `edit.setValue`: one cell of a layer (checked against its design, which may undo it) or of a
+/// standalone table, as its field holds it ([`typed`]), saying what that lost. A table's first
+/// copy of shared rows runs on the desktop table worker ([`table_ahead`]).
 fn set_value(s: &mut Session, p: &Json) -> CmdResult {
-    let id = s.layer_id(p)?;
-    let row = p.get("row").and_then(Json::as_u64).ok_or("row is required")? as usize;
-    let fi = field_index(s, id, ps(p, "field").ok_or("field is required")?)?;
-    let l = s.map_mut().layer_mut(id).ok_or("no layer")?;
-    let ty = l.dataset.fields.get(fi).map(|f| f.ty).ok_or("no field")?;
+    if let Some(result) = land_table_edit(s, p, "edit.setValue") {
+        return result;
+    }
+    let t = write_target(s, p)?;
+    // A row past `usize` (on a 32-bit build) is no row, not a row it wraps round to.
+    let row = usize::try_from(p.get("row").and_then(Json::as_u64).ok_or("row is required")?).map_err(|_| "no such row")?;
+    let fi = field_of(s, t, ps(p, "field").ok_or("field is required")?)?;
     let raw = p.get("value").cloned().unwrap_or(Json::Null);
     let input = Value::from_json(&raw);
+    let id = match t {
+        Target::Layer(id) => id,
+        // A table's row: the value, said if it lost something; it has no design to check it against.
+        Target::Table(_) => {
+            editing_on(s)?;
+            let ds = data_mut(s, t)?;
+            let (ty, field) = ds.fields.get(fi).map(|f| (f.ty, f.name.clone())).ok_or("no field")?;
+            let v = typed(raw, ty)?;
+            let loss = numeric_loss(&input, &v, ty);
+            let cell = ds.features.get_mut(row).and_then(|f| f.attrs.get_mut(fi)).ok_or("no such row")?;
+            *cell = v;
+            let table = ds.name.clone();
+            if let Some(key) = loss {
+                notify_loss(s, key, &table, field, row);
+            }
+            return Ok(Json::Null);
+        }
+    };
+    let l = s.map_mut().layer_mut(id).ok_or("no layer")?;
+    let ty = l.dataset.fields.get(fi).map(|f| f.ty).ok_or("no field")?;
     let field = l.dataset.fields.get(fi).map(|f| f.name.clone()).ok_or("no field")?;
     let layer = l.dataset.name.clone();
-    let v = match raw {
+    let v = typed(raw, ty)?;
+    // Keep the existing finite coercion, but say when it discards information.
+    let loss = numeric_loss(&input, &v, ty);
+    let f = l.dataset.features.get_mut(row).ok_or("no such row")?;
+    let before = f.clone();
+    let cell = f.attrs.get_mut(fi).ok_or("no such row")?;
+    *cell = v;
+    super::design::apply(s, id, vec![super::design::Change { before: Some(before), row: Some(row) }])?;
+    if let Some(key) = loss {
+        notify_loss(s, key, &layer, field, row);
+    }
+    Ok(Json::Null)
+}
+
+/// `raw` (an `edit.setValue` value) as a value of a `ty` field. A number that isn't finite, and a
+/// value a date field can't hold, are refused.
+fn typed(raw: Json, ty: FieldType) -> Result<Value, String> {
+    Ok(match raw {
         // A number that isn't finite (NaN, infinity) is no value a number field holds, nor one a
         // project can save: refused, as the attribute table refuses it.
         Json::String(t) if ty.is_numeric() && t.trim().parse::<f64>().is_ok_and(|f| !f.is_finite()) => {
@@ -375,29 +586,16 @@ fn set_value(s: &mut Session, p: &Json) -> CmdResult {
             Value::Null if ty.is_temporal() && !other.is_null() => return Err(format!("'{other}' isn't a {} value", ty.label())),
             v => v,
         },
-    };
-    // Keep the existing finite coercion, but say when it discards information.
-    let loss = numeric_loss(&input, &v, ty);
-    let f = l.dataset.features.get_mut(row).ok_or("no such row")?;
-    let before = f.clone();
-    let cell = f.attrs.get_mut(fi).ok_or("no such row")?;
-    *cell = v;
-    super::design::apply(s, id, vec![super::design::Change { before: Some(before), row: Some(row) }])?;
-    if let Some(key) = loss {
-        s.notify_text(
-            crate::notice_text::NoticeText::format(
-                key,
-                [("layer", layer.into()), ("field", field.into()), ("row", row.saturating_add(1).to_string().into())],
-            ),
-            false,
-        );
-    }
-    Ok(Json::Null)
+    })
 }
 
-/// Adds an empty field of a type: long, double, text, boolean, date or datetime.
+/// Adds an empty field of a type: long, double, text, boolean, date or datetime. Table rows
+/// are filled on the desktop worker ([`table_ahead`]), with progress and Cancel.
 fn add_field(s: &mut Session, p: &Json) -> CmdResult {
-    let id = s.layer_id(p)?;
+    if let Some(result) = land_table_edit(s, p, "edit.addField") {
+        return result;
+    }
+    let t = write_target(s, p)?;
     let name = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).ok_or("name is required")?;
     if !name.chars().all(|c| c.is_alphanumeric() || c == '_') || name.chars().count() > 64 {
         return Err("field names use letters, digits and _ (at most 64)".into());
@@ -411,11 +609,20 @@ fn add_field(s: &mut Session, p: &Json) -> CmdResult {
         "datetime" | "date-time" | "timestamp" => FieldType::DateTime,
         other => return Err(format!("unknown field type '{other}'")),
     };
-    let l = s.map_mut().layer_mut(id).ok_or("no layer")?;
-    if l.dataset.field_index(name).is_some() {
+    let ds = data_mut(s, t)?;
+    if ds.field_index(name).is_some() {
         return Err(format!("a field named '{name}' already exists"));
     }
-    l.dataset.ensure_field(name, ty);
+    if matches!(t, Target::Table(_)) {
+        ds.fields.push(Field::new(name, ty));
+        rustgis_data::progress::begin(ds.features.len());
+        for row in &mut ds.features {
+            rustgis_data::progress::step(1).map_err(|e| e.to_string())?;
+            row.attrs.push(Value::Null);
+        }
+    } else {
+        ds.ensure_field(name, ty);
+    }
     Ok(Json::Null)
 }
 
@@ -427,14 +634,45 @@ fn add_field(s: &mut Session, p: &Json) -> CmdResult {
 /// would stop reading with it. It runs on the UI thread: it is one parse of the text of a layer
 /// held in memory (a layer read in place is refused, as every `edit.*` command is), measured at
 /// about 60 ms for a million values, with nothing to read or wait for that progress could show.
+/// A standalone table has none of these to refuse it and converts on the desktop worker
+/// ([`table_ahead`]), with progress and Cancel.
 fn convert_field(s: &mut Session, p: &Json) -> CmdResult {
-    let id = s.layer_id(p)?;
-    let fi = field_index(s, id, ps(p, "field").ok_or("field is required")?)?;
+    if let Some(result) = land_table_edit(s, p, "edit.convertField") {
+        return result;
+    }
+    let t = write_target(s, p)?;
+    let fi = field_of(s, t, ps(p, "field").ok_or("field is required")?)?;
     let ty = match ps(p, "type").ok_or("type is required")?.to_ascii_lowercase().as_str() {
         "date" => FieldType::Date,
         "datetime" | "date-time" | "timestamp" => FieldType::DateTime,
         other => return Err(format!("'{other}' isn't a type a field converts to: date or datetime")),
     };
+    let (name, (converted, nulled, examples)) = match t {
+        Target::Table(_) => {
+            let ds = data_mut(s, t)?;
+            let field = ds.fields.get(fi).ok_or("no such field")?;
+            let name = field.name.clone();
+            if field.ty != FieldType::Text {
+                return Err(format!("'{name}' is a {} field: only a text field converts to dates", field.ty.label()));
+            }
+            (name, to_dates(ds, fi, ty)?)
+        }
+        Target::Layer(id) => convert_layer_field(s, id, fi, ty)?,
+    };
+    let (kind, one) = if ty == FieldType::Date { ("dates", "a date") } else { ("date-times", "a date-time") };
+    if nulled > 0 {
+        let rows = if nulled == 1 { "1 row".to_string() } else { format!("{nulled} rows") };
+        s.notify(
+            format!("Convert Field: '{name}' holds {kind} now, and is null in {rows} whose text isn't {one}: {}", examples.join(", ")),
+            false,
+        );
+    }
+    Ok(json!({"converted": converted, "null": nulled}))
+}
+
+/// Field `fi` of layer `id` as dates ([`to_dates`]) and its name, unless something that reads it
+/// would stop reading it (see [`convert_field`]).
+fn convert_layer_field(s: &mut Session, id: u32, fi: usize, ty: FieldType) -> Result<(String, (usize, usize, Vec<String>)), String> {
     let l = s.map_mut().layer_mut(id).ok_or("no layer")?;
     let field = l.dataset.fields.get(fi).ok_or("no such field")?;
     let name = field.name.clone();
@@ -492,8 +730,16 @@ fn convert_field(s: &mut Session, p: &Json) -> CmdResult {
     if let Some(r) = l.design.rules.iter().find(|r| rule_reads(r, &l.dataset) && !rule_reads(r, &schema)) {
         return Err(format!("attribute rule '{}' wouldn't read '{name}' as dates: change or remove it first", r.name));
     }
+    Ok((name, to_dates(&mut l.dataset, fi, ty)?))
+}
+
+/// Makes text field `fi` of `ds` a `ty` (date or date-time) field: how many values became dates,
+/// how many became null, and the first few of those.
+fn to_dates(ds: &mut Dataset, fi: usize, ty: FieldType) -> Result<(usize, usize, Vec<String>), String> {
     let (mut converted, mut nulled, mut examples) = (0usize, 0usize, Vec::new());
-    for f in &mut l.dataset.features {
+    rustgis_data::progress::begin(ds.features.len());
+    for f in &mut ds.features {
+        rustgis_data::progress::step(1).map_err(|e| e.to_string())?;
         let Some(v) = f.attrs.get_mut(fi) else { continue };
         let date = match &*v {
             v if v.asks_null() => Value::Null,
@@ -511,25 +757,36 @@ fn convert_field(s: &mut Session, p: &Json) -> CmdResult {
         converted += usize::from(!date.is_null());
         *v = date;
     }
-    if let Some(f) = l.dataset.fields.get_mut(fi) {
+    if let Some(f) = ds.fields.get_mut(fi) {
         f.ty = ty;
     }
-    let (kind, one) = if ty == FieldType::Date { ("dates", "a date") } else { ("date-times", "a date-time") };
-    if nulled > 0 {
-        let rows = if nulled == 1 { "1 row".to_string() } else { format!("{nulled} rows") };
-        s.notify(
-            format!("Convert Field: '{name}' holds {kind} now, and is null in {rows} whose text isn't {one}: {}", examples.join(", ")),
-            false,
-        );
-    }
-    Ok(json!({"converted": converted, "null": nulled}))
+    Ok((converted, nulled, examples))
 }
 
 /// `edit.deleteField`: removes a field and every reference to it (symbology, labels, the data
 /// design), or refuses while the definition query or a display filter reads it.
+/// A standalone table's field just goes: nothing refers to it. Its rows are changed on the
+/// desktop worker ([`table_ahead`]), with progress and Cancel.
 fn delete_field(s: &mut Session, p: &Json) -> CmdResult {
-    let id = s.layer_id(p)?;
-    let fi = field_index(s, id, ps(p, "field").ok_or("field is required")?)?;
+    if let Some(result) = land_table_edit(s, p, "edit.deleteField") {
+        return result;
+    }
+    let t = write_target(s, p)?;
+    let fi = field_of(s, t, ps(p, "field").ok_or("field is required")?)?;
+    let Target::Layer(id) = t else {
+        let ds = data_mut(s, t)?;
+        if fi < ds.fields.len() {
+            ds.fields.remove(fi);
+            rustgis_data::progress::begin(ds.features.len());
+            for f in &mut ds.features {
+                rustgis_data::progress::step(1).map_err(|e| e.to_string())?;
+                if fi < f.attrs.len() {
+                    f.attrs.remove(fi);
+                }
+            }
+        }
+        return Ok(json!({"rulesRemoved": 0}));
+    };
     let l = s.map_mut().layer_mut(id).ok_or("no layer")?;
     // A definition query or display filter that reads the field would stop reading without it,
     // and the layer would then draw and export the rows it leaves out: refused, naming it. What a
@@ -623,31 +880,189 @@ fn delete_field(s: &mut Session, p: &Json) -> CmdResult {
     Ok(json!({"rulesRemoved": removed_rules}))
 }
 
-/// Sets a field from an expression, on the selected rows or all of them.
+/// Table writes use one admitted worker path, including the first copy of shared rows. The
+/// handler runs on a session containing only the input table, never the caller's layers or secrets.
+pub(crate) const TABLE_EDITS: &[(&str, &str, fn(&mut Session, &Json) -> CmdResult)] = &[
+    ("edit.setValue", "Edit Attribute", set_value),
+    ("edit.addFeature", "Add Row", add_feature),
+    ("edit.addField", "Add Field", add_field),
+    ("edit.deleteField", "Delete Field", delete_field),
+    ("edit.convertField", "Convert Field", convert_field),
+    ("edit.calculateField", "Calculate Field", calculate_field),
+];
+
+/// The registered command and progress label for a table write. Layer invocations keep their
+/// existing path; the desktop uses this worker only when parameters name a standalone table.
+pub fn table_edit_in_background(command: &str) -> Option<(&'static str, &'static str)> {
+    TABLE_EDITS.iter().find(|(id, ..)| *id == command).map(|(id, name, _)| (*id, *name))
+}
+
+/// One table edit's input and completed result. Shared rows let landing detect concurrent edits
+/// without scanning them. Only fields and rows are installed; unrelated table metadata is kept.
+struct TableEdit {
+    opened: u64,
+    id: u32,
+    input: Dataset,
+    result: Result<(Dataset, Json, Vec<crate::Notice>), String>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+/// A table-write line recorded by a script worker for that same line to consume on landing.
+pub(crate) struct ScriptTableEdit {
+    command: String,
+    params: Json,
+    edit: TableEdit,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+/// Records a table line's actual rows and notices on the worker, or invokes the live line with
+/// those rows prepared. A missing or mismatched result is refused, never recomputed on the frame.
+/// The caller still authorizes and invokes the original operation under the live script owner.
+pub(crate) fn script_table(
+    s: &mut Session,
+    command: &str,
+    p: &Json,
+    prepared: bool,
+    run: impl FnOnce(&mut Session) -> CmdResult,
+) -> CmdResult {
+    use super::gp::{Ahead, RanAhead};
+    if prepared {
+        let next = match &mut s.tools_ahead {
+            Some(Ahead::Taking(ran)) => ran.pop_front(),
+            _ => None,
+        };
+        let Some(RanAhead::Table(next)) = next else {
+            return Err("the script's table input changed: run the script again".into());
+        };
+        let ScriptTableEdit { command: given, params, edit } = *next;
+        if given != command || params != *p {
+            return Err("the script's table command changed: run the script again".into());
+        }
+        return super::reads::taking(s, command, edit, run);
+    }
+    if !matches!(s.tools_ahead, Some(Ahead::Recording(_))) {
+        return run(s);
+    }
+    rustgis_data::progress::begin(0);
+    rustgis_data::progress::check().map_err(|e| e.to_string())?;
+    let Target::Table(i) = target(s, p)? else { return run(s) };
+    let table = s.project.tables.get(i).ok_or("no such table")?;
+    let (opened, id, input, mark) = (s.opened, table.id, table.dataset.clone(), s.notice_mark());
+    let answer = run(s).and_then(|answer| {
+        rustgis_data::progress::check().map_err(|e| e.to_string())?;
+        Ok(answer)
+    });
+    let result = answer.clone().and_then(|answer| {
+        let output = s.project.table(id).ok_or("no such table")?.dataset.clone();
+        Ok((output, answer, s.notices_since(mark).to_vec()))
+    });
+    if let Some(Ahead::Recording(ran)) = &mut s.tools_ahead {
+        ran.push(RanAhead::Table(Box::new(ScriptTableEdit {
+            command: command.into(),
+            params: p.clone(),
+            edit: TableEdit { opened, id, input, result },
+        })));
+    }
+    answer
+}
+
+/// Prepares a pure table write after admission, with no caller state on the worker except the
+/// table and editing flag. Cancel is checked between rows and before/after the handler. The
+/// shared row storage's first copy and one expression evaluation cannot be interrupted.
+pub(crate) fn table_ahead(s: &Session, command: &str, p: &Json) -> Result<Option<super::reads::ReadWork>, String> {
+    let Target::Table(i) = target(s, p)? else { return Ok(None) };
+    let &(_, name, handler) = TABLE_EDITS.iter().find(|(id, ..)| *id == command).ok_or("not a table edit")?;
+    let table = s.project.tables.get(i).ok_or("no such table")?.clone();
+    let (opened, id, input, p, editing) = (s.opened, table.id, table.dataset.clone(), p.clone(), s.map().editing.settings.enabled);
+    Ok(Some(super::reads::ahead(name, command.into(), move || {
+        let result = (|| {
+            rustgis_data::progress::begin(0);
+            rustgis_data::progress::check().map_err(|e| e.to_string())?;
+            let mut project = crate::Project::default();
+            project.tables.push(table);
+            let mut copy = Session::new(project);
+            copy.map_mut().editing.settings.enabled = editing;
+            let answer = handler(&mut copy, &p)?;
+            rustgis_data::progress::check().map_err(|e| e.to_string())?;
+            let output = copy.project.tables.into_iter().next().ok_or("no such table")?.dataset;
+            Ok((output, answer, copy.notices))
+        })();
+        TableEdit { opened, id, input, result }
+    })))
+}
+
+/// Installs only this command's prepared table edit, rejecting changed input instead of doing
+/// the work on the frame. The ordinary command transaction supplies history and one undo step.
+fn land_table_edit(s: &mut Session, p: &Json, command: &str) -> Option<CmdResult> {
+    let ahead = super::reads::take::<TableEdit>(s, command)?;
+    Some((|| {
+        let Target::Table(i) = target(s, p)? else { return Err("the edit no longer names a table".into()) };
+        let table = s.project.tables.get_mut(i).ok_or("no such table")?;
+        if ahead.opened != s.opened
+            || ahead.id != table.id
+            || !ahead.input.features.shares(&table.dataset.features)
+            || ahead.input.fields != table.dataset.fields
+        {
+            return Err("the table changed while it was edited: run the edit again".into());
+        }
+        let (output, answer, notices) = ahead.result?;
+        (table.dataset.fields, table.dataset.features) = (output.fields, output.features);
+        for notice in notices {
+            match notice.localized {
+                Some(text) => s.notify_text(text, notice.error),
+                None => s.notify(notice.text, notice.error),
+            }
+        }
+        Ok(answer)
+    })())
+}
+
+/// Evaluates and writes a table on its worker, checking Cancel between rows. An expression's
+/// evaluation on one row and the shared row storage's first copy cannot be interrupted;
+/// cancellation never installs partial output.
+fn calculate_table(input: &Dataset, p: &Json) -> Result<(Dataset, Cuts, usize), String> {
+    let fi = input.field_index(ps(p, "field").ok_or("field is required")?).ok_or("no field")?;
+    let ty = input.fields.get(fi).map(|f| f.ty).ok_or("no field")?;
+    let expr = ps(p, "expression").map(str::trim).filter(|e| !e.is_empty()).ok_or("expression is required")?;
+    let calc = Calculation::parse(expr, input)?;
+    let (out, cuts, unread) = evaluate(&calc, input, (0..input.features.len()).collect(), ty)?;
+    let mut result = input.clone();
+    rustgis_data::progress::begin(out.len());
+    for (r, v) in out {
+        rustgis_data::progress::step(1).map_err(|e| e.to_string())?;
+        if let Some(c) = result.features.get_mut(r).and_then(|f| f.attrs.get_mut(fi)) {
+            *c = v;
+        }
+    }
+    Ok((result, cuts, unread))
+}
+
+/// Sets a field from an expression, on the selected rows or all of them (all of a standalone
+/// table's). Desktop table calculations use the read worker with progress and Cancel; landing
+/// refuses changed input instead of recalculating on the frame. Layer edits retain the existing
+/// synchronous path so their editing rules and per-feature undo changes run together.
 fn calculate_field(s: &mut Session, p: &Json) -> CmdResult {
-    let id = s.layer_id(p)?;
-    let fi = field_index(s, id, ps(p, "field").ok_or("field is required")?)?;
+    if let Some(result) = land_table_edit(s, p, "edit.calculateField") {
+        return result;
+    }
+    let t = write_target(s, p)?;
+    let fi = field_of(s, t, ps(p, "field").ok_or("field is required")?)?;
     let expr = ps(p, "expression").map(str::trim).filter(|e| !e.is_empty()).ok_or("expression is required")?.to_string();
+    let Target::Layer(id) = t else {
+        editing_on(s)?;
+        let (ty, field) = data(s, t)?.fields.get(fi).map(|f| (f.ty, f.name.clone())).ok_or("no field")?;
+        let (result, cuts, unread) = calculate_table(data(s, t)?, p)?;
+        let n = result.features.len();
+        data_mut(s, t)?.features = result.features;
+        calculation_notices(s, &field, ty, cuts, unread);
+        return Ok(json!({"rows": n}));
+    };
     let l = s.map_mut().layer_mut(id).ok_or("no layer")?;
     let ty = l.dataset.fields.get(fi).map(|f| f.ty).ok_or("no field")?;
     let calc = Calculation::parse(&expr, &l.dataset)?;
     let rows: Vec<usize> = if l.selection.is_empty() { (0..l.dataset.features.len()).collect() } else { l.selection.clone() };
-    let mut out = Vec::new();
-    // The results a whole-number field cut (their fraction, or whole: past its range, or not a
-    // number), said even when a calculation rule writes the field afterwards: the rule may read
-    // the cut value, and says what it cuts itself.
-    let mut cuts = Cuts::default();
-    // Other results the field can't hold (text that isn't a number or a date) are null too, and
-    // counted.
-    let mut unread = 0usize;
-    for r in &rows {
-        let v = calc.eval(&l.dataset, *r);
-        let asked_null = v.asks_null();
-        let (v, cut) = coerce_cut(v, ty);
-        unread += usize::from(!asked_null && v.is_null() && cut == Cut::None);
-        cuts.add(cut);
-        out.push((*r, v));
-    }
+    let n = rows.len();
+    let (out, cuts, unread) = evaluate(&calc, &l.dataset, rows, ty)?;
     let mut changes = Vec::new();
     for (r, v) in out {
         if let Some(f) = l.dataset.features.get_mut(r) {
@@ -660,14 +1075,39 @@ fn calculate_field(s: &mut Session, p: &Json) -> CmdResult {
     }
     super::design::apply(s, id, changes)?;
     let field = s.map().layer(id).and_then(|l| l.dataset.fields.get(fi)).map(|f| f.name.clone()).unwrap_or_default();
-    for notice in cuts.notices("Calculate Field", &field) {
+    calculation_notices(s, &field, ty, cuts, unread);
+    Ok(json!({"rows": n}))
+}
+
+/// `calc` on `rows` of `ds`, each result as a `ty` field holds it: the rows' new values, the
+/// results a whole-number or date field cut, and how many other results it can't hold (text
+/// that isn't a number or a date), which are null.
+fn evaluate(calc: &Calculation, ds: &Dataset, rows: Vec<usize>, ty: FieldType) -> Result<(Vec<(usize, Value)>, Cuts, usize), String> {
+    let mut out = Vec::with_capacity(rows.len());
+    let (mut cuts, mut unread) = (Cuts::default(), 0usize);
+    rustgis_data::progress::begin(rows.len());
+    for r in rows {
+        rustgis_data::progress::step(1).map_err(|e| e.to_string())?;
+        let v = calc.eval(ds, r);
+        let asked_null = v.asks_null();
+        let (v, cut) = coerce_cut(v, ty);
+        unread += usize::from(!asked_null && v.is_null() && cut == Cut::None);
+        cuts.add(cut);
+        out.push((r, v));
+    }
+    Ok((out, cuts, unread))
+}
+
+/// Says what Calculate Field's results lost in `field` ([`evaluate`]), even when a calculation
+/// rule writes the field afterwards: the rule may read the cut value, and says what it cuts itself.
+fn calculation_notices(s: &mut Session, field: &str, ty: FieldType, cuts: Cuts, unread: usize) {
+    for notice in cuts.notices("Calculate Field", field) {
         s.notify(notice, false);
     }
     if unread > 0 {
         let rows = if unread == 1 { "1 row" } else { &format!("{unread} rows") };
         s.notify(format!("Calculate Field: '{field}' is null in {rows}, whose result isn't a {} value", ty.label()), false);
     }
-    Ok(json!({"rows": rows.len()}))
 }
 
 /// Whether Calculate Field reads `expr` (the error is the expression language's).

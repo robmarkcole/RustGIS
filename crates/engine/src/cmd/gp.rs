@@ -619,7 +619,7 @@ pub fn tool_complete(s: &mut Session, id: u64, done: ToolDone) -> Result<(), Str
 /// A tool's run made ahead on a copy of the session, for a model or script the app runs on a
 /// thread of its own ([`super::workflows::ahead_on_copy`]): what it read and what it made, for
 /// the run here to take instead of running the tool again.
-pub(crate) struct RanAhead {
+pub(crate) struct ToolAhead {
     pin: crate::policy::ToolPin,
     params: Value,
     read: Snapshot<'static>,
@@ -628,6 +628,14 @@ pub(crate) struct RanAhead {
     result: Result<rustgis_analysis::ToolResult, String>,
     full_ids: FullIds,
     millis: u64,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+/// A script's prepared operations in execution order. Table edits retain their output rows,
+/// so following tools see the same storage when the live script takes the edits.
+pub(crate) enum RanAhead {
+    Tool(Box<ToolAhead>),
+    Table(Box<super::edit::ScriptTableEdit>),
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -748,6 +756,10 @@ fn take_ahead(
 ) -> Option<(Result<rustgis_analysis::ToolResult, String>, FullIds, u64)> {
     let Some(Ahead::Taking(ran)) = &mut s.tools_ahead else { return None };
     let next = ran.pop_front()?;
+    let RanAhead::Tool(next) = next else {
+        s.tools_ahead = None;
+        return None;
+    };
     let now = Snapshot::of(s);
     let view = next.view.is_none_or(|v| v == view_extent(&now));
     if next.pin == *pin && next.params == *params && view && same_read(&next.read, &now) {
@@ -2385,7 +2397,7 @@ pub(crate) fn execute(
             let millis = now_ms().saturating_sub(t0);
             #[cfg(not(target_arch = "wasm32"))]
             if let (Some(read), Some(Ahead::Recording(ran))) = (read, &mut s.tools_ahead) {
-                ran.push(RanAhead {
+                ran.push(RanAhead::Tool(Box::new(ToolAhead {
                     pin: pin.clone(),
                     params: params.clone(),
                     read,
@@ -2393,7 +2405,7 @@ pub(crate) fn execute(
                     result: res.clone(),
                     full_ids: ids.clone(),
                     millis,
-                });
+                })));
             }
             (res, ids, millis)
         }
