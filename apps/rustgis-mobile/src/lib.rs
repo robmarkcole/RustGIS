@@ -154,7 +154,7 @@ mod android {
                     Event::Picked { purpose, name, path } => self.waiting.push((purpose, name, path)),
                     Event::Cancelled => {}
                     Event::Saved { name } => self.app.session.notify(i18n::fmt("Saved {name}.", &[("name", &name)]), false),
-                    Event::Position(fix) if self.locating => self.app.position = Some(fix),
+                    Event::Position(fix) if self.locating => self.app.report_position(fix),
                     // A fix that was on its way when positioning was turned off.
                     Event::Position(_) => {}
                     // Android ended positioning itself (its reason is a failure beside this): the

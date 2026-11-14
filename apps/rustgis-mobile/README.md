@@ -4,7 +4,8 @@ RustGIS on Android ([#1902](https://github.com/opengeos/RustGIS/issues/1902)). I
 front end (`rustgis-ui-egui`) in a `NativeActivity`, with the system's file picker for opening and
 saving, and the touch interface (`rustgis-ui-touch`) around its map, which can capture points,
 lines and polygons with their attributes, edit their shapes, snap, and show where the device is.
-It is not a field app yet: positions aren't averaged or logged as a track, and there are no photos.
+It averages positions and records tracks. It is not a field app yet: there are no photos, and a
+track stops while the app is out of sight.
 
 ## Build
 
@@ -110,6 +111,19 @@ as it is good to, and follows the device about once a second. **Go to My Positio
 sheet and at the top of the Capture sheet, moves the map so the capture cross is on it: a point
 or a vertex added then is at the device's position. **Hide My Position** stops asking, which
 spares the battery.
+
+**Average Position**, beside Go to My Position in the Capture sheet, averages the positions that
+come while it runs: each weighted by how exact Android says it is (one over its accuracy squared),
+and the sheet says how many and how far they lie from their average. **Use Average** puts the
+cross there, for a point or a vertex more exact than one position.
+
+**Record a Track**, in the More sheet with the position shown, draws where the device goes as it
+goes, with a bar over the buttons that counts its positions and has **Stop**. Stopping (or Hide My
+Position) adds the track as one line to the map's **Tracks** layer, made when the map has none,
+named for when it started, with its count and length in minutes. A position less exact than 50 m
+is left out, and the notice says how many were. Every position Android reports reaches the track,
+not only the last one each frame (`RustGisApp::fixes`). The track is kept in memory until it is
+stopped: an app the system ends loses it.
 
 **Edit**, beside **Add** at the top of the Capture sheet, changes the shapes already on the
 map, the same way: the map is moved under the cross. **Pick Feature at Cross** picks the layer's

@@ -21,7 +21,8 @@ import java.util.ArrayList;
  *   picked    purpose  name  path    a chosen file, copied to the app's storage
  *   cancelled                        a picker closed without a choice
  *   saved     name                   a file written where the user chose
- *   position  lon  lat  accuracy     where the device is (accuracy in metres, or empty)
+ *   position  lon  lat  accuracy  time   where the device is (accuracy in metres, or empty;
+ *                                        time in milliseconds since 1970)
  *   stopped                          positioning ended without being asked to
  *   failed    text                   what went wrong, to show the user
  */
@@ -182,7 +183,7 @@ public class MainActivity extends NativeActivity {
             @Override
             public void onLocationChanged(android.location.Location fix) {
                 add("position\t" + fix.getLongitude() + "\t" + fix.getLatitude() + "\t"
-                        + (fix.hasAccuracy() ? Float.toString(fix.getAccuracy()) : ""));
+                        + (fix.hasAccuracy() ? Float.toString(fix.getAccuracy()) : "") + "\t" + fix.getTime());
             }
 
             @Override

@@ -1114,6 +1114,23 @@ const CAPTURE_PIXELS: f64 = 16_000_000.0;
 /// The lowest dpi a layout is copied at: a page that would need less is an error.
 const CAPTURE_MIN_DPI: f64 = 36.0;
 
+/// The most positions [`RustGisApp::fixes`] keeps for an interface to take: a day of one a second.
+pub const FIXES_KEPT: usize = 86_400;
+
+impl RustGisApp {
+    /// Keeps a position the shell reported: the last one in [`RustGisApp::position`], and each in
+    /// [`RustGisApp::fixes`] until an interface takes them (the oldest dropped past
+    /// [`FIXES_KEPT`]).
+    pub fn report_position(&mut self, fix: rustgis_engine::platform::Fix) {
+        self.position = Some(fix);
+        if self.fixes.len() >= FIXES_KEPT {
+            self.fixes.pop_front();
+            self.fixes_dropped += 1;
+        }
+        self.fixes.push_back(fix);
+    }
+}
+
 pub struct RustGisApp {
     pub session: Session,
     pub ui: UiState,
@@ -1145,6 +1162,14 @@ pub struct RustGisApp {
     /// Where the device is, as the shell last reported it; `None` until it has, and again once
     /// positioning is off. An interface draws it on the map and can capture at it.
     pub position: Option<rustgis_engine::platform::Fix>,
+    /// Every position the shell reported since an interface last took them, oldest first (at most
+    /// [`FIXES_KEPT`]: the oldest go first). [`RustGisApp::position`] is only the last: a track
+    /// or an average needs each, including those that arrived together after the app was out of
+    /// sight.
+    pub fixes: std::collections::VecDeque<rustgis_engine::platform::Fix>,
+    /// How many positions were dropped from [`RustGisApp::fixes`] past [`FIXES_KEPT`] since an
+    /// interface last took them: the interface says so when a track or an average missed them.
+    pub fixes_dropped: usize,
     /// Watches linked local files for changes made outside RustGIS and offers Reload Data
     /// (the desktop app; see [`diskwatch`]). Off for tests, unless one turns it on (as `ui_shot`'s
     /// `watchFiles` does).
@@ -1414,6 +1439,8 @@ impl RustGisApp {
             chrome: None,
             locate: false,
             position: None,
+            fixes: std::collections::VecDeque::new(),
+            fixes_dropped: 0,
             #[cfg(not(target_arch = "wasm32"))]
             watch_files: false,
             #[cfg(not(target_arch = "wasm32"))]
