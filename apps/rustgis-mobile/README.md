@@ -3,9 +3,8 @@
 RustGIS on Android ([#1902](https://github.com/opengeos/RustGIS/issues/1902)). It runs the desktop
 front end (`rustgis-ui-egui`) in a `NativeActivity`, with the system's file picker for opening and
 saving, and the touch interface (`rustgis-ui-touch`) around its map, which can capture points,
-lines and polygons with their attributes and show where the device is. It is not a field app yet:
-a captured shape can't be edited by touch afterwards, positions aren't averaged or logged as a
-track, and there are no photos.
+lines and polygons with their attributes, edit their shapes, snap, and show where the device is.
+It is not a field app yet: positions aren't averaged or logged as a track, and there are no photos.
 
 ## Build
 
@@ -112,8 +111,21 @@ sheet and at the top of the Capture sheet, moves the map so the capture cross is
 or a vertex added then is at the device's position. **Hide My Position** stops asking, which
 spares the battery.
 
-What it doesn't do yet: moving or deleting a vertex once the feature is added, snapping, and a
-new layer to capture into.
+**Edit**, beside **Add** at the top of the Capture sheet, changes the shapes already on the
+map, the same way: the map is moved under the cross. **Pick Feature at Cross** picks the layer's
+feature drawn on top under it (within half a finger) and draws its vertices. For a line or polygon,
+**Pick Vertex at Cross** picks the vertex nearest the cross, and then **Move Here** moves it to
+where the cross is next, **Add After** puts a new vertex there after it, and **Delete Vertex**
+removes it (a line keeps two, a ring three). For a point, **Move Point Here** moves it. **Delete
+Feature** deletes it (only it: the map's other selections are kept), and **Done** lets
+it go. Each change is one edit, undone by Undo in the More sheet.
+
+**Snap** turns the map's snapping on and off (its settings are the desktop's: Edit › Snapping).
+With it on, the cross's place snaps to a vertex, a line's end or an edge in reach, for adding and
+editing alike: a green ring marks where, and the sheet says what it snapped to. A vertex being
+moved doesn't snap to itself or its own edges.
+
+What it doesn't do yet: editing an existing feature's attributes, and a new layer to capture into.
 
 The interface keeps out of the room the system's bars take: the activity's Java half reports the
 insets, and the bars' icons are drawn dark over a light theme's ground and light over a dark
