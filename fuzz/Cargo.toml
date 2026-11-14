@@ -88,6 +88,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "dates"
+path = "fuzz_targets/dates.rs"
+test = false
+doc = false
+bench = false
+
 # Writes the seed corpus: `cargo run --release --bin seeds` (see README.md).
 [[bin]]
 name = "seeds"

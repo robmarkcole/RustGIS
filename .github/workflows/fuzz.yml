@@ -58,7 +58,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [read_layers, sniff, geotiff, wkt, wkb, mvt, esripbf, project, sheets]
+        target: [read_layers, sniff, geotiff, wkt, wkb, mvt, esripbf, project, sheets, dates]
     env:
       SECONDS_PER_TARGET: ${{ github.event_name == 'pull_request' && '60' || inputs.seconds || '600' }}
       TARGET: ${{ matrix.target }}
@@ -107,9 +107,12 @@ jobs:
           [ "$n" -gt 0 ] && [ "$n" -le 2400 ] || { echo "::error::seconds must be from 1 to 2400"; exit 1; }
           # Fork mode with the ignore flags keeps fuzzing past a finding, so one known failure (an
           # unreleased fix in a dependency, say) doesn't stop the rest of the target being explored.
-          # Each failing input is saved in artifacts/<target>/.
+          # Each failing input is saved in artifacts/<target>/. A target with a dictionary
+          # (dictionaries/<target>.dict) gets its tokens in the mutations.
+          dict=()
+          if [ -f "dictionaries/$TARGET.dict" ]; then dict=(-dict="dictionaries/$TARGET.dict"); fi
           cargo fuzz run -O --target x86_64-unknown-linux-gnu "$TARGET" -- -fork=1 -ignore_crashes=1 -ignore_ooms=1 -ignore_timeouts=1 \
-            -max_total_time="$n" -rss_limit_mb=2048 -timeout=10
+            -max_total_time="$n" -rss_limit_mb=2048 -timeout=10 "${dict[@]}"
       - name: Findings
         id: findings
         # libFuzzer can exit non-zero after an ignored finding: check for saved inputs either way.

@@ -1,6 +1,7 @@
 //! Writes the seed corpus into `corpus/<target>/`: well-formed files made by RustGIS's own writers
-//! from the sample project's layers, so fuzzing starts from real files rather than guessing each
-//! format's magic bytes. The repository commits no data files; run this before fuzzing:
+//! from the sample project's layers and a layer of dates built here, so fuzzing starts from real
+//! files rather than guessing each format's magic bytes. The repository commits no data files; run
+//! this before fuzzing:
 //!
 //! ```sh
 //! cargo run --release --bin seeds
@@ -8,7 +9,7 @@
 
 use rustgis_data::io::{READ_EXTENSIONS, write_bytes, write_path};
 use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster, geotiff, wkt};
-use rustgis_data::{Dataset, sheets, wkb};
+use rustgis_data::{Coord, Dataset, Field, FieldType, Geometry, GeometryType, Value, sheets, wkb};
 use rustgis_engine::{Project, Session};
 use rustgis_tiles::mvt;
 use std::path::{Path, PathBuf};
@@ -59,11 +60,81 @@ fn corpus(target: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Date and date-time strings that sit on the edges of the parsers: offsets, fractions, the end of a
+/// day and of a minute, the first and last year, and digits that aren't ASCII.
+const DATE_TEXT: &[&str] = &[
+    "2026-03-05",
+    "0001-01-01",
+    "9999-12-31",
+    "0000-01-01",
+    "10000-01-01",
+    "-0001-01-01",
+    "2026-02-29",
+    "2024-02-29",
+    "2026-13-01",
+    "2026-00-10",
+    "2026-03-05T09:00",
+    "2026-03-05T09:00:00Z",
+    "2026-03-05 09:00:00.123456+05:30",
+    "2026-03-05T09:00:00.1234567",
+    "2026-03-05T09:00:00.1234560",
+    "2026-03-05T24:00:00",
+    "2026-03-05T23:59:60",
+    "2026-03-05T09:00:00-0800",
+    "2026-03-05T09:00:00+02",
+    "2026-03-05T09:00:00+18:00",
+    "2026-03-05T09:00:00-18:01",
+    "2026-03-05T09:00:00Z0200",
+    "0001-01-01T00:00:00+18:00",
+    "9999-12-31T23:59:59.999999-18:00",
+    "9999-12-31T23:59:59.999999Z",
+    "0001-01-01T00:00:00Z",
+    "\u{0662}\u{0660}\u{0662}\u{0666}-03-05",
+    "２０２６-03-05",
+    "2026-03-05T09:00:00\u{2212}05:00",
+    "  2026-03-05  ",
+    "2026/03/05",
+    "20260305",
+    "<null>",
+];
+
+/// A table of dates and date-times (edge cases among them) in a point layer, so the seeds reach each
+/// format's date code.
+fn dated() -> Dataset {
+    let fields = vec![Field::new("day", FieldType::Date), Field::new("at", FieldType::DateTime), Field::new("n", FieldType::Integer)];
+    let mut ds = Dataset::new("dated", GeometryType::Point, fields);
+    let rows = [
+        ("2026-03-05", "2026-03-05T09:00:00+02:00"),
+        ("0001-01-01", "0001-01-01T00:00:00Z"),
+        ("9999-12-31", "9999-12-31T23:59:59.999999Z"),
+        ("1969-12-31", "1969-12-31T23:59:59.5-05:30"),
+        ("2024-02-29", "2024-02-29T12:00:00"),
+        ("1970-01-01", "1970-01-01T00:00:00.000001"),
+    ];
+    for (i, (d, t)) in rows.iter().enumerate() {
+        let at = Value::parse(t, FieldType::DateTime);
+        ds.push(Some(Geometry::Point(Coord::new(i as f64, 0.0))), vec![Value::parse(d, FieldType::Date), at, Value::Int(i as i64)]);
+    }
+    ds.push(Some(Geometry::Point(Coord::new(9.0, 0.0))), vec![Value::Null, Value::Null, Value::Null]);
+    ds
+}
+
+/// A point layer with one date-time field whose values are all zoned or all clock times, the two
+/// layouts GeoParquet stores as native timestamps (a column mixing them is written as text).
+fn times(name: &str, at: &[&str]) -> Dataset {
+    let mut ds = Dataset::new(name, GeometryType::Point, vec![Field::new("at", FieldType::DateTime)]);
+    for (i, t) in at.iter().enumerate() {
+        ds.push(Some(Geometry::Point(Coord::new(i as f64, 0.0))), vec![Value::parse(t, FieldType::DateTime)]);
+    }
+    ds.push(Some(Geometry::Point(Coord::new(9.0, 0.0))), vec![Value::Null]);
+    ds
+}
+
 /// The sample project's layers, each cut to its first few features.
 fn layers() -> Result<(Project, Vec<Dataset>)> {
     let mut s = Session::new(Project::new("seeds"));
     s.run("project.sample", &serde_json::Value::Null)?;
-    let layers = s
+    let mut layers: Vec<Dataset> = s
         .map()
         .layers
         .iter()
@@ -73,6 +144,9 @@ fn layers() -> Result<(Project, Vec<Dataset>)> {
             ds
         })
         .collect();
+    layers.push(dated());
+    layers.push(times("zoned", &["2026-03-05T09:00:00+02:00", "0001-01-01T00:00:00Z", "9999-12-31T23:59:59.999999-05:30"]));
+    layers.push(times("clock", &["2026-03-05T09:00:00", "1969-12-31T23:59:59.5", "9999-12-31T23:59:59.999999"]));
     Ok((s.project.clone(), layers))
 }
 
@@ -170,6 +244,8 @@ fn compound() -> Vec<u8> {
     [header, words(&[0xFFFF_FFFD, END, END, END]), dir, words(&[END]), vec![0u8; 512]].concat()
 }
 
+/// Writes each target's seed files into `corpus/<target>/`, from RustGIS's own writers where there is one
+/// and from hand-encoded bytes where there isn't.
 fn main() -> Result<()> {
     let (project, layers) = layers()?;
 
@@ -247,7 +323,15 @@ fn main() -> Result<()> {
         layer.dataset.features.truncate(FEATURES);
     }
     seed(&dir, &mut n, serde_json::to_string(&small).map_err(|e| e.to_string())?.as_bytes())?;
+    // A project whose first layer holds dates.
+    small.map_mut().layers.first_mut().ok_or_else(|| "the sample project has no layers".to_string())?.dataset = dated();
+    seed(&dir, &mut n, serde_json::to_string(&small).map_err(|e| e.to_string())?.as_bytes())?;
     seed(&dir, &mut n, serde_json::to_string(&Project::new("empty")).map_err(|e| e.to_string())?.as_bytes())?;
+
+    let (dir, mut n) = (corpus("dates")?, 0);
+    for text in DATE_TEXT {
+        seed(&dir, &mut n, text.as_bytes())?;
+    }
 
     // Workbooks: an `.xlsx` from the crate's own builder, and a minimal `.xls` compound file
     // (RustGIS writes neither), so the fuzzer starts inside both of calamine's containers.
