@@ -73,6 +73,10 @@ pub struct Item {
     pub id: String,
     pub collection: String,
     pub datetime: String,
+    /// Whether `datetime` is the item's own `properties.datetime`: false when that is null or
+    /// missing, and `datetime` stands in with `start_datetime` (which an API sorting on
+    /// `datetime` did not sort by).
+    pub own_datetime: bool,
     /// West, south, east, north.
     pub bbox: Option<[f64; 4]>,
     /// Its footprint, a GeoJSON geometry.
@@ -192,6 +196,53 @@ fn sort_parts(sortby: Option<&str>) -> Result<Option<(&'static str, String)>, St
         format!("properties.{field}")
     };
     Ok(Some((sign, field)))
+}
+
+/// Whether `v` is in order, ascending or descending (equal neighbours are fine).
+fn ordered<T: PartialOrd>(v: &[T], descending: bool) -> bool {
+    v.windows(2).all(|w| if descending { w[0] >= w[1] } else { w[0] <= w[1] })
+}
+
+/// Whether `items`, as an API answered a search sorted by `sortby`, are visibly not in that
+/// order: `Some(false)` when two neighbours are the wrong way round, `Some(true)` when they are
+/// all in order, `None` when it can't be told: no sort, a sort on anything but date or cloud
+/// cover, dates that are not comparable as text, or fewer than two values. An API without the
+/// sort extension may ignore a sort rather than refuse it, and this is how that shows.
+pub fn sort_followed(items: &[Item], sortby: Option<&str>) -> Option<bool> {
+    let (sign, field) = sort_parts(sortby).ok().flatten()?;
+    let descending = sign == "-";
+    match field.as_str() {
+        "properties.eo:cloud_cover" => {
+            let v: Vec<f64> = items.iter().filter_map(|i| i.cloud).collect();
+            (v.len() >= 2).then(|| ordered(&v, descending))
+        }
+        // Dates compare as written, which orders them only when they are UTC (`Z`) and of one
+        // length (the same fraction of a second); any other offset or form is not compared.
+        "properties.datetime" => {
+            let len = items.first()?.datetime.len();
+            // An item whose own `datetime` is null carries its `start_datetime` here, which the
+            // API did not sort by: it can't be compared.
+            if len == 0
+                || items.len() < 2
+                || items.iter().any(|i| {
+                    !i.own_datetime || i.datetime.len() != len || !i.datetime.ends_with('Z') || i.datetime.get(10..11) != Some("T")
+                })
+            {
+                return None;
+            }
+            let v: Vec<&str> = items.iter().map(|i| i.datetime.as_str()).collect();
+            Some(ordered(&v, descending))
+        }
+        _ => None,
+    }
+}
+
+/// Whether a sort was asked for and `items` can't show if the API followed it: two or more items
+/// (one is in order whatever the sort) that [`sort_followed`] can't tell, because the sort is on
+/// something it doesn't compare or the dates are not comparable. The caller says so rather than
+/// leave the user to assume the sort was applied.
+pub fn sort_unchecked(items: &[Item], sortby: Option<&str>) -> bool {
+    items.len() >= 2 && sort_parts(sortby).ok().flatten().is_some() && sort_followed(items, sortby).is_none()
 }
 
 /// The address a POST search goes to.
@@ -410,6 +461,7 @@ fn item(f: &Value, from: Option<&str>) -> Option<Item> {
     });
     let geometry = f.get("geometry").filter(|g| g.is_object() && footprint_size(g) <= MAX_FOOTPRINT).cloned();
     let cloud = props.and_then(|p| p.get("eo:cloud_cover")).and_then(Value::as_f64).filter(|c| c.is_finite());
+    let own_datetime = props.and_then(|p| p.get("datetime")).is_some_and(Value::is_string);
     let datetime = props
         .and_then(|p| p.get("datetime").filter(|d| d.is_string()).or_else(|| p.get("start_datetime")))
         .and_then(Value::as_str)
@@ -484,6 +536,7 @@ fn item(f: &Value, from: Option<&str>) -> Option<Item> {
         id,
         collection: text(f.get("collection")),
         datetime,
+        own_datetime,
         bbox,
         geometry,
         cloud,
@@ -879,6 +932,103 @@ mod tests {
             {"rel": "parent", "href": "https://api.example.org/v1/collections/s2"}]}"#;
         assert_eq!(api_of(static_root, "https://cdn.example.org/s2/a.json").as_deref(), Some("https://api.example.org/v1"));
         assert_eq!(api_of(br#"{"links": [{"rel": "root", "href": "catalog.json"}]}"#, "https://cdn.example.org/a.json"), None);
+    }
+
+    /// Items with these dates and cloud covers, as an API answers them.
+    fn answered(rows: &[(&str, Option<f64>)]) -> Vec<Item> {
+        let features: Vec<Value> = rows
+            .iter()
+            .enumerate()
+            .map(|(n, (d, c))| {
+                let mut props = serde_json::json!({"datetime": d});
+                if let Some(c) = c {
+                    props["eo:cloud_cover"] = serde_json::json!(c);
+                }
+                serde_json::json!({"type": "Feature", "id": format!("i{n}"), "bbox": [0, 0, 1, 1], "properties": props})
+            })
+            .collect();
+        let body = serde_json::json!({"type": "FeatureCollection", "features": features}).to_string();
+        parse_items(body.as_bytes(), "https://x.org/v1/search").unwrap().0
+    }
+
+    #[test]
+    fn a_sort_the_api_ignored_shows_in_the_order_of_its_items() {
+        let newest =
+            answered(&[("2024-06-03T00:00:00Z", Some(9.0)), ("2024-06-02T00:00:00Z", Some(1.0)), ("2024-06-01T00:00:00Z", Some(5.0))]);
+        assert_eq!(sort_followed(&newest, Some("-datetime")), Some(true));
+        assert_eq!(sort_followed(&newest, Some("datetime")), Some(false));
+        // Cloud cover goes the other way: 9, 1, 5 is in neither order.
+        assert_eq!(sort_followed(&newest, Some("eo:cloud_cover")), Some(false));
+        assert_eq!(sort_followed(&newest, Some("-eo:cloud_cover")), Some(false));
+        let least =
+            answered(&[("2024-06-03T00:00:00Z", Some(1.0)), ("2024-06-01T00:00:00Z", Some(1.0)), ("2024-06-02T00:00:00Z", Some(5.0))]);
+        assert_eq!(sort_followed(&least, Some("eo:cloud_cover")), Some(true));
+        // Nothing to tell by: no sort, another field, one item, no cloud covers, dates of other lengths.
+        assert_eq!(sort_followed(&newest, None), None);
+        assert_eq!(sort_followed(&newest, Some("")), None);
+        assert_eq!(sort_followed(&newest, Some("platform")), None);
+        assert_eq!(sort_followed(&newest, Some("bad sort!")), None);
+        assert_eq!(sort_followed(&newest[..1], Some("-datetime")), None);
+        assert_eq!(
+            sort_followed(&answered(&[("2024-06-03T00:00:00Z", None), ("2024-06-01T00:00:00Z", None)]), Some("eo:cloud_cover")),
+            None
+        );
+        assert_eq!(sort_followed(&answered(&[("2024-06-03", None), ("2024-06-01T00:00:00Z", None)]), Some("datetime")), None);
+        assert_eq!(sort_followed(&[], Some("datetime")), None);
+        // Dates that are not UTC are not compared as text: the same length is no proof of the same zone.
+        let zones = answered(&[("2024-06-03T10:00:00+02:00", None), ("2024-06-03T06:00:00-05:00", None)]);
+        assert_eq!(sort_followed(&zones, Some("-datetime")), None);
+        assert_eq!(sort_followed(&zones, Some("datetime")), None);
+        // The same instant written two ways is not out of order.
+        let same = answered(&[("2024-06-01T00:00:00.0000Z", None), ("2024-06-01T00:00:00+00:00", None)]);
+        assert_eq!(sort_followed(&same, Some("datetime")), None);
+        // A lowercase `t` or a space for the separator sorts differently as text: not compared.
+        let sep = answered(&[("2024-06-01t00:00:00Z", None), ("2024-06-01T01:00:00Z", None)]);
+        assert_eq!(sort_followed(&sep, Some("datetime")), None);
+        let space = answered(&[("2024-06-01 00:00:00Z", None), ("2024-06-01T01:00:00Z", None)]);
+        assert_eq!(sort_followed(&space, Some("datetime")), None);
+    }
+
+    /// A sort whose order can't be checked is said so, and only when there is something to check:
+    /// a sort asked for, two or more items, and the answer can't tell.
+    #[test]
+    fn a_sort_that_cannot_be_checked_is_told_apart_from_one_that_can() {
+        let newest = answered(&[("2024-06-03T00:00:00Z", Some(9.0)), ("2024-06-02T00:00:00Z", Some(1.0))]);
+        // In order, or visibly out of it: checked either way.
+        assert!(!sort_unchecked(&newest, Some("-datetime")));
+        assert!(!sort_unchecked(&newest, Some("datetime")));
+        // No sort asked, or one that isn't a sort: nothing to say.
+        assert!(!sort_unchecked(&newest, None));
+        assert!(!sort_unchecked(&newest, Some(" ")));
+        assert!(!sort_unchecked(&newest, Some("bad sort!")));
+        // A field that isn't compared, dates in other zones, no cloud covers: asked, not known.
+        assert!(sort_unchecked(&newest, Some("platform")));
+        let zones = answered(&[("2024-06-03T10:00:00+02:00", None), ("2024-06-03T06:00:00-05:00", None)]);
+        assert!(sort_unchecked(&zones, Some("-datetime")));
+        let bare = answered(&[("2024-06-03T00:00:00Z", None), ("2024-06-01T00:00:00Z", None)]);
+        assert!(sort_unchecked(&bare, Some("eo:cloud_cover")));
+        // One item is in order whatever the sort, and no items have no order.
+        assert!(!sort_unchecked(&zones[..1], Some("-datetime")));
+        assert!(!sort_unchecked(&[], Some("-datetime")));
+    }
+
+    /// An item with a null `datetime` carries its `start_datetime` as its date, which the API did
+    /// not sort by: a correctly sorted answer with one is not called out of order.
+    #[test]
+    fn a_range_item_with_no_datetime_is_not_compared_by_its_start() {
+        let features = serde_json::json!([
+            {"type": "Feature", "id": "a", "bbox": [0, 0, 1, 1], "properties": {"datetime": "2024-06-03T00:00:00Z"}},
+            {"type": "Feature", "id": "b", "bbox": [0, 0, 1, 1], "properties": {"datetime": null, "start_datetime": "2024-06-05T00:00:00Z"}},
+        ]);
+        let body = serde_json::json!({"type": "FeatureCollection", "features": features}).to_string();
+        let items = parse_items(body.as_bytes(), "https://x.org/v1/search").unwrap().0;
+        assert_eq!(items[1].datetime, "2024-06-05T00:00:00Z");
+        assert!(items[0].own_datetime && !items[1].own_datetime);
+        // Newest first by `datetime`: the API may have put the null one last. Can't be told.
+        assert_eq!(sort_followed(&items, Some("-datetime")), None);
+        // Items that all have their own date are still checked.
+        let own = answered(&[("2024-06-03T00:00:00Z", None), ("2024-06-05T00:00:00Z", None)]);
+        assert_eq!(sort_followed(&own, Some("-datetime")), Some(false));
     }
 
     #[test]
