@@ -43100,6 +43100,72 @@ fn importing_a_file_that_is_neither_map_nor_project_says_so() {
     assert!(e.contains("Update RustGIS"), "{e}");
 }
 
+/// Format 2 is read a release before anything writes it (#1853 piece 1): a project of format 2
+/// opens, and is saved again in the format this RustGIS writes; one needing a capability this
+/// RustGIS doesn't know is refused naming it; a newer format is refused as before.
+#[test]
+fn format_2_is_read_unless_it_needs_what_this_rustgis_cannot_read() {
+    let s = world();
+    let as_format = |format: u64, requires: Option<Value>| {
+        let mut v: Value = serde_json::to_value(&s.project).unwrap();
+        v["format"] = json!(format);
+        if let Some(r) = requires {
+            v["requires"] = r;
+        }
+        v.to_string()
+    };
+    // Format 2, with no capabilities, an empty list or none: read whole, and written back as
+    // format 1, the format this RustGIS writes.
+    for requires in [None, Some(json!([])), Some(Value::Null)] {
+        let p = Project::from_json(&as_format(2, requires.clone())).unwrap();
+        assert_eq!(p.format, 2);
+        assert_eq!(p.maps.len(), s.project.maps.len(), "{requires:?}");
+        assert_eq!(p.map().layers.len(), s.map().layers.len(), "{requires:?}");
+        let again: Value = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        assert_eq!(again["format"], json!(crate::project::FORMAT));
+        assert!(again.get("requires").is_none());
+    }
+    // A capability this RustGIS doesn't know, in format 2 or a format 1 file that names one:
+    // refused, named once, with the advice to update.
+    for format in [1, 2] {
+        let e = Project::from_json(&as_format(format, Some(json!(["z-values", "z-values"])))).unwrap_err();
+        assert_eq!(e, "this project needs what this RustGIS can't read: z-values. Update RustGIS to open it.");
+    }
+    // A list that isn't one of names says so, whatever it holds instead.
+    for requires in [json!("z-values"), json!([1]), json!(["a", [["deep"]]]), json!({"z": true}), json!(true)] {
+        let e = Project::from_json(&as_format(2, Some(requires.clone()))).unwrap_err();
+        assert!(
+            e.contains("lists what it needs (`requires`) as something other than names") && e.contains("update RustGIS"),
+            "{requires}: {e}"
+        );
+    }
+    // Long names with line breaks and text-reordering characters, or none at all: five named, cut
+    // short, flattened, and how many more.
+    let mut many: Vec<String> = (0..20).map(|i| format!("cap{i}\n\u{202E}{}", "x".repeat(100))).collect();
+    many.insert(0, "\u{2066}".into());
+    let e = Project::from_json(&as_format(2, Some(json!(many)))).unwrap_err();
+    assert!(e.contains("(unnamed), cap0") && e.contains("cap3") && !e.contains("cap4") && e.contains("and 16 more"), "{e}");
+    assert!(!e.contains(['\n', '\u{202E}', '\u{2066}']) && e.contains("x…"), "{e}");
+    // More names than a document may list: refused without reading them.
+    let too_many: Vec<String> = (0..1000).map(|i| format!("c{i}")).collect();
+    let e = Project::from_json(&as_format(2, Some(json!(too_many)))).unwrap_err();
+    assert!(e.contains("lists more than 256 things it needs"), "{e}");
+    // A name of a million characters is said cut short (`requires_tests` checks what is kept).
+    let e = Project::from_json(&as_format(2, Some(json!(["y".repeat(1_000_000)])))).unwrap_err();
+    assert!(e.len() < 400 && e.contains("yyy…"), "{}", e.len());
+    // Names that look alike once flattened are said once.
+    let e = Project::from_json(&as_format(2, Some(json!(["a\n", "a\r"])))).unwrap_err();
+    assert!(e.contains("read: a. Update"), "{e}");
+    // Format 3 is still from a newer RustGIS, before its capabilities are looked at.
+    let e = Project::from_json(&as_format(3, Some(json!(["z-values"])))).unwrap_err();
+    assert!(e.contains("saved by a newer RustGIS (format 3)"), "{e}");
+    // Importing maps from a format 2 project reads it too.
+    let mut t = world();
+    let maps = t.project.maps.len();
+    t.run("map.import", &json!({"text": as_format(2, None)})).unwrap();
+    assert!(t.project.maps.len() > maps);
+}
+
 #[test]
 fn model_import_refusals_name_their_cause() {
     let mut s = world();

@@ -97,11 +97,45 @@ fn project_with_unknown_variant_suggests_newer_version() {
     assert!(err.contains("may have been saved by a newer RustGIS") || err.contains("Update RustGIS to open it"));
 }
 
+/// A document that requires a capability this RustGIS doesn't know is refused naming it, through
+/// direct, alternate and package imports, before its payload is read, and changes nothing.
+#[test]
+fn file_compatibility_refuses_unknown_capabilities_before_importing() -> Result<(), String> {
+    use base64::Engine;
+    let format = rustgis_engine::project::READ_FORMAT;
+    let text =
+        json!({"format": format, "requires": ["z-values"], "name": "Future", "maps": "new payload", "layers": "new payload"}).to_string();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&text);
+    let mut s = Session::new(Project::new("Original"));
+    s.run("project.rename", &json!({"name": "Keep"}))?;
+    s.mark_saved();
+    let before = serde_json::to_value(&s.project).map_err(|e| e.to_string())?;
+    let commands = ["map.import", "style.import", "layer.addLayerFile", "style.add", "project.fromTemplate"];
+    for (command, params) in commands
+        .iter()
+        .flat_map(|command| [(*command, json!({"text": text})), (*command, json!({"data": encoded}))])
+        .chain([("project.openText", json!({"text": text})), ("project.openText", json!({"text": text, "package": true}))])
+    {
+        let error = s.run(command, &params).unwrap_err();
+        assert!(error.contains("needs what this RustGIS can't read: z-values. Update RustGIS to open it."), "{command}: {error}");
+        assert_eq!(command == "project.fromTemplate", error.starts_with("this template "), "{command}: {error}");
+        assert_eq!(serde_json::to_value(&s.project).map_err(|e| e.to_string())?, before, "{command}");
+        assert!(!s.dirty(), "{command}");
+    }
+    // A template whose list isn't one of names, or is too long, is called a template too.
+    for requires in [json!("z-values"), json!((0..300).map(|i| format!("c{i}")).collect::<Vec<_>>())] {
+        let text = json!({"format": format, "requires": requires, "maps": []}).to_string();
+        let error = s.run("project.fromTemplate", &json!({"text": text})).unwrap_err();
+        assert!(error.starts_with("this template lists "), "{error}");
+    }
+    Ok(())
+}
+
 /// Future metadata wins over incompatible payloads through direct, alternate and package imports.
 #[test]
 fn file_compatibility_rejects_future_formats_before_importing() -> Result<(), String> {
     use base64::Engine;
-    for format in [u64::from(rustgis_engine::project::FORMAT) + 1, u64::from(u32::MAX) + 1] {
+    for format in [u64::from(rustgis_engine::project::READ_FORMAT) + 1, u64::from(u32::MAX) + 1] {
         let text = json!({"format": format, "name": "Future", "maps": "new payload", "layers": "new payload"}).to_string();
         let encoded = base64::engine::general_purpose::STANDARD.encode(&text);
         let mut s = Session::new(Project::new("Original"));

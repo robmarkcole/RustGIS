@@ -214,7 +214,7 @@ pub fn commands() -> Vec<C> {
                 Ok(proj) => proj,
                 Err(error) => {
                     super::connections::restore_active(s);
-                    return Err(error.replace("RustGIS project", "RustGIS template"));
+                    return Err(error.replace("RustGIS project", "RustGIS template").replace("this project ", "this template "));
                 }
             };
             proj.name = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).unwrap_or("Untitled").chars().take(200).collect();
