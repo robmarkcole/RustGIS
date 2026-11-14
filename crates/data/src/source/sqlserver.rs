@@ -832,12 +832,10 @@ impl SqlServerSource {
 
     /// Reads what a request asks for, each statement timing out after `timeout` seconds (else the
     /// statement timeout); values that aren't dates are counted in the rows kept.
+    /// A bounded server sample; an unplaceable view errors before any whole-table shortcut.
     fn read_within(&self, req: &Request, timeout: Option<u64>) -> Result<Batch> {
         let limit = clamp_limit(req.limit);
         let mut out = Batch::default();
-        if limit == 0 {
-            return Ok(out);
-        }
         if self.reproject.is_lonlat()
             && let Some(e) = req.extent
             && !e.intersects(&Extent::new(-180.0, -90.0, 180.0, 90.0))
@@ -846,7 +844,10 @@ impl SqlServerSource {
         }
         let secs = timeout.unwrap_or(STATEMENT_TIMEOUT);
         let query = |sql: &str| self.conn.query_within(sql, &[], secs)?.ok_or_else(|| timed_out(secs));
-        let window = native_window(req, self.info.extent, &self.reproject, self.geography, self.conn.compatibility);
+        let window = native_window(req, self.info.extent, &self.reproject, self.geography, self.conn.compatibility)?;
+        if limit == 0 {
+            return Ok(out);
+        }
         let filter = self.filter(window.as_deref());
         let from = self.table.sql_from();
         let cols = self.projection.select.iter().enumerate().map(|(i, e)| format!("{e} AS c{i}")).collect::<Vec<_>>().join(", ");
@@ -918,16 +919,19 @@ fn first_count(rows: &[Row]) -> Option<u64> {
     rows.first().and_then(|r| int_of(at(r, 0))).and_then(|n| u64::try_from(n).ok())
 }
 
-fn native_window(req: &Request, all: Extent, reproject: &Reproject, geography: bool, compatibility: u32) -> Option<String> {
+/// A server predicate for a boundable view, or an intentional whole-table read. Projection
+/// refusal is an error before compatibility and whole-table shortcuts can discard the predicate.
+fn native_window(req: &Request, all: Extent, reproject: &Reproject, geography: bool, compatibility: u32) -> Result<Option<String>> {
+    let Some(e) = req.extent else { return Ok(None) };
+    let native = reproject.database_extent(&e)?;
     // At level 100 geography polygons cannot exceed a hemisphere; use local filtering instead.
     if geography && compatibility <= 100 {
-        return None;
+        return Ok(None);
     }
-    let e = req.extent?;
     if !all.is_empty() && e.min_x <= all.min_x && e.min_y <= all.min_y && e.max_x >= all.max_x && e.max_y >= all.max_y {
-        return None;
+        return Ok(None);
     }
-    box_text(&reproject.extent_from_lonlat(&e), geography)
+    Ok(box_text(&native, geography))
 }
 
 /// A finite polygon literal. Geography needs a counter-clockwise ring, clear of poles and the
@@ -1102,25 +1106,35 @@ mod tests {
     }
 
     #[test]
+    fn refused_database_view_is_not_a_whole_table_sample() {
+        let r = Reproject::from_crs(Crs::from_epsg(32617).unwrap(), &mut Vec::new());
+        let req = Request { extent: Some(Extent::new(-120.0, -30.0, 10.0, 30.0)), limit: 10 };
+        let all = Extent::new(-84.0, 0.0, -78.0, 25.0);
+        assert!(native_window(&req, all, &r, false, 160).unwrap_err().to_string().contains("can't be bounded"));
+        let clean = Request { extent: Some(Extent::new(-84.0, 30.0, -78.0, 40.0)), limit: 10 };
+        assert!(native_window(&clean, Extent::EMPTY, &r, false, 160).unwrap().is_some());
+    }
+
+    #[test]
     fn native_windows_respect_database_compatibility() {
         let reproject = Reproject::from_crs(Crs::LonLat, &mut Vec::new());
         let req = Request { extent: Some(Extent::new(-180.0, -90.0, 180.0, 90.0)), limit: 100 };
         for compatibility in [0, 80, 90, 100] {
-            assert_eq!(native_window(&req, Extent::EMPTY, &reproject, true, compatibility), None);
+            assert_eq!(native_window(&req, Extent::EMPTY, &reproject, true, compatibility).unwrap(), None);
         }
         for compatibility in [110, 120, 160] {
-            let window = native_window(&req, Extent::EMPTY, &reproject, true, compatibility).unwrap_or_default();
+            let window = native_window(&req, Extent::EMPTY, &reproject, true, compatibility).unwrap().unwrap_or_default();
             assert!(window.starts_with("POLYGON((-179.9999 -89.9999, "), "{window}");
             assert!(window.ends_with(", -179.9999 -89.9999))"), "{window}");
         }
         for compatibility in [0, 80, 90, 100, 110, 120, 160] {
             assert_eq!(
-                native_window(&req, Extent::EMPTY, &reproject, false, compatibility).as_deref(),
+                native_window(&req, Extent::EMPTY, &reproject, false, compatibility).unwrap().as_deref(),
                 Some("POLYGON((-180 -90, 180 -90, 180 90, -180 90, -180 -90))"),
             );
         }
-        assert_eq!(native_window(&req, Extent::new(-10.0, -10.0, 10.0, 10.0), &reproject, true, 110), None);
-        assert_eq!(native_window(&Request { extent: None, limit: 100 }, Extent::EMPTY, &reproject, true, 110), None);
+        assert_eq!(native_window(&req, Extent::new(-10.0, -10.0, 10.0, 10.0), &reproject, true, 110).unwrap(), None);
+        assert_eq!(native_window(&Request { extent: None, limit: 100 }, Extent::EMPTY, &reproject, true, 110).unwrap(), None);
     }
 
     #[test]

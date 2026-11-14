@@ -3465,6 +3465,21 @@ fn with_raster() -> Session {
     s
 }
 
+/// A box whose corners the raster's system refuses (#1925) is placed by its part over the raster:
+/// a UTM zone 17 scene near 42°N clipped to a box holding it, whose corners on the equator are
+/// 91° and 89° from the zone's meridian, is the whole scene, not a window from the north corners
+/// alone, which misses it.
+#[test]
+fn a_raster_clipped_to_a_box_with_refused_corners_keeps_what_the_box_holds() {
+    let mut s = with_raster();
+    let t = rustgis_data::raster::Crs::from_epsg(32617).unwrap().transformer().unwrap();
+    let at = |x, y| t.from_lonlat(rustgis_geom::Coord::new(x, y));
+    assert!(at(10.0, 0.0).is_none() && at(-170.0, 0.0).is_none() && at(10.0, 50.0).is_some() && at(-170.0, 50.0).is_some());
+    s.run("raster.process", &json!({"layer": "scene", "operation": "clip", "extent": [-170.0, 0.0, 10.0, 50.0], "name": "part"})).unwrap();
+    let part = s.map().layer_by_name("part").and_then(|l| l.raster.as_ref()?.data.clone()).unwrap();
+    assert_eq!((part.width, part.height), (8, 6));
+}
+
 /// A QGIS raster style colours a raster layer; one reading a band the raster hasn't is noted and
 /// leaves it as it was.
 #[test]

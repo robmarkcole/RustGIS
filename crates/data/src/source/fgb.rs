@@ -281,11 +281,16 @@ impl FgbSource {
         Ok(())
     }
 
-    /// Reads a request; `scan` ignores the index.
+    /// Reads a request; `scan` ignores the index. A full geometry scan for a spatial request
+    /// counts features and checks Cancel between them.
     fn read_with<R: Read + Seek>(&self, open: &impl Fn() -> Result<R>, req: &Request, scan: bool) -> Result<Batch> {
         let limit = clamp_limit(req.limit);
+        let native = req.extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
+        // Preserve ordinary candidate counts; a refused view needs a geometry scan to count.
+        if limit == 0 && req.extent.is_some() && native.is_none() {
+            return Err(super::unbounded_count());
+        }
         let reader = open_reader(open()?)?;
-        let native = req.extent.map(|e| self.reproject.extent_from_lonlat(&e));
         let indexed = native.filter(|_| self.info.indexed && !scan);
         // Feature numbers in the file, for ids that stay put between reads: the index search's
         // results, in the order the selection visits them.
@@ -305,12 +310,19 @@ impl FgbSource {
             return self.read_with(open, req, true);
         }
         // Without an index, an extent is tested on each feature: sample the matches as they come.
-        let late = native.is_some() && indexed.is_none();
+        // That includes one the file's system couldn't bound (`native` is `None`).
+        let late = req.extent.is_some() && indexed.is_none();
         let matched = iter.features_count().map(|n| n as u64).or(self.info.count).unwrap_or(0);
         let mut sample = if late || matched == 0 { Sampler::new(limit) } else { Sampler::with_total(limit, matched) };
         let mut out = Batch::default();
         let mut n = 0u64;
+        if late {
+            crate::progress::begin(usize::try_from(matched).unwrap_or(0));
+        }
         while let Some(f) = iter.next().map_err(err)? {
+            if late {
+                crate::progress::step(1)?;
+            }
             n += 1;
             let id = numbers.as_ref().and_then(|v| v.get(usize::try_from(n - 1).unwrap_or(usize::MAX)).copied()).unwrap_or(n);
             // A cheap skip when the sample won't take this feature (the extent isn't tested yet).
@@ -346,7 +358,8 @@ impl FgbSource {
 
     /// Visits the features a complete [`FgbSource::read_with`] of `extent` gives, in the same
     /// order and with the same ids, a chunk at a time. An extent read through the index holds
-    /// the feature numbers it finds (8 bytes each) for the ids, as a read does.
+    /// the feature numbers it finds (8 bytes each) for the ids, as a read does. Counts candidates
+    /// and checks Cancel before filtering, including candidates the view does not keep.
     fn visit_with<R: Read + Seek>(
         &self,
         open: &impl Fn() -> Result<R>,
@@ -355,7 +368,7 @@ impl FgbSource {
     ) -> Result<Batch> {
         let req = Request { extent, limit: usize::MAX };
         let reader = open_reader(open()?)?;
-        let native = extent.map(|e| self.reproject.extent_from_lonlat(&e));
+        let native = extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
         let indexed = native.filter(|_| self.info.indexed);
         let mut numbers: Option<Vec<u64>> = match indexed {
             Some(e) => Some(self.search(open()?, &e)?),
@@ -374,7 +387,9 @@ impl FgbSource {
         }
         let mut out = Batch { complete: true, ..Batch::default() };
         let mut n = 0u64;
+        crate::progress::begin(iter.features_count().unwrap_or(0));
         while let Some(f) = iter.next().map_err(err)? {
+            crate::progress::step(1)?;
             n += 1;
             let id = numbers.as_ref().and_then(|v| v.get(usize::try_from(n - 1).unwrap_or(usize::MAX)).copied()).unwrap_or(n);
             let geometry = f.to_wkb(CoordDimensions::xy()).ok().as_deref().and_then(wkb::decode).and_then(|g| self.reproject.geometry(g));
@@ -586,15 +601,22 @@ impl FgbSource {
     }
 
     /// A request on a file by its web address: the index search, then the features the sample
-    /// takes, fetched together before any is read; the others are passed over unread.
+    /// takes, fetched together before any is read; the others are passed over unread. An unbounded
+    /// spatial read scans every candidate within the budget, counting features and checking Cancel.
     fn read_remote(&self, f: &Arc<Remote>, req: &Request) -> Result<Batch> {
         let limit = clamp_limit(req.limit);
-        let native = match req.extent {
-            Some(e) => self.reproject.extent_from_lonlat(&e),
-            None => Extent::new(f64::MIN, f64::MIN, f64::MAX, f64::MAX),
-        };
+        let native = req.extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
+        // Preserve ordinary candidate counts; a refused view needs a geometry scan to count.
+        if limit == 0 && req.extent.is_some() && native.is_none() {
+            return Err(super::unbounded_count());
+        }
+        let late = req.extent.is_some() && native.is_none();
+        let native = native.unwrap_or(Extent::new(f64::MIN, f64::MIN, f64::MAX, f64::MAX));
         let (index, features) = self.sections(f)?;
         let hits = self.remote_search(f, index, &native)?;
+        if late && hits.thin > 1 {
+            return Err(remote::view_budget());
+        }
         let n = hits.items.len();
         // Each hit's bytes: to the next feature when that follows it, else a guess.
         let size = |k: usize| -> u64 {
@@ -605,13 +627,20 @@ impl FgbSource {
         };
         // A sample: runs of consecutive features, every `step`-th run (fewer when their bytes
         // would be more than a read may fetch).
-        let mut step = usize::try_from(stride(n as u64, limit)).unwrap_or(usize::MAX).max(1);
+        // A refused native view must match geometry before any feature is sampled away.
+        let mut step = if late { 1 } else { usize::try_from(stride(n as u64, limit)).unwrap_or(usize::MAX).max(1) };
         // Runs short enough for the sample to be spread over many places.
         let run = (limit / 256).clamp(1, RUN);
         let taken = |k: usize, step: usize| step == 1 || (k / run).is_multiple_of(step);
         loop {
             let bytes: u64 = (0..n).filter(|&k| taken(k, step)).map(size).sum();
-            if bytes <= FEATURE_BUDGET || step >= n.max(1) {
+            if bytes <= FEATURE_BUDGET {
+                break;
+            }
+            if late {
+                return Err(remote::view_budget());
+            }
+            if step >= n.max(1) {
                 break;
             }
             step = step.saturating_mul(2);
@@ -656,8 +685,15 @@ impl FgbSource {
             return Err(DataError::Format("FlatGeobuf: the index search found a different set of features".into()));
         }
         let mut out = Batch::default();
+        let mut sample = Sampler::new(limit);
         let mut k = 0usize;
+        if late {
+            crate::progress::begin(n);
+        }
         while let Some(feat) = iter.next().map_err(err)? {
+            if late {
+                crate::progress::step(1)?;
+            }
             let this = k;
             k += 1;
             if !taken(this, step) {
@@ -670,7 +706,7 @@ impl FgbSource {
                 out.skipped += 1;
                 continue;
             };
-            if !in_request(&geometry, req) {
+            if !in_request(&geometry, req) || (late && !sample.wants()) {
                 continue;
             }
             let mut props = Props {
@@ -684,13 +720,24 @@ impl FgbSource {
                 continue;
             }
             super::add_unread_dates(&mut out.unread_dates, &props.unread_dates);
-            out.features.push(Feature { id, geometry: Some(geometry), attrs: props.values });
-            if out.features.len() >= limit {
-                break;
+            let feature = Feature { id, geometry: Some(geometry), attrs: props.values };
+            if late {
+                sample.keep(feature);
+            } else {
+                out.features.push(feature);
+                if out.features.len() >= limit {
+                    break;
+                }
             }
         }
-        out.matched = (n as u64).saturating_mul(hits.thin);
-        out.complete = step == 1 && hits.thin == 1;
+        if late {
+            out.matched = sample.seen();
+            out.complete = sample.complete();
+            out.features = sample.items;
+        } else {
+            out.matched = (n as u64).saturating_mul(hits.thin);
+            out.complete = step == 1 && hits.thin == 1;
+        }
         Ok(out)
     }
 }

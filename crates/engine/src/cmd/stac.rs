@@ -831,16 +831,18 @@ pub fn stac_cube(s: &mut Session, p: &Value) -> Result<StacCube, String> {
     };
     let read_tile_rows = layout.levels.get(read).map_or(1, |l| l.tile_height).div_ceil(factor).max(1);
     // The area, in the files' coordinates: the box's edges, each at 32 points, as a curved grid
-    // (MODIS's sinusoidal) bends them.
+    // (MODIS's sinusoidal) bends them. A point the system refuses (one it can't bring back,
+    // #1925) is an error: the points left would bound less than the box.
     let tr = layout.crs.transformer()?;
     let (mut x0, mut y0, mut x1, mut y1) = (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
     let [w, so, e, n] = bbox;
     for k in 0..=32 {
         let t = f64::from(k) / 32.0;
         for (lon, lat) in [(w + (e - w) * t, so), (w + (e - w) * t, n), (w, so + (n - so) * t), (e, so + (n - so) * t)] {
-            if let Some(c) = tr.from_lonlat(rustgis_geom::Coord::new(lon, lat)) {
-                (x0, y0, x1, y1) = (x0.min(c.x), y0.min(c.y), x1.max(c.x), y1.max(c.y));
-            }
+            let c = tr.from_lonlat(rustgis_geom::Coord::new(lon, lat)).ok_or_else(|| {
+                format!("the area reaches ({lon:.3}, {lat:.3}), which {} can't hold; choose a smaller area", layout.crs.label())
+            })?;
+            (x0, y0, x1, y1) = (x0.min(c.x), y0.min(c.y), x1.max(c.x), y1.max(c.y));
         }
     }
     if !(x0 < x1 && y0 < y1) {

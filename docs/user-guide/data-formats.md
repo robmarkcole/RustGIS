@@ -9,7 +9,9 @@ Formats read through external GDAL or DuckDB programs need the desktop app or `r
 they aren't available in the web app. Database connections and folder-based File Geodatabases
 are desktop-only too. Browser files are uploaded rather than opened by path; GeoPackages use a
 pure-Rust SQLite file reader there. Reprojection supports the coordinate systems RustGIS knows,
-not every EPSG code; azimuthal equidistant systems such as Equi7 need the desktop app.
+not every EPSG code; azimuthal equidistant systems such as Equi7 need the desktop app. A place
+far outside a projection's area of use that it can't bring back, such as the far side of the
+globe in a UTM zone, is refused rather than put somewhere else: an export names its feature.
 
 ## Vector and tabular files
 

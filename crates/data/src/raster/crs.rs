@@ -432,7 +432,8 @@ pub(crate) fn transformer_of(def: &str) -> Result<Transformer, String> {
     }
     let native = proj4rs::Proj::from_proj_string(def).map_err(|e| e.to_string())?;
     let geographic = geographic_def(def);
-    Ok(Transformer { kind: Kind::Proj { native: Box::new(native), wgs84: Box::new(wgs84()?), geographic } })
+    let robinson = if def.split_whitespace().any(|t| t == "+proj=robin") { Some(Box::new(eqc_geographic(def)?)) } else { None };
+    Ok(Transformer { kind: Kind::Proj { native: Box::new(native), wgs84: Box::new(wgs84()?), geographic, robinson } })
 }
 
 /// Whether a PROJ definition is in degrees: `longlat`, or one of the names PROJ takes for it.
@@ -511,7 +512,8 @@ pub fn ellipsoidal_eqc(def: &str) -> Option<Result<Transformer, String>> {
 }
 
 /// Longitude/latitude on the datum (its ellipsoid, shift to WGS 84 and prime meridian) of a PROJ
-/// definition of an equidistant cylindrical projection: every parameter but the projection's own.
+/// definition of an equidistant cylindrical projection (or a Robinson one, [`robinson_edge`]):
+/// every parameter but the projection's own.
 /// proj4rs replaces the ellipsoid of the projection itself with a sphere of its semi-major axis.
 pub(crate) fn eqc_geographic(def: &str) -> Result<proj4rs::Proj, String> {
     const PROJECTION: [&str; 13] =
@@ -706,14 +708,74 @@ impl WorldProjection {
     }
 }
 
+/// How far (degrees of latitude, or of longitude scaled to the ground) a place taken into a
+/// projection may come back from where it was: about 11 m on each axis, 16 m at most. Inside their
+/// areas of use places come back within a centimetre, except within a ten-thousandth of a degree of
+/// a pole in the authalic-latitude systems (0.2 m) and at Robinson's table rows, whose pieces
+/// overlap by up to 2.5 m.
+const COMES_BACK_DEG: f64 = 1e-4;
+
+/// Whether `back`, a place taken into a projection and back, is `c` (within [`COMES_BACK_DEG`]).
+fn comes_back(c: Coord, back: Coord) -> bool {
+    let dlon = (back.x - c.x + 180.0).rem_euclid(360.0) - 180.0;
+    (back.y - c.y).abs() <= COMES_BACK_DEG && (dlon * c.y.to_radians().cos()).abs() <= COMES_BACK_DEG
+}
+
+/// Robinson's coordinates `c` on the map's east or west edge, as WGS 84 radians, when its inverse
+/// refused them as past it. The inverse settles a latitude, then divides x by the width there,
+/// and that latitude's rounding (or, at some table rows, the piece above's width) puts the
+/// longitude past ±180° by up to 1.4e-7 of it (proj4rs 0.3.0 and PROJ refuse it), so 13% of the
+/// edge's places didn't come back. A point no more than a millionth past the edge is on it: the
+/// meridian opposite the central one, at y's latitude, on the same side of the central meridian
+/// as `c` (#1925). `geo` is the projection's own longitude/latitude: the edge is there before any datum
+/// shift. Recovery requires normalized east/north axes.
+fn robinson_edge(native: &proj4rs::Proj, geo: &proj4rs::Proj, wgs84: &proj4rs::Proj, c: Coord) -> Option<(f64, f64, f64)> {
+    use proj4rs::transform::transform;
+    if !native.is_normalized_axis() {
+        return None;
+    }
+    let x0 = native.false_easting() / native.to_meter();
+    let mut centre = (x0, c.y, 0.0);
+    transform(native, geo, &mut centre).ok()?;
+    let side = if c.x < x0 { -std::f64::consts::PI } else { std::f64::consts::PI };
+    // x grows in proportion to the longitude along a parallel: the edge is twice as far as halfway.
+    let mut x_half = (centre.0 + side / 2.0, centre.1, 0.0);
+    transform(geo, native, &mut x_half).ok()?;
+    // On the edge from both sides: a point inside the map refused for another reason isn't moved.
+    let (dx, edge_dx) = ((c.x - x0).abs(), 2.0 * (x_half.0 - x0).abs());
+    if dx > edge_dx * (1.0 + 1e-6) || dx < edge_dx * (1.0 - 1e-6) {
+        return None;
+    }
+    let mut edge = (centre.0 + side, centre.1, 0.0);
+    transform(geo, wgs84, &mut edge).ok()?;
+    // Within ±180°, as the inverse gives other places: off Greenwich, the edge is past it. On
+    // Greenwich it stays on its own side, at -180° or 180°.
+    if edge.0.abs() > std::f64::consts::PI + 1e-9 {
+        edge.0 -= std::f64::consts::TAU * (edge.0 / std::f64::consts::TAU).round();
+    }
+    Some(edge)
+}
+
 #[derive(Clone)]
 enum Kind {
     LonLat,
     Merc,
-    Proj { native: Box<proj4rs::Proj>, wgs84: Box<proj4rs::Proj>, geographic: bool },
+    /// `robinson`: a Robinson projection's own longitude/latitude, for [`robinson_edge`].
+    Proj {
+        native: Box<proj4rs::Proj>,
+        wgs84: Box<proj4rs::Proj>,
+        geographic: bool,
+        robinson: Option<Box<proj4rs::Proj>>,
+    },
     Sinusoidal(rustgis_geom::Sinusoidal),
-    Eqc { eqc: Box<EllipsoidalEqc>, wgs84: Box<proj4rs::Proj> },
-    World { world: Box<WorldProjection>, wgs84: Box<proj4rs::Proj> },
+    Eqc {
+        eqc: Box<EllipsoidalEqc>,
+        wgs84: Box<proj4rs::Proj>,
+    },
+    World {
+        world: Box<WorldProjection>,
+        wgs84: Box<proj4rs::Proj>,
+    },
 }
 
 /// Converts between a raster's coordinates and WGS 84 longitude/latitude.
@@ -742,9 +804,11 @@ impl Transformer {
         let out = match &self.kind {
             Kind::LonLat => c,
             Kind::Merc => merc_to_lonlat(c),
-            Kind::Proj { native, wgs84, geographic } => {
+            Kind::Proj { native, wgs84, geographic, robinson } => {
                 let mut p = if *geographic { (c.x.to_radians(), c.y.to_radians(), 0.0) } else { (c.x, c.y, 0.0) };
-                proj4rs::transform::transform(native, wgs84, &mut p).ok()?;
+                if proj4rs::transform::transform(native, wgs84, &mut p).is_err() {
+                    p = robinson_edge(native, robinson.as_deref()?, wgs84, c)?;
+                }
                 Coord::new(p.0.to_degrees(), p.1.to_degrees())
             }
             Kind::Sinusoidal(s) => s.inverse(c)?,
@@ -765,15 +829,30 @@ impl Transformer {
         out.is_finite().then_some(out)
     }
 
-    /// Longitude/latitude to native coordinates.
+    /// Longitude/latitude to native coordinates, or `None` where the system can't hold the place.
+    /// A projection proj4rs computes takes some places outside its area of use that it can't bring
+    /// back, as PROJ does: transverse Mercator up to 150° from its central meridian, where those
+    /// near 90° off on the equator come back anywhere; oblique Mercator the far side of the globe,
+    /// mirrored; Albers a place near a pole, as the pole. So its result is taken back, and a place
+    /// that doesn't come back (within [`COMES_BACK_DEG`]) is refused rather than put somewhere
+    /// else (#1925). A place that comes back keeps PROJ's coordinates. The other systems are
+    /// computed here and refuse what they can't bring back themselves.
     pub fn from_lonlat(&self, c: Coord) -> Option<Coord> {
         let out = match &self.kind {
             Kind::LonLat => c,
             Kind::Merc => lonlat_to_merc(c),
-            Kind::Proj { native, wgs84, geographic } => {
+            Kind::Proj { native, wgs84, geographic, .. } => {
                 let mut p = (c.x.to_radians(), c.y.to_radians(), 0.0);
                 proj4rs::transform::transform(wgs84, native, &mut p).ok()?;
-                if *geographic { Coord::new(p.0.to_degrees(), p.1.to_degrees()) } else { Coord::new(p.0, p.1) }
+                if *geographic {
+                    Coord::new(p.0.to_degrees(), p.1.to_degrees())
+                } else {
+                    let out = Coord::new(p.0, p.1);
+                    if !self.to_lonlat(out).is_some_and(|back| comes_back(c, back)) {
+                        return None;
+                    }
+                    out
+                }
             }
             Kind::Sinusoidal(s) => s.forward(c)?,
             Kind::Eqc { eqc, wgs84 } => eqc.project(wgs84, c)?,
@@ -819,6 +898,43 @@ mod tests {
         assert!((ll.y - 42.0).abs() < 1e-4, "{ll:?}");
         let back = t.from_lonlat(ll).unwrap();
         assert!((back.x - 500_000.0).abs() < 0.01 && (back.y - 4_649_776.22).abs() < 0.01);
+    }
+
+    /// #1925: places a projection can't bring back are refused, and Robinson's edge comes back.
+    #[test]
+    fn places_that_dont_come_back_are_refused() {
+        let utm = Crs::from_epsg(32617).unwrap().transformer().unwrap();
+        assert_eq!(utm.from_lonlat(Coord::new(10.598, 2.156)), None);
+        let swiss = Crs::from_epsg(2056).unwrap().transformer().unwrap();
+        assert_eq!(swiss.from_lonlat(Coord::new(-170.0, 0.0)), None);
+        assert!(swiss.from_lonlat(Coord::new(7.44, 46.95)).is_some());
+        // On WGS 84 the map's west edge comes back at -180°, not 180°, or a world layer's shapes
+        // would cross the map; a datum shift can put ±180° a hair round to the other end.
+        for (def, same_end) in [
+            ("+proj=robin +lon_0=0 +x_0=1000 +y_0=0 +datum=WGS84 +units=m +no_defs", true),
+            ("+proj=robin +lon_0=0 +x_0=1000 +y_0=0 +ellps=intl +towgs84=-87,-98,-121,0,0,0,0 +units=m +no_defs", false),
+            ("+proj=robin +lon_0=150 +x_0=1000 +y_0=0 +datum=WGS84 +units=m +no_defs", false),
+        ] {
+            let t = Crs::parse(def).unwrap().transformer().unwrap();
+            let centre = t.to_lonlat(Coord::new(1000.0, 0.0)).unwrap().x;
+            for lon in [centre - 180.0, centre + 180.0] {
+                for lat in [-60.0, 0.0, 5.008_897_586_777_495, 30.0, 89.0] {
+                    let at = Coord::new(lon, lat);
+                    let p = t.from_lonlat(at).unwrap_or_else(|| panic!("{def}: {at:?} was refused"));
+                    // Past the edge by a rounding's worth, from either system's side: still the edge.
+                    let past = Coord::new(1000.0 + (p.x - 1000.0) * (1.0 + 1e-8), p.y);
+                    for q in [p, past] {
+                        let back = t.to_lonlat(q).unwrap_or_else(|| panic!("{def}: {q:?} from {at:?} was refused"));
+                        assert!(back.x.abs() <= 180.0, "{def}: {at:?} came back at {back:?}");
+                        let dx = if same_end { back.x - at.x } else { (back.x - at.x + 180.0).rem_euclid(360.0) - 180.0 };
+                        assert!(dx.abs() < 1e-4 && (back.y - at.y).abs() < 1e-4, "{def}: {at:?} came back at {back:?}");
+                    }
+                }
+            }
+            // Well past the edge is still refused.
+            let p = t.from_lonlat(Coord::new(centre + 180.0, 30.0)).unwrap();
+            assert_eq!(t.to_lonlat(Coord::new(1000.0 + (p.x - 1000.0) * 1.001, p.y)), None, "{def}");
+        }
     }
 
     #[test]

@@ -1073,15 +1073,14 @@ impl PostgisSource {
         self.server_transform(e, self.srid, 4326).unwrap_or(Extent::EMPTY)
     }
 
-    /// A longitude/latitude extent in the table's coordinates; `None` when it can't be converted
-    /// (the read then filters nothing on the server).
-    fn lonlat_to_native(&self, e: &Extent) -> Option<Extent> {
+    /// A longitude/latitude extent in the table's coordinates; a refused box is an error,
+    /// so sampling cannot discard view matches before local filtering.
+    fn lonlat_to_native(&self, e: &Extent) -> Result<Extent> {
         if let Some(r) = &self.reproject {
-            let n = r.extent_from_lonlat(e);
-            return (!n.is_empty()).then_some(n);
+            return r.database_extent(e);
         }
         let c = Extent::new(e.min_x.max(-180.0), e.min_y.max(-89.9), e.max_x.min(180.0), e.max_y.min(89.9));
-        self.server_transform(&c, 4326, self.srid)
+        self.server_transform(&c, 4326, self.srid).ok_or_else(super::unbounded_database_view)
     }
 
     /// An extent converted by the server: its edges, densified, transformed.
@@ -1458,13 +1457,14 @@ impl FeatureSource for PostgisSource {
         &self.info
     }
 
+    /// Refuses an unbounded view before the server counts or samples the query.
     fn read(&self, req: &Request) -> Result<Batch> {
         let limit = clamp_limit(req.limit);
         let mut out = Batch::default();
+        let native = req.extent.map(|e| self.lonlat_to_native(&e)).transpose()?;
         if limit == 0 {
             return Ok(out);
         }
-        let native = req.extent.and_then(|e| self.lonlat_to_native(&e));
         let filter = self.filter(native.is_some());
         let args: Vec<f64> = native.map(|e| vec![e.min_x, e.min_y, e.max_x, e.max_y]).unwrap_or_default();
         let params: Vec<&(dyn ToSql + Sync)> = args.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
@@ -1529,9 +1529,9 @@ mod tests {
         assert_eq!(family_of("GEOMETRYCOLLECTION"), None);
     }
 
-    #[test]
-    fn unconstrained_geometry_keeps_its_parts() {
-        let source = |kind: &str| PostgisSource {
+    /// A disconnected source for geometry metadata and local query-bound validation.
+    fn source(kind: &str) -> PostgisSource {
+        PostgisSource {
             info: SourceInfo {
                 name: "t".into(),
                 format: "PostGIS",
@@ -1561,7 +1561,25 @@ mod tests {
             key: None,
             select: Vec::new(),
             reproject: None,
-        };
+        }
+    }
+
+    #[test]
+    fn refused_database_view_does_not_reach_the_connection() {
+        let mut source = source("POINT");
+        source.reproject = Some(Reproject::from_crs(Crs::from_epsg(32617).unwrap(), &mut Vec::new()));
+        for limit in [0, 10] {
+            let req = Request { extent: Some(Extent::new(-120.0, -30.0, 10.0, 30.0)), limit };
+            let error = source.read(&req).unwrap_err().to_string();
+            assert!(error.contains("can't be bounded in the database"), "{error}");
+        }
+        let clean = Request { extent: Some(Extent::new(-84.0, 30.0, -78.0, 40.0)), limit: 0 };
+        assert!(source.read(&clean).unwrap().features.is_empty());
+        assert!(source.read(&Request { extent: None, limit: 0 }).is_ok());
+    }
+
+    #[test]
+    fn unconstrained_geometry_keeps_its_parts() {
         // A typed column takes one part as its type; an unconstrained one keeps the geometry as it is.
         assert!(source("POLYGON").geometry_in(1, 2).contains("ST_NumGeometries"));
         assert!(!source("GEOMETRY").geometry_in(1, 2).contains("ST_NumGeometries"));

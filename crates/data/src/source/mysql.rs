@@ -868,21 +868,6 @@ impl MysqlSource {
         w
     }
 
-    /// A request's extent in the column's coordinates, as a polygon's text; `None` when it holds
-    /// the whole table, or can't be converted (the read then filters nothing on the server).
-    fn native_window(&self, req: &Request) -> Option<String> {
-        let e = req.extent?;
-        // The extent of a large table is a sample's, which can miss rows at its edges: a view
-        // holding it but not them reads the whole table's sample and keeps those in view, fewer
-        // than it could. Filtering every whole-table view instead costs far more (MySQL's
-        // geographic test runs on every row).
-        let all = self.info.extent;
-        if !all.is_empty() && e.min_x <= all.min_x && e.min_y <= all.min_y && e.max_x >= all.max_x && e.max_y >= all.max_y {
-            return None;
-        }
-        box_text(&self.reproject.extent_from_lonlat(&e), self.reproject.is_lonlat())
-    }
-
     /// A row read as a feature: the id, the geometry and the fields, in the order of the select.
     /// `None` without an id or a geometry RustGIS reads. A value of a date field that isn't a date
     /// RustGIS holds is null, counted in `unread` ([`Batch::unread_dates`]).
@@ -914,6 +899,18 @@ impl MysqlSource {
         // A negative key keeps its bits: still one id per row, and the same on every read.
         Some(Feature { id, geometry: Some(geometry), attrs })
     }
+}
+
+/// A request's native query polygon, or no predicate for an intentional whole-table read.
+/// Refuse a box the projection cannot bound before considering the whole-table shortcut.
+fn native_window(req: &Request, all: Extent, reproject: &Reproject) -> Result<Option<String>> {
+    let Some(e) = req.extent else { return Ok(None) };
+    let native = reproject.database_extent(&e)?;
+    // The table extent can be sampled; retain the existing shortcut for a view containing it.
+    if !all.is_empty() && e.min_x <= all.min_x && e.min_y <= all.min_y && e.max_x >= all.max_x && e.max_y >= all.max_y {
+        return Ok(None);
+    }
+    Ok(box_text(&native, reproject.is_lonlat()))
 }
 
 /// A box in a column's coordinates as a polygon's text, only finite numbers (it goes into the SQL
@@ -950,7 +947,7 @@ fn box_text(n: &Extent, lonlat: bool) -> Option<String> {
 
 impl MysqlSource {
     /// Reads what a request asks for, each statement timing out after `timeout` seconds when
-    /// given (else the session's).
+    /// given (else the session's). Refuses unbounded views before sampling on the server.
     fn read_within(&self, req: &Request, timeout: Option<u64>) -> Result<Batch> {
         let timed = |sql: String| match timeout {
             Some(secs) => self.conn.server.timed(&sql, secs),
@@ -958,9 +955,6 @@ impl MysqlSource {
         };
         let limit = clamp_limit(req.limit);
         let mut out = Batch::default();
-        if limit == 0 {
-            return Ok(out);
-        }
         // A geographic table has nothing past ±180°/±90° (a view panned off the world).
         if self.reproject.is_lonlat()
             && let Some(e) = req.extent
@@ -968,7 +962,10 @@ impl MysqlSource {
         {
             return Ok(out);
         }
-        let window = self.native_window(req);
+        let window = native_window(req, self.info.extent, &self.reproject)?;
+        if limit == 0 {
+            return Ok(out);
+        }
         let filter = self.filter(window.as_deref());
         let from = self.table.sql_from();
         let cols: Vec<String> = self.select.iter().enumerate().map(|(i, e)| format!("{e} AS c{i}")).collect();
@@ -1144,6 +1141,17 @@ mod tests {
         assert_eq!(float_of(&V::Bytes(b"nan".to_vec())), None);
         assert_eq!(text_of(&V::NULL), None);
         assert_eq!(text_of(&V::Bytes(vec![0xff, b'a'])).as_deref(), Some("\u{fffd}a"));
+    }
+
+    #[test]
+    fn refused_database_view_is_not_a_whole_table_sample() {
+        let r = Reproject::from_crs(crate::raster::Crs::from_epsg(32617).unwrap(), &mut Vec::new());
+        let req = Request { extent: Some(Extent::new(-120.0, -30.0, 10.0, 30.0)), limit: 10 };
+        let all = Extent::new(-84.0, 0.0, -78.0, 25.0);
+        assert!(native_window(&req, all, &r).unwrap_err().to_string().contains("can't be bounded"));
+        let clean = Request { extent: Some(Extent::new(-84.0, 30.0, -78.0, 40.0)), limit: 10 };
+        assert!(native_window(&clean, Extent::EMPTY, &r).unwrap().is_some());
+        assert!(native_window(&Request::all(), all, &r).unwrap().is_none());
     }
 
     #[test]
