@@ -22,6 +22,7 @@ mod bookmarkpane;
 mod catalogsui;
 mod chrome;
 mod comets;
+mod completion;
 mod connectiontree;
 mod connectionui;
 #[cfg(not(target_arch = "wasm32"))]
