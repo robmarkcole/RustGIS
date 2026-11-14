@@ -415,7 +415,9 @@ receives the feature's weight, a part with a coordinate missing or infinite is l
 counted, and a feature with no finite part is skipped). Calculations are performed in the linear units
 of a projected coordinate system (defaults to the layer's projected system; if the input layer lacks a
 coordinate system or is in degrees, or to project into a specific system, supply a projected system via `crs`,
-e.g. `EPSG:32618`).
+e.g. `EPSG:32618`). Geocentric systems such as `EPSG:4978` (X, Y and Z from the Earth's centre)
+are refused, whether supplied via `crs` or inherited from the layer: their three axes do not
+define the two-dimensional projected plane Kernel Density needs.
 Because bandwidth and cell size are measured in coordinate-space linear units, global cylindrical
 projections such as Web Mercator (EPSG:3857) introduce scale distortion that increases with latitude;
 use a local projected coordinate system (such as UTM or State Plane) when accurate ground distances
