@@ -235,7 +235,7 @@ pub fn opt_in(
 /// connections.
 pub fn use_saved_secrets(s: &mut crate::Session, prefs: &Map<String, Value>, store: Arc<dyn SecretStore>) {
     if let Some(text) = prefs.get(crate::connections::PREF).and_then(Value::as_str) {
-        s.connections = crate::connections::Connections::from_json(text);
+        s.load_connections(text);
     }
     s.database_logins.set_store(Some(store));
     s.database_logins.prefer_environment_passwords();

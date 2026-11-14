@@ -2931,6 +2931,16 @@ impl Session {
         }
     }
 
+    /// Takes the saved `connections` preference (the apps at start, and the command line and
+    /// Python when they use the desktop's saved secrets): what of it isn't used here is said as
+    /// notices, one per kind (see [`connections::Connections::unread`]).
+    pub fn load_connections(&mut self, text: &str) {
+        self.connections = connections::Connections::from_json(text);
+        for said in self.connections.unread() {
+            self.warn(said);
+        }
+    }
+
     /// Takes another session's extension choices (a copy that runs a model or script ahead, on
     /// the desktop only).
     #[cfg(not(target_arch = "wasm32"))]

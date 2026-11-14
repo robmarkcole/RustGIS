@@ -6,12 +6,18 @@ use std::sync::Arc;
 
 use rustgis_data::secrets::{Secret, SecretError, SecretStore};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::sources::{self, Sources};
 
 /// The desktop preference saved connections are kept under.
 pub const PREF: &str = "connections";
+/// The version of that preference this RustGIS reads and writes. One from a newer RustGIS isn't
+/// read, and is kept as it is.
+pub const VERSION: u64 = 1;
+/// Why the preference wasn't read when it couldn't be (`{why}`), and what to do.
+const UNREADABLE: &str =
+    "the saved connections couldn't be read ({why}); fix or remove \"connections\" in the preferences file to use or change them";
 
 pub const MAX_CONNECTIONS: usize = 200;
 const MAX_TEXT: usize = 2048;
@@ -77,6 +83,86 @@ pub struct Connections {
     pub connections: Vec<Connection>,
     #[serde(skip)]
     pub generation: u64,
+    /// What of the preference this version couldn't use, written back as it was.
+    #[serde(skip)]
+    kept: Kept,
+}
+
+/// What of the saved connections this version couldn't use. A newer RustGIS may add rows, fields
+/// and kinds without a new version: they are kept and written back unchanged, so editing a
+/// connection here never drops what the newer one wrote.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Kept {
+    /// The whole preference as read, when it is from a newer RustGIS or couldn't be read at all,
+    /// and why: no connection of it is used, and it is never written over.
+    whole: Option<(String, String)>,
+    /// Rows that couldn't be read (an unknown kind, a bad id…) or are past [`MAX_CONNECTIONS`].
+    rows: Vec<Value>,
+    /// How many of `rows` are readable but past [`MAX_CONNECTIONS`].
+    over_limit: usize,
+    /// The ids those rows carry, which a new connection never takes.
+    ids: BTreeSet<String>,
+    /// Fields of read connections this version doesn't know, by connection id.
+    fields: BTreeMap<String, Map<String, Value>>,
+    /// Keys beside `version`, `next` and `connections` this version doesn't know.
+    top: Map<String, Value>,
+    /// Rows and fields that couldn't be read and held a password, key or token: not kept, since
+    /// this version can't strip it from what it doesn't understand.
+    secrets: usize,
+    /// Readable rows whose address had a password, key or token taken out when read: saved so.
+    stripped: usize,
+    /// Readable rows whose name or group was cut (past [`MAX_NAME`] characters, or with control
+    /// characters).
+    cut: usize,
+}
+
+impl Kept {
+    /// The entries of `o` without a password, key or token, counting those left out. Every entry is
+    /// classified on the original object first, beside the others and `address` (the one a row
+    /// keeps apart from them): a bare `key` is a secret beside a web address, and an address
+    /// holding a secret doesn't stop being one. Only then are the classified entries removed.
+    fn without_secrets(&mut self, mut o: Map<String, Value>, address: &str) -> Map<String, Value> {
+        let secret: Vec<String> = o
+            .iter()
+            .filter(|(k, v)| {
+                let mut probe = Map::new();
+                probe.insert((*k).clone(), (*v).clone());
+                if web_address(&Value::String(address.into()), 0)
+                    || o.iter().any(|(other, v)| {
+                        other != *k && !other.eq_ignore_ascii_case("data") && !other.eq_ignore_ascii_case("text") && web_address(v, 0)
+                    })
+                {
+                    probe.insert("\u{1}beside".into(), "https://a".into());
+                }
+                sources::holds_secret(&Value::Object(probe))
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        self.secrets += secret.len();
+        o.retain(|k, _| !secret.contains(k));
+        o
+    }
+}
+
+/// Whether `v` is, or holds, a web address (not under a file's `data` or `text`).
+fn web_address(v: &Value, depth: usize) -> bool {
+    match v {
+        Value::String(t) => t.trim_start().get(..4).is_some_and(|p| p.eq_ignore_ascii_case("http")),
+        Value::Object(o) if depth < 4 => {
+            o.iter().any(|(k, v)| !k.eq_ignore_ascii_case("data") && !k.eq_ignore_ascii_case("text") && web_address(v, depth + 1))
+        }
+        Value::Array(a) if depth < 4 => a.iter().any(|v| web_address(v, depth + 1)),
+        _ => false,
+    }
+}
+
+/// A saved row: the connection, and the fields this version doesn't know.
+#[derive(Deserialize)]
+struct Row {
+    #[serde(flatten)]
+    connection: Connection,
+    #[serde(flatten)]
+    other: Map<String, Value>,
 }
 
 pub fn database_kind(address: &str) -> Option<&'static str> {
@@ -294,27 +380,94 @@ impl Connections {
         self.for_database(kind, database)
     }
 
+    /// The connections the `connections` preference holds, each checked and cleaned again (the
+    /// preferences are a file anyone could have edited). What this version can't use is kept, to
+    /// be written back by [`Connections::to_json`] as it was: rows it can't read and fields it
+    /// doesn't know, or the whole preference when it is from a newer RustGIS (a higher
+    /// `version`) or isn't a JSON object, in which case no connection is read and none can be
+    /// added. [`Connections::unread`] says what was kept.
     pub fn from_json(text: &str) -> Self {
-        let v: Value = serde_json::from_str(text).unwrap_or(Value::Null);
-        let mut s = Self { version: 1, next: v.get("next").and_then(Value::as_u64).unwrap_or(1).max(1), ..Self::default() };
+        let mut s = Self { version: 1, next: 1, ..Self::default() };
+        if text.trim().is_empty() {
+            return s;
+        }
+        let whole = |why: String| Kept { whole: Some((text.to_string(), why)), ..Kept::default() };
+        let mut o = match serde_json::from_str::<Value>(text) {
+            Ok(Value::Object(o)) => o,
+            _ => {
+                s.kept = whole(UNREADABLE.replace("{why}", "they aren't a JSON object"));
+                return s;
+            }
+        };
+        match o.get("version").map(Value::as_u64) {
+            None | Some(Some(0..=VERSION)) => {}
+            Some(Some(v)) => {
+                s.kept = whole(format!(
+                    "the saved connections are from a newer RustGIS (version {v}; this one reads {VERSION}); update RustGIS to use or change them"
+                ));
+                return s;
+            }
+            Some(None) => {
+                s.kept = whole(UNREADABLE.replace("{why}", "their version isn't a whole number"));
+                return s;
+            }
+        }
+        let rows = match o.remove("connections") {
+            None => Vec::new(),
+            Some(Value::Array(rows)) => rows,
+            Some(_) => {
+                s.kept = whole(UNREADABLE.replace("{why}", "their list isn't a JSON array"));
+                return s;
+            }
+        };
+        s.next = o.get("next").and_then(Value::as_u64).unwrap_or(1).max(1);
+        o.remove("version");
+        o.remove("next");
+        s.kept.top = s.kept.without_secrets(o, "");
         let mut ids = BTreeSet::new();
-        if let Some(rows) = v.get("connections").and_then(Value::as_array) {
-            for row in rows {
-                let Ok(c) = serde_json::from_value::<Connection>(row.clone()) else { continue };
-                let Ok((c, _)) = clean(c) else { continue };
-                if c.id.is_empty()
-                    || c.id.len() > 32
-                    || !c.id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-                    || !ids.insert(c.id.clone())
-                {
-                    continue;
+        for row in rows {
+            let read = serde_json::from_value::<Row>(row.clone()).ok().and_then(|r| {
+                let name = r.connection.name.trim().to_string();
+                let group = r.connection.group.trim().to_string();
+                let (c, stripped) = clean(r.connection).ok()?;
+                // What reading changed in the row, to be said: a secret taken out of the address, a name
+                // or group cut.
+                let changed = (stripped, (!name.is_empty() && c.name != name) || (!group.is_empty() && c.group != group));
+                Some(((c, changed), r.other))
+            });
+            let read = read.filter(|((c, _), _)| {
+                !c.id.is_empty()
+                    && c.id.len() <= 32
+                    && c.id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                    && !ids.contains(&c.id)
+            });
+            let over_limit = read.is_some() && s.connections.len() >= MAX_CONNECTIONS;
+            let read = read.filter(|_| !over_limit);
+            let id = match &read {
+                Some(((c, _), _)) => c.id.clone(),
+                None => row.get("id").and_then(Value::as_str).unwrap_or_default().to_string(),
+            };
+            match read {
+                Some(((c, (stripped, cut)), other)) => {
+                    s.kept.stripped += usize::from(stripped);
+                    s.kept.cut += usize::from(cut);
+                    if let Some(n) = id.strip_prefix('c').and_then(|n| n.parse::<u64>().ok()) {
+                        s.next = s.next.max(n.saturating_add(1));
+                    }
+                    ids.insert(c.id.clone());
+                    let other = s.kept.without_secrets(other, &c.address);
+                    if !other.is_empty() {
+                        s.kept.fields.insert(c.id.clone(), other);
+                    }
+                    s.connections.push(c);
                 }
-                if let Some(n) = c.id.strip_prefix('c').and_then(|n| n.parse::<u64>().ok()) {
-                    s.next = s.next.max(n.saturating_add(1));
-                }
-                s.connections.push(c);
-                if s.connections.len() == MAX_CONNECTIONS {
-                    break;
+                None if sources::holds_secret(&row) => s.kept.secrets += 1,
+                None => {
+                    s.kept.over_limit += usize::from(over_limit);
+                    if !id.is_empty() {
+                        s.kept.ids.insert(id);
+                    }
+                    s.kept.rows.push(row);
                 }
             }
         }
@@ -328,6 +481,65 @@ impl Connections {
             }
         }
         s
+    }
+
+    /// What of the preference read by [`Connections::from_json`] isn't used here, one line per
+    /// kind (none when all of it is).
+    pub fn unread(&self) -> Vec<String> {
+        let k = &self.kept;
+        if let Some((_, why)) = &k.whole {
+            return vec![format!("No saved connection is used, and none can be added: {why}. They are kept as they are.")];
+        }
+        let mut said = Vec::new();
+        if k.rows.len() > k.over_limit {
+            let n = k.rows.len() - k.over_limit;
+            said.push(format!(
+                "{n} saved connection{} couldn't be read (from a newer RustGIS, or damaged): not listed, and kept as {} when connections are saved",
+                if n == 1 { "" } else { "s" },
+                if n == 1 { "it was" } else { "they were" }
+            ));
+        }
+        if k.over_limit > 0 {
+            let n = k.over_limit;
+            said.push(format!(
+                "{n} saved connection{} past the {MAX_CONNECTIONS}-connection limit: not listed, and kept as {} when connections are saved",
+                if n == 1 { " is" } else { "s are" },
+                if n == 1 { "it was" } else { "they were" }
+            ));
+        }
+        if !k.fields.is_empty() {
+            let n = k.fields.len();
+            said.push(format!(
+                "{n} saved connection{} settings this version doesn't know (from a newer RustGIS): ignored here, and kept when connections are saved",
+                if n == 1 { " has" } else { "s have" }
+            ));
+        }
+        if k.stripped > 0 {
+            let n = k.stripped;
+            said.push(format!(
+                "{n} saved connection address{} had a password, key or token removed: saved without {}",
+                if n == 1 { "" } else { "es" },
+                if n == 1 { "it" } else { "them" }
+            ));
+        }
+        if k.cut > 0 {
+            let n = k.cut;
+            said.push(format!(
+                "{n} saved connection name{} or group{} cut to {MAX_NAME} characters or without control characters: saved cut",
+                if n == 1 { "" } else { "s" },
+                if n == 1 { " was" } else { "s were" }
+            ));
+        }
+        if k.secrets > 0 {
+            let n = k.secrets;
+            said.push(format!(
+                "{n} entr{} of the saved connections {} dropped because {} held a password, key or token",
+                if n == 1 { "y" } else { "ies" },
+                if n == 1 { "was" } else { "were" },
+                if n == 1 { "it" } else { "they" }
+            ));
+        }
+        said
     }
 
     pub fn import(saved: &Sources, s3_saved: &str) -> Self {
@@ -380,8 +592,28 @@ impl Connections {
         s
     }
 
+    /// The `connections` preference: these connections, with what [`Connections::from_json`]
+    /// kept written back as it was (a preference it didn't read at all, unchanged).
     pub fn to_json(&self) -> String {
-        serde_json::to_string(&json!({"version": 1, "next": self.next, "connections": self.connections})).unwrap_or_default()
+        if let Some((text, _)) = &self.kept.whole {
+            return text.clone();
+        }
+        let mut rows: Vec<Value> = Vec::with_capacity(self.connections.len() + self.kept.rows.len());
+        for c in &self.connections {
+            let mut row = serde_json::to_value(c).unwrap_or(Value::Null);
+            if let (Value::Object(row), Some(other)) = (&mut row, self.kept.fields.get(&c.id)) {
+                for (k, v) in other {
+                    row.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+            }
+            rows.push(row);
+        }
+        rows.extend(self.kept.rows.iter().cloned());
+        let mut o = self.kept.top.clone();
+        o.insert("version".into(), json!(VERSION));
+        o.insert("next".into(), json!(self.next));
+        o.insert("connections".into(), Value::Array(rows));
+        Value::Object(o).to_string()
     }
 
     pub fn find(&self, key: &str) -> Option<&Connection> {
@@ -411,7 +643,13 @@ impl Connections {
         base.into()
     }
 
+    /// Adds a connection under a new id (never one a kept row has), named uniquely; whether its
+    /// address was stripped of secrets. Refused while the preference is kept whole (from a newer
+    /// RustGIS, or unreadable), since it couldn't be saved without losing it.
     pub fn add(&mut self, c: Connection, explicit_name: bool) -> Result<(Connection, bool), String> {
+        if let Some((_, why)) = &self.kept.whole {
+            return Err(format!("a connection can't be added: {why}"));
+        }
         let (mut c, stripped) = clean(c)?;
         // A new connection (or a copy) has no saved keys of its own.
         c.saved_keys = false;
@@ -427,7 +665,7 @@ impl Connections {
         }
         c.name = name;
         let mut next = self.next.max(1);
-        while self.connections.iter().any(|c| c.id == format!("c{next}")) {
+        while self.connections.iter().any(|c| c.id == format!("c{next}")) || self.kept.ids.contains(&format!("c{next}")) {
             next = next.checked_add(1).ok_or("connection ids exhausted")?;
         }
         self.next = next.checked_add(1).ok_or("connection ids exhausted")?;
@@ -490,9 +728,13 @@ impl Connections {
         }
     }
 
+    /// Removes connection `id`, with the fields this version didn't know that it kept.
     pub fn remove(&mut self, id: &str) -> Option<Connection> {
         let index = self.connections.iter().position(|c| c.id == id)?;
         let c = self.connections.remove(index);
+        self.kept.fields.remove(id);
+        self.kept.rows.retain(|row| row.get("id").and_then(Value::as_str) != Some(id));
+        self.kept.ids.remove(id);
         self.generation = self.generation.wrapping_add(1);
         Some(c)
     }
@@ -991,6 +1233,134 @@ mod tests {
         assert_eq!(edited.name, "wms (2)");
         assert_eq!(s.find(&first.name), Some(&first));
         assert!(s.update(&second.id, Connection { name: first.name, ..edited }).is_err());
+    }
+
+    /// Rows, fields and keys a newer RustGIS added without a new version are kept through an edit
+    /// here, and a new connection never takes the id of a row that couldn't be read.
+    #[test]
+    fn connections_keep_rows_and_fields_this_version_cannot_read() {
+        let future = json!({"id":"c7","name":"Bucket","kind":"gcs","address":"https://g.example","region":"eu"});
+        let text = json!({"version":1,"next":7,"layout":{"folded":["c1"]},"connections":[
+            {"id":"c1","name":"WMS","kind":"wms","address":"https://w.example/wms","refresh":30},
+            future.clone(),
+            null
+        ]})
+        .to_string();
+        let mut s = Connections::from_json(&text);
+        assert_eq!(s.connections.len(), 1);
+        assert_eq!(s.unread().len(), 2, "{:?}", s.unread());
+        assert!(s.unread()[0].starts_with("2 saved connections couldn't be read"), "{:?}", s.unread());
+        let (added, _) =
+            s.add(Connection { kind: "wms".into(), address: "https://n.example/wms".into(), ..Connection::default() }, false).unwrap();
+        assert_eq!(added.id, "c8", "the unread row's id stays its own");
+        s.update("c1", Connection { name: "Renamed".into(), ..s.connections[0].clone() }).unwrap();
+        let saved: Value = serde_json::from_str(&s.to_json()).unwrap();
+        assert_eq!(saved["layout"], json!({"folded":["c1"]}));
+        let rows = saved["connections"].as_array().unwrap();
+        assert_eq!((rows[0]["name"].as_str(), &rows[0]["refresh"]), (Some("Renamed"), &json!(30)));
+        assert_eq!(rows[1]["id"], "c8");
+        assert_eq!(&rows[2..], [future, Value::Null]);
+        // Read again, the same is kept; a removed connection takes its unknown fields with it.
+        let mut again = Connections::from_json(&s.to_json());
+        assert_eq!(again.connections, s.connections);
+        again.remove("c1");
+        assert!(!again.to_json().contains("refresh"));
+        assert!(Connections::from_json(&again.to_json()).unread()[0].starts_with("2 saved"));
+        // What it can't read and that holds a secret isn't kept: this version can't strip it.
+        let secret = json!({"version":1,"password":"top","connections":[
+            {"id":"c1","name":"A","kind":"wms","address":"https://a","token":"hidden"},
+            {"id":"c2","name":"B","kind":"gcs","address":"https://u:hidden@g.example"}
+        ]});
+        let s = Connections::from_json(&secret.to_string());
+        assert!(
+            s.unread()
+                .iter()
+                .any(|t| t.starts_with("3 entries of the saved connections were dropped because they held a password, key or token")),
+            "{:?}",
+            s.unread()
+        );
+        assert!(!s.to_json().contains("hidden") && !s.to_json().contains("top"));
+        // A key is one beside a web address, even when both are fields this version doesn't know.
+        let beside =
+            json!({"connections":[{"id":"c1","name":"A","kind":"wms","address":"https://a","endpoint":"https://api.example","key":"abc"}]});
+        let s = Connections::from_json(&beside.to_string());
+        assert!(!s.to_json().contains("\"abc\""), "{}", s.to_json());
+        assert!(s.to_json().contains("api.example"));
+        // Or beside an address among the preference's own keys.
+        let top = json!({"address":"https://api.example","key":"abc","connections":[]});
+        assert!(!Connections::from_json(&top.to_string()).to_json().contains("\"abc\""));
+        // A file's contents beside a field isn't an address for it.
+        let file = json!({"data":"https://example.invalid/a.csv","key":"feature_id","connections":[]});
+        assert!(Connections::from_json(&file.to_string()).to_json().contains("feature_id"));
+        // Even when that address holds a secret itself.
+        let top = json!({"address":"https://api.example?token=hidden","key":"abc","connections":[]});
+        let saved = Connections::from_json(&top.to_string()).to_json();
+        assert!(!saved.contains("abc") && !saved.contains("hidden"), "{saved}");
+        // Or beside the row's own address.
+        let own = json!({"connections":[{"id":"c1","name":"A","kind":"wms","address":"https://a","key":"abc","note":"n"}]});
+        let s = Connections::from_json(&own.to_string());
+        assert!(!s.to_json().contains("\"abc\"") && s.to_json().contains("\"note\""), "{}", s.to_json());
+        // What reading cuts from a readable row is said: a secret in the address, a long name.
+        let cut = json!({"connections":[
+            {"id":"c1","name":"A","kind":"wms","address":"https://a/wms?token=hidden"},
+            {"id":"c2","name":"n".repeat(300),"kind":"wms","address":"https://b/wms"},
+            {"id":"c3","name":" C ","kind":"wms","address":"https://c/wms"},
+            {"id":"c4","name":"D","group":"g".repeat(300),"kind":"wms","address":"https://d/wms"}
+        ]});
+        let s = Connections::from_json(&cut.to_string());
+        assert!(s.unread().iter().any(|t| t.starts_with("1 saved connection address had a password")), "{:?}", s.unread());
+        assert!(s.unread().iter().any(|t| t.starts_with("2 saved connection names or groups were cut")), "{:?}", s.unread());
+        assert_eq!(s.unread().len(), 2);
+        // Rows past the limit are kept and said as that, not as unreadable.
+        let many: Vec<Value> = (1..=MAX_CONNECTIONS + 1)
+            .map(|i| json!({"id": format!("c{i}"), "name": format!("N{i}"), "kind": "wms", "address": "https://a"}))
+            .collect();
+        let s = Connections::from_json(&json!({ "connections": many }).to_string());
+        assert_eq!(s.connections.len(), MAX_CONNECTIONS);
+        assert_eq!(
+            s.unread(),
+            [format!(
+                "1 saved connection is past the {MAX_CONNECTIONS}-connection limit: not listed, and kept as it was when connections are saved"
+            )]
+        );
+        assert!(s.to_json().contains(&format!("\"c{}\"", MAX_CONNECTIONS + 1)));
+        // Removing a connection removes a second row with its id too, so it can't come back.
+        let twice = json!({"connections":[
+            {"id":"c1","name":"A","kind":"wms","address":"https://a"},
+            {"id":"c1","name":"B","kind":"wms","address":"https://b"}
+        ]});
+        let mut s = Connections::from_json(&twice.to_string());
+        s.remove("c1");
+        assert!(Connections::from_json(&s.to_json()).connections.is_empty() && !s.to_json().contains("\"c1\""), "{}", s.to_json());
+    }
+
+    /// A preference from a newer RustGIS, or one that can't be read at all, isn't used: it is said,
+    /// adding a connection is refused, and it is written back byte for byte. Clean input says
+    /// nothing.
+    #[test]
+    fn connections_from_a_newer_version_or_unreadable_are_kept_whole() {
+        let newer = r#"{"version": 2, "next": 4, "connections": [{"id":"c3","name":"A","kind":"wms","address":"https://a"}]}"#;
+        for (text, said) in [
+            (newer, "from a newer RustGIS (version 2; this one reads 1)"),
+            ("[1, 2]", "aren't a JSON object"),
+            (r#"{"version": "2"}"#, "isn't a whole number"),
+            (r#"{"connections": {"c1": {}}}"#, "isn't a JSON array"),
+        ] {
+            let mut s = Connections::from_json(text);
+            assert!(s.connections.is_empty(), "{text}");
+            assert!(matches!(s.unread().as_slice(), [one] if one.contains(said)), "{text}: {:?}", s.unread());
+            let c = Connection { kind: "wms".into(), address: "https://n.example".into(), ..Connection::default() };
+            assert!(s.add(c, false).unwrap_err().contains(said), "{text}");
+            assert_eq!(s.to_json(), text);
+        }
+        for clean in [
+            "",
+            r#"{"connections": []}"#,
+            r#"{"version": 1, "next": 2, "connections": [{"id":"c1","name":"A","kind":"wms","address":"https://a"}]}"#,
+        ] {
+            let s = Connections::from_json(clean);
+            assert!(s.unread().is_empty(), "{clean}: {:?}", s.unread());
+        }
     }
 
     #[test]
