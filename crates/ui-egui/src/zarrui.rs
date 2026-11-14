@@ -385,7 +385,7 @@ pub fn picker(app: &mut RustGisApp, ui: &mut egui::Ui) {
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         if ui.add_enabled(!busy, egui::Button::new(crate::tl!("Add to Map"))).clicked() {
-            add(app, zarr::Selection { variable: var.clone(), index }, &labels);
+            add(app, zarr::Selection { variable: var.clone(), index, window: None }, &labels);
         }
     });
 }
@@ -477,7 +477,7 @@ mod tests {
                 "elev": elev, "y": coords("y"), "x": coords("x"),
             }}});
             let store = zarr::parse_store(&[("zarr.json".into(), root.to_string().into_bytes())]).unwrap();
-            let sel = zarr::Selection { variable: "elev".into(), index: vec![] };
+            let sel = zarr::Selection { variable: "elev".into(), index: vec![], window: None };
             let plan = zarr::plan(&store, &sel).unwrap();
             let mut app = RustGisApp::new(Session::new(Project::default()));
             let st = &mut app.ui.zarr;

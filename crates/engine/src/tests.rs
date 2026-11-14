@@ -24791,6 +24791,40 @@ fn timed_zarr_open_failures_keep_status_without_store_credentials() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// A window of a folder store keeps its store through a save and reopen: a series at a point is
+/// read from it, as from a whole slice (#1885).
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_zarr_windows_series_after_reopening() {
+    let _cache = zarr_cache_lock();
+    let (dir, path) = zarr_store_over_time("window-reopen");
+    // Removed however the test ends.
+    struct Gone(std::path::PathBuf);
+    impl Drop for Gone {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _gone = Gone(dir.clone());
+    let mut s = Session::new(Project::default());
+    let id = s.run("layer.addZarr", &json!({"path": path, "variable": "t", "index": {"time": 1}, "cells": [0, 0, 2, 2]})).unwrap()["layer"]
+        .as_u64()
+        .unwrap();
+    // At 1°E 20°N: the stored row 1, column 0, so 100·k + 4 at step k.
+    let at = json!({"layer": id, "lon": 1.0, "lat": 20.0});
+    assert_eq!(s.run("zarr.series", &at).unwrap()["values"], json!([4.0, 104.0, 204.0]));
+    let saved = dir.join("window.rgis");
+    s.run("project.saveAs", &json!({"path": saved.display().to_string()})).unwrap();
+    let mut t = Session::new(Project::default());
+    t.run("project.open", &json!({"path": saved.display().to_string()})).unwrap();
+    let id = t.map().layers.iter().find(|l| l.raster.is_some()).unwrap().id;
+    // Read again from its GeoTIFF: the window, not the whole slice.
+    let data = t.map().layer(id).unwrap().raster.as_ref().unwrap().data.clone().unwrap();
+    assert_eq!((data.width, data.height), (2, 2));
+    let r = t.run("zarr.series", &json!({"layer": id, "lon": 1.0, "lat": 20.0})).unwrap();
+    assert_eq!(r["values"], json!([4.0, 104.0, 204.0]));
+}
+
 /// A Zarr variable's series at a point (#555): the values along its time dimension at the cell
 /// holding it, read from the chunks holding that cell, through a layer or the store itself.
 #[cfg(not(target_arch = "wasm32"))]
@@ -45233,6 +45267,178 @@ fn publication_writes_its_coverage_grid() {
     let r = s.run("layout.publication", &json!({"extent": piaui})).unwrap();
     assert!(r["coverage"].is_null() && !r["warnings"].to_string().contains("coverage"), "{r}");
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Serves each file by its path (others are 404) with byte ranges (`bytes=a-b`, `bytes=-n`)
+/// answered 206, keeping each request's path and range (empty for a whole file).
+#[cfg(not(target_arch = "wasm32"))]
+fn serve_ranged_files(files: Vec<(String, Vec<u8>)>) -> (String, std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = asked.clone();
+    let files = std::sync::Arc::new(files);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let (files, log) = (files.clone(), log.clone());
+            std::thread::spawn(move || {
+                // The request's whole head (to its blank line, at most 16 KB), however it arrives.
+                let (mut head, mut buf) = (Vec::new(), [0u8; 4096]);
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") && head.len() < 16 << 10 {
+                    match s.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => head.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let req = String::from_utf8_lossy(&head).to_string();
+                let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+                let range = req.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("range: bytes=").map(|r| r.trim().to_string()));
+                log.lock().unwrap().push((path.clone(), range.clone().unwrap_or_default()));
+                let Some((_, body)) = files.iter().find(|(p, _)| *p == path) else {
+                    let _ = write!(s, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    return;
+                };
+                let (status, part) = match range.as_deref().and_then(|r| r.split_once('-')) {
+                    Some(("", n)) => ("206 Partial Content", &body[body.len() - n.parse::<usize>().unwrap().min(body.len())..]),
+                    Some((a, b)) => ("206 Partial Content", &body[a.parse::<usize>().unwrap()..=b.parse::<usize>().unwrap()]),
+                    None => ("200 OK", &body[..]),
+                };
+                let _ = write!(s, "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", part.len());
+                let _ = s.write_all(part);
+            });
+        }
+    });
+    (base, asked)
+}
+
+/// A window of a Zarr variable by web address (#1720) reads only what it needs: the chunks it
+/// touches, and only the window's bytes of its coordinates (stored plain), by range. A folder's
+/// window is the same, a box placed by the coordinates gives the same cells, and a box past the
+/// grid is said.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_zarr_window_reads_only_its_chunks_by_range() {
+    // `v` (time 2, lat 8, lon 12; int16, `t·1000 + row·100 + col`) in chunks of 1 × 2 × 3;
+    // latitudes 8.5 down by 1, longitudes 0.5 up by 1, both stored plain.
+    let coord = |n: u64, units: &str| {
+        json!({"zarr_format": 3, "node_type": "array", "shape": [n], "data_type": "float64", "attributes": {"units": units},
+            "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [n]}}, "codecs": [{"name": "bytes"}], "fill_value": 0})
+    };
+    let v = json!({"zarr_format": 3, "node_type": "array", "shape": [2, 8, 12], "data_type": "int16",
+        "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [1, 2, 3]}}, "codecs": [{"name": "bytes"}],
+        "fill_value": -1, "dimension_names": ["time", "lat", "lon"]});
+    let root = json!({"zarr_format": 3, "node_type": "group", "consolidated_metadata": {"kind": "inline", "metadata": {
+        "v": v, "lat": coord(8, "degrees_north"), "lon": coord(12, "degrees_east")}}});
+    let f64s = |v: Vec<f64>| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+    let mut files = vec![
+        ("zarr.json".to_string(), root.to_string().into_bytes()),
+        ("lat/c/0".to_string(), f64s((0..8).map(|i| 8.5 - i as f64).collect())),
+        ("lon/c/0".to_string(), f64s((0..12).map(|i| 0.5 + i as f64).collect())),
+    ];
+    for (t, gy, gx) in (0..2u64).flat_map(|t| (0..4u64).flat_map(move |gy| (0..4u64).map(move |gx| (t, gy, gx)))) {
+        let body: Vec<u8> = (0..2)
+            .flat_map(|r| (0..3).map(move |c| (t * 1000 + (gy * 2 + r) * 100 + gx * 3 + c) as i16))
+            .flat_map(i16::to_le_bytes)
+            .collect();
+        files.push((format!("v/c/{t}/{gy}/{gx}"), body));
+    }
+    // Removed however the test ends.
+    struct Gone(std::path::PathBuf);
+    impl Drop for Gone {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let dir = std::env::temp_dir().join(format!("rustgis-zarr-window-engine-{}", std::process::id()));
+    let _gone = Gone(dir.clone());
+    for (k, b) in &files {
+        let path = dir.join("s.zarr").join(k);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b).unwrap();
+    }
+    let (base, asked) = serve_ranged_files(files.iter().map(|(k, b)| (format!("/s.zarr/{k}"), b.clone())).collect());
+    let url = format!("{base}/s.zarr");
+    let pixels = |s: &Session, r: &Value| {
+        let id = r["layer"].as_u64().unwrap() as u32;
+        let data = s.map().layer(id).unwrap().raster.as_ref().unwrap().data.clone().unwrap();
+        (data.width, data.height, data.bands[0].data.clone(), data.transform)
+    };
+    let mut s = Session::new(Project::default());
+    let r = s.run("layer.addZarr", &json!({"url": url, "variable": "v", "index": {"time": 1}, "cells": [2, 1, 5, 4]})).unwrap();
+    let (w, h, data, transform) = pixels(&s, &r);
+    assert_eq!((w, h), (3, 3));
+    assert_eq!(data, (1..4).flat_map(|r| (2..5).map(move |c| (1000 + r * 100 + c) as f32)).collect::<Vec<_>>());
+    assert_eq!((transform.origin_x, transform.origin_y), (2.0, 8.0));
+    let asked: Vec<(String, String)> = asked.lock().unwrap().clone();
+    let of = |key: &str| asked.iter().filter(|(p, _)| p == &format!("/s.zarr/{key}")).map(|(_, r)| r.as_str()).collect::<Vec<_>>();
+    // The four chunks it touches, whole, and the window's bytes of the coordinates.
+    let mut chunks: Vec<&str> = asked
+        .iter()
+        .filter(|(p, _)| p.starts_with("/s.zarr/v/"))
+        .map(|(p, r)| {
+            assert_eq!(r, "", "{p}");
+            p.as_str()
+        })
+        .collect();
+    chunks.sort();
+    assert_eq!(chunks, ["/s.zarr/v/c/1/0/0", "/s.zarr/v/c/1/0/1", "/s.zarr/v/c/1/1/0", "/s.zarr/v/c/1/1/1"]);
+    assert_eq!(of("lat/c/0"), ["8-31"]);
+    assert_eq!(of("lon/c/0"), ["16-39"]);
+    // From a folder: the same cells, kept in the project as a GeoTIFF (an older RustGIS would read
+    // the folder again by the label, whole), with the folder kept as where its store is.
+    let r =
+        s.run("layer.addZarr", &json!({"path": dir.join("s.zarr"), "variable": "v", "index": {"time": 1}, "cells": [2, 1, 5, 4]})).unwrap();
+    assert_eq!(pixels(&s, &r).2, data);
+    let layer = s.map().layer(r["layer"].as_u64().unwrap() as u32).unwrap().raster.as_ref().unwrap();
+    assert!(
+        layer.embedded.is_some()
+            && layer.path.as_deref().is_some_and(|p| p.ends_with("s.zarr"))
+            && layer.subdataset.as_deref() == Some("v[time=1,cells=2:1:5:4]"),
+        "{:?} {:?}",
+        layer.path,
+        layer.subdataset
+    );
+    // A box in degrees gives the same cells; one reaching past the grid is read within it, and said.
+    let mark = s.notice_mark();
+    let r = s.run("layer.addZarr", &json!({"url": url, "variable": "v", "index": {"time": 1}, "bbox": [2.2, 5.2, 4.8, 7.8]})).unwrap();
+    assert!(s.notices_since(mark).iter().all(|n| !n.text.contains("bbox")), "{:?}", s.notices_since(mark));
+    assert_eq!(pixels(&s, &r).2, data);
+    // A window isn't summarised over time: that would read the whole variable.
+    let e = s.run("zarr.reduce", &json!({"layer": r["layer"], "stat": "mean"})).unwrap_err();
+    assert!(e.contains("is a window of its variable: add the variable without a window"), "{e}");
+    // A box within one cell is read as two along that axis, and said.
+    let mark = s.notice_mark();
+    s.run("layer.addZarr", &json!({"url": url, "variable": "v", "index": {"time": 1}, "bbox": [2.2, 5.2, 2.4, 7.8]})).unwrap();
+    assert!(
+        s.notices_since(mark).iter().any(|n| n.text.contains("within one cell along an axis") && n.text.contains("columns 2–4")),
+        "{:?}",
+        s.notices_since(mark)
+    );
+    let info = s.run("raster.zarrInfo", &json!({"url": url, "bbox": [2.2, 5.2, 4.8, 7.8]})).unwrap();
+    assert_eq!(info["window"]["cells"], json!([2, 1, 5, 4]));
+    // Cells aren't placed (nor checked) here: they are refused, not echoed back.
+    let e = s.run("raster.zarrInfo", &json!({"url": url, "cells": [0, 0, 999_999, 999_999]})).unwrap_err();
+    assert!(e.contains("raster.zarrInfo takes a bbox"), "{e}");
+    assert_eq!(info["variables"][0]["chunks"], json!([1, 2, 3]));
+    let mark = s.notice_mark();
+    s.run("layer.addZarr", &json!({"url": url, "variable": "v", "bbox": [-20.0, 5.2, 4.8, 7.8]})).unwrap();
+    assert!(
+        s.notices_since(mark).iter().any(|n| n.text.contains("the bbox reaches past the grid: only columns 0–5")),
+        "{:?}",
+        s.notices_since(mark)
+    );
+    // Refused: cells and bbox together, a window with time, cells that aren't whole, a window outside.
+    for bad in [
+        json!({"url": url, "variable": "v", "cells": [2, 1, 5, 4], "bbox": [2, 4, 4, 6]}),
+        json!({"url": url, "variable": "v", "cells": [2, 1, 5, 4], "time": true}),
+        json!({"url": url, "variable": "v", "cells": [2, 1, 5.5, 4]}),
+        json!({"url": url, "variable": "v", "cells": [2, 1, 50, 4]}),
+        json!({"url": url, "variable": "v", "bbox": [100, 4, 110, 6]}),
+    ] {
+        assert!(s.run("layer.addZarr", &bad).is_err(), "{bad}");
+    }
 }
 
 /// `layer.rename` refuses a name over 200 characters (once trimmed) rather than cutting it
