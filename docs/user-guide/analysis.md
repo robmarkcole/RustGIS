@@ -312,7 +312,8 @@ origins are restored when a project replacement is undone or redone. Browser dow
 check the eventual save destination; choose a different file in the browser's save dialog to
 avoid replacing an input.
 An active selection is exported; otherwise the geoprocessing extent applies, and streamed
-sources are read in full rather than limited to the visible map window. It exports points,
+sources are read in full rather than limited to the visible map window. A layer's definition
+query leaves out the features it hides in either case. It exports points,
 lines and polygons, including multipart geometry, attributes and feature IDs—not the map's
 style or labels. Antimeridian paths are unwrapped and clipped with an 8/4096-tile buffer;
 latitudes beyond Web Mercator's limit are clamped and reported. Geometry parts collapsed by
@@ -383,11 +384,18 @@ size so points are not missed between cell centres.
 The search radius must be at least the pixel size. The extent can optionally be overridden via `extent`
 as `xmin,ymin,xmax,ymax` text or a four-number array. The output is written as a single-band Float32 GeoTIFF.
 
-Most feature tools process only the selected rows when an input has a selection. Selection tools
-instead replace the input's selection; Select Layer By Location honours the selecting layer's
-selection. Summarize Within counts the selected points against **all** input polygons, and
-Calculate Geometry Attributes updates **all** rows. For tools that create a map layer, `output`
-is the layer name; `vectorToPmtiles` uses it as a file destination.
+Most feature tools process only the selected rows when an input has a selection, and only the
+features a layer's definition query keeps (with the selection cut to them): a Clip by a layer
+filtered to one country uses that country, and a Buffer of a filtered layer buffers the features
+the filter keeps. Tools go by the definition query alone: the time slider's window and display
+filters, which follow the map's time and scale, don't change what a tool reads. A feature tool
+refuses a layer whose definition query hides every feature it would read. Selection tools instead
+replace the input's selection with features the map draws, leaving out the ones its definition
+query, time window or display filters hide and saying how many (none, if they hide every match);
+Select Layer By Location honours the selecting layer's selection. Summarize Within counts the
+selected points against **all** input polygons, and Calculate Geometry Attributes updates **all**
+rows, including the ones a definition query hides: the run says how many. For tools that create a map layer, `output` is the layer name; `vectorToPmtiles`
+uses it as a file destination.
 
 **Buffer** distances, and the distance of **Select Layer By Location**, are measured on the Earth
 (the WGS 84 ellipsoid, as PROJ and GeographicLib measure it), not in the map's display
@@ -458,8 +466,8 @@ type (points, lines or polygons) into a new layer. It needs no GeoLibre runner. 
 Layers** and **Preserve Attributes** in the tool pane, or pass names separated by `;` or a JSON
 array. Desktop runs can also name local vector files without adding them to the map first.
 In the browser, load the files as layers first. Each layer contributes its selection, or all its
-features when it has no selection; read-in-place layers without a selection contribute their
-complete source.
+features when it has no selection (only the ones its definition query keeps); read-in-place
+layers without a selection contribute their complete source.
 
 ```json
 {"tool":"merge","params":{"inputs":["Survey A","Survey B"],"attributes":true,"output":"Combined survey"}}

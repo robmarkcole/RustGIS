@@ -932,8 +932,10 @@ fn read_layers(s: &Session, spec: &rustgis_analysis::ToolSpec, resolved: &Value)
 }
 
 /// Fits a tool's result to the map: a selection made on the complete streamed source becomes
-/// rows of the current window. An update from a selection is still refused: it would replace
-/// the complete source with just those selected features.
+/// rows of the current window, and a selection leaves out the features the map doesn't draw at its
+/// scale (the layer's definition query, time window and display filters; the Select tools read the
+/// whole layer). An update from a selection is still
+/// refused: it would replace the complete source with just those selected features.
 fn fit_to_windows(s: &Session, res: &mut Result<rustgis_analysis::ToolResult, String>, full_ids: &FullIds) {
     if let Ok(r) = res
         && let Output::Selection { layer, rows } = &mut r.output
@@ -947,6 +949,19 @@ fn fit_to_windows(s: &Session, res: &mut Result<rustgis_analysis::ToolResult, St
             // Still streamed: outside the window. Loaded whole since: deleted meanwhile.
             let place = if l.is_streamed() { "are outside the part of it read for the view" } else { "were deleted while it ran" };
             r.messages.push(format!("{gone} of the features selected in {layer} {place}, and aren't selected"));
+        }
+    }
+    if let Ok(r) = res
+        && let Output::Selection { layer, rows } = &mut r.output
+        && let Some(l) = s.map().layer_by_name(layer)
+    {
+        let drawn = l.drawn_rows(s.scale());
+        let before = rows.len();
+        rows.retain(|row| drawn.get(*row).is_none_or(|d| *d));
+        let hidden = before - rows.len();
+        if hidden > 0 {
+            r.messages
+                .push(format!("{hidden} of the features selected in {layer} aren't drawn (its definition query, time window or display filters hide them), and aren't selected"));
         }
     }
     if let Ok(r) = res
@@ -1051,9 +1066,7 @@ fn map_inputs<'a>(s: &'a Session, spec: Option<&rustgis_analysis::ToolSpec>, par
 /// thread.
 fn inputs_of<'a>(snap: Snapshot<'a>, spec: Option<&rustgis_analysis::ToolSpec>, params: &Value) -> Result<MapInputs<'a>, String> {
     let full = streamed_inputs(&snap.map, spec, params)?;
-    let messages = Vec::new();
-    #[cfg(not(target_arch = "wasm32"))]
-    let mut messages = messages;
+    let mut messages = Vec::new();
     #[cfg(not(target_arch = "wasm32"))]
     let mut full = full;
     #[cfg(not(target_arch = "wasm32"))]
@@ -1089,7 +1102,91 @@ fn inputs_of<'a>(snap: Snapshot<'a>, spec: Option<&rustgis_analysis::ToolSpec>, 
             .collect::<Result<Vec<_>, _>>()?;
         rows.insert(name.clone(), selected);
     }
+    narrow_to_queries(&snap.map, spec, params, &full, &mut rows, &mut messages)?;
     Ok(MapInputs { snap, rows, loaded: full, messages, flat: std::cell::OnceCell::new(), view: std::cell::OnceCell::new() })
+}
+
+/// Narrows the rows a tool reads of each layer to the features its definition query keeps, as the
+/// map draws them (#1995): a selection is cut to its drawn features, and a layer without one (or
+/// with only the environment's extent) reads the kept features instead of every one. A layer whose
+/// query hides every feature the tool would read is refused, as an empty list of rows means all of
+/// them. A layer a tool reads whole whatever its selection ([`reads_whole`]) is read whole, and a
+/// notice says how many features its query hides. The query is evaluated in one pass over the
+/// layer's features, without a check for Cancel, as the map's own filter is.
+fn narrow_to_queries(
+    map: &rustgis_map::Map,
+    spec: Option<&rustgis_analysis::ToolSpec>,
+    params: &Value,
+    full: &std::collections::HashMap<String, Dataset>,
+    rows: &mut std::collections::HashMap<String, Vec<usize>>,
+    messages: &mut Vec<String>,
+) -> Result<(), String> {
+    let whole: Vec<&str> = spec
+        .iter()
+        .flat_map(|t| t.params.iter().filter(|p| reads_whole(t.id, p.name)).filter_map(|p| params.get(p.name)?.as_str()))
+        .collect();
+    let mut named = layer_names(spec, params);
+    // The layer a Select tool selects in is read whole, and its result is cut to the drawn
+    // features afterwards ([`fit_to_windows`]): not narrowed here, and never refused (it selects
+    // nothing then).
+    let selected_in: Vec<&str> = spec
+        .iter()
+        .flat_map(|t| t.params.iter().filter(|p| selects_in(t.id, p.name)).filter_map(|p| params.get(p.name)?.as_str()))
+        .collect();
+    for w in whole.iter().chain(&selected_in) {
+        if let Some(i) = named.iter().position(|n| n.eq_ignore_ascii_case(w)) {
+            named.remove(i);
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    for name in named {
+        let Some(layer) = map.layer_by_name(name) else { continue };
+        let key = layer.name.to_ascii_lowercase();
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+        let dataset = full.get(&key).unwrap_or(&layer.dataset);
+        let Some(keep) = layer.query_rows(dataset) else { continue };
+        let kept = |row: &usize| keep.get(*row).is_none_or(|k| *k);
+        let current = rows.get(&key).cloned().or_else(|| (!layer.selection.is_empty()).then(|| layer.selection.clone()));
+        let narrowed: Vec<usize> = match &current {
+            Some(rs) => rs.iter().copied().filter(kept).collect(),
+            None => (0..keep.len()).filter(kept).collect(),
+        };
+        if narrowed.is_empty() && !keep.is_empty() {
+            return Err(format!("{}: its definition query hides every feature the tool would read", layer.name));
+        }
+        if narrowed.len() < current.as_ref().map_or(keep.len(), Vec::len) {
+            rows.insert(key, narrowed);
+        }
+    }
+    let name = spec.map_or("", |t| t.name);
+    let mut told = std::collections::HashSet::new();
+    for layer in whole.iter().filter_map(|n| map.layer_by_name(n)).filter(|l| told.insert(l.name.to_ascii_lowercase())) {
+        let Some(keep) = layer.query_rows(full.get(&layer.name.to_ascii_lowercase()).unwrap_or(&layer.dataset)) else { continue };
+        let hidden = keep.iter().filter(|k| !**k).count();
+        if hidden > 0 {
+            messages.push(format!(
+                "{name}: reads all {} features of {}, including the {hidden} its definition query hides",
+                keep.len(),
+                layer.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The layer parameter a Select tool replaces the selection of: read whole, as the tool reads it.
+fn selects_in(tool: &str, param: &str) -> bool {
+    matches!((tool, param), ("selectByAttributes" | "selectByLocation", "input"))
+}
+
+/// The layer parameters a tool reads whole whatever the layer's selection or definition query:
+/// the one it updates in place, and the polygons it counts every point against (see the
+/// analysis guide). The Select tools read the whole layer too, and their selection is cut to the
+/// drawn features instead ([`selects_in`], [`fit_to_windows`]).
+fn reads_whole(tool: &str, param: &str) -> bool {
+    matches!((tool, param), ("calculateGeometry", "input") | ("countPoints", "polygons"))
 }
 
 /// Complete streamed inputs without selections, plus selected PMTiles inputs: that exporter

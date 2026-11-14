@@ -424,6 +424,113 @@ fn geoprocessing_adds_layers_and_history() {
     assert_eq!(s.project.gp_history.len(), 2, "a failed run restores the project");
 }
 
+/// A tool reads what its layers show (#1995): the features a definition query keeps, with a
+/// selection cut to them, for the input and for an overlay layer. The Select tools leave out the
+/// features it hides, a layer it hides entirely is refused, and a tool that reads a layer whole
+/// says how many features the query hides.
+#[test]
+fn tools_read_the_features_a_definition_query_keeps() {
+    let mut s = world();
+    let shown = |s: &Session, layer: &str| s.map().layer_by_name(layer).unwrap().visible_rows().iter().filter(|v| **v).count();
+    let rows = |s: &Session, layer: &str| s.map().layer_by_name(layer).unwrap().dataset.features.len();
+    let said = |s: &Session, mark, what: &str| s.notices_since(mark).iter().any(|n| n.text.contains(what));
+    let (cities, countries) = (rows(&s, "Cities"), rows(&s, "Countries"));
+    // Each run's output has its own name, so one run's layer isn't mistaken for another's.
+    let buffer = |out: &str| json!({"tool": "buffer", "params": {"input": "Cities", "distance": 10, "output": out}});
+    let query = |s: &mut Session, layer: &str, text: &str| s.run("layer.definitionQuery", &json!({"layer": layer, "where": text})).unwrap();
+
+    // The input: a Buffer of the features the query keeps, not of every city.
+    query(&mut s, "Cities", "pop_max > 10000000");
+    let big = shown(&s, "Cities");
+    assert!(big > 1 && big < cities, "{big} of {cities}");
+    s.run("gp.run", &buffer("Big")).unwrap();
+    assert_eq!(rows(&s, "Big"), big);
+    // A selection within them: its drawn features only.
+    let drawn = s.map().layer_by_name("Cities").unwrap().visible_rows();
+    let (Some(on), Some(off)) = (drawn.iter().position(|d| *d), drawn.iter().position(|d| !*d)) else { panic!("no drawn and hidden city") };
+    let id = s.map().layer_by_name("Cities").unwrap().id;
+    s.map_mut().layer_mut(id).unwrap().selection = vec![off, on];
+    s.run("gp.run", &buffer("One")).unwrap();
+    assert_eq!(rows(&s, "One"), 1);
+    // A selection of hidden features only, or a query that hides all of them, is refused: no
+    // rows would mean every city.
+    s.map_mut().layer_mut(id).unwrap().selection = vec![off];
+    let e = s.run("gp.run", &buffer("None")).unwrap_err();
+    assert!(e.contains("Cities: its definition query hides every feature the tool would read"), "{e}");
+    s.map_mut().layer_mut(id).unwrap().selection.clear();
+    query(&mut s, "Cities", "pop_max < 0");
+    assert!(s.run("gp.run", &buffer("None")).is_err());
+    // Without a query, or with one that doesn't read, every city is buffered, as the map draws them.
+    for (i, text) in ["", "no_such_field > 1"].into_iter().enumerate() {
+        // The command refuses a query that doesn't read; a saved project can hold one.
+        s.map_mut().layer_mut(id).unwrap().definition_query = Some(text.to_string());
+        let out = format!("All {i}");
+        s.run("gp.run", &buffer(&out)).unwrap();
+        assert_eq!(rows(&s, &out), cities, "{text:?}");
+    }
+
+    // An overlay layer: Clip by the countries the query keeps is Clip by those countries selected.
+    let clip = json!({"tool": "clip", "params": {"input": "Cities", "clip": "Countries", "output": "Clipped"}});
+    let populous = "pop_est > 100000000";
+    s.run("select.byAttributes", &json!({"layer": "Countries", "where": populous})).unwrap();
+    s.run("gp.run", &clip).unwrap();
+    let selected = rows(&s, "Clipped");
+    s.map_mut().clear_selection();
+    query(&mut s, "Countries", populous);
+    assert!(shown(&s, "Countries") < countries);
+    s.run("gp.run", &clip).unwrap();
+    assert_eq!(rows(&s, "Clipped"), selected);
+    assert!(selected < cities);
+
+    // The Select tools read the whole layer, and select only the features it draws.
+    query(&mut s, "Cities", "pop_max > 10000000");
+    let mark = s.notice_mark();
+    s.run("gp.run", &json!({"tool": "selectByAttributes", "params": {"input": "Cities", "where": "pop_max > 0"}})).unwrap();
+    assert_eq!(s.map().layer_by_name("Cities").unwrap().selection.len(), big);
+    assert!(said(&s, mark, &format!("{} of the features selected in Cities aren't drawn", cities - big)));
+    // And the Select By Attributes command.
+    let mark = s.notice_mark();
+    let r = s.run("select.byAttributes", &json!({"layer": "Cities", "where": "pop_max > 0"})).unwrap();
+    assert_eq!(r["selected"], json!(big));
+    assert!(said(&s, mark, &format!("{} more features match but aren't drawn", cities - big)));
+    // A query that hides every feature: a Select tool selects nothing, rather than being refused.
+    query(&mut s, "Cities", "pop_max < 0");
+    s.run("gp.run", &json!({"tool": "selectByAttributes", "params": {"input": "Cities", "where": "pop_max > 0"}})).unwrap();
+    assert!(s.map().layer_by_name("Cities").unwrap().selection.is_empty());
+    query(&mut s, "Cities", "");
+    let mark = s.notice_mark();
+    s.run("gp.run", &json!({"tool": "selectByAttributes", "params": {"input": "Cities", "where": "pop_max > 0"}})).unwrap();
+    s.run("select.byAttributes", &json!({"layer": "Cities", "where": "pop_max > 0"})).unwrap();
+    assert!(!said(&s, mark, "aren't drawn"));
+
+    // Calculate Geometry Attributes updates every row, and says the query hides some.
+    query(&mut s, "Countries", populous);
+    let mark = s.notice_mark();
+    s.run("gp.run", &json!({"tool": "calculateGeometry", "params": {"input": "Countries"}})).unwrap();
+    assert_eq!(rows(&s, "Countries"), countries);
+    assert!(said(
+        &s,
+        mark,
+        &format!(
+            "reads all {countries} features of Countries, including the {} its definition query hides",
+            countries - shown(&s, "Countries")
+        )
+    ));
+    // Every row has its area and perimeter, the hidden countries' as much as the drawn ones'.
+    let layer = s.map().layer_by_name("Countries").unwrap();
+    let ds = &layer.dataset;
+    let (area, perimeter) = (ds.field_index("area_km2").unwrap(), ds.field_index("perimeter_km").unwrap());
+    let hidden = layer.visible_rows().iter().position(|v| !*v).unwrap();
+    for row in [hidden, layer.visible_rows().iter().position(|v| *v).unwrap()] {
+        assert!(ds.value(row, area).as_f64().is_some_and(|a| a > 0.0), "row {row}");
+        assert!(ds.value(row, perimeter).as_f64().is_some_and(|p| p > 0.0), "row {row}");
+    }
+    query(&mut s, "Countries", "");
+    let mark = s.notice_mark();
+    s.run("gp.run", &json!({"tool": "calculateGeometry", "params": {"input": "Countries"}})).unwrap();
+    assert!(!said(&s, mark, "definition query"));
+}
+
 /// Pivot Table adds a standalone table in one undo step: a row for each continent and a field for
 /// each income group, holding the population summed over that continent's countries in the group.
 #[test]

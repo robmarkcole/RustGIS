@@ -171,7 +171,8 @@ pub trait Inputs {
     fn table(&self, _id: u32) -> Option<&Dataset> {
         None
     }
-    /// Selected rows of a layer; tools honour a selection like desktop GIS does.
+    /// The rows of a layer a tool reads: its selection, and the features its definition query
+    /// keeps. Empty means every row.
     fn selection(&self, layer: &str) -> &[usize];
     /// A raster layer by name.
     fn raster(&self, _layer: &str) -> Option<RasterInput<'_>> {
