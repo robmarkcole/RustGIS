@@ -115,7 +115,7 @@ one's.
 | File dialogs | Android's picker, through `Services::open_async` and `download` as in the browser. `rfd` has no Android backend, so what still asks it (choosing a folder) is cancelled and says so (`crates/ui-egui/src/filedialog.rs`) |
 | HTTPS trust | The bundled Mozilla roots, not the device's certificates; the session says so once (`rustgis_data::http`) |
 | Folders | Settings, app data and the cache are in the app's internal storage, set once at start-up (`rustgis_data::dirs::set_root`) |
-| GeoLibre tools, GDAL formats, DuckDB | Not available: a phone can't run their programs |
+| GeoLibre tools, GDAL formats, DuckDB | Not available: a phone can't run their programs. `rustgis_data::RUNS_PROGRAMS` is false on Android and iOS, so no program is looked for, and each place they would appear says so: a file read through GDAL or a DuckDB database is refused with the reason (convert it on a computer), the SQL pane says why it can't query, and the Geoprocessing pane shows a card in place of the GeoLibre tools. Add Data's Database… stays: its PostGIS, MySQL and SQL Server connections need no program. The app is built without the engine's `geolibre` feature |
 | Preferences, the keychain, autosave | Not wired up yet |
 | Soft keyboard | It opens for a text field. `NativeActivity`'s is poor; a real app moves to `GameActivity` |
 

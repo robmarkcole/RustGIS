@@ -5,8 +5,12 @@ use crate::Result;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// A program: in the folder `env` names, else on the `PATH`.
+/// A program: in the folder `env` names, else on the `PATH`. Never one in a build that can't run
+/// programs ([`crate::RUNS_PROGRAMS`]): a phone may have a file of that name, but can't start it.
 pub(crate) fn program(env: &str, name: &str) -> Option<PathBuf> {
+    if !crate::RUNS_PROGRAMS {
+        return None;
+    }
     let exe = if cfg!(windows) { format!("{name}.exe") } else { name.to_string() };
     let dirs: Vec<PathBuf> = std::env::var_os(env)
         .map(PathBuf::from)

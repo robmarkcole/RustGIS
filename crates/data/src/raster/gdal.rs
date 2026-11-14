@@ -126,10 +126,20 @@ pub fn convert_jpeg2000(bytes: Vec<u8>, crs: Option<&str>, max: u64) -> Result<C
 }
 
 fn missing() -> DataError {
-    DataError::Unsupported(
+    DataError::Unsupported(missing_text(crate::no_programs_here()))
+}
+
+/// Why a raster format read through GDAL can't be read: GDAL isn't installed, or (`here` names
+/// it) this build runs no programs, where installing it wouldn't help.
+fn missing_text(here: &str) -> String {
+    if here.is_empty() {
         "this raster format needs GDAL: install it (gdal_translate and gdalinfo on the PATH, or RUSTGIS_GDAL_BIN naming their folder) and add the file again"
-            .into(),
-    )
+            .into()
+    } else {
+        format!(
+            "this raster format is read through GDAL, a program {here} can't run: convert the file to a GeoTIFF on a computer and add that"
+        )
+    }
 }
 
 /// Refuses an ER Mapper header that would open more than its own data: any but an `ERStorage` one
@@ -495,6 +505,13 @@ fn ours(name: &str) -> bool {
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn where_programs_cant_run_the_message_says_so_instead_of_asking_for_an_install() {
+        assert!(missing_text("").contains("install it"));
+        let phone = missing_text("a phone");
+        assert!(phone.contains("a phone can't run") && !phone.contains("install"), "{phone}");
+    }
 
     #[test]
     fn names() {

@@ -506,7 +506,9 @@ fn home_tab(app: &mut RustGisApp, ui: &mut Ui) {
                 menu_item(ui, app, "", "From URL…", "ui.addUrl", Value::Null);
                 menu_item(ui, app, "", "From Service…", "ui.addService", Value::Null);
                 menu_item(ui, app, "", "Zarr…", "ui.dialog", json!({"name": "zarr"}));
-                // Databases are read through DuckDB, a program the browser can't run.
+                // Databases are read through DuckDB, a program the browser can't run. A phone keeps
+                // the row: its PostGIS, MySQL and SQL Server connections need no program, and a
+                // DuckDB database refused there says why (#1902).
                 #[cfg(not(target_arch = "wasm32"))]
                 menu_item(ui, app, "", "Database…", "ui.dialog", json!({"name": "addDatabase"}));
                 #[cfg(not(target_arch = "wasm32"))]

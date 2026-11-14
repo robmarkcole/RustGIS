@@ -3155,12 +3155,36 @@ impl GpForm {
     }
 }
 
+/// The card that stands for the GeoLibre tools on a phone, which can't run their program.
+fn no_geolibre_here(ui: &mut Ui, t: &Tokens) {
+    ui.add_space(6.0);
+    egui::Frame::NONE.stroke(Stroke::new(1.0, t.border)).corner_radius(CornerRadius::same(6)).inner_margin(egui::Margin::same(10)).show(
+        ui,
+        |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(egui::RichText::new(tl!("Whitebox and GeoLibre tools")).font(semibold(13.0)));
+            ui.label(
+                egui::RichText::new(tl!(
+                    "Not on a phone: these tools run as a program of their own, which a phone can't run. Use them in RustGIS on a computer."
+                ))
+                .size(11.5)
+                .color(t.text_dim),
+            );
+        },
+    );
+}
+
 /// Where to get the GeoLibre tools when the runner isn't installed (desktop and CLI builds only).
 fn geolibre_card(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     // Read directly, not through Session::run: a command each frame would bump the session's
     // revision and make the views redraw. The status itself is cached in the runner module.
     let status = rustgis_engine::cmd::gp::geolibre_status();
     if status["supported"] != true {
+        // A phone's build leaves the suite out (its runner is a program, which a phone's apps
+        // can't start): said where the card would be, so the tools aren't simply missing (#1902).
+        if !rustgis_engine::data::RUNS_PROGRAMS && !cfg!(target_arch = "wasm32") {
+            no_geolibre_here(ui, t);
+        }
         return;
     }
     // An install that just finished: use the runner, and remember it.

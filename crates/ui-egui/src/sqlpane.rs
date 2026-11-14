@@ -313,6 +313,14 @@ fn body(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         );
         return;
     }
+    // A phone's apps can't start another program (#1902).
+    if !rustgis_engine::data::RUNS_PROGRAMS {
+        ui.label(
+            RichText::new(tl!("SQL queries run through DuckDB, a program a phone can't run: open this project on a computer to query it."))
+                .weak(),
+        );
+        return;
+    }
     if !app.ui.sql.history_loaded {
         app.ui.sql.history_loaded = true;
         app.ui.sql.history = app

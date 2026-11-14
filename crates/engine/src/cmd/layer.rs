@@ -1589,7 +1589,14 @@ fn add_geodatabase(s: &mut Session, p: &Value, path: &str) -> CmdResult {
         match gdal.then(|| add_gdal(s, &q, path)) {
             Some(Ok(r)) => results.push(r),
             Some(Err(g)) => s.notify(format!("{path}: {table} not read: {why}; through GDAL: {g}"), true),
-            None => s.notify(format!("{path}: {table} not read: {why} (GDAL, when installed, reads it)"), true),
+            None if rustgis_data::RUNS_PROGRAMS => {
+                s.notify(format!("{path}: {table} not read: {why} (GDAL, when installed, reads it)"), true)
+            }
+            // Installing GDAL is no help where no program runs (a phone, #1902).
+            None => s.notify(
+                format!("{path}: {table} not read: {why} (GDAL reads it, a program {} can't run)", rustgis_data::no_programs_here()),
+                true,
+            ),
         }
     }
     if results.is_empty() {
