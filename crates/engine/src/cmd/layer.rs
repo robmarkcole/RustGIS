@@ -1480,10 +1480,12 @@ pub(crate) fn add_photos_to(s: &mut Session, name: &str, zoom: Option<bool>, fee
         }
         None => add_dataset(s, ds),
     };
+    let mut out = json!({"layer": id, "photos": added, "skipped": report.skipped});
+    // Framed on the photos this added, `zoomed` says whether the view moved to them.
     if zoom.unwrap_or(empty_before) {
-        s.zoom_to(&extent);
+        out["zoomed"] = json!(s.zoom_to(&extent));
     }
-    Ok(json!({"layer": id, "photos": added, "skipped": report.skipped}))
+    Ok(out)
 }
 
 /// The most folder entries `layer.addPhotos` lists (it keeps the first photos by name).
@@ -5178,11 +5180,10 @@ fn added_download(s: &mut Session, p: &Value, mut r: Value, mark_source: bool, u
     }
     // `"zoom": true` zooms to everything added, whatever the map held (a link's data); `zoomed`
     // says whether framing happened now, including the tile archive's own bounds handling. A photo result
-    // was already framed on the photos this download added; `zoom_to_added` would frame the whole
-    // photo layer, earlier photos included.
+    // says itself whether it framed the photos this download added (`zoom_to_added` would frame the
+    // whole photo layer, earlier photos included), so one that doesn't wasn't framed.
     if b(p, "zoom") == Some(true) {
-        let zoomed =
-            r.get("zoomed").and_then(Value::as_bool).unwrap_or_else(|| if r.get("photos").is_some() { true } else { zoom_to_added(s, &r) });
+        let zoomed = r.get("zoomed").and_then(Value::as_bool).unwrap_or_else(|| r.get("photos").is_none() && zoom_to_added(s, &r));
         if let Some(o) = r.as_object_mut() {
             o.insert("zoomed".into(), json!(zoomed));
         }
@@ -5191,7 +5192,8 @@ fn added_download(s: &mut Session, p: &Value, mut r: Value, mark_source: bool, u
 }
 
 /// Zooms to the layers a command's result names (`layer`, `layers`), all of them together;
-/// whether any had an extent.
+/// whether the view framed them (not when none had an extent, or the map's projection doesn't
+/// reach it).
 fn zoom_to_added(s: &mut Session, r: &Value) -> bool {
     let ids = r.get("layers").and_then(Value::as_array).into_iter().flatten().chain(r.get("layer"));
     let e = ids
@@ -5203,8 +5205,7 @@ fn zoom_to_added(s: &mut Session, r: &Value) -> bool {
     if e.is_empty() {
         return false;
     }
-    s.zoom_to(&e);
-    true
+    s.zoom_to(&e)
 }
 
 pub(crate) fn add_data_text(s: &mut Session, p: &Value) -> CmdResult {

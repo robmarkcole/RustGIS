@@ -1353,7 +1353,9 @@ fn add_discovered(s: &mut Session, p: &Value, url: &str, want: &str, found: &Dis
                     // Over an area, the features crossing it: the view stays, or goes to a box given
                     // (the whole layer's bounds would show a country to fill one state).
                     match (asked.is_some(), area, p.get("bbox")) {
-                        (true, Some([w, so, e, n]), Some(Value::Array(_))) => s.zoom_to(&rustgis_geom::Extent::new(w, so, e, n)),
+                        (true, Some([w, so, e, n]), Some(Value::Array(_))) => {
+                            s.zoom_to(&rustgis_geom::Extent::new(w, so, e, n));
+                        }
                         (true, ..) => {}
                         _ => zoom(s),
                     }

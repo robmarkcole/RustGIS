@@ -536,8 +536,7 @@ fn follow_archive(s: &mut Session, t: &TileLayer, wait: web_time::Duration) -> b
     if whole_world(&e) {
         return false;
     }
-    s.zoom_to(&e);
-    true
+    s.zoom_to(&e)
 }
 
 /// The tile layer a command names by `index`, `name` or `id`.

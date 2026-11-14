@@ -347,6 +347,9 @@ fn param_entries<'a>(desc: &'a str, mut visit: impl FnMut(&'a str, bool)) -> Opt
     Some(())
 }
 
+/// What a zoom to a place the map's projection doesn't reach says, once in a command.
+const BEYOND_PROJECTION: &str = "The place lies beyond what the map's projection shows, so the view wasn't moved to it.";
+
 /// `s` cut to `n` characters, with `…` when cut.
 fn clip(s: &str, n: usize) -> String {
     if s.chars().count() > n { s.chars().take(n).chain(['…']).collect() } else { s.to_string() }
@@ -750,6 +753,10 @@ pub struct Session {
     /// Notices given in this session, including ones no longer kept (see [`Session::notices_since`]),
     /// less those a failed command withdrew.
     notices_given: u64,
+    /// Whether the outermost command now running has said that a zoom couldn't reach its place;
+    /// `None` between commands. Its inner steps would each say it (a zoom refused by each layer an
+    /// add frames): it is said once in a command, however many notices come after.
+    beyond_said: Option<bool>,
     /// The count of cloud-optimised GeoTIFF headers landed when [`Session::notice_landed_rasters`]
     /// last looked back at the dates a dated series has shown (`cog::landed_count`).
     cog_headers_seen: u64,
@@ -1178,6 +1185,7 @@ impl Session {
             bundled_roots_said: false,
             diagnostics: rustgis_data::diagnostics::History::default(),
             notices_given: 0,
+            beyond_said: None,
             cog_headers_seen: 0,
             table_layer: None,
             table_standalone: None,
@@ -1550,10 +1558,12 @@ impl Session {
             // A step that joins the last one (a held arrow key nudging an element: `merge_undo`) is
             // one entry too, as it is one step to undo.
             let joins = self.merge.is_some() && self.merge == self.merged && !self.undo.is_empty();
+            self.beyond_said = Some(false);
             let (at, start) = (project_log::now_ms(), web_time::Instant::now());
             #[cfg(not(target_arch = "wasm32"))]
             let files_before: Vec<String> = self.mbtiles_files().map(str::to_string).collect();
             let res = self.with_unread_bools(source, run);
+            self.beyond_said = None;
             // Whichever command took its last layer away (removed, undone, the project closed):
             // the file can now be moved or replaced, so what was read of it is forgotten too.
             #[cfg(not(target_arch = "wasm32"))]
@@ -1609,6 +1619,7 @@ impl Session {
         // Every top-level invocation consumes its key, even a refusal or panic before guarded.
         if outermost {
             self.merge = None;
+            self.beyond_said = None;
         }
         match result {
             Ok(result) => result,
@@ -1889,7 +1900,12 @@ impl Session {
                 // go; its errors stay.
                 let new = usize::try_from(self.notices_given.saturating_sub(said)).unwrap_or(usize::MAX).min(self.notices.len());
                 let start = self.notices.len() - new;
-                let errors: Vec<Notice> = self.notices.drain(start..).filter(|n| n.error).collect();
+                let withdrawn: Vec<Notice> = self.notices.drain(start..).collect();
+                // A zoom it couldn't make, said and now withdrawn, is said again by the next one.
+                if withdrawn.iter().any(|n| n.text == BEYOND_PROJECTION) && self.beyond_said == Some(true) {
+                    self.beyond_said = Some(false);
+                }
+                let errors: Vec<Notice> = withdrawn.into_iter().filter(|n| n.error).collect();
                 self.notices_given -= (new - errors.len()) as u64;
                 self.notices.extend(errors);
                 let mut recorded_failure = false;
@@ -2957,17 +2973,29 @@ impl Session {
         cmd::navigate::view_of(self.map()).map(|(_, z)| z)
     }
 
-    /// Fits the camera to a lon/lat extent in the current view size.
-    pub fn zoom_to(&mut self, e: &rustgis_geom::Extent) {
+    /// Fits the camera to a lon/lat extent in the current view size; whether it did. One the map's
+    /// projection doesn't reach (wholly past Web Mercator's 85°, say) doesn't move the view to it,
+    /// and says so; an empty extent or view doesn't either, quietly.
+    pub fn zoom_to(&mut self, e: &rustgis_geom::Extent) -> bool {
         let (w, h) = self.view_size;
         let m = self.map_mut();
+        if e.is_empty() || w <= 1.0 || h <= 1.0 {
+            return false;
+        }
         if m.projection.is_globe() {
             rustgis_map::Globe::fit(&mut m.camera, e, w, h);
-        } else {
-            // An extent the projection doesn't reach leaves the view where it is.
-            let _ = m.fit_lonlat(e, w, h);
+        } else if !m.fit_lonlat(e, w, h) {
+            // Once in a command, though several of its steps zoom (each layer an add frames).
+            if self.beyond_said != Some(true) {
+                self.notify(BEYOND_PROJECTION, false);
+                if self.beyond_said.is_some() {
+                    self.beyond_said = Some(true);
+                }
+            }
+            return false;
         }
         self.record_extent();
+        true
     }
 
     pub fn title(&self) -> String {
