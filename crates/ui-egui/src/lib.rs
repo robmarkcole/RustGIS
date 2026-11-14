@@ -2365,6 +2365,14 @@ impl RustGisApp {
         mapview::show(self, ui);
     }
 
+    /// Where a longitude and latitude is on screen (points), in the map as it was last drawn: for
+    /// a shell that draws over the map ([`RustGisApp::chrome`]). `None` before the map is drawn,
+    /// and for a place the view doesn't show (behind the globe, off the projection).
+    pub fn lonlat_to_screen(&self, lon: f64, lat: f64) -> Option<egui::Pos2> {
+        let (rect, _) = self.map.view_rect?;
+        mapview::lonlat_to_screen(self, rect, rustgis_engine::geom::Coord::new(lon, lat))
+    }
+
     /// Whether background work is running that the user is shown, with its Cancel: an export, a
     /// file or a layer being read, a download. A shell that draws its own interface
     /// ([`RustGisApp::chrome`]) shows [`RustGisApp::background_status`] while it is.

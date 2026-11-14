@@ -6,10 +6,10 @@
 //! Project page stay the front end's.
 //!
 //! What is here: the map, the bar (Layers, Add Data, Capture, More), the Layers sheet (show,
-//! hide, zoom to, the active layer), the Capture sheet (a point where the cross on the map is,
-//! with a field for each of its layer's attributes) and the More sheet (full extent, project,
-//! undo, the desktop interface). Not yet: lines and polygons by touch, value lists and defaults
-//! in the form, and text input that suits a soft keyboard.
+//! hide, zoom to, the active layer), the Capture sheet (a point, line or polygon placed by the cross
+//! on the map, with a field for each of its layer's attributes) and the More sheet (full extent,
+//! project, undo, the desktop interface). Not yet: editing a shape's vertices, snapping, value
+//! lists and defaults in the form, and text input that suits a soft keyboard.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 use egui::{Align, Color32, CornerRadius, Layout, Rect, RichText, Sense, Stroke, Ui, Vec2};
@@ -34,7 +34,7 @@ enum Sheet {
     #[default]
     None,
     Layers,
-    /// Capturing a point where the cross on the map is.
+    /// Capturing a feature where the cross on the map is.
     Capture,
     More,
 }
@@ -94,6 +94,7 @@ pub fn chrome(app: &mut RustGisApp, ui: &mut Ui) {
         if shown == Sheet::Capture
             && let Some((map, _)) = app.map.view_rect
         {
+            sketch(app, &ui.painter().with_clip_rect(map), map.center(), &t, &ctx);
             cross(ui.painter(), map.center(), &t);
         }
     });
@@ -255,28 +256,47 @@ fn toggle_button(ui: &mut Ui, t: &Tokens, icon: &str, hint: &str, on: bool) -> b
     response.clicked()
 }
 
-/// What the Capture sheet holds between frames: the layer captured into, and what is typed for
-/// the next point's fields (by field name).
+/// What the Capture sheet holds between frames: the layer captured into, what is typed for the
+/// next feature's fields (by field name), and the vertices placed so far of a line or polygon.
 #[derive(Clone, Default)]
 struct Form {
     /// The layer a chip chose; `None` follows the active layer. A layer is named here by its
     /// `Layer::instance_id`, not its id: ids start again in each map and each project, and a
     /// choice or a draft must never pass to another map's layer of the same id.
     layer: Option<u64>,
-    /// The layer the fields were last shown for: what is typed belongs to it alone.
+    /// The layer the fields were last shown for: what is typed, and what is drawn, belong to
+    /// it alone.
     shown: Option<u64>,
     values: std::collections::BTreeMap<String, String>,
+    /// The vertices of the line or polygon being drawn, as longitude and latitude, in order.
+    vertices: Vec<(f64, f64)>,
 }
 
 impl Form {
-    /// The form for the layer `instance`: what was typed for another layer is dropped, so one
-    /// layer's text never goes into another's field of the same name.
+    /// The form for the layer `instance`: what was typed or drawn for another layer is dropped,
+    /// so one layer's text never goes into another's field of the same name, nor its vertices
+    /// into another's feature.
     fn for_layer(mut self, instance: u64) -> Form {
         if self.shown != Some(instance) {
             self.values.clear();
+            self.vertices.clear();
             self.shown = Some(instance);
         }
         self
+    }
+}
+
+impl Form {
+    /// Places a vertex of the shape being drawn at `at`, unless the last one is there already
+    /// (the button tapped twice with the map not moved): a vertex on the one before it adds
+    /// nothing to the shape, and two of three in one place make a polygon of no area. Says
+    /// whether it was placed.
+    fn place(&mut self, at: (f64, f64)) -> bool {
+        if self.vertices.last() == Some(&at) {
+            return false;
+        }
+        self.vertices.push(at);
+        true
     }
 }
 
@@ -288,33 +308,49 @@ fn set_form(ctx: &egui::Context, form: Form) {
     ctx.data_mut(|d| d.insert_temp(egui::Id::unique("touch_capture"), form));
 }
 
-/// The map's point layers (id, name, instance), top first: what a point can be captured into.
-fn point_layers(app: &RustGisApp) -> Vec<(u32, String, u64)> {
-    let point = rustgis_ui_egui::rustgis_engine::data::GeometryType::Point;
-    app.session.map().layers.iter().filter(|l| l.geometry_type() == point).map(|l| (l.id, l.name.clone(), l.instance_id())).collect()
+use rustgis_ui_egui::rustgis_engine::data::GeometryType;
+
+/// A layer a feature can be captured into.
+#[derive(Clone)]
+struct Target {
+    id: u32,
+    name: String,
+    instance: u64,
+    kind: GeometryType,
 }
 
-/// The layer the Capture sheet captures into: the one chosen in it while it is still a point
-/// layer of this map, else the active layer when it is one, else the top point layer.
-fn capture_layer(app: &RustGisApp, form: &Form) -> Option<u32> {
-    let layers = point_layers(app);
-    let chosen = form.layer.and_then(|instance| layers.iter().find(|(_, _, i)| *i == instance).map(|(id, _, _)| *id));
-    let has = |id: &u32| layers.iter().any(|(l, _, _)| l == id);
-    chosen.or(app.session.active_layer.filter(has)).or(layers.first().map(|(id, _, _)| *id))
+/// The map's point, line and polygon layers, top first: what a feature can be captured into.
+fn capture_layers(app: &RustGisApp) -> Vec<Target> {
+    app.session
+        .map()
+        .layers
+        .iter()
+        .filter(|l| matches!(l.geometry_type(), GeometryType::Point | GeometryType::Polyline | GeometryType::Polygon))
+        .map(|l| Target { id: l.id, name: l.name.clone(), instance: l.instance_id(), kind: l.geometry_type() })
+        .collect()
+}
+
+/// The layer the Capture sheet captures into: the one chosen in it while it is still a layer of
+/// this map that takes features, else the active layer when it is one, else the top such layer.
+fn capture_layer(app: &RustGisApp, form: &Form) -> Option<Target> {
+    let layers = capture_layers(app);
+    let chosen = form.layer.and_then(|instance| layers.iter().find(|l| l.instance == instance));
+    let active = app.session.active_layer.and_then(|id| layers.iter().find(|l| l.id == id));
+    chosen.or(active).or(layers.first()).cloned()
 }
 
 /// The Capture sheet's rows, for its height: its layers, its fields, where the cross is, and
-/// its button.
+/// its buttons (two rows of them for a line or polygon).
 fn capture_rows(app: &RustGisApp, ctx: &egui::Context) -> usize {
-    let Some(id) = capture_layer(app, &form(ctx)) else { return 2 };
-    let fields = app.session.map().layer(id).map_or(0, |l| l.dataset.fields.len());
-    fields + 3
+    let Some(target) = capture_layer(app, &form(ctx)) else { return 2 };
+    let fields = app.session.map().layer(target.id).map_or(0, |l| l.dataset.fields.len());
+    fields + if target.kind == GeometryType::Point { 3 } else { 4 }
 }
 
 /// A value typed for a field, as the command takes it: a number for a field of numbers, a truth
 /// value for a yes/no field, the text otherwise. Nothing typed is no value. Text that isn't a
 /// number, in a field of numbers, is an error here: the command would store nothing for it, and
-/// the point would be saved without what was typed.
+/// the feature would be saved without what was typed.
 fn typed(text: &str, ty: rustgis_ui_egui::rustgis_engine::data::FieldType) -> Result<Value, ()> {
     use rustgis_ui_egui::rustgis_engine::data::FieldType;
     let text = text.trim();
@@ -341,13 +377,49 @@ fn cross_place(app: &RustGisApp) -> Option<(f64, f64)> {
     map.to_lonlat(map.camera.center).map(|at| (at.x, at.y))
 }
 
-/// Adds a point to layer `id` where the middle of the map is, with what the form holds, turning
-/// editing on for the map first when it is off (and saying so). Says whether the point was added.
-/// It isn't, and the reason is said, when a field of numbers holds text that isn't one, when the
-/// cross is on no place of the map's projection, or when the command refuses.
-fn add_point(app: &mut RustGisApp, id: u32, form: &Form) -> bool {
+/// The fewest vertices a feature of `kind` is drawn with.
+fn fewest(kind: GeometryType) -> usize {
+    match kind {
+        GeometryType::Polygon => 3,
+        GeometryType::Polyline => 2,
+        _ => 1,
+    }
+}
+
+/// The GeoJSON geometry of a feature of `kind` through `vertices` (longitude and latitude, in
+/// order): a point at the first, a line through them, or a polygon whose ring closes on the
+/// first. A polygon closed by hand (its last vertex placed on its first) is not closed twice.
+/// `None` with fewer than the kind needs.
+fn geometry(kind: GeometryType, vertices: &[(f64, f64)]) -> Option<Value> {
+    let vertices = match vertices {
+        [first, middle @ .., last] if kind == GeometryType::Polygon && first == last && !middle.is_empty() => {
+            &vertices[..vertices.len() - 1]
+        }
+        _ => vertices,
+    };
+    if vertices.len() < fewest(kind) {
+        return None;
+    }
+    let at = |(lon, lat): &(f64, f64)| json!([lon, lat]);
+    match kind {
+        GeometryType::Point => vertices.first().map(|v| json!({"type": "Point", "coordinates": at(v)})),
+        GeometryType::Polyline => Some(json!({"type": "LineString", "coordinates": vertices.iter().map(at).collect::<Vec<_>>()})),
+        GeometryType::Polygon => {
+            let mut ring: Vec<Value> = vertices.iter().map(at).collect();
+            ring.push(at(vertices.first()?));
+            Some(json!({"type": "Polygon", "coordinates": [ring]}))
+        }
+        GeometryType::None => None,
+    }
+}
+
+/// Adds a feature to layer `id` with `geometry` and what the form holds, turning editing on for
+/// the map first when it is off (and saying so). Says whether it was added. It isn't, and the
+/// reason is said, when a field of numbers holds text that isn't one, or when the command
+/// refuses.
+fn add_feature(app: &mut RustGisApp, id: u32, form: &Form, geometry: Value) -> bool {
     let Some(layer) = app.session.map().layer(id) else { return false };
-    let name = layer.name.clone();
+    let (name, kind) = (layer.name.clone(), layer.geometry_type());
     let mut attributes = serde_json::Map::new();
     let mut not_numbers = Vec::new();
     for field in &layer.dataset.fields {
@@ -362,73 +434,160 @@ fn add_point(app: &mut RustGisApp, id: u32, form: &Form) -> bool {
     }
     if !not_numbers.is_empty() {
         let fields = not_numbers.join(", ");
-        app.session.notify(rustgis_ui_egui::i18n::fmt("The point wasn't added. Not a number, in: {fields}.", &[("fields", &fields)]), true);
+        app.session.notify(rustgis_ui_egui::i18n::fmt("Nothing was added. Not a number, in: {fields}.", &[("fields", &fields)]), true);
         return false;
     }
-    let Some((lon, lat)) = cross_place(app) else {
-        app.session.notify(tl!("The point wasn't added: the cross is off the map. Move the map under it."), true);
-        return false;
-    };
     if !app.session.map().editing.settings.enabled {
         if app.run_by_user("edit.enable", json!({"on": true})).is_err() {
             return false;
         }
         app.session.notify(tl!("Editing was turned on for this map."), false);
     }
-    let geometry = json!({"type": "Point", "coordinates": [lon, lat]});
     if app.run_by_user("edit.addFeature", json!({"layer": id, "geometry": geometry, "attributes": attributes})).is_err() {
         return false;
     }
-    app.session.notify(rustgis_ui_egui::i18n::fmt("Added a point to {layer}.", &[("layer", &name)]), false);
+    let added = match kind {
+        GeometryType::Polyline => rustgis_ui_egui::i18n::fmt("Added a line to {layer}.", &[("layer", &name)]),
+        GeometryType::Polygon => rustgis_ui_egui::i18n::fmt("Added a polygon to {layer}.", &[("layer", &name)]),
+        _ => rustgis_ui_egui::i18n::fmt("Added a point to {layer}.", &[("layer", &name)]),
+    };
+    app.session.notify(added, false);
     true
 }
 
-/// The Capture sheet: the layer to capture into, a field for each of its attributes, where the
-/// cross is, and the button that adds a point there. It stays up after a point, its fields
-/// emptied, for the next one.
+/// Adds a point to layer `id` where the middle of the map is, with what the form holds. A cross
+/// on no place of the map's projection adds none, and says so.
+fn add_point(app: &mut RustGisApp, id: u32, form: &Form) -> bool {
+    let Some(at) = cross_place(app) else {
+        app.session.notify(tl!("Nothing was added: the cross is off the map. Move the map under it."), true);
+        return false;
+    };
+    match geometry(GeometryType::Point, &[at]) {
+        Some(point) => add_feature(app, id, form, point),
+        None => false,
+    }
+}
+
+/// Draws the line or polygon being captured over the map: its vertices, the line through them,
+/// and a thinner one on to the cross, where the next vertex would go (and, for a polygon, back to
+/// the first).
+fn sketch(app: &RustGisApp, painter: &egui::Painter, cross: egui::Pos2, t: &Tokens, ctx: &egui::Context) {
+    let state = form(ctx);
+    let Some(target) = capture_layer(app, &state) else { return };
+    if target.kind == GeometryType::Point || state.vertices.is_empty() {
+        return;
+    }
+    // A vertex the view doesn't show (behind the globe) breaks the line there.
+    let placed: Vec<Option<egui::Pos2>> = state.vertices.iter().map(|(lon, lat)| app.lonlat_to_screen(*lon, *lat)).collect();
+    for pair in placed.windows(2) {
+        if let [Some(a), Some(b)] = pair {
+            painter.line_segment([*a, *b], Stroke::new(5.0, Color32::WHITE));
+            painter.line_segment([*a, *b], Stroke::new(3.0, t.accent));
+        }
+    }
+    let next = Stroke::new(1.5, t.accent);
+    if let Some(Some(last)) = placed.last() {
+        painter.line_segment([*last, cross], next);
+    }
+    if target.kind == GeometryType::Polygon
+        && placed.len() > 1
+        && let Some(Some(first)) = placed.first()
+    {
+        painter.line_segment([cross, *first], next);
+    }
+    for at in placed.into_iter().flatten() {
+        painter.circle(at, 5.0, Color32::WHITE, Stroke::new(2.0, t.accent));
+    }
+}
+
+/// A button of the Capture sheet, `width` wide and a finger tall: filled with the accent when it
+/// is the one to tap next. Says whether it was tapped.
+fn action(ui: &mut Ui, t: &Tokens, label: &str, width: f32, main: bool, enabled: bool) -> bool {
+    let text = RichText::new(label).size(16.0).color(if main { t.on_accent } else { t.text });
+    let button = egui::Button::new(text).fill(if main { t.accent } else { t.input }).min_size(Vec2::new(width, TARGET));
+    ui.add_enabled(enabled, button).clicked()
+}
+
+/// The Capture sheet: the layer to capture into, where the cross is, the buttons that capture
+/// there, and a field for each of the layer's attributes. A point is added where the cross is.
+/// A line or polygon is drawn a vertex at a time, each where the cross is when Add Vertex is
+/// tapped, and added by Finish. The sheet stays up after a feature, emptied, for the next one.
 fn capture(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
-    heading(ui, t, tl!("Capture a Point"));
+    heading(ui, t, tl!("Capture"));
     let ctx = ui.ctx().clone();
     let mut state = form(&ctx);
-    let layers = point_layers(app);
-    let Some(id) = capture_layer(app, &state) else {
-        ui.label(RichText::new(tl!("This map has no point layer to capture into. Add Data puts one on it.")).color(t.text_dim));
+    let layers = capture_layers(app);
+    let Some(target) = capture_layer(app, &state) else {
+        ui.label(RichText::new(tl!("This map has no layer to capture into. Add Data puts one on it.")).color(t.text_dim));
         ui.add_space(8.0);
         return;
     };
-    let instance = layers.iter().find(|(l, _, _)| *l == id).map_or(0, |(_, _, i)| *i);
-    state = state.for_layer(instance);
-    // The button stays in reach above the fields, however many the layer has.
-    let place = match cross_place(app) {
+    state = state.for_layer(target.instance);
+    // The buttons stay in reach above the fields, however many the layer has.
+    let cross = cross_place(app);
+    let place = match cross {
         Some((lon, lat)) => {
             rustgis_ui_egui::i18n::fmt("At the cross: {lon}, {lat}", &[("lon", &format!("{lon:.6}")), ("lat", &format!("{lat:.6}"))])
         }
         None => tl!("The cross is off the map: move the map under it.").to_string(),
     };
     ui.label(RichText::new(place).size(13.0).color(t.text_dim));
-    let add = egui::Button::new(RichText::new(tl!("Add Point Here")).size(16.0).color(t.on_accent))
-        .fill(t.accent)
-        .min_size(Vec2::new(ui.available_width(), TARGET));
-    if ui.add(add).clicked() && add_point(app, id, &state) {
-        state.values.clear();
+    let width = ui.available_width();
+    if target.kind == GeometryType::Point {
+        if action(ui, t, tl!("Add Point Here"), width, true, true) && add_point(app, target.id, &state) {
+            state.values.clear();
+        }
+    } else {
+        let placed = state.vertices.len();
+        // Enough, once the vertices make the layer's kind of shape.
+        let enough = geometry(target.kind, &state.vertices).is_some();
+        if action(ui, t, tl!("Add Vertex Here"), width, !enough, true) {
+            match cross {
+                Some(at) if state.place(at) => {}
+                Some(_) => app.session.notify(tl!("No vertex was added: the cross is where the last one is. Move the map under it."), true),
+                None => app.session.notify(tl!("No vertex was added: the cross is off the map. Move the map under it."), true),
+            }
+        }
+        ui.horizontal(|ui| {
+            let gap = ui.spacing().item_spacing.x;
+            let third = (width - 2.0 * gap) / 3.0;
+            if action(ui, t, tl!("Undo Vertex"), third, false, placed > 0) {
+                state.vertices.pop();
+            }
+            if action(ui, t, tl!("Start Over"), third, false, placed > 0) {
+                state.vertices.clear();
+            }
+            // Finish is the one to tap once the shape has enough vertices.
+            let finish = match target.kind {
+                GeometryType::Polygon => tl!("Finish Polygon"),
+                _ => tl!("Finish Line"),
+            };
+            if action(ui, t, finish, third, enough, enough)
+                && let Some(shape) = geometry(target.kind, &state.vertices)
+                && add_feature(app, target.id, &state, shape)
+            {
+                state.values.clear();
+                state.vertices.clear();
+            }
+        });
     }
     egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
-        // The layer: one chip for each point layer, in a row that scrolls sideways.
+        // The layer: one chip for each layer that takes features, in a row that scrolls sideways.
         egui::ScrollArea::horizontal().id_salt("touch_capture_layers").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.set_min_height(TARGET);
-                for (layer, name, instance) in &layers {
-                    let on = *layer == id;
-                    let text = RichText::new(name).size(15.0).color(if on { t.accent_text } else { t.text });
+                for layer in &layers {
+                    let on = layer.id == target.id;
+                    let text = RichText::new(&layer.name).size(15.0).color(if on { t.accent_text } else { t.text });
                     let chip = egui::Button::new(text).fill(if on { t.checked } else { t.input }).min_size(Vec2::new(TARGET, TARGET - 8.0));
                     // The next frame shows the chosen layer's fields, empty (`Form::for_layer`).
                     if ui.add(chip).clicked() && !on {
-                        state.layer = Some(*instance);
+                        state.layer = Some(layer.instance);
                     }
                 }
             });
         });
-        let fields: Vec<_> = app.session.map().layer(id).map(|l| l.dataset.fields.clone()).unwrap_or_default();
+        let fields: Vec<_> = app.session.map().layer(target.id).map(|l| l.dataset.fields.clone()).unwrap_or_default();
         for field in &fields {
             use rustgis_ui_egui::rustgis_engine::data::FieldType;
             let label = field.alias.clone().filter(|a| !a.trim().is_empty()).unwrap_or_else(|| field.name.clone());
@@ -581,16 +740,28 @@ mod tests {
         assert!(app.session.map().layers.is_empty());
     }
 
+    /// The sample's layer of `kind`, made the active one, as the sheet resolves it.
+    fn target(app: &mut RustGisApp, kind: GeometryType) -> Target {
+        let id = app.session.map().layers.iter().find(|l| l.geometry_type() == kind).map(|l| l.id).unwrap();
+        run(app, "layer.select", json!({"layer": id}));
+        let target = capture_layer(app, &Form::default()).unwrap();
+        assert_eq!(target.id, id);
+        target
+    }
+
+    fn count(app: &RustGisApp, id: u32) -> usize {
+        app.session.map().layer(id).unwrap().dataset.features.len()
+    }
+
     #[test]
     fn a_point_is_captured_where_the_map_is_centred_with_what_the_form_holds() {
         let ctx = egui::Context::default();
         let mut app = RustGisApp::with_sample();
-        // The sample's Cities are points: the sheet captures into them.
-        let state = Form::default();
-        let id = capture_layer(&app, &state).unwrap();
-        let layer = app.session.map().layer(id).unwrap();
-        assert_eq!(layer.name, "Cities");
-        let before = layer.dataset.features.len();
+        // The sample's Cities are points.
+        let cities = target(&mut app, GeometryType::Point);
+        assert_eq!(cities.name, "Cities");
+        let before = count(&app, cities.id);
+        let layer = app.session.map().layer(cities.id).unwrap();
         let text = layer
             .dataset
             .fields
@@ -598,63 +769,106 @@ mod tests {
             .find(|f| f.ty == rustgis_ui_egui::rustgis_engine::data::FieldType::Text)
             .map(|f| f.name.clone())
             .unwrap();
-        let instance = layer.instance_id();
-        let mut state = Form { layer: Some(instance), ..Form::default() };
+        let mut state = Form { layer: Some(cities.instance), ..Form::default() };
         state.values.insert(text.clone(), "Field Camp".into());
         // With editing off, capturing turns it on, and says so.
         run(&mut app, "edit.enable", json!({"on": false}));
         assert!(!app.session.map().editing.settings.enabled);
         let mark = app.session.notice_mark();
-        assert!(add_point(&mut app, id, &state));
+        assert!(add_point(&mut app, cities.id, &state));
         assert!(app.session.map().editing.settings.enabled);
         assert!(app.session.notices_since(mark).iter().all(|n| !n.error));
         assert_eq!(app.session.notices_since(mark).len(), 2);
-        let layer = app.session.map().layer(id).unwrap();
-        assert_eq!(layer.dataset.features.len(), before + 1);
-        // The sheet draws with the new point's layer, and for a map with no point layer.
+        assert_eq!(count(&app, cities.id), before + 1);
+        // The sheet draws with the new point's layer, and for a map with nothing to capture into.
         frame(&mut app, &ctx, Sheet::Capture);
-        run(&mut app, "layer.remove", json!({"layer": id}));
-        assert_eq!(capture_layer(&app, &Form { layer: Some(instance), ..Form::default() }), None);
+        let ids: Vec<u32> = app.session.map().layers.iter().map(|l| l.id).collect();
+        for id in ids {
+            run(&mut app, "layer.remove", json!({"layer": id}));
+        }
+        assert!(capture_layer(&app, &Form { layer: Some(cities.instance), ..Form::default() }).is_none());
         frame(&mut app, &ctx, Sheet::Capture);
+    }
+
+    #[test]
+    fn a_line_and_a_polygon_are_captured_through_their_vertices() {
+        let ctx = egui::Context::default();
+        let mut app = RustGisApp::with_sample();
+        // Too few vertices make no geometry; enough make the kind's own.
+        let square = [(10.0, 10.0), (11.0, 10.0), (11.0, 11.0), (10.0, 11.0)];
+        assert_eq!(geometry(GeometryType::Polyline, &square[..1]), None);
+        assert_eq!(geometry(GeometryType::Polygon, &square[..2]), None);
+        let line = geometry(GeometryType::Polyline, &square[..2]).unwrap();
+        assert_eq!(line, json!({"type": "LineString", "coordinates": [[10.0, 10.0], [11.0, 10.0]]}));
+        // A polygon's ring closes on its first vertex.
+        let ring = geometry(GeometryType::Polygon, &square).unwrap();
+        assert_eq!(ring["coordinates"][0].as_array().unwrap().len(), 5);
+        assert_eq!(ring["coordinates"][0][0], ring["coordinates"][0][4]);
+        for (kind, shape, word) in [(GeometryType::Polyline, line, "line"), (GeometryType::Polygon, ring, "polygon")] {
+            let layer = target(&mut app, kind);
+            let before = count(&app, layer.id);
+            let mark = app.session.notice_mark();
+            assert!(add_feature(&mut app, layer.id, &Form::default(), shape));
+            assert_eq!(count(&app, layer.id), before + 1);
+            let said: Vec<_> = app.session.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+            assert!(said.iter().any(|text| text.contains(word)), "{said:?}");
+            // The sheet draws for the layer with a shape half drawn, its sketch over the map.
+            set_form(&ctx, Form { vertices: square[..3].to_vec(), shown: Some(layer.instance), ..Form::default() });
+            frame(&mut app, &ctx, Sheet::Capture);
+            assert_eq!(form(&ctx).vertices.len(), 3);
+        }
+        // Closed by hand, on its first vertex: the ring is the same, and three in all are too few.
+        let by_hand = [square[0], square[1], square[2], square[3], square[0]];
+        assert_eq!(geometry(GeometryType::Polygon, &by_hand), geometry(GeometryType::Polygon, &square));
+        assert_eq!(geometry(GeometryType::Polygon, &[square[0], square[1], square[0]]), None);
+        // A line may come back to where it began.
+        assert!(geometry(GeometryType::Polyline, &[square[0], square[1], square[0]]).is_some());
+        // A vertex where the last one is isn't placed; one anywhere else is.
+        let mut drawing = Form::default();
+        assert!(drawing.place(square[0]));
+        assert!(!drawing.place(square[0]));
+        assert!(drawing.place(square[1]));
+        assert_eq!(drawing.vertices, square[..2]);
+        // A shape of the wrong kind for its layer is refused, and said.
+        let cities = target(&mut app, GeometryType::Point);
+        let before = count(&app, cities.id);
+        let mark = app.session.notice_mark();
+        assert!(!add_feature(&mut app, cities.id, &Form::default(), geometry(GeometryType::Polyline, &square).unwrap()));
+        assert_eq!(count(&app, cities.id), before);
+        assert_eq!(app.session.notices_since(mark).iter().filter(|n| n.error).count(), 1);
     }
 
     #[test]
     fn the_sheet_follows_the_active_layer_until_a_chip_chooses_another() {
         let mut app = RustGisApp::with_sample();
-        // A second point layer: a copy of the sample's cities.
-        let cities = point_layers(&app)[0].0;
-        run(&mut app, "layer.copy", json!({"layer": cities}));
-        run(&mut app, "layer.paste", Value::Null);
-        let layers = point_layers(&app);
-        assert_eq!(layers.len(), 2, "{layers:?}");
-        let (other, _, other_instance) = layers.iter().find(|(id, _, _)| *id != cities).cloned().unwrap();
+        let cities = target(&mut app, GeometryType::Point);
+        let rivers = target(&mut app, GeometryType::Polyline);
         // Nothing chosen: the active layer, whichever it is, and it is followed as it changes.
-        for id in [cities, other] {
-            run(&mut app, "layer.select", json!({"layer": id}));
-            assert_eq!(capture_layer(&app, &Form::default()), Some(id));
+        for layer in [&cities, &rivers] {
+            run(&mut app, "layer.select", json!({"layer": layer.id}));
+            assert_eq!(capture_layer(&app, &Form::default()).map(|l| l.id), Some(layer.id));
         }
         // Drawing the sheet doesn't choose: the next frame still follows the active layer.
         let ctx = egui::Context::default();
         frame(&mut app, &ctx, Sheet::Capture);
         assert_eq!(form(&ctx).layer, None);
         // A chip's choice wins over the active layer.
-        run(&mut app, "layer.select", json!({"layer": cities}));
-        assert_eq!(capture_layer(&app, &Form { layer: Some(other_instance), ..Form::default() }), Some(other));
+        run(&mut app, "layer.select", json!({"layer": cities.id}));
+        assert_eq!(capture_layer(&app, &Form { layer: Some(rivers.instance), ..Form::default() }).map(|l| l.id), Some(rivers.id));
         // A choice made for another map's or project's layer is no choice here, whatever its id.
-        assert_eq!(capture_layer(&app, &Form { layer: Some(u64::MAX), ..Form::default() }), Some(cities));
+        assert_eq!(capture_layer(&app, &Form { layer: Some(u64::MAX), ..Form::default() }).map(|l| l.id), Some(cities.id));
         // The sample opened again: its Cities is another layer, though its id is the same.
-        let was = layers.iter().find(|(id, _, _)| *id == cities).map(|(_, _, i)| *i);
         app.session.mark_saved();
         run(&mut app, "project.sample", Value::Null);
-        let again = point_layers(&app).iter().find(|(id, _, _)| *id == cities).map(|(_, _, i)| *i);
-        assert!(again.is_some() && again != was, "{was:?} {again:?}");
+        let again = capture_layers(&app).into_iter().find(|l| l.id == cities.id).map(|l| l.instance);
+        assert!(again.is_some() && again != Some(cities.instance), "{again:?}");
     }
 
     #[test]
     fn text_in_a_field_of_numbers_keeps_the_point_from_being_added_and_is_said() {
         use rustgis_ui_egui::rustgis_engine::data::FieldType;
         let mut app = RustGisApp::with_sample();
-        let id = capture_layer(&app, &Form::default()).unwrap();
+        let id = target(&mut app, GeometryType::Point).id;
         let layer = app.session.map().layer(id).unwrap();
         let before = layer.dataset.features.len();
         let number =
@@ -663,7 +877,7 @@ mod tests {
         state.values.insert(number.clone(), "many".into());
         let mark = app.session.notice_mark();
         assert!(!add_point(&mut app, id, &state));
-        assert_eq!(app.session.map().layer(id).unwrap().dataset.features.len(), before);
+        assert_eq!(count(&app, id), before);
         let said: Vec<_> = app.session.notices_since(mark).iter().filter(|n| n.error).collect();
         assert_eq!(said.len(), 1);
         assert!(said[0].text.contains(&number), "{}", said[0].text);
@@ -679,9 +893,11 @@ mod tests {
         let mut state = Form::default().for_layer(1);
         state.values.insert("name".into(), "Camp".into());
         // The same layer keeps it; another drops it.
+        state.vertices.push((1.0, 2.0));
         let state = state.for_layer(1);
-        assert_eq!(state.values.len(), 1);
-        assert!(state.for_layer(2).values.is_empty());
+        assert_eq!((state.values.len(), state.vertices.len()), (1, 1));
+        let other = state.for_layer(2);
+        assert!(other.values.is_empty() && other.vertices.is_empty());
     }
 
     #[test]
