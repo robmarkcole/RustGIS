@@ -82,14 +82,19 @@ middle of the map: the map is moved under it, and the sheet's fields are filled 
 of the layer's attributes). For a point layer, **Add Point Here** puts the point at the cross.
 For a line or polygon layer, **Add Vertex Here** places a vertex at the cross, the shape so far
 is drawn over the map with a thin line on to the cross, **Undo Vertex** and **Start Over** take
-vertices back, and **Finish** adds the feature once it has enough of them (two for a line, three
-for a polygon). The sheet stays up, emptied, for the next feature. Editing is turned on for the
-map when it was off, and the sheet says so.
+vertices back, and **Finish Line** or **Finish Polygon** adds the feature once it has enough of
+them (two for a line, three for a polygon). The sheet stays up, emptied, for the next feature.
+Editing is turned on for the map when it was off, and the sheet says so.
+
+The form follows the layer's data design. A field with a list of values (a coded-value domain,
+the layer's subtypes, or yes and no) shows a chip for each: one is tapped to choose it, and
+tapped again to leave the field empty. A field with a range says its limits. When the layer has
+feature templates, a **Template** row chooses one, and its defaults fill what the form leaves
+empty; the template stays chosen for the next feature.
 
 What it doesn't do yet: moving or deleting a vertex once the feature is added, snapping, a new
-layer to capture into, value lists and defaults from the layer's design, and keeping the field
-being typed in above the soft keyboard (the keyboard covers the lower fields: close it to reach
-them).
+layer to capture into, marking which fields a rule requires, and keeping the field being typed in
+above the soft keyboard (the keyboard covers the lower fields: close it to reach them).
 
 The interface keeps out of the room the system's bars take: the activity's Java half reports the
 insets, and the bars' icons are drawn dark over a light theme's ground and light over a dark

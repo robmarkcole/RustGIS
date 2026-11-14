@@ -7,9 +7,10 @@
 //!
 //! What is here: the map, the bar (Layers, Add Data, Capture, More), the Layers sheet (show,
 //! hide, zoom to, the active layer), the Capture sheet (a point, line or polygon placed by the cross
-//! on the map, with a field for each of its layer's attributes) and the More sheet (full extent,
-//! project, undo, the desktop interface). Not yet: editing a shape's vertices, snapping, value
-//! lists and defaults in the form, and text input that suits a soft keyboard.
+//! on the map, with a form for its layer's attributes that follows the layer's data design: value
+//! lists, ranges and feature templates) and the More sheet (full extent, project, undo, the
+//! desktop interface). Not yet: editing a shape's vertices, snapping, and text input that suits
+//! a soft keyboard.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 use egui::{Align, Color32, CornerRadius, Layout, Rect, RichText, Sense, Stroke, Ui, Vec2};
@@ -268,6 +269,9 @@ struct Form {
     /// it alone.
     shown: Option<u64>,
     values: std::collections::BTreeMap<String, String>,
+    /// The layer's feature template chosen for the next feature, by name: its defaults fill
+    /// the fields the form leaves empty.
+    template: Option<String>,
     /// The vertices of the line or polygon being drawn, as longitude and latitude, in order.
     vertices: Vec<(f64, f64)>,
 }
@@ -280,6 +284,7 @@ impl Form {
         if self.shown != Some(instance) {
             self.values.clear();
             self.vertices.clear();
+            self.template = None;
             self.shown = Some(instance);
         }
         self
@@ -343,7 +348,8 @@ fn capture_layer(app: &RustGisApp, form: &Form) -> Option<Target> {
 /// its buttons (two rows of them for a line or polygon).
 fn capture_rows(app: &RustGisApp, ctx: &egui::Context) -> usize {
     let Some(target) = capture_layer(app, &form(ctx)) else { return 2 };
-    let fields = app.session.map().layer(target.id).map_or(0, |l| l.dataset.fields.len());
+    let layer = app.session.map().layer(target.id);
+    let fields = layer.map_or(0, |l| l.dataset.fields.len() + usize::from(!l.design.templates.is_empty()));
     fields + if target.kind == GeometryType::Point { 3 } else { 4 }
 }
 
@@ -434,7 +440,10 @@ fn add_feature(app: &mut RustGisApp, id: u32, form: &Form, geometry: Value) -> b
     }
     if !not_numbers.is_empty() {
         let fields = not_numbers.join(", ");
-        app.session.notify(rustgis_ui_egui::i18n::fmt("Nothing was added. Not a number, in: {fields}.", &[("fields", &fields)]), true);
+        app.session.notify(
+            rustgis_ui_egui::i18n::fmt("Nothing was added. Not a value the field can hold, in: {fields}.", &[("fields", &fields)]),
+            true,
+        );
         return false;
     }
     if !app.session.map().editing.settings.enabled {
@@ -443,7 +452,16 @@ fn add_feature(app: &mut RustGisApp, id: u32, form: &Form, geometry: Value) -> b
         }
         app.session.notify(tl!("Editing was turned on for this map."), false);
     }
-    if app.run_by_user("edit.addFeature", json!({"layer": id, "geometry": geometry, "attributes": attributes})).is_err() {
+    let mut feature = json!({"layer": id, "geometry": geometry, "attributes": attributes});
+    // A template chosen while the layer still has it: one removed since is not asked for.
+    let template = form
+        .template
+        .as_ref()
+        .filter(|name| app.session.map().layer(id).is_some_and(|l| l.design.templates.iter().any(|t| &t.name == *name)));
+    if let Some(name) = template {
+        feature["template"] = json!(name);
+    }
+    if app.run_by_user("edit.addFeature", feature).is_err() {
         return false;
     }
     let added = match kind {
@@ -466,6 +484,65 @@ fn add_point(app: &mut RustGisApp, id: u32, form: &Form) -> bool {
         Some(point) => add_feature(app, id, form, point),
         None => false,
     }
+}
+
+/// The values a field takes from a list, as (what is stored, what is shown): the codes of its
+/// coded-value domain, the layer's subtypes for the subtype field, or yes and no for a yes/no
+/// field. `None` for a field that is typed into.
+fn choices(
+    layer: &rustgis_ui_egui::rustgis_engine::map::Layer,
+    field: &rustgis_ui_egui::rustgis_engine::data::Field,
+) -> Option<Vec<(String, String)>> {
+    use rustgis_ui_egui::rustgis_engine::data::FieldType;
+    use rustgis_ui_egui::rustgis_engine::map::design::DomainKind;
+    let same = |name: &str| name.eq_ignore_ascii_case(&field.name);
+    if let Some(subtypes) = layer.design.subtypes.as_ref().filter(|s| same(&s.field)) {
+        return Some(subtypes.subtypes.iter().map(|s| (s.code.to_string(), s.name.clone())).collect());
+    }
+    if let Some(DomainKind::Coded(codes)) = layer.design.domains.iter().find(|d| same(&d.field)).map(|d| &d.kind) {
+        // A code of no text is left out: it would be stored as nothing, and its chip would show
+        // as chosen whenever nothing is.
+        let list: Vec<(String, String)> = codes
+            .iter()
+            .map(|(code, says)| (code.to_string(), says))
+            .filter(|(code, _)| !code.is_empty())
+            .map(|(code, says)| if says.trim().is_empty() { (code.clone(), code) } else { (code, says.clone()) })
+            .collect();
+        // A list with nothing left to offer is no list: the field is typed into.
+        if !list.is_empty() {
+            return Some(list);
+        }
+    }
+    (field.ty == FieldType::Boolean)
+        .then(|| vec![("true".to_string(), tl!("Yes").to_string()), ("false".to_string(), tl!("No").to_string())])
+}
+
+/// The limits of a field's range domain, when it has one.
+fn range_of(layer: &rustgis_ui_egui::rustgis_engine::map::Layer, field: &str) -> Option<(f64, f64)> {
+    use rustgis_ui_egui::rustgis_engine::map::design::DomainKind;
+    layer.design.domains.iter().find(|d| d.field.eq_ignore_ascii_case(field)).and_then(|d| match d.kind {
+        DomainKind::Range { min, max } => Some((min, max)),
+        DomainKind::Coded(_) => None,
+    })
+}
+
+/// A row of chips, one for each of `list` (what is stored, what is shown), scrolled sideways when
+/// it is wider than the sheet. The one whose stored value is `value` is marked; tapping another
+/// makes it the value, and tapping the marked one empties the value, so "nothing chosen" shows
+/// as no chip marked.
+fn chips(ui: &mut Ui, t: &Tokens, salt: impl egui::AsIdSalt, list: &[(String, String)], value: &mut String) {
+    egui::ScrollArea::horizontal().id_salt(salt).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            for (stored, shown) in list {
+                let on = stored == value;
+                let text = RichText::new(shown).size(15.0).color(if on { t.accent_text } else { t.text });
+                let chip = egui::Button::new(text).fill(if on { t.checked } else { t.input }).min_size(Vec2::new(TARGET, TARGET - 8.0));
+                if ui.add(chip).clicked() {
+                    *value = if on { String::new() } else { stored.clone() };
+                }
+            }
+        });
+    });
 }
 
 /// Draws the line or polygon being captured over the map: its vertices, the line through them,
@@ -523,6 +600,16 @@ fn capture(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         return;
     };
     state = state.for_layer(target.instance);
+    // A template chosen and since removed from the layer is let go, and said, before a button can
+    // add a feature without the defaults the form still seemed to promise: nothing is added on
+    // the frame that finds it, so the next tap is made knowing.
+    let on_layer = |name: &String| app.session.map().layer(target.id).is_some_and(|l| l.design.templates.iter().any(|t| &t.name == name));
+    let stale = state.template.clone().filter(|name| !on_layer(name));
+    if let Some(gone) = &stale {
+        state.template = None;
+        app.session.notify(rustgis_ui_egui::i18n::fmt("The template {name} is no longer on this layer.", &[("name", gone)]), false);
+    }
+    let fresh = stale.is_none();
     // The buttons stay in reach above the fields, however many the layer has.
     let cross = cross_place(app);
     let place = match cross {
@@ -534,7 +621,7 @@ fn capture(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     ui.label(RichText::new(place).size(13.0).color(t.text_dim));
     let width = ui.available_width();
     if target.kind == GeometryType::Point {
-        if action(ui, t, tl!("Add Point Here"), width, true, true) && add_point(app, target.id, &state) {
+        if action(ui, t, tl!("Add Point Here"), width, true, true) && fresh && add_point(app, target.id, &state) {
             state.values.clear();
         }
     } else {
@@ -563,6 +650,7 @@ fn capture(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 _ => tl!("Finish Line"),
             };
             if action(ui, t, finish, third, enough, enough)
+                && fresh
                 && let Some(shape) = geometry(target.kind, &state.vertices)
                 && add_feature(app, target.id, &state, shape)
             {
@@ -587,25 +675,51 @@ fn capture(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 }
             });
         });
-        let fields: Vec<_> = app.session.map().layer(target.id).map(|l| l.dataset.fields.clone()).unwrap_or_default();
-        for field in &fields {
+        // Read first: the rows change the form, not the layer.
+        let (fields, templates, lists): (Vec<_>, Vec<String>, Vec<Option<Vec<(String, String)>>>) = match app.session.map().layer(target.id)
+        {
+            Some(l) => (
+                l.dataset.fields.clone(),
+                l.design.templates.iter().map(|template| template.name.clone()).collect(),
+                l.dataset.fields.iter().map(|f| choices(l, f)).collect(),
+            ),
+            None => Default::default(),
+        };
+        // The layer's feature templates: one fills in its defaults for what the form leaves empty.
+        if !templates.is_empty() {
+            ui.horizontal(|ui| {
+                ui.set_min_height(TARGET);
+                ui.add_sized([110.0, TARGET], egui::Label::new(RichText::new(tl!("Template")).size(14.0).color(t.text_dim)).truncate());
+                let picked = state.template.clone().unwrap_or_default();
+                let list: Vec<(String, String)> = templates.iter().map(|name| (name.clone(), name.clone())).collect();
+                let mut chosen = picked.clone();
+                chips(ui, t, "touch_capture_templates", &list, &mut chosen);
+                if chosen != picked {
+                    state.template = Some(chosen).filter(|name| !name.is_empty());
+                }
+            });
+        }
+        for (field, list) in fields.iter().zip(lists) {
             use rustgis_ui_egui::rustgis_engine::data::FieldType;
             let label = field.alias.clone().filter(|a| !a.trim().is_empty()).unwrap_or_else(|| field.name.clone());
             ui.horizontal(|ui| {
                 ui.set_min_height(TARGET);
                 ui.add_sized([110.0, TARGET], egui::Label::new(RichText::new(&label).size(14.0).color(t.text_dim)).truncate());
                 let value = state.values.entry(field.name.clone()).or_default();
-                if field.ty == FieldType::Boolean {
-                    let mut on = value == "true";
-                    if ui.add(egui::Checkbox::without_text(&mut on)).changed() {
-                        *value = if on { "true".into() } else { "false".into() };
-                    }
+                if let Some(list) = list {
+                    // A list of values: one is tapped, and tapped again to leave the field empty.
+                    chips(ui, t, ("touch_capture_values", &field.name), &list, value);
                 } else {
-                    let hint = match field.ty {
-                        FieldType::Integer | FieldType::Double => tl!("a number"),
-                        FieldType::Date => tl!("a date, as 2026-03-05"),
-                        FieldType::DateTime => tl!("a date and time"),
-                        _ => "",
+                    let range = app.session.map().layer(target.id).and_then(|l| range_of(l, &field.name));
+                    let hint = match (field.ty, range) {
+                        (_, Some((min, max))) => rustgis_ui_egui::i18n::fmt(
+                            "a number from {min} to {max}",
+                            &[("min", &min.to_string()), ("max", &max.to_string())],
+                        ),
+                        (FieldType::Integer | FieldType::Double, None) => tl!("a number").to_string(),
+                        (FieldType::Date, None) => tl!("a date, as 2026-03-05").to_string(),
+                        (FieldType::DateTime, None) => tl!("a date and time").to_string(),
+                        _ => String::new(),
                     };
                     let edit = egui::TextEdit::singleline(value)
                         .hint_text(hint)
@@ -889,15 +1003,85 @@ mod tests {
     }
 
     #[test]
+    fn a_fields_list_range_and_template_come_from_the_layers_design() {
+        use rustgis_ui_egui::rustgis_engine::data::{Field, FieldType};
+        let ctx = egui::Context::default();
+        let mut app = RustGisApp::with_sample();
+        let cities = target(&mut app, GeometryType::Point);
+        let fields = app.session.map().layer(cities.id).unwrap().dataset.fields.clone();
+        let text = fields.iter().find(|f| f.ty == FieldType::Text).unwrap().clone();
+        let number = fields.iter().find(|f| matches!(f.ty, FieldType::Integer | FieldType::Double)).unwrap().clone();
+        // No design yet: both are typed into. A yes/no field always has its two values.
+        let layer = app.session.map().layer(cities.id).unwrap();
+        assert_eq!(choices(layer, &text), None);
+        assert_eq!(range_of(layer, &number.name), None);
+        let yes_no = choices(layer, &Field::new("surveyed", FieldType::Boolean)).unwrap();
+        assert_eq!(yes_no.iter().map(|(stored, _)| stored.as_str()).collect::<Vec<_>>(), ["true", "false"]);
+        // A coded domain gives the field a list, shown by description; a range gives its limits.
+        let coded = json!({"layer": cities.id, "field": text.name, "coded": [["cap", "Capital"], ["town", ""]], "force": true});
+        run(&mut app, "data.domain", coded);
+        run(&mut app, "data.domain", json!({"layer": cities.id, "field": number.name, "min": 0, "max": 10, "force": true}));
+        let layer = app.session.map().layer(cities.id).unwrap();
+        assert_eq!(choices(layer, &text), Some(vec![("cap".into(), "Capital".into()), ("town".into(), "town".into())]));
+        assert_eq!(range_of(layer, &number.name), Some((0.0, 10.0)));
+        assert_eq!(choices(layer, &number), None);
+        // A template's defaults fill what the form leaves empty.
+        run(&mut app, "edit.template", json!({"layer": cities.id, "name": "Capital", "defaults": {text.name.clone(): "cap"}}));
+        let state = Form { template: Some("Capital".into()), ..Form::default() };
+        assert!(add_point(&mut app, cities.id, &state));
+        let layer = app.session.map().layer(cities.id).unwrap();
+        let column = layer.dataset.fields.iter().position(|f| f.name == text.name).unwrap();
+        assert_eq!(layer.dataset.features.last().unwrap().attrs[column].to_string(), "cap");
+        // A template the layer no longer has is not asked for: the point is still added.
+        let before = count(&app, cities.id);
+        assert!(add_point(&mut app, cities.id, &Form { template: Some("Gone".into()), ..Form::default() }));
+        assert_eq!(count(&app, cities.id), before + 1);
+        // A value outside the list is refused by the command, and said.
+        let mut state = Form::default();
+        state.values.insert(text.name.clone(), "village".into());
+        let mark = app.session.notice_mark();
+        assert!(!add_point(&mut app, cities.id, &state));
+        assert!(app.session.notices_since(mark).iter().any(|n| n.error));
+        // A code of no text is not offered: it would show as chosen whenever nothing is.
+        run(
+            &mut app,
+            "data.domain",
+            json!({"layer": cities.id, "field": text.name, "coded": [["", "None"], ["cap", "Capital"]], "force": true}),
+        );
+        let layer = app.session.map().layer(cities.id).unwrap();
+        assert_eq!(choices(layer, &text), Some(vec![("cap".into(), "Capital".into())]));
+        // With no code left to offer, the field is typed into, as one without a list is.
+        // (The command itself drops a code of no text; a design read from a project may hold one.)
+        use rustgis_ui_egui::rustgis_engine::data::Value as Stored;
+        use rustgis_ui_egui::rustgis_engine::map::design::{Domain, DomainKind};
+        let mut copy = app.session.map().layer(cities.id).unwrap().clone();
+        copy.design.domains =
+            vec![Domain { field: text.name.clone(), kind: DomainKind::Coded(vec![(Stored::Text(String::new()), "None".into())]) }];
+        assert_eq!(choices(&copy, &text), None);
+        // A template chosen and since removed is let go by the sheet, with a notice.
+        set_form(&ctx, Form { shown: Some(cities.instance), template: Some("Gone".into()), ..Form::default() });
+        let mark = app.session.notice_mark();
+        frame(&mut app, &ctx, Sheet::Capture);
+        assert_eq!(form(&ctx).template, None);
+        assert!(app.session.notices_since(mark).iter().any(|n| n.text.contains("Gone")));
+        // The sheet draws the lists, the range hint and the templates.
+        set_form(&ctx, Form { shown: Some(cities.instance), template: Some("Capital".into()), ..Form::default() });
+        frame(&mut app, &ctx, Sheet::Capture);
+        assert_eq!(form(&ctx).template.as_deref(), Some("Capital"));
+    }
+
+    #[test]
     fn what_is_typed_for_one_layer_is_dropped_for_another() {
         let mut state = Form::default().for_layer(1);
         state.values.insert("name".into(), "Camp".into());
         // The same layer keeps it; another drops it.
         state.vertices.push((1.0, 2.0));
+        state.template = Some("Camp".into());
         let state = state.for_layer(1);
+        assert_eq!(state.template.as_deref(), Some("Camp"));
         assert_eq!((state.values.len(), state.vertices.len()), (1, 1));
         let other = state.for_layer(2);
-        assert!(other.values.is_empty() && other.vertices.is_empty());
+        assert!(other.values.is_empty() && other.vertices.is_empty() && other.template.is_none());
     }
 
     #[test]
