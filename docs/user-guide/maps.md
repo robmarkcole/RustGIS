@@ -37,7 +37,9 @@ tile layers whose capabilities advertise geographic bounds, including WMS. WMS 1
 bounds and WMS 1.1 latitude/longitude bounds are inherited from parent layers when needed and
 saved with the project. Re-add a service layer saved by an older version to retain its bounds.
 Tile layers without known bounds (such as plain XYZ/TMS or MVT templates, styles and MBTiles
-archives) have no **Zoom To Layer** action unless bounds were supplied when adding them.
+archives) have no **Zoom To Layer** action unless bounds were supplied when adding them. A zoom to a
+place the map's projection doesn't reach (wholly past Web Mercator's 85°, say) doesn't move the
+view to it, and says so.
 
 **Rotating and tilting the map.** Drag with the right mouse button, or hold ++ctrl++ and drag
 with the Pan tool, to turn the map about the centre of the view (to the right turns it clockwise)
@@ -685,6 +687,7 @@ masking, swipe, blending, aggregation, graphics, stacked strokes, fills or label
 on the CPU. Extrusions use the GPU only on a tilted map. In the desktop app, if the graphics
 card runs out of memory (a card with 2 GB at a large window size, with other programs using it
 too), the map switches to the CPU, with a notice, instead of the app closing; clicking **CPU**
-in the status bar tries the GPU again, as does the next start (the setting stays on). Any other
-error the graphics card reports is said once, as the map (or, with the map on the CPU, the
-window) may then be drawn wrongly.
+in the status bar tries the GPU again, as does the next start (the setting stays on); errors
+that follow from running out in the same moment aren't said on their own. Any other error the
+graphics card reports is said once, as the map (or, with the map on the CPU, the window) may
+then be drawn wrongly; so is running out of memory with the map already on the CPU.

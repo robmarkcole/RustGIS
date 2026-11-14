@@ -141,14 +141,14 @@ pub(crate) fn drag_start(app: &mut RustGisApp, rect: Rect, origin: Pos2, force_n
     };
     let Some(id) = app.session.active_layer else { return false };
     let (row, original, handle) = match chosen {
-        Some((_, row, b, h)) => {
-            rustgis_engine::cmd::select::set(&mut app.session, id, vec![row], rustgis_engine::cmd::select::Mode::New);
-            app.map.invalidate();
-            (Some(row), b, h)
-        }
+        Some((_, row, b, h)) => (Some(row), b, h),
         None => (None, BoxSpec { frame: Frame::default(), center: [0., 0.], width: 1., height: 1., angle: 0. }, Handle::New),
     };
     let Some(start) = original.frame.to_local(c) else { return false };
+    if let Some(row) = row {
+        rustgis_engine::cmd::select::set(&mut app.session, id, vec![row], rustgis_engine::cmd::select::Mode::New);
+        app.map.invalidate();
+    }
     let Some(l) = app.session.map().layer(id) else { return false };
     app.boxes = State {
         gesture: Some(Gesture {
@@ -189,7 +189,7 @@ fn moved(b: &BoxSpec, start: [f64; 2], p: [f64; 2], h: Handle, shift: bool) -> B
             let angle = |p: [f64; 2]| (p[1] - b.center[1]).atan2(p[0] - b.center[0]);
             next.angle = (b.angle + (angle(p) - angle(start)).to_degrees()).rem_euclid(360.);
             if shift {
-                next.angle = (next.angle / 15.).round() * 15.;
+                next.angle = ((next.angle / 15.).round() * 15.).rem_euclid(360.);
             }
         }
         Handle::Resize(x, y) => {
@@ -445,6 +445,21 @@ mod tests {
         assert_eq!((moved.width, moved.height, moved.angle), (resized.width, resized.height, resized.angle));
         assert_ne!(moved.center, resized.center);
     }
+    #[test]
+    fn box_edit_snapping_back_to_zero_does_not_add_an_undo_step() {
+        let mut app = app();
+        let (id, row, b) = create(&mut app);
+        assert_eq!(b.angle, 0.);
+        let depth = app.session.undo_depth();
+        let paddle = handles(&app, rect(), &b).into_iter().find(|(h, _)| matches!(h, Handle::Rotate)).unwrap().1;
+        assert!(drag_start(&mut app, rect(), paddle, false));
+        drag_to(&mut app, rect(), paddle - vec2(1., 0.), true);
+        assert_eq!(app.boxes.preview.as_ref().unwrap().angle, 0.);
+        drag_stop(&mut app);
+        assert_eq!(app.session.box_spec(id, row), Some(b));
+        assert_eq!(app.session.undo_depth(), depth);
+    }
+
     #[test]
     fn box_edit_replaced_rows_or_project_cancel_a_held_gesture() {
         let mut app = app();

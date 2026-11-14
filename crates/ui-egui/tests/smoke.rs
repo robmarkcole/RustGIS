@@ -1457,6 +1457,58 @@ fn connections_persist_and_import_once() {
     assert!(empty.session.connections.connections.is_empty(), "an empty saved list must not import again");
 }
 
+/// Saved connections from a newer RustGIS (#1405): a preference of a newer version is said, isn't
+/// used and stays byte for byte through other changes to the preferences, recording a recent
+/// source among them; rows and fields this version can't read survive a connection made here.
+#[test]
+fn connections_from_a_newer_version_survive_other_changes() {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    let newer = json!({"version": 2, "next": 2, "connections": [{"id": "c1", "name": "A", "kind": "wms", "address": "https://a.example"}]})
+        .to_string();
+    let future_row = json!({"id": "c5", "name": "Bucket", "kind": "gcs", "address": "https://g.example"});
+    let unknown = json!({"version": 1, "next": 2, "connections": [
+        {"id": "c1", "name": "A", "kind": "wms", "address": "https://a.example", "refresh": 30},
+        future_row.clone()
+    ]})
+    .to_string();
+    for text in [newer.clone(), unknown] {
+        let store = Arc::new(Mutex::new(HashMap::from([("connections".to_string(), text.clone())])));
+        let (load, save) = (store.clone(), store.clone());
+        let services = rustgis_ui_egui::Services {
+            load_pref: Some(Box::new(move |k| load.lock().unwrap().get(k).cloned())),
+            save_pref: Some(Box::new(move |k, v| {
+                save.lock().unwrap().insert(k.to_string(), v.to_string());
+            })),
+            ..Default::default()
+        };
+        let mut app = RustGisApp::with_sample().with_services(services);
+        let said: Vec<_> = app.session.notices_since(0).iter().map(|n| n.text.clone()).collect();
+        assert!(said.iter().any(|t| t.contains("saved connection")), "{said:?}");
+        app.session.sources.note(rustgis_engine::sources::Source {
+            kind: "url".into(),
+            name: "Recent".into(),
+            address: "https://r.example/a.geojson".into(),
+            extra: serde_json::Value::Null,
+        });
+        app.run("sources.favourite", json!({"kind": "url", "address": "https://f.example/b.geojson"})).unwrap();
+        let added = app.run("connection.new", json!({"kind": "wms", "name": "New", "address": "https://n.example/wms"}));
+        let stored = store.lock().unwrap()["connections"].clone();
+        if text == newer {
+            assert!(added.unwrap_err().contains("newer RustGIS"));
+            assert!(app.session.connections.connections.is_empty());
+            assert_eq!(stored, text, "a newer version's connections stay as they were");
+        } else {
+            added.unwrap();
+            let stored: serde_json::Value = serde_json::from_str(&stored).unwrap();
+            let rows = stored["connections"].as_array().unwrap();
+            assert_eq!(rows.len(), 3);
+            assert_eq!(rows[0]["refresh"], 30);
+            assert_eq!(rows[2], future_row);
+        }
+    }
+}
+
 /// Settings › Start-up › Start With a project (#377): the last one opened or saved, or one picked
 /// once. It opens with its own projection and view, a shell's `blank` still wins, one that no
 /// longer opens leaves the sample with a notice, and after a crash none is opened.

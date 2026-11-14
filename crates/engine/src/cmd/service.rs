@@ -942,6 +942,9 @@ pub(crate) fn layers(s: &mut Session, p: &Value) -> CmdResult {
     if let Some(next) = found.next {
         out["next"] = json!(next);
     }
+    if !s.policy_user() {
+        crate::sources::redact_url_fields(&mut out);
+    }
     Ok(out)
 }
 
@@ -1353,7 +1356,9 @@ fn add_discovered(s: &mut Session, p: &Value, url: &str, want: &str, found: &Dis
                     // Over an area, the features crossing it: the view stays, or goes to a box given
                     // (the whole layer's bounds would show a country to fill one state).
                     match (asked.is_some(), area, p.get("bbox")) {
-                        (true, Some([w, so, e, n]), Some(Value::Array(_))) => s.zoom_to(&rustgis_geom::Extent::new(w, so, e, n)),
+                        (true, Some([w, so, e, n]), Some(Value::Array(_))) => {
+                            s.zoom_to(&rustgis_geom::Extent::new(w, so, e, n));
+                        }
                         (true, ..) => {}
                         _ => zoom(s),
                     }
@@ -1488,6 +1493,9 @@ fn coverage(s: &mut Session, p: &Value) -> CmdResult {
     if anonymous {
         out["anonymous"] = json!(true);
     }
+    if !s.policy_user() {
+        crate::sources::redact_url_fields(&mut out);
+    }
     Ok(out)
 }
 
@@ -1550,6 +1558,9 @@ pub(super) fn catalog_search(s: &mut Session, p: &Value) -> CmdResult {
     if dropped > 0 {
         out["notes"] =
             json!([format!("{dropped} links point to addresses RustGIS won't fetch for a catalogue on the web and are left out")]);
+    }
+    if !s.policy_user() {
+        crate::sources::redact_url_fields(&mut out);
     }
     Ok(out)
 }

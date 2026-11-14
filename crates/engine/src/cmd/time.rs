@@ -103,7 +103,12 @@ pub fn info(s: &Session) -> Value {
             Some(json!({"layer": l.name, "field": t.field, "shown": in_window, "features": n}))
         })
         .collect();
-    let tiles: Vec<Value> = m.tiles.iter().filter(|t| t.time_url.is_some()).map(|t| json!({"name": t.name, "url": t.url})).collect();
+    let tiles: Vec<Value> = m
+        .tiles
+        .iter()
+        .filter(|t| t.time_url.is_some())
+        .map(|t| json!({"name": t.name, "url": crate::sources::redact_output(&t.url)}))
+        .collect();
     let Some(t) = &m.time else { return json!({"on": false, "layers": bound, "tiles": tiles}) };
     let steps = t.steps();
     let (from, to) = t.window();

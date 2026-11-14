@@ -340,7 +340,7 @@ fn terrain(s: &mut Session, p: &Value) -> CmdResult {
     let out = json!({
         "source": match &t.source {
             TerrainSource::Layer(n) => json!({"layer": n}),
-            TerrainSource::Tiles { url, encoding } => json!({"tiles": url, "encoding": encoding.code()}),
+            TerrainSource::Tiles { url, encoding } => json!({"tiles": crate::sources::redact_output(url), "encoding": encoding.code()}),
         },
         "exaggeration": t.exaggeration,
     });

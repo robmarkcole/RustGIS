@@ -359,6 +359,15 @@ impl<'a> Prepare<'a> {
         }
     }
 
+    /// Cleans secrets and credentialed addresses inside a saved DuckDB SQL query.
+    pub(crate) fn sql(&mut self, leaf: Leaf, value: &str) {
+        let clean = crate::roles::sql_secrets_removed(value);
+        if clean != value {
+            self.report.addresses = self.report.addresses.saturating_add(1);
+            self.edit(leaf, Payload::Text(clean), Kind::Credential);
+        }
+    }
+
     /// Prepares both fields of one replayable command, counting the owning step once.
     pub(crate) fn command(&mut self, leaf: Leaf, id_leaf: Leaf, id: &str, value: &Value) {
         self.executable((leaf, id_leaf), id, value, crate::roles::command(id, value, self.depth));
@@ -747,7 +756,7 @@ fn public_address_at(address: &str, depth: usize) -> Kept {
 /// A COG address without its look (`…#bands=…`), and the look as written. A reader takes any word
 /// for `dequantize` and `cube`, but a saved look holds only numbers and these keys' own words: any
 /// other, or a key not named here, stays in the address and goes as any other fragment does.
-fn split_look(address: &str) -> (&str, &str) {
+pub(crate) fn split_look(address: &str) -> (&str, &str) {
     let file = crate::render::rustgis_tiles::cog::split(address).0;
     let look = address.get(file.len()..).unwrap_or("");
     let plain = look.split(['#', '&']).filter(|kv| !kv.is_empty()).all(|kv| {
@@ -818,7 +827,11 @@ impl Durable for rustgis_map::Map {
     /// Offers classified whole fields once, before any live mutation.
     fn prepare(&self, p: &mut Prepare<'_>) {
         for s in self.slots() {
-            p.string(Leaf::Map(s.at), s.value, s.address, s.local_path);
+            if matches!(s.at, rustgis_map::SlotPos::Layer { role: rustgis_map::LayerRole::DuckDbSql, .. }) {
+                p.sql(Leaf::Map(s.at), s.value);
+            } else {
+                p.string(Leaf::Map(s.at), s.value, s.address, s.local_path);
+            }
         }
         for l in &self.layers {
             p.count_layer_numbers(l);
@@ -839,7 +852,11 @@ impl Durable for rustgis_map::Layer {
     /// Offers classified whole fields once, before any live mutation.
     fn prepare(&self, p: &mut Prepare<'_>) {
         for (role, value, address, path) in self.output_slots() {
-            p.string(Leaf::Layer(role), value, address, path);
+            if role == rustgis_map::LayerRole::DuckDbSql {
+                p.sql(Leaf::Layer(role), value);
+            } else {
+                p.string(Leaf::Layer(role), value, address, path);
+            }
         }
         p.count_layer_numbers(self);
     }

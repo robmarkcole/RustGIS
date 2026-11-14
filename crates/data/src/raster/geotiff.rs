@@ -807,12 +807,23 @@ fn lzw<R: Read + Seek>(dec: &mut Decoder<R>) -> bool {
     dec.find_tag_unsigned::<u16>(Tag::Compression).ok().flatten() == Some(5)
 }
 
-/// Decodes chunk `index` (a strip or tile) of the current image. The `tiff` crate fails on some
-/// LZW chunks it should read (issue #350): those are decoded by [`super::lzw`] instead.
-pub(crate) fn read_chunk<R: Read + Seek>(dec: &mut Decoder<R>, index: u32) -> Result<DecodingResult> {
+/// Decodes chunk `index` (a strip or tile) of the current image: its samples, and which of them
+/// its own encoding marks invalid (LERC's validity masks), for the caller to make no-data with
+/// [`super::lerc::blank`]. The `tiff` crate fails on some LZW chunks it should read (issue #350):
+/// those are decoded by [`super::lzw`] instead. It has no LERC codec: LERC chunks are decoded by
+/// [`super::lerc`] (#1818), `table` keeping the image's chunk offsets from one call to the next.
+pub(crate) fn read_chunk<R: Read + Seek>(
+    dec: &mut Decoder<R>,
+    index: u32,
+    table: &mut super::lerc::Table,
+) -> Result<(DecodingResult, Option<Vec<bool>>)> {
+    if super::lerc::is_lerc(dec) {
+        let c = super::lerc::chunk(dec, index, table)?;
+        return Ok((c.samples, c.gaps));
+    }
     match dec.read_chunk(index) {
-        Ok(v) => Ok(v),
-        Err(e) if lzw(dec) => super::lzw::chunk(dec, index).map_err(|_| err(e)),
+        Ok(v) => Ok((v, None)),
+        Err(e) if lzw(dec) => super::lzw::chunk(dec, index).map(|v| (v, None)).map_err(|_| err(e)),
         Err(e) => Err(err(e)),
     }
 }
@@ -1157,6 +1168,8 @@ const PARALLEL_CHUNKS: u64 = 16;
 /// made as it is read, for a file too large to hold that has none. Returns the bands. With `k`
 /// 1, the whole image a chunk at a time. With `open`, chunks are decoded on several threads,
 /// each reading image `image` of its own copy of the file.
+/// Progress counts chunks examined, including ones skipped by the overview. Cancel is checked
+/// between chunks; decoding and placing an individual chunk cannot be interrupted.
 #[allow(clippy::too_many_arguments)]
 fn decimate<R: Read + Seek>(
     dec: &mut Decoder<R>,
@@ -1168,6 +1181,7 @@ fn decimate<R: Read + Seek>(
     nodata: Uncounted,
     open: Option<(Opener<'_>, usize, Limits)>,
 ) -> Result<(Vec<Vec<f32>>, &'static str, Vec<u64>)> {
+    crate::progress::check()?;
     let k = k.max(1);
     let (ow, oh) = (w.div_ceil(k) as usize, h.div_ceil(k) as usize);
     let mut bands = (0..nbands).map(|_| super::filled(ow, oh, f32::NAN)).collect::<Result<Vec<_>>>()?;
@@ -1187,16 +1201,23 @@ fn decimate<R: Read + Seek>(
         }
     }
     let _ = open;
+    crate::progress::begin(usize::try_from(chunks.count()).unwrap_or(usize::MAX));
     let mut data_type = "Float32";
     let mut rounded = vec![0u64; nbands];
+    let mut table = super::lerc::Table::default();
     for i in 0..chunks.count() {
-        let Some((plane, index)) = chunks.wanted(i, k) else { continue };
-        let buf = read_chunk(dec, index)?;
-        let changed = rounded_bits(&buf, nodata);
-        let (values, dt) = to_f32(buf, (ow, oh))?;
-        data_type = dt;
-        chunks.place(&mut bands, &values, changed.as_deref(), &mut rounded, plane, index, k, ow);
+        crate::progress::check()?;
+        if let Some((plane, index)) = chunks.wanted(i, k) {
+            let (buf, gaps) = read_chunk(dec, index, &mut table)?;
+            let changed = rounded_bits(&buf, nodata);
+            let (mut values, dt) = to_f32(buf, (ow, oh))?;
+            super::lerc::blank(&mut values, gaps.as_deref());
+            data_type = dt;
+            chunks.place(&mut bands, &values, changed.as_deref(), &mut rounded, plane, index, k, ow);
+        }
+        crate::progress::step(1)?;
     }
+    crate::progress::check()?;
     Ok((bands, data_type, rounded))
 }
 
@@ -1216,6 +1237,9 @@ fn decimate_parallel(
 ) -> Result<(Vec<Vec<f32>>, &'static str, Vec<u64>)> {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    crate::progress::begin(usize::try_from(chunks.count()).unwrap_or(usize::MAX));
+    crate::progress::check()?;
+    let probe = crate::progress::current();
     let next = AtomicU64::new(0);
     let failed = AtomicBool::new(false);
     let failure: Mutex<Option<DataError>> = Mutex::new(None);
@@ -1228,24 +1252,38 @@ fn decimate_parallel(
         }
     };
     let work = || {
+        let _guard = crate::progress::install(probe.clone());
+        if let Err(e) = crate::progress::check() {
+            return fail(e);
+        }
         let dec = open().map_err(err).and_then(|r| Decoder::new(r).map_err(err)).map(|d| d.with_limits(limits.clone()));
         let mut dec = match dec.and_then(|mut d| d.seek_to_image(image).map_err(err).map(|()| d)) {
             Ok(d) => d,
             Err(e) => return fail(e),
         };
+        let mut table = super::lerc::Table::default();
         while !failed.load(Ordering::Relaxed) {
+            if let Err(e) = crate::progress::check() {
+                return fail(e);
+            }
             let i = next.fetch_add(1, Ordering::Relaxed);
             if i >= chunks.count() {
                 break;
             }
-            let Some((plane, index)) = chunks.wanted(i, k) else { continue };
-            match read_chunk(&mut dec, index) {
-                Ok(buf) => {
+            let Some((plane, index)) = chunks.wanted(i, k) else {
+                if let Err(e) = crate::progress::step(1) {
+                    return fail(e);
+                }
+                continue;
+            };
+            match read_chunk(&mut dec, index, &mut table) {
+                Ok((buf, gaps)) => {
                     let changed = rounded_bits(&buf, nodata);
-                    let (values, dt) = match to_f32(buf, (ow, oh)) {
+                    let (mut values, dt) = match to_f32(buf, (ow, oh)) {
                         Ok(v) => v,
                         Err(e) => return fail(e),
                     };
+                    super::lerc::blank(&mut values, gaps.as_deref());
                     if let Ok(mut o) = out.lock() {
                         let (bands, data_type, rounded) = &mut *o;
                         *data_type = dt;
@@ -1253,6 +1291,9 @@ fn decimate_parallel(
                     }
                 }
                 Err(e) => return fail(e),
+            }
+            if let Err(e) = crate::progress::step(1) {
+                return fail(e);
             }
         }
     };
@@ -1271,6 +1312,7 @@ fn decimate_parallel(
     if let Some(e) = failure.into_inner().ok().flatten() {
         return Err(e);
     }
+    crate::progress::check()?;
     out.into_inner().map_err(|_| err("a chunk couldn't be decoded"))
 }
 
@@ -1529,7 +1571,10 @@ pub(super) fn read_limited_with_nodata(
     // A large image, from a file, is read a chunk at a time on several threads (not one of
     // fewer than 8 bits a sample, whose chunks pack several pixels to a byte).
     let chunked = open.is_some() && n >= 1 << 20 && bits(&mut dec) >= 8;
-    let whole = if decimate_by > 1 || extra_samples || planar_tiles || chunked {
+    // The decoder has no LERC codec: such an image is read a chunk at a time, every chunk decoded
+    // by [`super::lerc`] (#1818).
+    let lerc = super::lerc::is_lerc(&mut dec);
+    let whole = if decimate_by > 1 || extra_samples || planar_tiles || chunked || lerc {
         None
     } else {
         let mut buf = DecodingResult::U8(Vec::new());
@@ -1972,6 +2017,84 @@ fn encode(r: &Raster, band: usize, every: bool) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::raster::tests::small;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn chunked_reads_count_progress_and_stop_before_or_during_serial_and_parallel_work() {
+        use crate::progress::{install, tests::Counted};
+        use std::io::Cursor;
+        use std::sync::atomic::Ordering;
+
+        // Sixteen strips; k=4 skips twelve of them, but progress still reaches its total.
+        let values: Vec<f32> = (0..256).map(|i| i as f32).collect();
+        let mut encoded = Cursor::new(Vec::new());
+        {
+            let mut enc = tiff::encoder::TiffEncoder::new(&mut encoded).unwrap();
+            let mut img = enc.new_image::<tiff::encoder::colortype::Gray32Float>(16, 16).unwrap();
+            img.rows_per_strip(1).unwrap();
+            img.write_data(&values).unwrap();
+        }
+        let bytes = encoded.into_inner();
+        for parallel in [false, true] {
+            for k in [1u32, 4] {
+                for after in [None, Some(0), Some(1)] {
+                    let probe = after.map_or_else(|| std::sync::Arc::new(Counted::default()), Counted::cancelling_after);
+                    let mut dec = Decoder::new(Cursor::new(&bytes)).unwrap();
+                    let chunks = Chunks::new(&mut dec, 16, 16, 1, false);
+                    let _guard = install(Some(probe.clone()));
+                    let got = if parallel {
+                        let caller = std::thread::current().id();
+                        let open = || {
+                            // Make a worker, rather than the calling thread, count the first
+                            // chunk. This catches a missing thread-local probe handover even
+                            // when the caller could otherwise decode the entire tiny fixture.
+                            if std::thread::current().id() == caller {
+                                let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                                while probe.done.load(Ordering::Relaxed) == 0 {
+                                    if std::time::Instant::now() >= end {
+                                        return Err(std::io::Error::other("worker never reported chunk progress"));
+                                    }
+                                    std::thread::yield_now();
+                                }
+                            }
+                            reader(Cursor::new(bytes.clone()))
+                        };
+                        let side = 16usize.div_ceil(k as usize);
+                        decimate_parallel(
+                            chunks,
+                            vec![vec![f32::NAN; side * side]],
+                            k,
+                            (side, side),
+                            Uncounted::new(None, None),
+                            2,
+                            &open,
+                            0,
+                            Limits::default(),
+                        )
+                    } else {
+                        decimate(&mut dec, 16, 16, 1, false, k, Uncounted::new(None, None), None)
+                    };
+                    if let Some(after) = after {
+                        assert!(matches!(got, Err(DataError::Cancelled)), "parallel={parallel}, k={k}, after={after}: {got:?}");
+                        let done = probe.done.load(Ordering::Relaxed);
+                        assert!(done >= after && done < 16, "{done} chunks counted before Cancel");
+                        assert!(matches!(crate::progress::check(), Err(DataError::Cancelled)), "the caller keeps its probe");
+                    } else {
+                        let (bands, data_type, rounded) = got.unwrap();
+                        let expected: Vec<f32> = (0..16)
+                            .step_by(k as usize)
+                            .flat_map(|y| (0..16).step_by(k as usize).map(move |x| (y * 16 + x) as f32))
+                            .collect();
+                        assert_eq!(bands, vec![expected]);
+                        assert_eq!(data_type, "Float32");
+                        assert_eq!(rounded, vec![0]);
+                        assert_eq!(probe.total.load(Ordering::Relaxed), 16);
+                        assert_eq!(probe.done.load(Ordering::Relaxed), 16);
+                    }
+                }
+            }
+        }
+    }
 
     /// Who holds the rights (the Copyright tag) is written by both writers and read back, as the
     /// ASCII a TIFF tag holds (`©` as `(c)`, control characters as spaces, others as `?`); a

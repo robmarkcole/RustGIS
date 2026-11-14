@@ -203,6 +203,72 @@ fn retype_columns(dbf: &mut [u8], from: u8, to: u8) -> Vec<usize> {
     changed
 }
 
+/// A column of a `.dbf` as its header describes it: its name's bytes (up to the first NUL),
+/// type letter, length in bytes and decimals.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Column {
+    pub name: Vec<u8>,
+    pub ty: u8,
+    pub len: u8,
+    pub decimals: u8,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+/// A `.dbf` read as its bytes, without decoding a value: its columns, and each record that isn't
+/// marked deleted, as the bytes of each of its columns. `None` when the header doesn't describe
+/// records that fit the file.
+pub(crate) struct RawTable<'a> {
+    pub columns: Vec<Column>,
+    pub records: Vec<Vec<&'a [u8]>>,
+    /// The records marked deleted, which aren't among `records`.
+    pub deleted: usize,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+/// Reads `dbf` as a [`RawTable`]: what a rewrite is compared with, byte for byte, where a
+/// decoded value would hide a difference (text with leading spaces, which a read trims; a code
+/// page's bytes).
+pub(crate) fn raw_table(dbf: &[u8]) -> Option<RawTable<'_>> {
+    let le16 = |at: usize| Some(usize::from(u16::from_le_bytes([*dbf.get(at)?, *dbf.get(at + 1)?])));
+    let count = usize::try_from(u32::from_le_bytes(dbf.get(4..8)?.try_into().ok()?)).ok()?;
+    let (header_len, record_len) = (le16(8)?, le16(10)?);
+    let mut columns = Vec::new();
+    for start in (32..header_len.min(dbf.len())).step_by(32) {
+        let d = dbf.get(start..start + 32).filter(|d| d.first() != Some(&0x0D));
+        let Some(d) = d else { break };
+        let name = d.get(..11)?;
+        let name = name.get(..name.iter().position(|b| *b == 0).unwrap_or(11))?.to_vec();
+        columns.push(Column { name, ty: *d.get(11)?, len: *d.get(16)?, decimals: *d.get(17)? });
+    }
+    let width: usize = 1 + columns.iter().map(|c| usize::from(c.len)).sum::<usize>();
+    if width != record_len || record_len == 0 {
+        return None;
+    }
+    let body = dbf.get(header_len..)?;
+    // Every byte must belong to a counted record or the optional EOF marker. A rewrite
+    // must not discard uncounted records or other data left past the declared body.
+    let trailing = body.get(count.checked_mul(record_len)?..)?;
+    if !trailing.is_empty() && trailing != [0x1a] {
+        return None;
+    }
+    let (mut records, mut deleted) = (Vec::new(), 0);
+    for record in body.chunks_exact(record_len).take(count) {
+        if record.first() == Some(&b'*') {
+            deleted += 1;
+            continue;
+        }
+        let mut at = 1;
+        let mut values = Vec::with_capacity(columns.len());
+        for c in &columns {
+            let end = at + usize::from(c.len);
+            values.push(record.get(at..end)?);
+            at = end;
+        }
+        records.push(values);
+    }
+    Some(RawTable { columns, records, deleted })
+}
+
 /// A date (`D`) field's value, `YYYYMMDD`: `Ok(None)` when it's blank or zeros, as writers leave
 /// a date empty, and `Err(())` when it isn't a date (`20260230`, `2026-3-5`).
 pub(crate) fn date(field: &[u8]) -> std::result::Result<Option<crate::date::Date>, ()> {
@@ -280,17 +346,18 @@ mod tests {
         assert!(dates_as_text(&mut [0u8; 10]).is_empty());
     }
 
-    /// Floating point columns are marked as numeric, so `dbase` reads them as `f64`; others are kept.
+    /// Float columns are marked as numeric columns; others, and what follows the header, are kept.
     #[test]
     fn float_columns_read_as_numeric() {
-        let mut dbf = vec![0u8; 32 + 3 * 32 + 1];
-        dbf[8] = (dbf.len()) as u8;
-        for (k, ty) in b"NFf".iter().copied().enumerate() {
+        let mut dbf = vec![0u8; 32 + 3 * 32 + 2];
+        dbf[8] = (32 + 3 * 32 + 1) as u8;
+        for (k, ty) in b"FfC".iter().copied().enumerate() {
             dbf[32 + k * 32 + 11] = ty;
         }
         dbf[32 + 3 * 32] = 0x0D;
+        dbf[32 + 3 * 32 + 1] = b'F';
         floats_as_numeric(&mut dbf);
-        assert_eq!([dbf[43], dbf[75], dbf[107]], [b'N', b'N', b'N']);
+        assert_eq!([dbf[43], dbf[75], dbf[107], dbf[129]], [b'N', b'N', b'C', b'F']);
         floats_as_numeric(&mut [0u8; 10]);
     }
 

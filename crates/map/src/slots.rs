@@ -17,6 +17,7 @@ pub enum LayerRole {
     ZarrStore,
     GdalPath,
     DuckDbDatabase,
+    DuckDbSql,
     GpkgPath,
     PostgisEditDatabase,
     PostgisDatabase,

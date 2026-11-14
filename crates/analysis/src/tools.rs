@@ -4785,6 +4785,9 @@ fn kernel_density_tool(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String>
         ));
     };
 
+    if crs.is_geocentric() {
+        return Err("kernel density requires a projected coordinate system with linear units (such as UTM or State Plane), not a geocentric one (X, Y and Z from the Earth's centre). Provide a projected system under 'crs' (e.g. EPSG:32618)".into());
+    }
     if crs.is_geographic() {
         if !crs_text.is_empty() {
             return Err("crs must be a projected coordinate system with linear units (such as UTM or State Plane, e.g. EPSG:32618), not geographic coordinates (degrees)".into());
@@ -10947,6 +10950,31 @@ mod tests {
         let e = with_budget(BUFFER_STORAGE_ERROR.to_string(), 512 << 20);
         assert!(e.starts_with(BUFFER_STORAGE_ERROR) && e.contains("512 MiB"), "{e}");
         assert_eq!(with_budget("Distance must be a number".into(), 512 << 20), "Distance must be a number");
+    }
+
+    #[test]
+    fn kernel_density_refuses_explicit_and_inherited_geocentric_systems() {
+        let mut pts = Dataset::new("pts", GeometryType::Point, vec![]);
+        // At the equator, dropping geocentric Z can even round-trip these points, so the
+        // existing unplaceable-point check alone cannot refuse this three-dimensional CRS.
+        pts.push(Some(Geometry::Point(Coord::new(-75.0, 0.0))), vec![]);
+        pts.push(Some(Geometry::Point(Coord::new(-74.99, 0.0))), vec![]);
+        let mut m = Map(HashMap::from([("pts".to_string(), pts)]));
+        let projected = serde_json::json!({"input": "pts", "crs": "EPSG:32618", "radius": 1000.0, "pixelSize": 250.0});
+        crate::run("kernelDensity", &m, &projected).unwrap();
+        for text in ["EPSG:4978", "+proj=geocent +datum=WGS84 +units=m +no_defs"] {
+            let mut explicit = projected.clone();
+            explicit["crs"] = serde_json::json!(text);
+            let error = crate::run("kernelDensity", &m, &explicit).unwrap_err();
+            assert!(error.contains("geocentric") && error.contains("projected") && error.contains("EPSG:32618"), "{error}");
+            m.0.get_mut("pts").unwrap().crs = Some(Crs::parse(text).unwrap());
+            let mut inherited = projected.clone();
+            inherited.as_object_mut().unwrap().remove("crs");
+            let error = crate::run("kernelDensity", &m, &inherited).unwrap_err();
+            assert!(error.contains("geocentric") && error.contains("projected"), "{error}");
+            // An explicit projected target still overrides the layer's default system.
+            crate::run("kernelDensity", &m, &projected).unwrap();
+        }
     }
 
     #[test]

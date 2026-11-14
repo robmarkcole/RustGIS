@@ -28,6 +28,9 @@ mod remembered_database_packets;
 #[path = "tests/service_logins.rs"]
 mod service_logins;
 
+#[path = "tests/scopes_and_redaction.rs"]
+mod scopes_and_redaction;
+
 /// Keeps tests away from the user's installed plugins.
 fn isolate_plugins() {
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -2136,6 +2139,8 @@ fn qgis_bookmarks_relations_rotation_and_time_import() {
         <relation id="own" name="Owners of parcel" referencedLayer="parcels_1" referencingLayer="owners_1" strength="Association"><fieldRef referencedField="id" referencingField="pid"/></relation>
         <relation id="gone" name="To nowhere" referencedLayer="parcels_1" referencingLayer="missing_1" strength="Association"><fieldRef referencedField="id" referencingField="pid"/></relation>
         <relation id="trip" name="Trip names" referencedLayer="trip_1" referencingLayer="owners_1" strength="Association"><fieldRef referencedField="name" referencingField="pid"/></relation>
+        <relation id="points" name="Trip points" referencedLayer="trip_1" referencingLayer="owners_1" strength="Association"><fieldRef referencedField="points" referencingField="pid"/></relation>
+        <relation id="self" name="Trip self" referencedLayer="trip_1" referencingLayer="trip_1" strength="Association"><fieldRef referencedField="points" referencingField="track"/></relation>
       </relations>
       <Bookmarks>
         <Bookmark extent="Polygon ((8.4 47.3, 8.6 47.3, 8.6 47.45, 8.4 47.45, 8.4 47.3))" group="" id="a" name="Zurich" rotation="0"><spatialrefsys><authid>EPSG:4326</authid></spatialrefsys></Bookmark>
@@ -2175,7 +2180,7 @@ fn qgis_bookmarks_relations_rotation_and_time_import() {
     assert!(notes.contains("its bookmarks in a coordinate system RustGIS can't read (1: Odd)"), "{notes}");
     assert!(notes.contains("its bookmarks whose place lies outside their coordinate system's area (1: Beyond)"), "{notes}");
     let rels = &m.editing.relationships;
-    assert_eq!(rels.len(), 1, "{notes}");
+    assert_eq!(rels.len(), 2, "{notes}");
     let r = &rels[0];
     assert_eq!(
         (r.name.as_str(), r.origin.as_str(), r.origin_key.as_str(), r.destination.as_str(), r.destination_key.as_str()),
@@ -2190,6 +2195,14 @@ fn qgis_bookmarks_relations_rotation_and_time_import() {
             .contains("its relations to a layer that came in as several tables with the field, any of which it could mean (1: Trip names)"),
         "{notes}"
     );
+    // A relation of it to itself whose fields are in two of its tables (tracks and track points):
+    // not made, and said why.
+    assert!(notes.contains("whose two fields are in two of the tables it came in as, neither holding both (1: Trip self)"), "{notes}");
+    // Of its tables, only the tracks have `points` (routes have it too, but this file has none):
+    // related to them, said to be a guess.
+    assert_eq!((rels[1].name.as_str(), rels[1].origin_key.as_str()), ("Trip points", "points"));
+    assert!(notes.contains("related to the one table with the field, QGIS's own not being known (1: Trip points)"), "{notes}");
+    assert!(!notes.contains("not being known (2"), "{notes}");
     // Bound, the slider off: every feature shows, as QGIS opens a project.
     let events = m.layer_by_name("events").unwrap();
     assert_eq!(events.time.as_ref().map(|t| t.field.as_str()), Some("when"));
@@ -4313,6 +4326,39 @@ fn shaded_relief_keeps_its_sky_visibility() {
     s.notices.clear();
     assert!(crate::cmd::share::map_png(&mut s, Some(300.0), Some(200.0), None).unwrap().len() > 1000);
     assert!(s.notices.iter().all(|n| !n.text.contains("sky")), "{:?}", s.notices);
+}
+
+/// Shaded Relief's fill light is set, clamped, kept when left out, saved with the project only
+/// when there is some, and back when the project is opened again.
+#[test]
+fn shaded_relief_keeps_its_fill_light() {
+    let mut s = with_raster();
+    let fill = |s: &Session| match s.map().layers.iter().find_map(|l| l.raster.as_ref()).map(|r| &r.style.renderer) {
+        Some(rustgis_map::RasterRenderer::ShadedRelief { fill, .. }) => *fill,
+        other => panic!("{other:?}"),
+    };
+    let fills_saved = |s: &mut Session| s.project.saved_text(None).unwrap().0.matches("\"fill\"").count();
+    let before = fills_saved(&mut s);
+    s.run("raster.symbology", &json!({"type": "shadedRelief"})).unwrap();
+    assert_eq!((fill(&s), fills_saved(&mut s)), (0.0, before), "none, and not saved");
+    s.run("raster.symbology", &json!({"type": "shadedRelief", "fill": 0.3})).unwrap();
+    s.run("raster.symbology", &json!({"type": "shadedRelief", "azimuth": 200})).unwrap();
+    assert_eq!(fill(&s), 0.3, "left out, kept");
+    assert_eq!(fills_saved(&mut s), before + 1);
+    s.run("raster.symbology", &json!({"type": "shadedRelief", "fill": -2})).unwrap();
+    assert_eq!(fill(&s), 0.0);
+    s.run("raster.symbology", &json!({"type": "shadedRelief", "fill": 7})).unwrap();
+    assert_eq!(fill(&s), 1.0);
+    s.run("raster.symbology", &json!({"type": "shadedRelief", "fill": 0.45})).unwrap();
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let dir = std::env::temp_dir().join(format!("rustgis-fill-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("fill.rgis");
+    s.run("project.saveAs", &json!({"path": path.display().to_string()})).unwrap();
+    let mut t = Session::new(Project::default());
+    t.run("project.open", &json!({"path": path.display().to_string()})).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(fill(&t), 0.45, "back when opened");
 }
 
 /// An export draws the sky a pit hides: its floor darker with `sky` 1 than with 0, the ground
@@ -12740,6 +12786,175 @@ fn plugin_commands_run_like_commands() {
     s.run("plugin.enable", &json!({"id": "eng-view", "enabled": false})).unwrap();
     assert!(s.run("plugin:eng-view/h", &Value::Null).unwrap_err().contains("disabled"));
     rustgis_plugins::unload("eng-view");
+}
+
+#[test]
+fn plugin_host_gives_layer_crs_and_features_in_it() {
+    let mut s = world();
+    plugin("eng-crs", &["edit"]);
+    // A layer read in UTM 37N: stored in longitude/latitude, with its own system kept.
+    let text = r#"{"type":"FeatureCollection","crs":{"type":"name","properties":{"name":"EPSG:32637"}},
+        "features":[{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[500000.0,3320000.0]}}]}"#;
+    let (ds, _) = rustgis_data::io::read_geojson(text, "Mine").unwrap();
+    assert_eq!(ds.crs.map(|c| c.epsg()), Some(32637));
+    s.map_mut().add_dataset(ds);
+    let layers = forward(&mut s, "eng-crs", "host.layers", json!({})).unwrap();
+    let find = |n: &str| layers.as_array().unwrap().iter().find(|l| l["name"] == n).unwrap().clone();
+    assert_eq!(find("Mine")["crs"], "EPSG:32637");
+    assert_eq!(find("Cities")["crs"], "EPSG:4326");
+    assert!(find("Cities")["extent"].is_array(), "the other members stay");
+    // Without crs: degrees, no crs member, as before.
+    let deg = forward(&mut s, "eng-crs", "host.features", json!({"layer": "Mine"})).unwrap();
+    assert!(deg.get("crs").is_none(), "{deg}");
+    let (lon, lat) = (
+        deg["features"][0]["geometry"]["coordinates"][0].as_f64().unwrap(),
+        deg["features"][0]["geometry"]["coordinates"][1].as_f64().unwrap(),
+    );
+    assert!((lon - 39.0).abs() < 1e-6 && (lat - 30.0).abs() < 0.1, "{deg}");
+    // "layer": the source's metres, named so host.addLayer reads them back.
+    for asked in ["layer", "EPSG:32637", " Layer "] {
+        let m = forward(&mut s, "eng-crs", "host.features", json!({"layer": "Mine", "crs": asked})).unwrap();
+        let c = &m["features"][0]["geometry"]["coordinates"];
+        assert!((c[0].as_f64().unwrap() - 500000.0).abs() < 0.01 && (c[1].as_f64().unwrap() - 3320000.0).abs() < 0.01, "{asked}: {m}");
+        assert_eq!(m["crs"]["properties"]["name"], "EPSG:32637");
+        assert_eq!(m["features"][0]["row"], 0);
+    }
+    // A round trip through host.addLayer lands where it was.
+    let m = forward(&mut s, "eng-crs", "host.features", json!({"layer": "Mine", "crs": "layer"})).unwrap();
+    forward(&mut s, "eng-crs", "host.addLayer", json!({"name": "Again", "geojson": m})).unwrap();
+    let again = forward(&mut s, "eng-crs", "host.features", json!({"layer": "Again"})).unwrap();
+    for i in 0..2 {
+        let (a, b) = (
+            again["features"][0]["geometry"]["coordinates"][i].as_f64().unwrap(),
+            deg["features"][0]["geometry"]["coordinates"][i].as_f64().unwrap(),
+        );
+        assert!((a - b).abs() < 1e-9, "{again} vs {deg}");
+    }
+    // "map" is the map's projection; WGS 84 asked for is the plain answer.
+    let m = forward(&mut s, "eng-crs", "host.features", json!({"layer": "Mine", "crs": "map"})).unwrap();
+    assert_eq!(m["crs"]["properties"]["name"], "EPSG:3857");
+    assert!(m["features"][0]["geometry"]["coordinates"][0].as_f64().unwrap().abs() > 1000.0, "{m}");
+    s.run("map.projection", &json!({"type": "EPSG:32617"})).unwrap();
+    let m = forward(&mut s, "eng-crs", "host.features", json!({"layer": "Mine", "crs": "map"})).unwrap();
+    assert_eq!(m["crs"]["properties"]["name"], "EPSG:32617");
+    let w = forward(&mut s, "eng-crs", "host.features", json!({"layer": "Mine", "crs": "EPSG:4326"})).unwrap();
+    assert!(w.get("crs").is_none(), "{w}");
+    // Null, empty, explicit WGS 84 and a WGS 84 layer retain the default response shape.
+    let plain = forward(&mut s, "eng-crs", "host.features", json!({"layer": "Cities"})).unwrap();
+    for asked in [Value::Null, json!(""), json!("EPSG:4326"), json!("4326"), json!("layer")] {
+        let got = forward(&mut s, "eng-crs", "host.features", json!({"layer": "Cities", "crs": asked})).unwrap();
+        assert_eq!(got, plain, "{asked}");
+        assert!(got.get("crs").is_none());
+    }
+    // Default VN-2000 map presets have named EPSG systems despite their human labels.
+    let (vn, _) = rustgis_data::io::read_geojson(r#"{"type":"Point","coordinates":[105,21]}"#, "VN").unwrap();
+    s.map_mut().add_dataset(vn);
+    for (preset, epsg) in [("vn2000Utm48", 3405), ("vn2000Utm49", 3406), ("vn2000tm3", 5897)] {
+        s.run("map.projection", &json!({"type": preset})).unwrap();
+        let got = forward(&mut s, "eng-crs", "host.features", json!({"layer": "VN", "crs": "map"})).unwrap();
+        assert_eq!(got["crs"]["properties"]["name"], format!("EPSG:{epsg}"));
+        let direct = forward(&mut s, "eng-crs", "host.features", json!({"layer": "VN", "crs": format!("EPSG:{epsg}")})).unwrap();
+        assert_eq!(got, direct);
+    }
+    // A bare code reads as EPSG; refused: unknown, unparseable, not text. All say `crs:`.
+    let bare = forward(&mut s, "eng-crs", "host.features", json!({"layer": "Mine", "crs": "32637"})).unwrap();
+    assert_eq!(bare["crs"]["properties"]["name"], "EPSG:32637");
+    for bad in [json!("EPSG:999999"), json!("nonsense"), json!(7), json!("EPSG:"), json!("EPSG:12x")] {
+        let e = forward(&mut s, "eng-crs", "host.features", json!({"layer": "Mine", "crs": bad})).unwrap_err();
+        assert!(e.contains("crs:"), "{bad}: {e}");
+    }
+    rustgis_plugins::unload("eng-crs");
+}
+
+#[test]
+fn plugin_host_features_takes_only_epsg_codes_so_it_registers_nothing() {
+    let mut s = world();
+    plugin("eng-crs-reg", &[]);
+    // WKT and PROJ text from a plugin (no permission needed) never reaches the process-wide table.
+    let proj = "+proj=tmerc +lat_0=0 +lon_0=33 +k=0.9996 +x_0=500000 +y_0=0 +datum=WGS84 +units=m +no_defs";
+    let wkt = "PROJCS[\"x\",GEOGCS[\"WGS 84\",DATUM[\"WGS_1984\",SPHEROID[\"WGS 84\",6378137,298.257223563]],\
+        PRIMEM[\"Greenwich\",0],UNIT[\"degree\",0.0174532925199433]],PROJECTION[\"Transverse_Mercator\"],UNIT[\"metre\",1]]";
+    for (i, text) in [proj.to_string(), wkt.to_string(), format!("{proj} +k={}", 1)].into_iter().enumerate() {
+        let e = forward(&mut s, "eng-crs-reg", "host.features", json!({"layer": "Cities", "crs": text})).unwrap_err();
+        assert!(e.contains("crs:") && e.contains("EPSG"), "{i}: {e}");
+    }
+    // The same text typed a few hundred distinct ways still leaves room for later PROJ systems.
+    for n in 0..300 {
+        let text = format!("+proj=tmerc +lon_0={} +k=0.9996 +datum=WGS84", 100.0 + f64::from(n) * 0.001);
+        assert!(forward(&mut s, "eng-crs-reg", "host.features", json!({"layer": "Cities", "crs": text})).is_err());
+    }
+    assert!(rustgis_data::raster::Crs::parse("+proj=tmerc +lon_0=7.77777 +k=0.9996 +datum=WGS84").is_ok());
+    rustgis_plugins::unload("eng-crs-reg");
+}
+
+#[test]
+fn plugin_host_features_refuses_what_it_can_not_place_with_crs_errors() {
+    use rustgis_data::raster::{Crs, crs::CustomCrs};
+    let mut s = world();
+    plugin("eng-crs-no", &[]);
+    let ask = |s: &mut Session, layer: &str, crs: &str| forward(s, "eng-crs-no", "host.features", json!({"layer": layer, "crs": crs}));
+    let custom = |proj4: &str| {
+        Crs::custom(CustomCrs { proj4: proj4.into(), label: "Mine".into(), geokeys: Vec::new(), doubles: Vec::new(), ascii: String::new() })
+            .unwrap()
+    };
+    let point = |lon: f64, lat: f64| {
+        let t = format!(
+            r#"{{"type":"FeatureCollection","features":[{{"type":"Feature","properties":{{}},"geometry":{{"type":"Point","coordinates":[{lon},{lat}]}}}},
+            {{"type":"Feature","properties":{{}},"geometry":{{"type":"Point","coordinates":[{lon},{lat}]}}}}]}}"#
+        );
+        rustgis_data::io::read_geojson(&t, "P").unwrap().0
+    };
+    // Past Web Mercator's limit: refused with the count, nothing returned; inside it, answered.
+    s.map_mut().add_dataset(point(10.0, 89.0));
+    let e = ask(&mut s, "P", "EPSG:3857").unwrap_err();
+    assert!(e.contains("crs: 2 feature(s) of P can't be placed in EPSG:3857") && e.contains("nothing was returned"), "{e}");
+    s.run("map.projection", &json!({"type": "EPSG:3857"})).unwrap();
+    let e = ask(&mut s, "P", "map").unwrap_err();
+    assert!(e.contains("crs: 2 feature(s)"), "{e}");
+    let mut inside = point(10.0, 85.0);
+    inside.name = "Q".into();
+    s.map_mut().add_dataset(inside);
+    let ok = ask(&mut s, "Q", "EPSG:3857").unwrap();
+    assert_eq!(ok["features"].as_array().map(Vec::len), Some(2), "{ok}");
+    // A layer's own system without an EPSG code: "layer" is refused, and says how to read it.
+    let mut ds = point(10.0, 10.0);
+    ds.crs = Some(custom("+proj=sinu +lon_0=5 +R=6371000 +units=m +no_defs"));
+    ds.name = "Sinu".into();
+    s.map_mut().add_dataset(ds);
+    let e = ask(&mut s, "Sinu", "layer").unwrap_err();
+    assert!(e.contains("crs:") && e.contains("no EPSG code"), "{e}");
+    // `host.layers` still names it (not the null of an unread raster).
+    let layers = forward(&mut s, "eng-crs-no", "host.layers", json!({})).unwrap();
+    let sinu = layers.as_array().unwrap().iter().find(|l| l["name"] == "Sinu").unwrap();
+    assert!(sinu["crs"].as_str().is_some_and(|t| t.contains("Sinusoidal")), "{sinu}");
+    // "map" on a projection with no EPSG code is refused, and nothing is registered for it.
+    s.run("map.projection", &json!({"type": "robinson"})).unwrap();
+    let e = ask(&mut s, "P", "map").unwrap_err();
+    assert!(e.contains("crs:") && e.contains("no EPSG code"), "{e}");
+    s.run("map.projection", &json!({"type": "EPSG:3857"})).unwrap();
+    // Geocentric targets can't carry a third coordinate.
+    let e = ask(&mut s, "P", "EPSG:4978").unwrap_err();
+    assert!(e.contains("crs:") && e.contains("geocentric"), "{e}");
+    // A layer on another body can't be given in an Earth system.
+    let mut mars = point(10.0, 10.0);
+    mars.crs = Some(custom("+proj=longlat +a=3396190 +b=3376200 +no_defs"));
+    mars.name = "Mars".into();
+    s.map_mut().add_dataset(mars);
+    let e = ask(&mut s, "Mars", "EPSG:32637").unwrap_err();
+    assert!(e.contains("crs:") && e.contains("another body"), "{e}");
+    // Legacy/default degrees are the source body's, also for explicit WGS 84 requests.
+    let plain = forward(&mut s, "eng-crs-no", "host.features", json!({"layer": "Mars"})).unwrap();
+    assert_eq!(plain["features"][0]["geometry"]["coordinates"], json!([10.0, 10.0]));
+    for asked in [Value::Null, json!(""), json!("EPSG:4326"), json!("4326")] {
+        let got = forward(&mut s, "eng-crs-no", "host.features", json!({"layer": "Mars", "crs": asked})).unwrap();
+        assert_eq!(got, plain);
+        assert!(got.get("crs").is_none());
+    }
+    // The map of another body has none either.
+    s.run("map.body", &json!({"name": "Mars", "basemap": false})).unwrap();
+    let e = ask(&mut s, "P", "map").unwrap_err();
+    assert!(e.contains("crs:") && e.contains("Mars"), "{e}");
+    rustgis_plugins::unload("eng-crs-no");
 }
 
 #[test]
@@ -44779,6 +44994,10 @@ fn long_commands_stop_when_cancelled_while_they_run() {
     s.run("layer.addDataText", &json!({"fileName": "training.geojson", "text": training.to_string()})).unwrap();
     s.run("layout.new", &json!({"page": "a4", "orientation": "landscape", "template": "blank"})).unwrap();
     s.run("layout.addFrame", &json!({"x": 20, "y": 20, "w": 150, "h": 150})).unwrap();
+    // A layer read from a Shapefile, edited, to publish.
+    s.run("share.exportLayer", &json!({"layer": "Cities", "path": out("towns.shp")})).unwrap();
+    s.run("layer.addData", &json!({"path": out("towns.shp"), "name": "towns"})).unwrap();
+    s.run("edit.setValue", &json!({"layer": "towns", "row": 0, "field": "name", "value": "Renamed"})).unwrap();
 
     // What didn't stop, and how often it looked.
     let mut kept_going = Vec::new();
@@ -44835,6 +45054,7 @@ fn long_commands_stop_when_cancelled_while_they_run() {
         ("share.exportMap", json!({"path": out("map.png"), "width": 320, "height": 200})),
         ("layout.export", json!({"path": out("layout.pdf"), "dpi": 72})),
         ("report.export", json!({"path": out("report.pdf"), "dpi": 72})),
+        ("source.publish", json!({"layer": "towns"})),
     ];
     s.run("report.new", &json!({"layer": "Cities"})).unwrap();
     let registered = crate::cmd::exports::IN_BACKGROUND.iter().map(|(c, ..)| *c).collect::<std::collections::BTreeSet<_>>();
@@ -45513,6 +45733,175 @@ fn change_detection_leaves_out_see_through_cells() {
         "{:?}",
         kept.iter().find(|i| r.bands[0].data[**i] != 5.0)
     );
+}
+
+/// A layer read from a Shapefile publishes its edits to the file (#1385): the file then holds
+/// them, the layer reads `inSync`, and undoing an edit made before shows it as an edit again,
+/// as the file keeps it. A layer without edits writes nothing; a file changed since it was read,
+/// or one read from a GeoJSON file, is refused with nothing written.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_layer_publishes_its_edits_to_its_shapefile() {
+    // Removed however the test ends.
+    struct Dir(std::path::PathBuf);
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    impl Dir {
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    let dir = Dir(std::env::temp_dir().join(format!("rustgis-engine-publish-{}", std::process::id())));
+    let _ = std::fs::remove_dir_all(dir.path());
+    std::fs::create_dir_all(dir.path()).unwrap();
+    let path = dir.path().join("towns.shp");
+    let mut s = world();
+    s.run("share.exportLayer", &json!({"layer": "Cities", "path": path})).unwrap();
+    let id = s.run("layer.addData", &json!({"path": path, "name": "towns"})).unwrap()["layer"].as_u64().unwrap();
+    let state = |s: &mut Session| s.run("source.syncState", &json!({"layer": id})).unwrap()["state"].clone();
+    let dbf = || std::fs::read(dir.path().join("towns.dbf")).unwrap();
+    let before = dbf();
+    let out = s.run("source.publish", &json!({"layer": id})).unwrap();
+    assert_eq!(out["published"], false);
+    assert_eq!(dbf(), before, "nothing to write");
+    s.run("edit.setValue", &json!({"layer": id, "row": 0, "field": "name", "value": "Renamed"})).unwrap();
+    s.mark_saved();
+    let undo_before_publish = s.undo_depth();
+    let out = s.run("source.publish", &json!({"layer": id})).unwrap();
+    assert_eq!(s.undo_depth(), undo_before_publish, "publishing cannot be undone separately from the edits");
+    assert!(s.log.entries().any(|e| e.command == "source.publish" && e.ok));
+    assert_eq!(out["published"], true);
+    assert!(s.dirty(), "the layer's new record is a change to save");
+    let (read, _) = rustgis_data::io::read_path(&path).unwrap();
+    let name = read.fields.iter().position(|f| f.name == "name").unwrap();
+    assert_eq!(read.features.iter().next().unwrap().attrs[name], rustgis_data::Value::Text("Renamed".into()));
+    assert_eq!(state(&mut s), "inSync");
+    // Undo doesn't change the file: the layer now lacks an edit the file has.
+    s.run("edit.undo", &Value::Null).unwrap();
+    assert_eq!(state(&mut s), "edited");
+    s.run("edit.redo", &Value::Null).unwrap();
+    assert_eq!(state(&mut s), "inSync");
+    // An empty text, which the file holds as no value: the layer takes it as the file reads it,
+    // and is in step with it.
+    {
+        let l = s.map_mut().layer_mut(id as u32).unwrap();
+        l.dataset.fields.iter_mut().find(|f| f.name == "name").unwrap().alias = Some("Town name".into());
+    }
+    s.run("edit.setValue", &json!({"layer": id, "row": 2, "field": "name", "value": ""})).unwrap();
+    s.run("source.publish", &json!({"layer": id})).unwrap();
+    assert_eq!(state(&mut s), "inSync");
+    let l = s.map().layer(id as u32).unwrap();
+    let name = l.dataset.fields.iter().position(|f| f.name == "name").unwrap();
+    assert!(l.dataset.features.get(2).unwrap().attrs[name].is_null());
+    assert_eq!(l.dataset.fields[name].alias.as_deref(), Some("Town name"));
+    // Cancel arriving after the final .shp rename cannot turn a committed publish into an
+    // error or leave its old sync record. The probe observes the real file, not an internal hook.
+    struct CancelAfterPlacement {
+        path: std::path::PathBuf,
+        before: Vec<u8>,
+    }
+    impl rustgis_data::progress::Probe for CancelAfterPlacement {
+        /// Changes only after the last .shp rename, the publication commit point.
+        fn cancelled(&self) -> bool {
+            std::fs::read(&self.path).is_ok_and(|bytes| bytes != self.before)
+        }
+        fn begin(&self, _: u64) {}
+        fn advance(&self, _: u64) {}
+    }
+    s.run("edit.setGeometry", &json!({"layer": id, "row": 0, "geometry": {"type": "Point", "coordinates": [1, 2]}})).unwrap();
+    {
+        let probe = std::sync::Arc::new(CancelAfterPlacement { path: path.clone(), before: std::fs::read(&path).unwrap() });
+        let _installed = rustgis_data::progress::install(Some(probe.clone()));
+        // Run the real worker directly: synchronous Session dispatch installs its own probe.
+        let work = crate::cmd::publish::publish_work(&s, &json!({"layer": id})).unwrap();
+        let mut wrote = work().unwrap();
+        assert_eq!(wrote.answer["published"], true);
+        wrote.then.take().unwrap()(&mut s, &mut wrote.answer).unwrap();
+        assert!(rustgis_data::progress::Probe::cancelled(probe.as_ref()), "the probe saw the committed shape");
+    }
+    assert_eq!(state(&mut s), "inSync");
+    // Define Projection makes the geographic CRS explicit. Publishing normalizes it as
+    // the reader does, so the live layer and its new sync point agree after completion.
+    s.run("layer.defineProjection", &json!({"layer": id, "crs": "EPSG:4326"})).unwrap();
+    assert_eq!(state(&mut s), "edited");
+    assert_eq!(s.run("source.publish", &json!({"layer": id})).unwrap()["published"], true);
+    assert_eq!(state(&mut s), "inSync");
+    assert_eq!(s.run("source.publish", &json!({"layer": id})).unwrap()["published"], false);
+    // A later script failure rolls project edits back, but not its committed file or baseline,
+    // including when the script removed the published layer before failing.
+    for (n, (edited_inside, removed)) in [(false, false), (true, false), (true, true)].into_iter().enumerate() {
+        if !edited_inside {
+            s.run("edit.setValue", &json!({"layer": id, "row": 1, "field": "name", "value": "Committed"})).unwrap();
+        }
+        s.mark_saved();
+        let undo = s.undo_depth();
+        let mut lines = Vec::new();
+        let value = if edited_inside { format!("In script {n}") } else { "Committed".into() };
+        if edited_inside {
+            lines.push(format!("edit.setValue {}", json!({"layer":id,"row":1,"field":"name","value":value})));
+        }
+        lines.push(format!("source.publish {}", json!({"layer":id})));
+        if removed {
+            lines.push(format!("layer.remove {}", json!({"layer":id})));
+        }
+        lines.push("layer.remove {\"layer\":\"missing-layer\"}".into());
+        assert!(s.run("script.run", &json!({"script":lines.join("\n")})).is_err());
+        let checked = s.run("source.syncState", &json!({"layer":id})).unwrap();
+        assert_eq!(checked["changed"], json!([]), "the committed file retains its current baseline");
+        assert_eq!(checked["state"], if edited_inside { "edited" } else { "inSync" });
+        assert!(s.dirty(), "the committed baseline still needs saving after rollback");
+        assert_eq!(s.undo_depth(), undo, "a failed script adds no undo step");
+        let (back, _) = rustgis_data::io::read_path(&path).unwrap();
+        assert_eq!(back.features.get(1).unwrap().attrs[name], rustgis_data::Value::Text(value));
+    }
+    s.run("source.publish", &json!({"layer":id})).unwrap();
+    assert_eq!(state(&mut s), "inSync");
+    // A successful script can remove a layer after publication too. Undo restores its old
+    // rows against the committed file baseline; redo and a second undo keep that baseline.
+    let script = [
+        format!("edit.setValue {}", json!({"layer":id,"row":1,"field":"name","value":"Published and removed"})),
+        format!("source.publish {}", json!({"layer":id})),
+        format!("layer.remove {}", json!({"layer":id})),
+    ]
+    .join("\n");
+    s.run("script.run", &json!({"script":script})).unwrap();
+    assert!(s.map().layer(id as u32).is_none());
+    for again in [false, true] {
+        if again {
+            s.run("edit.redo", &Value::Null).unwrap();
+            assert!(s.map().layer(id as u32).is_none());
+        }
+        s.run("edit.undo", &Value::Null).unwrap();
+        let checked = s.run("source.syncState", &json!({"layer":id})).unwrap();
+        assert_eq!(checked["changed"], json!([]));
+        assert_eq!(checked["state"], "edited");
+        let (back, _) = rustgis_data::io::read_path(&path).unwrap();
+        assert_eq!(back.features.get(1).unwrap().attrs[name], rustgis_data::Value::Text("Published and removed".into()));
+    }
+    // Changed since: refused, the file left as it was.
+    s.run("edit.setValue", &json!({"layer": id, "row": 1, "field": "name", "value": "Mine"})).unwrap();
+    let mut theirs = dbf();
+    *theirs.last_mut().unwrap() ^= 1;
+    std::fs::write(dir.path().join("towns.dbf"), &theirs).unwrap();
+    let e = s.run("source.publish", &json!({"layer": id})).unwrap_err();
+    assert!(e.contains("towns.dbf changed since the layer was read") && e.contains("nothing was written"), "{e}");
+    assert_eq!(dbf(), theirs);
+    // The same command and sync record work for a GeoJSON source.
+    let geojson = dir.path().join("towns.geojson");
+    s.run("share.exportLayer", &json!({"layer": "Cities", "path": geojson})).unwrap();
+    s.run("layer.addData", &json!({"path": geojson, "name": "towns.geojson"})).unwrap();
+    s.run("edit.setValue", &json!({"layer": "towns.geojson", "row": 0, "field": "name", "value": "Published"})).unwrap();
+    let out = s.run("source.publish", &json!({"layer": "towns.geojson"})).unwrap();
+    assert_eq!(out["published"], true);
+    let (read, _) = rustgis_data::io::read_path(&geojson).unwrap();
+    let name = read.fields.iter().position(|f| f.name == "name").unwrap();
+    assert_eq!(read.features.first().unwrap().attrs[name], rustgis_data::Value::Text("Published".into()));
+    assert_eq!(s.run("source.syncState", &json!({"layer": "towns.geojson"})).unwrap()["state"], "inSync");
+    s.run("edit.undo", &Value::Null).unwrap();
+    assert_eq!(s.run("source.syncState", &json!({"layer": "towns.geojson"})).unwrap()["state"], "edited");
 }
 
 /// A layer read whole from a Shapefile or GeoJSON file remembers the files and its rows as read
@@ -46618,4 +47007,38 @@ fn an_animation_export_says_its_missing_cast_shadows_once() {
         assert!(said.len() == 1 && said[0].starts_with(what), "{command}: {said:?}");
     }
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A zoom to a place wholly past a Web Mercator map's 85° leaves the view where it is, says so,
+/// and is said not to have framed it (as `"zoomed"` reports); one reaching into them fits, clamped.
+#[test]
+fn a_zoom_beyond_web_mercators_latitudes_says_so() {
+    let mut s = world();
+    let view = s.map().camera;
+    let mark = s.notice_mark();
+    assert!(!s.zoom_to(&rustgis_geom::Extent::new(-10.0, 86.0, 10.0, 89.0)));
+    assert_eq!((s.map().camera.center, s.map().camera.res), (view.center, view.res));
+    let said: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+    assert!(said.iter().any(|n| n.contains("beyond what the map's projection shows")), "{said:?}");
+    let mark = s.notice_mark();
+    assert!(s.zoom_to(&rustgis_geom::Extent::new(-10.0, 80.0, 10.0, 89.0)));
+    assert_ne!(s.map().camera.center, view.center);
+    assert!(s.notices_since(mark).is_empty());
+}
+
+/// A command whose steps each zoom to a place the projection can't reach (an add framing each
+/// layer of a file, then all of them) says so once.
+#[test]
+fn a_command_says_once_that_it_couldnt_zoom() {
+    let mut s = world();
+    let gpx = r#"<gpx version="1.1" creator="t" xmlns="http://www.topografix.com/GPX/1/1"><wpt lat="87" lon="10"><name>a</name></wpt><trk><name>b</name><trkseg><trkpt lat="86" lon="10"/><trkpt lat="88" lon="20"/></trkseg></trk></gpx>"#;
+    let view = s.map().camera;
+    let id = s.download_started();
+    assert!(s.download_landed(id, gpx.as_bytes().to_vec()));
+    let mark = s.notice_mark();
+    let out = s.run("layer.addDownload", &json!({"id": id, "url": "https://example.org/arctic.gpx", "zoom": true})).unwrap();
+    let beyond = s.notices_since(mark).iter().filter(|n| n.text.contains("beyond what the map's projection shows")).count();
+    assert_eq!(beyond, 1, "{out}");
+    assert_eq!(out["zoomed"], json!(false), "{out}");
+    assert_eq!(s.map().camera.center, view.center);
 }

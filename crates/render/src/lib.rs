@@ -2590,9 +2590,10 @@ fn render_tilted(map: &mut Map, view: &View, full_res_rasters: bool, sources_rea
 /// triangles raised to the ground's height and mapped from its picture, every band keeping to
 /// its own stretch of ground, all drawn far to near so nearer slopes hide what lies behind
 /// them; fog with distance, and the sky behind. (Without terrain, [`Warp`] does it per pixel.)
-/// Reading the grids' heights and ordering the triangles (tens of milliseconds) doesn't look at
-/// Cancel; drawing them, the long part, does. False when an export cancelled meanwhile stopped
-/// it, the picture left half drawn.
+/// Cancel is looked at before each band's grid of heights is read (up to 641 × 641 points,
+/// `terrain::settled_cells`) and while the triangles are drawn, the long part; ordering them
+/// doesn't. False when an export cancelled meanwhile, or a settled frame gone out of date
+/// (`cancel`), stopped it, the picture left half drawn.
 fn drape_terrain(pm: &mut Pixmap, view: &View, map: &Map, bands: &[(View, (f64, f64), Pixmap)], ground: &terrain::Ground) -> bool {
     let (sky, fog) = tilt_sky(map);
     let cam = view.camera;
@@ -2617,16 +2618,20 @@ fn drape_terrain(pm: &mut Pixmap, view: &View, map: &Map, bands: &[(View, (f64, 
         None => pm.fill(c(fog)),
     }
     // Every band's triangles: (depth, band, cell * 2 + which half), with each band's grid of
-    // vertices (screen point, picture point, depth). Indices, not corners: the settled mesh is
-    // fine (`terrain::SETTLED_CELLS`), and corners copied into each triangle took 112 bytes a
-    // triangle against 16 (13 MB against 8 with the grids, for a 1600 × 1100 export).
+    // vertices (screen point, picture point, depth) and its cells a side. Indices, not corners: the
+    // settled mesh is fine (`terrain::settled_cells`), and corners copied into each triangle took
+    // 112 bytes a triangle against 16 (13 MB against 8 with the grids, for a 1600 × 1100 export
+    // at 160 cells).
     type Vertex = ((f64, f64), (f64, f64), f64);
-    let n = terrain::SETTLED_CELLS;
     let (pw, ph) = (f64::from(pm.width()), f64::from(pm.height()));
-    let mut grids: Vec<Vec<Option<Vertex>>> = Vec::with_capacity(bands.len());
+    let mut grids: Vec<(usize, Vec<Option<Vertex>>)> = Vec::with_capacity(bands.len());
     let mut tris: Vec<(f64, u32, u32)> = Vec::new();
     for (bi, (v, (d0, d1), pic)) in bands.iter().enumerate() {
+        if rustgis_data::progress::check().is_err() || cancel::requested() {
+            return false;
+        }
         let kb = f64::from(pic.width()) / v.width.max(1e-9);
+        let n = band_cells(v, pic.width().max(pic.height()), ground);
         let grid: Vec<Option<Vertex>> = (0..=n)
             .flat_map(|j| (0..=n).map(move |i| (i, j)))
             .map(|(i, j)| {
@@ -2656,18 +2661,18 @@ fn drape_terrain(pm: &mut Pixmap, view: &View, map: &Map, bands: &[(View, (f64, 
                 tris.push((depth, bi as u32, (cell * 2 + half) as u32));
             }
         }
-        grids.push(grid);
+        grids.push((n, grid));
     }
     tris.sort_by(|a, b| b.0.total_cmp(&a.0));
     let fog_paint = |t: f64| paint(fog, t as f32);
     for (drawn, (depth, bi, at)) in tris.into_iter().enumerate() {
         // An export cancelled meanwhile (see `rustgis_data::progress`) stops here: it writes
-        // nothing. The settled frame on screen has no run to cancel.
-        if drawn % 4096 == 0 && rustgis_data::progress::check().is_err() {
+        // nothing. So does a settled frame on screen gone out of date (see `cancel`).
+        if drawn % 4096 == 0 && (rustgis_data::progress::check().is_err() || cancel::requested()) {
             return false;
         }
-        let (Some((_, _, pic)), Some(grid)) = (bands.get(bi as usize), grids.get(bi as usize)) else { continue };
-        let cell = at as usize / 2;
+        let (Some((_, _, pic)), Some((n, grid))) = (bands.get(bi as usize), grids.get(bi as usize)) else { continue };
+        let (n, cell) = (*n, at as usize / 2);
         let Some([p, q, r]) = triangles(grid, n, cell % n, cell / n).and_then(|t| t.get(at as usize % 2).copied()) else { continue };
         let (dst, src) = ([p.0, q.0, r.0], [p.1, q.1, r.1]);
         let Some(t) = affine(src, dst) else { continue };
@@ -2683,6 +2688,14 @@ fn drape_terrain(pm: &mut Pixmap, view: &View, map: &Map, bands: &[(View, (f64, 
         }
     }
     true
+}
+
+/// Cells along each side of the mesh laying the band `v` over `ground`, its picture
+/// `picture_px` on its longer side: as fine as the picture, up to the ground's own cells across
+/// the band (#1882).
+fn band_cells(v: &View, picture_px: u32, ground: &terrain::Ground) -> usize {
+    let corners = [(0.0, 0.0), (v.width, 0.0), (0.0, v.height), (v.width, v.height)].map(|(x, y)| v.camera.to_map(x, y, v.width, v.height));
+    terrain::settled_cells(picture_px, ground.cells_across(&corners))
 }
 
 /// The two triangles of the cell (`i`, `j`) of a band's grid of `n` cells a side, [a, b, d] and
@@ -8850,6 +8863,7 @@ mod tests {
                 z_factor: 1.0,
                 shadow,
                 sky: 0.0,
+                fill: 0.0,
             };
         };
         let camera = Camera { center: lonlat_to_merc(Coord::new(0.0, 0.0)), res: 1200.0, bearing: 0.0, pitch: 0.0 };
@@ -8883,6 +8897,7 @@ mod tests {
             z_factor: 1.0,
             shadow: 1.0,
             sky: 0.0,
+            fill: 0.0,
         };
         // Drawn only zoomed out past a scale between the centre's and the far band's.
         l.max_scale = Some((centre + farthest) / 2.0);
@@ -8926,6 +8941,7 @@ mod tests {
                 z_factor: 1.0,
                 shadow: 1.0,
                 sky: 0.0,
+                fill: 0.0,
             };
             // Drawn only zoomed in past 1:1: or in a group drawn only there.
             if grouped {
@@ -9248,8 +9264,51 @@ mod tests {
     }
 
     #[test]
+    fn the_settled_mesh_follows_the_picture_up_to_the_dem() {
+        // #1882: each band's mesh grows with its picture, within 160 and 640 cells a side, and
+        // never past the DEM's own cells across its ground; a small DEM keeps 160.
+        use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster};
+        let camera = Camera { center: Coord::new(0.0, 0.0), res: 10.0, bearing: 30.0, pitch: 65.0 };
+        let cells = |side: u32, cell: f64, ppp: f64| -> Vec<(usize, Option<f64>)> {
+            let half = f64::from(side) * cell / 2.0;
+            let gt = GeoTransform { origin_x: -half, origin_y: half, pixel_width: cell, pixel_height: -cell };
+            let heights = vec![0.0; (side * side) as usize];
+            let dem = Raster::new("dem", side, side, vec![heights], gt, Crs::WebMercator, None, ColorHint::Gray, "Float32").unwrap();
+            let mut m = Map::new("Map");
+            m.add_raster("dem", rustgis_map::RasterLayer::from_path(dem, "dem.tif"));
+            m.view.terrain =
+                Some(rustgis_map::view::Terrain { source: rustgis_map::view::TerrainSource::Layer("dem".into()), exaggeration: 1.0 });
+            let g = terrain::Ground::of(&m, &camera).expect("terrain");
+            let view = View { width: 1600.0, height: 1100.0, pixels_per_point: ppp, camera, sky: false };
+            camera
+                .tilt_bands(view.width, view.height)
+                .iter()
+                .map(|b| {
+                    let v = band_view(&view, b);
+                    let (w, h) = v.pixel_size();
+                    let c = [(0.0, 0.0), (v.width, 0.0), (0.0, v.height), (v.width, v.height)];
+                    let across = g.cells_across(&c.map(|(x, y)| v.camera.to_map(x, y, v.width, v.height)));
+                    (band_cells(&v, w.max(h), &g), across)
+                })
+                .collect()
+        };
+        // A DEM of 8 m cells, 16 km a side: finer than the bands' pictures.
+        let (screen, print) = (cells(2000, 8.0, 1.0), cells(2000, 8.0, 3.0));
+        assert!(print.iter().all(|(n, _)| (terrain::SETTLED_CELLS..=terrain::MAX_SETTLED_CELLS).contains(n)), "{print:?}");
+        assert!(screen.iter().zip(&print).all(|(a, b)| a.0 <= b.0), "{screen:?} vs {print:?}");
+        assert!(print.iter().any(|(n, _)| *n == terrain::MAX_SETTLED_CELLS), "{print:?}");
+        assert!(screen.iter().any(|(n, _)| *n > terrain::SETTLED_CELLS && *n < terrain::MAX_SETTLED_CELLS), "{screen:?}");
+        // A coarser DEM caps the bands at its cells across them, no lower than 160.
+        let coarse = cells(400, 40.0, 3.0);
+        assert!(coarse.iter().all(|(n, d)| *n <= d.unwrap_or(0.0).ceil().max(terrain::SETTLED_CELLS as f64) as usize), "{coarse:?}");
+        assert!(coarse.iter().zip(&print).any(|(c, p)| c.0 < p.0), "{coarse:?} vs {print:?}");
+        // A 120-cell DEM: 160 everywhere, as before.
+        assert!(cells(120, 100.0, 3.0).iter().all(|(n, _)| *n == terrain::SETTLED_CELLS));
+    }
+
+    #[test]
     fn a_cancelled_export_stops_laying_the_map_over_its_terrain() {
-        // Cancelled once the terrain's drawing has looked once: halfway through its triangles.
+        // Cancelled once the terrain's drawing has looked once: before its second band's grid.
         struct CancelledMidway(std::sync::atomic::AtomicUsize);
         impl rustgis_data::progress::Probe for CancelledMidway {
             fn cancelled(&self) -> bool {
@@ -9279,6 +9338,32 @@ mod tests {
         probe.0.store(0, std::sync::atomic::Ordering::Relaxed);
         let _probe = rustgis_data::progress::install(Some(probe));
         assert_eq!(render_png(&mut m, &view).err().as_deref(), Some(rustgis_data::DataError::Cancelled.to_string().as_str()));
+    }
+
+    #[test]
+    fn a_settled_frame_gone_out_of_date_stops_laying_its_terrain() {
+        // A settled frame's worker stops it (`cancel`): the drape, now up to 640 cells a band
+        // (#1882), stops too, before reading another band's grid.
+        let camera = Camera { center: lonlat_to_merc(Coord::new(0.0, -0.6)), res: 600.0, bearing: 0.0, pitch: 65.0 };
+        let view = View { width: 400.0, height: 300.0, pixels_per_point: 1.0, camera, sky: false };
+        let mut m = hill_map();
+        m.view.terrain =
+            Some(rustgis_map::view::Terrain { source: rustgis_map::view::TerrainSource::Layer("dem".into()), exaggeration: 2.0 });
+        let ground = terrain::Ground::of(&m, &camera).expect("terrain");
+        let bands: Vec<(View, (f64, f64), Pixmap)> = camera
+            .tilt_bands(view.width, view.height)
+            .iter()
+            .filter_map(|b| {
+                let v = band_view(&view, b);
+                let (w, h) = v.pixel_size();
+                Some((v, b.depth, Pixmap::new(w, h)?))
+            })
+            .collect();
+        let mut pm = Pixmap::new(400, 300).expect("a pixmap");
+        assert!(drape_terrain(&mut pm, &view, &m, &bands, &ground));
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let _stop = cancel::install(flag);
+        assert!(!drape_terrain(&mut pm, &view, &m, &bands, &ground));
     }
 
     #[test]

@@ -281,10 +281,20 @@ fn live_not_here() -> DataError {
 }
 
 fn missing() -> DataError {
-    DataError::Unsupported(
+    DataError::Unsupported(missing_text(crate::no_programs_here()))
+}
+
+/// Why a query or a DuckDB database can't be read: DuckDB isn't installed, or (`here` names it)
+/// this build runs no programs, where installing it wouldn't help.
+fn missing_text(here: &str) -> String {
+    if here.is_empty() {
         "SQL queries and DuckDB databases need DuckDB: install it (the duckdb program on the PATH, or RUSTGIS_DUCKDB_BIN naming its folder) and try again"
-            .into(),
-    )
+            .into()
+    } else {
+        format!(
+            "SQL queries and DuckDB databases run through DuckDB, a program {here} can't run: open this project on a computer to use them"
+        )
+    }
 }
 
 /// Where results are kept: the platform's cache folder, or `RUSTGIS_DUCKDB_CACHE`.
@@ -965,6 +975,13 @@ fn ours(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn where_programs_cant_run_the_message_says_so_instead_of_asking_for_an_install() {
+        assert!(missing_text("").contains("install it"));
+        let phone = missing_text("a phone");
+        assert!(phone.contains("a phone can't run") && !phone.contains("install"), "{phone}");
+    }
 
     /// Each kind reads only its own client's variable, and an empty one is none (a fake
     /// environment: the process's is never changed).

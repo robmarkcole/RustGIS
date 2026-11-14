@@ -1,6 +1,8 @@
 //! Runtime construction for boxes on ordinary polygon layers. No fields or saved metadata are
-//! added to a dataset. Construction snapshots accompany undo/redo; a foreign
-//! vertex edit invalidates the constrained editor instead of silently fitting another box.
+//! added to a dataset. Construction snapshots accompany undo/redo. Handles require the recorded
+//! geometry to match the feature; foreign geometry is never fitted to a new box. Insert/delete
+//! edits through `design::apply` forget records, while sync and restore paths can retain them
+//! subject to that geometry-equality check.
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -11,7 +13,7 @@ use rustgis_geom::Coord;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::{CmdResult, CommandSpec as C, Session};
+use crate::{CmdResult, Session};
 
 /// A frozen planar grid, with x right and y down. The default is Web Mercator grid metres,
 /// not ground metres. A GeoTIFF's original grid can be supplied through [`Self::from_grid`].
@@ -211,8 +213,9 @@ impl Cache {
         Ok((count > 0).then(|| format!("{count} rotated box(es): session-only construction is not included in this export and will not survive reimport; the source polygons use four transformed corners, with curved grid edges approximated by straight edges")))
     }
 }
-/// Newly inserted ordinary features must never inherit a deleted feature's construction if
-/// its row id is reused. Deletion forgets only the live snapshot; undo retains the old cache.
+/// Forget the live record for insertion/removal paths that call this hook (`design::apply`).
+/// This prevents id reuse in those paths from adopting construction; undo keeps its own cache.
+/// Sync and restore paths may retain records, guarded by `box_spec`'s geometry-equality check.
 pub(crate) fn forget_feature(s: &mut Session, layer: u32, feature: u64) {
     if let Some(l) = s.map().layer(layer) {
         let key = (s.map().instance_id(), l.instance_id(), l.replacement_revision(), feature);
@@ -228,20 +231,6 @@ impl Session {
     }
 }
 
-pub(crate) fn commands() -> Vec<C> {
-    let roles: &[crate::ParamRole] =
-        &[crate::ParamRole { key: "box", role: crate::Role::Opaque }, crate::ParamRole { key: "attributes", role: crate::Role::Opaque }];
-    vec![
-        C::new("edit.addBox", "Add Rotated Box", "Edit › Features", add).inputs(new_box_inputs).roles(roles).effects(crate::policy::Effects::NONE)
-            .when(crate::cmd::design::need_editable).params(r#"{"layer"?: name|id, "box": {"center":[x,y],"width":number,"height":number,"angle":clockwise degrees,"frame"?:{"epsg":number,"width":pixels,"height":pixels,"affine":[x0,xc,xr,y0,yc,yr]}},"attributes"?:{field:value},"template"?:string}"#),
-        C::new("edit.updateBox", "Update Rotated Box", "Edit › Features", update).roles(&[crate::ParamRole { key: "box", role: crate::Role::Opaque }]).effects(crate::policy::Effects::NONE)
-            .when(crate::cmd::design::need_editable).params(r#"{"layer"?:name|id,"row":number,"featureId"?:number,"box":as edit.addBox}"#),
-        C::new("edit.deleteBox", "Delete Box", "Edit › Features", delete_box).roles(&[]).effects(crate::policy::Effects::NONE)
-            .when(crate::cmd::design::need_editable).params(r#"{"layer"?:name|id,"row":number,"featureId"?:number}"#),
-        C::new("edit.boxInfo", "Box Construction", "Edit › Features", info).roles(&[]).effects(crate::policy::Effects::NONE).view()
-            .params(r#"{"layer"?:name|id,"row":number}"#),
-    ]
-}
 // Shared feature intake also supports standalone tables; a box always targets a layer.
 fn reject_table(p: &Value) -> Result<(), String> {
     if p.get("table").is_some_and(|t| !t.is_null()) {
@@ -249,7 +238,7 @@ fn reject_table(p: &Value) -> Result<(), String> {
     }
     Ok(())
 }
-fn new_box_inputs(input: &crate::cmd::InputContext<'_>, p: &Value) -> Result<crate::cmd::Inputs, String> {
+pub(crate) fn new_box_inputs(input: &crate::cmd::InputContext<'_>, p: &Value) -> Result<crate::cmd::Inputs, String> {
     reject_table(p)?;
     crate::cmd::design::new_feature_inputs(input, p)
 }
@@ -293,7 +282,7 @@ fn parsed(p: &Value, previous_frame: Option<&Frame>) -> Result<BoxSpec, String> 
 fn row(p: &Value) -> Result<usize, String> {
     p.get("row").and_then(Value::as_u64).and_then(|r| usize::try_from(r).ok()).ok_or_else(|| "row is required".into())
 }
-fn add(s: &mut Session, p: &Value) -> CmdResult {
+pub(crate) fn add(s: &mut Session, p: &Value) -> CmdResult {
     reject_table(p)?;
     let id = s.layer_id(p)?;
     check_layer(s, id)?;
@@ -326,7 +315,7 @@ fn remember(s: &mut Session, id: u32, row: usize, spec: BoxSpec) -> Result<(), S
     }
     s.boxes.remember(key, Record { spec, geometry: g })
 }
-fn update(s: &mut Session, p: &Value) -> CmdResult {
+pub(crate) fn update(s: &mut Session, p: &Value) -> CmdResult {
     let id = s.layer_id(p)?;
     check_layer(s, id)?;
     if p.get("attributes").is_some() {
@@ -347,7 +336,7 @@ fn update(s: &mut Session, p: &Value) -> CmdResult {
     remember(s, id, row, b.clone())?;
     Ok(json!({"row":row,"box":b}))
 }
-fn delete_box(s: &mut Session, p: &Value) -> CmdResult {
+pub(crate) fn delete_box(s: &mut Session, p: &Value) -> CmdResult {
     let id = s.layer_id(p)?;
     check_layer(s, id)?;
     let row = row(p)?;
@@ -365,7 +354,7 @@ fn delete_box(s: &mut Session, p: &Value) -> CmdResult {
     crate::cmd::design::apply(s, id, vec![crate::cmd::design::Change { before: Some(before), row: None }])?;
     Ok(json!({"deleted":1,"featureId":key.3}))
 }
-fn info(s: &mut Session, p: &Value) -> CmdResult {
+pub(crate) fn info(s: &mut Session, p: &Value) -> CmdResult {
     let id = s.layer_id(p)?;
     let row = row(p)?;
     let b = s.box_spec(id, row).ok_or("this feature has no unchanged box construction")?;

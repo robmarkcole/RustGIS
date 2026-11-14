@@ -14,8 +14,13 @@ pub fn commands() -> Vec<C> {
         )
         .view(),
         C::new("s3.disconnect", "Disconnect From S3", "Home › Add › S3", disconnect).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Reserved)).view().params(r#"{"name": text}"#),
-        C::new("s3.connections", "S3 Connections", "Home › Add › S3", |_s, _p| {
-            Ok(json!({"connections": s3::connections().iter().map(Connection::public).collect::<Vec<_>>()}))
+        C::new("s3.connections", "S3 Connections", "Home › Add › S3", |s, _p| {
+            let connections = s3::connections()
+                .into_iter()
+                .filter(|c| visible_to_session(s, c))
+                .map(|c| c.public())
+                .collect::<Vec<_>>();
+            Ok(json!({"connections": connections}))
         }).roles(&[]).effects(crate::policy::Effects::NONE)
         .view(),
         C::new("s3.list", "List S3 Bucket", "Home › Add › S3", list).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network)).view().params(
@@ -128,12 +133,58 @@ fn install(p: &Value, saved: Option<(&str, &str)>) -> CmdResult {
     Ok(out)
 }
 
-fn disconnect(_s: &mut Session, p: &Value) -> CmdResult {
+fn disconnect(s: &mut Session, p: &Value) -> CmdResult {
     let name = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).ok_or("name is required")?;
+    if !s.policy_allows_reserved() {
+        return Err("disconnecting S3 connections requires user authorization".into());
+    }
+    if let Some(c) = s3::connection(name)
+        && s3::binding_of(&c.name).is_some()
+        && owned_saved_binding(s, &c).is_none()
+    {
+        return Err(format!("no S3 connection named '{name}'"));
+    }
     if !s3::disconnect(name) {
         return Err(format!("no S3 connection named '{name}'"));
     }
     Ok(Value::Null)
+}
+
+/// The runtime token of this session's saved S3 connection login when `conn` belongs to `s`.
+fn owned_saved_binding(s: &Session, conn: &Connection) -> Option<String> {
+    if s.web_logins.is_anonymous() {
+        return None;
+    }
+    let binding = s3::binding_of(&conn.name)?;
+    let (_, id) = s3::saved_connection(&binding)?;
+    let saved = s.connections.find(&id).filter(|c| c.kind == "s3" && c.name == conn.name)?;
+    (s.s3_binding(&saved.id) == Some(binding.as_str())).then_some(binding)
+}
+
+/// Whether `conn` may be exposed to `s` in `s3.connections` or bucketless `s3.list`.
+fn visible_to_session(s: &Session, conn: &Connection) -> bool {
+    if s3::binding_of(&conn.name).is_some() {
+        owned_saved_binding(s, conn).is_some() && s.policy_allows_reserved()
+    } else {
+        (!s.web_logins.is_anonymous() && s.policy_allows_reserved()) || conn.credentials.is_none()
+    }
+}
+
+/// Policy reach of `s3.list` from its parameters alone: naming a connection (which uses keys and
+/// grants the bucket to it) or listing buckets without naming one requires `Effect::Reserved`.
+pub(crate) fn declared_reach(p: &Value) -> crate::policy::Effects {
+    let names_connection = ps(p, "connection").is_some_and(|n| !n.trim().is_empty());
+    let names_bucket = ps(p, "url").is_some_and(|u| !u.trim().is_empty()) || ps(p, "bucket").is_some_and(|b| !b.trim().is_empty());
+    if names_connection || !names_bucket {
+        crate::policy::Effects::NONE.with(crate::policy::Effect::Reserved)
+    } else {
+        crate::policy::Effects::NONE
+    }
+}
+
+/// Session-aware policy reach of `s3.list`.
+pub(crate) fn list_reach(_s: &Session, p: &Value) -> crate::policy::Effects {
+    declared_reach(p)
 }
 
 /// The bucket and prefix a listing names.
@@ -155,10 +206,19 @@ fn target(p: &Value) -> Result<(Option<String>, String), String> {
     Ok((bucket, prefix))
 }
 
-pub(super) fn list(_s: &mut Session, p: &Value) -> CmdResult {
+pub(super) fn list(s: &mut Session, p: &Value) -> CmdResult {
     let (bucket, prefix) = target(p)?;
     let named = match ps(p, "connection").map(str::trim).filter(|n| !n.is_empty()) {
-        Some(n) => Some(s3::connection(n).ok_or_else(|| format!("no S3 connection named '{n}'"))?),
+        Some(n) => {
+            if !s.policy_allows_reserved() {
+                return Err("listing through a named S3 connection requires user authorization".into());
+            }
+            let c = s3::connection(n).ok_or_else(|| format!("no S3 connection named '{n}'"))?;
+            if s3::binding_of(&c.name).is_some() && owned_saved_binding(s, &c).is_none() {
+                return Err(format!("no S3 connection named '{n}'"));
+            }
+            Some(c)
+        }
         None => None,
     };
     let limit = super::f(p, "limit").map(|l| l.clamp(1.0, s3::MAX_LIST as f64) as usize).unwrap_or(1000);
@@ -169,16 +229,23 @@ pub(super) fn list(_s: &mut Session, p: &Value) -> CmdResult {
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let fetch = |url: &str| crate::render::rustgis_tiles::cache::download_blocking(url);
-        // A saved connection's login signs only the addresses that name it.
+        let fetch =
+            |url: &str| crate::render::rustgis_tiles::cache::download_blocking(url).map_err(|e| crate::sources::scrub_s3_wrappers(&e));
+        // A saved connection's login signs only the addresses that name this session's binding.
         let through = |c: &s3::Connection, url: String| match s3::binding_of(&c.name) {
-            Some(binding) => s3::bound_url(&binding, &url),
+            Some(_) => {
+                let binding = owned_saved_binding(s, c).ok_or_else(|| format!("no S3 connection named '{}'", c.name))?;
+                s3::bound_url(&binding, &url)
+            }
             None => Ok(url),
         };
         let Some(bucket) = bucket else {
+            if !s.policy_allows_reserved() {
+                return Err("give a bucket (or an s3:// address)".into());
+            }
             // A connection's buckets (ListBuckets needs its credentials).
             let c = named
-                .or_else(|| s3::connections().into_iter().find(|c| c.credentials.is_some()))
+                .or_else(|| s3::connections().into_iter().find(|c| c.credentials.is_some() && visible_to_session(s, c)))
                 .ok_or("give a bucket (or an s3:// address), or connect with credentials first to list your buckets")?;
             if c.credentials.is_none() {
                 return Err(format!("'{}' is anonymous: listing its buckets needs credentials; give a bucket", c.name));
@@ -189,12 +256,18 @@ pub(super) fn list(_s: &mut Session, p: &Value) -> CmdResult {
         // A bucket listed through a connection is served by it from then on (its objects are read
         // with its keys); otherwise the bucket's own connection, if any, or anonymously.
         if let Some(c) = &named {
+            if !s.policy_allows_reserved() {
+                return Err("listing through a named S3 connection requires user authorization".into());
+            }
             match s3::binding_of(&c.name) {
-                Some(binding) => s3::grant_saved(&binding, &bucket)?,
+                Some(_) => {
+                    let binding = owned_saved_binding(s, c).ok_or_else(|| format!("no S3 connection named '{}'", c.name))?;
+                    s3::grant_saved(&binding, &bucket)?;
+                }
                 None => s3::grant(&c.name, &bucket),
             }
         }
-        let conn = named.or_else(|| s3::for_bucket(&bucket));
+        let conn = named.or_else(|| s3::for_bucket(&bucket).filter(|c| !s.web_logins.is_anonymous() || c.credentials.is_none()));
         let (mut prefixes, mut objects, mut token, mut pages) = (Vec::new(), Vec::new(), None::<String>, 0);
         loop {
             let url = s3::list_url(&bucket, &prefix, token.as_deref(), conn.as_ref());
@@ -214,19 +287,11 @@ pub(super) fn list(_s: &mut Session, p: &Value) -> CmdResult {
         let more = token.is_some() || prefixes.len() + objects.len() > limit;
         prefixes.truncate(limit);
         objects.truncate(limit.saturating_sub(prefixes.len()));
-        // What a saved connection lists is added through it: its objects' addresses name it.
-        let address = |key: &str| {
-            let url = format!("s3://{bucket}/{key}");
-            match conn.as_ref().map(|c| through(c, url.clone())) {
-                Some(Ok(bound)) => bound,
-                _ => url,
-            }
-        };
         Ok(json!({
             "bucket": bucket,
             "prefix": prefix,
             "prefixes": prefixes,
-            "objects": objects.iter().map(|o| json!({"key": o.key, "size": o.size, "modified": o.modified, "url": address(&o.key)})).collect::<Vec<_>>(),
+            "objects": objects.iter().map(|o| json!({"key": o.key, "size": o.size, "modified": o.modified, "url": format!("s3://{bucket}/{}", o.key)})).collect::<Vec<_>>(),
             "truncated": more,
         }))
     }

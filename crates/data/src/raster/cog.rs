@@ -639,9 +639,9 @@ pub fn decode_tile_counted(header: &Sparse, layout: &Layout, level: usize, index
     let r = header.clone().with(at, bytes).reader();
     let mut dec = Decoder::new(super::geotiff::reader(r).map_err(err)?).map_err(err)?.with_limits(limits());
     dec.seek_to_image(l.ifd).map_err(err)?;
-    let buf = super::geotiff::read_chunk(&mut dec, index)?;
+    let (buf, gaps) = super::geotiff::read_chunk(&mut dec, index, &mut super::lerc::Table::default())?;
     let changed = super::geotiff::rounded_bits(&buf, super::Uncounted::new(layout.nodata_exact, None));
-    let values = match buf {
+    let mut values = match buf {
         DecodingResult::U8(v) => v.into_iter().map(f32::from).collect::<Vec<f32>>(),
         DecodingResult::I8(v) => v.into_iter().map(f32::from).collect(),
         DecodingResult::U16(v) => v.into_iter().map(f32::from).collect(),
@@ -654,6 +654,7 @@ pub fn decode_tile_counted(header: &Sparse, layout: &Layout, level: usize, index
         DecodingResult::F32(v) => v,
         DecodingResult::F64(v) => v.into_iter().map(|x| x as f32).collect(),
     };
+    super::lerc::blank(&mut values, gaps.as_deref());
     let (tw, th) = (l.tile_width as usize, l.tile_height as usize);
     let nb = layout.chunk_bands();
     // A band's chunk is a tile of its plane.

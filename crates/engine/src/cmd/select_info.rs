@@ -92,14 +92,21 @@ fn ask(t: &rustgis_map::tiles::TileLayer, fi: &FeatureInfo, at: Coord, m_per_px:
 pub(super) fn requests(s: &Session, lon: f64, lat: f64, first_layer: bool, picked: Option<usize>) -> Vec<Value> {
     let Some((at, m_per_px)) = merc_at(s, lon, lat) else { return Vec::new() };
     let wanted = if first_layer { 1 } else { MAX_ASKED };
-    s.map()
+    let mut asks: Vec<Value> = s
+        .map()
         .tiles
         .iter()
         .enumerate()
         .filter(|(i, t)| picked.is_none_or(|p| p == *i) && askable(t, picked.is_some()))
         .filter_map(|(_, t)| next_fetch(t, lon, lat, at, m_per_px))
         .take(wanted)
-        .collect()
+        .collect();
+    if !s.policy_user() {
+        for ask in &mut asks {
+            crate::sources::redact_url_fields(ask);
+        }
+    }
+    asks
 }
 
 /// The index of the topmost WMS tile layer that can be asked what is at a point (it covers it).
@@ -188,12 +195,17 @@ fn feature_info(s: &mut Session, p: &Value) -> CmdResult {
             // The service's error in the format asked in: the request in the next, for the point.
             Err(e) => {
                 let point = f(p, "lon").zip(f(p, "lat")).and_then(|(lon, lat)| merc_at(s, lon, lat).map(|m| (lon, lat, m)));
-                let retry = match (asked, point) {
+                let mut retry = match (asked, point) {
                     (Some(request), Some((lon, lat, (at, m_per_px)))) if ogc::may_answer_in_another_format(text.as_bytes()) => {
                         retry(s, index, request, lon, lat, at, m_per_px)
                     }
                     _ => None,
                 };
+                if !s.policy_user()
+                    && let Some(out) = &mut retry
+                {
+                    crate::sources::redact_url_fields(out);
+                }
                 retry.ok_or_else(|| named(e))
             }
         };
@@ -204,7 +216,11 @@ fn feature_info(s: &mut Session, p: &Value) -> CmdResult {
     let next = |s: &Session| s.map().tiles.get(index).and_then(|t| next_fetch(t, lon, lat, at, m_per_px));
     if b(p, "request") == Some(true) {
         // Nothing to ask (not queryable, or outside the layer): no results.
-        return Ok(next(s).unwrap_or_else(|| json!({"results": []})));
+        let mut out = next(s).unwrap_or_else(|| json!({"results": []}));
+        if !s.policy_user() {
+            crate::sources::redact_url_fields(&mut out);
+        }
+        return Ok(out);
     }
     #[cfg(target_arch = "wasm32")]
     {

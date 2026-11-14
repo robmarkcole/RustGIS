@@ -79,8 +79,8 @@ pub fn save(app: &mut RustGisApp) {
 pub fn load_connections(app: &mut RustGisApp) {
     use rustgis_engine::{connections::Connections, sources::Sources};
     let Some(load) = &app.services.load_pref else { return };
-    app.session.connections = if let Some(text) = load(rustgis_engine::connections::PREF) {
-        Connections::from_json(&text)
+    if let Some(text) = load(rustgis_engine::connections::PREF) {
+        app.session.load_connections(&text);
     } else {
         let imported =
             Connections::import(&Sources::from_json(&load(PREF).unwrap_or_default()), &load(crate::s3ui::SAVED).unwrap_or_default());
@@ -88,8 +88,8 @@ pub fn load_connections(app: &mut RustGisApp) {
         if let Some(save) = &app.services.save_pref {
             save(rustgis_engine::connections::PREF, &imported.to_json());
         }
-        imported
-    };
+        app.session.connections = imported;
+    }
     app.ui.connections_saved = app.session.connections.generation;
 }
 

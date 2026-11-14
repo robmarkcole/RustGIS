@@ -41,6 +41,14 @@ impl SlotKey<'_> {
             Self::Video { presentation, page } => SlotKey::Video { presentation: *presentation, page: *page },
         }
     }
+
+    fn is_duckdb_sql(&self) -> bool {
+        matches!(
+            self,
+            Self::Map { at: Position::Layer { role: rustgis_map::LayerRole::DuckDbSql, .. }, .. }
+                | Self::Area { at: Position::Layer { role: rustgis_map::LayerRole::DuckDbSql, .. }, .. }
+        )
+    }
 }
 
 struct Slot<'a> {
@@ -164,7 +172,9 @@ fn source_choice(layer: Option<&rustgis_map::Layer>) -> Result<Option<String>, (
             &s.shapefile_crs,
             s.embedded.as_deref(),
             s.gdal.as_ref().map(|g| (public(&g.path), &g.layer, g.family, &g.crs)),
-            s.duckdb.as_ref().map(|d| (&d.sql, d.database.as_deref().map(public), &d.table, &d.crs, d.family)),
+            s.duckdb.as_ref().map(|d| {
+                (d.sql.as_deref().map(crate::roles::sql_secrets_removed), d.database.as_deref().map(public), &d.table, &d.crs, d.family)
+            }),
             s.postgis.as_ref().map(|d| (public(&d.database), &d.table, d.family, &d.crs)),
             s.mysql.as_ref().map(|d| (public(&d.database), &d.table, d.family, &d.crs)),
             s.sqlserver.as_ref().map(|d| (public(&d.database), &d.table, d.family, &d.crs)),
@@ -241,11 +251,19 @@ impl Exchange {
                 .layer
                 .and_then(|l| l.source.as_ref())
                 .is_some_and(|s| s.postgis.is_some() || s.mysql.is_some() || s.sqlserver.is_some() || s.duckdb.is_some());
-            let public = match durable::public_address(slot.value) {
-                Kept::Unchanged if database => slot.value.to_string(),
-                Kept::Unchanged => continue,
-                Kept::Changed(s) => s,
-                Kept::Withheld(prefix) => prefix.into(),
+            let public = if slot.key.is_duckdb_sql() {
+                let clean = crate::roles::sql_secrets_removed(slot.value);
+                if clean == slot.value && !database {
+                    continue;
+                }
+                clean
+            } else {
+                match durable::public_address(slot.value) {
+                    Kept::Unchanged if database => slot.value.to_string(),
+                    Kept::Unchanged => continue,
+                    Kept::Changed(s) => s,
+                    Kept::Withheld(prefix) => prefix.into(),
+                }
             };
             // Even an account omitted by the cap cannot make an earlier recorded public form
             // unambiguous. After the first overflow, no later slot is recorded.
@@ -354,6 +372,7 @@ fn reopen(p: &mut Project, at: &At) {
         | rustgis_map::LayerRole::MysqlDatabase
         | rustgis_map::LayerRole::SqlServerDatabase
         | rustgis_map::LayerRole::DuckDbDatabase
+        | rustgis_map::LayerRole::DuckDbSql
         | rustgis_map::LayerRole::GdalPath => {
             if let Some(source) = &mut layer.source {
                 source.allow_reconnect();
@@ -456,8 +475,12 @@ impl Session {
         report.lost = slots(&self.project)
             .into_iter()
             .filter(|slot| {
-                !matches!(durable::public_address(slot.value), Kept::Unchanged)
-                    && !incoming.get(&slot.key).is_some_and(|(count, value, _)| *count == 1 && *value == slot.value)
+                let had_secret = if slot.key.is_duckdb_sql() {
+                    crate::roles::sql_secrets_removed(slot.value) != slot.value
+                } else {
+                    !matches!(durable::public_address(slot.value), Kept::Unchanged)
+                };
+                had_secret && !incoming.get(&slot.key).is_some_and(|(count, value, _)| *count == 1 && *value == slot.value)
             })
             .count()
             .try_into()

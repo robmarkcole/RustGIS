@@ -243,8 +243,6 @@ And alongside it:
   [#596](https://github.com/opengeos/RustGIS/issues/596)).
 
 ### Edit
-- Save edits back to Shapefile and GeoJSON layers, as GeoPackage and PostGIS do
-  ([#1385](https://github.com/opengeos/RustGIS/issues/1385)). _Coordinate first._
 - Selecting and deleting rows of a standalone table (its cells, rows and fields are editable).
 - Shared edges, so that moving one polygon boundary moves its neighbour's too
   ([#872](https://github.com/opengeos/RustGIS/issues/872)). Coincident vertices already move

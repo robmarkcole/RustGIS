@@ -22,6 +22,7 @@ mod bookmarkpane;
 mod catalogsui;
 mod chrome;
 mod comets;
+mod completion;
 mod connectiontree;
 mod connectionui;
 #[cfg(not(target_arch = "wasm32"))]
@@ -1114,6 +1115,25 @@ const CAPTURE_PIXELS: f64 = 16_000_000.0;
 /// The lowest dpi a layout is copied at: a page that would need less is an error.
 const CAPTURE_MIN_DPI: f64 = 36.0;
 
+/// The most positions [`RustGisApp::fixes`] keeps for an interface to take: more than two days of
+/// one a second, as many as a phone's shell keeps out of sight (its `MOST_EVENTS`), so a batch it
+/// hands over on coming back is taken whole into a track.
+pub const FIXES_KEPT: usize = 200_000;
+
+impl RustGisApp {
+    /// Keeps a position the shell reported: the last one in [`RustGisApp::position`], and each in
+    /// [`RustGisApp::fixes`] until an interface takes them (the oldest dropped past
+    /// [`FIXES_KEPT`]).
+    pub fn report_position(&mut self, fix: rustgis_engine::platform::Fix) {
+        self.position = Some(fix);
+        if self.fixes.len() >= FIXES_KEPT {
+            self.fixes.pop_front();
+            self.fixes_dropped += 1;
+        }
+        self.fixes.push_back(fix);
+    }
+}
+
 pub struct RustGisApp {
     pub session: Session,
     pub(crate) boxes: boxedit::State,
@@ -1146,6 +1166,17 @@ pub struct RustGisApp {
     /// Where the device is, as the shell last reported it; `None` until it has, and again once
     /// positioning is off. An interface draws it on the map and can capture at it.
     pub position: Option<rustgis_engine::platform::Fix>,
+    /// Every position the shell reported since an interface last took them, oldest first (at most
+    /// [`FIXES_KEPT`]: the oldest go first). [`RustGisApp::position`] is only the last: a track
+    /// or an average needs each, including those that arrived together after the app was out of
+    /// sight.
+    pub fixes: std::collections::VecDeque<rustgis_engine::platform::Fix>,
+    /// Whether the interface wants positions while the app is out of sight too (a track being
+    /// recorded): a phone's shell keeps them coming then, with the notice its system requires.
+    pub keep_locating: bool,
+    /// How many positions were dropped from [`RustGisApp::fixes`] past [`FIXES_KEPT`] since an
+    /// interface last took them: the interface says so when a track or an average missed them.
+    pub fixes_dropped: usize,
     /// Watches linked local files for changes made outside RustGIS and offers Reload Data
     /// (the desktop app; see [`diskwatch`]). Off for tests, unless one turns it on (as `ui_shot`'s
     /// `watchFiles` does).
@@ -1416,6 +1447,9 @@ impl RustGisApp {
             chrome: None,
             locate: false,
             position: None,
+            fixes: std::collections::VecDeque::new(),
+            keep_locating: false,
+            fixes_dropped: 0,
             #[cfg(not(target_arch = "wasm32"))]
             watch_files: false,
             #[cfg(not(target_arch = "wasm32"))]
@@ -2523,6 +2557,15 @@ impl RustGisApp {
             // it found said once it lands (Command Search shows no answer).
             if id == "source.syncState" {
                 return readjob::run_then(self, "source.syncState", params, Some(sync_state_said));
+            }
+            // Publishing hashes, reads and writes the whole file: on a thread of its own, with
+            // progress and Cancel, as an export is.
+            if id == "source.publish" {
+                let params = if params.is_null() { json!({}) } else { params };
+                // Refused before it starts (another export running, no record): said, as Command
+                // Search shows no answer.
+                let mark = self.session.notice_mark();
+                return exportjob::start(self, "source.publish", params).inspect_err(|e| self.command_failed(id, e, mark));
             }
             // Converting the labels of a layer read in place reads all of its source first, on a
             // thread of its own, whoever asks (a click, the assistant).

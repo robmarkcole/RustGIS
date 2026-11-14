@@ -44,6 +44,7 @@ pub(crate) const IN_BACKGROUND: &[(&str, &str, Start)] = &[
     ("share.exportMap", "Export Map", super::share::map_work),
     ("layout.export", "Export Layout", super::layout::export_work),
     ("report.export", "Export Report", super::report::export_work),
+    ("source.publish", "Publish to Source", super::publish::publish_work),
 ];
 
 /// `command` and what it is called, when the app writes its file on another thread (see
@@ -65,7 +66,7 @@ pub(crate) fn write_here(s: &mut Session, p: &Value, command: &str) -> CmdResult
         let work = start(s, p)?;
         written_under(name, &control, work)
     })?;
-    s.check_continuation(&owner).map_err(|why| completion_refused(wrote.written_path.as_deref(), why))?;
+    s.check_continuation(&owner).map_err(|why| completion_with_notes(command, wrote.written_path.as_deref(), &wrote.notes, why))?;
     said(s, wrote)
 }
 
@@ -74,6 +75,24 @@ pub(crate) fn completion_refused(written_path: Option<&str>, why: String) -> Str
     match written_path {
         Some(path) => format!("Exported {path}; completion was refused: {why}"),
         None => why,
+    }
+}
+
+/// A committed publication's format notices remain part of its refusal diagnostic; its
+/// finalizer stays blocked, so reporting the write cannot update a revoked layer's record.
+fn completion_with_notes(command: &str, written_path: Option<&str>, notes: &[String], why: String) -> String {
+    if command == "source.publish"
+        && let Some(path) = written_path
+    {
+        let mut message =
+            format!("Published {path}; completion was refused: {why}; the layer's record wasn't updated; add the file again to compare it");
+        for note in notes {
+            message.push('\n');
+            message.push_str(note);
+        }
+        message
+    } else {
+        completion_refused(written_path, why)
     }
 }
 
@@ -284,8 +303,9 @@ pub fn export_land(s: &mut Session, started: Started, done: Result<Wrote, String
             }
         }
         let written_path = done.as_ref().ok().and_then(|wrote| wrote.written_path.clone());
+        let notes = done.as_ref().ok().filter(|_| command == "source.publish").map(|wrote| wrote.notes.clone()).unwrap_or_default();
         s.finish_export(&owner, |s| done.and_then(|wrote| said(s, wrote)))
-            .map_err(|why| completion_refused(written_path.as_deref(), why))?
+            .map_err(|why| completion_with_notes(command, written_path.as_deref(), &notes, why))?
     })();
     // Its failure said once, under the command, as `Session::run` says one.
     if let Err(e) = &landed {

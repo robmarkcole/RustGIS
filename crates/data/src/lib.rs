@@ -37,6 +37,8 @@ pub mod ogc;
 pub mod osm;
 pub mod photo;
 pub mod progress;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod publish;
 pub mod query;
 pub mod raster;
 pub mod s3_address;
@@ -60,6 +62,24 @@ pub use rustgis_geom::{Coord, Extent};
 pub use value::{Field, FieldType, Value};
 
 use serde::{Deserialize, Serialize};
+
+/// Whether this build runs other programs: GDAL's (for the formats read through it), DuckDB (SQL
+/// queries and DuckDB databases) and the `geolibre` runner. Not in the browser, which runs none,
+/// nor on a phone (Android, iOS), whose apps can't start them (#1902): there, what would run one
+/// says so (see [`no_programs_here`]) instead of asking for an install that can't be made.
+pub const RUNS_PROGRAMS: bool = !cfg!(any(target_arch = "wasm32", target_os = "android", target_os = "ios"));
+
+/// What runs RustGIS where [`RUNS_PROGRAMS`] is false, for a message that says a program can't run
+/// there: "a phone" or "the browser". Empty where programs run.
+pub fn no_programs_here() -> &'static str {
+    if RUNS_PROGRAMS {
+        ""
+    } else if cfg!(target_arch = "wasm32") {
+        "the browser"
+    } else {
+        "a phone"
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum DataError {

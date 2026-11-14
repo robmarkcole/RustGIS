@@ -3155,12 +3155,36 @@ impl GpForm {
     }
 }
 
+/// The card that stands for the GeoLibre tools on a phone, which can't run their program.
+fn no_geolibre_here(ui: &mut Ui, t: &Tokens) {
+    ui.add_space(6.0);
+    egui::Frame::NONE.stroke(Stroke::new(1.0, t.border)).corner_radius(CornerRadius::same(6)).inner_margin(egui::Margin::same(10)).show(
+        ui,
+        |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(egui::RichText::new(tl!("Whitebox and GeoLibre tools")).font(semibold(13.0)));
+            ui.label(
+                egui::RichText::new(tl!(
+                    "Not on a phone: these tools run as a program of their own, which a phone can't run. Use them in RustGIS on a computer."
+                ))
+                .size(11.5)
+                .color(t.text_dim),
+            );
+        },
+    );
+}
+
 /// Where to get the GeoLibre tools when the runner isn't installed (desktop and CLI builds only).
 fn geolibre_card(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     // Read directly, not through Session::run: a command each frame would bump the session's
     // revision and make the views redraw. The status itself is cached in the runner module.
     let status = rustgis_engine::cmd::gp::geolibre_status();
     if status["supported"] != true {
+        // A phone's build leaves the suite out (its runner is a program, which a phone's apps
+        // can't start): said where the card would be, so the tools aren't simply missing (#1902).
+        if !rustgis_engine::data::RUNS_PROGRAMS && !cfg!(target_arch = "wasm32") {
+            no_geolibre_here(ui, t);
+        }
         return;
     }
     // An install that just finished: use the runner, and remember it.
@@ -6732,10 +6756,13 @@ fn raster_symbology(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
         RasterRenderer::Colormap => {
             ui.label(egui::RichText::new(tl!("Colors from the raster's own color table.")).size(11.5).color(t.text_dim));
         }
-        RasterRenderer::ShadedRelief { band, ramp, azimuth, altitude, z_factor, shadow, sky } => {
-            let (az, alt, zf, sh, sk, rp) = (*azimuth, *altitude, *z_factor, *shadow, *sky, ramp.as_ref().map(|r| r.name().to_string()));
+        RasterRenderer::ShadedRelief { band, ramp, azimuth, altitude, z_factor, shadow, sky, fill } => {
+            let (az, alt, zf, sh, sk, fl) = (*azimuth, *altitude, *z_factor, *shadow, *sky, *fill);
+            let rp = ramp.as_ref().map(|r| r.name().to_string());
             let relief = move |band: usize, az: f64, alt: f64, zf: f64, sh: f64| {
-                let mut p = json!({"type": "shadedRelief", "band": band + 1, "azimuth": az, "altitude": alt, "zFactor": zf, "shadow": sh, "sky": sk});
+                let mut p = json!({
+                    "type": "shadedRelief", "band": band + 1, "azimuth": az, "altitude": alt, "zFactor": zf, "shadow": sh, "sky": sk, "fill": fl
+                });
                 match &rp {
                     Some(r) => p["ramp"] = json!(r),
                     None => p["grey"] = json!(true),
@@ -6750,6 +6777,7 @@ fn raster_symbology(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
                     ("Z factor", zf, 0.001..=1000.0, 0.01, 2),
                     ("Cast shadows", sh, 0.0..=1.0, 0.01, 3),
                     ("Sky visibility", sk, 0.0..=1.0, 0.01, 4),
+                    ("Fill light", fl, 0.0..=1.0, 0.01, 5),
                 ] {
                     let input_label = ui.label(tl!(label));
                     let mut x = v;
@@ -6763,6 +6791,9 @@ fn raster_symbology(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
                         4 => r.on_hover_text(tl!(
                             "How much the sky each cell sees, over the terrain around it, scales its ambient light, from 0 (not at all) to 1"
                         )),
+                        5 => r.on_hover_text(tl!(
+                            "A light from the side opposite the sun that lightens the slopes turned toward it, from 0 (none) to 1"
+                        )),
                         _ => r,
                     };
                     if drag.settled(ui, &r, &mut x) && x != v {
@@ -6774,8 +6805,10 @@ fn raster_symbology(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
                             _ => (az, alt, zf, sh),
                         };
                         let mut p = relief(*band, a, b, c, d);
-                        if which == 4 {
-                            p["sky"] = json!(x);
+                        match which {
+                            4 => p["sky"] = json!(x),
+                            5 => p["fill"] = json!(x),
+                            _ => {}
                         }
                         let _ = app.run("raster.symbology", p);
                     }

@@ -87,7 +87,8 @@ pub struct CommandSpec {
     pub shortcut: &'static str,
     /// Parameter description for scripts and agents.
     pub params: &'static str,
-    /// Whether it changes the project (and so takes an undo snapshot).
+    /// Whether it takes an automatic project-edit transaction (undo snapshot and dirty marking).
+    /// Changes committed without that transaction declare `Effect::Edits` explicitly.
     pub mutates: bool,
     /// `None` = enabled; `Some(reason)` = disabled.
     pub enabled: fn(&Session) -> Option<&'static str>,
@@ -110,6 +111,12 @@ impl CommandSpec {
     /// the description is not a `{"key": …}` object (nothing to check against).
     pub fn param_keys(&self) -> Option<Vec<&'static str>> {
         param_keys(self.params)
+    }
+
+    /// Whether it can change the project, including external commits that update metadata
+    /// without an automatic undo snapshot. Logging and command discovery use this contract.
+    pub const fn changes_project(&self) -> bool {
+        self.mutates || self.effects.contains(policy::Effect::Edits)
     }
 
     /// Whether the parameter description includes a required top-level input.
@@ -164,7 +171,8 @@ impl CommandSpec {
         self.params = p;
         self
     }
-    /// Doesn't change the project (no undo snapshot, not dirtying).
+    /// Suppresses automatic undo snapshots and dirty marking. Usually read-only; a command
+    /// committing external changes can update metadata itself and declares `Effect::Edits`.
     pub const fn view(mut self) -> Self {
         self.mutates = false;
         self
@@ -339,6 +347,9 @@ fn param_entries<'a>(desc: &'a str, mut visit: impl FnMut(&'a str, bool)) -> Opt
     }
     Some(())
 }
+
+/// What a zoom to a place the map's projection doesn't reach says, once in a command.
+const BEYOND_PROJECTION: &str = "The place lies beyond what the map's projection shows, so the view wasn't moved to it.";
 
 /// `s` cut to `n` characters, with `…` when cut.
 fn clip(s: &str, n: usize) -> String {
@@ -758,6 +769,10 @@ pub struct Session {
     /// Notices given in this session, including ones no longer kept (see [`Session::notices_since`]),
     /// less those a failed command withdrew.
     notices_given: u64,
+    /// Whether the outermost command now running has said that a zoom couldn't reach its place;
+    /// `None` between commands. Its inner steps would each say it (a zoom refused by each layer an
+    /// add frames): it is said once in a command, however many notices come after.
+    beyond_said: Option<bool>,
     /// The count of cloud-optimised GeoTIFF headers landed when [`Session::notice_landed_rasters`]
     /// last looked back at the dates a dated series has shown (`cog::landed_count`).
     cog_headers_seen: u64,
@@ -837,6 +852,9 @@ pub struct Session {
     /// How many of the commands running now restore the project if they fail: a replacement is
     /// put aside only under one of them, as only then can it be rolled back.
     restorable: u32,
+    /// File writes committed inside the outer command, retained through layer removal or a
+    /// project replacement so its rollback can restore the current source-file record.
+    published_syncs: Vec<(u64, String, rustgis_data::sync::Synced)>,
     /// Who runs commands now: `None` is the user; the MCP relay names an attached agent around
     /// its calls. Each undo step remembers who made it ([`Session::undo_actor`]).
     pub actor: Option<String>,
@@ -1183,6 +1201,7 @@ impl Session {
             bundled_roots_said: false,
             diagnostics: rustgis_data::diagnostics::History::default(),
             notices_given: 0,
+            beyond_said: None,
             cog_headers_seen: 0,
             table_layer: None,
             table_standalone: None,
@@ -1218,6 +1237,7 @@ impl Session {
             depth: 0,
             diagnostic_source: None,
             restorable: 0,
+            published_syncs: Vec::new(),
             actor: None,
             back: Vec::new(),
             forward: Vec::new(),
@@ -1555,10 +1575,12 @@ impl Session {
             // A step that joins the last one (a held arrow key nudging an element: `merge_undo`) is
             // one entry too, as it is one step to undo.
             let joins = self.merge.is_some() && self.merge == self.merged && !self.undo.is_empty();
+            self.beyond_said = Some(false);
             let (at, start) = (project_log::now_ms(), web_time::Instant::now());
             #[cfg(not(target_arch = "wasm32"))]
             let files_before: Vec<String> = self.mbtiles_files().map(str::to_string).collect();
             let res = self.with_unread_bools(source, run);
+            self.beyond_said = None;
             // Whichever command took its last layer away (removed, undone, the project closed):
             // the file can now be moved or replaced, so what was read of it is forgotten too.
             #[cfg(not(target_arch = "wasm32"))]
@@ -1614,6 +1636,7 @@ impl Session {
         // Every top-level invocation consumes its key, even a refusal or panic before guarded.
         if outermost {
             self.merge = None;
+            self.beyond_said = None;
         }
         match result {
             Ok(result) => result,
@@ -1814,6 +1837,10 @@ impl Session {
             // session's own flag says so, not the answer, which a plugin's command could forge.
             (Ok(_), Some(_)) if std::mem::take(&mut self.request_only) => {}
             (Ok(_), Some(mut snap)) => {
+                // A successful script may publish and then remove the layer. Its undo
+                // snapshot still needs the committed file record, even without a live layer
+                // from which undo could carry that record forward.
+                self.keep_published_syncs(&mut snap);
                 fresh_source_ids(&snap, &mut self.project);
                 forget_label_state_of_removed_features(&snap, &mut self.project);
                 // An edit may change the dates the time slider's window filters on: bound layers
@@ -1867,7 +1894,8 @@ impl Session {
                 let failed_history = if self.opened == opened { std::mem::take(&mut self.project.gp_history) } else { Vec::new() };
                 // The project as it was before the command, so the layout open then, whatever
                 // the command opened on the way (a task's steps).
-                self.project = snap;
+                let committed = std::mem::replace(&mut self.project, snap);
+                let sync_changed = self.keep_synced(&committed);
                 (self.trusted_tasks, self.trusted_models, self.trusted_notebooks) = trust;
                 self.active_layout = open_layout;
                 // Replaced during the command: what it held beside itself (its undo history, its
@@ -1891,7 +1919,12 @@ impl Session {
                 // go; its errors stay.
                 let new = usize::try_from(self.notices_given.saturating_sub(said)).unwrap_or(usize::MAX).min(self.notices.len());
                 let start = self.notices.len() - new;
-                let errors: Vec<Notice> = self.notices.drain(start..).filter(|n| n.error).collect();
+                let withdrawn: Vec<Notice> = self.notices.drain(start..).collect();
+                // A zoom it couldn't make, said and now withdrawn, is said again by the next one.
+                if withdrawn.iter().any(|n| n.text == BEYOND_PROJECTION) && self.beyond_said == Some(true) {
+                    self.beyond_said = Some(false);
+                }
+                let errors: Vec<Notice> = withdrawn.into_iter().filter(|n| n.error).collect();
                 self.notices_given -= (new - errors.len()) as u64;
                 self.notices.extend(errors);
                 let mut recorded_failure = false;
@@ -1901,7 +1934,11 @@ impl Session {
                     self.push_gp_record(record);
                     recorded_failure = true;
                 }
-                if recorded_failure {
+                if sync_changed {
+                    self.mark_unsaved();
+                    self.warn("Source-file records were kept: rolling back a command does not undo its file writes");
+                }
+                if recorded_failure || sync_changed {
                     if self.depth == 0 && self.project.gp_history.len() > 500 {
                         let excess = self.project.gp_history.len() - 500;
                         self.project.gp_history.drain(..excess);
@@ -1926,6 +1963,7 @@ impl Session {
         // The command, and those it ran, are done: a replaced project stays replaced.
         if self.depth == 0 {
             self.put_aside = None;
+            self.published_syncs.clear();
         }
         self.fix_active_layer();
         self.revision = self.revision.wrapping_add(1);
@@ -2566,6 +2604,7 @@ impl Session {
         self.keep_time_position(&cur);
         self.keep_tile_pick(&cur);
         self.keep_headers_said(&cur);
+        self.keep_synced(&cur);
         self.redo.push((cur, was, label, actor, std::mem::replace(&mut self.state, state), files, old_trust, old_boxes));
         self.touch_all_geometry();
         true
@@ -2592,6 +2631,7 @@ impl Session {
         self.keep_time_position(&cur);
         self.keep_tile_pick(&cur);
         self.keep_headers_said(&cur);
+        self.keep_synced(&cur);
         self.undo.push((cur, was, label, actor, std::mem::replace(&mut self.state, state), files, old_trust, old_boxes));
         self.touch_all_geometry();
         true
@@ -2608,6 +2648,51 @@ impl Session {
         }
         // Zarr layers that follow the slider read the step it is back at.
         cmd::zarr::follow_time(self);
+    }
+
+    /// Remembers a physical source write only while a command can still roll its project back.
+    /// The outer guard clears these records on success or failure; they never go in a project.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn remember_source_write(&mut self, instance: u64, path: String, synced: rustgis_data::sync::Synced) {
+        if self.restorable > 0 {
+            self.published_syncs.retain(|(i, p, _)| *i != instance || *p != path);
+            self.published_syncs.push((instance, path, synced));
+        }
+    }
+
+    /// Gives a command's undo snapshot the records of files it physically wrote, including
+    /// layers the command removed after publishing. The records belong to these instances only.
+    fn keep_published_syncs(&self, project: &mut Project) {
+        for l in project.maps.iter_mut().flat_map(|m| m.layers.iter_mut()) {
+            if let Some((_, _, synced)) =
+                self.published_syncs.iter().rev().find(|(i, p, _)| *i == l.instance_id() && l.dataset.source.as_deref() == Some(p.as_str()))
+            {
+                l.synced = Some(synced.clone());
+            }
+        }
+    }
+
+    /// After undo, redo or failed-command rollback swaps the project: each layer keeps its
+    /// file record (`synced`), as restoring the project doesn't change the file. A published
+    /// layer keeps the record of what was written, so restored edits compare with that file.
+    /// Returns whether the restored project took a different record and needs saving.
+    fn keep_synced(&mut self, before: &Project) -> bool {
+        let mut changed = false;
+        for l in self.project.maps.iter_mut().flat_map(|m| m.layers.iter_mut()) {
+            let old = before.maps.iter().flat_map(|m| &m.layers).find(|o| o.instance_id() == l.instance_id());
+            let synced = old.filter(|o| o.dataset.source == l.dataset.source).map(|o| o.synced.clone()).or_else(|| {
+                self.published_syncs
+                    .iter()
+                    .rev()
+                    .find(|(i, p, _)| *i == l.instance_id() && l.dataset.source.as_deref() == Some(p.as_str()))
+                    .map(|(_, _, synced)| Some(synced.clone()))
+            });
+            if let Some(synced) = synced {
+                changed |= l.synced != synced;
+                l.synced = synced;
+            }
+        }
+        changed
     }
 
     /// After undo or redo swaps the project: the tile layer picked in the Layers pane stays the one
@@ -2870,6 +2955,16 @@ impl Session {
         }
     }
 
+    /// Takes the saved `connections` preference (the apps at start, and the command line and
+    /// Python when they use the desktop's saved secrets): what of it isn't used here is said as
+    /// notices, one per kind (see [`connections::Connections::unread`]).
+    pub fn load_connections(&mut self, text: &str) {
+        self.connections = connections::Connections::from_json(text);
+        for said in self.connections.unread() {
+            self.warn(said);
+        }
+    }
+
     /// Takes another session's extension choices (a copy that runs a model or script ahead, on
     /// the desktop only).
     #[cfg(not(target_arch = "wasm32"))]
@@ -2912,17 +3007,29 @@ impl Session {
         cmd::navigate::view_of(self.map()).map(|(_, z)| z)
     }
 
-    /// Fits the camera to a lon/lat extent in the current view size.
-    pub fn zoom_to(&mut self, e: &rustgis_geom::Extent) {
+    /// Fits the camera to a lon/lat extent in the current view size; whether it did. One the map's
+    /// projection doesn't reach (wholly past Web Mercator's 85°, say) doesn't move the view to it,
+    /// and says so; an empty extent or view doesn't either, quietly.
+    pub fn zoom_to(&mut self, e: &rustgis_geom::Extent) -> bool {
         let (w, h) = self.view_size;
         let m = self.map_mut();
+        if e.is_empty() || w <= 1.0 || h <= 1.0 {
+            return false;
+        }
         if m.projection.is_globe() {
             rustgis_map::Globe::fit(&mut m.camera, e, w, h);
-        } else {
-            // An extent the projection doesn't reach leaves the view where it is.
-            let _ = m.fit_lonlat(e, w, h);
+        } else if !m.fit_lonlat(e, w, h) {
+            // Once in a command, though several of its steps zoom (each layer an add frames).
+            if self.beyond_said != Some(true) {
+                self.notify(BEYOND_PROJECTION, false);
+                if self.beyond_said.is_some() {
+                    self.beyond_said = Some(true);
+                }
+            }
+            return false;
         }
         self.record_extent();
+        true
     }
 
     pub fn title(&self) -> String {

@@ -107,10 +107,18 @@ pub fn usable() -> bool {
 }
 
 fn missing() -> DataError {
-    DataError::Unsupported(
+    DataError::Unsupported(missing_text(crate::no_programs_here()))
+}
+
+/// Why a format read through GDAL can't be read: GDAL isn't installed, or (`here` names it) this
+/// build runs no programs, where installing it wouldn't help.
+fn missing_text(here: &str) -> String {
+    if here.is_empty() {
         "this format needs GDAL: install it (ogr2ogr and ogrinfo on the PATH, or RUSTGIS_GDAL_BIN naming their folder) and add the file again"
-            .into(),
-    )
+            .into()
+    } else {
+        format!("this format is read through GDAL, a program {here} can't run: convert the file to a GeoPackage on a computer and add that")
+    }
 }
 
 /// Where converted layers are kept: the platform's cache folder, or `RUSTGIS_GDAL_CACHE`.
@@ -605,6 +613,15 @@ fn ours(name: &str) -> bool {
 mod tests {
     use super::*;
     use crate::GeometryType;
+
+    #[test]
+    fn where_programs_cant_run_the_message_says_so_instead_of_asking_for_an_install() {
+        assert!(missing_text("").contains("install it"));
+        let phone = missing_text("a phone");
+        assert!(phone.contains("a phone can't run") && !phone.contains("install"), "{phone}");
+        // Where programs run, the build reports none missing for that reason.
+        assert_eq!(crate::RUNS_PROGRAMS, crate::no_programs_here().is_empty());
+    }
 
     #[test]
     fn names() {

@@ -193,7 +193,7 @@ fn object(id: &str, value: &Value, depth: usize, config_depth: usize, registered
             None
         } else if role == Some(Role::Sql) {
             v.as_str().and_then(|s| {
-                let clean = crate::project_log::sql_secrets_removed(s);
+                let clean = sql_secrets_removed(s);
                 (clean != s).then_some(Value::String(clean))
             })
         } else if ADDRESS.contains(&k.as_str()) || address_like(v) {
@@ -471,4 +471,193 @@ pub(crate) fn script(source: &str, depth: usize) -> (Option<String>, Report) {
         offset += line.len();
     }
     (out, report)
+}
+
+/// Removes secrets from a DuckDB SQL string: `CREATE … SECRET (…)` bodies, `SET`/`PRAGMA`/`ATTACH`
+/// secret options, and credentials or live capabilities inside single-quoted addresses and
+/// database connection strings. Clean SQL is returned byte-for-byte unchanged.
+pub(crate) fn sql_secrets_removed(t: &str) -> String {
+    let t = crate::project_log::sql_secrets_removed(t);
+    let bytes = t.as_bytes();
+    let mut out: Option<String> = None;
+    let mut copied = 0usize;
+    let mut i = 0usize;
+    let mut stmt_head: Option<String> = None;
+    let mut prev_words: [String; 2] = [String::new(), String::new()];
+    let mut prev_eq = false;
+    while let Some(&b) = bytes.get(i) {
+        if b == b'-' && bytes.get(i + 1) == Some(&b'-') {
+            i += 2;
+            while let Some(&c) = bytes.get(i) {
+                i += 1;
+                if c == b'\n' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while let Some(&c) = bytes.get(i) {
+                if c == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'"' {
+            i += 1;
+            while let Some(&c) = bytes.get(i) {
+                i += 1;
+                if c == b'"' {
+                    if bytes.get(i) == Some(&b'"') {
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            prev_eq = false;
+            continue;
+        }
+        if b == b';' {
+            stmt_head = None;
+            prev_words = [String::new(), String::new()];
+            prev_eq = false;
+            i += 1;
+            continue;
+        }
+        if b == b'=' {
+            prev_eq = true;
+            i += 1;
+            continue;
+        }
+        if b.is_ascii_alphabetic() || b == b'_' {
+            let start = i;
+            i += 1;
+            while bytes.get(i).is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_' || *c == b'.') {
+                i += 1;
+            }
+            let word = t.get(start..i).unwrap_or("").to_ascii_lowercase();
+            if stmt_head.is_none() {
+                stmt_head = Some(word.clone());
+            }
+            prev_words[0] = std::mem::replace(&mut prev_words[1], word);
+            prev_eq = false;
+            continue;
+        }
+        if b == b'\'' {
+            let start = i;
+            i += 1;
+            let mut raw = String::new();
+            let mut closed = false;
+            while let Some(rest) = t.get(i..) {
+                let Some(ch) = rest.chars().next() else { break };
+                i += ch.len_utf8();
+                if ch == '\'' {
+                    if bytes.get(i) == Some(&b'\'') {
+                        raw.push('\'');
+                        i += 1;
+                    } else {
+                        closed = true;
+                        break;
+                    }
+                } else {
+                    raw.push(ch);
+                }
+            }
+            let cleaned = if !closed {
+                // An unclosed literal that looks like a secret setting or credentialed address is emptied.
+                let setting = sql_secret_context(stmt_head.as_deref(), &prev_words, prev_eq);
+                if setting || clean_sql_literal(&raw).is_some() { Some(String::new()) } else { None }
+            } else if sql_secret_context(stmt_head.as_deref(), &prev_words, prev_eq) {
+                (!raw.is_empty()).then_some(String::new())
+            } else {
+                clean_sql_literal(&raw)
+            };
+            if let Some(clean) = cleaned {
+                let buf = out.get_or_insert_with(|| String::with_capacity(t.len()));
+                buf.push_str(t.get(copied..start).unwrap_or(""));
+                buf.push('\'');
+                buf.push_str(&clean.replace('\'', "''"));
+                if closed {
+                    buf.push('\'');
+                }
+                copied = i;
+            }
+            prev_words = [String::new(), String::new()];
+            prev_eq = false;
+            continue;
+        }
+        if !b.is_ascii_whitespace() {
+            prev_words = [String::new(), String::new()];
+            prev_eq = false;
+        }
+        let step = t.get(i..).and_then(|s| s.chars().next()).map_or(1, char::len_utf8);
+        i += step;
+    }
+    if let Some(mut buf) = out {
+        buf.push_str(t.get(copied..).unwrap_or(""));
+        buf
+    } else {
+        t
+    }
+}
+
+/// Whether the tokens preceding a SQL string literal assign a secret setting or `ATTACH` secret.
+fn sql_secret_context(stmt_head: Option<&str>, prev_words: &[String; 2], prev_eq: bool) -> bool {
+    let is_secret_setting = |w: &str| {
+        let leaf = w.rsplit('.').next().unwrap_or(w);
+        (leaf != "key" && rustgis_data::address::secret_key(leaf)) || leaf.ends_with("connection_string")
+    };
+    match stmt_head {
+        Some("set" | "pragma") => {
+            if prev_eq {
+                is_secret_setting(&prev_words[1])
+            } else {
+                prev_words[1] == "to" && is_secret_setting(&prev_words[0])
+            }
+        }
+        Some("attach") => is_secret_setting(&prev_words[1]),
+        _ => false,
+    }
+}
+
+/// Cleans a single-quoted SQL literal when it holds a credentialed URL, capability wrapper or
+/// database connection string; `None` when unchanged.
+fn clean_sql_literal(raw: &str) -> Option<String> {
+    let trimmed = raw.trim_start();
+    let has_scheme = [
+        "http:",
+        "https:",
+        "s3:",
+        "rustgis-login:",
+        "rustgis-anonymous:",
+        "rustgis-s3:",
+        "pmtiles:",
+        "cog:",
+        "postgres:",
+        "postgresql:",
+        "pg:",
+        "mysql:",
+        "mariadb:",
+        "mssql:",
+    ]
+    .iter()
+    .any(|p| trimmed.get(..p.len()).is_some_and(|s| s.eq_ignore_ascii_case(p)));
+    if has_scheme {
+        let clean = crate::sources::redact_output(raw);
+        return (clean != raw).then_some(clean);
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if (lower.contains("password=") || lower.contains("sslpassword=") || lower.contains("passfile="))
+        && (lower.contains("host=") || lower.contains("dbname="))
+        && let Some(label) = rustgis_data::source::pgconn::public_label(&format!("postgres:{trimmed}"))
+    {
+        let clean = label.strip_prefix("postgres:").unwrap_or(&label).to_string();
+        return (clean != raw).then_some(clean);
+    }
+    None
 }

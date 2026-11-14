@@ -17,6 +17,7 @@ mod esri;
 pub mod gdal;
 pub mod geotiff;
 mod image_grid;
+mod lerc;
 mod lzw;
 mod mask;
 pub mod pam;

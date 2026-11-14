@@ -42,6 +42,8 @@ image = { workspace = true, features = ["jpeg"] }
 base64 = { workspace = true }
 lz4_flex = { workspace = true }
 ruzstd = { workspace = true }
+lerc-reader = { workspace = true }
+lerc-core = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # Azimuthal equidistant systems (Equi7's EPSG 27701–27707, ESRI's polar ones) need proj4rs' `aeqd`,
@@ -80,6 +82,8 @@ parquet = { workspace = true, features = ["arrow"] }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 proptest = { workspace = true }
+# Writing LERC blobs with masks, band sets and padded strips that GDAL never writes.
+lerc-writer = "0.5"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # Writing Zstandard-compressed GeoTIFFs.

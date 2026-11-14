@@ -181,8 +181,10 @@ impl World {
         World { kind, lon0, radius, x0: 0.0, y0: 0.0, lat1: winkel_parallel() }
     }
 
+    /// Longitude/latitude to projected coordinates; `None` for a non-finite point or a radius
+    /// that isn't finite and positive.
     pub fn forward(&self, c: Coord) -> Option<Coord> {
-        if !c.is_finite() {
+        if !c.is_finite() || !self.radius.is_finite() || self.radius <= 0.0 {
             return None;
         }
         // Keep ±180° (and points a rounding error past it) on their own side, so rings along the
@@ -198,8 +200,9 @@ impl World {
 
     /// The longitude and latitude at `m`; `None` when no point maps to it. Eckert IV and Equal
     /// Earth have inverse formulas; the others use Newton's method from a starting guess.
+    /// A radius that isn't finite and positive is refused, as in [`Self::forward`].
     pub fn inverse(&self, m: Coord) -> Option<Coord> {
-        if !m.is_finite() {
+        if !m.is_finite() || !self.radius.is_finite() || self.radius <= 0.0 {
             return None;
         }
         let (tx, ty) = ((m.x - self.x0) / self.radius, (m.y - self.y0) / self.radius);
@@ -332,6 +335,27 @@ fn equal_earth_inverse(x: f64, y: f64) -> Option<(f64, f64)> {
 mod tests {
     use super::*;
     use crate::MERCATOR_R;
+
+    #[test]
+    fn invalid_radii_give_no_projected_or_geographic_point() {
+        for kind in [Kind::Robinson, Kind::EqualEarth, Kind::NaturalEarth, Kind::WinkelTripel, Kind::EckertIV] {
+            for radius in [0.0, -0.0, -1.0, -MERCATOR_R, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                let w = World::new(kind, 0.0, radius);
+                for c in [Coord::new(0.0, 0.0), Coord::new(10.0, 50.0)] {
+                    assert_eq!(w.forward(c), None, "{w:?}: forward {c:?}");
+                    assert_eq!(w.inverse(c), None, "{w:?}: inverse {c:?}");
+                }
+            }
+            // Both unit spheres and metre-based worlds remain usable, including offsets.
+            for radius in [1.0, MERCATOR_R] {
+                let w = World { x0: 1000.0, y0: -2000.0, ..World::new(kind, 30.0, radius) };
+                let c = Coord::new(40.0, 50.0);
+                let m = w.forward(c).unwrap();
+                let back = w.inverse(m).unwrap();
+                assert!((back.x - c.x).abs() < 1e-5 && (back.y - c.y).abs() < 1e-5, "{w:?}: {back:?}");
+            }
+        }
+    }
 
     #[test]
     fn round_trips_and_outlines() {

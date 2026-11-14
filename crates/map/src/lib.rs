@@ -3154,6 +3154,7 @@ impl Layer {
             LayerRole::Streamed
             | LayerRole::GdalPath
             | LayerRole::DuckDbDatabase
+            | LayerRole::DuckDbSql
             | LayerRole::PostgisDatabase
             | LayerRole::MysqlDatabase
             | LayerRole::SqlServerDatabase => self.source.as_mut()?.output_slot_mut(role),

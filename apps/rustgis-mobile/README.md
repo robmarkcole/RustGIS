@@ -3,9 +3,9 @@
 RustGIS on Android ([#1902](https://github.com/opengeos/RustGIS/issues/1902)). It runs the desktop
 front end (`rustgis-ui-egui`) in a `NativeActivity`, with the system's file picker for opening and
 saving, and the touch interface (`rustgis-ui-touch`) around its map, which can capture points,
-lines and polygons with their attributes and show where the device is. It is not a field app yet:
-a captured shape can't be edited by touch afterwards, positions aren't averaged or logged as a
-track, and there are no photos.
+lines and polygons with their attributes, edit their shapes, snap, and show where the device is.
+It averages positions and records tracks, also out of sight. It is not a field app yet: there are
+no photos.
 
 ## Build
 
@@ -52,7 +52,7 @@ of the app.
 ## The phone, from Rust
 
 `rustgis_engine::platform::Platform` is what a front end asks a phone for: files from the system's
-picker, a place to save, and the device's position. The camera is added to it with its first
+picker, a place to save, the device's position, and positions kept coming out of sight. The camera is added to it with its first
 implementation. `src/phone.rs` implements it for Android by calling the activity's Java half,
 `java/org/rustgis/mobile/MainActivity.java`, which is the only code that can show the picker (the
 Storage Access Framework) and receive its answer.
@@ -91,7 +91,19 @@ The form follows the layer's data design. A field with a list of values (a coded
 the layer's subtypes, or yes and no) shows a chip for each: one is tapped to choose it, and
 tapped again to leave the field empty. A field with a range says its limits. When the layer has
 feature templates, a **Template** row chooses one, and its defaults fill what the form leaves
-empty; the template stays chosen for the next feature.
+empty; the template stays chosen for the next feature. A field a constraint rule requires (the
+rule asks `IS NOT NULL` of it, alone or joined to other clauses by `AND`) is marked with `*`, and a
+feature with it empty, and no default for it from the template or subtype chosen, isn't added: the
+sheet names the fields to fill in. A field in a contingent value set offers only the values that
+fit what the set's other fields hold, as chips (a value chosen before the others changed stays,
+so the conflict shows). A date or date and time field has a calendar button: a month of days a
+finger tall each, with **Today** (in UTC; the phone's time zone isn't asked) and, for a date and
+time, **Now**.
+
+While a field is typed in, the sheet takes most of the window and stays above the soft keyboard:
+the activity's Java half counts the keyboard in the window's bottom inset, the app looks again
+for it while a field wants the keyboard (Android doesn't wake the app when it comes or goes), the
+field is scrolled into view, and closing the keyboard ends the typing (Android 11 and later, which say when it goes; before, the field keeps the focus until the next tap, and the keyboard's room isn't counted).
 
 **Show My Position**, in the More sheet, asks Android for the device's position (and the user,
 the first time, for leave to use it). The position is drawn on the map as a dot in a ring as wide
@@ -100,9 +112,43 @@ sheet and at the top of the Capture sheet, moves the map so the capture cross is
 or a vertex added then is at the device's position. **Hide My Position** stops asking, which
 spares the battery.
 
-What it doesn't do yet: moving or deleting a vertex once the feature is added, snapping, a new
-layer to capture into, marking which fields a rule requires, and keeping the field being typed in
-above the soft keyboard (the keyboard covers the lower fields: close it to reach them).
+**Average Position**, beside Go to My Position in the Capture sheet, averages the positions that
+come while it runs: each weighted by how exact Android says it is (one over its accuracy squared),
+and the sheet says how many and how far they lie from their average. **Use Average** puts the
+cross there, for a point or a vertex more exact than one position.
+
+**Record a Track**, in the More sheet with the position shown, draws where the device goes as it
+goes, with a bar over the buttons that counts its positions and has **Stop**. Stopping (or Hide My
+Position) adds the track as one line to the map's **Tracks** layer, made when the map has none,
+named for when it started, with its count and length in minutes. A position less exact than 50 m
+is left out, and the notice says how many were. Every position Android reports reaches the track,
+not only the last one each frame (`RustGisApp::fixes`). The track is kept in memory until it is
+stopped: an app the system ends loses it.
+
+A track goes on while the app is out of sight (the Home button, the screen off). Recording one
+starts `TrackService`, a foreground service of the location type, with the notice Android requires:
+"RustGIS is recording a track", which brings the app back when tapped. The activity's location
+listener then keeps receiving positions after the activity stops, and they wait in its events
+(at most 200,000; past that the oldest go, and the app says how many) until the app is back in
+sight and takes them all into the track. The first track asks for leave to show notifications
+(Android 13 and later); refused, the service still runs, its notice unseen. Stopping the track
+stops the service. Ending the app (swiping it away), or Android ending its activity, ends the track with it: the session goes with the process (see below).
+
+**Edit**, beside **Add** at the top of the Capture sheet, changes the shapes already on the
+map, the same way: the map is moved under the cross. **Pick Feature at Cross** picks the layer's
+feature drawn on top under it (within half a finger) and draws its vertices. For a line or polygon,
+**Pick Vertex at Cross** picks the vertex nearest the cross, and then **Move Here** moves it to
+where the cross is next, **Add After** puts a new vertex there after it, and **Delete Vertex**
+removes it (a line keeps two, a ring three). For a point, **Move Point Here** moves it. **Delete
+Feature** deletes it (only it: the map's other selections are kept), and **Done** lets
+it go. Each change is one edit, undone by Undo in the More sheet.
+
+**Snap** turns the map's snapping on and off (its settings are the desktop's: Edit › Snapping).
+With it on, the cross's place snaps to a vertex, a line's end or an edge in reach, for adding and
+editing alike: a green ring marks where, and the sheet says what it snapped to. A vertex being
+moved doesn't snap to itself or its own edges.
+
+What it doesn't do yet: editing an existing feature's attributes, and a new layer to capture into.
 
 The interface keeps out of the room the system's bars take: the activity's Java half reports the
 insets, and the bars' icons are drawn dark over a light theme's ground and light over a dark
@@ -115,9 +161,9 @@ one's.
 | File dialogs | Android's picker, through `Services::open_async` and `download` as in the browser. `rfd` has no Android backend, so what still asks it (choosing a folder) is cancelled and says so (`crates/ui-egui/src/filedialog.rs`) |
 | HTTPS trust | The bundled Mozilla roots, not the device's certificates; the session says so once (`rustgis_data::http`) |
 | Folders | Settings, app data and the cache are in the app's internal storage, set once at start-up (`rustgis_data::dirs::set_root`) |
-| GeoLibre tools, GDAL formats, DuckDB | Not available: a phone can't run their programs |
+| GeoLibre tools, GDAL formats, DuckDB | Not available: a phone can't run their programs. `rustgis_data::RUNS_PROGRAMS` is false on Android and iOS, so no program is looked for, and each place they would appear says so: a file read through GDAL or a DuckDB database is refused with the reason (convert it on a computer), the SQL pane says why it can't query, and the Geoprocessing pane shows a card in place of the GeoLibre tools. Add Data's Database… stays: its PostGIS, MySQL and SQL Server connections need no program. The app is built without the engine's `geolibre` feature |
 | Preferences, the keychain, autosave | Not wired up yet |
-| Soft keyboard | It opens for a text field. `NativeActivity`'s is poor; a real app moves to `GameActivity` |
+| Soft keyboard | It opens for a text field, and the touch interface keeps the field above it. `NativeActivity`'s text input is still poor (no suggestions, no composing): a real app moves to `GameActivity` |
 
 ## What phase 0 found
 

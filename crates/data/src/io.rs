@@ -621,78 +621,8 @@ pub fn write_path_to(ds: &Dataset, path: &Path, crs: Crs, gpkg: &GpkgTable) -> R
         "shp" => {
             crate::progress::begin(ds.features.len());
             let (parts, left_out) = shapefile_parts_in(ds, crs)?;
-            // Every part is written to a temporary file first and renamed into place only once all
-            // are written, the .shp last, so a failed write leaves the old Shapefile whole.
-            let mut written: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
-            let staged = parts.iter().try_for_each(|(e, bytes)| {
-                // The .shp keeps the name given (`Roads.SHP` stays so); the others take its stem.
-                let target = if *e == "shp" { path.to_path_buf() } else { path.with_extension(e) };
-                let tmp = temp_beside(&target)?;
-                let result = write_new(&tmp, bytes);
-                if result.is_ok() {
-                    written.push((tmp, target));
-                }
-                result
-            });
-            // A cancel before the parts land leaves the old Shapefile as it was.
-            if let Err(e) = staged.map_err(DataError::from).and_then(|()| crate::progress::check()) {
-                for (tmp, _) in &written {
-                    let _ = std::fs::remove_file(tmp);
-                }
-                return Err(e);
-            }
-            written.sort_by_key(|(_, target)| target == path);
-            // The old parts are moved aside first and put back if any new part fails to land, so
-            // the old Shapefile stays a matching set.
-            let mut backups: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
-            let mut placed: Vec<std::path::PathBuf> = Vec::new();
-            let mut result = Ok(());
-            for (tmp, target) in &written {
-                // A cancel before the last part lands rolls back like a failed rename.
-                if crate::progress::check().is_err() {
-                    result = Err(std::io::Error::other(DataError::Cancelled));
-                    break;
-                }
-                if target.exists() {
-                    // Any failure here rolls back like a failed rename.
-                    let bak = match temp_beside(target) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            result = Err(e);
-                            break;
-                        }
-                    };
-                    if let Err(e) = std::fs::rename(target, &bak) {
-                        result = Err(e);
-                        break;
-                    }
-                    backups.push((bak, target.clone()));
-                }
-                if let Err(e) = std::fs::rename(tmp, target) {
-                    result = Err(e);
-                    break;
-                }
-                placed.push(target.clone());
-            }
-            if let Err(e) = result {
-                for p in &placed {
-                    let _ = std::fs::remove_file(p);
-                }
-                for (bak, target) in &backups {
-                    let _ = std::fs::rename(bak, target);
-                }
-                for (tmp, _) in &written {
-                    let _ = std::fs::remove_file(tmp);
-                }
-                return Err(e.into());
-            }
-            for (bak, _) in &backups {
-                let _ = std::fs::remove_file(bak);
-            }
-            // A spatial index left from an older file of the same name would no longer match.
-            for stale in ["qix", "sbn", "sbx"] {
-                let _ = std::fs::remove_file(path.with_extension(stale));
-            }
+            let parts: Vec<(std::path::PathBuf, Vec<u8>)> = parts.into_iter().map(|(e, bytes)| (shapefile_part(path, e), bytes)).collect();
+            place_shapefile(path, &stage_shapefile(&parts)?)?;
             Ok((left_out, None))
         }
         _ if crs != Crs::LonLat && !PROJECTED_FORMATS.contains(&ext.as_str()) => {
@@ -704,6 +634,121 @@ pub fn write_path_to(ds: &Dataset, path: &Path, crs: Crs, gpkg: &GpkgTable) -> R
             Ok((left_out, None))
         }
     }
+}
+
+/// The path of the part with extension `ext` of the Shapefile at `path`: the `.shp` keeps the
+/// name given (`Roads.SHP` stays so); the others take its stem.
+pub(crate) fn shapefile_part(path: &Path, ext: &str) -> std::path::PathBuf {
+    if ext == "shp" { path.to_path_buf() } else { path.with_extension(ext) }
+}
+
+/// Writes each of a Shapefile's parts (its path and bytes) to a temporary file beside it, synced
+/// to the disk; returns each temporary file with the part it becomes. Nothing is left behind
+/// when one fails or the run is cancelled (see [`place_shapefile`]).
+pub(crate) fn stage_shapefile(parts: &[(std::path::PathBuf, Vec<u8>)]) -> Result<Vec<(std::path::PathBuf, std::path::PathBuf)>> {
+    let mut written: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+    let staged = parts.iter().try_for_each(|(target, bytes)| {
+        let tmp = temp_beside(target)?;
+        let result = write_new_like(&tmp, target, bytes);
+        if result.is_ok() {
+            written.push((tmp, target.clone()));
+        }
+        result
+    });
+    // A cancel before the parts land leaves the old Shapefile as it was.
+    if let Err(e) = staged.map_err(DataError::from).and_then(|()| crate::progress::check()) {
+        unstage(&written);
+        return Err(e);
+    }
+    Ok(written)
+}
+
+/// Removes the temporary files [`stage_shapefile`] wrote.
+pub(crate) fn unstage(staged: &[(std::path::PathBuf, std::path::PathBuf)]) {
+    for (tmp, _) in staged {
+        let _ = std::fs::remove_file(tmp);
+    }
+}
+
+/// Renames each staged part of the Shapefile at `path` ([`stage_shapefile`]) into place, the
+/// `.shp` last, so a failed write leaves the old Shapefile whole: each old part is moved aside
+/// first and put back if any new part fails to land, and a Cancel before the last part lands
+/// rolls back the same way. Once all have landed, the old parts and the spatial indexes that
+/// would no longer match (`.qix`, `.sbn`, `.sbx`) are removed.
+pub(crate) fn place_shapefile(path: &Path, staged: &[(std::path::PathBuf, std::path::PathBuf)]) -> Result<()> {
+    let mut written: Vec<&(std::path::PathBuf, std::path::PathBuf)> = staged.iter().collect();
+    written.sort_by_key(|(_, target)| target == path);
+    let mut backups: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+    let mut placed: Vec<std::path::PathBuf> = Vec::new();
+    let mut result = Ok(());
+    for (tmp, target) in written {
+        // A cancel before the last part lands rolls back like a failed rename.
+        if crate::progress::check().is_err() {
+            result = Err(std::io::Error::other(DataError::Cancelled));
+            break;
+        }
+        if target.exists() {
+            // Any failure here rolls back like a failed rename.
+            let bak = match temp_beside(target) {
+                Ok(b) => b,
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
+            };
+            // Reserve this name before moving the old part: a previous crash's backup
+            // (or a symlink) must never be replaced when a process id is reused.
+            if let Err(e) = std::fs::OpenOptions::new().write(true).create_new(true).open(&bak).map(drop) {
+                result = Err(e);
+                break;
+            }
+            if let Err(e) = std::fs::rename(target, &bak) {
+                let _ = std::fs::remove_file(&bak);
+                result = Err(e);
+                break;
+            }
+            backups.push((bak, target.clone()));
+        }
+        if let Err(e) = std::fs::rename(tmp, target) {
+            result = Err(e);
+            break;
+        }
+        placed.push(target.clone());
+    }
+    if let Err(e) = result {
+        for p in &placed {
+            let _ = std::fs::remove_file(p);
+        }
+        // An old part that can't be put back is named, so it isn't lost under its temporary name.
+        let mut kept = Vec::new();
+        for (bak, target) in &backups {
+            if std::fs::rename(bak, target).is_err() {
+                kept.push(format!("{} is kept as {}", target.display(), bak.display()));
+            }
+        }
+        unstage(staged);
+        let e = DataError::from(e);
+        if kept.is_empty() {
+            return Err(e);
+        }
+        return Err(DataError::Format(format!("{e}; putting the old file back failed: {}", kept.join(", "))));
+    }
+    for (bak, _) in &backups {
+        let _ = std::fs::remove_file(bak);
+    }
+    // A spatial index left from an older file of the same name would no longer match.
+    for stale in ["qix", "sbn", "sbx"] {
+        // Sidecars may use any letter case, even beside a lowercase `.shp`.
+        for capitals in 0..8 {
+            let extension: String = stale
+                .bytes()
+                .enumerate()
+                .map(|(i, b)| char::from(if capitals & (1 << i) == 0 { b } else { b.to_ascii_uppercase() }))
+                .collect();
+            let _ = std::fs::remove_file(path.with_extension(extension));
+        }
+    }
+    Ok(())
 }
 
 /// A new temporary name beside `path`, unique per call, so concurrent writes to the same target
@@ -722,17 +767,48 @@ pub(crate) fn temp_beside(path: &Path) -> std::io::Result<std::path::PathBuf> {
 
 /// Writes and syncs a new file (`create_new`, so an existing file or symlink is never followed);
 /// removes it on failure.
+#[cfg(test)]
 fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    write_new_with(path, |w| w.write_all(bytes))
+    write_new_with(path, |_, w| w.write_all(bytes))
 }
 
-/// [`write_new`] with the content written by `write`, through a buffer, as it goes.
-fn write_new_with(path: &Path, write: impl FnOnce(&mut dyn std::io::Write) -> std::io::Result<()>) -> std::io::Result<()> {
+/// [`write_new`], the new file taking the mode of the file at `like` (on Unix, when there is one)
+/// before any content is written: a private part (`0600`) stays private once the new file
+/// replaces it, and its content is never readable by others meanwhile. A mode that can't be set
+/// is an error, rather than a part made readable.
+fn write_new_like(path: &Path, like: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    let mode = match std::fs::symlink_metadata(like) {
+        Ok(old) if !old.file_type().is_symlink() => Some(old.permissions()),
+        Ok(_) => None,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
+    #[cfg(not(unix))]
+    let _ = like;
+    write_new_with(path, |file, w| {
+        // Through the handle opened, not the path, which could name another file by now.
+        #[cfg(unix)]
+        if let Some(mode) = mode {
+            use std::os::unix::fs::PermissionsExt;
+            if file.metadata()?.permissions().mode() != mode.mode() {
+                file.set_permissions(mode)?;
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = file;
+        w.write_all(bytes)
+    })
+}
+
+/// [`write_new`] with the content written by `write`, through a buffer, as it goes; `write` is
+/// also given the file opened, before anything is written to it.
+fn write_new_with(path: &Path, write: impl FnOnce(&std::fs::File, &mut dyn std::io::Write) -> std::io::Result<()>) -> std::io::Result<()> {
     use std::io::Write;
     let f = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
     let res = (|| {
         let mut w = std::io::BufWriter::new(&f);
-        write(&mut w)?;
+        write(&f, &mut w)?;
         w.flush()?;
         drop(w);
         f.sync_all()
@@ -2338,17 +2414,17 @@ pub fn read_zip_in(file_name: &str, bytes: &[u8], crs: Option<Crs>) -> Result<Ve
 }
 
 /// The files of a Shapefile, read into memory.
-struct ShapefileParts {
-    shp: Vec<u8>,
-    shx: Option<Vec<u8>>,
-    dbf: Vec<u8>,
-    prj: Option<String>,
-    cpg: Option<Vec<u8>>,
+pub(crate) struct ShapefileParts {
+    pub shp: Vec<u8>,
+    pub shx: Option<Vec<u8>>,
+    pub dbf: Vec<u8>,
+    pub prj: Option<String>,
+    pub cpg: Option<Vec<u8>>,
 }
 
 /// Decodes attributes and shapes together, tracking geometry lost during CRS conversion so
 /// a later projection definition cannot silently repair an incomplete layer.
-fn read_shapefile_parts(mut parts: ShapefileParts, name: &str, crs: Option<Crs>) -> Result<(Dataset, ReadReport)> {
+pub(crate) fn read_shapefile_parts(mut parts: ShapefileParts, name: &str, crs: Option<Crs>) -> Result<(Dataset, ReadReport)> {
     use shapefile::Shape;
     use shapefile::dbase::FieldValue;
     use std::io::Cursor;
@@ -2582,7 +2658,31 @@ fn integral_numeric_to_integer(ds: &mut Dataset) {
 }
 
 /// WGS 84 as ESRI WKT, for a Shapefile's `.prj`.
-const WGS84_PRJ: &str = "GEOGCS[\"GCS_WGS_1984\",DATUM[\"D_WGS_1984\",SPHEROID[\"WGS_1984\",6378137.0,298.257223563]],PRIMEM[\"Greenwich\",0.0],UNIT[\"Degree\",0.0174532925199433]]";
+pub(crate) const WGS84_PRJ: &str = "GEOGCS[\"GCS_WGS_1984\",DATUM[\"D_WGS_1984\",SPHEROID[\"WGS_1984\",6378137.0,298.257223563]],PRIMEM[\"Greenwich\",0.0],UNIT[\"Degree\",0.0174532925199433]]";
+
+/// The longest prefix of `s` whose text takes at most `max` bytes in `encoding`, cut at a
+/// character boundary: what a `.dbf` in that code page holds of it.
+fn cut_encoded<'a>(s: &'a str, max: usize, encoding: &crate::dbf::DbfEncoding) -> &'a str {
+    use shapefile::dbase::encoding::Encoding;
+    let encoder = encoding.decoder();
+    let fits = |t: &str| encoder.encode(t).map_or(t.len(), |b| b.len()) <= max;
+    if fits(s) {
+        return s;
+    }
+    // The longest prefix that fits: a character takes at least one byte, so it is within `max`
+    // characters, and a shorter prefix never takes more bytes.
+    let ends: Vec<usize> = s.char_indices().map(|(i, _)| i).skip(1).take(max).chain([s.len()]).collect();
+    let (mut lo, mut hi) = (0usize, ends.len());
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if ends.get(mid - 1).is_some_and(|&e| fits(s.get(..e).unwrap_or(""))) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    lo.checked_sub(1).and_then(|i| ends.get(i)).and_then(|&e| s.get(..e)).unwrap_or("")
+}
 
 /// The longest prefix of `s` that fits in `max` bytes, cut at a character boundary.
 pub(crate) fn cut(s: &str, max: usize) -> &str {
@@ -2825,7 +2925,7 @@ pub fn shapefile_values_notes(ds: &Dataset, target: &str) -> Vec<String> {
                 FieldType::Date if !value.asks_null() && dbf_date(value).is_none() => loss.empty += 1,
                 FieldType::Integer | FieldType::Double => {
                     let d = decimals.get(k).copied().unwrap_or(0);
-                    match dbf_number(value, field.ty, d) {
+                    match dbf_number(value, field.ty, d, if field.ty == FieldType::Integer { 18 } else { 24 }) {
                         None => loss.empty += 1,
                         Some(number) => {
                             // The writer uses fixed decimal text, including ties rounded to even.
@@ -2872,6 +2972,13 @@ pub fn shapefile_values_notes(ds: &Dataset, target: &str) -> Vec<String> {
     notes
 }
 
+/// The names of the `.dbf` columns a Shapefile written from `fields` has, in order
+/// ([`dbf_names`]).
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn shapefile_column_names(fields: &[Field]) -> Vec<String> {
+    dbf_names(fields)
+}
+
 /// dBase field names (at most 10 bytes, unique without regard to case) for the fields.
 fn dbf_names(fields: &[Field]) -> Vec<String> {
     let mut out: Vec<String> = Vec::with_capacity(fields.len());
@@ -2910,15 +3017,15 @@ fn dbf_decimals(ds: &Dataset, k: usize) -> usize {
 }
 
 /// The number a `.dbf` numeric field of type `ty` with `d` decimals holds for `v`: none for a
-/// value that isn't a number, or one rejected by the writer's size and precision checks.
+/// value that isn't a number, or one rejected by the selected column's `width` and precision.
 /// Rejected numbers are left empty rather than cut short.
-fn dbf_number(v: &Value, ty: FieldType, d: usize) -> Option<f64> {
+fn dbf_number(v: &Value, ty: FieldType, d: usize, width: usize) -> Option<f64> {
     let x = v.as_f64().filter(|x| {
         // A whole number past 2^53 would be held only rounded (dBase's decimal text goes through
         // f64), and one too small for the field's decimals would read 0.
         let exact = !(matches!(v, Value::Int(i) if i.unsigned_abs() > 1 << 53)
             || ty == FieldType::Double && *x != 0.0 && x.abs() < 0.5 * 10f64.powi(-(d as i32)));
-        exact && format!("{x:.d$}").len() <= if ty == FieldType::Integer { 18 } else { 24 }
+        exact && format!("{x:.d$}").len() <= width
     })?;
     Some(if ty == FieldType::Integer { x.round() } else { x })
 }
@@ -3242,48 +3349,159 @@ pub fn shapefile_parts(ds: &Dataset) -> Result<(Vec<(&'static str, Vec<u8>)>, us
 /// As [`shapefile_parts`], for a dataset whose geometry is in `crs`'s coordinates: the `.prj`
 /// says `crs`, and is left out for a system WKT can't describe.
 pub fn shapefile_parts_in(ds: &Dataset, crs: Crs) -> Result<(Vec<(&'static str, Vec<u8>)>, usize)> {
+    shapefile_parts_styled(ds, crs, None).map(|(parts, left_out, _)| (parts, left_out))
+}
+
+/// What a Shapefile written over the one a layer was read from keeps of that file's `.dbf`
+/// (#1385): its code page (the encoding its text is written in, and the language driver byte
+/// its header names), and each column's width, decimals and type (`F` stays `F`) where the
+/// layer's field of that name still fits it.
+pub(crate) struct DbfStyle {
+    pub encoding: crate::dbf::DbfEncoding,
+    pub ldid: u8,
+    pub columns: Vec<crate::dbf::Column>,
+}
+
+/// The `.dbf` column a field is written to: its type letter, width and decimals.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Spec {
+    ty: u8,
+    len: u8,
+    decimals: u8,
+}
+
+/// The column field `k` of `ds` is written to as a new file has it: numbers in 18 digits
+/// (integers) or 24 characters with as many decimals as fit, text as wide as its longest value.
+fn new_column(ds: &Dataset, k: usize) -> Spec {
+    let Some(f) = ds.fields.get(k) else { return Spec { ty: b'C', len: 1, decimals: 0 } };
+    match f.ty {
+        // 18 digits: GDAL reads a wider field as a real number.
+        FieldType::Integer => Spec { ty: b'N', len: 18, decimals: 0 },
+        FieldType::Double => Spec { ty: b'N', len: 24, decimals: u8::try_from(dbf_decimals(ds, k)).unwrap_or(15) },
+        FieldType::Boolean => Spec { ty: b'L', len: 1, decimals: 0 },
+        FieldType::Date => Spec { ty: b'D', len: 8, decimals: 0 },
+        // A `.dbf` has no date-time field that other programs read, so they're ISO text.
+        FieldType::Text | FieldType::DateTime => {
+            let longest = ds.features.iter().filter_map(|r| r.attrs.get(k)).map(|v| v.to_string().len()).max().unwrap_or(0);
+            Spec { ty: b'C', len: u8::try_from(longest.clamp(1, 254)).unwrap_or(254), decimals: 0 }
+        }
+    }
+}
+
+impl std::fmt::Display for Spec {
+    /// As a `.dbf` column is described: its type letter, width and, for a number, decimals
+    /// (`N(10,2)`, `C(24)`).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let ty = char::from(self.ty);
+        if matches!(self.ty, b'N' | b'F') { write!(f, "{ty}({},{})", self.len, self.decimals) } else { write!(f, "{ty}({})", self.len) }
+    }
+}
+
+/// The column field `k` (written as `name`) is written to over a file whose `.dbf` `style`
+/// describes: the file's column of that name where the field's kind and every value still fit
+/// it, so the file keeps its widths and decimals; otherwise a new one ([`new_column`]), at least
+/// as wide as the file's, and, when a column of that name changes kind or can't
+/// hold the values, what changed (`'ACRES' N(10,2) to N(24,9)`).
+fn kept_column(ds: &Dataset, k: usize, name: &str, style: &DbfStyle) -> (Spec, Option<String>) {
+    let new = new_column(ds, k);
+    let (Some(field), Some(was)) = (ds.fields.get(k), style.columns.iter().find(|c| c.name == name.as_bytes())) else {
+        return (new, None);
+    };
+    let values = || ds.features.iter().filter_map(|r| r.attrs.get(k)).filter(|v| !v.is_null());
+    let ty = was.ty.to_ascii_uppercase();
+    let kept = Spec { ty, len: was.len, decimals: was.decimals };
+    let encoding = style.encoding.decoder();
+    // Bytes of a value's text in the file's code page.
+    let encoded_len = |v: &Value| {
+        use shapefile::dbase::encoding::Encoding;
+        let text = v.to_string();
+        encoding.encode(&text).map_or(text.len(), |b| b.len())
+    };
+    let fits = match (field.ty, ty) {
+        (FieldType::Integer | FieldType::Double, b'N' | b'F') => values().all(|v| {
+            let d = usize::from(was.decimals);
+            dbf_number(v, field.ty, d, usize::from(was.len)).is_some_and(|x| {
+                let text = format!("{x:.d$}");
+                text.len() <= usize::from(was.len) && text.parse::<f64>().ok() == v.as_f64()
+            })
+        }),
+        (FieldType::Boolean, b'L') | (FieldType::Date, b'D') => true,
+        (FieldType::Text | FieldType::DateTime, b'C') => values().all(|v| encoded_len(v) <= usize::from(was.len)),
+        // Another kind of field now: say how its physical column changes too.
+        _ => return (new, Some(format!("'{}' {kept} to {new}", dbf_notice_name(&field.name)))),
+    };
+    if fits {
+        return (kept, None);
+    }
+    let spec = if new.ty == b'C' {
+        // Text wider than the file's column: as wide as its longest value, in the file's code
+        // page, up to the 254 bytes written (a longer value is cut, which publishing refuses).
+        let longest = values().map(encoded_len).max().unwrap_or(0).min(254);
+        Spec { len: u8::try_from(longest).unwrap_or(254), ..new }
+    } else {
+        // A number with more digits or decimals: never narrower than the file's column.
+        Spec { len: new.len.max(was.len), ..new }
+    };
+    (spec, Some(format!("'{}' {kept} to {spec}", dbf_notice_name(&field.name))))
+}
+
+/// As [`shapefile_parts_in`], the `.dbf` written as `style` says when it's given (in the file's
+/// code page, its columns kept where the values fit): also returns, for each field whose column
+/// couldn't hold its values, how its column changed.
+pub(crate) fn shapefile_parts_styled(
+    ds: &Dataset,
+    crs: Crs,
+    style: Option<&DbfStyle>,
+) -> Result<(Vec<(&'static str, Vec<u8>)>, usize, Vec<String>)> {
     use shapefile::dbase::{FieldName, FieldValue, Record, TableWriterBuilder};
     use std::io::Cursor;
     let fmt = |e: shapefile::Error| DataError::Format(format!("Shapefile: {e}"));
     let names = dbf_names(&ds.fields);
     let dbf_name = |n: &str| FieldName::try_from(n).map_err(|e| DataError::Format(format!("Shapefile: field {n}: {e}")));
-    let mut table = TableWriterBuilder::new();
-    // Per field: decimals of a Double field (numbers too large for 24 characters become null).
-    let mut decimals = vec![0usize; ds.fields.len()];
-    for (k, (f, n)) in ds.fields.iter().zip(&names).enumerate() {
-        table = match f.ty {
-            // 18 digits: GDAL reads a wider field as a real number.
-            FieldType::Integer => table.add_numeric_field(dbf_name(n)?, 18, 0),
-            FieldType::Double => {
-                let d = dbf_decimals(ds, k);
-                if let Some(slot) = decimals.get_mut(k) {
-                    *slot = d;
-                }
-                table.add_numeric_field(dbf_name(n)?, 24, u8::try_from(d).unwrap_or(15))
+    let mut table = match style {
+        Some(style) => TableWriterBuilder::with_encoding(style.encoding.decoder()),
+        None => TableWriterBuilder::new(),
+    };
+    // Per field: its column (numbers too large for it become null), and how the columns that
+    // couldn't hold their values changed.
+    let mut specs = Vec::with_capacity(ds.fields.len());
+    let mut widened = Vec::new();
+    for (k, n) in names.iter().enumerate() {
+        let spec = match style {
+            Some(style) => {
+                let (spec, changed) = kept_column(ds, k, n, style);
+                widened.extend(changed);
+                spec
             }
-            FieldType::Boolean => table.add_logical_field(dbf_name(n)?),
-            FieldType::Date => table.add_date_field(dbf_name(n)?),
-            // A `.dbf` has no date-time field that other programs read, so they're ISO text.
-            FieldType::Text | FieldType::DateTime => {
-                let longest = ds.features.iter().filter_map(|r| r.attrs.get(k)).map(|v| v.to_string().len()).max().unwrap_or(0);
-                table.add_character_field(dbf_name(n)?, u8::try_from(longest.clamp(1, 254)).unwrap_or(254))
-            }
+            None => new_column(ds, k),
         };
+        table = match spec.ty {
+            // A float column is written as a numeric one (both hold the number as text) and
+            // marked `F` again below: `dbase` writes an `F` column's number as an `f32`.
+            b'N' | b'F' => table.add_numeric_field(dbf_name(n)?, spec.len, spec.decimals),
+            b'L' => table.add_logical_field(dbf_name(n)?),
+            b'D' => table.add_date_field(dbf_name(n)?),
+            _ => table.add_character_field(dbf_name(n)?, spec.len),
+        };
+        specs.push(spec);
     }
     let record = |r: &crate::Feature| -> Record {
         let mut rec = Record::default();
         for (k, (f, n)) in ds.fields.iter().zip(&names).enumerate() {
             let v = r.attrs.get(k).unwrap_or(&Value::Null);
+            let decimals = specs.get(k).map_or(0, |s| usize::from(s.decimals));
+            let width = specs.get(k).map_or(0, |s| usize::from(s.len));
             let value = match f.ty {
-                FieldType::Integer | FieldType::Double => FieldValue::Numeric(dbf_number(v, f.ty, decimals.get(k).copied().unwrap_or(0))),
+                FieldType::Integer | FieldType::Double => FieldValue::Numeric(dbf_number(v, f.ty, decimals, width)),
                 FieldType::Boolean => FieldValue::Logical(dbf_boolean(v)),
                 FieldType::Date => FieldValue::Date(dbf_date(v).and_then(|d| {
                     let (y, m, d) = d.ymd();
                     shapefile::dbase::Date::new(u32::try_from(d).ok()?, u32::try_from(m).ok()?, u32::try_from(y).ok()?).ok()
                 })),
-                FieldType::Text | FieldType::DateTime => {
-                    FieldValue::Character((!v.is_null()).then(|| cut(&v.to_string(), 254).to_string()))
-                }
+                FieldType::Text | FieldType::DateTime => FieldValue::Character((!v.is_null()).then(|| match style {
+                    Some(style) => cut_encoded(&v.to_string(), 254, &style.encoding).to_string(),
+                    None => cut(&v.to_string(), 254).to_string(),
+                })),
             };
             rec.insert(n.clone(), value);
         }
@@ -3359,10 +3577,25 @@ pub fn shapefile_parts_in(ds: &Dataset, crs: Crs) -> Result<(Vec<(&'static str, 
         }
     }
     let prj = if crs == Crs::LonLat { Some(WGS84_PRJ.to_string()) } else { crate::raster::wkt::to_wkt(crs) };
-    let mut parts = vec![("shp", shp.into_inner()), ("shx", shx.into_inner()), ("dbf", dbf.into_inner())];
+    let mut dbf = dbf.into_inner();
+    if let Some(style) = style {
+        // The file's language driver, whatever `dbase` takes the encoding for, and its float
+        // columns marked `F` again.
+        if let Some(b) = dbf.get_mut(29) {
+            *b = style.ldid;
+        }
+        for (k, spec) in specs.iter().enumerate() {
+            if spec.ty == b'F'
+                && let Some(b) = dbf.get_mut(32 + k * 32 + 11)
+            {
+                *b = b'F';
+            }
+        }
+    }
+    let mut parts = vec![("shp", shp.into_inner()), ("shx", shx.into_inner()), ("dbf", dbf)];
     parts.extend(prj.map(|p| ("prj", p.into_bytes())));
     parts.push(("cpg", b"UTF-8".to_vec()));
-    Ok((parts, left_out))
+    Ok((parts, left_out, widened))
 }
 
 fn is_outer<P>(r: &shapefile::PolygonRing<P>) -> bool {
@@ -3385,6 +3618,33 @@ pub(crate) fn group_rings(rings: Vec<(Vec<Coord>, bool)>) -> Geometry {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// Text is cut to what its code page holds in the bytes given, at a character boundary.
+    #[test]
+    fn text_is_cut_to_its_code_page_bytes() {
+        let cp1252 = crate::dbf::DbfEncoding::Standard(encoding_rs::WINDOWS_1252);
+        let e = "é".repeat(300);
+        assert_eq!(cut_encoded(&e, 254, &cp1252).chars().count(), 254);
+        assert_eq!(cut_encoded(&e, 254, &crate::dbf::DbfEncoding::Utf8).chars().count(), 127);
+        assert_eq!(cut_encoded("short", 254, &cp1252), "short");
+        assert_eq!(cut_encoded("ab", 0, &cp1252), "");
+    }
+
+    /// A text column as wide as a `.dbf` allows (255 bytes, a width the writer never uses) with a
+    /// longer value gets a column of the 254 bytes written, not a crash.
+    #[test]
+    fn a_full_width_text_column_with_a_longer_value_is_written_at_254() {
+        let mut ds = Dataset::new("a", GeometryType::Point, vec![Field::new("NOTE", FieldType::Text)]);
+        ds.push(Some(Geometry::Point(Coord::new(0.0, 0.0))), vec![Value::Text("x".repeat(300))]);
+        let style = DbfStyle {
+            encoding: crate::dbf::DbfEncoding::Utf8,
+            ldid: 0,
+            columns: vec![crate::dbf::Column { name: b"NOTE".to_vec(), ty: b'C', len: 255, decimals: 0 }],
+        };
+        let (spec, changed) = kept_column(&ds, 0, "NOTE", &style);
+        assert_eq!(spec.len, 254);
+        assert_eq!(changed.as_deref(), Some("'NOTE' C(255) to C(254)"));
+    }
 
     /// A Shapefile export of a polygon layer holding a point and a feature without geometry writes
     /// the polygon and counts both left out, the point for its kind; a layer of polygons loses none.
@@ -3598,7 +3858,7 @@ mod tests {
         Ok(())
     }
 
-    /// Exercises caller cleanup through the public Shapefile writer, one fresh process per collision.
+    /// Exercises staging and backup cleanup through the public writer, one fresh process per collision.
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn shapefile_staging_collisions_preserve_existing_entries() -> std::io::Result<()> {
@@ -3609,32 +3869,35 @@ mod tests {
         const CHILD: &str = "RUSTGIS_SHAPEFILE_STAGING_COLLISION";
         let Ok(case) = std::env::var(CHILD) else {
             let kinds: &[&str] = if cfg!(unix) { &["file", "live", "dangling"] } else { &["file"] };
-            for index in 0..parts.len() {
-                for kind in kinds {
-                    let output = std::process::Command::new(std::env::current_exe()?)
-                        .args([
-                            "--exact",
-                            "io::tests::shapefile_staging_collisions_preserve_existing_entries",
-                            "--nocapture",
-                            "--test-threads=1",
-                        ])
-                        .env(CHILD, format!("{index}:{kind}"))
-                        .output()?;
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    assert!(
-                        output.status.success()
-                            && stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;")
-                            && stdout.contains(&format!("collision case completed: {index}:{kind}")),
-                        "part={index} kind={kind}: {}{}",
-                        stdout,
-                        String::from_utf8_lossy(&output.stderr)
-                    );
+            for phase in ["stage", "backup"] {
+                for index in 0..parts.len() {
+                    for kind in kinds {
+                        let output = std::process::Command::new(std::env::current_exe()?)
+                            .args([
+                                "--exact",
+                                "io::tests::shapefile_staging_collisions_preserve_existing_entries",
+                                "--nocapture",
+                                "--test-threads=1",
+                            ])
+                            .env(CHILD, format!("{phase}:{index}:{kind}"))
+                            .output()?;
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        assert!(
+                            output.status.success()
+                                && stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;")
+                                && stdout.contains(&format!("collision case completed: {phase}:{index}:{kind}")),
+                            "phase={phase} part={index} kind={kind}: {}{}",
+                            stdout,
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                    }
                 }
             }
-            println!("collision scenarios: {}", parts.len() * kinds.len());
+            println!("collision scenarios: {}", 2 * parts.len() * kinds.len());
             return Ok(());
         };
-        let (index, kind) = case.split_once(':').ok_or_else(|| std::io::Error::other("missing collision case"))?;
+        let (phase, case_parts) = case.split_once(':').ok_or_else(|| std::io::Error::other("missing collision phase"))?;
+        let (index, kind) = case_parts.split_once(':').ok_or_else(|| std::io::Error::other("missing collision case"))?;
         let index = index.parse::<usize>().map_err(std::io::Error::other)?;
         if !matches!(kind, "file" | "live" | "dangling") {
             return Err(std::io::Error::other("unknown collision kind"));
@@ -3646,12 +3909,17 @@ mod tests {
         for (extension, bytes) in &parts {
             std::fs::write(destination(extension), bytes)?;
         }
-        let (extension, _) = parts.get(index).ok_or_else(|| std::io::Error::other("collision part out of range"))?;
+        let mut ordered: Vec<_> = parts.iter().collect();
+        if phase == "backup" {
+            ordered.sort_by_key(|(extension, _)| *extension == "shp");
+        }
+        let (extension, _) = ordered.get(index).ok_or_else(|| std::io::Error::other("collision part out of range"))?;
         let target = destination(extension);
-        // This child runs only this test: write_path's first staging counter is zero.
+        // This child starts the counter at zero; backups follow all staged parts.
         let mut name = std::ffi::OsString::from(".");
         name.push(target.file_name().ok_or_else(|| std::io::Error::other("missing part name"))?);
-        name.push(format!(".{}.{index}.tmp", std::process::id()));
+        let counter = if phase == "backup" { parts.len() + index } else { index };
+        name.push(format!(".{}.{counter}.tmp", std::process::id()));
         let collision = target.with_file_name(name);
         #[cfg(unix)]
         let link_target = root.join("link-target");

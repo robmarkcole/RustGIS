@@ -8,7 +8,9 @@ use super::{need_layer_or_table, ps};
 use crate::{CmdResult, CommandSpec as C, Session};
 
 pub fn commands() -> Vec<C> {
-    let mut commands = vec![
+    let box_roles: &[crate::ParamRole] =
+        &[crate::ParamRole { key: "box", role: crate::Role::Opaque }, crate::ParamRole { key: "attributes", role: crate::Role::Opaque }];
+    vec![
         C::new("edit.calculateGeometry", "Calculate Geometry", "Attribute Table", crate::geometry_calc::run).roles(&[]).effects(crate::policy::Effects::NONE)
             .when(super::design::need_editable)
             .params(r#"{"layer"?, "field": string, "create": bool, "overwrite": bool, "property": string, "unit": string, "epsg"?: number, "scope": "all"|"selected"}"#),
@@ -31,9 +33,15 @@ pub fn commands() -> Vec<C> {
         C::new("edit.calculateField", "Calculate Field", "Attribute Table", calculate_field).roles(&[]).effects(crate::policy::Effects::NONE)
             .when(super::design::need_editable_or_table)
             .params(r#"{"layer"?, "table"?: name|id (a standalone table, instead of a layer: every row), "field": string, "expression": "an expression: fields, 'text', numbers, + - * / % ^ ||, functions (see the Expressions page)"}"#),
-    ];
-    commands.extend(crate::box_edit::commands());
-    commands
+        C::new("edit.addBox", "Add Rotated Box", "Edit › Features", crate::box_edit::add).inputs(crate::box_edit::new_box_inputs).roles(box_roles).effects(crate::policy::Effects::NONE)
+            .when(crate::cmd::design::need_editable).params(r#"{"layer"?: name|id, "box": {"center":[x,y],"width":number,"height":number,"angle":clockwise degrees,"frame"?:{"epsg":number,"width":pixels,"height":pixels,"affine":[x0,xc,xr,y0,yc,yr]}},"attributes"?:{field:value},"template"?:string}"#),
+        C::new("edit.updateBox", "Update Rotated Box", "Edit › Features", crate::box_edit::update).roles(&[crate::ParamRole { key: "box", role: crate::Role::Opaque }]).effects(crate::policy::Effects::NONE)
+            .when(crate::cmd::design::need_editable).params(r#"{"layer"?:name|id,"row":number,"featureId"?:number,"box":as edit.addBox}"#),
+        C::new("edit.deleteBox", "Delete Box", "Edit › Features", crate::box_edit::delete_box).roles(&[]).effects(crate::policy::Effects::NONE)
+            .when(crate::cmd::design::need_editable).params(r#"{"layer"?:name|id,"row":number,"featureId"?:number}"#),
+        C::new("edit.boxInfo", "Box Construction", "Edit › Features", crate::box_edit::info).roles(&[]).effects(crate::policy::Effects::NONE).view()
+            .params(r#"{"layer"?:name|id,"row":number}"#),
+    ]
 }
 
 /// What an edit command changes: a layer, or a standalone table (by its position among the

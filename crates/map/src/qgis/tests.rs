@@ -867,7 +867,16 @@ fn raster_renderers_read_as_rustgis_raster_styles() {
     );
     assert_eq!(
         s.raster.unwrap().renderer,
-        RasterRenderer::ShadedRelief { band: 0, ramp: None, azimuth: 300.0, altitude: 35.0, z_factor: 2.0, shadow: 0.0, sky: 0.0 }
+        RasterRenderer::ShadedRelief {
+            band: 0,
+            ramp: None,
+            azimuth: 300.0,
+            altitude: 35.0,
+            z_factor: 2.0,
+            shadow: 0.0,
+            sky: 0.0,
+            fill: 0.0
+        }
     );
     assert!(report.notes.iter().any(|n| n.text.contains("saturation")));
     let (s, report) = read(r#"<rasterrenderer type="contour" band="1"/>"#, "");
