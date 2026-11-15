@@ -29,6 +29,19 @@ pub(crate) struct Record {
 }
 type Shard = Arc<BTreeMap<Key, Arc<Record>>>;
 
+#[derive(Default)]
+pub(crate) struct Counts {
+    boxes: usize,
+    circles: usize,
+}
+impl Counts {
+    pub(crate) fn notes(self) -> Vec<String> {
+        let boxes = (self.boxes > 0).then(|| format!("{} rotated box(es): session-only construction is not included in this output and will not survive reimport; the source polygons use four transformed corners, with curved grid edges approximated by straight edges", self.boxes));
+        let circles = (self.circles > 0).then(|| format!("{} circle(s): session-only centre/radius construction is not included in this output and will not survive reimport; source polygons approximate circles with straight edges (tolerance in each construction grid, before projection)", self.circles));
+        boxes.into_iter().chain(circles).collect()
+    }
+}
+
 /// Immutable snapshots accompany undo and background exports. An edit copies at most 512
 /// record references and the 256-entry directory; construction geometries remain shared.
 #[derive(Clone, Default)]
@@ -85,6 +98,23 @@ impl Cache {
             self.len = self.len.saturating_sub(1);
         }
     }
+    /// Follow source-edit ID reassignment without reviving stale constructions.
+    pub(crate) fn rekey(&mut self, key: Key, id: u64, geometry: Option<&Geometry>) -> Result<(), String> {
+        if let Some(record) = geometry.and_then(|g| self.get(key, g)).cloned() {
+            self.remove(key);
+            self.remember((key.0, key.1, key.2, id), record)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn count_feature(&self, map: u64, layer: &rustgis_map::Layer, feature: &rustgis_data::Feature, counts: &mut Counts) {
+        let key = (map, layer.instance_id(), layer.replacement_revision(), feature.id);
+        if let Some(record) = feature.geometry.as_ref().and_then(|g| self.get(key, g)) {
+            match record.spec {
+                Construction::Box(_) => counts.boxes += 1,
+                Construction::Circle(_) => counts.circles += 1,
+            }
+        }
+    }
     pub(crate) fn export_notes(&self, map: u64, layer: &rustgis_map::Layer) -> Result<Vec<String>, String> {
         self.output_notes(std::iter::once((map, layer)))
     }
@@ -95,25 +125,17 @@ impl Cache {
         if self.len == 0 {
             return Ok(Vec::new());
         }
-        let (mut boxes, mut circles) = (0_usize, 0_usize);
+        let mut counts = Counts::default();
         for (map, layer) in layers {
             rustgis_data::progress::check().map_err(|e| e.to_string())?;
             for (row, feature) in layer.dataset.features.iter().enumerate() {
                 if row.is_multiple_of(256) {
                     rustgis_data::progress::check().map_err(|e| e.to_string())?;
                 }
-                let key = (map, layer.instance_id(), layer.replacement_revision(), feature.id);
-                if let Some(record) = feature.geometry.as_ref().and_then(|g| self.get(key, g)) {
-                    match record.spec {
-                        Construction::Box(_) => boxes += 1,
-                        Construction::Circle(_) => circles += 1,
-                    }
-                }
+                self.count_feature(map, layer, feature, &mut counts);
             }
         }
-        let boxes = (boxes > 0).then(|| format!("{boxes} rotated box(es): session-only construction is not included in this output and will not survive reimport; the source polygons use four transformed corners, with curved grid edges approximated by straight edges"));
-        let circles = (circles > 0).then(|| format!("{circles} circle(s): session-only centre/radius construction is not included in this output and will not survive reimport; source polygons approximate circles with straight edges (tolerance in each construction grid, before projection)"));
-        Ok(boxes.into_iter().chain(circles).collect())
+        Ok(counts.notes())
     }
 }
 /// Forget the live record for insertion/removal paths that call this hook (`design::apply`).

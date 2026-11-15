@@ -1067,9 +1067,11 @@ fn edited_streamed(before: &Project, after: &Project) -> Option<String> {
 /// New features of a layer loaded for source editing never keep the key of a row it loaded (one
 /// deleted since, whose id an editing tool can hand out again): saved, they would be that row,
 /// changed. They take ids past every key instead. Layers whose rows were loaded or saved again by
-/// the command (their versions replaced) are left alone.
-fn fresh_source_ids(before: &Project, after: &mut Project) {
+/// the command (their versions replaced) are left alone. Session-only constructions follow the
+/// final ID; a full destination cache shard rejects the command through the usual rollback.
+fn fresh_source_ids(before: &Project, after: &mut Project, constructions: &mut construction::Cache) -> Result<(), String> {
     for (mb, ma) in before.maps.iter().zip(after.maps.iter_mut()) {
+        let map = ma.instance_id();
         for la in ma.layers.iter_mut() {
             let Some(versions) = la.edit_versions() else { continue };
             let Some(lb) = mb.layers.iter().find(|l| l.id == la.id) else { continue };
@@ -1098,14 +1100,17 @@ fn fresh_source_ids(before: &Project, after: &mut Project) {
                 .filter(|&k| k.cast_signed() >= 0)
                 .max()
                 .unwrap_or(0);
+            let scope = (map, la.instance_id(), la.replacement_revision());
             for i in reused {
                 next = next.saturating_add(1);
                 if let Some(f) = la.dataset.features.get_mut(i) {
+                    constructions.rekey((scope.0, scope.1, scope.2, f.id), next, f.geometry.as_ref())?;
                     f.id = next;
                 }
             }
         }
     }
+    Ok(())
 }
 
 /// A lock names each label by its feature's id, and [`rustgis_data::Dataset::push`] hands the
@@ -1864,7 +1869,8 @@ impl Session {
         let res = match (&res, &snapshot) {
             (Ok(_), Some(snap)) => match edited_streamed(snap, &self.project) {
                 Some(name) => Err(streamed_refusal(label, &name)),
-                None => res,
+                None if self.request_only => res,
+                None => fresh_source_ids(snap, &mut self.project, &mut self.constructions).and(res),
             },
             _ => res,
         };
@@ -1878,7 +1884,6 @@ impl Session {
                 // snapshot still needs the committed file record, even without a live layer
                 // from which undo could carry that record forward.
                 self.keep_published_syncs(&mut snap);
-                fresh_source_ids(&snap, &mut self.project);
                 forget_label_state_of_removed_features(&snap, &mut self.project);
                 // An edit may change the dates the time slider's window filters on: bound layers
                 // whose features or fields the command changed (features are shared with the

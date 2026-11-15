@@ -205,6 +205,15 @@ pub fn commands() -> Vec<C> {
 /// The shared item bytes of a kind: its name, bytes and source. Rasters drawn into it without
 /// their cast shadows are said (see [`super::share::saying_shadows`]).
 pub fn share_bytes(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Vec<u8>, String), String> {
+    let (name, bytes, source, notes) = share_output(s, kind, p)?;
+    for note in notes {
+        s.notify(note, false);
+    }
+    Ok((name, bytes, source))
+}
+
+/// Shared-item construction notes are deferred when a front end still needs to deliver bytes.
+pub(crate) fn share_output(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Vec<u8>, String, Vec<String>), String> {
     let what = match kind {
         "webMap" => "The web map",
         "webLayer" => "The web layer",
@@ -221,11 +230,8 @@ pub fn share_bytes(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Ve
         }
         _ => Vec::new(),
     };
-    let result = super::share::saying_shadows(s, what, |s| share_bytes_inner(s, kind, p))?;
-    for note in notes {
-        s.notify(note, false);
-    }
-    Ok(result)
+    let (name, bytes, source) = super::share::saying_shadows(s, what, |s| share_bytes_inner(s, kind, p))?;
+    Ok((name, bytes, source, notes))
 }
 
 fn share_bytes_inner(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Vec<u8>, String), String> {

@@ -4148,8 +4148,8 @@ impl RustGisApp {
                 // A field package makes an offline area first: one not saved after all goes again.
                 let areas = self.session.project.offline_areas.len();
                 let session = &mut self.session;
-                let (name, bytes) =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rustgis_engine::cmd::items::item_bytes(session, kind, p)))
+                let (name, bytes, notes) =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rustgis_engine::cmd::items::item_output(session, kind, p)))
                         .unwrap_or_else(|_| Err("saving failed unexpectedly".into()))
                         .inspect_err(|e| {
                             // An area a field package made before it failed goes too.
@@ -4158,7 +4158,11 @@ impl RustGisApp {
                         })?;
                 if self.services.download.is_some() {
                     // Not handed over (the failure is said): the area made for it goes too.
-                    if !self.download(&name, bytes) {
+                    if self.download(&name, bytes) {
+                        for note in notes {
+                            self.session.notify(note, false);
+                        }
+                    } else {
                         rustgis_engine::cmd::field::forget_new_areas(&mut self.session, areas);
                     }
                 } else {
@@ -4169,6 +4173,9 @@ impl RustGisApp {
                             if let Err(e) = rustgis_engine::data::io::write_atomic(std::path::Path::new(&path), &bytes) {
                                 rustgis_engine::cmd::field::forget_new_areas(&mut self.session, areas);
                                 return Err(e.to_string());
+                            }
+                            for note in notes {
+                                self.session.notify(note, false);
                             }
                             self.session.notify(i18n::fmt("Saved {name}", &[("name", &path)]), false);
                         }

@@ -606,6 +606,40 @@ mod tests {
         }
     }
     #[test]
+    fn circle_edit_item_download_reports_construction_loss_only_after_acceptance() {
+        for kind in ["layer", "map", "webLayer", "webMap", "obj", "stl"] {
+            for accept in [false, true] {
+                let mut app = app();
+                let (id, row, b) = create(&mut app);
+                app.services.download = Some(Box::new(move |_, _| if accept { Ok(()) } else { Err("rejected download".into()) }));
+                app.session.notices.clear();
+                app.run("ui.saveItem", json!({"kind":kind,"layer":id})).unwrap();
+                assert_eq!(app.session.notices.iter().filter(|n| n.text.starts_with("1 circle")).count(), usize::from(accept), "{kind}");
+                assert_eq!(app.session.circle_spec(id, row), Some(b));
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn circle_edit_item_file_reports_construction_loss_only_after_successful_write() {
+        let mut app = app();
+        let (id, row, b) = create(&mut app);
+        let dir = std::env::temp_dir().join(format!("rustgis-circle-item-save-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (path, expected) in [(None, false), (Some(dir.clone()), false), (Some(dir.join("saved.rgislyr")), true)] {
+            let write_fails = path.as_ref() == Some(&dir);
+            crate::dialogs::PICKED.with(|p| *p.borrow_mut() = path.map(|p| p.display().to_string()));
+            app.session.notices.clear();
+            let result = app.run("ui.saveItem", json!({"kind":"layer","layer":id}));
+            assert_eq!(result.is_err(), write_fails);
+            assert_eq!(app.session.notices.iter().filter(|n| n.text.starts_with("1 circle")).count(), usize::from(expected));
+            assert_eq!(app.session.circle_spec(id, row), Some(b.clone()));
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn circle_edit_dragging_an_unselected_circle_selects_and_moves_it() {
         let mut app = app();
         let (id, row, b) = create(&mut app);

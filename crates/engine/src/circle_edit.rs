@@ -594,6 +594,100 @@ mod tests {
     }
 
     #[test]
+    fn circle_edit_source_id_reassignment_preserves_both_constructions_and_history() {
+        use rustgis_map::source::{PostgisEdit, PostgisOrigin, RowVersion, row_hash};
+        for circle in [true, false] {
+            let (mut s, id) = session();
+            let b = spec();
+            let bx = crate::box_edit::BoxSpec { frame: Frame::default(), center: [0., 0.], width: 100., height: 80., angle: 25. };
+            for _ in 0..2 {
+                s.run("edit.addFeature", &json!({"geometry":rustgis_data::io::geometry_to_geojson(&b.geometry().unwrap())})).unwrap();
+            }
+            let layer = s.map_mut().layer_mut(id).unwrap();
+            let highest = layer.dataset.features[1].id;
+            layer.postgis = Some(PostgisEdit {
+                origin: PostgisOrigin {
+                    database: "postgres:host=127.0.0.1 port=1 dbname=gis".into(),
+                    table: "polygons".into(),
+                    family: None,
+                    crs: None,
+                },
+                key: "fid".into(),
+                srid: 4326,
+                writable: true,
+                condition: None,
+                limit: 0,
+                versions: layer.dataset.features.iter().map(|f| (f.id, RowVersion { version: 1, hash: row_hash(f) })).collect(),
+            });
+            layer.selection = vec![1];
+            s.run("edit.delete", &json!({})).unwrap();
+            let depth = s.undo_depth();
+            let (command, params) = if circle { ("edit.addCircle", json!({"circle":b})) } else { ("edit.addBox", json!({"box":bx})) };
+            s.run(command, &params).unwrap();
+            let final_id = s.map().layer(id).unwrap().dataset.features[1].id;
+            assert!(final_id > highest);
+            assert_eq!(s.constructions.len, 1);
+            assert_eq!(s.undo_depth(), depth + 1);
+            assert_eq!(s.circle_spec(id, 1), circle.then(|| b.clone()));
+            assert_eq!(s.box_spec(id, 1), (!circle).then(|| bx.clone()));
+            s.run("edit.undo", &json!({})).unwrap();
+            assert_eq!(s.map().layer(id).unwrap().dataset.features.len(), 1);
+            assert_eq!(s.constructions.len, 0);
+            s.run("edit.redo", &json!({})).unwrap();
+            assert_eq!(s.map().layer(id).unwrap().dataset.features[1].id, final_id);
+            if circle {
+                s.run("edit.updateCircle", &json!({"row":1,"featureId":final_id,"circle":{"center":[1000,1000],"radius":120}})).unwrap();
+                assert_eq!(s.circle_spec(id, 1).unwrap().radius, 120.);
+            } else {
+                assert_eq!(s.box_spec(id, 1), Some(bx));
+            }
+        }
+    }
+
+    #[test]
+    fn circle_edit_mesh_losses_count_only_contributing_features() {
+        let (mut s, id) = session();
+        let b = spec();
+        s.run("edit.addCircle", &json!({"circle":b,"attributes":{"class":"hidden"}})).unwrap();
+        s.run("edit.addCircle", &json!({"circle":b,"attributes":{"class":"flat"}})).unwrap();
+        s.run("edit.addBox", &json!({"box":{"center":[0,0],"width":100,"height":80,"angle":0},"attributes":{"class":"solid"}})).unwrap();
+        s.run("edit.addField", &json!({"name":"h","type":"Float"})).unwrap();
+        for (row, height) in [(0, 10), (1, 0), (2, 20)] {
+            s.run("edit.setValue", &json!({"row":row,"field":"h","value":height})).unwrap();
+        }
+        s.map_mut().layer_mut(id).unwrap().definition_query = Some("class <> 'hidden'".into());
+        for (kind, circles) in [("obj", 1), ("stl", 0)] {
+            let p = json!({"layer":id,"heightField":"h"});
+            s.notices.clear();
+            let (_, bytes) = crate::cmd::items::item_bytes(&mut s, kind, &p).unwrap();
+            assert!(!bytes.is_empty());
+            let notes = construction_notices(&s);
+            assert_eq!(notes.len(), 1 + circles, "{kind}: {notes:?}");
+            assert!(notes.iter().any(|n| n.starts_with("1 rotated box")));
+            assert_eq!(notes.iter().filter(|n| n.starts_with("1 circle")).count(), circles);
+            let path = std::env::temp_dir().join(format!("rustgis-circle-mesh-{}.{kind}", std::process::id()));
+            s.notices.clear();
+            let mut p = p;
+            p["path"] = json!(path);
+            s.run("share.export3d", &p).unwrap();
+            assert_eq!(construction_notices(&s).len(), 1 + circles);
+            let _ = std::fs::remove_file(path);
+        }
+        // With only an ordinary solid retained, a successful mesh has no construction losses.
+        s.run(
+            "edit.addFeature",
+            &json!({"geometry":rustgis_data::io::geometry_to_geojson(&b.geometry().unwrap()),"attributes":{"class":"ordinary","h":20}}),
+        )
+        .unwrap();
+        s.map_mut().layer_mut(id).unwrap().definition_query = Some("class = 'ordinary'".into());
+        for kind in ["obj", "stl"] {
+            s.notices.clear();
+            crate::cmd::items::item_bytes(&mut s, kind, &json!({"heightField":"h"})).unwrap();
+            assert!(construction_notices(&s).is_empty());
+        }
+    }
+
+    #[test]
     fn circle_edit_explicit_project_save_reports_live_constructions_across_maps() {
         let (mut s, first) = session();
         let b = spec();
