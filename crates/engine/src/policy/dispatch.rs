@@ -124,7 +124,7 @@ impl Session {
         let CallKind::Command { id, params } = &call.kind else {
             return Err("only standalone archive or column-statistics commands can prepare a scoped read".into());
         };
-        if !matches!(id.as_str(), "map.reloadTiles" | "map.repairTiles" | "table.statistics") {
+        if !matches!(id.as_str(), "map.reloadTiles" | "map.repairTiles" | "table.statistics" | "edit.previewShapeConversion") {
             return Err("only standalone archive or column-statistics commands can prepare a scoped read".into());
         }
         let capture = |s: &mut Session| s.capture_read(id, params);
@@ -156,6 +156,7 @@ impl Session {
                 | "service.add"
                 | "source.syncState"
                 | "table.statistics"
+                | "edit.previewShapeConversion"
         ) && crate::cmd::edit::table_edit_in_background(command).is_none()
         {
             return Err("only Add Data, Load All, Repair/Reload Data, Convert To Annotation, models, scripts, tile archives, service reads, topology, Source File State and Column Statistics prepare background work".into());
@@ -163,7 +164,13 @@ impl Session {
         let mut params = params.as_object().cloned().ok_or("read parameters must be an object")?;
         if matches!(
             command,
-            "layer.loadAll" | "layer.reloadData" | "layer.repairSource" | "labels.convert" | "source.syncState" | "table.statistics"
+            "layer.loadAll"
+                | "layer.reloadData"
+                | "layer.repairSource"
+                | "labels.convert"
+                | "source.syncState"
+                | "table.statistics"
+                | "edit.previewShapeConversion"
         ) || (command == "edit.convertField" && params.get("table").is_none_or(Value::is_null))
         {
             let id = self.layer_id(&Value::Object(params.clone()))?;

@@ -409,3 +409,61 @@ no map layer is active then, and clicking one ends it). With **Selected in Layer
 the map then identifies that tile layer alone: a WMS layer is asked as above, and a vector tile
 layer, archive or MapLibre style lists its features. This works for catalog basemaps and MapLibre
 styles too, which the topmost and visible modes leave out.
+
+### Manually converting imported polygons
+
+Circles and rotated boxes shared as GeoJSON reopen as ordinary polygons. To edit one with
+constrained handles again, turn **Edit › Edit** on, select its loaded polygon layer, right-click
+the object and choose **Convert to › Circle…** or **Rotated Box…**. The **Editing** pane also has
+**Convert Selected Polygon…**, and Command Search has **Convert Polygon to Shape…**. These tools
+are available independently of any annotation workflow. A right-click keeps the selected object
+under the pointer; Alt-right-click cycles overlapping objects.
+
+1. Choose Circle or Rotated Box and a construction grid. The default is **Web Mercator grid
+   metres**, not ground metres. Choose an open GeoTIFF to fit in its **original image pixels**,
+   preserving the source affine transform, including rotation and shear, rather than using a
+   display overview. Local GeoTIFFs and embedded/browser-uploaded GeoTIFFs are supported; remote
+   original grids must be downloaded and added first. An unreadable or unsupported source gives
+   an error, without falling back to a different grid.
+2. Click **Preview Conversion**. The orange outline previews the replacement without changing
+   the feature or undo history. The desktop performs fitting and header reads in the background,
+   with progress and Cancel in the status bar. Drag the map to pan while reviewing the preview.
+3. Review or adjust the centre and dimensions, then **Apply Conversion** or **Cancel Conversion**.
+   Apply replaces only this feature, preserves its ID and attributes, and enables the existing
+   Circle or Rotated Box editor. One Undo restores the original polygon and construction state;
+   Redo restores the conversion. Cancel leaves the geometry and history unchanged.
+
+A rotated box uses the minimum-area enclosing rectangle of the input vertices in the chosen
+planar grid (longer side as width, clockwise angle in `[0,180)`). A circle uses the centre of
+the vertices' axis-aligned bounds and the maximum vertex distance as radius. This deterministic
+circle encloses the vertices; it is not a least-squares or minimum-enclosing-circle fit.
+The tolerance starts at the larger of 0.25 grid units and radius/10000, before projection.
+Both operations can change the boundary; neither promises recovery of the original construction.
+Transformed edges are still represented by straight polygon edges, with the limits described above.
+
+Conversion accepts a single closed polygon without holes, with at most 4096 vertices (excluding
+its closing duplicate). Multipart features, holes, degenerate grids/polygons and unsupported
+projection boundaries are refused, never silently discarded. A source or selection changed while
+reviewing the preview invalidates it; preview again. Edit rules that change the proposed geometry,
+attributes or identity cause the whole conversion to be refused. Larger polygons must be simplified
+explicitly before fitting.
+
+The result remains an ordinary polygon on disk. Centre, radius and box dimensions live only in
+this session; saves and exports retain the existing counted construction-loss notes. No custom
+GeoJSON metadata, image bindings, class palette format or saved-file changes are introduced.
+
+Scripts, CLI, Python, the Assistant/MCP and permitted plugins use the same commands:
+
+```text
+edit.previewShapeConversion={"layer":"Annotations","row":0,"kind":"rotatedBox","image":"Original TIFF"}
+```
+
+Pass that command's complete answer as `preview` to
+`edit.applyShapeConversion={"preview":…,"confirm":true}` in the **same live session**. Preview is
+read-only and does not grant consent to Apply. Preview tokens cannot be reused after reopening
+a project; saved workflows must obtain a fresh preview. Omit `image` to use Web Mercator, or supply `frame`
+with the same EPSG, dimensions and affine fields accepted by `edit.addBox` (image and frame are
+mutually exclusive). Preview may read a source file and therefore declares the Files permission.
+Synchronous API callers must invoke fitting off their own UI thread. On the phone the commands
+are usable through its existing command interface; the desktop-style right-click menu is not a
+new touch-bar destination.

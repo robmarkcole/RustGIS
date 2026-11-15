@@ -24,6 +24,7 @@ pub mod policy;
 pub mod prefs;
 pub mod project;
 mod roles;
+pub mod shape_conversion;
 pub use peer::Peer;
 pub(crate) use roles::{Document, ParamRole, Role};
 mod parameters;
@@ -1180,7 +1181,7 @@ fn edits_features(id: &str) -> bool {
 }
 
 impl Session {
-    /// Marks this thread as the desktop window owner for column statistics. Adapters with a
+    /// Marks this thread as the desktop window owner for column statistics and shape fitting. Adapters with a
     /// window use the prepared read queue; headless adapters leave this disabled.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn statistics_need_read_ahead(&mut self, enabled: bool) {

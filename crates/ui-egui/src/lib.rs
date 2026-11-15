@@ -105,6 +105,7 @@ mod scriptcomplete;
 mod searchbox;
 mod serviceui;
 mod sessionlog;
+mod shapeconvert;
 mod shortcutfile;
 mod shortcutui;
 mod showme;
@@ -1160,6 +1161,7 @@ pub struct RustGisApp {
     pub session: Session,
     pub(crate) boxes: boxedit::State,
     pub(crate) circles: circleedit::State,
+    pub(crate) conversion: shapeconvert::State,
     pub ui: UiState,
     pub map: mapview::MapView,
     pub dialogs: dialogs::Dialogs,
@@ -1462,6 +1464,7 @@ impl RustGisApp {
             session: s,
             boxes: boxedit::State::default(),
             circles: circleedit::State::default(),
+            conversion: shapeconvert::State::default(),
             ui,
             map: mapview::MapView::default(),
             dialogs: dialogs::Dialogs::default(),
@@ -2658,6 +2661,9 @@ impl RustGisApp {
             }
             // Counting a column goes over every row of the layer: on a thread of its own, and the
             // answer shown once it lands (the table's Statistics window).
+            if id == "edit.previewShapeConversion" {
+                return readjob::run_then(self, "edit.previewShapeConversion", params, Some(shapeconvert::landed));
+            }
             if id == "table.statistics" {
                 return readjob::run_then(self, "table.statistics", params, Some(table::statistics_landed));
             }
@@ -4143,6 +4149,21 @@ impl RustGisApp {
                 }
             }
             // Project items: save (a file dialog, or a download on the web) and open.
+            "ui.previewShapeConversion" => {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    return readjob::run_then(self, "edit.previewShapeConversion", p.clone(), Some(shapeconvert::landed));
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let result = self.run("edit.previewShapeConversion", p.clone());
+                    shapeconvert::landed(self, Landed::Ran(result.clone()));
+                    return result;
+                }
+            }
+            "ui.convertShape" => {
+                shapeconvert::open(self, p)?;
+            }
             "ui.saveItem" => {
                 let kind = p.get("kind").and_then(Value::as_str).ok_or("kind is required")?;
                 // A field package makes an offline area first: one not saved after all goes again.

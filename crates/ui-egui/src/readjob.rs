@@ -28,6 +28,24 @@ pub struct Reads {
     fail_spawn: bool,
 }
 
+impl Reads {
+    /// An older conversion's failure must not replace the state of its queued successor.
+    pub(crate) fn shape_conversion_waiting(&self, request: u64) -> bool {
+        self.waiting
+            .iter()
+            .any(|a| a.command == "edit.previewShapeConversion" && a.params.get("request").and_then(Value::as_u64) == Some(request))
+    }
+    /// Closing a conversion preview cancels only its read, leaving unrelated queued work alone.
+    pub(crate) fn cancel_shape_conversion(&mut self) {
+        if let Some(job) = &self.job
+            && job.asked.command == "edit.previewShapeConversion"
+        {
+            job.control.cancel();
+        }
+        self.waiting.retain(|a| a.command != "edit.previewShapeConversion");
+    }
+}
+
 /// A command asked for, with where it was asked: the project, map and layer then open.
 /// A reload also retains its source and confirmed editable state until it lands.
 struct Asked {
@@ -114,7 +132,13 @@ fn run_presented(
     }
     let layer = matches!(
         command,
-        "layer.loadAll" | "layer.reloadData" | "layer.repairSource" | "labels.convert" | "source.syncState" | "table.statistics"
+        "layer.loadAll"
+            | "layer.reloadData"
+            | "layer.repairSource"
+            | "labels.convert"
+            | "source.syncState"
+            | "table.statistics"
+            | "edit.previewShapeConversion"
     )
     .then(|| app.session.layer_id(&p).ok().and_then(|id| app.session.map().layer(id)).map(|l| (l.instance_id(), l.name.clone())))
     .flatten();

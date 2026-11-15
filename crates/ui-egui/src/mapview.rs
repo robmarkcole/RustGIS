@@ -2748,22 +2748,21 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
         app.map.kept_lonlat = Some((c, app.session.map().instance_id(), app.session.opened));
     }
     let tool = app.session.tool;
+    if resp.secondary_clicked()
+        && let Some(c) = resp.interact_pointer_pos().and_then(|p| screen_to_lonlat(app, rect, p))
+    {
+        crate::shapeconvert::pick(app, c, ui.input(|i| i.modifiers.alt));
+    }
     crate::boxedit::cancel_stale(app);
     crate::circleedit::cancel_stale(app);
     if tool == Tool::RotatedBox {
         if resp.secondary_clicked() {
-            if let Some(c) = resp.interact_pointer_pos().and_then(|p| screen_to_lonlat(app, rect, p)) {
-                crate::boxedit::click(app, c, false, false);
-            }
             app.map.popup = None;
         }
         resp.context_menu(|ui| crate::boxedit::context_menu(app, ui));
     }
     if tool == Tool::Circle {
         if resp.secondary_clicked() {
-            if let Some(c) = resp.interact_pointer_pos().and_then(|p| screen_to_lonlat(app, rect, p)) {
-                crate::circleedit::click(app, c, false, false);
-            }
             app.map.popup = None;
         }
         resp.context_menu(|ui| crate::circleedit::context_menu(app, ui));
@@ -3559,6 +3558,7 @@ fn overlays(app: &mut RustGisApp, ui: &mut Ui, p: &egui::Painter, rect: Rect, t:
     if app.session.tool == Tool::Circle {
         crate::circleedit::draw(app, p, rect, accent);
     }
+    crate::shapeconvert::draw(app, p, rect);
     // The navigator: a compass, zoom buttons and a pan pad in the top-left corner.
     if app.session.map().view.navigator {
         navigator(app, ui, p, rect, t);
