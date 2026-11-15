@@ -674,4 +674,55 @@ mod tests {
         assert!(s.construction_output_notes().unwrap().is_empty());
         let _ = std::fs::remove_file(path);
     }
+    #[test]
+    fn circle_edit_mobile_package_counts_only_retained_layers_after_group_visibility() {
+        let (mut s, hidden) = session();
+        let b = spec();
+        add(&mut s, &b);
+        let visible = s.map_mut().add_dataset(Dataset::new("Visible circles", GeometryType::Polygon, vec![]));
+        s.run("edit.addCircle", &json!({"layer":visible,"circle":b})).unwrap();
+        s.run("edit.addBox", &json!({"layer":visible,"box":{"center":[0,0],"width":100,"height":80,"angle":0}})).unwrap();
+        let group = s.run("group.add", &json!({"name":"Hidden group","layers":[hidden]})).unwrap()["group"].clone();
+        s.run("group.set", &json!({"group":group,"visible":false})).unwrap();
+        assert!(s.map().layer(hidden).unwrap().visible, "visibility is inherited from the group");
+        for (kind, circles) in [("mobilePackage", 1), ("mapPackage", 2)] {
+            s.notices.clear();
+            let (_, bytes) = crate::cmd::items::item_bytes(&mut s, kind, &json!({"tolerance":0})).unwrap();
+            let notes = construction_notices(&s);
+            assert_eq!(notes.len(), 2, "{kind}");
+            assert!(notes.iter().any(|n| n.starts_with(&format!("{circles} circle"))), "{kind}: {notes:?}");
+            assert!(notes.iter().any(|n| n.starts_with("1 rotated box")));
+            if kind == "mobilePackage" {
+                let entries = rustgis_data::zip::read_matching(&bytes, |name| name.ends_with(".rgismap")).unwrap();
+                let map: rustgis_map::Map = serde_json::from_slice(&entries[0].1).unwrap();
+                assert!(map.layer(hidden).is_none());
+                assert!(map.layer(visible).is_some());
+            }
+        }
+        s.map_mut().layer_mut(visible).unwrap().visible = false;
+        s.notices.clear();
+        crate::cmd::items::item_bytes(&mut s, "mobilePackage", &json!({"tolerance":0})).unwrap();
+        assert!(construction_notices(&s).is_empty());
+    }
+
+    #[test]
+    fn circle_edit_committed_construction_notices_survive_later_workflow_rollback() {
+        let (mut s, id) = session();
+        let b = spec();
+        add(&mut s, &b);
+        for (command, extension) in
+            [("project.saveAs", "rgis"), ("layer.save", "rgislayer"), ("share.export3d", "obj"), ("share.export3d", "stl")]
+        {
+            let path = std::env::temp_dir().join(format!("rustgis-circle-written-{}.{extension}", std::process::id()));
+            s.notices.clear();
+            let script = format!("{command} {}\nlayer.remove {{\"layer\":\"missing\"}}", json!({"layer":id,"path":path}));
+            assert!(s.run("script.run", &json!({"script":script})).is_err());
+            assert!(path.exists(), "{command}");
+            let notes = construction_notices(&s);
+            assert_eq!(notes.len(), 1, "{command}: {notes:?}");
+            assert!(notes[0].starts_with("1 circle"));
+            assert_eq!(s.circle_spec(id, 0), Some(b.clone()));
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }

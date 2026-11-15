@@ -788,21 +788,28 @@ pub(crate) fn safe(name: &str) -> String {
     if s.trim().is_empty() { "project".into() } else { s }
 }
 
+/// Fold group visibility and keep exactly the layers a mobile package includes. The source
+/// used for construction notices must use this same rule before geometry is simplified.
+fn mobile_map(mut m: Map) -> Map {
+    // Groups folded into their layers: a hidden group's layers are dropped with the others.
+    m.bake_groups();
+    // A hidden DEM still gives the terrain its heights (it can stay hidden): it is kept.
+    let dem = match &m.view.terrain {
+        Some(rustgis_map::view::Terrain { source: rustgis_map::view::TerrainSource::Layer(n), .. }) => Some(n.clone()),
+        _ => None,
+    };
+    let kept = |l: &rustgis_map::Layer| l.visible || (l.is_raster() && dem.as_deref().is_some_and(|d| l.name.eq_ignore_ascii_case(d)));
+    let hidden: Vec<u32> = m.layers.iter().filter(|l| !kept(l)).map(|l| l.id).collect();
+    m.release_tiles(&hidden);
+    m.layers.retain(|l| kept(l));
+    m
+}
+
 /// A package of the active map; `mobile` drops hidden layers and simplifies geometry.
 fn package_map(s: &mut Session, mobile: bool, tol: f64) -> Result<Vec<u8>, String> {
     let mut m = embedded_map(s.map(), &mut MAX_EMBED.clone());
     if mobile {
-        // Groups folded into their layers: a hidden group's layers are dropped with the others.
-        m.bake_groups();
-        // A hidden DEM still gives the terrain its heights (it can stay hidden): it is kept.
-        let dem = match &m.view.terrain {
-            Some(rustgis_map::view::Terrain { source: rustgis_map::view::TerrainSource::Layer(n), .. }) => Some(n.clone()),
-            _ => None,
-        };
-        let kept = |l: &rustgis_map::Layer| l.visible || (l.is_raster() && dem.as_deref().is_some_and(|d| l.name.eq_ignore_ascii_case(d)));
-        let hidden: Vec<u32> = m.layers.iter().filter(|l| !kept(l)).map(|l| l.id).collect();
-        m.release_tiles(&hidden);
-        m.layers.retain(|l| kept(l));
+        m = mobile_map(m);
     }
     // What Simplify left alone or changed beyond simplifying (a latitude past a pole taken as the
     // pole, a one-vertex line part left out, a feature left as it was or too intricate), over all
@@ -1076,6 +1083,7 @@ pub(crate) fn names_place(v: &Value, keys: &[&str], depth: usize) -> bool {
 /// are extruded to a height, lines are polylines (OBJ only), points are small cubes. Coordinates
 /// are metres east and north of the layer's south-west corner.
 fn export_3d(s: &mut Session, p: &Value) -> CmdResult {
+    let written = s.notice_mark();
     let path = ps(p, "path").ok_or("path is required")?.to_string();
     let id = s.layer_id(p)?;
     let construction_notes = s.constructions.export_notes(s.map().instance_id(), s.map().layer(id).ok_or("no such layer")?)?;
@@ -1085,7 +1093,8 @@ fn export_3d(s: &mut Session, p: &Value) -> CmdResult {
         for note in construction_notes {
             s.notify(note, false);
         }
-        s.notify(format!("Exported {path}"), false);
+        s.retain_written_notices(written);
+        s.notify_written(format!("Exported {path}"), false);
         return Ok(json!({
             "path": path, "bytes": bytes.len(), "triangles": report.triangles,
             "skippedDegenerate": report.degenerate, "linesDropped": report.lines, "capsFanned": report.fanned,
@@ -1096,7 +1105,8 @@ fn export_3d(s: &mut Session, p: &Value) -> CmdResult {
     for note in construction_notes {
         s.notify(note, false);
     }
-    s.notify(format!("Exported {path}"), false);
+    s.retain_written_notices(written);
+    s.notify_written(format!("Exported {path}"), false);
     Ok(json!({"path": path, "bytes": obj.len()}))
 }
 
@@ -1639,9 +1649,11 @@ pub fn item_bytes(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Vec
             s.constructions.export_notes(s.map().instance_id(), s.map().layer(id).ok_or("no such layer")?)?
         }
         "template" | "projectPackage" => s.construction_output_notes()?,
-        "mapPackage" | "mobilePackage" | "fieldPackage" => {
-            s.constructions.output_notes(s.map().layers.iter().map(|l| (s.map().instance_id(), l)))?
+        "mobilePackage" => {
+            let m = mobile_map(s.map().clone());
+            s.constructions.output_notes(m.layers.iter().map(|l| (m.instance_id(), l)))?
         }
+        "mapPackage" | "fieldPackage" => s.constructions.output_notes(s.map().layers.iter().map(|l| (s.map().instance_id(), l)))?,
         "gpPackage" => s.constructions.output_notes(gp_result_layers(s).into_iter().map(|(m, l)| (m.instance_id(), l)))?,
         _ => Vec::new(),
     };
@@ -1765,9 +1777,11 @@ pub fn item_bytes(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Vec
 
 /// Writes an item to `path`.
 pub(crate) fn save_item(s: &mut Session, kind: &str, p: &Value) -> CmdResult {
+    let written = s.notice_mark();
     let path = ps(p, "path").ok_or("path is required")?.to_string();
     let (_, bytes) = item_bytes(s, kind, p)?;
     rustgis_data::io::write_atomic(Path::new(&path), &bytes).map_err(|e| format!("{path}: {e}"))?;
+    s.retain_written_notices(written);
     Ok(json!({"path": path, "bytes": bytes.len()}))
 }
 

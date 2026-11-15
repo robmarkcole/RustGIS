@@ -638,4 +638,31 @@ mod tests {
             assert!(app.session.notices.last().is_some_and(|n| n.error && n.text.contains("construction grid")));
         }
     }
+    #[test]
+    fn circle_edit_browser_layer_download_reports_both_shape_kinds_only_after_acceptance() {
+        for accept in [false, true] {
+            let mut app = app();
+            let (constructed, _, b) = create(&mut app);
+            app.run("edit.addBox", json!({"layer":constructed,"box":{"center":[0,0],"width":100,"height":80,"angle":0}})).unwrap();
+            let ordinary = app.session.map_mut().add_dataset(Dataset::new("Ordinary", GeometryType::Polygon, vec![]));
+            app.run(
+                "edit.addFeature",
+                json!({"layer":ordinary,"geometry":rustgis_engine::data::io::geometry_to_geojson(&b.geometry().unwrap())}),
+            )
+            .unwrap();
+            app.services.download = Some(Box::new(move |_, _| if accept { Ok(()) } else { Err("rejected download".into()) }));
+            for layer in [constructed, ordinary] {
+                app.session.notices.clear();
+                let result = app.run("ui.exportLayer", json!({"layer":layer,"format":"geojson"}));
+                if accept {
+                    assert!(result.is_ok());
+                }
+                let has_notes = accept && layer == constructed;
+                for prefix in ["1 circle", "1 rotated box"] {
+                    assert_eq!(app.session.notices.iter().filter(|n| n.text.starts_with(prefix)).count(), usize::from(has_notes));
+                }
+                assert_eq!(app.session.circle_spec(constructed, 0), Some(b.clone()));
+            }
+        }
+    }
 }

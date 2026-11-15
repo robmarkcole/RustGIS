@@ -268,14 +268,19 @@ and more. RustGIS doesn't link to GDAL: each layer is converted once, by `ogr2og
 FlatGeobuf with a spatial index in WGS 84 (GDAL reprojects it), kept in the cache folder
 (`~/.cache/rustgis/gdal` on Linux, `~/Library/Caches/RustGIS/gdal` on macOS,
 `%LOCALAPPDATA%\RustGIS\cache\gdal` on Windows, or `RUSTGIS_GDAL_CACHE`). Adding the file again
-reuses the conversion until the file changes, and large layers stream like any large FlatGeobuf
-(below). Every layer of the file is added; a layer mixing geometry types is added as one layer
-per type, its points on top and its polygons at the bottom. Curves become straight segments, and
+reuses the conversion and its layer listing until the file's path, size or modification time
+changes (for a File Geodatabase folder, RustGIS checks its files too). Missing or unreadable
+cached listings are rebuilt; **Reload** always reads the source afresh. The first listing skips
+spatial extents but keeps feature counts to check for conversion losses. Large layers stream
+like any large FlatGeobuf (below). Every layer of the file is added; a layer mixing geometry
+types is added as one layer per type, its points on top and its polygons at the bottom. Curves become straight segments, and
 3D surfaces (an Esri multipatch, such as the buildings of swissBUILDINGS3D, is read as a TIN)
 become flat polygons, one part per face, without their heights. The conversion leaves out a
 feature it can't index, such as a polygon with no coordinates; when GDAL gives the layer's feature
 count, adding the file says how many were left out, also when it reuses a conversion. Projects
-remember the original file and convert it again if the cached copy is gone.
+remember the original file and convert it again if the cached copy is gone. A listing that runs
+past five minutes, or a conversion past thirty minutes, stops with an error naming the source
+file and the operation that exceeded its limit.
 
 ## SQL queries and DuckDB databases
 
@@ -634,8 +639,16 @@ page of their own: [Web Data](web-data.md).
 layer's addresses into points: a CSV of addresses without coordinates is added as a standalone table, then each row's address
 fields (`"address"`: a field, or several such as street, city and country, joined with commas)
 are looked up, each distinct address once. The result is a new point layer holding every field
-plus `geocoded`, what the geocoder called the place; rows that weren't found stay in its table
-without a point.
+plus `geocoded`, what the geocoder called the place, and a text field `match_status`:
+
+- `matched`: the geocoder returned a usable point for the row's address.
+- `unmatched`: the row has no usable point, including an empty address or a failed lookup.
+
+Rows that weren't found stay in its table without a point, and a notice counts them; filter
+`match_status = 'unmatched'` to review them. A field of the same name in the input is kept, and
+the new one gets an underscore appended (`match_status_`; filter that one then). `matched` means the geocoder returned a point, not that
+it is the exact address: it may be placed along the street or at a broader place. The geocoders
+don't give a match score, so there is none in the output.
 
 The geocoder is OpenStreetMap's public [Nominatim](https://nominatim.org) by default, or
 [Photon](https://photon.komoot.io) (`"provider": "photon"`). Their usage policies allow light

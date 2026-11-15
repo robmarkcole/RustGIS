@@ -15,6 +15,10 @@ mod review_boundaries;
 #[path = "tests/table_statistics.rs"]
 mod table_statistics;
 
+#[cfg(not(target_arch = "wasm32"))]
+#[path = "tests/write_notices.rs"]
+mod write_notices;
+
 #[path = "tests/task_reentry.rs"]
 mod task_reentry;
 
@@ -8887,10 +8891,15 @@ fn publication_layouts_fit_their_pages() {
             assert!(reference.contains("Web Mercator") && reference.contains("WGS 84") && reference.contains("2°"), "{reference}");
             assert!(text("Author").unwrap().contains("{date}"), "the date stays a token the layout fills");
             // Nothing said but, over the sample world's land, the surrounds sharing its one corner
-            // of sea, or the map moved in its frame for the legend (placement has its own tests).
+            // of sea, the map moved in its frame for the legend (placement has its own tests), or
+            // the lakes in one colour beside the countries by classes left out of the legend as
+            // context (#1379).
             let said: Vec<&str> = r["warnings"].as_array().unwrap().iter().filter_map(|w| w.as_str()).collect();
             assert!(
-                said.len() <= 2 && said.iter().all(|w| w.contains("on what the map shows") || w.contains("in its frame")),
+                said.len() <= 3
+                    && said.iter().all(|w| w.contains("on what the map shows")
+                        || w.contains("in its frame")
+                        || w.contains("context layer around the data (Lakes)")),
                 "{profile}: {r}"
             );
         } else {
@@ -9883,6 +9892,105 @@ fn a_publication_legend_takes_the_columns_that_fit_the_free_rectangle() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Context around the data is left out of a publication's legend, which a warning names (#1379):
+/// a layer that only outlines its polygons, and one in one colour running on past the frame beside
+/// a layer drawn by classes. A study area in one colour inside the frame is data, and stays listed,
+/// and so does a context layer sharing its name. `"contextInLegend": true` lists them all; a choice
+/// that isn't true or false is refused.
+#[test]
+fn a_publication_legend_leaves_out_context_layers() {
+    let dir = std::env::temp_dir().join(format!("rustgis-legend-context-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let square = |[w, s, e, n]: [f64; 4], k: &str| {
+        json!({"type": "Feature", "properties": {"k": k}, "geometry":
+            {"type": "Polygon", "coordinates": [[[w, s], [e, s], [e, n], [w, n], [w, s]]]}})
+    };
+    let file = |name: &str, features: Vec<Value>| {
+        let path = dir.join(name);
+        std::fs::write(&path, json!({"type": "FeatureCollection", "features": features}).to_string()).unwrap();
+        path.display().to_string()
+    };
+    let data = file("data.geojson", vec![square([0.0, 0.0, 5.0, 10.0], "a"), square([5.0, 0.0, 10.0, 10.0], "b")]);
+    let around = file("around.geojson", vec![square([-30.0, -30.0, 40.0, 40.0], "x")]);
+    let border = file("border.geojson", vec![square([1.0, 1.0, 9.0, 9.0], "x")]);
+    let study = file("study.geojson", vec![square([2.0, 2.0, 4.0, 4.0], "x")]);
+    let laid = |extra: Value| {
+        let mut s = Session::new(Project::default());
+        for path in [&around, &data, &study, &border] {
+            s.run("layer.addData", &json!({"path": path})).unwrap();
+        }
+        // The study area under the name of the context layer around: that name stays listed.
+        if extra.get("mixed").is_some() {
+            s.run("layer.rename", &json!({"layer": "study", "name": "around"})).unwrap();
+        }
+        s.run("layer.symbology", &json!({"layer": "data", "type": "unique", "field": "k"})).unwrap();
+        s.run("layer.color", &json!({"layer": "border", "color": "#00000000"})).unwrap();
+        let mut p = json!({"profile": "a4-portrait", "extent": [0, 0, 10, 10], "author": "", "locator": "none"});
+        p.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone().into_iter().filter(|(k, _)| k != "mixed"));
+        let r = s.run("layout.publication", &p)?;
+        let layout = s.project.layouts.last().unwrap();
+        let exclude = layout
+            .elements
+            .iter()
+            .find_map(|e| match &e.kind {
+                rustgis_map::layout::ElementKind::Legend { exclude, .. } => Some(exclude.clone()),
+                _ => None,
+            })
+            .expect("a legend");
+        let said =
+            r["warnings"].as_array().unwrap().iter().filter_map(|w| w.as_str()).find(|w| w.contains("context layer")).map(String::from);
+        Ok::<_, String>((exclude, said))
+    };
+    let (mut exclude, said) = laid(json!({})).unwrap();
+    exclude.sort();
+    assert_eq!(exclude, ["around", "border"], "the context, not the data nor the study area");
+    let said = said.expect("said");
+    assert!(said.contains("2 context layers") && said.contains("around") && said.contains("border"), "{said}");
+    let (exclude, said) = laid(json!({"mixed": true})).unwrap();
+    assert_eq!(exclude, ["border"], "a name a data layer shares stays: {said:?}");
+    let (exclude, said) = laid(json!({"contextInLegend": true})).unwrap();
+    assert!(exclude.is_empty() && said.is_none(), "{exclude:?} {said:?}");
+    let bad = laid(json!({"contextInLegend": "yes"})).unwrap_err();
+    assert!(bad.contains("contextInLegend is true or false"), "{bad}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A publication whose extent spans 20° or more has no north arrow: its graticule gives north,
+/// and one arrow can't point north across the whole frame, which a warning says (#1379).
+/// `"northArrow": "always"` draws one, `"none"` leaves it out at any span, and an unknown choice is
+/// refused. An extent's width counts as long as it is at its middle latitude.
+#[test]
+fn a_publication_has_no_north_arrow_at_a_continental_span() {
+    use crate::cmd::layout::extent_span_deg;
+    assert!(extent_span_deg(&rustgis_geom::Extent::new(0.0, 60.0, 40.0, 62.0)) < 20.0, "40° of longitude at 61°N is under 20°");
+    assert!(extent_span_deg(&rustgis_geom::Extent::new(-82.0, -56.5, -34.5, 13.0)) >= 20.0);
+    let path = std::env::temp_dir().join(format!("rustgis-north-{}.geojson", std::process::id()));
+    std::fs::write(
+        &path,
+        json!({"type": "FeatureCollection", "features": [{"type": "Feature", "properties": {}, "geometry":
+            {"type": "Polygon", "coordinates": [[[-80.0, -55.0], [-35.0, -55.0], [-35.0, 12.0], [-80.0, 12.0], [-80.0, -55.0]]]}}]})
+        .to_string(),
+    )
+    .unwrap();
+    let laid = |extent: Value, choice: Value| {
+        let mut s = Session::new(Project::default());
+        s.run("layer.addData", &json!({"path": path.display().to_string()})).unwrap();
+        let r = s.run("layout.publication", &json!({"profile": "a4-portrait", "extent": extent, "author": "", "northArrow": choice}))?;
+        let arrows = r["elements"].as_array().unwrap().iter().filter(|e| e["name"] == "North Arrow").count();
+        let said = r["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().starts_with("no north arrow"));
+        Ok::<_, String>((arrows, said))
+    };
+    let continent = json!([-82, -56.5, -34.5, 13]);
+    assert_eq!(laid(continent.clone(), Value::Null).unwrap(), (0, true), "none on a continent, and said");
+    assert_eq!(laid(continent.clone(), json!("auto")).unwrap(), (0, true));
+    assert_eq!(laid(continent.clone(), json!("always")).unwrap(), (1, false));
+    assert_eq!(laid(json!([-50, -20, -40, -10]), Value::Null).unwrap(), (1, false), "one on a smaller extent");
+    assert_eq!(laid(json!([-50, -20, -40, -10]), json!("none")).unwrap(), (0, false), "asked for: not said");
+    let bad = laid(continent, json!("north")).unwrap_err();
+    assert!(bad.contains("northArrow is \"auto\", \"always\" or \"none\""), "{bad}");
+    let _ = std::fs::remove_file(&path);
+}
+
 /// `"colorbar": "none"` leaves a raster's colorbar out of a publication, and its room in the
 /// legend's box with it: the box is the legend's height plus its padding (#1680). An unknown
 /// choice is refused.
@@ -10475,8 +10583,9 @@ fn a_publication_reads_streamed_layers_for_the_move_searchs_wide_drawing() {
 #[test]
 fn a_veil_panel_groups_the_surrounds_by_the_bands_shape() {
     use crate::cmd::layout::veil_panel;
-    let (legend, arrow, scale) = ((80.0, 50.0), (8.0, 12.0), (60.0, 10.0));
+    let (legend, arrow, scale) = ((80.0, 50.0), Some((8.0, 12.0)), (60.0, 10.0));
     let (l, locator, a, b) = veil_panel((0.0, 0.0, 160.0, 70.0), legend, Some(40.0), arrow, scale, 3.0).unwrap();
+    let a = a.unwrap();
     assert!(l.0 + l.2 <= locator.unwrap().0, "beside it: {l:?} {locator:?}");
     assert!(a.0 + a.2 <= 160.0 && b.1 >= locator.unwrap().1 + 40.0, "{a:?} {b:?}");
     let apart =
@@ -10486,6 +10595,15 @@ fn a_veil_panel_groups_the_surrounds_by_the_bands_shape() {
     assert!(l.1 >= b.1 + b.3 && locator.unwrap().0 == b.0, "under it: {l:?} {b:?}");
     assert!(veil_panel((0.0, 0.0, 60.0, 60.0), legend, Some(40.0), arrow, scale, 3.0).is_none());
     assert!(veil_panel((0.0, 0.0, 160.0, 70.0), legend, None, arrow, scale, 3.0).unwrap().1.is_none());
+    // With no north arrow (a continental extent, #1379), the locator stands alone over the scale bar.
+    let (_, locator, a, b) = veil_panel((0.0, 0.0, 160.0, 70.0), legend, Some(40.0), None, scale, 3.0).unwrap();
+    assert!(a.is_none(), "no place for an arrow there isn't: {a:?}");
+    assert_eq!(locator.unwrap().0, b.0, "the locator over the scale bar: {locator:?} {b:?}");
+    // With neither, the scale bar heads its group, with no gap over it: a band just as tall as the
+    // legend and the bar one over the other takes them.
+    let (l, locator, a, b) = veil_panel((0.0, 0.0, 80.0, 63.0), legend, None, None, scale, 3.0).unwrap();
+    assert!(locator.is_none() && a.is_none(), "{locator:?} {a:?}");
+    assert_eq!((b.1, l.1), (0.0, 13.0), "the bar at the band's top, the legend under it: {b:?} {l:?}");
 }
 
 /// With no room for any shape of the legend on either side of a centred map, the map moves towards
@@ -10902,6 +11020,41 @@ fn a_publication_layouts_raster_gets_a_colorbar() {
     s.run("layout.publication", &json!({"extent": [10, 45, 11, 46]})).unwrap();
     assert!(s.project.layouts.last().unwrap().elements.iter().all(|e| e.name != "Colorbar"));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Series page labels and dynamic text share the row-number fallback for null and blank names.
+#[test]
+fn map_series_empty_names_use_row_numbers() {
+    use crate::cmd::layout::{series_info, series_pages};
+    use rustgis_data::{Dataset, Field, FieldType, GeometryType, Value as V};
+    use rustgis_render::layout::{PageInfo, expand};
+
+    for (values, names) in [
+        ([V::Text("A".into()), V::Null, V::Text(String::new())], ["A", "2", "3"]),
+        ([V::Text(" A ".into()), V::Text(" \t\n\u{2003}".into()), V::Int(0)], [" A ", "2", "0"]),
+        ([V::Text("<Null>".into()), V::Bool(false), V::Null], ["<Null>", "False", "3"]),
+    ] {
+        let mut data = Dataset::new("Index", GeometryType::Point, vec![Field::new("name", FieldType::Text)]);
+        for value in values {
+            data.push(None, vec![value]);
+        }
+        let mut s = Session::new(Project::default());
+        s.map_mut().add_dataset(data);
+        s.run("layout.new", &json!({"name": "Atlas"})).unwrap();
+        s.run("layout.series", &json!({"layer": "Index", "nameField": "name"})).unwrap();
+        assert_eq!(series_pages(&s, 0).unwrap(), names);
+        for (page, name) in names.iter().enumerate() {
+            let info = series_info(&s, 0, page).unwrap();
+            assert_eq!(info, (3, name.to_string()), "the UI's current-page name agrees with the page list");
+            let result = s.run("layout.seriesPage", &json!({"page": page})).unwrap();
+            assert_eq!(result["name"], *name);
+            let info = PageInfo { page: page + 1, pages: info.0, page_name: info.1 };
+            assert_eq!(expand("{pageName}", &s.project.layouts[0], &info, None), *name);
+        }
+        // A removed name field uses the same fallback on every page.
+        s.project.layouts[0].series.as_mut().unwrap().name_field = "missing".into();
+        assert_eq!(series_pages(&s, 0).unwrap(), ["1", "2", "3"]);
+    }
 }
 
 #[test]
@@ -15506,6 +15659,19 @@ fn registry_downloads_are_checked() {
     crate::cmd::plugins::install_checked(&e, &bytes).unwrap();
     assert_eq!(crate::cmd::plugins::entry_status(&e)["installed"], "1.0.0");
     assert_eq!(crate::cmd::plugins::entry_status(&e)["runtime"], "wasm");
+    assert!(crate::cmd::plugins::entry_status(&e).get("unavailable").is_none());
+    // A newer release needing a newer RustGIS is listed, not installed or offered as the update
+    // (#1405); one this RustGIS meets is.
+    let needs = rustgis_plugins::registry::Entry { version: "2.0.0".into(), min_rustgis_version: "999.0.0".into(), ..e.clone() };
+    assert_eq!(needs.needs_rustgis(), Some("999.0.0"));
+    let err = crate::cmd::plugins::install_checked(&needs, &bytes).unwrap_err();
+    assert!(err.starts_with("Reg needs RustGIS 999.0.0 or newer (this is ") && err.ends_with("; it wasn't installed"), "{err}");
+    let status = crate::cmd::plugins::entry_status(&needs);
+    assert_eq!((&status["available"], &status["update"]), (&json!(false), &json!(false)));
+    assert!(status["unavailable"].as_str().is_some_and(|w| w.starts_with("Reg needs RustGIS 999.0.0")), "{status}");
+    let meets = rustgis_plugins::registry::Entry { min_rustgis_version: "0.1.0".into(), ..needs.clone() };
+    assert_eq!(meets.needs_rustgis(), None);
+    assert_eq!(crate::cmd::plugins::entry_status(&meets)["update"], json!(true));
     let _ = rustgis_plugins::store::uninstall("eng-reg");
 }
 #[test]
@@ -20157,6 +20323,68 @@ fn arcgis_features_read_past_the_record_limit() {
     );
 }
 
+/// A where clause is encoded as one query value, combined with the area and kept by every
+/// page. Omitting it retains the whole-layer query; a rejected clause fails without a layer.
+#[test]
+fn arcgis_service_add_where_filters_every_page_and_reports_rejection() {
+    use ogc_server::{Route, Server, arcgis_layer, arcgis_page};
+    let path = "/arcgis/rest/services/P/MapServer/28";
+    let rest = "&outFields=*&returnGeometry=true&outSR=4326&f=geojson";
+    let filtered = "DFIRM_ID%3D%2747157C%27%20AND%20NOTE%3D%27A%26B%27";
+    let area = "&geometry=-91,34,-89,36&geometryType=esriGeometryEnvelope&inSR=4326&spatialRel=esriSpatialRelIntersects";
+    let query = |clause: &str, offset| {
+        let area = if clause == filtered { area } else { "" };
+        let query =
+            if clause == "1%3D1" { format!("where={clause}{rest}") } else { format!("{}&where={clause}", rest.trim_start_matches('&')) };
+        format!("{path}/query?{query}{area}&resultOffset={offset}&resultRecordCount=2&orderByFields=OBJECTID")
+    };
+    let mut refused = Route::new(&query("bad_http", 0), "Invalid where clause");
+    refused.status = 400;
+    let server = Server::new(vec![
+        Route::new(path, &arcgis_layer(2, true)),
+        Route::new(&query("1%3D1", 0), &arcgis_page(&[0, 1], true)),
+        Route::new(&query("1%3D1", 2), &arcgis_page(&[2], false)),
+        Route::new(&query(filtered, 0), &arcgis_page(&[7, 8], true)),
+        Route::new(&query(filtered, 2), &arcgis_page(&[9], false)),
+        Route::new(&query("bad", 0), r#"{"error":{"code":400,"message":"Invalid where clause"}}"#),
+        refused,
+    ]);
+    let service = r#"{"currentVersion":11,"layers":[{"id":28,"name":"Flood"}]}"#;
+    let url = format!("{}/arcgis/rest/services/P/MapServer", server.base);
+    for clause in [None, Some("DFIRM_ID='47157C' AND NOTE='A&B'"), Some("bad"), Some("bad_http")] {
+        let mut session = Session::new(Project::default());
+        let mut params = json!({"url":url,"layer":"28","text":service});
+        if let Some(clause) = clause {
+            params["where"] = json!(clause);
+            if clause.starts_with("DFIRM_ID") {
+                params["bbox"] = json!([-91, 34, -89, 36]);
+            }
+        }
+        let result = session.run("service.add", &params);
+        if clause.is_some_and(|clause| clause.starts_with("bad")) {
+            let error = result.unwrap_err();
+            assert!(error.contains("where clause") && error.contains("rejected"), "{error}");
+            assert!(session.map().layers.is_empty());
+        } else {
+            assert_eq!(result.unwrap()["features"], 3);
+            let ids = session.map().layers[0].dataset.features.iter().map(|f| f.attrs[0].as_f64()).collect::<Vec<_>>();
+            let first = if clause.is_some() { 7.0 } else { 0.0 };
+            assert_eq!(ids, [Some(first), Some(first + 1.0), Some(first + 2.0)]);
+            if clause.is_some() {
+                let source = session.map().layers[0].dataset.source.as_deref().unwrap();
+                assert!(source.contains(&format!("where={filtered}")) && source.contains("geometry=-91,34,-89,36"), "{source}");
+            }
+        }
+    }
+    let clauses = server
+        .requests()
+        .into_iter()
+        .filter(|r| r.path.ends_with("/query"))
+        .map(|r| r.query.iter().filter(|(k, _)| k == "where").map(|(_, v)| v.clone()).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    assert_eq!(clauses, [vec!["1%3D1"], vec!["1%3D1"], vec![filtered], vec![filtered], vec!["bad"], vec!["bad_http"]]);
+}
+
 /// An ArcGIS layer whose description lists protocol buffers is read through service.add in `f=pbf`
 /// pages into one layer, known by its address; one whose first such page can't be read is read in
 /// GeoJSON pages instead (#1326).
@@ -23444,12 +23672,20 @@ fn geocoding_places_and_addresses() {
     assert_eq!((r["matched"].as_u64(), r["unmatched"].as_u64()), (Some(3), Some(1)), "{r}");
     let l = s.map().layer_by_name("sites (geocoded)").unwrap();
     assert_eq!(l.dataset.features.len(), 4);
-    assert_eq!(l.dataset.fields.last().unwrap().name, "geocoded");
+    assert_eq!(l.dataset.fields[l.dataset.fields.len() - 2].name, "geocoded");
+    let status = l.dataset.field_index("match_status").unwrap();
+    assert_eq!((0..4).map(|r| l.dataset.value(r, status).to_string()).collect::<Vec<_>>(), ["matched", "matched", "matched", "unmatched"]);
     assert!(l.dataset.features[3].geometry.is_none());
     // The app's own answers: one address found, the other not.
     let places = json!({"Champ de Mars, Paris": {"lon": 2.29, "lat": 48.85, "name": "Champ de Mars"}, "5 Av. Anatole, Paris": null});
     let r = s.run("layer.geocode", &json!({"layer": "sites", "address": "street, city", "places": places, "name": "G"})).unwrap();
     assert_eq!((r["matched"].as_u64(), r["unmatched"].as_u64()), (Some(2), Some(2)));
+    let l = s.map().layer_by_name("G").unwrap();
+    let status = l.dataset.field_index("match_status").unwrap();
+    assert_eq!(
+        (0..4).map(|r| l.dataset.value(r, status).to_string()).collect::<Vec<_>>(),
+        ["matched", "matched", "unmatched", "unmatched"]
+    );
     for bad in
         [json!({"layer": "sites"}), json!({"layer": "sites", "address": "nope"}), json!({"layer": "sites", "address": "id", "places": 7})]
     {
@@ -23463,6 +23699,53 @@ fn geocoding_places_and_addresses() {
     // A public server takes a hundred addresses a run.
     let g = Geocoder::new(None, None).unwrap();
     assert!(crate::cmd::geocode::check_batch(&g, 101).unwrap_err().contains("100"));
+}
+
+/// Status is per source row, including duplicate, empty and unfound addresses; colliding input
+/// columns keep their names and values, and the unmatched notice still counts rows, not queries.
+#[test]
+fn geocoding_match_status_preserves_fields_and_unmatched_notice() {
+    let mut s = Session::new(Project::default());
+    let csv = "id,address,geocoded,MATCH_STATUS,match_status_\n1,A,old one,reviewed,kept\n2,A,old two,reviewed,kept\n3,B,old three,reviewed,kept\n4,,old four,reviewed,kept\n";
+    s.run("layer.addDataText", &json!({"fileName":"addresses.csv", "text":csv})).unwrap();
+    for (name, b, statuses, unmatched) in [
+        ("mixed", Value::Null, ["matched", "matched", "unmatched", "unmatched"], 2),
+        ("clean", json!({"lon":-77.1,"lat":38.1,"name":"B"}), ["matched", "matched", "matched", "unmatched"], 1),
+    ] {
+        let mark = s.notice_mark();
+        let result = s
+            .run(
+                "layer.geocode",
+                &json!({"table":"addresses", "address":"address", "name":name,
+            "places":{"A":{"lon":-77.0,"lat":38.0,"name":""}, "B":b}}),
+            )
+            .unwrap();
+        assert_eq!(result["unmatched"], unmatched);
+        let ds = &s.map().layer_by_name(name).unwrap().dataset;
+        let names: Vec<_> = ds.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["id", "address", "geocoded", "MATCH_STATUS", "match_status_", "geocoded_", "match_status__"]);
+        assert_eq!(ds.features.len(), 4);
+        for (r, status) in statuses.iter().enumerate() {
+            assert_eq!(ds.value(r, 6).to_string(), *status);
+            assert_eq!(ds.features[r].geometry.is_some(), *status == "matched");
+            for c in 0..5 {
+                assert_eq!(ds.value(r, c), s.project.tables[0].dataset.value(r, c));
+            }
+        }
+        // A usable point counts as a match even if the provider gave no display name.
+        assert_eq!(ds.value(0, 5), &rustgis_data::Value::Text(String::new()));
+        let notices = s.notices_since(mark);
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].text, format!("{unmatched} of 4 rows weren't found; they are in the table without a point"));
+    }
+    let mark = s.notice_mark();
+    s.run(
+        "layer.geocode",
+        &json!({"table":"addresses", "address":"id", "name":"all matched",
+        "places":{"1":{"lon":1,"lat":1}, "2":{"lon":2,"lat":2}, "3":{"lon":3,"lat":3}, "4":{"lon":4,"lat":4}}}),
+    )
+    .unwrap();
+    assert!(s.notices_since(mark).is_empty());
 }
 
 /// Applying supplied answers does not require a network-capable Census endpoint, including
@@ -23590,7 +23873,7 @@ fn geocoding_with_the_locatieserver() {
     assert_eq!(points[0], Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(4.89803846, 52.37714446))));
     assert_eq!(points[1], Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(4.47920127, 51.92272076))));
     assert_eq!(points[2], None);
-    let geocoded = l.dataset.fields.len() - 1;
+    let geocoded = l.dataset.field_index("geocoded").unwrap();
     assert_eq!(l.dataset.value(1, geocoded).to_string(), "Coolsingel 40, 3011AD Rotterdam");
     assert_eq!(left_out(&s).len(), 1, "one notice for the run: {:?}", left_out(&s));
     assert!(left_out(&s)[0].starts_with("1 of the geocoder's places"), "{:?}", left_out(&s));
@@ -47381,7 +47664,9 @@ fn the_footer_lines_up_with_a_legend_at_the_right() {
 
 /// `layout.publication` itself lines the footer's right column up with a legend placed at the
 /// right (#1379): with `"arrangement": "legendRight"` and a legend wide enough to start between
-/// 45 % and 70 % of the frame's width, the Reference Box starts where the Legend Box does.
+/// 45 % and 70 % of the frame's width, the Reference Box starts where the Legend Box does. The
+/// sample's lakes stay listed (`"contextInLegend": true`): the legend's widths these names give
+/// are measured with them.
 #[test]
 fn a_publication_footer_lines_up_with_its_legend() {
     let piaui = json!([-46.8, -11.6, -38.5, -2.2]);
@@ -47397,7 +47682,7 @@ fn a_publication_footer_lines_up_with_its_legend() {
         s.run("layer.rename", &json!({"layer": "Countries", "name": name})).unwrap();
         s.run(
             "layout.publication",
-            &json!({"profile": "a4-portrait", "extent": piaui, "arrangement": "legendRight", "author": "", "sources": "Natural Earth"}),
+            &json!({"profile": "a4-portrait", "extent": piaui, "arrangement": "legendRight", "author": "", "sources": "Natural Earth", "contextInLegend": true}),
         )
         .unwrap();
         let l = s.project.layouts.last().unwrap();
@@ -49049,4 +49334,89 @@ fn convert_field_workers_refuse_stale_rows() {
         let after = ds(&s);
         assert_eq!(after.value(0, after.field_index("day").unwrap()).to_string(), "04/06/2026");
     }
+}
+
+/// The template's element list is additive; scripts can use its IDs without reading a project.
+#[test]
+fn layout_creation_and_info_return_element_addresses() {
+    isolate_plugins();
+    let mut s = Session::new(Project::default());
+    let made = s.run("layout.new", &json!({"name": "Addressable"})).unwrap();
+    assert_eq!(made["layout"], 0);
+    assert_eq!(made["name"], "Addressable");
+    let elements = made["elements"].as_array().unwrap();
+    assert_eq!(elements.len(), 6);
+    let title = elements.iter().find(|e| e["name"] == "Title").unwrap();
+    assert_eq!(title["kind"], "text");
+    s.run("layout.update", &json!({"element": title["element"], "text": "Addressed"})).unwrap();
+    let info = s.run("info.project", &Value::Null).unwrap();
+    assert_eq!(info["layouts"][0]["elements"], made["elements"]);
+    assert_eq!(info["layouts"][0]["mapFrames"][0]["id"], 1);
+    let blank = s.run("layout.new", &json!({"template": "blank"})).unwrap();
+    assert_eq!(blank["elements"], json!([]));
+}
+
+/// All export formats deliver a counted notice through the real Session command path; a long
+/// line inside the page is kept even outside its box, and clean exports produce no such notice.
+#[test]
+fn layout_exports_report_cut_text_and_clean_exports_do_not() {
+    isolate_plugins();
+    let dir = std::env::temp_dir().join(format!("rustgis-layout-clipping-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut s = Session::new(Project::default());
+    s.run("layout.new", &json!({"template": "blank", "width": 120, "height": 90})).unwrap();
+    let a = s.run("layout.addElement", &json!({"kind":"text", "text":"Long title on the page", "x":110, "y":10, "w":5, "h":12})).unwrap()["element"].clone();
+    let b = s
+        .run("layout.addElement", &json!({"kind":"text", "text":"one\ntwo\nthree\nfour\nfive", "x":10, "y":30, "w":60, "h":2}))
+        .unwrap()["element"]
+        .clone();
+    s.run("layout.update", &json!({"element":a, "name":"Heading"})).unwrap();
+    s.run("layout.update", &json!({"element":b, "name":"Sources"})).unwrap();
+    for clean in [false, true] {
+        if clean {
+            s.run("layout.update", &json!({"element":a, "x":10})).unwrap();
+            s.run("layout.update", &json!({"element":b, "h":50})).unwrap();
+        }
+        for ext in ["png", "pdf", "svg"] {
+            s.notices.clear();
+            s.run("layout.export", &json!({"path":dir.join(format!("page.{ext}")), "dpi":48})).unwrap();
+            let notes: Vec<_> = s.notices.iter().filter(|n| n.text.contains("Text is cut off")).collect();
+            if clean {
+                assert!(notes.is_empty(), "{ext}: {notes:?}");
+            } else {
+                assert_eq!(notes.len(), 1, "{ext}: {notes:?}");
+                let note = &notes[0].text;
+                assert!(note.contains("2 layout element(s)") && note.contains("Heading (1)") && note.contains("Sources (2)"), "{note}");
+            }
+        }
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// The optional legend flag survives serialization and undo, while old layouts omit it and
+/// retain their appearance. Creation and updates use the same command parameter.
+#[test]
+fn layout_no_data_legend_is_optional_and_saved() {
+    isolate_plugins();
+    use rustgis_map::layout::ElementKind;
+    let mut s = Session::new(Project::default());
+    s.run("layout.new", &Value::Null).unwrap();
+    let old = serde_json::to_value(&s.project.layouts[0]).unwrap();
+    assert!(old["elements"][2]["kind"]["Legend"].get("show_no_data").is_none());
+    assert!(s.run("layout.addElement", &json!({"kind":"text", "showNoData":true})).unwrap_err().contains("only legends"));
+    assert!(s.run("layout.update", &json!({"element":2, "showNoData":true})).unwrap_err().contains("only legends"));
+    s.run("layout.update", &json!({"element":3, "showNoData":true})).unwrap();
+    assert!(matches!(s.project.layouts[0].element(3).unwrap().kind, ElementKind::Legend { show_no_data: true, .. }));
+    let saved = serde_json::to_string(&s.project.layouts[0]).unwrap();
+    let loaded: rustgis_map::layout::Layout = serde_json::from_str(&saved).unwrap();
+    assert!(matches!(loaded.element(3).unwrap().kind, ElementKind::Legend { show_no_data: true, .. }));
+    s.run("edit.undo", &Value::Null).unwrap();
+    assert_eq!(serde_json::to_value(&s.project.layouts[0]).unwrap(), old);
+    let made = s.run("layout.addElement", &json!({"kind":"legend", "showNoData":true})).unwrap();
+    assert!(matches!(
+        s.project.layouts[0].element(made["element"].as_u64().unwrap() as u32).unwrap().kind,
+        ElementKind::Legend { show_no_data: true, .. }
+    ));
+    let old: rustgis_map::layout::Layout = serde_json::from_value(old).unwrap();
+    assert!(matches!(old.element(3).unwrap().kind, ElementKind::Legend { show_no_data: false, .. }));
 }

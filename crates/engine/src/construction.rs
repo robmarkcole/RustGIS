@@ -127,6 +127,12 @@ pub(crate) fn forget_feature(s: &mut Session, layer: u32, feature: u64) {
 }
 
 impl Session {
+    /// Counted losses for a layer output, including browser downloads. Call before encoding
+    /// and present the notes only after the output has been accepted or written.
+    pub fn layer_construction_output_notes(&self, layer: u32) -> Result<Vec<String>, String> {
+        let l = self.map().layer(layer).ok_or("no such layer")?;
+        self.constructions.export_notes(self.map().instance_id(), l)
+    }
     /// Counted runtime-construction losses for a whole-project output. Embedders saving the
     /// public `Project` directly should present these notes too: `Project` owns no session cache.
     /// Explicit save/download paths call this inside their existing durable output transaction;

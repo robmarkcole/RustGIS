@@ -193,8 +193,8 @@ GeoTIFFs. This does not bind a layer to an image or save image metadata.
 Construction is kept only in the current session. An independent vertex edit disables the
 box handles rather than silently fitting a new box; undo restores them. Saving/reopening or
 sharing GeoJSON leaves **ordinary polygons** and ordinary feature properties. In-session edits
-preserve feature identity; import uses the normal GeoJSON reader. There is no automatic
-recognition of imported polygons. Use **Edit Vertices** to edit those polygons.
+preserve feature identity; import uses the normal GeoJSON reader. Copy/paste transfers ordinary polygon geometry and attributes, not construction parameters;
+the original keeps its constrained handles. There is no automatic recognition of imported polygons. Use **Edit Vertices** to edit those polygons.
 **Export Features** (`share.exportLayer`) includes one counted note explaining that box
 construction does not round-trip. Explicit project saves/downloads, map/layer files, project
 and map packages, data conversions and feature-bearing web shares report the same loss.
@@ -258,7 +258,8 @@ losses. Explicit project saves/downloads, map/layer files, project and map packa
 conversions and feature-bearing web shares report this loss too. Reopening a project or
 importing GeoJSON leaves polygons; use **Edit Vertices** for those. There is no automatic
 circle detection, image binding or custom metadata. Independent geometry edits disable the
-circle handles; undo restores them when the original geometry returns.
+circle handles; undo restores them when the original geometry returns. Copy/paste produces
+ordinary polygons in the target; the original retains its circle construction.
 
 ```text
 edit.addCircle={"layer":"Training polygons","circle":{"center":[1000,1000],"radius":100,"tolerance":0.25},"attributes":{"class":"tree"}}
