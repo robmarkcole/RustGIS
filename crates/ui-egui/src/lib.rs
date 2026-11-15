@@ -90,6 +90,7 @@ pub enum Landed {
     NotRun(String),
 }
 mod boxedit;
+mod circleedit;
 #[cfg(not(target_arch = "wasm32"))]
 mod relayshot;
 #[cfg(not(target_arch = "wasm32"))]
@@ -1158,6 +1159,7 @@ impl RustGisApp {
 pub struct RustGisApp {
     pub session: Session,
     pub(crate) boxes: boxedit::State,
+    pub(crate) circles: circleedit::State,
     pub ui: UiState,
     pub map: mapview::MapView,
     pub dialogs: dialogs::Dialogs,
@@ -1459,6 +1461,7 @@ impl RustGisApp {
         RustGisApp {
             session: s,
             boxes: boxedit::State::default(),
+            circles: circleedit::State::default(),
             ui,
             map: mapview::MapView::default(),
             dialogs: dialogs::Dialogs::default(),
@@ -2762,6 +2765,7 @@ impl RustGisApp {
         // vertex or held gesture to the replacement feature at the same row.
         crate::vertexedit::cancel_stale_drag(self);
         crate::boxedit::cancel_stale(self);
+        crate::circleedit::cancel_stale(self);
         if let Err(e) = &r {
             self.command_failed(id, e, notice_mark);
         }

@@ -1,0 +1,561 @@
+//! Constrained circles on ordinary polygon layers. Parameters live only in the session cache.
+//! Each geometry is rebuilt from the frozen grid, centre and radius; no accumulated vertex edits.
+use crate::box_edit::Frame;
+use crate::construction::{Cache, Construction, Record};
+use crate::{CmdResult, Session};
+use rustgis_data::Geometry;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+fn default_tolerance() -> f64 {
+    0.25
+}
+/// A circle in planar grid units (image pixels or default Web Mercator grid metres).
+/// `tolerance` bounds the sagitta before projection. The transformed straight-edge polygon
+/// cannot promise this bound in other coordinate systems. Sampling is bounded to 32..=2048 edges.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CircleSpec {
+    #[serde(default)]
+    pub frame: Frame,
+    pub center: [f64; 2],
+    pub radius: f64,
+    #[serde(default = "default_tolerance")]
+    pub tolerance: f64,
+}
+impl CircleSpec {
+    pub fn point(&self, angle: f64) -> [f64; 2] {
+        [self.center[0] + self.radius * angle.cos(), self.center[1] + self.radius * angle.sin()]
+    }
+    /// Bounded tessellation; refuse accuracy that cannot be met, rather than silently cap it.
+    pub fn segments(&self) -> Result<usize, String> {
+        if !self.center.iter().chain([&self.radius, &self.tolerance]).all(|v| v.is_finite() && v.abs() <= 1e12)
+            || self.radius < 1e-6
+            || self.tolerance <= 0.
+        {
+            return Err("a circle needs finite coordinates, a positive radius and positive tolerance".into());
+        }
+        // 2*sin²(theta/2) avoids cancellation for small tolerance/radius ratios.
+        for n in [32_usize, 64, 128, 256, 512, 1024, 2048] {
+            let error = 2. * self.radius * (std::f64::consts::PI / (2. * n as f64)).sin().powi(2);
+            if error <= self.tolerance {
+                return Ok(n);
+            }
+        }
+        Err("circle tolerance requires more than 2048 edges; increase tolerance or reduce radius".into())
+    }
+    pub fn geometry(&self) -> Result<Geometry, String> {
+        let n = self.segments()?;
+        let mut ring = Vec::with_capacity(n + 1);
+        for i in 0..n {
+            let c = self
+                .frame
+                .to_lonlat(self.point(i as f64 * std::f64::consts::TAU / n as f64))
+                .filter(|c| c.is_finite() && c.x.abs() <= 180. && c.y.abs() < 85.05)
+                .ok_or("circle crosses an unsupported projection boundary or the polar editing limit")?;
+            ring.push(c);
+        }
+        let span = ring.iter().map(|p| p.x).fold(f64::NEG_INFINITY, f64::max) - ring.iter().map(|p| p.x).fold(f64::INFINITY, f64::min);
+        if span > 180. {
+            return Err("circles crossing the antimeridian are not supported".into());
+        }
+        let mut area = 0.;
+        let origin = ring.first().copied().ok_or("missing circle vertex")?;
+        for (a, b) in ring.iter().zip(ring.iter().cycle().skip(1)) {
+            if a == b {
+                return Err("circle collapses after transformation; use a larger circle".into());
+            }
+            area += (a.x - origin.x) * (b.y - origin.y) - (b.x - origin.x) * (a.y - origin.y);
+        }
+        if !area.is_finite() || area == 0. {
+            return Err("circle collapses after transformation".into());
+        }
+        if area < 0. {
+            ring.reverse();
+        }
+        let first = ring.first().copied().ok_or("missing circle vertex")?;
+        ring.push(first);
+        Ok(Geometry::Polygon(vec![vec![ring]]))
+    }
+}
+impl Session {
+    /// Imported or independently edited polygons never acquire circle constraints automatically.
+    pub fn circle_spec(&self, layer: u32, row: usize) -> Option<CircleSpec> {
+        let g = self.map().layer(layer)?.dataset.features.get(row)?.geometry.as_ref()?;
+        self.constructions.get(Cache::key(self, layer, row)?, g)?.spec.circle_spec().cloned()
+    }
+}
+// Shared feature intake also supports standalone tables; a circle always targets a layer.
+fn reject_table(p: &Value) -> Result<(), String> {
+    if p.get("table").is_some_and(|t| !t.is_null()) {
+        return Err("circles require a polygon layer; the 'table' parameter is unsupported".into());
+    }
+    Ok(())
+}
+pub(crate) fn new_circle_inputs(input: &crate::cmd::InputContext<'_>, p: &Value) -> Result<crate::cmd::Inputs, String> {
+    reject_table(p)?;
+    crate::cmd::design::new_feature_inputs(input, p)
+}
+pub fn check_tool(s: &Session, id: u32) -> Result<(), String> {
+    crate::box_edit::check_tool(s, id).map_err(|e| e.replace("Rotated Box", "Circle").replace("rotated box", "circle"))
+}
+fn check_layer(s: &Session, id: u32) -> Result<(), String> {
+    crate::box_edit::check_layer(s, id).map_err(|e| e.replace("rotated box", "circle"))
+}
+fn parsed(p: &Value, previous_frame: Option<&Frame>) -> Result<CircleSpec, String> {
+    let value = p.get("circle").ok_or("circle is required")?;
+    let mut b: CircleSpec = CircleSpec::deserialize(value).map_err(|e| e.to_string())?;
+    if value.get("frame").is_none()
+        && let Some(frame) = previous_frame
+    {
+        b.frame = frame.clone();
+    }
+    b.geometry()?;
+    Ok(b)
+}
+fn row(p: &Value) -> Result<usize, String> {
+    p.get("row").and_then(Value::as_u64).and_then(|r| usize::try_from(r).ok()).ok_or_else(|| "row is required".into())
+}
+/// Synchronous: a single feature, with sampling capped at 2048 edges.
+pub(crate) fn add(s: &mut Session, p: &Value) -> CmdResult {
+    reject_table(p)?;
+    let id = s.layer_id(p)?;
+    check_layer(s, id)?;
+    s.constructions.room()?;
+    let b = parsed(p, None)?;
+    if let Some(attributes) = p.get("attributes") {
+        let attributes = attributes.as_object().ok_or("attributes must be an object")?;
+        let layer = s.map().layer(id).ok_or("no layer")?;
+        for field in attributes.keys() {
+            if !layer.dataset.fields.iter().any(|f| f.name == *field) {
+                return Err(format!("no attribute field '{field}'; add it to the layer first"));
+            }
+        }
+    }
+    let g = b.geometry()?;
+    let result = crate::cmd::edit::add_geometry(s, id, p, g)?;
+    let row = result.get("row").and_then(Value::as_u64).and_then(|r| usize::try_from(r).ok()).ok_or("circle was not added")?;
+    remember(s, id, row, b.clone())?;
+    Ok(
+        json!({"row":row,"circle":b,"polygonEdges":b.segments()?,"approximation":"straight edges; tolerance is in construction-grid units before projection"}),
+    )
+}
+fn remember(s: &mut Session, id: u32, row: usize, spec: CircleSpec) -> Result<(), String> {
+    let key = Cache::key(s, id, row).ok_or("circle source changed")?;
+    if key.3 == u64::MAX {
+        return Err("feature IDs have reached their limit; create a fresh layer for circles".into());
+    }
+    let g =
+        s.map().layer(id).and_then(|l| l.dataset.features.get(row)).and_then(|f| f.geometry.clone()).ok_or("circle geometry is missing")?;
+    if g != spec.geometry()? {
+        return Err("an edit rule changed the circle geometry".into());
+    }
+    s.constructions.remember(key, Record { spec: Construction::Circle(spec), geometry: g })
+}
+/// Synchronous: a single feature, with sampling capped at 2048 edges.
+pub(crate) fn update(s: &mut Session, p: &Value) -> CmdResult {
+    let id = s.layer_id(p)?;
+    check_layer(s, id)?;
+    if p.get("attributes").is_some() {
+        return Err("edit.updateCircle changes the shape only; set attributes with edit.setValue".into());
+    }
+    let row = row(p)?;
+    let key = Cache::key(s, id, row).ok_or("no such feature")?;
+    let g =
+        s.map().layer(id).and_then(|l| l.dataset.features.get(row)).and_then(|f| f.geometry.as_ref()).ok_or("missing circle geometry")?;
+    let before = s
+        .constructions
+        .get(key, g)
+        .and_then(|r| r.spec.circle_spec().cloned())
+        .ok_or("this feature has no unchanged circle construction; use Edit Vertices")?;
+    if p.get("featureId").is_some_and(|v| v.as_u64() != Some(key.3)) {
+        return Err("the feature changed during this edit".into());
+    }
+    let b = parsed(p, Some(&before.frame))?;
+    if b.frame != before.frame {
+        return Err("a circle's construction grid is frozen; start another circle to change grids".into());
+    }
+    crate::cmd::design::replace_geometry(s, id, row, b.geometry()?)?;
+    remember(s, id, row, b.clone())?;
+    Ok(
+        json!({"row":row,"circle":b,"polygonEdges":b.segments()?,"approximation":"straight edges; tolerance is in construction-grid units before projection"}),
+    )
+}
+pub(crate) fn delete_circle(s: &mut Session, p: &Value) -> CmdResult {
+    let id = s.layer_id(p)?;
+    check_layer(s, id)?;
+    let row = row(p)?;
+    let key = Cache::key(s, id, row).ok_or("no such feature")?;
+    if s.circle_spec(id, row).is_none() {
+        return Err("this feature has no unchanged circle construction".into());
+    }
+    if p.get("featureId").is_some_and(|v| v.as_u64() != Some(key.3)) {
+        return Err("the feature changed during this edit".into());
+    }
+    let layer = s.map_mut().layer_mut(id).ok_or("no layer")?;
+    let before = layer.dataset.features.remove(row);
+    layer.selection = layer.selection.iter().copied().filter(|r| *r != row).map(|r| if r > row { r - 1 } else { r }).collect();
+    layer.touch_geometry();
+    crate::cmd::design::apply(s, id, vec![crate::cmd::design::Change { before: Some(before), row: None }])?;
+    Ok(json!({"deleted":1,"featureId":key.3}))
+}
+pub(crate) fn info(s: &mut Session, p: &Value) -> CmdResult {
+    let id = s.layer_id(p)?;
+    let row = row(p)?;
+    let b = s.circle_spec(id, row).ok_or("this feature has no unchanged circle construction")?;
+    Ok(
+        json!({"row":row,"circle":b,"polygonEdges":b.segments()?,"approximation":"straight edges; tolerance is in construction-grid units before projection"}),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::box_edit::Frame;
+    use rustgis_data::raster::{Crs, ImageGrid};
+    use rustgis_data::{Dataset, Field, FieldType, GeometryType};
+    use rustgis_geom::Coord;
+    fn session() -> (Session, u32) {
+        let mut s = Session::new(crate::Project::default());
+        let id = s.map_mut().add_dataset(Dataset::new(
+            "Boxes",
+            GeometryType::Polygon,
+            vec![Field::new("class", FieldType::Text), Field::new("_rustgis_box", FieldType::Text)],
+        ));
+        s.active_layer = Some(id);
+        s.run("edit.enable", &json!({"on":true})).unwrap();
+        (s, id)
+    }
+    fn spec() -> CircleSpec {
+        CircleSpec { frame: Frame::default(), center: [1000., 1000.], radius: 100., tolerance: 0.25 }
+    }
+    fn add(s: &mut Session, b: &CircleSpec) -> usize {
+        s.run("edit.addCircle", &json!({"circle":b,"attributes":{"class":"vehicle","_rustgis_box":"user-owned"}})).unwrap()["row"]
+            .as_u64()
+            .unwrap() as usize
+    }
+    #[test]
+    fn circle_edit_preserves_attributes_identity_and_construction_through_history() {
+        let (mut s, id) = session();
+        let b = spec();
+        let row = add(&mut s, &b);
+        let original = s.map().layer(id).unwrap().dataset.features[row].clone();
+        let fields = s.map().layer(id).unwrap().dataset.fields.clone();
+        let mut next = b.clone();
+        next.radius = 112.;
+        next.tolerance = 0.1;
+        s.run("edit.updateCircle", &json!({"row":row,"featureId":original.id,"circle":next})).unwrap();
+        let after = &s.map().layer(id).unwrap().dataset.features[row];
+        assert_eq!(after.id, original.id);
+        assert_eq!(after.attrs, original.attrs);
+        assert_eq!(s.map().layer(id).unwrap().dataset.fields, fields);
+        assert_eq!(s.circle_spec(id, row), Some(next.clone()));
+        s.run("edit.undo", &json!({})).unwrap();
+        assert_eq!(s.circle_spec(id, row), Some(b.clone()));
+        assert_eq!(s.map().layer(id).unwrap().dataset.features[row].geometry, original.geometry);
+        s.run("edit.redo", &json!({})).unwrap();
+        assert_eq!(s.circle_spec(id, row), Some(next));
+        s.run("edit.delete", &json!({})).unwrap();
+        assert!(s.circle_spec(id, row).is_none());
+        s.run("edit.undo", &json!({})).unwrap();
+        assert!(s.circle_spec(id, row).is_some());
+    }
+    #[test]
+    fn circle_edit_foreign_geometry_changes_disable_handles_and_undo_restores_them() {
+        let (mut s, id) = session();
+        let b = spec();
+        let row = add(&mut s, &b);
+        let changed = Geometry::Polygon(vec![vec![vec![Coord::new(0., 0.), Coord::new(1., 0.), Coord::new(0., 1.), Coord::new(0., 0.)]]]);
+        s.run("edit.setGeometry", &json!({"row":row,"geometry":rustgis_data::io::geometry_to_geojson(&changed)})).unwrap();
+        assert!(s.circle_spec(id, row).is_none());
+        assert!(s.run("edit.updateCircle", &json!({"row":row,"circle":b})).is_err());
+        s.run("edit.undo", &json!({})).unwrap();
+        assert_eq!(s.circle_spec(id, row), Some(b));
+    }
+    #[test]
+    fn circle_edit_delete_targets_one_object_and_row_id_reuse_never_adopts_a_polygon() {
+        let (mut s, id) = session();
+        let b = spec();
+        let first = add(&mut s, &b);
+        let second = add(&mut s, &b);
+        s.map_mut().layer_mut(id).unwrap().selection = vec![first, second];
+        let depth = s.undo_depth();
+        s.run("edit.deleteCircle", &json!({"row":first})).unwrap();
+        assert_eq!(s.map().layer(id).unwrap().dataset.features.len(), 1);
+        assert!(s.circle_spec(id, 0).is_some());
+        assert_eq!(s.undo_depth(), depth + 1);
+        s.run("edit.undo", &json!({})).unwrap();
+        assert_eq!(s.map().layer(id).unwrap().dataset.features.len(), 2);
+        assert!(s.circle_spec(id, first).is_some() && s.circle_spec(id, second).is_some());
+        s.run("edit.delete", &json!({})).unwrap();
+        s.run("edit.addFeature", &json!({"geometry":rustgis_data::io::geometry_to_geojson(&b.geometry().unwrap())})).unwrap();
+        assert!(s.circle_spec(id, 0).is_none());
+    }
+
+    #[test]
+    fn circle_edit_cut_paste_reused_ids_stay_ordinary_and_history_restores_only_originals() {
+        let (mut s, id) = session();
+        let b = spec();
+        let kept = add(&mut s, &b);
+        let cut = add(&mut s, &b);
+        let original = s.map().layer(id).unwrap().dataset.features[cut].clone();
+        s.run("edit.cut", &json!({})).unwrap();
+        assert_eq!(s.circle_spec(id, kept), Some(b.clone()));
+        s.run("edit.paste", &json!({"layer":id})).unwrap();
+        assert_eq!(s.map().layer(id).unwrap().dataset.features[cut], original);
+        assert!(s.circle_spec(id, cut).is_none());
+        assert_eq!(s.circle_spec(id, kept), Some(b.clone()));
+        s.run("edit.undo", &json!({})).unwrap();
+        assert_eq!(s.map().layer(id).unwrap().dataset.features.len(), 1);
+        s.run("edit.undo", &json!({})).unwrap();
+        assert_eq!(s.circle_spec(id, cut), Some(b.clone()));
+        s.run("edit.redo", &json!({})).unwrap();
+        s.run("edit.redo", &json!({})).unwrap();
+        assert!(s.circle_spec(id, cut).is_none());
+        assert_eq!(s.circle_spec(id, kept), Some(b));
+    }
+
+    #[test]
+    fn circle_edit_update_inherits_omitted_image_grid_before_geometry_validation() {
+        let (mut s, id) = session();
+        let grid = ImageGrid::new(400, 300, Crs::from_epsg(32633).unwrap(), [500_000., 0.8, 0.2, 1000., 0.1, -0.8]).unwrap();
+        let b = CircleSpec { frame: Frame::from_grid(&grid).unwrap(), center: [200., 150.], radius: 30., tolerance: 0.25 };
+        let row = add(&mut s, &b);
+        let mut next = b.clone();
+        next.radius = 80.;
+        next.tolerance = 0.1;
+        let mut value = serde_json::to_value(&next).unwrap();
+        value.as_object_mut().unwrap().remove("frame");
+        s.run("edit.updateCircle", &json!({"row":row,"circle":value})).unwrap();
+        assert_eq!(s.circle_spec(id, row), Some(next.clone()));
+        assert_eq!(s.map().layer(id).unwrap().dataset.features[row].geometry, Some(next.geometry().unwrap()));
+        let depth = s.undo_depth();
+        for bad in [json!(Frame::default()), Value::Null, json!({"epsg":0})] {
+            value["frame"] = bad;
+            assert!(s.run("edit.updateCircle", &json!({"row":row,"circle":value})).is_err());
+            assert_eq!(s.circle_spec(id, row), Some(next.clone()));
+            assert_eq!(s.undo_depth(), depth);
+        }
+        s.run("edit.undo", &json!({})).unwrap();
+        assert_eq!(s.circle_spec(id, row), Some(b));
+    }
+
+    #[test]
+    fn circle_edit_interactive_activation_requires_a_flat_view_but_geometry_does_not() {
+        let (mut s, id) = session();
+        let flat = s.map().projection.clone();
+        let b = spec();
+        for (projection, pitch) in [(rustgis_map::Projection::Globe, 0.), (flat.clone(), 30.)] {
+            s.map_mut().projection = projection;
+            s.map_mut().camera.pitch = pitch;
+            let error = s.run("tool.set", &json!({"tool":"circle"})).unwrap_err();
+            assert!(error.contains("zero pitch"));
+            assert_eq!(s.tool, crate::Tool::Explore);
+            let row = add(&mut s, &b);
+            assert_eq!(s.map().layer(id).unwrap().dataset.features[row].geometry, Some(b.geometry().unwrap()));
+            let mut changed = b.clone();
+            changed.radius = 70.;
+            s.run("edit.updateCircle", &json!({"row":row,"circle":changed})).unwrap();
+            assert_eq!(s.circle_spec(id, row), Some(changed));
+            s.run("edit.deleteCircle", &json!({"row":row})).unwrap();
+            assert!(s.map().layer(id).unwrap().dataset.features.is_empty());
+        }
+        s.map_mut().projection = flat;
+        s.map_mut().camera.pitch = 0.;
+        s.run("tool.set", &json!({"tool":"circle"})).unwrap();
+        assert_eq!(s.tool, crate::Tool::Circle);
+    }
+
+    #[test]
+    fn circle_edit_update_refuses_attributes_without_mutation_and_points_to_set_value() {
+        let (mut s, id) = session();
+        let b = spec();
+        let row = add(&mut s, &b);
+        let before = s.map().layer(id).unwrap().dataset.features[row].clone();
+        let depth = s.undo_depth();
+        let mut changed = b.clone();
+        changed.radius = 70.;
+        for attributes in [json!({"class":"other"}), json!({}), Value::Null] {
+            let error = s.run("edit.updateCircle", &json!({"row":row,"circle":changed,"attributes":attributes})).unwrap_err();
+            assert!(error.contains("edit.setValue"));
+            assert_eq!(s.map().layer(id).unwrap().dataset.features[row], before);
+            assert_eq!(s.circle_spec(id, row), Some(b.clone()));
+            assert_eq!(s.undo_depth(), depth);
+        }
+        s.run("edit.setValue", &json!({"row":row,"field":"class","value":"other"})).unwrap();
+        assert_eq!(s.map().layer(id).unwrap().dataset.value(row, 0), &rustgis_data::Value::Text("other".into()));
+        assert_eq!(s.circle_spec(id, row), Some(b));
+    }
+
+    #[test]
+    fn circle_edit_add_refuses_standalone_table_targets_before_intake_or_mutation() {
+        let (mut s, id) = session();
+        let depth = s.undo_depth();
+        for mut p in [json!({"table":"Rows"}), json!({"layer":id,"table":"Rows"})] {
+            p["circle"] = json!(spec());
+            let error = s.run("edit.addCircle", &p).unwrap_err();
+            assert!(error.contains("polygon layer"), "{error}");
+            assert!(s.map().layer(id).unwrap().dataset.features.is_empty());
+            assert_eq!(s.undo_depth(), depth);
+        }
+    }
+
+    #[test]
+    fn circle_edit_rejects_unknown_attributes_and_exhausted_feature_ids() {
+        let (mut s, id) = session();
+        let b = spec();
+        assert!(s.run("edit.addCircle", &json!({"circle":b,"attributes":{"missing":"lost"}})).is_err());
+        assert!(s.map().layer(id).unwrap().dataset.features.is_empty());
+        s.map_mut().layer_mut(id).unwrap().dataset.features.push(rustgis_data::Feature {
+            id: u64::MAX,
+            geometry: Some(b.geometry().unwrap()),
+            attrs: vec![],
+        });
+        assert!(s.run("edit.addCircle", &json!({"circle":b})).is_err());
+        assert_eq!(s.map().layer(id).unwrap().dataset.features.len(), 1);
+        assert!(s.circle_spec(id, 0).is_none());
+    }
+
+    #[test]
+    fn circle_edit_replacement_sources_and_reopened_projects_do_not_inherit_construction() {
+        let (mut s, id) = session();
+        let b = spec();
+        let row = add(&mut s, &b);
+        let reopened = Session::new(s.project.clone());
+        assert!(reopened.circle_spec(id, row).is_none());
+        let l = s.map_mut().layer_mut(id).unwrap();
+        l.touch_replacement();
+        assert!(s.circle_spec(id, row).is_none());
+    }
+    #[test]
+    fn circle_edit_affine_radius_tolerance_and_winding() {
+        let grids = [
+            Frame::default(),
+            Frame::from_grid(&ImageGrid::new(400, 300, Crs::from_epsg(32633).unwrap(), [500000., 0.8, 0.2, 1000., 0.1, -0.8]).unwrap())
+                .unwrap(),
+        ];
+        for frame in grids {
+            for radius in [0.01, 30., 1000., 100000.] {
+                let b = CircleSpec { frame: frame.clone(), center: [200., 150.], radius, tolerance: 0.25 };
+                let Geometry::Polygon(polys) = b.geometry().unwrap() else { panic!("polygon") };
+                let ring = &polys[0][0];
+                let n = b.segments().unwrap();
+                assert_eq!(ring.len(), n + 1);
+                assert_eq!(ring.first(), ring.last());
+                let mut area = 0.;
+                for pair in ring.windows(2) {
+                    area += pair[0].x * pair[1].y - pair[1].x * pair[0].y;
+                    let a = frame.to_local(pair[0]).unwrap();
+                    let c = frame.to_local(pair[1]).unwrap();
+                    assert!(((a[0] - 200.).hypot(a[1] - 150.) - radius).abs() < 1e-5);
+                    let midpoint = [(a[0] + c[0]) / 2., (a[1] + c[1]) / 2.];
+                    let sagitta = radius - (midpoint[0] - 200.).hypot(midpoint[1] - 150.);
+                    assert!(sagitta <= b.tolerance + 1e-5);
+                }
+                assert!(area > 0.);
+            }
+        }
+        let mut b = spec();
+        b.tolerance = 1e-20;
+        assert!(b.geometry().unwrap_err().contains("2048"));
+        b.radius = f64::NAN;
+        assert!(b.geometry().is_err());
+        b.radius = f64::INFINITY;
+        assert!(b.geometry().is_err());
+    }
+
+    #[test]
+    fn circle_edit_bad_parameters_and_stale_ids_are_atomic() {
+        let (mut s, id) = session();
+        let b = spec();
+        let row = add(&mut s, &b);
+        let before = s.map().layer(id).unwrap().dataset.features[row].clone();
+        let depth = s.undo_depth();
+        for patch in [
+            json!({"radius":0}),
+            json!({"radius":-1}),
+            json!({"radius":"NaN"}),
+            json!({"tolerance":0}),
+            json!({"tolerance":1e-30}),
+            json!({"center":[1e99,0]}),
+            json!({"frame":{"affine":[0,0,0,0,0,0]}}),
+            json!({"frame":{"epsg":0}}),
+            json!({"unexpected":true}),
+        ] {
+            let mut bad = json!(b);
+            for (k, v) in patch.as_object().unwrap() {
+                bad[k] = v.clone();
+            }
+            assert!(s.run("edit.updateCircle", &json!({"row":row,"circle":bad})).is_err());
+            assert!(s.run("edit.addCircle", &json!({"circle":bad})).is_err());
+            assert_eq!(s.map().layer(id).unwrap().dataset.features.len(), 1);
+            assert_eq!(s.map().layer(id).unwrap().dataset.features[row], before);
+            assert_eq!(s.circle_spec(id, row), Some(b.clone()));
+            assert_eq!(s.undo_depth(), depth);
+        }
+        for cmd in ["edit.updateCircle", "edit.deleteCircle"] {
+            assert!(s.run(cmd, &json!({"row":row,"featureId":before.id+1,"circle":b})).is_err());
+            assert_eq!(s.undo_depth(), depth);
+        }
+        let mut polar = spec();
+        polar.center = [0., -30_000_000.];
+        assert!(polar.geometry().is_err());
+        let mut crossing = spec();
+        crossing.center = [20_037_500., 0.];
+        crossing.radius = 1000.;
+        assert!(crossing.geometry().is_err());
+    }
+
+    #[test]
+    fn circle_edit_geojson_is_plain_and_export_counts_each_shape_kind() {
+        let (mut s, id) = session();
+        let b = spec();
+        add(&mut s, &b);
+        add(&mut s, &b);
+        s.run("edit.addBox", &json!({"box":{"center":[0,0],"width":100,"height":200,"angle":0}})).unwrap();
+        assert!(s.circle_spec(id, 2).is_none());
+        assert!(s.box_spec(id, 0).is_none());
+        let cache = s.constructions.clone();
+        let layer = s.map().layer(id).unwrap().clone();
+        let map = s.map().instance_id();
+        let mut changed = b.clone();
+        changed.radius = 42.;
+        s.run("edit.updateCircle", &json!({"row":0,"circle":changed})).unwrap();
+        assert!(cache.export_notes(map, &layer).unwrap().iter().any(|n| n.starts_with("2 circle")));
+        for ext in ["geojson", "csv", "gpx"] {
+            let path = std::env::temp_dir().join(format!("rustgis-circle-{}.{ext}", std::process::id()));
+            s.notices.clear();
+            s.run("share.exportLayer", &json!({"layer":id,"path":path})).unwrap();
+            assert_eq!(s.notices.iter().filter(|n| n.text.starts_with("2 circle")).count(), 1);
+            assert_eq!(s.notices.iter().filter(|n| n.text.starts_with("1 rotated box")).count(), 1);
+            if ext == "geojson" {
+                let text = std::fs::read_to_string(&path).unwrap();
+                let j: Value = serde_json::from_str(&text).unwrap();
+                assert!(j.get("rustgis_annotation").is_none());
+                let props = j["features"][0]["properties"].as_object().unwrap();
+                assert_eq!(props.len(), 2);
+                assert_eq!(props["class"], "vehicle");
+                let (ds, report) = rustgis_data::io::read_geojson(&text, "reopened").unwrap();
+                assert_eq!(report.skipped, 0);
+                assert_eq!(ds.features.len(), 3);
+                let mut reopened = Session::new(crate::Project::default());
+                let other = reopened.map_mut().add_dataset(ds);
+                assert!(reopened.circle_spec(other, 0).is_none());
+                assert!(
+                    reopened
+                        .constructions
+                        .export_notes(reopened.map().instance_id(), reopened.map().layer(other).unwrap())
+                        .unwrap()
+                        .is_empty()
+                );
+            } else {
+                assert!(s.notices.iter().any(|n| if ext == "gpx" {
+                    n.text.contains("GPX has no areas")
+                } else {
+                    n.text.contains("point")
+                }));
+            }
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
