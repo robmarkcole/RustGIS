@@ -220,7 +220,7 @@ pub(crate) fn share_output(s: &mut Session, kind: &str, p: &Value) -> Result<(St
         _ => "The shared item",
     };
     let notes = match kind {
-        "webMap" | "geodataService" | "webScene" => {
+        "webMap" | "geodataService" | "webScene" if s.constructions.len > 0 => {
             let m = map_of(s, p)?;
             s.constructions.output_notes(m.layers.iter().filter(|l| shared_layer(kind, l)).map(|l| (m.instance_id(), l)))?
         }

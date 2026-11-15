@@ -160,8 +160,14 @@ pub(crate) fn drag_to(app: &mut RustGisApp, rect: Rect, p: Pos2) {
         return;
     };
     let b = moved(&g.original, g.start, p, g.handle);
-    app.circles.error = b.geometry().err();
-    app.circles.preview = Some(b);
+    match b.geometry() {
+        Ok(_) => {
+            app.circles.error = None;
+            app.circles.preview = Some(b);
+        }
+        // Keep the last valid outline, so `draw` can show it in red beside the error.
+        Err(e) => app.circles.error = Some(e),
+    }
 }
 pub(crate) fn drag_stop(app: &mut RustGisApp) {
     cancel_stale(app);

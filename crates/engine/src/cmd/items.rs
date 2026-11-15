@@ -1662,7 +1662,7 @@ pub fn item_output(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Ve
             s.constructions.export_notes(s.map().instance_id(), s.map().layer(id).ok_or("no such layer")?)?
         }
         "template" | "projectPackage" => s.construction_output_notes()?,
-        "mobilePackage" => {
+        "mobilePackage" if s.constructions.len > 0 => {
             let m = mobile_map(s.map().clone());
             s.constructions.output_notes(m.layers.iter().map(|l| (m.instance_id(), l)))?
         }
