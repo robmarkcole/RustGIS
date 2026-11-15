@@ -86,25 +86,33 @@ impl Cache {
         }
     }
     pub(crate) fn export_notes(&self, map: u64, layer: &rustgis_map::Layer) -> Result<Vec<String>, String> {
+        self.output_notes(std::iter::once((map, layer)))
+    }
+    /// Count only unchanged, live constructions from the output's source layers. Exports call
+    /// this on their worker. Document writers call it in their existing synchronous durable
+    /// transaction, before output, with the same cancellation context as serialization.
+    pub(crate) fn output_notes<'a>(&self, layers: impl IntoIterator<Item = (u64, &'a rustgis_map::Layer)>) -> Result<Vec<String>, String> {
         if self.len == 0 {
             return Ok(Vec::new());
         }
-        let mut count = 0;
-        let mut circles = 0;
-        for (row, feature) in layer.dataset.features.iter().enumerate() {
-            if row.is_multiple_of(256) {
-                rustgis_data::progress::check().map_err(|e| e.to_string())?;
-            }
-            let key = (map, layer.instance_id(), layer.replacement_revision(), feature.id);
-            if let Some(record) = feature.geometry.as_ref().and_then(|g| self.get(key, g)) {
-                match record.spec {
-                    Construction::Box(_) => count += 1,
-                    Construction::Circle(_) => circles += 1,
+        let (mut boxes, mut circles) = (0_usize, 0_usize);
+        for (map, layer) in layers {
+            rustgis_data::progress::check().map_err(|e| e.to_string())?;
+            for (row, feature) in layer.dataset.features.iter().enumerate() {
+                if row.is_multiple_of(256) {
+                    rustgis_data::progress::check().map_err(|e| e.to_string())?;
+                }
+                let key = (map, layer.instance_id(), layer.replacement_revision(), feature.id);
+                if let Some(record) = feature.geometry.as_ref().and_then(|g| self.get(key, g)) {
+                    match record.spec {
+                        Construction::Box(_) => boxes += 1,
+                        Construction::Circle(_) => circles += 1,
+                    }
                 }
             }
         }
-        let boxes = (count > 0).then(|| format!("{count} rotated box(es): session-only construction is not included in this export and will not survive reimport; the source polygons use four transformed corners, with curved grid edges approximated by straight edges"));
-        let circles = (circles > 0).then(|| format!("{circles} circle(s): session-only centre/radius construction is not included in this export and will not survive reimport; source polygons approximate circles with straight edges (tolerance in each construction grid, before projection)"));
+        let boxes = (boxes > 0).then(|| format!("{boxes} rotated box(es): session-only construction is not included in this output and will not survive reimport; the source polygons use four transformed corners, with curved grid edges approximated by straight edges"));
+        let circles = (circles > 0).then(|| format!("{circles} circle(s): session-only centre/radius construction is not included in this output and will not survive reimport; source polygons approximate circles with straight edges (tolerance in each construction grid, before projection)"));
         Ok(boxes.into_iter().chain(circles).collect())
     }
 }
@@ -115,5 +123,15 @@ pub(crate) fn forget_feature(s: &mut Session, layer: u32, feature: u64) {
     if let Some(l) = s.map().layer(layer) {
         let key = (s.map().instance_id(), l.instance_id(), l.replacement_revision(), feature);
         s.constructions.remove(key);
+    }
+}
+
+impl Session {
+    /// Counted runtime-construction losses for a whole-project output. Embedders saving the
+    /// public `Project` directly should present these notes too: `Project` owns no session cache.
+    /// Explicit save/download paths call this inside their existing durable output transaction;
+    /// unlike the live session, the serialized document contains only polygon geometry.
+    pub fn construction_output_notes(&self) -> Result<Vec<String>, String> {
+        self.constructions.output_notes(self.project.maps.iter().flat_map(|m| m.layers.iter().map(move |l| (m.instance_id(), l))))
     }
 }

@@ -196,8 +196,8 @@ sharing GeoJSON leaves **ordinary polygons** and ordinary feature properties. In
 preserve feature identity; import uses the normal GeoJSON reader. There is no automatic
 recognition of imported polygons. Use **Edit Vertices** to edit those polygons.
 **Export Features** (`share.exportLayer`) includes one counted note explaining that box
-construction does not round-trip. Other shares and project saves do not currently emit this
-note; their saved output also has no box construction.
+construction does not round-trip. Explicit project saves/downloads, map/layer files, project
+and map packages, data conversions and feature-bearing web shares report the same loss.
 Source polygons contain four transformed corners joined by straight edges; curved grid edges
 are approximated. The target format may further approximate or omit geometry: CSV writes
 representative points and GPX does not retain polygon areas, with their own format-specific notes.
@@ -228,7 +228,7 @@ On a loaded polygon layer, turn **Edit › Edit** on and choose **Edit › Featu
 This creates ordinary feature polygons, independently of the annotation workflow or graphics.
 The existing **Editing** pane opens with centre X/Y, radius and polygon tolerance controls.
 
-- Drag from the centre to the edge to create a circle. Drag inside a selected circle to move
+- Drag from the centre to the edge to create a circle. Drag inside an existing circle to select and move
   it, or drag its round radius handle to resize with the centre fixed.
 - Click to select, ++alt++-click to cycle overlaps, ++shift++-click to extend the selection.
   ++ctrl++/++cmd++-drag forces a new circle over existing features.
@@ -254,7 +254,8 @@ Changing a radius does not repeatedly rescale old vertices.
 
 Exported GeoJSON holds only ordinary polygons and feature properties. **Export Features**
 reports a counted circle-construction/approximation note, separately from any box or format
-losses. Other shares and project saves do not currently emit this note. Reopening a project or
+losses. Explicit project saves/downloads, map/layer files, project and map packages, data
+conversions and feature-bearing web shares report this loss too. Reopening a project or
 importing GeoJSON leaves polygons; use **Edit Vertices** for those. There is no automatic
 circle detection, image binding or custom metadata. Independent geometry edits disable the
 circle handles; undo restores them when the original geometry returns.

@@ -1077,9 +1077,14 @@ pub(crate) fn names_place(v: &Value, keys: &[&str], depth: usize) -> bool {
 /// are metres east and north of the layer's south-west corner.
 fn export_3d(s: &mut Session, p: &Value) -> CmdResult {
     let path = ps(p, "path").ok_or("path is required")?.to_string();
+    let id = s.layer_id(p)?;
+    let construction_notes = s.constructions.export_notes(s.map().instance_id(), s.map().layer(id).ok_or("no such layer")?)?;
     if path.to_ascii_lowercase().ends_with(".stl") {
         let (bytes, report) = stl_bytes(s, p)?;
         rustgis_data::io::write_atomic(Path::new(&path), &bytes).map_err(|e| format!("{path}: {e}"))?;
+        for note in construction_notes {
+            s.notify(note, false);
+        }
         s.notify(format!("Exported {path}"), false);
         return Ok(json!({
             "path": path, "bytes": bytes.len(), "triangles": report.triangles,
@@ -1088,6 +1093,9 @@ fn export_3d(s: &mut Session, p: &Value) -> CmdResult {
     }
     let obj = obj_text(s, p)?;
     rustgis_data::io::write_atomic(Path::new(&path), obj.as_bytes()).map_err(|e| format!("{path}: {e}"))?;
+    for note in construction_notes {
+        s.notify(note, false);
+    }
     s.notify(format!("Exported {path}"), false);
     Ok(json!({"path": path, "bytes": obj.len()}))
 }
@@ -1619,6 +1627,24 @@ pub const ITEMS: &[(&str, &str, &str)] = &[
 
 /// An item as file bytes, with a suggested file name.
 pub fn item_bytes(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Vec<u8>), String> {
+    // The item serializer is already a synchronous durable transaction. Compute losses before
+    // producing bytes, and publish them only if that transaction succeeds.
+    let construction_notes = match kind {
+        "map" => {
+            let m = saved_map(s, p)?;
+            s.constructions.output_notes(m.layers.iter().map(|l| (m.instance_id(), l)))?
+        }
+        "layer" | "obj" | "stl" => {
+            let id = s.layer_id(p)?;
+            s.constructions.export_notes(s.map().instance_id(), s.map().layer(id).ok_or("no such layer")?)?
+        }
+        "template" | "projectPackage" => s.construction_output_notes()?,
+        "mapPackage" | "mobilePackage" | "fieldPackage" => {
+            s.constructions.output_notes(s.map().layers.iter().map(|l| (s.map().instance_id(), l)))?
+        }
+        "gpPackage" => s.constructions.output_notes(gp_result_layers(s).into_iter().map(|(m, l)| (m.instance_id(), l)))?,
+        _ => Vec::new(),
+    };
     let (name, bytes) = match kind {
         "map" => {
             let map = saved_map(s, p)?;
@@ -1730,6 +1756,9 @@ pub fn item_bytes(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Vec
         }
         k => return Err(format!("unknown item '{k}'")),
     };
+    for note in construction_notes {
+        s.notify(note, false);
+    }
     let ext = ITEMS.iter().find(|i| i.0 == kind).map_or("json", |i| i.1);
     Ok((format!("{}.{ext}", safe(&name)), bytes))
 }

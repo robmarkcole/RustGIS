@@ -152,7 +152,7 @@ pub(crate) fn new_box_inputs(input: &crate::cmd::InputContext<'_>, p: &Value) ->
 }
 pub fn check_layer(s: &Session, id: u32) -> Result<(), String> {
     if s.map().body != "earth" {
-        return Err("rotated construction grids currently require an Earth map".into());
+        return Err("rotated box grids currently require an Earth map".into());
     }
     if !s.map().editing.settings.enabled {
         return Err("turn on editing first (Edit › Edit)".into());

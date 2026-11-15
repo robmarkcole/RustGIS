@@ -533,12 +533,16 @@ fn write(s: &mut Session, path: PathBuf) -> CmdResult {
             format!("a project saves to a .rgis file, not a .{ext} one")
         });
     }
+    let construction_notes = s.construction_output_notes()?;
     let report = s.project.save(&destination)?;
     let stripped = report.layer_addresses();
     s.mark_saved();
     s.edit_counts.clear();
     s.notify(format!("Saved {}", path.display()), false);
     crate::durable::notify(s, &report);
+    for note in construction_notes {
+        s.notify(note, false);
+    }
     s.path = Some(destination);
     Ok(json!({"path": path.display().to_string(), "stripped": stripped}))
 }

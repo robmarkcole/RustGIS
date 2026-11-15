@@ -2087,6 +2087,7 @@ impl RustGisApp {
         let stem: String = stem.chars().take(200).collect();
         // Not an undoable edit: saving names the project, as `project.saveAs` does, once the
         // browser takes the file.
+        let construction_notes = self.session.construction_output_notes()?;
         let old = std::mem::replace(&mut self.session.project.name, stem.clone());
         let (text, report) = match self.session.project.saved_text(None) {
             Ok(saved) => saved,
@@ -2114,6 +2115,9 @@ impl RustGisApp {
         };
         self.session.notify(offered, false);
         report.notify(&mut self.session);
+        for note in construction_notes {
+            self.session.notify(note, false);
+        }
         self.ui.web_file = Some(file);
         Ok(())
     }

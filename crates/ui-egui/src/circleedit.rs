@@ -154,7 +154,11 @@ fn moved(b: &CircleSpec, start: [f64; 2], p: [f64; 2], h: Handle) -> CircleSpec 
 pub(crate) fn drag_to(app: &mut RustGisApp, rect: Rect, p: Pos2) {
     cancel_stale(app);
     let Some(g) = app.circles.gesture.as_ref() else { return };
-    let Some(p) = screen_to_lonlat(app, rect, p).and_then(|c| g.original.frame.to_local(c)) else { return };
+    let Some(p) = screen_to_lonlat(app, rect, p).and_then(|c| g.original.frame.to_local(c)) else {
+        app.circles.preview = None;
+        app.circles.error = Some(tl!("Choose a position within the supported map and construction grid.").into());
+        return;
+    };
     let b = moved(&g.original, g.start, p, g.handle);
     app.circles.error = b.geometry().err();
     app.circles.preview = Some(b);
@@ -162,11 +166,11 @@ pub(crate) fn drag_to(app: &mut RustGisApp, rect: Rect, p: Pos2) {
 pub(crate) fn drag_stop(app: &mut RustGisApp) {
     cancel_stale(app);
     let State { gesture, preview, error } = std::mem::take(&mut app.circles);
-    let (Some(g), Some(b)) = (gesture, preview) else { return };
     if let Some(e) = error {
         app.session.notify(e, true);
         return;
     }
+    let (Some(g), Some(b)) = (gesture, preview) else { return };
     if let Some(row) = g.row {
         if b != g.original {
             let _ = app.run("edit.updateCircle", json!({"layer":g.layer,"row":row,"featureId":g.feature,"circle":b}));
@@ -584,5 +588,54 @@ mod tests {
         assert_eq!(moved.frame, b.frame);
         app.run("edit.undo", json!({})).unwrap();
         assert_eq!(app.session.circle_spec(id, row), Some(resized));
+    }
+    #[test]
+    fn circle_edit_browser_project_download_reports_loss_only_after_acceptance() {
+        for accept in [false, true] {
+            let mut app = app();
+            let (id, row, b) = create(&mut app);
+            let before = app.session.project.name.clone();
+            app.services.download = Some(Box::new(move |_, _| if accept { Ok(()) } else { Err("rejected download".into()) }));
+            app.session.notices.clear();
+            assert_eq!(app.save_download("Circle sample.rgis").is_ok(), accept);
+            assert_eq!(app.session.notices.iter().filter(|n| n.text.starts_with("1 circle")).count(), usize::from(accept));
+            assert_eq!(app.session.circle_spec(id, row), Some(b));
+            if !accept {
+                assert_eq!(app.session.project.name, before);
+            }
+        }
+    }
+    #[test]
+    fn circle_edit_dragging_an_unselected_circle_selects_and_moves_it() {
+        let mut app = app();
+        let (id, row, b) = create(&mut app);
+        app.run("select.clear", json!({})).unwrap();
+        let p = at(&app, rect(), &b.frame, b.center).unwrap();
+        assert!(drag_start(&mut app, rect(), p, false));
+        drag_to(&mut app, rect(), p + vec2(20., 10.));
+        drag_stop(&mut app);
+        assert_eq!(app.session.map().layer(id).unwrap().selection, vec![row]);
+        assert_eq!(app.session.map().layer(id).unwrap().dataset.features.len(), 1);
+        assert_ne!(app.session.circle_spec(id, row).unwrap().center, b.center);
+    }
+    #[test]
+    fn circle_edit_invalid_release_never_commits_the_last_valid_preview() {
+        let mut app = app();
+        let (id, row, b) = create(&mut app);
+        let p = at(&app, rect(), &b.frame, b.center).unwrap();
+        for force_new in [false, true] {
+            let depth = app.session.undo_depth();
+            let count = app.session.map().layer(id).unwrap().dataset.features.len();
+            assert!(drag_start(&mut app, rect(), p, force_new));
+            drag_to(&mut app, rect(), p + vec2(20., 10.));
+            assert!(app.circles.preview.is_some());
+            drag_to(&mut app, rect(), Pos2::new(f32::NAN, 0.));
+            assert!(app.circles.preview.is_none());
+            drag_stop(&mut app);
+            assert_eq!(app.session.undo_depth(), depth);
+            assert_eq!(app.session.map().layer(id).unwrap().dataset.features.len(), count);
+            assert_eq!(app.session.circle_spec(id, row), Some(b.clone()));
+            assert!(app.session.notices.last().is_some_and(|n| n.error && n.text.contains("construction grid")));
+        }
     }
 }

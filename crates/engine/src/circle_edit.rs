@@ -97,10 +97,17 @@ pub(crate) fn new_circle_inputs(input: &crate::cmd::InputContext<'_>, p: &Value)
     crate::cmd::design::new_feature_inputs(input, p)
 }
 pub fn check_tool(s: &Session, id: u32) -> Result<(), String> {
-    crate::box_edit::check_tool(s, id).map_err(|e| e.replace("Rotated Box", "Circle").replace("rotated box", "circle"))
+    check_layer(s, id)?;
+    if s.map().projection.is_globe() || s.map().camera.pitch != 0. {
+        return Err("the Circle tool requires a flat Earth map with zero pitch".into());
+    }
+    Ok(())
 }
 fn check_layer(s: &Session, id: u32) -> Result<(), String> {
-    crate::box_edit::check_layer(s, id).map_err(|e| e.replace("rotated box", "circle"))
+    if s.map().body != "earth" {
+        return Err("circles currently require an Earth map".into());
+    }
+    crate::box_edit::check_layer(s, id)
 }
 fn parsed(p: &Value, previous_frame: Option<&Frame>) -> Result<CircleSpec, String> {
     let value = p.get("circle").ok_or("circle is required")?;
@@ -557,5 +564,114 @@ mod tests {
             }
             let _ = std::fs::remove_file(path);
         }
+    }
+    #[test]
+    fn circle_edit_non_earth_errors_name_the_circle_tool_without_mutation() {
+        let (mut s, id) = session();
+        let b = spec();
+        let row = add(&mut s, &b);
+        s.map_mut().body = "moon".into();
+        let depth = s.undo_depth();
+        for (cmd, params) in [
+            ("edit.addCircle", json!({"circle":b})),
+            ("edit.updateCircle", json!({"row":row,"circle":b})),
+            ("edit.deleteCircle", json!({"row":row})),
+            ("tool.set", json!({"tool":"circle"})),
+        ] {
+            let error = s.run(cmd, &params).unwrap_err();
+            assert_eq!(error, "circles currently require an Earth map");
+            assert_eq!(s.circle_spec(id, row), Some(b.clone()));
+            assert_eq!(s.undo_depth(), depth);
+        }
+    }
+
+    fn construction_notices(s: &Session) -> Vec<&str> {
+        s.notices
+            .iter()
+            .map(|n| n.text.as_str())
+            .filter(|n| n.contains("session-only") && n.contains("construction is not included"))
+            .collect()
+    }
+
+    #[test]
+    fn circle_edit_explicit_project_save_reports_live_constructions_across_maps() {
+        let (mut s, first) = session();
+        let b = spec();
+        add(&mut s, &b);
+        s.run("edit.addBox", &json!({"box":{"center":[0,0],"width":100,"height":200,"angle":0}})).unwrap();
+        let mut other = s.map().clone();
+        other.name = "Other map".into();
+        other.renew_instance_id();
+        s.project.maps.push(other);
+        s.project.active_map = 1;
+        // The cloned polygons are ordinary: their new map identity must not adopt construction.
+        assert!(s.circle_spec(first, 0).is_none());
+        add(&mut s, &b);
+        let path = std::env::temp_dir().join(format!("rustgis-circle-save-{}.rgis", std::process::id()));
+        for cmd in ["project.saveAs", "project.save"] {
+            s.notices.clear();
+            s.run(cmd, &json!({"path":path})).unwrap();
+            let notes = construction_notices(&s);
+            assert_eq!(notes.len(), 2);
+            assert!(notes.iter().any(|n| n.starts_with("2 circle")));
+            assert!(notes.iter().any(|n| n.starts_with("1 rotated box")));
+            assert_eq!(s.circle_spec(first, 2), Some(b.clone()));
+        }
+        let mut reopened = Session::new(crate::Project::default());
+        reopened.run("project.open", &json!({"path":path})).unwrap();
+        assert!(reopened.circle_spec(first, 2).is_none());
+        assert!(reopened.construction_output_notes().unwrap().is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn circle_edit_item_outputs_count_only_their_source_and_ordinary_polygons_stay_quiet() {
+        let (mut s, id) = session();
+        let b = spec();
+        add(&mut s, &b);
+        let second = s.map_mut().add_dataset(Dataset::new("Ordinary", GeometryType::Polygon, vec![]));
+        s.run("edit.addFeature", &json!({"layer":second,"geometry":rustgis_data::io::geometry_to_geojson(&b.geometry().unwrap())}))
+            .unwrap();
+        for kind in ["layer", "map", "projectPackage", "mapPackage", "mobilePackage", "template", "webLayer", "webMap", "geodataService"] {
+            s.active_layer = Some(id);
+            s.notices.clear();
+            crate::cmd::items::item_bytes(&mut s, kind, &json!({"layer":id})).unwrap();
+            let notes = construction_notices(&s);
+            assert_eq!(notes.len(), 1, "{kind}: {notes:?}");
+            assert!(notes[0].starts_with("1 circle"), "{kind}");
+            assert_eq!(s.circle_spec(id, 0), Some(b.clone()));
+        }
+        for kind in ["layer", "webLayer"] {
+            s.notices.clear();
+            crate::cmd::items::item_bytes(&mut s, kind, &json!({"layer":second})).unwrap();
+            assert!(construction_notices(&s).is_empty(), "{kind}");
+        }
+        s.notices.clear();
+        assert!(crate::cmd::items::item_bytes(&mut s, "map", &json!({"map":"missing"})).is_err());
+        assert!(construction_notices(&s).is_empty());
+        let mut ordinary = Session::new(s.project.clone());
+        let path = std::env::temp_dir().join(format!("rustgis-circle-clean-save-{}.rgis", std::process::id()));
+        ordinary.run("project.saveAs", &json!({"path":path})).unwrap();
+        assert!(construction_notices(&ordinary).is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn circle_edit_conversion_notices_cover_text_and_background_file_output() {
+        let (mut s, id) = session();
+        let b = spec();
+        add(&mut s, &b);
+        s.notices.clear();
+        let result = s.run("data.convert", &json!({"layer":id,"format":"geojson"})).unwrap();
+        assert!(result["text"].as_str().unwrap().contains("Polygon"));
+        assert_eq!(construction_notices(&s).len(), 1);
+        let path = std::env::temp_dir().join(format!("rustgis-circle-convert-{}.geojson", std::process::id()));
+        let work = crate::cmd::workflows::convert_work(&s, &json!({"layer":id,"format":"geojson","path":path})).unwrap();
+        // A later live edit cannot change the worker's frozen source/cache snapshot.
+        s.run("edit.deleteCircle", &json!({"row":0})).unwrap();
+        let wrote = work().unwrap();
+        assert_eq!(wrote.notes.iter().filter(|n| n.starts_with("1 circle")).count(), 1);
+        assert!(s.construction_output_notes().unwrap().is_empty());
+        let _ = std::fs::remove_file(path);
     }
 }
