@@ -29,12 +29,6 @@ pub struct Reads {
 }
 
 impl Reads {
-    /// An older conversion's failure must not replace the state of its queued successor.
-    pub(crate) fn shape_conversion_waiting(&self, request: u64) -> bool {
-        self.waiting
-            .iter()
-            .any(|a| a.command == "edit.previewShapeConversion" && a.params.get("request").and_then(Value::as_u64) == Some(request))
-    }
     /// Closing a conversion preview cancels only its read, leaving unrelated queued work alone.
     pub(crate) fn cancel_shape_conversion(&mut self, request: u64) {
         let belongs = |a: &Asked| {
@@ -70,13 +64,27 @@ struct Asked {
     /// A service add keeps the connection's display name until its actual landing.
     origin: Option<String>,
     /// Given what the command answered when it runs, or why it didn't (cancelled, or left).
-    then: Option<Then>,
+    then: Option<Completion>,
     /// A direct relay archive call owns its real completion, rather than a Native callback.
     relay: Option<rustgis_assistant::relay::Relay>,
 }
 
 /// What a caller does once the command lands (ModelBuilder shows its run).
 pub type Then = fn(&mut RustGisApp, Landed);
+
+#[derive(Clone, Copy)]
+enum Completion {
+    Command(Then),
+    ShapeConversion(Option<u64>),
+}
+impl Completion {
+    fn deliver(self, app: &mut RustGisApp, result: Landed) {
+        match self {
+            Self::Command(then) => then(app, result),
+            Self::ShapeConversion(request) => crate::shapeconvert::landed(app, request, result),
+        }
+    }
+}
 
 pub use crate::Landed;
 
@@ -106,7 +114,13 @@ pub fn run(app: &mut RustGisApp, command: &'static str, p: Value) -> Result<Valu
 /// [`run`], then `then` with what the command answered once it ran, here or as it lands, or why
 /// it never ran.
 pub fn run_then(app: &mut RustGisApp, command: &'static str, p: Value, then: Option<Then>) -> Result<Value, String> {
-    run_presented(app, command, p, then, None, None)
+    run_presented(app, command, p, then.map(Completion::Command), None, None)
+}
+
+/// Carries the originating request through success, failure and abandonment callbacks alike.
+pub(crate) fn run_shape_conversion(app: &mut RustGisApp, p: Value) -> Result<Value, String> {
+    let request = p.get("request").and_then(Value::as_u64);
+    run_presented(app, "edit.previewShapeConversion", p, Some(Completion::ShapeConversion(request)), None, None)
 }
 
 /// Keeps a service layer's title and connection display name outside recorded parameters
@@ -126,7 +140,7 @@ fn run_presented(
     app: &mut RustGisApp,
     command: &'static str,
     mut p: Value,
-    then: Option<Then>,
+    then: Option<Completion>,
     presentation: Option<(String, Option<String>)>,
     preview: Option<rustgis_engine::data::Dataset>,
 ) -> Result<Value, String> {
@@ -315,17 +329,17 @@ fn finish_relay(app: &mut RustGisApp, relay: &rustgis_assistant::relay::Relay, r
 }
 
 /// What the command answered, `r`, given to `then` first.
-fn answered(app: &mut RustGisApp, then: Option<Then>, r: Result<Value, String>) -> Result<Value, String> {
+fn answered(app: &mut RustGisApp, then: Option<Completion>, r: Result<Value, String>) -> Result<Value, String> {
     if let Some(then) = then {
-        then(app, Landed::Ran(r.clone()));
+        then.deliver(app, Landed::Ran(r.clone()));
     }
     r
 }
 
 /// Why the command never ran, given to `then`.
-fn not_run(app: &mut RustGisApp, then: Option<Then>, why: String) {
+fn not_run(app: &mut RustGisApp, then: Option<Completion>, why: String) {
     if let Some(then) = then {
-        then(app, Landed::NotRun(why));
+        then.deliver(app, Landed::NotRun(why));
     }
 }
 
@@ -740,6 +754,40 @@ mod tests {
         assert!(!showing(h.state()));
         assert!(h.state().session.notices.iter().any(|n| n.error && n.text.contains("worker could not start")));
         assert!(h.query_by_label("Convert Now").is_some(), "the form remains available for retry");
+    }
+
+    #[test]
+    fn shape_conversion_reopening_cancels_running_and_queued_fits() {
+        use rustgis_engine::{
+            Project, Session,
+            data::{Dataset, GeometryType},
+        };
+        let mut session = Session::new(Project::default());
+        let id = session.map_mut().add_dataset(Dataset::new("Polygons", GeometryType::Polygon, vec![]));
+        session.active_layer = Some(id);
+        session.run("edit.enable", &json!({"on":true})).unwrap();
+        session
+            .run(
+                "edit.addFeature",
+                &json!({"geometry":{"type":"Polygon","coordinates":[[[0.,0.],[0.01,0.],[0.01,0.01],[0.,0.01],[0.,0.]]]}}),
+            )
+            .unwrap();
+        let mut app = RustGisApp::new(session);
+        app.reads_off_frame = true;
+        app.run("ui.convertShape", json!({"kind":"circle"})).unwrap();
+        run_shape_conversion(&mut app, json!({"row":0,"kind":"circle","request":1})).unwrap();
+        let control = app.reads.job.as_ref().unwrap().control.clone();
+        app.run("ui.convertShape", json!({"kind":"rotatedBox"})).unwrap();
+        assert!(control.is_cancelled());
+        assert!(!app.reads.job.as_ref().unwrap().cancel_waiting);
+        run_shape_conversion(&mut app, json!({"row":0,"kind":"rotatedBox","request":2})).unwrap();
+        assert_eq!(app.reads.waiting.len(), 1);
+        app.run("ui.convertShape", json!({"kind":"circle"})).unwrap();
+        assert!(app.reads.waiting.is_empty(), "replacing a queued fit must remove only that fit");
+        run_shape_conversion(&mut app, json!({"row":0,"kind":"circle","request":3})).unwrap();
+        landed(&mut app, 60);
+        assert!(!showing(&app));
+        assert_eq!(app.session.map().layer(id).unwrap().dataset.features.len(), 1);
     }
 
     #[test]

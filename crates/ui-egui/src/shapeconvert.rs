@@ -122,6 +122,10 @@ pub(crate) fn open(app: &mut RustGisApp, p: &Value) -> Result<(), String> {
         return Err(tl!("Choose Circle or Rotated Box.").into());
     }
     app.conversion.next_request = app.conversion.next_request.checked_add(1).ok_or("conversion request limit reached")?;
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(old) = &app.conversion.form {
+        app.reads.cancel_shape_conversion(old.request);
+    }
     app.conversion.form = Some(Form {
         previous_tool: app.session.tool,
         image_stamp: None,
@@ -152,7 +156,10 @@ pub(crate) fn menu(app: &mut RustGisApp, ui: &mut egui::Ui) {
         ui.close();
     }
 }
-pub(crate) fn landed(app: &mut RustGisApp, result: crate::Landed) {
+pub(crate) fn landed(app: &mut RustGisApp, request: Option<u64>, result: crate::Landed) {
+    if app.conversion.form.as_ref().is_none_or(|f| Some(f.request) != request || !f.pending) {
+        return;
+    }
     let Some(mut f) = app.conversion.form.take() else { return };
     if !valid(app, &f) {
         #[cfg(not(target_arch = "wasm32"))]
@@ -162,21 +169,6 @@ pub(crate) fn landed(app: &mut RustGisApp, result: crate::Landed) {
     }
     if let crate::Landed::Ran(Ok(ref answer)) = result
         && answer.get("request").and_then(Value::as_u64) != Some(f.request)
-    {
-        app.conversion.form = Some(f);
-        return;
-    }
-    if !matches!(result, crate::Landed::Ran(Ok(_)))
-        && (!f.pending || {
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                app.reads.shape_conversion_waiting(f.request)
-            }
-            #[cfg(target_arch = "wasm32")]
-            {
-                false
-            }
-        })
     {
         app.conversion.form = Some(f);
         return;
@@ -622,7 +614,7 @@ mod tests {
         form.apply_after_fit = true;
         let depth = app.session.undo_depth();
         app.run("tool.set", json!({"tool":"measure"})).unwrap();
-        landed(&mut app, crate::Landed::Ran(Ok(answer)));
+        landed(&mut app, Some(request), crate::Landed::Ran(Ok(answer)));
         assert!(app.conversion.form.is_none());
         assert_eq!(app.session.undo_depth(), depth);
         assert_eq!(app.session.tool, Tool::Measure);
@@ -652,7 +644,7 @@ mod tests {
                 form.pending = true;
                 form.apply_after_fit = true;
             }
-            landed(&mut app, crate::Landed::Ran(Ok(answer)));
+            landed(&mut app, Some(request), crate::Landed::Ran(Ok(answer)));
             assert_eq!(app.session.undo_depth(), depth);
             assert_eq!(app.session.map().layer(id).unwrap().dataset.features[0], before);
             assert!(app.session.box_spec(id, 0).is_none() && app.session.circle_spec(id, 0).is_none());
@@ -661,9 +653,52 @@ mod tests {
             } else {
                 assert!(app.conversion.form.as_ref().unwrap().pending);
                 app.run("select.clear", json!({})).unwrap();
-                landed(&mut app, crate::Landed::Ran(Err("cancelled".into())));
+                let request = app.conversion.form.as_ref().unwrap().request;
+                landed(&mut app, Some(request), crate::Landed::Ran(Err("cancelled".into())));
                 assert!(app.conversion.form.is_none());
             }
+        }
+    }
+
+    #[test]
+    fn shape_conversion_reopened_form_ignores_every_old_completion() {
+        for kind in ["circle", "rotatedBox"] {
+            let mut app = app();
+            let id = app.session.active_layer.unwrap();
+            let geometry = app.session.map().layer(id).unwrap().dataset.features[0].geometry.clone().unwrap();
+            app.run("edit.addFeature", json!({"geometry":rustgis_engine::data::io::geometry_to_geojson(&geometry)})).unwrap();
+            app.run("select.rows", json!({"rows":[0],"mode":"new"})).unwrap();
+            open(&mut app, &json!({"kind":kind})).unwrap();
+            let old = app.conversion.form.as_ref().unwrap().request;
+            let answer = app.session.run("edit.previewShapeConversion", &json!({"row":0,"kind":kind,"request":old})).unwrap();
+            app.conversion.form.as_mut().unwrap().pending = true;
+            app.conversion.form.as_mut().unwrap().apply_after_fit = true;
+            app.run("select.rows", json!({"rows":[1],"mode":"new"})).unwrap();
+            open(&mut app, &json!({"kind":kind})).unwrap();
+            let current = app.conversion.form.as_ref().unwrap().request;
+            assert_ne!(current, old);
+            app.conversion.form.as_mut().unwrap().pending = true;
+            app.conversion.form.as_mut().unwrap().apply_after_fit = true;
+            let before = app.session.map().layer(id).unwrap().dataset.features.to_vec();
+            let depth = app.session.undo_depth();
+            for result in [
+                crate::Landed::Ran(Err("old fit failed".into())),
+                crate::Landed::NotRun("old fit cancelled".into()),
+                crate::Landed::Ran(Ok(answer)),
+            ] {
+                landed(&mut app, Some(old), result);
+                let f = app.conversion.form.as_ref().unwrap();
+                assert_eq!((f.request, f.row), (current, 1));
+                assert!(f.pending && f.apply_after_fit && f.error.is_none() && f.proposal.is_none());
+                assert_eq!(app.session.undo_depth(), depth);
+                assert_eq!(app.session.map().layer(id).unwrap().dataset.features.to_vec(), before);
+            }
+            let answer = app.session.run("edit.previewShapeConversion", &json!({"row":1,"kind":kind,"request":current})).unwrap();
+            landed(&mut app, Some(current), crate::Landed::Ran(Ok(answer)));
+            assert!(app.conversion.form.is_none(), "the new Convert Now must still apply");
+            assert_eq!(app.session.undo_depth(), depth + 1);
+            assert_eq!(app.session.map().layer(id).unwrap().dataset.features[0], before[0]);
+            assert!(if kind == "circle" { app.session.circle_spec(id, 1).is_some() } else { app.session.box_spec(id, 1).is_some() });
         }
     }
 
@@ -673,7 +708,7 @@ mod tests {
         let request = app.conversion.form.as_ref().unwrap().request;
         let answer = app.session.run("edit.previewShapeConversion", &json!({"row":0,"kind":"circle","request":request})).unwrap();
         open(&mut app, &json!({"kind":"rotatedBox"})).unwrap();
-        landed(&mut app, crate::Landed::Ran(Ok(answer)));
+        landed(&mut app, Some(request), crate::Landed::Ran(Ok(answer)));
         assert!(app.conversion.form.as_ref().unwrap().proposal.is_none());
         app.session.run("select.clear", &json!({})).unwrap();
         let mut h = harness(app);

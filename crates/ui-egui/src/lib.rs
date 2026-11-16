@@ -2666,7 +2666,7 @@ impl RustGisApp {
             // Counting a column goes over every row of the layer: on a thread of its own, and the
             // answer shown once it lands (the table's Statistics window).
             if id == "edit.previewShapeConversion" {
-                return readjob::run_then(self, "edit.previewShapeConversion", params, Some(shapeconvert::landed));
+                return readjob::run_shape_conversion(self, params);
             }
             if id == "table.statistics" {
                 return readjob::run_then(self, "table.statistics", params, Some(table::statistics_landed));
@@ -4192,12 +4192,12 @@ impl RustGisApp {
             "ui.previewShapeConversion" => {
                 #[cfg(not(target_arch = "wasm32"))]
                 {
-                    return readjob::run_then(self, "edit.previewShapeConversion", p.clone(), Some(shapeconvert::landed));
+                    return readjob::run_shape_conversion(self, p.clone());
                 }
                 #[cfg(target_arch = "wasm32")]
                 {
                     let result = self.run("edit.previewShapeConversion", p.clone());
-                    shapeconvert::landed(self, Landed::Ran(result.clone()));
+                    shapeconvert::landed(self, p.get("request").and_then(Value::as_u64), Landed::Ran(result.clone()));
                     return result;
                 }
             }
