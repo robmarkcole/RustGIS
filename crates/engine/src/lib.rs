@@ -1848,6 +1848,22 @@ impl Session {
     /// Runs `f` as the command `label`: when it `mutates`, the project is snapshotted for undo
     /// and restored if `f` fails or panics.
     pub(crate) fn guarded(&mut self, label: &'static str, mutates: bool, f: impl FnOnce(&mut Session) -> CmdResult) -> CmdResult {
+        self.guarded_inner(label, mutates, true, f)
+    }
+
+    /// An atomic host-call savepoint. The enclosing plugin transaction owns Undo; a guest may
+    /// handle this call's error and still succeed, so failure must restore its changes here.
+    pub(crate) fn savepoint(&mut self, label: &'static str, f: impl FnOnce(&mut Session) -> CmdResult) -> CmdResult {
+        self.guarded_inner(label, true, false, f)
+    }
+
+    fn guarded_inner(
+        &mut self,
+        label: &'static str,
+        mutates: bool,
+        record_undo: bool,
+        f: impl FnOnce(&mut Session) -> CmdResult,
+    ) -> CmdResult {
         let snapshot = mutates.then(|| self.project.clone());
         let construction_snapshot = self.constructions.clone();
         let trust = (self.trusted_tasks.clone(), self.trusted_models.clone(), self.trusted_notebooks.clone());
@@ -1894,6 +1910,7 @@ impl Session {
             // [`Session::request_url`]) changed nothing: no undo step, nothing to save yet. The
             // session's own flag says so, not the answer, which a plugin's command could forge.
             (Ok(_), Some(_)) if std::mem::take(&mut self.request_only) => {}
+            (Ok(_), Some(_)) if !record_undo => {}
             (Ok(_), Some(mut snap)) => {
                 // A successful script may publish and then remove the layer. Its undo
                 // snapshot still needs the committed file record, even without a live layer

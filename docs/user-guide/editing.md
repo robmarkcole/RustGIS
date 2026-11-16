@@ -414,7 +414,8 @@ styles too, which the topmost and visible modes leave out.
 
 Circles and rotated boxes shared as GeoJSON reopen as ordinary polygons. To edit one with
 constrained handles again, turn **Edit › Edit** on, select its loaded polygon layer, right-click
-the object and choose **Convert to › Circle…** or **Rotated Box…**. The **Editing** pane also has
+the object and choose **Convert Polygon…**. Choose Circle or Rotated Box once, in the conversion
+pane. The **Editing** pane also has
 **Convert Selected Polygon…**, and Command Search has **Convert Polygon to Shape…**. These tools
 are available independently of any annotation workflow. A right-click keeps the selected object
 under the pointer; Alt-right-click cycles overlapping objects. In Explore, selection tools and
@@ -423,19 +424,30 @@ space preserves the selection but offers no conversion target. Circle and Rotate
 clear the selection on empty space, ready to draw another shape. Drawing and measurement tools
 keep their current selection when opening the map menu.
 
-1. Choose Circle or Rotated Box and a construction grid. The default is **Web Mercator grid
+1. Choose Circle or Rotated Box and a construction grid. The shape defaults to the active
+   Circle or Rotated Box tool when opening conversion; other tools default to Circle. The default is **Web Mercator grid
    metres**, not ground metres. Choose an open GeoTIFF to fit in its **original image pixels**,
    preserving the source affine transform, including rotation and shear, rather than using a
    display overview. Local GeoTIFFs and embedded/browser-uploaded GeoTIFFs are supported; remote
    original grids must be downloaded and added first. An unreadable or unsupported source gives
    an error, without falling back to a different grid.
-2. Click **Preview Conversion**. The orange outline previews the replacement without changing
-   the feature or undo history. The desktop performs fitting and header reads in the background,
-   with progress and Cancel in the status bar. Drag the map to pan while reviewing the preview.
-3. Review or adjust the centre and dimensions, then **Apply Conversion** or **Cancel Conversion**.
-   Apply replaces only this feature, preserves its ID and attributes, and enables the existing
+2. For a quick conversion, click **Convert Now** to fit and apply using the chosen shape and
+   grid, without a preview or another confirmation. Alternatively, click **Preview Conversion**
+   to show an orange outline without changing the feature or undo history, review or adjust the
+   centre and dimensions, then **Apply Conversion** or **Close**. Apply replaces Convert Now
+   in the same button position; the actions and Construction Grid stay in place after preview.
+3. Both routes replace only this feature, preserve its ID and attributes, and enable the existing
    Circle or Rotated Box editor. One Undo restores the original polygon and construction state;
-   Redo restores the conversion. Cancel leaves the geometry and history unchanged.
+   Redo restores the conversion. The desktop performs fitting and header reads in the background,
+   with progress and Cancel in the status bar. Cancel or a changed source/selection before fitting
+   finishes leaves the geometry and history unchanged. **Close** abandons an uncommitted
+   preview; **Cancel Fitting** stops an active fit. After applying, use the regular **Undo**
+   action to restore the original polygon. Drag the map to pan while fitting or
+   reviewing a preview.
+
+Conversion is not captured by **Record Task**: the proposal belongs to the current session and
+cannot safely be replayed after reopening a project. A notice explains when a conversion is
+omitted from the recording.
 
 A rotated box uses the minimum-area enclosing rectangle of the input vertices in the chosen
 planar grid (longer side as width, clockwise angle in `[0,180)`). A circle uses the centre of

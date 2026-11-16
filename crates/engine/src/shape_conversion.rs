@@ -479,6 +479,91 @@ mod tests {
     }
 
     #[test]
+    fn shape_conversion_plugin_handled_rejection_is_atomic_and_has_no_inner_undo() {
+        for (index, kind) in ["circle", "rotatedBox"].into_iter().enumerate() {
+            let (mut s, id) = ordinary(rectangle(Frame::default()).geometry().unwrap());
+            let initial = s.run("edit.previewShapeConversion", &json!({"row":0,"kind":"rotatedBox"})).unwrap();
+            s.run("edit.applyShapeConversion", &json!({"preview":initial,"confirm":true})).unwrap();
+            s.run("data.archive", &json!({"on":true})).unwrap();
+            s.run("data.attributeRule", &json!({"name":"Reclassify","kind":"calculation","field":"class","expression":"'changed'"}))
+                .unwrap();
+            let plugin = format!("shape-conversion-savepoint-{index}");
+            for reject in [true, false] {
+                if !reject {
+                    s.run("data.attributeRule", &json!({"name":"Reclassify","remove":true})).unwrap();
+                }
+                let preview = s.run("edit.previewShapeConversion", &json!({"row":0,"kind":kind})).unwrap();
+                let request = json!({"op":"edit.applyShapeConversion","params":{"preview":preview,"confirm":true}});
+                let wasm = rustgis_plugins::testing::wasm_with_handled_host_error(&request);
+                assert!(!wasm.is_empty());
+                let manifest = rustgis_plugins::testing::manifest(&plugin, &["edit"]);
+                let bytes = rustgis_plugins::testing::zip_of(&[("plugin.json", manifest.as_bytes()), ("plugin.wasm", &wasm)]);
+                rustgis_plugins::load(rustgis_plugins::Package::from_zip(&bytes).unwrap(), "test").unwrap();
+                let before = s.map().layer(id).unwrap().dataset.features[0].clone();
+                let archive = s.map().layer(id).unwrap().design.archive.clone();
+                let counts = s.run("edit.status", &json!({})).unwrap()["layers"].clone();
+                let depth = s.undo_depth();
+                let result = s.run(&format!("plugin:{plugin}/f"), &json!({})).unwrap();
+                assert_eq!(s.undo_depth(), depth + 1, "only the outer plugin records Undo");
+                if reject {
+                    assert!(result["handled"]["error"].as_str().unwrap().contains("attributes"), "{result}");
+                    assert_eq!(s.map().layer(id).unwrap().dataset.features[0], before);
+                    assert_eq!(s.map().layer(id).unwrap().design.archive, archive);
+                    assert_eq!(s.run("edit.status", &json!({})).unwrap()["layers"], counts);
+                    assert!(s.box_spec(id, 0).is_some() && s.circle_spec(id, 0).is_none());
+                } else {
+                    assert_eq!(result["handled"]["ok"]["converted"], 1, "{result}");
+                    assert_eq!(s.circle_spec(id, 0).is_some(), kind == "circle");
+                    assert_eq!(s.box_spec(id, 0).is_some(), kind == "rotatedBox");
+                    s.run("edit.undo", &json!({})).unwrap();
+                    assert_eq!(s.map().layer(id).unwrap().dataset.features[0], before);
+                }
+                rustgis_plugins::unload(&plugin);
+            }
+        }
+    }
+
+    #[test]
+    fn shape_conversion_scoped_preview_keeps_approved_named_and_implicit_selectors() {
+        use crate::policy::{Call, Effects, Outcome, Revocation, Scope};
+        use std::sync::Arc;
+        struct Live;
+        impl Revocation for Live {
+            fn allows(&self, _: Effects) -> bool {
+                true
+            }
+        }
+        for selector in [Value::Null, json!("Shared annotations")] {
+            for change_target in [false, true] {
+                let (mut s, id) = ordinary(rectangle(Frame::default()).geometry().unwrap());
+                let mut params = json!({"row":0,"kind":"circle"});
+                if !selector.is_null() {
+                    params["layer"] = selector.clone();
+                }
+                let call = Call::command("edit.previewShapeConversion", params);
+                let scope = Scope::assistant(2274, Arc::new(Live));
+                let Outcome::NeedsApproval(pending) = s.review(&scope, &call) else { panic!("preview needs Files approval") };
+                let read = s.start_scoped_archive_read(scope, &call, Some(pending.allow())).unwrap();
+                let done = read.run(&rustgis_analysis::control::Control::new()).unwrap();
+                if change_target {
+                    s.run("layer.rename", &json!({"layer":id,"name":"Renamed source"})).unwrap();
+                    let other = s.map_mut().add_dataset(Dataset::new("Shared annotations", GeometryType::Polygon, vec![]));
+                    s.active_layer = Some(other);
+                }
+                let result = crate::cmd::reads::read_land(&mut s, done);
+                if change_target {
+                    assert!(result.is_err());
+                } else {
+                    let proposal: Proposal = serde_json::from_value(result.unwrap()).unwrap();
+                    assert_eq!(proposal.layer, id);
+                    assert!(proposal.current(&s));
+                }
+                assert!(s.circle_spec(id, 0).is_none());
+            }
+        }
+    }
+
+    #[test]
     fn shape_conversion_background_preview_is_cancellable_and_rejects_changed_rows() {
         let (mut s, id) = ordinary(rectangle(Frame::default()).geometry().unwrap());
         let params = json!({"layer":id,"row":0,"kind":"rotatedBox"});

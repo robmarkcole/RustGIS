@@ -626,7 +626,14 @@ fn shape_conversion_preview_uses_the_worker_without_implicitly_applying() {
     let done = worker(relay.take_archive_read().unwrap());
     finish(&relay, &mut s, done);
     let answer = reply(&rx);
-    assert_ne!(answer["result"]["isError"], true, "{answer}");
+    assert!(answer.get("error").is_none(), "{answer}");
+    let result = answer.get("result").expect("preview returned no result");
+    assert_eq!(result["isError"], false, "{answer}");
+    let text = result["content"][0]["text"].as_str().unwrap();
+    let proposal: rustgis_engine::shape_conversion::Proposal = serde_json::from_str(text).unwrap();
+    assert_eq!((proposal.layer, proposal.row), (id, 0));
+    assert!(matches!(proposal.shape, rustgis_engine::shape_conversion::Shape::Circle(_)));
+    assert!(proposal.current(&s));
     assert_eq!(s.undo_depth(), depth);
     assert!(s.circle_spec(id, 0).is_none());
     relay.stop();

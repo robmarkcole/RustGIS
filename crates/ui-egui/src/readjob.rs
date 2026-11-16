@@ -36,13 +36,19 @@ impl Reads {
             .any(|a| a.command == "edit.previewShapeConversion" && a.params.get("request").and_then(Value::as_u64) == Some(request))
     }
     /// Closing a conversion preview cancels only its read, leaving unrelated queued work alone.
-    pub(crate) fn cancel_shape_conversion(&mut self) {
-        if let Some(job) = &self.job
-            && job.asked.command == "edit.previewShapeConversion"
+    pub(crate) fn cancel_shape_conversion(&mut self, request: u64) {
+        let belongs = |a: &Asked| {
+            a.command == "edit.previewShapeConversion"
+                && a.relay.is_none()
+                && a.params.get("request").and_then(Value::as_u64) == Some(request)
+        };
+        if let Some(job) = &mut self.job
+            && belongs(&job.asked)
         {
+            job.cancel_waiting = false;
             job.control.cancel();
         }
-        self.waiting.retain(|a| a.command != "edit.previewShapeConversion");
+        self.waiting.retain(|a| !belongs(a));
     }
 }
 
@@ -82,6 +88,8 @@ struct ReadJob {
     gone: Option<Gone>,
     name: &'static str,
     control: Arc<Control>,
+    /// Status-bar cancellation stops the queue; closing one conversion leaves other reads alone.
+    cancel_waiting: bool,
     slot: crate::Slot<Result<reads::Read, String>>,
     /// A reload's target and what its file held, looked at on its thread as the read started.
     seen: Option<(crate::diskwatch::Target, crate::Slot<crate::diskwatch::Seen>)>,
@@ -453,8 +461,10 @@ fn start(app: &mut RustGisApp, mut asked: Asked, p: Value) -> Result<Value, Stri
     let spawn = || if app.reads.fail_spawn { Err(std::io::Error::other("worker start refused for test")) } else { spawn() };
     let spawned = spawn();
     if let Err(e) = spawned {
-        if matches!(asked.command, "map.reloadTiles" | "map.repairTiles" | "service.add" | "service.layers" | "script.run")
-            || rustgis_engine::cmd::edit::table_edit_in_background(asked.command).is_some()
+        if matches!(
+            asked.command,
+            "map.reloadTiles" | "map.repairTiles" | "service.add" | "service.layers" | "script.run" | "edit.previewShapeConversion"
+        ) || rustgis_engine::cmd::edit::table_edit_in_background(asked.command).is_some()
         {
             let why = crate::i18n::fmt("The background worker could not start ({error}). Retry the command.", &[("error", &e.to_string())]);
             app.session.notify(why.clone(), true);
@@ -477,7 +487,7 @@ fn start(app: &mut RustGisApp, mut asked: Asked, p: Value) -> Result<Value, Stri
         return complete_here(app, asked, p, read);
     }
     let seen = watched.map(|(target, _)| (target, looked));
-    app.reads.job = Some(ReadJob { asked, gone: None, name, control, slot, seen });
+    app.reads.job = Some(ReadJob { asked, gone: None, name, control, cancel_waiting: true, slot, seen });
     Ok(json!({"started": name}))
 }
 
@@ -539,7 +549,7 @@ pub fn land(app: &mut RustGisApp) -> bool {
             (Some(why), _) | (None, Err(why)) => leave(app, &mut left, &job.asked, why),
             (None, Ok(p)) => {
                 if job.control.is_cancelled() {
-                    // Cancelled (once it had read too): it adds nothing, and nor does what waits.
+                    // Cancelled even after reading: add nothing. Only queue-wide cancellation also drops waiting reads.
                     let said = if job.asked.what.is_empty() {
                         crate::i18n::fmt("{tool} was cancelled", &[("tool", tl_raw!(job.name))])
                     } else {
@@ -547,17 +557,19 @@ pub fn land(app: &mut RustGisApp) -> bool {
                     };
                     app.session.notify(said.clone(), false);
                     not_run_asked(app, &job.asked, said);
-                    let waiting = std::mem::take(&mut app.reads.waiting);
-                    let n = waiting.len();
-                    let left_too = match n {
-                        1 => tl!("The one waiting after it was left too").to_string(),
-                        _ => crate::i18n::fmt("The {n} waiting after it were left too", &[("n", &n.to_string())]),
-                    };
-                    if n > 0 {
-                        app.session.notify(left_too.clone(), false);
-                    }
-                    for asked in waiting {
-                        not_run_asked(app, &asked, left_too.clone());
+                    if job.cancel_waiting {
+                        let waiting = std::mem::take(&mut app.reads.waiting);
+                        let n = waiting.len();
+                        let left_too = match n {
+                            1 => tl!("The one waiting after it was left too").to_string(),
+                            _ => crate::i18n::fmt("The {n} waiting after it were left too", &[("n", &n.to_string())]),
+                        };
+                        if n > 0 {
+                            app.session.notify(left_too.clone(), false);
+                        }
+                        for asked in waiting {
+                            not_run_asked(app, &asked, left_too.clone());
+                        }
                     }
                 } else {
                     // What its file held as its read started is what this reload acknowledges.
@@ -687,6 +699,84 @@ mod tests {
             assert!(std::time::Instant::now() < end, "the reads never landed");
             std::thread::sleep(std::time::Duration::from_millis(5)); // test-wait: legacy polling for background read completion
         }
+    }
+
+    #[test]
+    fn shape_conversion_worker_failure_does_not_fit_or_apply_on_the_frame() {
+        use egui_kittest::kittest::Queryable;
+        use rustgis_engine::{
+            Project, Session,
+            data::{Dataset, GeometryType},
+        };
+        let mut session = Session::new(Project::default());
+        let id = session.map_mut().add_dataset(Dataset::new("Polygons", GeometryType::Polygon, vec![]));
+        session.active_layer = Some(id);
+        session.run("edit.enable", &json!({"on":true})).unwrap();
+        session
+            .run(
+                "edit.addFeature",
+                &json!({"geometry":{"type":"Polygon","coordinates":[[[0.,0.],[0.01,0.],[0.01,0.01],[0.,0.01],[0.,0.]]]}}),
+            )
+            .unwrap();
+        let before = session.map().layer(id).unwrap().dataset.features[0].clone();
+        let depth = session.undo_depth();
+        let mut app = RustGisApp::new(session);
+        app.reads_off_frame = true;
+        app.reads.fail_spawn = true;
+        app.run("ui.convertShape", json!({"kind":"circle"})).unwrap();
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1400., 900.)).with_max_steps(1000).build_ui_state(
+            |ui, app: &mut RustGisApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            app,
+        );
+        h.get_by_label("Convert Now").click();
+        h.run();
+        assert_eq!(h.state().session.map().layer(id).unwrap().dataset.features[0], before);
+        assert_eq!(h.state().session.undo_depth(), depth);
+        assert!(h.state().session.circle_spec(id, 0).is_none());
+        assert!(!showing(h.state()));
+        assert!(h.state().session.notices.iter().any(|n| n.error && n.text.contains("worker could not start")));
+        assert!(h.query_by_label("Convert Now").is_some(), "the form remains available for retry");
+    }
+
+    #[test]
+    fn shape_conversion_cancel_keeps_other_reads_and_other_preview_requests() {
+        use rustgis_engine::{
+            Project, Session,
+            box_edit::{BoxSpec, Frame},
+            data::{Dataset, GeometryType},
+        };
+        let mut session = Session::new(Project::default());
+        let id = session.map_mut().add_dataset(Dataset::new("Polygons", GeometryType::Polygon, vec![]));
+        session.active_layer = Some(id);
+        session.run("edit.enable", &json!({"on":true})).unwrap();
+        let shape = BoxSpec { frame: Frame::default(), center: [1000., 1000.], width: 100., height: 50., angle: 20. };
+        session
+            .run("edit.addFeature", &json!({"geometry":rustgis_engine::data::io::geometry_to_geojson(&shape.geometry().unwrap())}))
+            .unwrap();
+        let mut app = RustGisApp::new(session);
+        app.reads_off_frame = true;
+        fn completed(app: &mut RustGisApp, result: Landed) {
+            let Landed::Ran(Ok(value)) = result else { panic!("unrelated preview was cancelled") };
+            assert_eq!(value["request"], 18);
+            app.session.notify("Unrelated preview completed", false);
+        }
+        run(&mut app, "edit.previewShapeConversion", json!({"layer":id,"row":0,"kind":"circle","request":17})).unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        let file = folder.path().join("queued.csv");
+        std::fs::write(&file, "name,lon,lat\nQueued,1,2\n").unwrap();
+        run(&mut app, "layer.addData", json!({"path":file,"name":"Queued layer"})).unwrap();
+        run_then(&mut app, "edit.previewShapeConversion", json!({"layer":id,"row":0,"kind":"circle","request":18}), Some(completed))
+            .unwrap();
+        assert_eq!(app.reads.waiting.len(), 2);
+        app.reads.cancel_shape_conversion(17);
+        landed(&mut app, 60);
+        assert!(app.session.map().layer_by_name("Queued layer").is_some());
+        assert!(app.session.notices.iter().any(|n| n.text == "Unrelated preview completed"));
+        assert!(app.session.circle_spec(id, 0).is_none());
     }
 
     fn relay_command(id: u64, command: &str, params: Value) -> Value {

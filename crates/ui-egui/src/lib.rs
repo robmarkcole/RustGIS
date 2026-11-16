@@ -3039,6 +3039,10 @@ impl RustGisApp {
         // Export Table writes a file without changing the project, but remains a replayable
         // task step. Other exports keep their existing recording behavior.
         let Some(spec) = self.session.registry.get(id).filter(|c| c.mutates || id == "share.exportTable").copied() else { return };
+        if id == "edit.applyShapeConversion" {
+            self.session.notify(tl!("Shape conversion isn't recorded: its preview belongs to this session. Convert the polygon explicitly after reopening the project."), false);
+            return;
+        }
         // Downloaded data is kept for this session only, and adding it uses it up: a task
         // couldn't add it again.
         // A result handed over by the app (`ran`: a summary worked out on a thread) is used up

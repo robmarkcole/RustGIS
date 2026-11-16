@@ -45,11 +45,13 @@ struct Form {
     kind: String,
     image: Option<u32>,
     pending: bool,
+    apply_after_fit: bool,
     proposal: Option<Proposal>,
     error: Option<String>,
 }
 fn valid(app: &RustGisApp, f: &Form) -> bool {
     app.session.map().instance_id() == f.map
+        && (!f.apply_after_fit || app.session.tool == rustgis_engine::Tool::Explore)
         && app.session.active_layer == Some(f.layer)
         && f.image.is_none_or(|id| {
             app.session.map().layer(id).is_some_and(|l| {
@@ -111,7 +113,11 @@ pub(crate) fn open(app: &mut RustGisApp, p: &Value) -> Result<(), String> {
     rustgis_engine::box_edit::check_tool(&app.session, layer)?;
     let l = app.session.map().layer(layer).ok_or("no layer")?;
     let [row] = l.selection.as_slice() else { return Err(tl!("Select one polygon to convert.").into()) };
-    let kind = p.get("kind").and_then(Value::as_str).unwrap_or("circle");
+    let default_kind = match app.session.tool {
+        rustgis_engine::Tool::RotatedBox => "rotatedBox",
+        _ => "circle",
+    };
+    let kind = p.get("kind").and_then(Value::as_str).unwrap_or(default_kind);
     if !matches!(kind, "circle" | "rotatedBox") {
         return Err(tl!("Choose Circle or Rotated Box.").into());
     }
@@ -129,6 +135,7 @@ pub(crate) fn open(app: &mut RustGisApp, p: &Value) -> Result<(), String> {
         kind: kind.into(),
         image: None,
         pending: false,
+        apply_after_fit: false,
         proposal: None,
         error: None,
     });
@@ -140,19 +147,17 @@ pub(crate) fn open(app: &mut RustGisApp, p: &Value) -> Result<(), String> {
 pub(crate) fn menu(app: &mut RustGisApp, ui: &mut egui::Ui) {
     let Some(target) = app.conversion.menu.filter(|t| t.current(app)) else { return };
     let layer = target.layer;
-    ui.menu_button(tl!("Convert to"), |ui| {
-        for (kind, label) in [("circle", tl!("Circle…")), ("rotatedBox", tl!("Rotated Box…"))] {
-            if ui.button(label).clicked() {
-                let _ = app.run("ui.convertShape", json!({"layer":layer,"kind":kind}));
-                ui.close();
-            }
-        }
-    });
+    if ui.button(tl!("Convert Polygon…")).clicked() {
+        let _ = app.run("ui.convertShape", json!({"layer":layer}));
+        ui.close();
+    }
 }
 pub(crate) fn landed(app: &mut RustGisApp, result: crate::Landed) {
     let Some(mut f) = app.conversion.form.take() else { return };
     if !valid(app, &f) {
-        app.session.notify(tl!("Conversion preview closed because the source or selection changed."), false);
+        #[cfg(not(target_arch = "wasm32"))]
+        app.reads.cancel_shape_conversion(f.request);
+        app.session.notify(tl!("Conversion closed because the source, selection or tool changed."), false);
         return;
     }
     if let crate::Landed::Ran(Ok(ref answer)) = result
@@ -184,7 +189,27 @@ pub(crate) fn landed(app: &mut RustGisApp, result: crate::Landed) {
         },
         crate::Landed::Ran(Err(e)) | crate::Landed::NotRun(e) => f.error = Some(e),
     }
+    let apply_after_fit = f.apply_after_fit;
+    f.apply_after_fit = false;
+    if apply_after_fit && apply_proposal(app, &mut f) {
+        return;
+    }
     app.conversion.form = Some(f);
+}
+/// Synchronous, bounded Apply after the shared cancellable fit has landed and passed its source
+/// checks. Both the reviewed and direct paths use the same engine transaction and editor.
+fn apply_proposal(app: &mut RustGisApp, f: &mut Form) -> bool {
+    let Some(p) = &f.proposal else { return false };
+    match app.run("edit.applyShapeConversion", json!({"preview":p,"confirm":true})) {
+        Ok(_) => {
+            let _ = app.run("tool.set", json!({"tool":f.kind}));
+            true
+        }
+        Err(e) => {
+            f.error = Some(e);
+            false
+        }
+    }
 }
 pub(crate) fn panel(app: &mut RustGisApp, ui: &mut egui::Ui) {
     let Some(mut f) = app.conversion.form.take() else {
@@ -198,7 +223,9 @@ pub(crate) fn panel(app: &mut RustGisApp, ui: &mut egui::Ui) {
         return;
     };
     if !valid(app, &f) {
-        app.session.notify(tl!("Conversion preview closed because the source or selection changed."), false);
+        #[cfg(not(target_arch = "wasm32"))]
+        app.reads.cancel_shape_conversion(f.request);
+        app.session.notify(tl!("Conversion closed because the source, selection or tool changed."), false);
         return;
     }
     ui.heading(tl!("Convert Polygon"));
@@ -211,6 +238,54 @@ pub(crate) fn panel(app: &mut RustGisApp, ui: &mut egui::Ui) {
                 changed |= ui.selectable_value(&mut f.kind, "circle".into(), tl!("Circle")).changed();
                 changed |= ui.selectable_value(&mut f.kind, "rotatedBox".into(), tl!("Rotated Box")).changed();
             });
+    });
+    if changed {
+        f.proposal = None;
+        f.image_stamp = None;
+        f.error = None;
+    }
+    let reviewed = f.proposal.is_some();
+    let can_apply = f.proposal.as_ref().is_some_and(|p| p.shape.geometry().is_ok());
+    let convert_label = tl!("Convert Now");
+    let apply_label = tl!("Apply Conversion");
+    let action_width = [convert_label, apply_label]
+        .into_iter()
+        .map(|label| {
+            ui.painter().layout_no_wrap(label.into(), egui::TextStyle::Button.resolve(ui.style()), ui.visuals().text_color()).size().x
+        })
+        .fold(0., f32::max)
+        + ui.spacing().button_padding.x * 2.;
+    let (preview, primary) = ui
+        .horizontal(|ui| {
+            let primary = ui
+                .add_enabled_ui(!f.pending && (!reviewed || can_apply), |ui| {
+                    ui.add_sized(
+                        [action_width, ui.spacing().interact_size.y],
+                        egui::Button::new(if reviewed { apply_label } else { convert_label }),
+                    )
+                })
+                .inner
+                .clicked();
+            let preview = ui.add_enabled(!f.pending, egui::Button::new(tl!("Preview Conversion"))).clicked();
+            (preview, primary)
+        })
+        .inner;
+    let convert = primary && !reviewed;
+    let apply = primary && reviewed;
+    let close_label = if f.pending { tl!("Cancel Fitting") } else { tl!("Close") };
+    if ui
+        .button(close_label)
+        .on_hover_text(tl!("Close without applying the preview and stop any pending fit. Use Undo after applying a conversion."))
+        .clicked()
+    {
+        #[cfg(not(target_arch = "wasm32"))]
+        app.reads.cancel_shape_conversion(f.request);
+        if app.session.tool == rustgis_engine::Tool::Explore {
+            let _ = app.run("tool.set", json!({"tool":f.previous_tool.code()}));
+        }
+        return;
+    }
+    ui.add_enabled_ui(!f.pending, |ui| {
         let title = f
             .image
             .and_then(|id| app.session.map().layer(id))
@@ -243,7 +318,9 @@ pub(crate) fn panel(app: &mut RustGisApp, ui: &mut egui::Ui) {
         ui.spinner();
         ui.label(tl!("Fitting in progress. Cancel is also available in the status bar."));
     }
-    let preview = ui.add_enabled(!f.pending, egui::Button::new(tl!("Preview Conversion"))).clicked();
+    if f.proposal.is_none() {
+        ui.small(tl!("Convert Now fits and applies immediately. Preview Conversion lets you review or adjust first."));
+    }
     if let Some(p) = &mut f.proposal {
         let frame = match &p.shape {
             Shape::Circle(c) => &c.frame,
@@ -272,33 +349,17 @@ pub(crate) fn panel(app: &mut RustGisApp, ui: &mut egui::Ui) {
     if let Some(e) = &f.error {
         ui.colored_label(egui::Color32::RED, e);
     }
-    let can_apply = !f.pending && f.proposal.as_ref().is_some_and(|p| p.shape.geometry().is_ok());
-    let apply = ui.add_enabled(can_apply, egui::Button::new(tl!("Apply Conversion"))).clicked();
-    if ui.button(tl!("Cancel Conversion")).clicked() {
-        #[cfg(not(target_arch = "wasm32"))]
-        app.reads.cancel_shape_conversion();
-        if app.session.tool == rustgis_engine::Tool::Explore {
-            let _ = app.run("tool.set", json!({"tool":f.previous_tool.code()}));
-        }
+    ui.separator();
+    if apply && apply_proposal(app, &mut f) {
         return;
     }
-    ui.separator();
-    if apply && let Some(p) = &f.proposal {
-        let params = json!({"preview":p,"confirm":true});
-        match app.run("edit.applyShapeConversion", params) {
-            Ok(_) => {
-                let _ = app.run("tool.set", json!({"tool":f.kind}));
-                return;
-            }
-            Err(e) => f.error = Some(e),
-        }
-    }
-    let params = preview.then(|| {
+    let params = (preview || convert).then(|| {
         app.conversion.next_request = app.conversion.next_request.saturating_add(1);
         f.request = app.conversion.next_request;
         f.image_stamp =
             f.image.and_then(|id| app.session.map().layer(id)).map(|l| (l.instance_id(), l.replacement_revision(), l.geometry_rev));
         f.pending = true;
+        f.apply_after_fit = convert;
         f.proposal = None;
         f.error = None;
         let mut p = json!({"layer":f.layer,"row":f.row,"kind":f.kind,"request":f.request});
@@ -356,6 +417,62 @@ mod tests {
             .build_ui_state(|ui, app| panel(app, ui), app)
     }
     #[test]
+    fn shape_conversion_defaults_follow_the_active_tool_and_close_restores_it() {
+        for (tool, explicit, expected) in [
+            (Tool::Circle, None, "circle"),
+            (Tool::RotatedBox, None, "rotatedBox"),
+            (Tool::Explore, None, "circle"),
+            (Tool::RotatedBox, Some("circle"), "circle"),
+            (Tool::Circle, Some("rotatedBox"), "rotatedBox"),
+        ] {
+            let mut app = app();
+            app.conversion.form = None;
+            app.run("tool.set", json!({"tool":tool.code()})).unwrap();
+            let depth = app.session.undo_depth();
+            let mut params = json!({});
+            if let Some(kind) = explicit {
+                params["kind"] = json!(kind);
+            }
+            app.run("ui.convertShape", params).unwrap();
+            assert_eq!(app.conversion.form.as_ref().unwrap().kind, expected);
+            let mut h = harness(app);
+            let shown = if expected == "circle" { "Circle" } else { "Rotated Box" };
+            assert!(h.query_all_by_role(egui::accesskit::Role::ComboBox).any(|node| node.value().as_deref() == Some(shown)));
+            h.get_by_label("Close").click();
+            h.run();
+            assert!(h.state().conversion.form.is_none());
+            assert_eq!(h.state().session.tool, tool);
+            assert_eq!(h.state().session.undo_depth(), depth);
+        }
+    }
+
+    #[test]
+    fn shape_conversion_preview_keeps_actions_and_grid_in_place() {
+        for kind in ["circle", "rotatedBox"] {
+            let mut app = app();
+            open(&mut app, &json!({"kind":kind})).unwrap();
+            let mut h = harness(app);
+            let primary = h.get_by_label("Convert Now").rect();
+            let preview = h.get_by_label("Preview Conversion").rect();
+            let close = h.get_by_label("Close").rect();
+            let grid = h.get_by_label("Construction Grid").rect();
+            assert!(primary.max.y < grid.min.y);
+            for _ in 0..2 {
+                h.get_by_label("Preview Conversion").click();
+                h.run();
+                assert!(h.state().conversion.form.as_ref().unwrap().proposal.is_some());
+                assert_eq!(h.get_by_label("Apply Conversion").rect(), primary);
+                assert_eq!(h.get_by_label("Preview Conversion").rect(), preview);
+                assert_eq!(h.get_by_label("Close").rect(), close);
+                assert_eq!(h.get_by_label("Construction Grid").rect(), grid);
+            }
+            h.get_by_label("Apply Conversion").click();
+            h.run();
+            assert!(h.state().conversion.form.is_none());
+        }
+    }
+
+    #[test]
     fn shape_conversion_preview_cancel_and_apply_use_the_existing_editor() {
         for apply in [false, true] {
             let app = app();
@@ -368,7 +485,7 @@ mod tests {
             assert!(h.state().conversion.form.as_ref().unwrap().proposal.is_some());
             assert_eq!(h.state().session.undo_depth(), depth);
             assert_eq!(h.state().session.map().layer(id).unwrap().dataset.features[0], before);
-            h.get_by_label(if apply { "Apply Conversion" } else { "Cancel Conversion" }).click();
+            h.get_by_label(if apply { "Apply Conversion" } else { "Close" }).click();
             h.run();
             assert!(h.state().conversion.form.is_none());
             assert_eq!(h.state().session.undo_depth(), depth + usize::from(apply));
@@ -378,6 +495,178 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn shape_conversion_convert_now_applies_once_and_uses_the_chosen_shape() {
+        for kind in ["circle", "rotatedBox"] {
+            let mut app = app();
+            open(&mut app, &json!({"kind":"circle"})).unwrap();
+            let id = app.session.active_layer.unwrap();
+            let before = app.session.map().layer(id).unwrap().dataset.features[0].clone();
+            let depth = app.session.undo_depth();
+            let mut h = harness(app);
+            if kind == "rotatedBox" {
+                h.query_all_by_role(egui::accesskit::Role::ComboBox)
+                    .find(|node| node.value().as_deref() == Some("Circle"))
+                    .unwrap()
+                    .click();
+                h.run();
+                h.get_by_label("Rotated Box").click();
+                h.run();
+            }
+            assert_eq!(h.state().session.undo_depth(), depth, "choosing the shape must not convert it");
+            assert_eq!(h.state().session.map().layer(id).unwrap().dataset.features[0], before);
+            h.get_by_label("Convert Now").click();
+            h.run();
+            let app = h.state_mut();
+            assert!(app.conversion.form.is_none());
+            assert_eq!(app.session.undo_depth(), depth + 1);
+            assert_eq!(app.session.tool.code(), kind);
+            let after = &app.session.map().layer(id).unwrap().dataset.features[0];
+            assert_eq!(after.id, before.id);
+            assert_eq!(after.attrs, before.attrs);
+            assert_eq!(app.session.circle_spec(id, 0).is_some(), kind == "circle");
+            assert_eq!(app.session.box_spec(id, 0).is_some(), kind == "rotatedBox");
+            app.run("edit.undo", json!({})).unwrap();
+            assert_eq!(app.session.map().layer(id).unwrap().dataset.features[0], before);
+            assert!(app.session.circle_spec(id, 0).is_none() && app.session.box_spec(id, 0).is_none());
+            app.run("edit.redo", json!({})).unwrap();
+            assert_eq!(app.session.circle_spec(id, 0).is_some(), kind == "circle");
+            assert_eq!(app.session.box_spec(id, 0).is_some(), kind == "rotatedBox");
+        }
+    }
+
+    #[test]
+    fn shape_conversion_convert_now_uses_the_selected_original_image_grid() {
+        use rustgis_engine::data::raster::{ColorHint, Crs, GeoTransform, Raster, geotiff};
+        let mut app = app();
+        let id = app.session.active_layer.unwrap();
+        let raster = Raster::new(
+            "image",
+            16,
+            16,
+            vec![vec![1.; 256]],
+            GeoTransform { origin_x: 840., origin_y: -840., pixel_width: 20., pixel_height: -20. },
+            Crs::from_epsg(3857).unwrap(),
+            None,
+            ColorHint::Gray,
+            "UInt8",
+        )
+        .unwrap();
+        let bytes = geotiff::write(&raster, 0).unwrap();
+        let expected = Frame::from_grid(&geotiff::read_image_grid(std::io::Cursor::new(&bytes)).unwrap()).unwrap();
+        let image =
+            app.session.map_mut().add_raster("Image pixels", rustgis_engine::map::RasterLayer::from_bytes(raster, "image.tif", bytes));
+        app.conversion.form.as_mut().unwrap().image = Some(image);
+        let mut h = harness(app);
+        h.get_by_label("Convert Now").click();
+        h.run();
+        assert!(h.state().conversion.form.is_none());
+        assert_eq!(h.state().session.box_spec(id, 0).unwrap().frame, expected);
+    }
+
+    #[test]
+    fn shape_conversion_not_recorded_as_a_session_bound_task() {
+        for direct in [false, true] {
+            let mut app = app();
+            app.ws.recording = Some(Vec::new());
+            let mut h = harness(app);
+            h.get_by_label(if direct { "Convert Now" } else { "Preview Conversion" }).click();
+            h.run();
+            if !direct {
+                h.get_by_label("Apply Conversion").click();
+                h.run();
+            }
+            assert!(h.state().conversion.form.is_none());
+            assert!(h.state().ws.recording.as_ref().unwrap().is_empty());
+            assert!(h.state().session.notices.iter().any(|n| n.text.contains("Shape conversion isn't recorded")));
+        }
+    }
+
+    #[test]
+    fn shape_conversion_convert_now_respects_fit_and_edit_rule_failures() {
+        for bad_fit in [false, true] {
+            let mut app = app();
+            if bad_fit {
+                let g = app.session.map().layers[0].dataset.features[0].geometry.clone().unwrap();
+                let rustgis_engine::data::Geometry::Polygon(mut polygons) = g else { panic!() };
+                let hole = polygons[0][0].clone();
+                polygons[0].push(hole);
+                app.run("edit.setGeometry", json!({"row":0,"geometry":rustgis_engine::data::io::geometry_to_geojson(&rustgis_engine::data::Geometry::Polygon(polygons))})).unwrap();
+            } else {
+                app.run("data.attributeRule", json!({"name":"Never","kind":"constraint","expression":"1 = 0"})).unwrap();
+            }
+            open(&mut app, &json!({"kind":"circle"})).unwrap();
+            let id = app.session.active_layer.unwrap();
+            let before = app.session.map().layer(id).unwrap().dataset.features[0].clone();
+            let depth = app.session.undo_depth();
+            let mut h = harness(app);
+            h.get_by_label("Convert Now").click();
+            h.run();
+            let app = h.state();
+            let form = app.conversion.form.as_ref().unwrap();
+            assert!(form.error.is_some());
+            assert!(!form.pending && !form.apply_after_fit);
+            assert_eq!(app.session.undo_depth(), depth);
+            assert_eq!(app.session.map().layer(id).unwrap().dataset.features[0], before);
+            assert!(app.session.circle_spec(id, 0).is_none());
+        }
+    }
+
+    #[test]
+    fn shape_conversion_convert_now_does_not_apply_after_changing_tools() {
+        let mut app = app();
+        let request = app.conversion.form.as_ref().unwrap().request;
+        let answer = app.session.run("edit.previewShapeConversion", &json!({"row":0,"kind":"rotatedBox","request":request})).unwrap();
+        let form = app.conversion.form.as_mut().unwrap();
+        form.pending = true;
+        form.apply_after_fit = true;
+        let depth = app.session.undo_depth();
+        app.run("tool.set", json!({"tool":"measure"})).unwrap();
+        landed(&mut app, crate::Landed::Ran(Ok(answer)));
+        assert!(app.conversion.form.is_none());
+        assert_eq!(app.session.undo_depth(), depth);
+        assert_eq!(app.session.tool, Tool::Measure);
+        assert!(app.session.box_spec(app.session.active_layer.unwrap(), 0).is_none());
+    }
+
+    #[test]
+    fn shape_conversion_direct_late_results_cannot_apply_after_cancel_or_retarget() {
+        for cancel in [false, true] {
+            let mut app = app();
+            let request = app.conversion.form.as_ref().unwrap().request;
+            let answer = app.session.run("edit.previewShapeConversion", &json!({"row":0,"kind":"rotatedBox","request":request})).unwrap();
+            let form = app.conversion.form.as_mut().unwrap();
+            form.pending = true;
+            form.apply_after_fit = true;
+            let depth = app.session.undo_depth();
+            let id = app.session.active_layer.unwrap();
+            let before = app.session.map().layer(id).unwrap().dataset.features[0].clone();
+            if cancel {
+                let mut h = harness(app);
+                h.get_by_label("Cancel Fitting").click();
+                h.run();
+                app = h.into_state();
+            } else {
+                open(&mut app, &json!({"kind":"circle"})).unwrap();
+                let form = app.conversion.form.as_mut().unwrap();
+                form.pending = true;
+                form.apply_after_fit = true;
+            }
+            landed(&mut app, crate::Landed::Ran(Ok(answer)));
+            assert_eq!(app.session.undo_depth(), depth);
+            assert_eq!(app.session.map().layer(id).unwrap().dataset.features[0], before);
+            assert!(app.session.box_spec(id, 0).is_none() && app.session.circle_spec(id, 0).is_none());
+            if cancel {
+                assert!(app.conversion.form.is_none());
+            } else {
+                assert!(app.conversion.form.as_ref().unwrap().pending);
+                app.run("select.clear", json!({})).unwrap();
+                landed(&mut app, crate::Landed::Ran(Err("cancelled".into())));
+                assert!(app.conversion.form.is_none());
+            }
+        }
+    }
+
     #[test]
     fn shape_conversion_selection_changes_and_late_answers_never_retarget() {
         let mut app = app();
@@ -431,9 +720,9 @@ mod overlap_tests {
             }
             h.run_steps(3);
             assert_eq!(h.state().session.map().layer(id).unwrap().selection, [1], "{tool:?}");
-            h.get_by_label("Convert to").click();
-            h.run();
-            h.get_by_label("Circle…").click();
+            assert!(h.query_by_label("Circle…").is_none());
+            assert!(h.query_by_label("Rotated Box…").is_none());
+            h.get_by_label("Convert Polygon…").click();
             h.run();
             assert_eq!(h.state().conversion.form.as_ref().unwrap().row, 1, "{tool:?}");
         }
