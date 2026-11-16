@@ -13,6 +13,7 @@ mod construction;
 pub mod durable;
 pub mod extensions;
 pub mod geometry_calc;
+pub mod image_grid;
 pub mod model;
 mod notice_text;
 #[cfg(not(target_arch = "wasm32"))]

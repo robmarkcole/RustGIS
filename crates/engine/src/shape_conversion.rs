@@ -213,27 +213,7 @@ fn target(s: &Session, p: &Value) -> Result<Proposal, String> {
 }
 fn frame(raster: Option<&rustgis_map::raster::RasterLayer>, p: &Value) -> Result<Frame, String> {
     if let Some(r) = raster {
-        let grid = if let Some(bytes) = &r.embedded {
-            rustgis_data::raster::geotiff::read_image_grid(std::io::Cursor::new(bytes.as_slice()))
-        } else {
-            let path = r
-                .path
-                .as_deref()
-                .filter(|p| rustgis_map::paths::is_local(p))
-                .ok_or("choose a local or embedded GeoTIFF; remote original grids are not read by conversion")?;
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                let input = std::fs::File::open(path).map_err(|e| e.to_string())?;
-                rustgis_data::raster::geotiff::read_image_grid(input)
-            }
-            #[cfg(target_arch = "wasm32")]
-            {
-                let _ = path;
-                return Err("upload the original GeoTIFF to use its grid in the browser".into());
-            }
-        }
-        .map_err(|e| e.to_string())?;
-        Frame::from_grid(&grid)
+        crate::image_grid::read(r)
     } else if let Some(f) = p.get("frame") {
         serde_json::from_value(f.clone()).map_err(|e| e.to_string())
     } else {

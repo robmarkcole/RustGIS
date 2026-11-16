@@ -157,6 +157,45 @@ you edit the value or choose units; click **Apply elevation** to apply the new i
   [Geoprocessing tools](analysis.md#geoprocessing-tools), **Near the poles**).
 - **Status**: features added, changed and deleted per layer since the last save.
 
+### Annotating an image
+
+**Analyze → Annotate** opens the annotation pane. It is also available from **View → Windows**
+and Command Search. Add a GeoTIFF and a polygon feature layer first, then choose the **Image**
+and **Target layer** in the pane, enable editing, and choose Circle or Rotated Box.
+The ordinary tools remain available under Edit and share these settings.
+
+Selecting an image defaults the **New shape grid** to **Original image pixels**. RustGIS reads
+its original TIFF header, including rotation and shear, independently of any displayed overview.
+New box widths/heights and circle radii are then expressed in source-image pixels. A circle in
+image coordinates may appear elliptical on the map; a rectangle may appear skewed. The image is
+not resampled by this choice, and shapes are not clipped to its boundary.
+
+Choose **Web Mercator grid metres** explicitly to draw in map coordinates instead; those are not
+ground-distance metres. Choosing **No image** restores that grid. Under Edit, the same choices
+are in Editing → New shape grid when a circle or rotated box tool is active. Grid changes affect
+new shapes; existing shapes retain their own construction grid when moved, resized or rotated.
+Undo/Redo retain those constructions within the session.
+
+On desktop, header reads run in the background with progress and Cancel. Changing images,
+switching to Web Mercator or using **Cancel Grid Read** stops only that lookup and preserves
+unrelated queued work. The status-bar Cancel retains its queue-wide behaviour. Pixel-based
+drawing waits for a valid grid; a failed or cancelled read never silently substitutes map metres.
+After changing a source file externally, reload the image layer first, then use **Reload Grid**.
+Removing/replacing an image invalidates its cached grid. Local and embedded GeoTIFFs are supported; download remote originals
+first. In the browser, upload the original GeoTIFF.
+
+Space or middle-drag pans; releasing Space keeps the drawing tool. Use the selected object's
+existing handles and numeric controls, Undo/Redo, and **Export GeoJSON…**. Exports contain
+ordinary geographic polygons and feature properties; circles are polygon approximations.
+Image selection, grid choices and exact constructions are session-only. Reopened polygons can
+be explicitly converted again. No image-binding metadata or palette sidecars are added.
+
+For CLI, Python, Assistant/MCP and permitted plugins, `raster.imageGrid={"layer":"Image"}`
+returns the original `epsg`, `width`, `height` and six affine coefficients in the same format
+accepted by `edit.addBox.box.frame` and `edit.addCircle.circle.frame`. The query is read-only,
+requires Files permission, and uses the shared read worker on desktop/MCP. Headless synchronous
+callers must run file reads off their own UI thread.
+
 ### Rotated boxes
 
 Choose a loaded, visible polygon layer, turn **Edit › Edit** on, and select **Edit › Features ›

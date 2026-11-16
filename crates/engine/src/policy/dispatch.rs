@@ -124,7 +124,10 @@ impl Session {
         let CallKind::Command { id, params } = &call.kind else {
             return Err("only standalone archive or column-statistics commands can prepare a scoped read".into());
         };
-        if !matches!(id.as_str(), "map.reloadTiles" | "map.repairTiles" | "table.statistics" | "edit.previewShapeConversion") {
+        if !matches!(
+            id.as_str(),
+            "map.reloadTiles" | "map.repairTiles" | "table.statistics" | "edit.previewShapeConversion" | "raster.imageGrid"
+        ) {
             return Err("only standalone archive or column-statistics commands can prepare a scoped read".into());
         }
         let capture = |s: &mut Session| s.capture_read(id, params);
@@ -156,6 +159,7 @@ impl Session {
                 | "service.add"
                 | "source.syncState"
                 | "table.statistics"
+                | "raster.imageGrid"
                 | "edit.previewShapeConversion"
         ) && crate::cmd::edit::table_edit_in_background(command).is_none()
         {
@@ -172,8 +176,9 @@ impl Session {
                 | "labels.convert"
                 | "source.syncState"
                 | "table.statistics"
+                | "raster.imageGrid"
                 | "edit.previewShapeConversion"
-        ) && (command != "edit.previewShapeConversion" || self.policy_user())
+        ) && (!matches!(command, "edit.previewShapeConversion" | "raster.imageGrid") || self.policy_user())
             || (command == "edit.convertField" && params.get("table").is_none_or(Value::is_null))
         {
             let id = self.layer_id(&Value::Object(params.clone()))?;

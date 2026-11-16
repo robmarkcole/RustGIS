@@ -89,6 +89,7 @@ pub enum Landed {
     Ran(Result<Value, String>),
     NotRun(String),
 }
+mod annotation;
 mod boxedit;
 mod circleedit;
 #[cfg(not(target_arch = "wasm32"))]
@@ -655,6 +656,7 @@ pub enum RightPane {
     Symbology,
     History,
     Editing,
+    Annotation,
     Design,
     Workflows,
     Script,
@@ -1165,6 +1167,7 @@ pub struct RustGisApp {
     pub(crate) boxes: boxedit::State,
     pub(crate) circles: circleedit::State,
     pub(crate) conversion: shapeconvert::State,
+    pub(crate) annotation: annotation::State,
     pub ui: UiState,
     pub map: mapview::MapView,
     pub dialogs: dialogs::Dialogs,
@@ -1472,6 +1475,7 @@ impl RustGisApp {
             boxes: boxedit::State::default(),
             circles: circleedit::State::default(),
             conversion: shapeconvert::State::default(),
+            annotation: annotation::State::default(),
             ui,
             map: mapview::MapView::default(),
             dialogs: dialogs::Dialogs::default(),
@@ -2746,6 +2750,9 @@ impl RustGisApp {
             }
             // Counting a column goes over every row of the layer: on a thread of its own, and the
             // answer shown once it lands (the table's Statistics window).
+            if id == "raster.imageGrid" {
+                return readjob::run(self, "raster.imageGrid", params);
+            }
             if id == "edit.previewShapeConversion" {
                 return readjob::run_shape_conversion(self, params);
             }
@@ -2864,6 +2871,7 @@ impl RustGisApp {
         // Nested commands (including scripts) can replace rows too; never retarget a chosen
         // vertex or held gesture to the replacement feature at the same row.
         crate::vertexedit::cancel_stale_drag(self);
+        annotation::sync(self);
         crate::boxedit::cancel_stale(self);
         crate::circleedit::cancel_stale(self);
         if let Err(e) = &r {
@@ -3315,6 +3323,17 @@ impl RustGisApp {
                     return self.run_ui("ui.pane.layerProperties", &json!({"tab": "source", "layer": layer}));
                 }
             }
+            "ui.pane.annotation" => {
+                if self.ui.right == Some(RightPane::Annotation) {
+                    self.ui.close_right(RightPane::Annotation);
+                } else {
+                    annotation::open(self)?;
+                }
+            }
+            "ui.annotationImage" => annotation::select_image(self, p)?,
+            "ui.annotationGrid" => annotation::select_grid(self, p.get("pixels").and_then(Value::as_bool).ok_or("pixels is required")?)?,
+            "ui.annotationCancel" => annotation::cancel_read(self),
+            "ui.annotationLayer" => annotation::select_layer(self, p)?,
             "ui.pane.editing" => toggle_right(&mut self.ui, RightPane::Editing),
             "ui.pane.design" => toggle_right(&mut self.ui, RightPane::Design),
             "ui.pane.script" => toggle_right(&mut self.ui, RightPane::Script),
@@ -5971,6 +5990,7 @@ impl RustGisApp {
 
     /// Per-frame work that doesn't draw (theme, fonts, files that arrived).
     pub fn logic(&mut self, ctx: &egui::Context) {
+        annotation::sync(self);
         #[cfg(not(target_arch = "wasm32"))]
         self.session.statistics_need_read_ahead(self.reads_off_frame);
         let _diagnostics = self.session.diagnostics.enter();

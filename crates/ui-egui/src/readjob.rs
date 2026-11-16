@@ -36,6 +36,14 @@ impl Reads {
                 && a.relay.is_none()
                 && a.params.get("request").and_then(Value::as_u64) == Some(request)
         };
+        self.cancel_where(belongs);
+    }
+    pub(crate) fn cancel_annotation_grid(&mut self, request: u64) {
+        self.cancel_where(|a| {
+            a.command == "raster.imageGrid" && a.relay.is_none() && matches!(a.then, Some(Completion::ImageGrid(id)) if id == request)
+        });
+    }
+    fn cancel_where(&mut self, belongs: impl Fn(&Asked) -> bool) {
         if let Some(job) = &mut self.job
             && belongs(&job.asked)
         {
@@ -76,12 +84,14 @@ pub type Then = fn(&mut RustGisApp, Landed);
 enum Completion {
     Command(Then),
     ShapeConversion(Option<u64>),
+    ImageGrid(u64),
 }
 impl Completion {
     fn deliver(self, app: &mut RustGisApp, result: Landed) {
         match self {
             Self::Command(then) => then(app, result),
             Self::ShapeConversion(request) => crate::shapeconvert::landed(app, request, result),
+            Self::ImageGrid(request) => crate::annotation::landed(app, request, result),
         }
     }
 }
@@ -123,6 +133,11 @@ pub(crate) fn run_shape_conversion(app: &mut RustGisApp, p: Value) -> Result<Val
     run_presented(app, "edit.previewShapeConversion", p, Some(Completion::ShapeConversion(request)), None, None)
 }
 
+/// Original grid lookup shares the read queue and carries its request through every outcome.
+pub(crate) fn run_image_grid(app: &mut RustGisApp, p: Value, request: u64) -> Result<Value, String> {
+    run_presented(app, "raster.imageGrid", p, Some(Completion::ImageGrid(request)), None, None)
+}
+
 /// Keeps a service layer's title and connection display name outside recorded parameters
 /// until its admitted discovery lands. The ordinary read queue owns progress and Cancel.
 #[cfg(not(target_arch = "wasm32"))]
@@ -160,6 +175,7 @@ fn run_presented(
             | "labels.convert"
             | "source.syncState"
             | "table.statistics"
+            | "raster.imageGrid"
             | "edit.previewShapeConversion"
     )
     .then(|| app.session.layer_id(&p).ok().and_then(|id| app.session.map().layer(id)).map(|l| (l.instance_id(), l.name.clone())))
@@ -477,7 +493,13 @@ fn start(app: &mut RustGisApp, mut asked: Asked, p: Value) -> Result<Value, Stri
     if let Err(e) = spawned {
         if matches!(
             asked.command,
-            "map.reloadTiles" | "map.repairTiles" | "service.add" | "service.layers" | "script.run" | "edit.previewShapeConversion"
+            "map.reloadTiles"
+                | "map.repairTiles"
+                | "service.add"
+                | "service.layers"
+                | "script.run"
+                | "edit.previewShapeConversion"
+                | "raster.imageGrid"
         ) || rustgis_engine::cmd::edit::table_edit_in_background(asked.command).is_some()
         {
             let why = crate::i18n::fmt("The background worker could not start ({error}). Retry the command.", &[("error", &e.to_string())]);
@@ -713,6 +735,72 @@ mod tests {
             assert!(std::time::Instant::now() < end, "the reads never landed");
             std::thread::sleep(std::time::Duration::from_millis(5)); // test-wait: legacy polling for background read completion
         }
+    }
+
+    #[test]
+    fn annotation_grid_cancel_preserves_unrelated_waiting_reads() {
+        use rustgis_engine::{
+            Project, Session,
+            data::raster::{ColorHint, Crs, GeoTransform, Raster, geotiff},
+        };
+        let raster = Raster::new(
+            "image",
+            1,
+            1,
+            vec![vec![1.]],
+            GeoTransform { origin_x: 0., origin_y: 1., pixel_width: 1., pixel_height: -1. },
+            Crs::from_epsg(3857).unwrap(),
+            None,
+            ColorHint::Gray,
+            "UInt8",
+        )
+        .unwrap();
+        let bytes = geotiff::write(&raster, 0).unwrap();
+        let mut s = Session::new(Project::default());
+        let id = s.map_mut().add_raster("Image", rustgis_engine::map::RasterLayer::from_bytes(raster, "image.tif", bytes));
+        let mut app = RustGisApp::new(s);
+        app.reads_off_frame = true;
+        app.run("ui.annotationImage", json!({"image":id})).unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        let file = folder.path().join("queued.csv");
+        std::fs::write(&file, "name,lon,lat\nQueued,1,2\n").unwrap();
+        run(&mut app, "layer.addData", json!({"path":file,"name":"Queued after grid"})).unwrap();
+        app.run("ui.annotationCancel", Value::Null).unwrap();
+        let job = app.reads.job.as_ref().unwrap();
+        assert!(job.control.is_cancelled() && !job.cancel_waiting);
+        assert_eq!(app.reads.waiting.len(), 1);
+        landed(&mut app, 60);
+        assert!(app.session.map().layer_by_name("Queued after grid").is_some());
+        assert!(crate::annotation::drawing_frame(&app).is_err());
+    }
+
+    #[test]
+    fn annotation_grid_worker_failure_never_reads_headers_on_the_frame() {
+        use rustgis_engine::{
+            Project, Session,
+            data::raster::{ColorHint, Crs, GeoTransform, Raster},
+        };
+        let raster = Raster::new(
+            "image",
+            1,
+            1,
+            vec![vec![1.]],
+            GeoTransform { origin_x: 0., origin_y: 1., pixel_width: 1., pixel_height: -1. },
+            Crs::from_epsg(3857).unwrap(),
+            None,
+            ColorHint::Gray,
+            "UInt8",
+        )
+        .unwrap();
+        let mut s = Session::new(Project::default());
+        let id = s.map_mut().add_raster("Image", rustgis_engine::map::RasterLayer::from_bytes(raster, "image.tif", vec![0; 32]));
+        let mut app = RustGisApp::new(s);
+        app.reads_off_frame = true;
+        app.reads.fail_spawn = true;
+        app.run("ui.annotationImage", json!({"image":id})).unwrap();
+        assert!(!showing(&app));
+        assert!(crate::annotation::drawing_frame(&app).unwrap_err().contains("worker could not start"));
+        assert!(app.session.notices.iter().any(|n| n.error && n.text.contains("worker could not start")));
     }
 
     #[test]

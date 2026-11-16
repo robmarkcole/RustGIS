@@ -877,6 +877,7 @@ pub(crate) const UI_COMMANDS: &[(&str, &str, &str)] = &[
     ("ui.mcpRelay", "MCP Relay", "Help › Help"),
     ("ui.pane.geoprocessing", "Tools Pane", "View › Windows"),
     ("ui.pane.symbology", "Symbology Pane", "Style › Drawing"),
+    ("ui.pane.annotation", "Annotate", "Analyze › Annotate"),
     ("ui.pane.labeling", "Labeling Pane", "View › Windows"),
     ("ui.pane.layerProperties", "Layer Properties Pane", "View › Windows"),
     ("ui.pane.diagnosticLog", "Messages", "View › Windows"),
@@ -919,6 +920,7 @@ fn search_action(id: &str) -> Option<SearchAction> {
     Some(match id {
         "project.open" => Command("ui.open"),
         "project.save" => Command("ui.save"),
+        "raster.imageGrid" => Command("ui.pane.annotation"),
         "edit.previewShapeConversion" => Command("ui.convertShape"),
         "project.saveAs" => Command("ui.saveAs"),
         "project.addFolder" => Command("ui.addFolder"),

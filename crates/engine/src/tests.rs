@@ -48537,6 +48537,27 @@ fn long_commands_stop_when_cancelled_while_they_run() {
         note("edit.previewShapeConversion", read.run(&control).map(|_| ()), &control);
     }
 
+    // Reading original TIFF headers also checks Cancel through the common read queue.
+    {
+        let raster = rustgis_data::raster::Raster::new(
+            "grid",
+            1,
+            1,
+            vec![vec![1.]],
+            rustgis_data::raster::GeoTransform { origin_x: 0., origin_y: 0., pixel_width: 1., pixel_height: -1. },
+            rustgis_data::raster::Crs::from_epsg(3857).unwrap(),
+            None,
+            rustgis_data::raster::ColorHint::Gray,
+            "UInt8",
+        )
+        .unwrap();
+        let bytes = rustgis_data::raster::geotiff::write(&raster, 0).unwrap();
+        let id = s.map_mut().add_raster("Original grid", rustgis_map::RasterLayer::from_bytes(raster, "grid.tif", bytes));
+        let read = crate::cmd::reads::read_ahead(&mut s, "raster.imageGrid", &json!({"layer":id})).unwrap();
+        let control = Control::cancelled_once_started();
+        note("raster.imageGrid", read.run(&control).map(|_| ()), &control);
+    }
+
     // Column Statistics counts every row of a layer on a thread of its own in the desktop app.
     {
         let read = crate::cmd::reads::read_ahead(&mut s, "table.statistics", &json!({"layer": "Cities", "field": "pop_max"})).unwrap();
