@@ -23,7 +23,7 @@ impl Shape {
         }
     }
 }
-/// An ephemeral preview, valid only for this source instance and geometry revision. Not a file
+/// An ephemeral preview, bound to this source instance, revision and exact geometry. Not a file
 /// format or a recovered construction: callers explicitly apply the proposed replacement.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -37,16 +37,23 @@ pub struct Proposal {
     pub layer_instance: u64,
     pub replacement: u64,
     pub revision: u64,
+    source_geometry: Geometry,
     pub shape: Shape,
 }
 impl Proposal {
     pub fn current(&self, s: &Session) -> bool {
-        s.map().instance_id() == self.map_instance
+        // Undo/redo can reuse a geometry revision. Comparing the bounded source snapshot also
+        // prevents an old preview from overwriting different geometry at the same revision.
+        polygon(&self.source_geometry).is_ok()
+            && s.map().instance_id() == self.map_instance
             && s.map().layer(self.layer).is_some_and(|l| {
                 l.instance_id() == self.layer_instance
                     && l.replacement_revision() == self.replacement
                     && l.geometry_rev == self.revision
-                    && l.dataset.features.get(self.row).is_some_and(|f| f.id == self.feature_id)
+                    && l.dataset
+                        .features
+                        .get(self.row)
+                        .is_some_and(|f| f.id == self.feature_id && f.geometry.as_ref() == Some(&self.source_geometry))
             })
     }
 }
@@ -189,7 +196,8 @@ fn target(s: &Session, p: &Value) -> Result<Proposal, String> {
     if p.get("featureId").is_some_and(|v| v.as_u64() != Some(feature.id)) {
         return Err("feature changed; preview again".into());
     }
-    polygon(feature.geometry.as_ref().ok_or("missing polygon geometry")?)?;
+    let geometry = feature.geometry.as_ref().ok_or("missing polygon geometry")?;
+    polygon(geometry)?;
     Ok(Proposal {
         request: p.get("request").and_then(Value::as_u64).unwrap_or(0),
         layer,
@@ -199,6 +207,7 @@ fn target(s: &Session, p: &Value) -> Result<Proposal, String> {
         layer_instance: l.instance_id(),
         replacement: l.replacement_revision(),
         revision: l.geometry_rev,
+        source_geometry: geometry.clone(),
         shape: Shape::Circle(CircleSpec { frame: Frame::default(), center: [0., 0.], radius: 1., tolerance: 0.25 }),
     })
 }
@@ -392,6 +401,56 @@ mod tests {
         assert!(s.circle_spec(id, 0).is_none());
         assert!(fit(&g, Frame { affine: [0.; 6], ..Frame::default() }, "circle").is_err());
     }
+    #[test]
+    fn shape_conversion_preview_rejects_undo_revision_aliases() {
+        for kind in ["circle", "rotatedBox"] {
+            let (mut s, id) = ordinary(rectangle(Frame::default()).geometry().unwrap());
+            let mut changed = rectangle(Frame::default());
+            changed.width *= 2.;
+            s.run("edit.setGeometry", &json!({"row":0,"geometry":rustgis_data::io::geometry_to_geojson(&changed.geometry().unwrap())}))
+                .unwrap();
+            let preview = s.run("edit.previewShapeConversion", &json!({"row":0,"kind":kind})).unwrap();
+            // Use the wire representation too: source coordinates must survive JSON exactly.
+            let preview: Value = serde_json::from_str(&serde_json::to_string(&preview).unwrap()).unwrap();
+            s.run("edit.undo", &json!({})).unwrap();
+            assert_eq!(s.map().layer(id).unwrap().geometry_rev, preview["revision"].as_u64().unwrap());
+            let restored = s.map().layer(id).unwrap().dataset.features[0].clone();
+            let depth = s.undo_depth();
+            let error = s.run("edit.applyShapeConversion", &json!({"preview":preview,"confirm":true})).unwrap_err();
+            assert!(error.contains("source changed"), "{error}");
+            assert_eq!(s.map().layer(id).unwrap().dataset.features[0], restored);
+            assert_eq!(s.undo_depth(), depth);
+            assert!(s.box_spec(id, 0).is_none() && s.circle_spec(id, 0).is_none());
+            // Refusal must preserve Redo as well as the restored source and construction state.
+            s.run("edit.redo", &json!({})).unwrap();
+            assert_eq!(s.map().layer(id).unwrap().dataset.features[0].geometry, Some(changed.geometry().unwrap()));
+            let fresh = s.run("edit.previewShapeConversion", &json!({"row":0,"kind":kind})).unwrap();
+            let fresh: Value = serde_json::from_str(&serde_json::to_string(&fresh).unwrap()).unwrap();
+            s.run("edit.applyShapeConversion", &json!({"preview":fresh,"confirm":true})).unwrap();
+        }
+    }
+
+    #[test]
+    fn shape_conversion_apply_checks_its_preview_layer_instead_of_the_active_stream() {
+        for kind in ["circle", "rotatedBox"] {
+            let (mut s, id) = ordinary(rectangle(Frame::default()).geometry().unwrap());
+            let preview = s.run("edit.previewShapeConversion", &json!({"layer":id,"row":0,"kind":kind})).unwrap();
+            let streamed = s.map_mut().add_streamed("Unrelated stream", rustgis_map::source::SourceLayer::default());
+            s.active_layer = Some(streamed);
+            s.run("edit.applyShapeConversion", &json!({"preview":preview,"confirm":true})).unwrap();
+            assert!(s.box_spec(id, 0).is_some() || s.circle_spec(id, 0).is_some());
+            let preview = s.run("edit.previewShapeConversion", &json!({"layer":id,"row":0,"kind":kind})).unwrap();
+            s.map_mut().layer_mut(id).unwrap().source = Some(rustgis_map::source::SourceLayer::default());
+            s.active_layer = None;
+            let before = s.map().layer(id).unwrap().dataset.features[0].clone();
+            let depth = s.undo_depth();
+            let error = s.run("edit.applyShapeConversion", &json!({"preview":preview,"confirm":true})).unwrap_err();
+            assert!(error.contains("read in place"), "{error}");
+            assert_eq!(s.map().layer(id).unwrap().dataset.features[0], before);
+            assert_eq!(s.undo_depth(), depth);
+        }
+    }
+
     #[test]
     fn shape_conversion_rules_cannot_silently_change_attributes_and_history_restores_constructions() {
         let (mut s, id) = ordinary(rectangle(Frame::default()).geometry().unwrap());

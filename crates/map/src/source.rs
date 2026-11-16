@@ -34,6 +34,9 @@ pub const VIEW_LIMIT: usize = if cfg!(target_arch = "wasm32") { 100_000 } else {
 /// The most features a view reads from a file by its web address (each one is fetched).
 pub const REMOTE_VIEW_LIMIT: usize = if cfg!(target_arch = "wasm32") { 30_000 } else { 60_000 };
 
+/// Repair advice shared by render errors and the session's translated read-failure notice.
+pub const REPAIR_SOURCE: &str = "if the file was moved or deleted, restore it or use Repair Data Source to point to its new location";
+
 const RECONNECT_REQUIRED: &str = "this database source came from a peer; reconnect explicitly before reading it";
 
 /// Ambiguous polygon areas among decoded features, including rows an area query could not keep.
@@ -139,6 +142,9 @@ pub struct SourceLayer {
     /// Why the source couldn't be opened or read.
     #[serde(skip)]
     pub error: Option<String>,
+    /// Last read failure reported by the session, independent of disposable render copies.
+    #[serde(skip)]
+    error_said: Option<String>,
     /// The last open failed because the server refused the login (no password given this session, or a wrong one).
     #[serde(skip)]
     pub login: bool,
@@ -763,6 +769,33 @@ impl SourceLayer {
         p.filter(|p| crate::paths::is_local(p))
     }
 
+    /// A read failure with the linked file and the repair action, when it has a local source.
+    /// The caller supplies the layer's current name, which can differ from the file's name.
+    pub fn read_error(&self) -> Option<String> {
+        let error = self.error.as_ref()?;
+        Some(match self.linked_file() {
+            Some(path) => format!("could not read {path}: {error}; {REPAIR_SOURCE}"),
+            None => error.clone(),
+        })
+    }
+
+    /// Clears a recovered failure and its notice marker, even between notice passes.
+    pub fn clear_error(&mut self) {
+        self.error = None;
+        self.error_said = None;
+    }
+
+    /// Takes each persistent read failure once, so redraws do not repeat its notice. A successful
+    /// read, or an explicit reopen/repair, allows a later failure to be reported.
+    pub fn error_unsaid(&mut self) -> Option<String> {
+        if self.error == self.error_said {
+            return None;
+        }
+        let error = self.error.clone();
+        self.error_said.clone_from(&error);
+        error
+    }
+
     /// Opens a replacement with fresh handles, windows, caches and selection.
     pub fn relinked(&self, path: &str, table: Option<&str>) -> Result<SourceLayer, String> {
         if self.embedded.is_some() || self.postgis.is_some() || self.mysql.is_some() || self.sqlserver.is_some() {
@@ -788,8 +821,13 @@ impl SourceLayer {
                 declared_empty = fresh.empty;
                 conversion_zm_dropped = fresh.zm_dropped;
                 new.path = Some(fresh.path.display().to_string());
-                let handle = rustgis_data::source::fgb::FgbSource::open_owned_path(&fresh.path, layer, fresh.workspace)
-                    .map_err(|e| format!("{path}: {e}"))?;
+                let handle = rustgis_data::source::fgb::FgbSource::open_converted_path(
+                    &fresh.path,
+                    layer,
+                    std::path::Path::new(path),
+                    Some(fresh.workspace),
+                )
+                .map_err(|e| format!("{path}: {e}"))?;
                 new.handle = Some(Arc::new(handle));
                 new.gdal = Some(GdalOrigin { path: path.into(), layer: layer.into(), ..g.clone() });
             }
@@ -819,8 +857,13 @@ impl SourceLayer {
                 let part = out.parts.first().ok_or_else(|| format!("{path}: the table returns no {}", d.family.label()))?;
                 declared_empty = part.count == 0;
                 new.path = Some(part.path.display().to_string());
-                let handle = rustgis_data::source::parquet::ParquetSource::open_owned_path(&part.path, name, fresh.workspace)
-                    .map_err(|e| format!("{path}: {e}"))?;
+                let handle = rustgis_data::source::parquet::ParquetSource::open_converted_path(
+                    &part.path,
+                    name,
+                    Some(std::path::Path::new(path)),
+                    Some(fresh.workspace),
+                )
+                .map_err(|e| format!("{path}: {e}"))?;
                 new.handle = Some(Arc::new(handle));
                 conversion_zm_dropped = false;
                 new.duckdb = Some(d);
@@ -967,7 +1010,7 @@ impl SourceLayer {
                 self.conversion_notes_unsaid = self.conversion_info.as_ref().map(|info| info.notes.clone()).unwrap_or_default();
                 self.opening = None;
                 self.reset();
-                self.error = None;
+                self.clear_error();
                 self.login = false;
                 Ok(())
             }
@@ -1059,13 +1102,26 @@ impl SourceLayer {
             if p.to_ascii_lowercase().ends_with(".fgb") {
                 let path = std::path::Path::new(p);
                 let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("layer");
-                let prepared = rustgis_data::source::fgb::FgbSource::prepare_path(path, name);
+                let prepared = match &self.gdal {
+                    Some(g) => rustgis_data::source::fgb::FgbSource::prepare_converted_path(path, name, std::path::Path::new(&g.path)),
+                    None => rustgis_data::source::fgb::FgbSource::prepare_path(path, name),
+                };
                 self.conversion_fallback = saved_conversion_note;
                 return self.open_fgb(prepared);
             }
             let opened = {
                 #[cfg(not(target_arch = "wasm32"))]
-                if let Some(crs) = overridden {
+                if let Some(d) = &self.duckdb {
+                    use rustgis_data::source::{duckdb::Database, parquet::ParquetSource};
+                    let database = d.database.as_deref().map(Database::parse);
+                    let original = match &database {
+                        Some(Database::File(path)) => Some(path.as_path()),
+                        _ => None,
+                    };
+                    let path = std::path::Path::new(p);
+                    let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("layer");
+                    ParquetSource::open_converted_path(path, name, original, None).map(|src| Box::new(src) as Box<dyn FeatureSource>)
+                } else if let Some(crs) = overridden {
                     let name = std::path::Path::new(p).file_stem().and_then(|s| s.to_str()).unwrap_or("layer");
                     rustgis_data::source::shp::ShpSource::open_path_in(std::path::Path::new(p), name, Some(crs))
                         .map(|src| Box::new(src) as Box<dyn FeatureSource>)
@@ -1080,7 +1136,15 @@ impl SourceLayer {
                 #[cfg(not(target_arch = "wasm32"))]
                 (Err(_), Some(d)) if !std::path::Path::new(p).exists() => match rerun(d) {
                     Ok(fresh) => {
-                        let r = rustgis_data::source::open_path(&fresh, None);
+                        use rustgis_data::source::{duckdb::Database, parquet::ParquetSource};
+                        let database = d.database.as_deref().map(Database::parse);
+                        let original = match &database {
+                            Some(Database::File(path)) => Some(path.as_path()),
+                            _ => None,
+                        };
+                        let name = fresh.file_stem().and_then(|s| s.to_str()).unwrap_or("layer");
+                        let r = ParquetSource::open_converted_path(&fresh, name, original, None)
+                            .map(|src| Box::new(src) as Box<dyn FeatureSource>);
                         if r.is_ok() {
                             self.path = Some(fresh.display().to_string());
                         }
@@ -1102,7 +1166,7 @@ impl SourceLayer {
                     self.conversion_fallback = saved_conversion_note;
                 }
                 self.window = None;
-                self.error = None;
+                self.clear_error();
                 self.login = false;
                 Ok(())
             }
@@ -1167,7 +1231,7 @@ impl SourceLayer {
             wake();
         };
         self.handle = None;
-        self.error = None;
+        self.clear_error();
         self.reset();
         if let Err(e) = std::thread::Builder::new().name("rustgis-source-open".into()).spawn(job) {
             return self.opened(Err(format!("couldn't start opening the layer: {e}")));
@@ -1291,7 +1355,7 @@ impl SourceLayer {
             Ok(s) => {
                 self.handle = Some(s);
                 self.window = None;
-                self.error = None;
+                self.clear_error();
                 Ok(())
             }
             Err(e) => {
@@ -1404,7 +1468,7 @@ impl SourceLayer {
         self.handle = None;
         self.opening = None;
         self.pending = None;
-        self.error = None;
+        self.clear_error();
         self.login = false;
         // A new opening may hold other values: what was said of the last one doesn't hold.
         self.unread_dates = None;
@@ -1603,7 +1667,7 @@ impl SourceLayer {
                     self.ready_cache = Some(cache);
                     let w = Window { extent: p.extent, complete: b.complete, matched: b.matched, kept: b.features.len(), filtered };
                     self.window = Some(w);
-                    self.error = None;
+                    self.clear_error();
                     return Polled::Done(w, b);
                 }
                 Some(Err(e)) => {
@@ -1716,6 +1780,7 @@ impl SourceLayer {
             query: _,
             opening: _,
             error: _,
+            error_said: _,
             login: _,
             reconnect_required: _,
             limit: _,
@@ -1792,6 +1857,29 @@ impl SourceLayer {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn whole_layer_report_keeps_effective_conversion_notes_and_dimensions() {
+        use rustgis_data::{Dataset, GeometryType};
+        let mut original = Dataset::new("converted", GeometryType::Point, Vec::new());
+        original.push(Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(1.0, 2.0))), Vec::new());
+        let bytes = std::sync::Arc::new(rustgis_data::source::fgb::write(&original).unwrap());
+        let handle = rustgis_data::source::open_shared("converted.fgb", bytes.clone(), None).unwrap();
+        let mut source = super::SourceLayer::from_bytes("converted.fgb", bytes, None, handle);
+        let mut info = source.info().unwrap().clone();
+        info.notes.push("conversion left out 2 source features".into());
+        info.zm_dropped = true;
+        source.conversion_info = Some(info);
+        let mut layer = crate::Layer::new(1, Dataset::new("layer", GeometryType::Point, Vec::new()));
+        layer.source = Some(source);
+        let (dataset, report) = layer.load_all_reported().unwrap();
+        assert!(dataset.zm_dropped);
+        assert_eq!(report.messages.iter().filter(|n| n.contains("conversion left out 2 source features")).count(), 1);
+        assert_eq!(dataset.features.len(), 1);
+        let (_, counted) = layer.load_all_counted().unwrap();
+        assert_eq!(counted.messages.iter().filter(|n| n.contains("conversion left out 2 source features")).count(), 1);
+        assert!(!counted.zm_noted, "a flag with no Z/M diagnostic cannot suppress the export warning");
+    }
+
     /// Project-restored disk and embedded date sources schedule their classification, share
     /// the pending open across copies, and expose typed dates only after it lands.
     #[cfg(not(target_arch = "wasm32"))]

@@ -14,6 +14,7 @@ use super::{b, f, ps};
 use crate::project::{Model, ModelStep};
 use crate::{CmdResult, CommandSpec as C, Session};
 
+/// Registers workflow and raster commands with the parameter help used by command clients.
 pub fn commands() -> Vec<C> {
     vec![
         C::new("gp.env", "Environments", "Analyze › Geoprocessing", environments).inputs(environment_inputs).roles(&[]).effects(crate::policy::Effects::NONE).params(
@@ -54,10 +55,10 @@ pub fn commands() -> Vec<C> {
         C::new("script.run", "Run Script", "Analyze › Geoprocessing", run_script).roles(&[crate::ParamRole { key: "script", role: crate::Role::Script }]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Automation))
             .params(r#"{"script": "one command per line: id {json}; # comments"}"#),
         C::new("raster.function", "Raster Functions", "Analyze › Raster", raster_function).inputs(function_inputs).roles(&[]).effects(crate::policy::Effects::NONE).params(
-            r#"{"layer": raster, "function": "slope"|"aspect"|"hillshade"|"ndvi"|"bandMath"|"remap"|"threshold"|"resample" (slope returns degrees, not percent), "band"?: 1-based, "expression"?: "(b4-b3)/(b4+b3)", "ranges"?: [[lo, hi, value]] (lo inclusive, hi exclusive; [21, 22, 1] maps integer class 21 to 1), "value"?: number, "keep"?: bool (remap: keep unmatched cells), "nir"?, "red"?: band numbers (ndvi; default 4 and 3), "azimuth"?, "altitude"?, "zFactor"?, "target"?: raster (resample onto its grid), "name"?: output, "ran"?: (internal: a raster the app has worked out)}"#,
+            r#"{"layer": raster, "function": "slope"|"aspect"|"hillshade"|"ndvi"|"bandMath"|"remap"|"threshold"|"resample", "units"?: "degrees"|"percent" (slope only; default degrees; percent is 100 × tan(angle in radians)), "band"?: 1-based, "expression"?: "(b4-b3)/(b4+b3)", "ranges"?: [[lo, hi, value]] (lo inclusive, hi exclusive; [21, 22, 1] maps integer class 21 to 1), "value"?: number, "keep"?: bool (remap: keep unmatched cells), "nir"?, "red"?: band numbers (ndvi; default 4 and 3), "azimuth"?, "altitude"?, "zFactor"?, "target"?: raster (resample onto its grid), "name"?: output, "ran"?: (internal: a raster the app has worked out)}"#,
         ),
         C::new("raster.functionChain", "Function Editor", "Analyze › Raster", function_chain).inputs(chain_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
-            .params(r#"{"layer": raster, "steps": [{"function", … (as raster.function; slope returns degrees, not percent)}], "name"?: output, "ran"?: (internal: a raster the app has worked out)}"#),
+            .params(r#"{"layer": raster, "steps": [{"function", … (as raster.function; slope units: "degrees" (default) or "percent")}], "name"?: output, "ran"?: (internal: a raster the app has worked out)}"#),
         C::new("analysis.suitability", "Suitability Modeler", "Analyze › Workflows", suitability).inputs(suitability_inputs).roles(&[]).effects(crate::policy::Effects::NONE).params(
             r#"{"criteria": [{"layer": raster, "band"?: 1-based, "ranges": [[lo, hi, score]] (lo inclusive, hi exclusive; [21, 22, 1] scores integer class 21 as 1), "weight": number}], "name"?: output, "ran"?: (internal: a raster the app has worked out)}"#,
         ),
@@ -131,6 +132,7 @@ fn point(p: &Value, k: &str) -> Result<Coord, String> {
 /// project), what the command says of it besides its layer, and what else the command does once
 /// it is added: made on any thread, added by [`add_made`].
 pub struct Made {
+    inputs: Vec<rustgis_data::provenance::Fingerprint>,
     name: String,
     layer: rustgis_map::RasterLayer,
     extra: Option<Value>,
@@ -165,13 +167,14 @@ pub(crate) fn made_then(raster: Raster, extra: Option<Value>, then: Option<Then>
 
 /// A layer made (styled, say), to be added as `name`.
 pub(crate) fn made_layer(name: String, layer: rustgis_map::RasterLayer, extra: Option<Value>, then: Option<Then>) -> Made {
-    Made { name, layer, extra, then, ran: None, continuation: None }
+    Made { name, layer, extra, then, ran: None, continuation: None, inputs: Vec::new() }
 }
 
 /// Adds a made raster as a layer: the command's answer is the layer's (its id, size and bands) and
 /// what the command says besides (`extra`), and what it does then.
 pub(crate) fn add_made(s: &mut Session, m: Made) -> CmdResult {
-    let Made { name, layer, extra, then, .. } = m;
+    let Made { name, layer, extra, then, inputs, .. } = m;
+    rustgis_data::provenance::record(inputs);
     let mut v = super::raster::add_raster(s, &name, layer)?;
     if let (Some(Value::Object(more)), Some(o)) = (extra, v.as_object_mut()) {
         o.extend(more);
@@ -276,6 +279,7 @@ pub struct RasterRun {
     /// What the command is called, for a cancelled run's error.
     pub name: &'static str,
     work: Work,
+    capture_inputs: bool,
     /// The map it started on, the one its raster is added to.
     map: u64,
     continuation: crate::policy::Continuation,
@@ -286,6 +290,7 @@ impl RasterRun {
     /// Makes the raster, blocking until it's made; `control` stops it and counts its progress (see
     /// [`rustgis_analysis::control`]).
     pub fn run(self, control: &std::sync::Arc<rustgis_analysis::control::Control>) -> Result<Made, String> {
+        let inputs = self.capture_inputs.then(rustgis_data::provenance::Capture::start);
         let RasterRun { name, work, map, continuation, .. } = self;
         continuation.check()?;
         let current = continuation.clone();
@@ -295,7 +300,12 @@ impl RasterRun {
             crate::render::rustgis_tiles::cache::with_still(still, || rustgis_analysis::run_under(name, control, work))
         }))
         .unwrap_or_else(|_| Err(format!("{name} failed unexpectedly")))
-        .map(|m| Made { ran: Some((name, map)), continuation: Some(continuation), ..m })
+        .map(|m| Made {
+            ran: Some((name, map)),
+            continuation: Some(continuation),
+            inputs: inputs.as_ref().map_or_else(Vec::new, rustgis_data::provenance::Capture::inputs),
+            ..m
+        })
     }
 }
 
@@ -327,7 +337,7 @@ pub(crate) fn raster_start_raw(s: &mut Session, op: crate::policy::Authorized<cr
         s.raster_runs.remove(0);
     }
     s.raster_runs.push((id, continuation.clone()));
-    Ok(RasterRun { id, name, work, map: s.map().instance_id(), continuation })
+    Ok(RasterRun { id, name, work, map: s.map().instance_id(), continuation, capture_inputs: s.log.on() })
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -528,7 +538,7 @@ pub fn gallery_list(kind: &str) -> CmdResult {
             (
                 "raster.function",
                 "Raster Functions",
-                "Slope (degrees), aspect, hillshade, NDVI, band math, remap, threshold and resampling.",
+                "Slope (degrees or percent), aspect, hillshade, NDVI, band math, remap, threshold and resampling.",
             ),
             ("analysis.suitability", "Suitability Modeler", "Weighted overlay of scored rasters."),
             ("analysis.viewshed", "Viewshed", "The cells visible from an observer on a DEM."),
@@ -1171,7 +1181,12 @@ fn apply_function(r: &Raster, p: &Value, target: Option<&Raster>, remaps: &mut R
     let band = band_of(p, r)?;
     let zf = f(p, "zFactor").unwrap_or(1.0).clamp(0.0001, 100_000.0);
     match ps(p, "function").ok_or("function is required")? {
-        "slope" => rasterops::slope(r, band, zf),
+        "slope" => match p.get("units") {
+            None => rasterops::slope(r, band, zf),
+            Some(Value::String(units)) if units == "degrees" => rasterops::slope(r, band, zf),
+            Some(Value::String(units)) if units == "percent" => rasterops::slope_percent(r, band, zf),
+            _ => Err("slope units must be degrees or percent".into()),
+        },
         "aspect" => rasterops::aspect(r, band),
         "hillshade" => {
             rasterops::hillshade(r, band, f(p, "azimuth").unwrap_or(315.0), f(p, "altitude").unwrap_or(45.0).clamp(0.0, 90.0), zf)
@@ -1259,7 +1274,7 @@ fn derive_function(r: &Raster, name: &str, p: &Value, pixels: Vec<f32>) -> Resul
     if ps(p, "function") == Some("slope")
         && let Some(band) = out.bands.first_mut()
     {
-        band.name = "Slope (degrees)".into();
+        band.name = if ps(p, "units") == Some("percent") { "Slope (percent)" } else { "Slope (degrees)" }.into();
     }
     Ok(out)
 }
@@ -1935,11 +1950,12 @@ pub(crate) fn convert_work(s: &Session, p: &Value) -> Result<super::exports::Wor
             let ds = whole.as_ref().unwrap_or(&layer.dataset);
             rustgis_data::progress::begin(ds.features.len());
             let (text, mut notes) = converted(ds, &params)?;
+            super::share::coalesce_read_zm(&mut notes, &path, ds, &unreadable);
             rustgis_data::io::write_atomic(std::path::Path::new(&path), text.as_bytes()).map_err(|e| format!("{path}: {e}"))?;
             if unreadable.rows > 0 {
                 notes.push(format!("{path}: {} rows couldn't be read and were left out", unreadable.rows));
             }
-            notes.extend(super::share::read_date_notes(&path, &ds.name, &unreadable));
+            notes.extend(super::share::read_notes(&path, &ds.name, &unreadable));
             (notes, rustgis_data::export::numbers_written_as_null(&ds.features, &ds.fields, format))
         };
         let bytes = std::fs::metadata(&path).map_err(|e| format!("{path}: {e}"))?.len();

@@ -1,6 +1,10 @@
 //! Publish tab: export the map as PNG or GeoTIFF and layers as GeoJSON, CSV, FlatGeobuf, GeoPackage,
 //! GeoParquet, Shapefile, KML/KMZ or GPX.
 
+mod table;
+
+pub(super) use table::table_work;
+
 use std::path::Path;
 
 use rustgis_data::io::{GpkgMode, GpkgTable, GpkgWritten};
@@ -31,51 +35,9 @@ pub fn commands() -> Vec<C> {
             .view()
             .when(need_layer)
             .params(r#"{"layer"?, "path": "*.geojson|*.csv|*.fgb|*.gpkg|*.parquet|*.shp|*.zip|*.kml|*.kmz|*.gpx", "crs"?: "EPSG:… (or WKT) for a GeoPackage, Shapefile or FlatGeobuf (default: the system the layer was read in, else EPSG:4326)", "mode"?: "newFile (default: refuses an existing file) | addTable | replaceTable, for a GeoPackage", "tableName"?: "the GeoPackage table (default: the layer's name)"}"#),
-        C::new("share.exportTable", "Export Table", "Publish › Output", |s, p| {
-            let owner = s.continuation()?;
-            owner.check()?;
-            let _progress = rustgis_analysis::control::install_progress(None);
-            let path = ps(p, "path").ok_or("path is required")?;
-            let ext = Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-            let gpkg = gpkg_table(p, &ext)?;
-            let t = s.project.tables.get(s.table_index(p)?).ok_or("no such table")?;
-            let default = t.dataset.name.clone();
-            let null_numbers = rustgis_data::export::numbers_written_as_null(&t.dataset.features, &t.dataset.fields, &ext);
-            // Tables may retain geometry and its import losses, just as feature layers do.
-            let notes = rustgis_data::export_notes([(&t.dataset, t.dataset.extent())], path, Crs::LonLat);
-            let mut dbf_notes = Vec::new();
-            if matches!(ext.as_str(), "shp" | "zip") {
-                dbf_notes.extend(rustgis_data::io::shapefile_names_note(&t.dataset.fields, path));
-                dbf_notes.extend(rustgis_data::io::shapefile_values_notes(&t.dataset, path));
-                dbf_notes.extend(rustgis_data::io::shapefile_geometry_notes(&t.dataset, path, Crs::LonLat));
-            }
-            if matches!(ext.as_str(), "parquet" | "geoparquet") {
-                dbf_notes.extend(rustgis_data::source::parquet::values_note(&t.dataset, path));
-            }
-            if ext == "gpkg" {
-                dbf_notes.extend(rustgis_data::io::geopackage_names_note(&t.dataset.fields, path));
-            }
-            dbf_notes.extend(rustgis_data::io::dates_as_text_note(&t.dataset.fields, path));
-            dbf_notes.extend(gpkg_dates_note(&t.dataset, &ext, path));
-            // CSV holds a point a row, GPX a name for each feature and no areas.
-            let name_field = rustgis_data::io::name_field(&t.dataset);
-            dbf_notes.extend(rustgis_data::io::export_losses_notes(&t.dataset, &ext, name_field, path));
-            let (left_out, table) =
-                rustgis_data::io::write_path_to(&t.dataset, Path::new(path), Crs::LonLat, &gpkg).map_err(|e| e.to_string())?;
-            s.check_continuation(&owner).map_err(|why| super::exports::completion_refused(Some(path), why))?;
-            if let Some(note) = rustgis_data::io::left_out_note(path, &ext, left_out) {
-                s.notify(note, false);
-            }
-            for note in notes.into_iter().chain(dbf_notes) {
-                s.notify(note, false);
-            }
-            notify_null_numbers(s, path, null_numbers);
-            let mut out = json!({"path": path});
-            report_table(s, path, &gpkg, &default, table, &mut out);
-            Ok(out)
-        }).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
+        C::new("share.exportTable", "Export Table", "Publish › Output", |s, p| super::exports::write_here(s, p, "share.exportTable")).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
         .params(
-            r#"{"table": name|id (a standalone table), "path": "*.geojson|*.csv|*.fgb|*.gpkg|*.parquet|*.shp|*.zip|*.kml|*.kmz|*.gpx", "mode"?: "newFile (default: refuses an existing file) | addTable | replaceTable, for a GeoPackage", "tableName"?: "the GeoPackage table (default: the table's name)"}"#,
+            r#"{"table": name|id (a standalone table), "path": "*.geojson|*.csv|*.fgb|*.gpkg|*.parquet|*.shp|*.zip|*.kml|*.kmz|*.gpx", "mode"?: "newFile (default: refuses an existing file) | addTable | replaceTable, for a GeoPackage", "tableName"?: "the GeoPackage table (default: the table's name)", "sort"?: [{"field": name, "descending"?: false}], "limit"?: "nonnegative integer: keep the first N rows after sorting"}"#,
         )
         .view(),
     ]
@@ -676,6 +638,22 @@ pub fn read_date_notes(file: &str, layer: &str, lost: &rustgis_map::Unreadable) 
     empty.chain(lost.rounded.iter().map(|n| format!("{file}: {layer}: {n} when read for the export"))).collect()
 }
 
+/// The complete diagnostics from a whole read made for an export, including metadata losses
+/// discovered by a temporary source opening that the live layer never received.
+pub fn read_notes(file: &str, layer: &str, lost: &rustgis_map::Unreadable) -> Vec<String> {
+    read_date_notes(file, layer, lost).into_iter().chain(lost.messages.iter().map(|n| format!("{file}: {n}"))).collect()
+}
+
+/// A counted source Z/M diagnostic replaces only the equivalent generic export warning.
+/// Resident/older layers and custom providers without that diagnostic keep their warning.
+pub fn coalesce_read_zm(notes: &mut Vec<String>, file: &str, ds: &rustgis_data::Dataset, lost: &rustgis_map::Unreadable) {
+    if lost.zm_noted
+        && let Some(generic) = rustgis_data::zm_export_note([ds], file)
+    {
+        notes.retain(|note| note != &generic);
+    }
+}
+
 /// What a GeoPackage export of `ds` says of its dates: date-times written in UTC, and text in
 /// date fields that isn't a date, and rounded to the millisecond; for a FlatGeobuf, its date fields with no values. Nothing for
 /// another format, or when there was none.
@@ -748,7 +726,7 @@ fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, gpkg: Gpk
             let unfit = if parquet { rustgis_data::source::parquet::values_note(ds, path) } else { None };
             let null_numbers = rustgis_data::export::numbers_written_as_null(&ds.features, &ds.fields, &ext);
             let csv = if ext == "csv" { rustgis_data::io::CsvLosses::of(&ds.features, ds.geometry_type) } else { Default::default() };
-            let mut dates = read_date_notes(path, &ds.name, &unreadable);
+            let mut dates = read_notes(path, &ds.name, &unreadable);
             dates.extend(gpkg_dates_note(ds, &ext, path));
             (ds.features.len().saturating_sub(left_out), left_out, unread, table, unfit, null_numbers, None, csv, dates)
         }
@@ -759,6 +737,7 @@ fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, gpkg: Gpk
     // raster layer's extent is its raster's, which the file doesn't hold.
     let extent = if chunks.is_some() { l.extent() } else { ds.extent() };
     let mut notes = rustgis_data::export_notes([(ds, extent)], path, crs);
+    coalesce_read_zm(&mut notes, path, ds, &unreadable);
     if asked.is_none() {
         notes.extend(rustgis_data::io::default_export_note(ds, path));
     }

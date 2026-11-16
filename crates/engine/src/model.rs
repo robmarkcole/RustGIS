@@ -520,6 +520,9 @@ pub fn graph_from_json_counted(v: &Value) -> Result<(ModelGraph, GraphDropped), 
     for n in nodes {
         let Ok(mut node) = serde_json::from_value::<ModelNode>(n.clone()) else {
             dropped.nodes += 1;
+            if let Some(id) = n.get("id").and_then(Value::as_str) {
+                given_dropped.push(id.to_string());
+            }
             continue;
         };
         let id: String = node.id.trim().chars().take(MAX_NODE_ID).collect();
@@ -965,14 +968,159 @@ pub(crate) fn check_file(v: &Value) -> Result<(), String> {
     Ok(())
 }
 
-/// A graph's current file envelope; imports also accept legacy envelopes without a version.
+/// A graph's current file envelope, requiring any capabilities an older reader would misread.
+/// Imports also accept legacy envelopes without a version.
 pub fn to_file(name: &str, g: &ModelGraph) -> Value {
-    json!({"$schema": SCHEMA, "version": FILE_VERSION, "name": name, "graph": g})
+    let mut file = json!({"$schema": SCHEMA, "version": FILE_VERSION, "name": name, "graph": g});
+    let required = crate::project::model_capabilities(&[], Some(g));
+    if !required.is_empty() {
+        file["requires"] = json!(required);
+    }
+    file
+}
+
+/// Web tools save only steps and their exposed defaults, with capabilities of those steps.
+pub(crate) fn to_web_tool_file(name: &str, steps: &[ModelStep]) -> Value {
+    let params: Vec<Value> = steps
+        .iter()
+        .enumerate()
+        .flat_map(|(i, st)| {
+            st.params.as_object().into_iter().flatten().map(move |(k, v)| json!({"step": i + 1, "tool": st.tool, "name": k, "default": v}))
+        })
+        .collect();
+    let mut file = json!({"format": "RustGIS web tool", "version": WEB_TOOL_VERSION, "name": name, "steps": steps, "parameters": params});
+    let required = crate::project::model_capabilities(steps, None);
+    if !required.is_empty() {
+        file["requires"] = json!(required);
+    }
+    file
 }
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::Project;
+
+    /// Graph and web-tool envelopes reflect only their saved executable payload, and default
+    /// km² remains readable without the capability even if the omitted representation needs it.
+    #[test]
+    fn tabulate_unit_files_require_only_the_saved_payload_capability() {
+        for unit in [None, Some("km2"), Some("ac")] {
+            let mut params = json!({"zones":"Zones", "classes":"Classes"});
+            if let Some(unit) = unit {
+                params["areaUnit"] = json!(unit);
+            }
+            let mut graph = ModelGraph {
+                nodes: vec![ModelNode {
+                    id: "t".into(),
+                    kind: ModelNodeKind::Tool,
+                    tool: Some("tabulateIntersection".into()),
+                    params: params.clone(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let steps = vec![ModelStep { tool: "tabulateIntersection".into(), params }];
+            let mut project = Project::default();
+            let mut omitted = graph.clone();
+            omitted.nodes[0].params["areaUnit"] = json!("ac");
+            project.models.push(crate::project::Model { name: "Tabulate".into(), steps, graph: Some(omitted) });
+            let mut session = Session::new(project);
+            let (_, bytes, _) = crate::cmd::sharing::share_bytes(&mut session, "webTool", &json!({"model":"Tabulate"})).unwrap();
+            for file in [to_file("Tabulate", &graph), serde_json::from_slice::<Value>(&bytes).unwrap()] {
+                if unit == Some("ac") {
+                    assert_eq!(file["requires"], json!(["tabulate-intersection-unit"]));
+                } else {
+                    assert!(file.get("requires").is_none());
+                }
+                check_file(&file).unwrap();
+                let mut future = file;
+                future["requires"] = json!(["future-area-unit"]);
+                assert!(check_file(&future).unwrap_err().contains("future-area-unit"));
+            }
+            graph.nodes[0].kind = ModelNodeKind::Input;
+            assert!(to_file("Input", &graph).get("requires").is_none());
+        }
+        let steps = [ModelStep { tool: "buffer".into(), params: json!({"areaUnit":"ac"}) }];
+        assert!(to_web_tool_file("Other", &steps).get("requires").is_none());
+    }
+
+    /// Adding either capability must preserve the other in project, graph and web-tool headers.
+    #[test]
+    fn saved_command_capabilities_accumulate_independently() {
+        let mut steps = vec![
+            ModelStep { tool: "raster.function".into(), params: json!({"function":"slope", "units":"percent"}) },
+            ModelStep { tool: "tabulateIntersection".into(), params: json!({"areaUnit":"ac"}) },
+        ];
+        for expected in [json!(["slope-percent", "tabulate-intersection-unit"]), json!(["slope-percent"]), json!([])] {
+            let graph = ModelGraph {
+                nodes: steps
+                    .iter()
+                    .enumerate()
+                    .map(|(i, step)| ModelNode {
+                        id: i.to_string(),
+                        kind: ModelNodeKind::Tool,
+                        tool: Some(step.tool.clone()),
+                        params: step.params.clone(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            };
+            let mut project = Project::default();
+            project.models.push(crate::project::Model { name: "Both".into(), steps: steps.clone(), graph: Some(graph.clone()) });
+            for file in [serde_json::to_value(&project).unwrap(), to_file("Both", &graph), to_web_tool_file("Both", &steps)] {
+                assert_eq!(file.get("requires").cloned().unwrap_or_else(|| json!([])), expected);
+            }
+            steps.pop();
+        }
+    }
+
+    /// File headers follow only the graph/steps actually written, for both function commands.
+    /// The ordinary degree forms keep their existing envelopes without a requires field.
+    #[test]
+    fn percent_slope_files_require_the_saved_payload_capability() {
+        for units in [None, Some("degrees"), Some("percent")] {
+            let mut slope = json!({"function": "slope"});
+            if let Some(units) = units {
+                slope["units"] = json!(units);
+            }
+            for (id, params) in [("raster.function", slope.clone()), ("raster.functionChain", json!({"steps": [slope]}))] {
+                let mut graph = ModelGraph {
+                    nodes: vec![ModelNode {
+                        id: "s".into(),
+                        kind: ModelNodeKind::Tool,
+                        tool: Some(id.into()),
+                        params: params.clone(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                };
+                let steps = [ModelStep { tool: id.into(), params }];
+                let mut project = Project::default();
+                // Web tools omit this graph, so it must not affect the header of degree steps.
+                let percent_graph = serde_json::from_value(json!({"nodes": [
+                    {"id": "s", "kind": "tool", "tool": "raster.function", "params": {"function": "slope", "units": "percent"}}
+                ]}))
+                .unwrap();
+                project.models.push(crate::project::Model { name: "Slope".into(), steps: steps.to_vec(), graph: Some(percent_graph) });
+                let mut session = Session::new(project);
+                let (_, bytes, _) = crate::cmd::sharing::share_bytes(&mut session, "webTool", &json!({"model": "Slope"})).unwrap();
+                let web_tool = serde_json::from_slice::<Value>(&bytes).unwrap();
+                for file in [to_file("Slope", &graph), web_tool] {
+                    if units == Some("percent") {
+                        assert_eq!(file["requires"], json!(["slope-percent"]));
+                    } else {
+                        assert!(file.get("requires").is_none());
+                    }
+                    check_file(&file).unwrap();
+                }
+                graph.nodes[0].kind = ModelNodeKind::Input;
+                assert!(to_file("Input", &graph).get("requires").is_none());
+            }
+        }
+        let steps = [ModelStep { tool: "other".into(), params: json!({"function": "slope", "units": "percent"}) }];
+        assert!(to_web_tool_file("Other", &steps).get("requires").is_none());
+    }
 
     fn session() -> Session {
         let mut s = Session::new(Project::default());

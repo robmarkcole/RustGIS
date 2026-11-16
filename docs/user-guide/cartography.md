@@ -681,7 +681,11 @@ ribbon and the layer's right-click menu. A tab per topic shows one part at a tim
 - **Display**: the visibility range (**Out Beyond**, **In Beyond**, **Clear Limits**),
   **Transparency**, **Masking**, a raster's **Layer Blend** or a feature layer's **Reference
   scale**, and the **Depth priority** that View › Scene › Raise and Lower Priority change (a
-  higher one draws on top, whatever the layer order).
+  higher one draws on top, whatever the layer order). A polygon layer also has its
+  **Extrusion**, as Style › Extrusion, Faces and Light and Shadow set it: the **Type** (None,
+  Constant height or By a numeric field) and, once extruded, the **Height (m)** of a constant
+  height (the ribbon sets 50 km), **Factor**, **Base** with **Base (m)**, **Face Culling**,
+  **Lighting** and **Cast Shadow**. Each change undoes on its own.
 - **Query**, for a feature layer: its definition query, the SQL clause the features must match to
   draw (the grammar is in [Expressions](expressions.md)). Buttons add a field or an operator, and
   the **Functions** and **Variables** menus add a function (left open for its arguments, with what
@@ -726,6 +730,22 @@ the height or the factor. The `layer.extrusionBase` command does the same (`fiel
 `"field": null` clears the field). Turning extrusion off drops the base with it. Without a tilt,
 and on a tilted map drawn without the graphics card, extrusions are painted in the order they
 stand on the ground, so a part raised over a building behind it may be painted under it.
+
+A city model (CityJSON or CityGML) comes in standing: when it is added, the polygon layers of its
+volumes are extruded by `height` on `base_height`, and its surfaces stay flat (see
+[Data formats](data-formats.md), CityJSON). **Style › Extrusion › Type › None** turns one off, and undo
+takes the layers away with their extrusion. Other data with the same fields comes in flat.
+
+Layers that go together, such as a city model's layers, are raised at once: pick them in the
+Layers pane, right-click one of them and choose **Extrusion › None** or **By** a numeric field
+every one of them has (**By height**) and, once all are extruded, **Extrusion Base › Ground** or
+**By** a field (**By base_height**).
+It acts on their polygon layers and says so when the others are left out, sets every one alike in
+one step to undo, and leaves each one's height, factor and base as they were where the choice
+doesn't set them. `layer.extrusion` and `layer.extrusionBase` take a list of layers in `layer`
+for the same. A layer that isn't polygons, a field that one of them lacks, or (for the base) one
+that isn't extruded yet refuses the whole list and changes none; the message names those layers
+(a list whose first layer isn't polygons is refused as that one layer would be).
 
 For a raster layer, the **Style** tab also has **Layer Blend** (multiply, screen, overlay,
 darken, lighten, difference), **Swipe** (the layer shows only left of a divider you slide, to

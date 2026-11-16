@@ -15,6 +15,8 @@ use rustgis_tiles::template::{self, TileId};
 
 mod water;
 
+pub(crate) use water::Water;
+
 /// Cells along each side of a tilted view's band laid over the relief while the map moves (the
 /// drape, `tilt_drape` in the app): few enough to lay out every frame.
 pub const CELLS: usize = 40;
@@ -206,8 +208,25 @@ impl Ground {
     fn raw_height(&self, m: Coord) -> Option<f64> {
         match &self.heights {
             Heights::Raster { raster, wrap_width } => raster_height(raster, m, *wrap_width),
+            Heights::Tiles { url, encoding, zoom, read, pending, waiting } => {
+                tile_height(url, *encoding, *zoom, read, pending, waiting, m).0
+            }
+        }
+    }
+
+    /// A usable shore height and whether its requested detail was read. A ready ancestor can
+    /// supply the height after a detailed tile failed, but the shore must still be read again.
+    fn shore_height(&self, m: Coord) -> (Option<f64>, bool) {
+        match &self.heights {
+            Heights::Raster { raster, wrap_width } => (raster_height(raster, m, *wrap_width), true),
             Heights::Tiles { url, encoding, zoom, read, pending, waiting } => tile_height(url, *encoding, *zoom, read, pending, waiting, m),
         }
+    }
+
+    /// The terrain's water (#1915), when it names a water layer: what Shaded Relief draws with
+    /// the even light of flat ground.
+    pub(crate) fn water(&self) -> Option<&Arc<Water>> {
+        self.water.as_ref()
     }
 
     /// How many polygons of the terrain's water layer have no level, so stay on the ground: no
@@ -343,7 +362,7 @@ impl Ground {
                     .water
                     .as_ref()
                     .and_then(|w| w.level(m))
-                    .or_else(|| tile_height(url, *encoding, coarse.min(*zoom), read, pending, waiting, m))?;
+                    .or_else(|| tile_height(url, *encoding, coarse.min(*zoom), read, pending, waiting, m).0)?;
                 let h = raw * self.exaggeration;
                 h.is_finite().then_some(h)
             }
@@ -383,6 +402,16 @@ impl Ground {
     }
 }
 
+/// The layer called `name` on `map` that a block diagram's walls are coloured by (#1914), when it
+/// can be: the only layer of that name, of polygons, holding them all (not read a view at a
+/// time), as `map.terrain` checks it. Otherwise the walls are their own colour.
+pub fn walls_layer<'a>(map: &'a Map, name: &str) -> Option<&'a rustgis_map::Layer> {
+    let mut named = map.layers.iter().filter(|l| l.name.eq_ignore_ascii_case(name));
+    let l = named.next()?;
+    let polygons = l.geometry_type() == rustgis_data::GeometryType::Polygon;
+    (named.next().is_none() && polygons && !l.is_streamed()).then_some(l)
+}
+
 /// The largest north-up Web Mercator box inside a DEM's corners, near enough (the second
 /// smallest and second largest of their x and of their y): its whole extent for a DEM in
 /// geographic or Web Mercator coordinates, a little less for one turned a little by its
@@ -420,9 +449,17 @@ fn raster_corners(r: &Raster) -> Option<([f64; 4], [f64; 4])> {
     Some((xs, ys))
 }
 
-/// A DEM's height at a Web Mercator point, read bilinearly from its first band; nodata and
-/// points off it give `None`.
+/// A DEM's first-band height at a Web Mercator point, before exaggeration or water. Uses
+/// the same bounded bilinear sampling and full-turn wrapping as [`Ground`]; nodata, empty
+/// grids and points off the DEM give `None`.
+pub fn dem_height(raster: &Raster, at: Coord) -> Option<f64> {
+    raster_height(raster, at, crate::raster::full_turn_width(raster))
+}
+
 fn raster_height(r: &Raster, m: Coord, wrap_width: Option<i64>) -> Option<f64> {
+    if r.width == 0 || r.height == 0 {
+        return None;
+    }
     let n = r.transformer().from_merc(m)?;
     let (px, py) = r.transform.to_pixel(n);
     let px = r.wrap_col(px);
@@ -463,7 +500,8 @@ fn tile_at(m: Coord, zoom: u8) -> Option<(TileId, f64, f64)> {
 
 /// An elevation tile's height at a Web Mercator point: the tile at `zoom` once read (its fetch
 /// starts here, with one [`COARSE_LEVELS`] up), meanwhile the nearest coarser one read already.
-/// A failed fetch is tried again only after the cache's back-off.
+/// A failed fetch is tried again only after the cache's back-off. The flag says the height
+/// came from the requested detail tile, so shore sampling needs no second lookup.
 fn tile_height(
     url: &str,
     encoding: TerrainEncoding,
@@ -472,8 +510,8 @@ fn tile_height(
     pending: &RefCell<bool>,
     waiting: &RefCell<std::collections::HashSet<TileId>>,
     m: Coord,
-) -> Option<f64> {
-    let (id, _, _) = tile_at(m, zoom)?;
+) -> (Option<f64>, bool) {
+    let Some((id, _, _)) = tile_at(m, zoom) else { return (None, false) };
     let tile = |id: TileId, fetch: bool| -> Option<Arc<Payload>> {
         if let Some(t) = read.borrow().get(&id) {
             return t.clone();
@@ -507,10 +545,10 @@ fn tile_height(
             && let Payload::Image(pm) = &*p
             && let Some((_, fx, fy)) = tile_at(m, t.z)
         {
-            return pixel_height(pm, encoding, fx, fy);
+            return (pixel_height(pm, encoding, fx, fy), k == 0);
         }
     }
-    None
+    (None, false)
 }
 
 /// The height an elevation tile's pixels give at (`fx`, `fy`) across it, bilinearly.
@@ -555,6 +593,29 @@ mod tests {
     }
 
     #[test]
+    fn dem_sampler_refuses_empty_grid_dimensions() {
+        let mut raster = Raster::new(
+            "DEM",
+            2,
+            1,
+            vec![vec![10.0, 20.0]],
+            GeoTransform { origin_x: 0.0, origin_y: 100.0, pixel_width: 100.0, pixel_height: -100.0 },
+            Crs::WebMercator,
+            None,
+            ColorHint::Gray,
+            "Float32",
+        )
+        .unwrap();
+        let at = Coord::new(0.0, 50.0);
+        assert!(dem_height(&raster, at).is_some());
+        raster.width = 0;
+        assert_eq!(dem_height(&raster, at), None);
+        raster.width = 2;
+        raster.height = 0;
+        assert_eq!(dem_height(&raster, Coord::new(50.0, 100.0)), None);
+    }
+
+    #[test]
     fn a_blocks_base_goes_below_the_nodata_drawn_at_zero() {
         // #1914: ground 5000 m high beside nodata (drawn at 0): the base is 1000 m below 0, not
         // below 5000 m, so the walls still go down.
@@ -567,6 +628,7 @@ mod tests {
             extent: Some([0.0, 0.0, 200.0, 100.0]),
             depth: Some(1000.0),
             walls: rustgis_map::view::BLOCK_WALLS,
+            walls_layer: None,
         };
         m.view.terrain = Some(rustgis_map::view::Terrain {
             source: rustgis_map::view::TerrainSource::Layer("dem".into()),
@@ -609,6 +671,7 @@ mod tests {
             extent: Some([0.0, 0.0, 5000.0, 5000.0]),
             depth: Some(300.0),
             walls: rustgis_map::view::BLOCK_WALLS,
+            walls_layer: None,
         };
         m.view.terrain = Some(rustgis_map::view::Terrain {
             source: rustgis_map::view::TerrainSource::Tiles {

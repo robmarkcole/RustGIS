@@ -66,7 +66,18 @@ fn valid(app: &RustGisApp, f: &Form) -> bool {
 }
 pub(crate) fn pick(app: &mut RustGisApp, c: Coord, alt: bool) {
     app.conversion.menu = None;
-    if !crate::boxedit::ready(app) {
+    if !matches!(
+        app.session.tool,
+        rustgis_engine::Tool::Explore
+            | rustgis_engine::Tool::Select
+            | rustgis_engine::Tool::SelectPolygon
+            | rustgis_engine::Tool::SelectLasso
+            | rustgis_engine::Tool::SelectRadius
+            | rustgis_engine::Tool::EditVertices
+            | rustgis_engine::Tool::Circle
+            | rustgis_engine::Tool::RotatedBox
+    ) || !crate::boxedit::ready(app)
+    {
         return;
     }
     let hits = crate::boxedit::hits(app, c);
@@ -385,6 +396,83 @@ mod tests {
 #[cfg(test)]
 mod overlap_tests {
     use super::*;
+    #[test]
+    fn shape_conversion_selection_tools_offer_the_right_click_menu() {
+        use egui_kittest::kittest::Queryable;
+        use rustgis_engine::Tool;
+        for tool in [Tool::Explore, Tool::Select, Tool::SelectPolygon, Tool::SelectLasso, Tool::SelectRadius] {
+            let mut app = super::tests::app();
+            app.conversion.form = None;
+            let id = app.session.active_layer.unwrap();
+            let g = app.session.map().layer(id).unwrap().dataset.features[0].geometry.clone().unwrap();
+            app.run("edit.addFeature", json!({"geometry":rustgis_engine::data::io::geometry_to_geojson(&g)})).unwrap();
+            app.run("select.rows", json!({"rows":[0,1],"mode":"new"})).unwrap();
+            app.session.tool = tool;
+            app.run("map.zoomToExtent", json!({"extent":[-0.02,-0.02,0.04,0.04]})).unwrap();
+            let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1400., 860.)).with_max_steps(1000).build_ui_state(
+                |ui, app: &mut RustGisApp| {
+                    let ctx = ui.ctx().clone();
+                    app.logic(&ctx);
+                    app.ui(ui);
+                },
+                app,
+            );
+            h.run_steps(6);
+            let c = rustgis_engine::box_edit::Frame::default().to_lonlat([1000., 1000.]).unwrap();
+            let at = crate::mapview::lonlat_to_screen(h.state(), h.state().map.view_rect.unwrap().0, c).unwrap();
+            h.event(egui::Event::PointerMoved(at));
+            for pressed in [true, false] {
+                h.event(egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Secondary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            h.run_steps(3);
+            assert_eq!(h.state().session.map().layer(id).unwrap().selection, [1], "{tool:?}");
+            h.get_by_label("Convert to").click();
+            h.run();
+            h.get_by_label("Circle…").click();
+            h.run();
+            assert_eq!(h.state().conversion.form.as_ref().unwrap().row, 1, "{tool:?}");
+        }
+    }
+
+    #[test]
+    fn shape_conversion_right_click_respects_tool_and_empty_space_selection() {
+        use rustgis_engine::Tool;
+        for tool in [
+            Tool::Explore,
+            Tool::Select,
+            Tool::SelectPolygon,
+            Tool::SelectLasso,
+            Tool::SelectRadius,
+            Tool::EditVertices,
+            Tool::CreatePolygon,
+            Tool::Measure,
+            Tool::Circle,
+            Tool::RotatedBox,
+        ] {
+            let mut app = super::tests::app();
+            app.conversion.form = None;
+            app.session.tool = tool;
+            let id = app.session.active_layer.unwrap();
+            let frame = rustgis_engine::box_edit::Frame::default();
+            pick(&mut app, frame.to_lonlat([1e7, 1e7]).unwrap(), false);
+            let clears = matches!(tool, Tool::Circle | Tool::RotatedBox);
+            assert_eq!(app.session.map().layer(id).unwrap().selection.is_empty(), clears, "{tool:?}");
+            assert!(app.conversion.menu.is_none(), "{tool:?}");
+            if !clears {
+                app.run("select.clear", json!({})).unwrap();
+            }
+            pick(&mut app, frame.to_lonlat([1000., 1000.]).unwrap(), false);
+            let draws = matches!(tool, Tool::CreatePolygon | Tool::Measure);
+            assert_eq!(app.session.map().layer(id).unwrap().selection.is_empty(), draws, "{tool:?}");
+            assert_eq!(app.conversion.menu.is_none(), draws, "{tool:?}");
+        }
+    }
+
     #[test]
     fn shape_conversion_right_click_keeps_selected_overlap_and_alt_cycles() {
         let mut app = super::tests::app();

@@ -46,8 +46,10 @@ adb exec-out screencap -p > shot.png
 ```
 
 The APK is signed with a debug key made in `target/android`. There is no Gradle project: `aapt2`
-links the manifest, `javac` and `d8` compile the one Java class, and the Rust library is the rest
-of the app.
+links the manifest and the launcher icon, `javac` and `d8` compile the one Java class, and the Rust
+library is the rest of the app. The icon is an adaptive icon drawn by `build.rs` from the same code
+as the desktop's window icon: the logo on white, with a monochrome layer that themed icons (Android
+13 and later, and launchers that tint icons) draw in their own colour.
 
 Both apps carry RustGIS's `LICENSE` and this folder's `THIRD-PARTY-LICENSES.txt`, the notices of
 the crates the phone builds compile in (in the APK's `assets/`, at the top of `RustGIS.app`).
@@ -283,7 +285,8 @@ Development or Distribution identity in the keychain) and `IOS_PROFILE` (a provi
 `org.rustgis.mobile`) it signs the app and packs `target/ios/RustGIS.ipa`, for a device or for
 TestFlight. There is no Xcode project: cargo builds the executable and the script makes the bundle
 around it, with `ios/Info.plist`, the app icon (the logo, drawn by `build.rs` from the same code as
-the desktop's window icon and compiled with `actool`), and the build keys Xcode's own builds
+the desktop's window icon and compiled with `actool`, with the dark and tinted variants iOS 18 and
+later show), and the build keys Xcode's own builds
 record. The build number is the commit count, or `IOS_BUILD` (a device build from a shallow
 clone, which can't count them, is refused without it).
 
@@ -355,10 +358,16 @@ A release also releases the bundle on Google Play's **production** track
 (`.github/scripts/play_upload.py`, which calls the Play Developer API with no third-party Action):
 it reaches users once Google's review passes. Until the app's first release is published in Play
 Console, Play takes only drafts, so the release is made a draft there (and the run says so) for
-someone to roll out by hand. A manual run with `play` uploads to the track and status it is given,
-by default an internal testing draft. It needs a Google Cloud service account Play Console lets
-release, its JSON key in the `mobile-release` environment as `PLAY_SERVICE_ACCOUNT_JSON`:
+someone to roll out by hand. A pre-release goes to internal testing as a draft, never to
+production. A manual run with `play` uploads to the track and status it is given, by default an
+internal testing draft. Play refuses a version code it has: when its bundle with that code is the
+same file, that upload is released instead; otherwise (a manual run uploaded the same commit, built
+on another runner, so the files differ) the run fails saying so, and that build is released in
+Play Console. It needs a Google Cloud service account Play Console lets release, its
+JSON key in the `mobile-release` environment as `PLAY_SERVICE_ACCOUNT_JSON`:
 
+0. A new app's first bundle is uploaded in Play Console by hand (Test and release › Internal
+   testing): the API can't add one to an app that has none. RustGIS's was, on 2026-11-15.
 1. In Google Cloud (any project), enable the Google Play Android Developer API, create a service
    account and a JSON key for it.
 2. In Play Console, Users and permissions › Invite new users: the service account's email, with

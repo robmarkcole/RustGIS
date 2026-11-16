@@ -66,11 +66,22 @@ For commands, `format` is optional and defaults to `"iso"`: ISO 8601 (`2026-03-0
 `2026-03-05T14:30:00+02:00`, or with a space for the `T`). An explicit numeric pattern uses
 `%Y` (four-digit year), `%m` (month), `%d` (day), `%H` (24-hour clock), `%M` (minute),
 `%S` (second), `%f` (fractional second digits), `%z` (`Z`, `+0200` or `+02:00`), and `%%` (a
-literal percent). Month, day, hour, minute, second and `%y` take two digits. Other characters
+literal percent). `%m`, `%d`, `%H`, `%M`, `%S` and `%y` take exactly two digits. Other characters
 match literally; surrounding whitespace is ignored. For example:
 
 ```json
 {"layer":"Permits","field":"issued","type":"datetime","format":"%m/%d/%Y %H:%M"}
+```
+
+For a month, day or 24-hour clock written with one or two digits, use `%-m`, `%-d` or `%-H`.
+Each reads up to two digits; separate these fields with punctuation or spaces. The fixed-width
+`%m`, `%d` and `%H` keep their meaning, including in compact patterns such as `%m%d%Y`.
+`%I` reads a one- or two-digit 12-hour clock (1 to 12), paired with `%p` for case-insensitive
+`AM` or `PM`: 12 AM is midnight and 12 PM is noon. Do not combine it with `%H` or `%-H`.
+The dialog offers **M/D/YYYY h:MM:SS AM/PM** for text such as `6/23/2021 5:00:00 AM`:
+
+```json
+{"layer":"Permits","field":"issued","type":"datetime","format":"%-m/%-d/%Y %I:%M:%S %p"}
 ```
 
 `%y` requires `pivotYear`, the first year of a 100-year window (1 to 9900). For example,
@@ -375,6 +386,7 @@ Use these ids in `gp.run`'s `tool` parameter (`gp.tools` lists the available too
 | IDW Interpolation | `idwInterpolation` | Analysis › Interpolation |
 | Ordinary Kriging | `kriging` | Analysis › Interpolation |
 | Zonal Statistics | `zonalStats` | Analysis › Raster |
+| Tabulate Area | `tabulateArea` | Analysis › Raster |
 | Kernel Density | `kernelDensity` | Analysis › Density |
 
 **Raster to PMTiles** (`rasterToPmtiles`) writes Web Mercator PNG tiles using the raster's current
@@ -686,8 +698,9 @@ layers**: the prediction, named by `output`, and `<output>_variance`.
 the count of output polygon features whose total area is less than one millionth (`1e-6`) of
 their input feature's area, measured in the overlay plane. These may be slivers along the clip
 boundary; they are kept unchanged. Check these features before using the result as a map series
-index, where a tiny sliver can make an apparently empty page. Ordinary clipped pieces give no
-sliver notice, and empty intersections are still left out.
+index, where a tiny sliver can make an apparently empty page. A genuine small piece of a very
+large input can also trigger this notice. Pieces at or above the ratio give no sliver notice,
+and empty intersections are still left out.
 
 **Erase** (`erase`) removes from `input` features (points, lines or polygons) their parts inside
 the `erase` polygons. An erase polygon's edge counts as inside it, as for Clip, so a point on the
@@ -948,9 +961,9 @@ digits, so `06/23/2021` converts but `6/23/2021` doesn't).
    A date such as `2026-03-05` becomes `2026-03`, keeping different years separate.
 2. Run **Summary Statistics** on the permits, with **Case Fields** = `issue_month` and a
    **COUNT** statistic on `issue_date` (use **Add statistic**).
-3. Read `FREQUENCY` as the number of permits per month. Records without a date form a separate
-   group with an empty key. The output
-   contains months present in the data; it does not fill in missing months with zero.
+3. Read `FREQUENCY` as the number of permits per month. A null date and an empty-text date form
+   separate groups with null and empty-text keys; if both forms occur, there are two groups. The
+   output contains months present in the data; it does not fill in missing months with zero.
 
 **Minimum Bounding Geometry** (`convexHull`) encloses each feature in its convex hull (Group
 Option `None`), or all of them in one (`All`, with `count`, the features it enclosed). It passes
@@ -1042,16 +1055,18 @@ the table it names with `read_features`, a row per county.
 **Tabulate Intersection** (`tabulateIntersection`) measures how much of each zone each class of
 polygons covers, and shares the classes' totals out to the zones by area. Both layers are polygon
 layers. Zone features sharing the values of the `zoneFields` (one field, or several as a list) make
-one zone, and class features sharing the values of the `classFields` make one class; with no class
-fields, all the class features are one class. The tool makes a standalone table with a row for each
-zone and class that overlap (pairs that only touch get none), sorted by the zone fields' values,
+one zone. Zone Fields is optional: when empty, each zone feature is a separate zone, with its
+zero-based input row in an integer `zone_row` field. These zones stay in input row order; selecting
+features keeps their original row numbers. Class features sharing the values of the `classFields`
+make one class; with no class fields, all the class features are one class. The tool makes a
+standalone table with a row for each zone and class that overlap (pairs that only touch get none), sorted by the zone fields' values,
 then the class fields', with empty values first, as Summary Statistics sorts its rows:
 
 | Field | Holds |
 | --- | --- |
-| The zone fields | The zone's values |
+| The zone fields, or `zone_row` | The zone's values, or the zero-based input row when no zone fields are given |
 | The class fields | The class's values |
-| `area_km2` | The ground area of the class in the zone, in km², where class features overlap each other counted once |
+| `area_<unit>` (`area_km2` by default) | The ground area of the class in the zone, in the chosen unit, where class features overlap each other counted once |
 | `percentage` | The class's area in the zone as a percentage of the zone's area, both measured as the map draws them (below; empty for a zone with no area) |
 | Each of `sumFields` | The sum, over the class's features, of the field's value times the part of the feature's area inside the zone |
 
@@ -1063,7 +1078,12 @@ school district: a block half inside a district gives it half its population. Th
 and can't also be class fields. Zones that overlap each other each get their share, so a value can
 be shared out more than once; the value of a feature's part outside every zone isn't shared out.
 
-`area_km2` is measured on the ellipsoid, as Calculate Geometry Attributes measures it. The
+The optional `areaUnit` uses the same unit keys as Calculate Geometry and `area()`: `m2` (square
+metres), `km2` (square kilometres, the default), `ha` (hectares), `ac` (acres), `ft2` (square feet)
+and `mi2` (square miles). It changes the area values and field name, for example `area_ac` for
+acres; percentages and sum shares stay the same. Existing calls keep `area_km2` and its values.
+
+The area is measured on the ellipsoid, as Calculate Geometry Attributes measures it. The
 percentages and shares compare areas measured on a sphere with each edge as the map draws it (a
 straight line on the map), the lines the tool cuts along, so the shares of a feature that zones
 cover without overlapping each other add up to its whole value, up to the overlay's rounding of the
@@ -1094,6 +1114,7 @@ features are used when a layer has a selection, and the table is named `<zones>_
 ```text
 gp.run={"tool":"tabulateIntersection","params":{"zones":"districts","zoneFields":"district","classes":"blocks","sumFields":["population"]}}
 gp.run={"tool":"tabulateIntersection","params":{"zones":"counties","zoneFields":"county","classes":"landcover","classFields":"class"}}
+gp.run={"tool":"tabulateIntersection","params":{"zones":"parcels","classes":"floodplain","areaUnit":"ac"}}
 ```
 
 <figure markdown="span">
@@ -1390,7 +1411,7 @@ click them on the map:
 
 | Workflow | What it does |
 | --- | --- |
-| Raster Functions | Slope in degrees (not percent), aspect, hillshade (8-bit shades from 1 to 255, with 0 for no data), NDVI, band math (`(b4-b3)/(b4+b3)`), remapping, thresholds, resampling |
+| Raster Functions | Slope in degrees or percent, aspect, hillshade (8-bit shades from 1 to 255, with 0 for no data), NDVI, band math (`(b4-b3)/(b4+b3)`), remapping, thresholds, resampling |
 | Function Editor | Chains raster functions, each on the previous output |
 | Suitability Modeler | Scores rasters 1–10 and adds them with weights |
 | Visibility Analysis | A viewshed from a point on an elevation raster, with the Earth's curvature and the refraction of visible light (1/7, as `gdal_viewshed`). The ground along each ray is the cell each point falls in by default; `heights: "bilinear"` (**Ground heights › Between cells (bilinear)** in the Workflows pane) reads it between the cells' centres instead. Both are estimates of the ground between cell centres; between cells is closer on ground that bulges (a hill seen from its top), where the nearest cell can hide cells just inside the horizon. With no radius, or one longer than the raster's diagonal, the viewshed covers the whole raster. The map's **Viewshed N km Here** reads the ground as the Workflows pane's **Ground heights** says. On a raster round the whole Earth the rays don't cross its east–west edge, which the analysis says when the radius reaches it and the way across is shorter: the ground just across the edge is left out, worked out the long way round where the radius reaches the far edge through the raster too (always with no radius), or partly both, near the observer's row and not farther from it. The observer's height must be from 0 to 10,000 m. Ground with no data hides nothing, and next to it bilinear heights take the nearest cell's height; the analysis says how many cells this touched, in a notice. The answer gives both counts (0 when there is nothing to say): `acrossNoData` counts the visible cells whose rays crossed ground with no data (a hidden cell stays hidden whatever that ground is, so it isn't counted, and 0 doesn't mean no ray crossed any); `readNearest` counts every cell, visible or hidden, whose ray took a nearest height next to no data in bilinear mode |
@@ -1404,12 +1425,15 @@ click them on the map:
 | Embeddings | The features most like the selected one, by their numeric attributes |
 | Data Interop | KML, GPX, CSV with WKT, GeoJSON or CSV |
 
-Slope, in Raster Functions and the Function Editor, is in degrees, from 0 (flat) to 90
-(vertical), from Horn's 3 × 3 gradient; there is no percent option. Percent slope is
-`100 × tan(slope × π / 180)` (the angle in radians, as `tan` takes it), so 45° is 100%: convert
-each cell before averaging, since a converted mean angle isn't the mean percent. The result's
-band is named **Slope (degrees)**, which `raster.info` shows and a saved project or GeoTIFF
-export keeps; a later step in a chain names it again.
+Slope, in Raster Functions and the Function Editor, uses Horn's 3 × 3 gradient. Choose
+**Slope units**: **Degrees (0–90)** (the default, from flat to vertical) or **Percent**.
+For `raster.function`, set `"function": "slope", "units": "percent"`; in `raster.functionChain`,
+set `"units": "percent"` on the slope step. Omitting `units`, or setting it to `"degrees"`,
+keeps degree output. Percent slope is `100 × tan(slope × π / 180)` (the angle in radians, as
+`tan` takes it), so 45° is 100%. Percent is computed per cell before any later step or
+statistics; converting a mean angle would not give the mean percent. The result's band is
+named **Slope (degrees)** or **Slope (percent)**, which `raster.info` shows and a saved project
+or GeoTIFF export keeps; a later step in a chain names it again.
 
 Slope, aspect and hillshade need the cell size in the elevation's unit. On a projected DEM the
 cell size is taken as it is, so elevations must be in the same unit as the coordinates (feet
@@ -1424,9 +1448,11 @@ from its low end up to, but not including, its high end: `[21, 22, 1]` maps clas
 ranges that can match nothing, and another says when a remap, or a suitability whose criteria
 score no cell in common, leaves no cells with values.
 
-Network routing rebuilds its graph for each request and solves each edge length on WGS 84.
-Large line networks can therefore take longer to route than with spherical lengths; repeated
-routes do not currently share a cached graph.
+Network routing solves each edge length on WGS 84 and reuses the most recent network graph
+across repeated routes, including command, model and script loops. Editing the network, changing
+its visible rows or choosing a different cost field rebuilds the graph. Route ends and snap
+distance are checked separately for each request. The cache holds at most one graph with up to
+256 MiB of heap storage (including its row list); larger networks are rebuilt for each request.
 
 Rasters these make are kept in the project. **Environments** (`gp.env`) set an extent from the map
 view, full extent, a layer or a longitude/latitude box (or `null` to clear it). For tools that
@@ -1741,9 +1767,12 @@ The Imagery tab's groups open their tools in the Workflows pane. The tab belongs
     (each channel's most frequent value among the pixels that show). Class names are kept with
     `nearest` and `mode`; other methods remove them with a notice naming the affected bands.
     Palette images use `nearest` for sampling and `mode` for aggregation, keeping their classes.
-  - Cells off the raster are its no-data value. A raster without one keeps its bands as they are,
-    with NaN there in a floating-point type and 0 in a whole-number one, as GDAL leaves them; a
-    colour image gains an alpha band instead, so they are see-through.
+  - Cells off the raster use 0 in every band when the image has alpha or gains it, so they are
+    see-through. Otherwise an explicit no-data value takes precedence. Without either, every
+    band uses NaN when any band has class names, the type is floating-point, or RGB data has
+    more than three bands (for example RGBI, whose fourth band is data). Other unlabelled
+    whole-number data uses 0. A three-band RGB image without alpha or no-data gains an alpha
+    band for its outside cells.
   - Datums are shifted as everywhere in RustGIS, through each system's transformation to WGS 84
     (a Helmert step for SAD69 or Córrego Alegre, a few metres from the IBGE's grid shifts).
   - The result has to fit in memory (120 million values, cells times bands, or more on a computer
@@ -1938,6 +1967,58 @@ rustgis-cli run --cmd 'cube.reduce={"layers":["ndvi_2015","ndvi_2016","ndvi_2017
 rustgis-cli run --data cobertura_1985.tif --data cobertura_1986.tif --data cobertura_1987.tif --cmd 'cube.reduce={"layers":["cobertura_1985","cobertura_1986","cobertura_1987"],"stat":"changes"}'
 rustgis-cli run --cmd 'cube.reduce={"url":"https://data.inpe.br/bdc/stac/v1","collection":"mod13q1-6.1","asset":"NDVI","bbox":[-44.8,-7.5,-44.3,-7.0],"start":"2001","end":"2025","cellSize":1000,"stat":"mean","by":"year","minValid":0.5,"name":"NDVI"}' --save urucui.rgis
 ```
+
+## Categorical raster area by zone
+
+**Tabulate Area** (`tabulateArea`) makes a standalone table with one row per polygon zone
+and one column per raster class: for example, acres of each land-cover class in each census
+tract. Open it in the Tools pane. Choose `raster`, `zones`, and a 1-based `band` (default 1).
+Only selected zone features are used when the layer has a selection. With no `zoneField`, each
+feature gets a row identified by its `zone_id` (the feature ID, as text). With one field,
+equal values form one zone, sorted by value; null values form their own zone. Overlapping parts
+or features of the same zone count a cell once. Different overlapping zones each count it.
+
+The output has a `class_<value>` column for every distinct valid value in the chosen band,
+sorted numerically, including classes absent from the zones. A name colliding with the zone
+field gets a numeric suffix. Classes absent from a zone have zero values. Zones outside the
+raster, or containing no valid cells, still have rows of zeros and are counted in a notice.
+NoData and non-finite cells are excluded and their count **inside zones** is reported, once per
+zone; overlapping zones can therefore report the same missing cell more than once.
+
+`measure: "Area"` is the default. `unit` uses the same conversions as Calculate Geometry:
+`km2` (default, as in Tabulate Intersection), `m2`, `ha`, `ac`, `ft2` or `mi2`.
+`measure: "Count"` instead puts integer cell counts in the class columns.
+
+Cells are counted by **centre**, as in Zonal Statistics: a cell whose centre is inside a zone
+contributes its whole area; there is no partial-cell weighting. Polygon coordinates are stored
+in WGS 84 and transformed onto the raster's grid; the polygon layer's original CRS metadata
+is not applied again. Invalid features and parts that cannot be placed on the raster are
+counted in notices, with valid features and grid-projected parts retained.
+
+For geographic and **Web Mercator** rasters, cell corners are transformed to WGS 84 and
+measured on the ellipsoid using geodesic edges. This gives ground area instead of Web
+Mercator's inflated map area. WGS 84 longitude/latitude and Web Mercator grids share a cache
+of cell areas by raster row; every worker uses the same first-column representative, keeping
+results identical across thread counts. Other geographic datums and axis orders retain
+per-cell measurement because their transformed cell areas can also vary across a row.
+A cell whose area cannot be measured causes an error.
+
+Other projected rasters use the absolute pixel width times pixel height, converted from the
+CRS's linear units to square metres. The tool reports this **area in the raster's projection**
+in a notice. RustGIS does not currently classify equal-area projections, so all projected
+rasters except Web Mercator receive that notice for Area measurements. Use an equal-area
+raster for ground-area summaries: a 30 m equal-area raster contributes 900 m²
+(900 / 4046.8564224 acres) per cell. Count measurements need no area conversion or notice.
+
+```json
+{"tool":"tabulateArea","params":{"raster":"LandCover","zones":"Tracts","zoneField":"GEOID","unit":"ac","output":"CoverAcres"}}
+```
+
+Use this with `gp.run`, then export the resulting table as CSV. Like Pivot Table, the tool
+refuses more than 1,000 class columns or 10 million output values. On the desktop it runs in
+the background with progress and Cancel; independent zones use several threads within the
+mask memory budget. Each zone's mask is filled as one step before its cells are scanned, so
+Cancel can wait for that mask fill to finish.
 
 ## Zonal statistics and polygon clipping
 

@@ -199,7 +199,7 @@ impl Session {
     }
     /// Lands only the original read invocation; no result can be claimed by another command.
     pub(crate) fn finish_read(&mut self, read: crate::cmd::reads::Read) -> CmdResult {
-        let crate::cmd::reads::Read { op, owner, source, ready } = read;
+        let crate::cmd::reads::Read { op, owner, source, ready, inputs } = read;
         let (command, params) = match op.op() {
             CommandOp::Registered { spec, params } => (spec.id, params.clone()),
             _ => return Err("not a registered read command".into()),
@@ -207,6 +207,7 @@ impl Session {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.with_deferred_downloads(|s| {
                 s.command_epilogue(command, &params, |s| {
+                    rustgis_data::provenance::record(inputs);
                     s.check_delivery(&owner)?;
                     if let Some(source) = &source {
                         let layer = s.map().layer(s.layer_id(&params)?).ok_or("no such layer")?;
@@ -724,8 +725,12 @@ impl Session {
         // command of an extension that is off, as `Session::run` does: the one asked for, and
         // the one a completion finishes.
         if let Some(why) = self.extensions().blocks(id) {
-            // A completion's raster is let go, as `finish_raster` does.
-            if let Some(run) = params.get("ran").and_then(Value::as_u64) {
+            // Only its own completion may release the raster, as `finish_raster` does.
+            if let Some(run) = params.get("ran").and_then(Value::as_u64)
+                && let Some(c) = self.raster_results.iter().find(|(n, _)| *n == run).and_then(|(_, m)| m.continuation.as_ref())
+                && c.node.id() == id
+                && self.check_delivery_owner(c).is_ok()
+            {
                 self.raster_results.retain(|(n, _)| *n != run);
             }
             return Err(why);

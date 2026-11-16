@@ -3,10 +3,11 @@
 mod check_geometry;
 mod geometry;
 mod repair_geometry;
+mod tabulate_area;
 
 use geo::{BooleanOps, Contains, ConvexHull, CoordsIter, InteriorPoint, Intersects, MultiPolygon, Orient, Relate, orient::Direction};
 use rustgis_data::raster::{Crs, Transformer};
-use rustgis_data::{Coord, Dataset, Feature, Field, FieldType, Geometry, GeometryType, Value};
+use rustgis_data::{Coord, Dataset, Feature, Field, FieldType, Geometry, GeometryType, Measure, Value};
 use rustgis_geom::Extent;
 use serde_json::Value as Json;
 use std::borrow::Cow;
@@ -654,9 +655,9 @@ pub static TOOLS: &[ToolSpec] = &[
                 name: "zoneFields",
                 label: "Zone Fields",
                 kind: K::Fields { input: "zones" },
-                required: true,
+                required: false,
                 default: "",
-                help: "Zones sharing these fields' values make one zone. Scripts and the AI Assistant can give several fields as a list.",
+                help: "Zones sharing these fields' values make one zone. Leave empty for one zone per feature, identified by zone_row (the zero-based input row). Scripts and the AI Assistant can give several fields as a list.",
             },
             P { name: "classes", label: "Input Class Features", kind: K::PolygonLayer, required: true, default: "", help: "" },
             P {
@@ -674,6 +675,14 @@ pub static TOOLS: &[ToolSpec] = &[
                 required: false,
                 default: "",
                 help: "Numeric fields of the class features whose values are shared out to the zones by the part of each feature's area in them.",
+            },
+            P {
+                name: "areaUnit",
+                label: "Area Unit",
+                kind: K::Choice(&["m2", "km2", "ha", "ac", "ft2", "mi2"]),
+                required: false,
+                default: "\"km2\"",
+                help: "Square metres (m2), square kilometres (km2), hectares (ha), acres (ac), square feet (ft2) or square miles (mi2), as in Calculate Geometry and area(). The area field is named area_<unit>.",
             },
             P { name: "output", label: "Output Name", kind: K::Text, required: false, default: "", help: "" },
         ],
@@ -907,6 +916,57 @@ pub static TOOLS: &[ToolSpec] = &[
             P { name: "output", label: "Output Name", kind: K::Text, required: false, default: "", help: "" },
         ],
         run: kriging_interpolation,
+    },
+    ToolSpec {
+        id: "tabulateArea",
+        name: "Tabulate Area",
+        toolbox: "Analysis › Raster",
+        summary: "Tabulates each raster class by polygon zone, as area or cell count in a standalone table.",
+        params: &[
+            P {
+                name: "raster",
+                label: "Input Raster",
+                kind: K::RasterLayer,
+                required: true,
+                default: "",
+                help: "Categorical raster; each distinct valid band value is a class.",
+            },
+            P {
+                name: "zones",
+                label: "Zone Polygons",
+                kind: K::PolygonLayer,
+                required: true,
+                default: "",
+                help: "Cells are included by their centres, without partial-cell weighting.",
+            },
+            P {
+                name: "zoneField",
+                label: "Zone Field",
+                kind: K::Field,
+                required: false,
+                default: "",
+                help: "One field whose equal values form a zone; empty gives one row per feature.",
+            },
+            P { name: "band", label: "Band", kind: K::Number, required: false, default: "1", help: "1-based categorical band number." },
+            P {
+                name: "measure",
+                label: "Measure",
+                kind: K::Choice(&["Area", "Count"]),
+                required: false,
+                default: "\"Area\"",
+                help: "Area of whole cells, or their count.",
+            },
+            P {
+                name: "unit",
+                label: "Area Unit",
+                kind: K::Choice(&["km2", "m2", "ha", "ac", "ft2", "mi2"]),
+                required: false,
+                default: "\"km2\"",
+                help: "Square kilometres, square metres, hectares, acres, square feet or square miles; ignored for Count.",
+            },
+            P { name: "output", label: "Output Name", kind: K::Text, required: false, default: "", help: "Output table name." },
+        ],
+        run: tabulate_area::run,
     },
     ToolSpec {
         id: "zonalStats",
@@ -1906,7 +1966,7 @@ fn clip_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>, cache_bytes: Opti
     }
     r.messages.extend(left.notes("Clip", &clip_ds.name));
     if slivers > 0 {
-        r.messages.push(format!("Clip: {slivers} output feature(s) have less than one millionth of their input feature's area; they may be slivers along the clip boundary (kept unchanged)"));
+        r.messages.push(format!("Clip: {slivers} output feature(s) have less than one millionth of their input feature's area in the overlay plane; they may be slivers along the clip boundary (kept unchanged)"));
     }
     Ok(r)
 }
@@ -2513,7 +2573,8 @@ const SPLIT_PART_CHUNK: usize = if cfg!(test) { 64 } else { 65_536 };
 /// as the other half holds of twice the largest input feature's and area's coordinates. Cancel
 /// is looked at, and progress counted, item by item in each step; one feature made ready, one
 /// area's union and one part are each a step without a look, which can be long for an area of
-/// many large polygons.
+/// many large polygons. Candidate ordering is another unchecked step, bounded by the
+/// layer's feature count when adding pole candidates; its reused buffer is sorted in place.
 fn split_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result<ToolResult, String> {
     let ds = input(inp, p, "input")?;
     if ds.geometry_type == GeometryType::None {
@@ -2534,6 +2595,7 @@ fn split_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result<ToolRe
     let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
     let mut by_key: HashMap<(bool, String), usize> = HashMap::new();
     for (zi, z) in zones.iter().enumerate() {
+        crate::control::check()?;
         let Some(f) = sp.features.get(z.row) else { continue };
         let value = field.and_then(|i| f.attrs.get(i)).filter(|v| !v.is_null());
         // -0 is 0, in the key and the name alike.
@@ -2554,34 +2616,81 @@ fn split_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result<ToolRe
         }
     }
     let prefix = out_name(p, ds.name.clone());
-    let located: Vec<(usize, Extent)> =
-        rows(inp, p, "input", ds).into_iter().filter_map(|r| Some((r, ds.features.get(r)?.geometry.as_ref()?.extent()))).collect();
-    let index = ExtentIndex::new(located.iter().map(|(_, e)| *e));
+    let mut located = Vec::new();
+    for row in rows(inp, p, "input", ds) {
+        crate::control::check()?;
+        if let Some(geometry) = ds.features.get(row).and_then(|feature| feature.geometry.as_ref()) {
+            located.push((row, geometry.extent()));
+        }
+    }
+    let index = ExtentIndex::with_checks(located.iter().map(|(_, e)| *e), crate::control::check)?;
     // The input points at each pole: in a split polygon reaching it, at any longitude (#1033).
     let point = |r: usize| {
         ds.features.get(r).and_then(|f| f.geometry.as_ref()).is_some_and(|g| matches!(g, Geometry::Point(_) | Geometry::MultiPoint(_)))
     };
-    let points_at_poles = AtPoles::new(located.iter().map(|(r, e)| if point(*r) { poles(e) } else { (false, false) }));
+    let mut points_at_poles = AtPoles::default();
+    for (i, (row, extent)) in located.iter().enumerate() {
+        crate::control::check()?;
+        let (north, south) = if point(*row) { poles(extent) } else { (false, false) };
+        if north {
+            points_at_poles.north.push(i);
+        }
+        if south {
+            points_at_poles.south.push(i);
+        }
+    }
     // Each split area: its polygons, their extent and the poles they reach.
     let areas: Vec<(String, Vec<&Zone>, Extent, (bool, bool))> = groups
         .into_iter()
         .map(|(name, members)| {
-            let polys: Vec<&Zone> = members.iter().filter_map(|zi| zones.get(*zi)).collect();
-            let ext = polys.iter().fold(Extent::EMPTY, |e, z| e.union(&z.ext));
-            let reached = polys.iter().map(|z| poles(&z.ext)).fold((false, false), |(n, s), (zn, zs)| (n || zn, s || zs));
-            (name, polys, ext, reached)
+            crate::control::check()?;
+            let mut polys = Vec::new();
+            let mut ext = Extent::EMPTY;
+            let mut reached = (false, false);
+            for zi in members {
+                crate::control::check()?;
+                if let Some(zone) = zones.get(zi) {
+                    polys.push(zone);
+                    ext = ext.union(&zone.ext);
+                    let (north, south) = poles(&zone.ext);
+                    reached = (reached.0 || north, reached.1 || south);
+                }
+            }
+            Ok((name, polys, ext, reached))
         })
-        .collect();
+        .collect::<Result<_, String>>()?;
     // The input features an area meets, by their place in `located`, in the index's order.
-    let met_by = |ext: &Extent, reached: (bool, bool), cand_buf: &mut Vec<usize>| {
-        index.candidates_into(ext, cand_buf);
-        points_at_poles.add_to(reached, cand_buf);
-        cand_buf.retain(|&li| {
-            located.get(li).is_some_and(|(r, e)| {
+    let met_by = |ext: &Extent, reached: (bool, bool), cand_buf: &mut Vec<usize>| -> Result<(), String> {
+        index.checked_candidates_into(ext, cand_buf)?;
+        for rows in [reached.0.then_some(&points_at_poles.north), reached.1.then_some(&points_at_poles.south)].into_iter().flatten() {
+            for chunk in rows.chunks(4096) {
+                crate::control::check()?;
+                cand_buf.extend_from_slice(chunk);
+            }
+        }
+        if reached.0 || reached.1 {
+            cand_buf.sort_unstable();
+            crate::control::check()?;
+            cand_buf.dedup();
+        }
+        let mut kept = 0;
+        for position in 0..cand_buf.len() {
+            if position % 4096 == 0 {
+                crate::control::check()?;
+            }
+            let Some(li) = cand_buf.get(position).copied() else { continue };
+            if located.get(li).is_some_and(|(r, e)| {
                 ds.features.get(*r).is_some_and(|f| f.geometry.is_some())
                     && (e.intersects(ext) || (point(*r) && meet_at_a_pole(poles(e), reached)))
-            })
-        });
+            }) {
+                if let Some(slot) = cand_buf.get_mut(kept) {
+                    *slot = li;
+                }
+                kept += 1;
+            }
+        }
+        cand_buf.truncate(kept);
+        Ok(())
     };
     // Which features some area meets, and how many parts there are to make: looked up area by
     // area (the index's lookups, quick), counted area by area, with Cancel looked at for each and
@@ -2593,7 +2702,7 @@ fn split_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result<ToolRe
     for (done, (_, _, ext, reached)) in areas.iter().enumerate() {
         crate::control::check()?;
         crate::control::reached(done);
-        met_by(ext, *reached, &mut cand_buf);
+        met_by(ext, *reached, &mut cand_buf)?;
         pairs = pairs.saturating_add(cand_buf.len());
         for (k, &li) in cand_buf.iter().enumerate() {
             if k % 4096 == 4095 {
@@ -2685,7 +2794,7 @@ fn split_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result<ToolRe
         };
         let mut work: Vec<(usize, usize)> = Vec::new();
         for (ai, (_, _, ext, reached)) in batch.iter().enumerate() {
-            met_by(ext, *reached, &mut cand_buf);
+            met_by(ext, *reached, &mut cand_buf)?;
             for &li in &cand_buf {
                 work.push((ai, li));
                 if work.len() >= SPLIT_PART_CHUNK {
@@ -2778,8 +2887,8 @@ fn dissolve(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
         if !requests.is_empty() {
             record_order(&mut records);
             // Each record is in one group: counted here, each is counted once.
-            rounded.count_texts(ds, &records, &requests, false);
-            attrs.extend(statistic_values(ds, &records, &requests, false, separator, &mut rounded));
+            rounded.count_texts(ds, &records, &requests, false)?;
+            attrs.extend(statistic_values(ds, &records, &requests, false, separator, &mut rounded)?);
         }
         out.push(from_multipolygon(&u), attrs);
     }
@@ -5114,14 +5223,14 @@ fn count_points_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result
         out.fields.extend(added);
         // A point in several overlapping polygons is read for each of them: counted over the
         // points, not the polygons' lists, each is counted once.
-        rounded.count_texts(pts, &summarised, &requests, false);
+        rounded.count_texts(pts, &summarised, &requests, false)?;
         let width = out.fields.len();
         for (f, mut records) in out.features.iter_mut().zip(members) {
             if f.attrs.len() < width {
                 f.attrs.resize(width, Value::Null);
             }
             record_order(&mut records);
-            let values = statistic_values(pts, &records, &requests, false, separator, &mut rounded);
+            let values = statistic_values(pts, &records, &requests, false, separator, &mut rounded)?;
             for (i, v) in values.into_iter().enumerate() {
                 if let Some(slot) = f.attrs.get_mut(first + i) {
                     *slot = v;
@@ -5171,11 +5280,12 @@ fn ground_area_perimeter(g: &Geometry) -> (f64, f64) {
             let polar = ring.0.first().zip(ring.0.last()).is_some_and(|(a, b)| (a.x - b.x).abs() > 180.0);
             let orientable = !polar && ring.0.iter().all(|c| c.x.is_finite() && (-90.0..=90.0).contains(&c.y));
             let polygon = geo::Polygon::new(ring, vec![]);
-            // Within a longitude span of 180°, the ring cannot enclose more than a hemisphere.
+            // Within an unwrapped longitude span of 180°, the ring cannot enclose more than a
+            // hemisphere.
             // Use signed magnitude there: a tiny overlay sliver can have opposite planar and
             // geodesic windings, making its unsigned area nearly the whole Earth (#1966).
-            let wide = polygon.bounding_rect().is_some_and(|bounds| bounds.width() > 180.0);
-            let (rp, ra) = if orientable && wide {
+            let wide = orientable && polygon.bounding_rect().is_some_and(|bounds| bounds.width() > 180.0);
+            let (rp, ra) = if wide {
                 polygon.orient(Direction::Default).geodesic_perimeter_area_unsigned()
             } else {
                 // Keep smaller local rings and polar caps; invalid coordinates bypass orientation.
@@ -5497,11 +5607,11 @@ fn summary_statistics(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
     rs.sort_unstable();
     rs.dedup();
     let mut rounded = Rounded::new(requests.len());
-    rounded.count_texts(ds, &rs, &requests, as_numbers);
+    rounded.count_texts(ds, &rs, &requests, as_numbers)?;
     for group in stats::group_rows(ds, &rs, &cases) {
         let mut row = group.key;
         row.push(stats::count(group.rows.len()));
-        row.extend(statistic_values(ds, &group.rows, &requests, as_numbers, separator, &mut rounded));
+        row.extend(statistic_values(ds, &group.rows, &requests, as_numbers, separator, &mut rounded)?);
         // One past the last id: `push` would search them all for each group.
         out.push_next(None, row);
     }
@@ -5548,7 +5658,7 @@ impl Rounded {
     /// records `rows` are whole numbers written as text past the i64 range, read as decimals.
     /// Called once over the records a tool reads, each once, so a value is counted once however
     /// many groups (Summarize Within's polygons) it is summarised in.
-    fn count_texts(&mut self, ds: &Dataset, rows: &[usize], requests: &[crate::stats::Request], as_numbers: bool) {
+    fn count_texts(&mut self, ds: &Dataset, rows: &[usize], requests: &[crate::stats::Request], as_numbers: bool) -> Result<(), String> {
         // Each field once, in the requests' order, which names them in the notice.
         let mut fields: Vec<usize> = Vec::new();
         for r in requests {
@@ -5557,7 +5667,7 @@ impl Rounded {
             }
         }
         for field in fields {
-            let n = crate::stats::column(ds, rows, field, as_numbers).rounded_texts();
+            let n = crate::stats::checked_column(ds, rows, field, as_numbers)?.rounded_texts();
             if n == 0 {
                 continue;
             }
@@ -5567,6 +5677,7 @@ impl Rounded {
                 None => self.texts.push((name.to_string(), n)),
             }
         }
+        Ok(())
     }
 }
 
@@ -5583,30 +5694,33 @@ fn statistic_values(
     as_numbers: bool,
     separator: &str,
     rounded: &mut Rounded,
-) -> Vec<Value> {
+) -> Result<Vec<Value>, String> {
     use crate::stats;
     let mut read: Vec<(usize, stats::Column)> = Vec::new();
     let mut out = Vec::with_capacity(requests.len());
     for r in requests {
+        crate::control::check()?;
         let i = match read.iter().position(|(f, _)| *f == r.field) {
             Some(i) => i,
             None => {
-                read.push((r.field, stats::column(ds, rows, r.field, as_numbers)));
+                read.push((r.field, stats::checked_column(ds, rows, r.field, as_numbers)?));
                 read.len() - 1
             }
         };
-        let value = read.get(i).map_or(Value::Null, |(_, c)| {
-            let v = stats::compute(r.stat, c, separator);
+        let value = if let Some((_, c)) = read.get(i) {
+            let v = stats::checked_compute(r.stat, c, separator)?;
             if stats::rounded(r.stat, c, &v)
                 && let Some(n) = rounded.results.get_mut(out.len())
             {
                 *n += 1;
             }
             v
-        });
+        } else {
+            Value::Null
+        };
         out.push(value);
     }
-    out
+    Ok(out)
 }
 
 /// The notices for what a statistics list lost to decimals: the statistics that came out rounded,
@@ -5794,7 +5908,7 @@ fn pivot_table(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     // numbers written as text past the i64 range that a statistic read as decimals, each once.
     let mut rounded = Rounded::new(columns.len());
     if let Some(stat) = stat {
-        rounded.count_texts(ds, &rs, &[Request { field: value, stat }], false);
+        rounded.count_texts(ds, &rs, &[Request { field: value, stat }], false)?;
     }
     let mut column_of: HashMap<usize, usize> = HashMap::with_capacity(rs.len());
     for (c, column) in columns.iter().enumerate() {
@@ -5901,9 +6015,10 @@ fn pivot_column_name(field: &str, v: &Value) -> String {
     if !text || name.is_empty() || name.starts_with(char::is_numeric) { format!("{field}{name}") } else { name }
 }
 
-/// A zone of Tabulate Intersection: the zone features sharing the zone fields' values, as one mask.
+/// A zone of Tabulate Intersection: features sharing the zone fields' values, or one feature
+/// when no zone fields are given, as one mask.
 struct TabulateZone {
-    /// The zone fields' values.
+    /// The zone fields' values, or the zero-based input row when no fields are given.
     key: Vec<Value>,
     /// The lon/lat extent of its features, for the index.
     ext: Extent,
@@ -5925,7 +6040,7 @@ struct TabulateCell {
 }
 
 /// Tabulate Intersection: a row for each zone and class that overlap, holding the zone fields, the
-/// class fields, `area_km2` (the ground area of the class in the zone, class features overlapping
+/// class fields, `area_<unit>` (the ground area of the class in the zone, class features overlapping
 /// each other counted once), `percentage` (that area as a percentage of the zone's) and each sum
 /// field's share: the sum, over the class's features, of the field's value times the part of the
 /// feature's area inside the zone. Rows are sorted by the zone fields' values, then the class
@@ -5935,7 +6050,10 @@ struct TabulateCell {
 /// with no value in a sum field and, with sum fields, class features not wholly inside the zones,
 /// whose values are not wholly shared out.
 ///
-/// `area_km2` is measured on the ellipsoid, as Calculate Geometry Attributes measures it. The
+/// Without zone fields, each feature is a separate zone, identified by `zone_row` (its zero-based
+/// input row); those zones stay in input order, including when a selection is used.
+/// The area defaults to `area_km2` and is measured on the ellipsoid, as Calculate Geometry
+/// Attributes measures it, converted with [`Measure::units`]. The
 /// percentages and shares compare areas measured as the map draws the polygons instead
 /// ([`map_area_m2`]): the overlay cuts along straight lines on the map, which that measure splits
 /// exactly and the ellipsoid's geodesic edges don't, so a feature's shares in zones that cover it
@@ -5950,9 +6068,8 @@ fn tabulate_intersection(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
         }
     }
     let zone_keys = key_fields(zones, p.get("zoneFields"), "Zone Field")?;
-    if zone_keys.is_empty() {
-        return Err("'Zone Fields' is required".into());
-    }
+    let area_unit = p.get("areaUnit").and_then(Json::as_str).unwrap_or("km2");
+    let area_divisor = Measure::Area.unit(area_unit).ok_or("unknown area unit")?;
     let class_keys = key_fields(classes, p.get("classFields"), "Class Field")?;
     let sum_fields = key_fields(classes, p.get("sumFields"), "Sum Field")?;
     for &f in &sum_fields {
@@ -5989,8 +6106,8 @@ fn tabulate_intersection(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
     }
     let (zones_shapeless, classes_shapeless) = (shapeless(zones, &zone_rows), shapeless(classes, &class_rows));
     // Features with a ring that jumps across the antimeridian unsplit: the overlay, like the map,
-    // takes such a ring the long way round, while `area_km2` takes its ground shape. A ring that
-    // loops around a pole jumps too, but is no crossing: it has a notice of its own (#1354).
+    // takes such a ring the long way round, while the area field takes its ground shape. A ring
+    // that loops around a pole jumps too, but is no crossing: it has a notice of its own (#1354).
     let unsplit = |ds: &Dataset, rs: &[usize]| {
         let jumps = |g: &Geometry| {
             has_shape(g)
@@ -6003,7 +6120,7 @@ fn tabulate_intersection(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
     let (zones_unsplit, classes_unsplit) = (unsplit(zones, &zone_rows), unsplit(classes, &class_rows));
     // Features with an edge beyond 85.05° that runs east or west: the overlay, in the analysis
     // plane, takes it straight in longitude and latitude there (the Web Mercator map clamps it),
-    // while `area_km2` takes the shortest way between its ends, which near a pole runs far
+    // while the area field takes the shortest way between its ends, which near a pole runs far
     // poleward of it (#1033).
     let polar = |ds: &Dataset, rs: &[usize]| {
         let max = rustgis_geom::MAX_LAT;
@@ -6016,7 +6133,12 @@ fn tabulate_intersection(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
         rs.iter().filter(|&&r| ds.features.get(r).and_then(|f| f.geometry.as_ref()).is_some_and(across)).count()
     };
     let (zones_polar, classes_polar) = (polar(zones, &zone_rows), polar(classes, &class_rows));
-    let zone_list: Vec<TabulateZone> = crate::stats::group_rows(zones, &zone_rows, &zone_keys)
+    let zone_groups = if zone_keys.is_empty() {
+        zone_rows.iter().map(|&row| crate::stats::Group { key: vec![Value::Int(row as i64)], rows: vec![row] }).collect()
+    } else {
+        crate::stats::group_rows(zones, &zone_rows, &zone_keys)
+    };
+    let zone_list: Vec<TabulateZone> = zone_groups
         .into_iter()
         .map(|group| {
             let shapes: Vec<&Geometry> =
@@ -6175,7 +6297,11 @@ fn tabulate_intersection(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
     let mut out = Dataset::new(
         out_name(p, format!("{}_Tabulate", zones.name)),
         GeometryType::None,
-        zone_keys.iter().filter_map(|&k| zones.fields.get(k).cloned()).collect(),
+        if zone_keys.is_empty() {
+            vec![Field::new("zone_row", FieldType::Integer)]
+        } else {
+            zone_keys.iter().filter_map(|&k| zones.fields.get(k).cloned()).collect()
+        },
     );
     out.crs_incomplete = zones.crs_incomplete || classes.crs_incomplete;
     // A class field, or an output field, whose name is taken gets a suffix (`name_2`).
@@ -6183,9 +6309,9 @@ fn tabulate_intersection(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
         let name = unique_field(&out, &f.name);
         out.fields.push(Field { name, ..f.clone() });
     }
-    for base in
-        ["area_km2", "percentage"].into_iter().chain(sum_fields.iter().filter_map(|&f| classes.fields.get(f).map(|f| f.name.as_str())))
-    {
+    let area_field = unique_field(&out, &format!("area_{area_unit}"));
+    out.fields.push(Field::new(area_field.clone(), FieldType::Double));
+    for base in ["percentage"].into_iter().chain(sum_fields.iter().filter_map(|&f| classes.fields.get(f).map(|f| f.name.as_str()))) {
         let name = unique_field(&out, base);
         out.fields.push(Field::new(name, FieldType::Double));
     }
@@ -6215,7 +6341,7 @@ fn tabulate_intersection(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
         if let Some(message) = rustgis_data::ambiguous_area_message(std::iter::once(covered)) {
             return Err(format!("Tabulate Intersection: {message}"));
         }
-        row.push(Value::Float(ground_area_perimeter(covered).0 / 1e6));
+        row.push(Value::Float(ground_area_perimeter(covered).0 / area_divisor));
         let covered_area = map_area_m2(covered);
         row.push(if zone.map_area_m2 > 0.0 { Value::Float(covered_area / zone.map_area_m2 * 100.0) } else { Value::Null });
         row.extend(cell.sums.into_iter().map(Value::Float));
@@ -6264,7 +6390,7 @@ fn tabulate_intersection(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
     if !unsplit.is_empty() {
         let verb = if zones_unsplit + classes_unsplit == 1 { "crosses" } else { "cross" };
         messages.push(format!(
-            "{} {verb} the antimeridian without being split there: the map draws them the long way round, and their percentages and shares follow the map, while area_km2 follows the ground",
+            "{} {verb} the antimeridian without being split there: the map draws them the long way round, and their percentages and shares follow the map, while {area_field} follows the ground",
             unsplit.join(" and ")
         ));
     }
@@ -6276,7 +6402,7 @@ fn tabulate_intersection(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
     if !polar.is_empty() {
         let verb = if zones_polar + classes_polar == 1 { "has" } else { "have" };
         messages.push(format!(
-            "{} {verb} an edge beyond 85.05° running east or west: the analysis plane takes it straight in longitude and latitude beyond 85.05°, and their percentages and shares follow the plane, while area_km2 takes the shortest way on the ground, which near a pole can differ widely",
+            "{} {verb} an edge beyond 85.05° running east or west: the analysis plane takes it straight in longitude and latitude beyond 85.05°, and their percentages and shares follow the plane, while {area_field} takes the shortest way on the ground, which near a pole can differ widely",
             polar.join(" and ")
         ));
     }
@@ -6519,8 +6645,21 @@ impl ExtentIndex {
 
     /// An index of these extents, numbered in order from 0.
     pub(crate) fn new(extents: impl Iterator<Item = Extent>) -> Self {
-        let extents: Vec<Extent> = extents.collect();
-        let total = extents.iter().fold(Extent::EMPTY, |t, e| t.union(e));
+        match Self::with_checks(extents, || Ok::<(), std::convert::Infallible>(())) {
+            Ok(index) => index,
+            Err(never) => match never {},
+        }
+    }
+
+    fn with_checks<E>(extents: impl Iterator<Item = Extent>, mut check: impl FnMut() -> Result<(), E>) -> Result<Self, E> {
+        let mut collected = Vec::new();
+        let mut total = Extent::EMPTY;
+        for extent in extents {
+            check()?;
+            total = total.union(&extent);
+            collected.push(extent);
+        }
+        let extents = collected;
         let n_cells = (extents.len() as f64).sqrt().clamp(4.0, 256.0);
         let mut index = ExtentIndex {
             total,
@@ -6531,20 +6670,23 @@ impl ExtentIndex {
             references: 0,
         };
         if extents.len() <= Self::MAX_LINEAR_FEATURES || total.is_empty() {
-            return index;
+            return Ok(index);
         }
         let mut references = 0usize;
         for e in &extents {
+            check()?;
             let ((x0, y0), (x1, y1)) = (index.key(e.min_x, e.min_y), index.key(e.max_x, e.max_y));
             references = references.saturating_add(((x1 - x0 + 1) as usize).saturating_mul((y1 - y0 + 1) as usize));
             if references > Self::MAX_REFERENCES {
-                return index;
+                return Ok(index);
             }
         }
         let mut grid: std::collections::HashMap<(i64, i64), Vec<usize>> = std::collections::HashMap::new();
         for (i, e) in extents.iter().enumerate() {
+            check()?;
             let ((x0, y0), (x1, y1)) = (index.key(e.min_x, e.min_y), index.key(e.max_x, e.max_y));
             for x in x0..=x1 {
+                check()?;
                 for y in y0..=y1 {
                     grid.entry((x, y)).or_default().push(i);
                 }
@@ -6552,7 +6694,7 @@ impl ExtentIndex {
         }
         index.grid = Some(grid);
         index.references = references;
-        index
+        Ok(index)
     }
 
     /// Conservative retained grid allocation estimate: spare reference capacity plus table
@@ -6626,6 +6768,37 @@ impl ExtentIndex {
         }
         out.sort_unstable();
         out.dedup();
+    }
+
+    /// Split's potentially layer-wide preparation lookup, with Cancel during collection.
+    /// The single in-place sort is an unchecked step, bounded by MAX_REFERENCES (one million).
+    fn checked_candidates_into(&self, ext: &Extent, out: &mut Vec<usize>) -> Result<(), String> {
+        out.clear();
+        let Some(grid) = &self.grid else {
+            for i in 0..self.len {
+                if i % 4096 == 0 {
+                    crate::control::check()?;
+                }
+                out.push(i);
+            }
+            return Ok(());
+        };
+        let Some(((x0, y0), (x1, y1))) = self.query_cells(ext) else { return Ok(()) };
+        for x in x0..=x1 {
+            for y in y0..=y1 {
+                crate::control::check()?;
+                if let Some(indices) = grid.get(&(x, y)) {
+                    for chunk in indices.chunks(4096) {
+                        crate::control::check()?;
+                        out.extend_from_slice(chunk);
+                    }
+                }
+            }
+        }
+        out.sort_unstable();
+        crate::control::check()?;
+        out.dedup();
+        Ok(())
     }
 
     /// The features whose extents may meet `ext`, in order and once each: every feature without a
@@ -7720,6 +7893,15 @@ fn feature_envelope_to_polygon(inp: &dyn Inputs, p: &Json) -> Result<ToolResult,
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn split_extent_preparation_checks_cancel_before_finishing_the_layer() {
+        let cancelled = crate::control::Control::cancelled_at_look(7);
+        let _installed = crate::control::install(Some(cancelled.clone()));
+        let extent = Extent { min_x: 0.0, min_y: 0.0, max_x: 1.0, max_y: 1.0 };
+        assert!(ExtentIndex::with_checks(std::iter::repeat_n(extent, 10_000), crate::control::check).is_err());
+        assert_eq!(cancelled.looked(), 7);
+    }
+
     use super::*;
     use crate::geodesic::geodesic_buffer;
     use rustgis_data::Feature;
@@ -13415,7 +13597,7 @@ mod tests {
                 r.messages,
                 [
                     "Clip: 2 features kept",
-                    "Clip: 2 output feature(s) have less than one millionth of their input feature's area; they may be slivers along the clip boundary (kept unchanged)",
+                    "Clip: 2 output feature(s) have less than one millionth of their input feature's area in the overlay plane; they may be slivers along the clip boundary (kept unchanged)",
                 ]
             );
             let out = layer(r);
@@ -14862,6 +15044,195 @@ mod tests {
         assert!(crate::param_applies("spatialJoin", "merge", &with("", "")));
         assert!(!crate::param_applies("spatialJoin", "merge", &with("", "Join one to many")));
         assert!(crate::param_applies("buffer", "units", &with("", "")));
+    }
+
+    /// A 30 m projected categorical grid: two zones, one missing cell, and a zone outside.
+    /// The zones' metadata records a different source CRS; their stored geometry stays WGS 84.
+    #[test]
+    fn tabulate_area_counts_areas_nodata_and_grouped_zones() {
+        use rustgis_data::raster::{ColorHint, GeoTransform, Raster};
+        let raster = Raster::new(
+            "cover",
+            4,
+            2,
+            vec![vec![11., 21., 21., 41., 11., -9999., 41., 41.]],
+            GeoTransform { origin_x: 0., origin_y: 60., pixel_width: 30., pixel_height: -30. },
+            Crs::Epsg(32631),
+            Some(-9999.),
+            ColorHint::Gray,
+            "Float32",
+        )
+        .unwrap();
+        let polygon = |x: f64| sq(x, 0., 60.).map_coords(&|c| raster.transformer().to_lonlat(c).unwrap());
+        let mut zones = Dataset::new("zones", GeometryType::Polygon, vec![Field::new("tract", FieldType::Text)]);
+        zones.crs = Some(Crs::Epsg(26916));
+        for (x, name) in [(0., "a"), (60., "b"), (300., "c")] {
+            zones.push(Some(polygon(x)), vec![Value::Text(name.into())]);
+        }
+        let mut m = RasterMap { datasets: HashMap::from([("zones".into(), zones)]), rasters: HashMap::from([("cover".into(), &raster)]) };
+        let params = serde_json::json!({"raster": "cover", "zones": "zones", "zoneField": "TRACT", "measure": "Count"});
+        let result = crate::run("tabulateArea", &m, &params).unwrap();
+        assert!(!result.messages.iter().any(|m| m.contains("uses the raster projection")));
+        assert!(result.messages.iter().any(|m| m.starts_with("1 NoData")));
+        assert!(result.messages.iter().any(|m| m.starts_with("1 zone(s) contained no valid")));
+        let Output::Table(table) = result.output else { panic!("a table") };
+        assert_eq!(table.fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["tract", "class_11", "class_21", "class_41"]);
+        let counts = [[2, 1, 0], [0, 1, 3], [0, 0, 0]];
+        for (row, expected) in table.features.iter().zip(counts) {
+            assert_eq!(row.attrs.get(1..).unwrap(), expected.map(Value::Int));
+        }
+        for unit in ["m2", "km2", "ac"] {
+            let mut p = params.clone();
+            p["measure"] = Json::from("Area");
+            p["unit"] = Json::from(unit);
+            let result = crate::run("tabulateArea", &m, &p).unwrap();
+            assert!(result.messages.iter().any(|m| m.contains("uses the raster projection (EPSG:32631)")));
+            let Output::Table(area) = result.output else { panic!("a table") };
+            for (row, expected) in area.features.iter().zip(counts) {
+                for (value, count) in row.attrs.iter().skip(1).zip(expected) {
+                    assert_eq!(*value, Value::Float(count as f64 * 900. / rustgis_data::Measure::Area.unit(unit).unwrap()));
+                }
+            }
+        }
+        // Grouping combines the masks, so duplicate overlapping features don't double-count.
+        let zones = m.datasets.get_mut("zones").unwrap();
+        zones.push(Some(polygon(0.)), vec![Value::Text("a".into())]);
+        for threads in [1, 2, 7] {
+            let got = tabulate_area::run_on(&m, &params, Some(threads)).unwrap();
+            let Output::Table(grouped) = got.output else { panic!("a table") };
+            assert_eq!(grouped.features, table.features);
+        }
+        let mut per_feature = params.clone();
+        per_feature.as_object_mut().unwrap().remove("zoneField");
+        let Output::Table(each) = crate::run("tabulateArea", &m, &per_feature).unwrap().output else { panic!("a table") };
+        assert_eq!(each.features.len(), 4);
+        assert_eq!(each.fields[0].name, "zone_id");
+        // Clean zones produce no NoData notice.
+        let zones = m.datasets.get_mut("zones").unwrap();
+        zones.features = vec![zones.features[1].clone()].into();
+        let clean = crate::run("tabulateArea", &m, &params).unwrap();
+        assert!(!clean.messages.iter().any(|m| m.contains("NoData")), "{:?}", clean.messages);
+    }
+
+    /// Geographic area uses the shared ellipsoid measurement; counts and areas stay identical
+    /// across workers. Missing zone geometry is counted in a notice.
+    #[test]
+    fn tabulate_area_geographic_invalid_geometry_and_limits() {
+        use rustgis_data::raster::{ColorHint, GeoTransform, Raster};
+        let raster = Raster::new(
+            "cover",
+            2,
+            1,
+            vec![vec![-0., 2.5]],
+            GeoTransform { origin_x: 0., origin_y: 1., pixel_width: 1., pixel_height: -1. },
+            Crs::LonLat,
+            None,
+            ColorHint::Gray,
+            "Float32",
+        )
+        .unwrap();
+        let mut zones = Dataset::new("zones", GeometryType::Polygon, vec![]);
+        zones.push(Some(sq(0., 0., 2.)), vec![]);
+        zones.push(None, vec![]);
+        let m = RasterMap { datasets: HashMap::from([("zones".into(), zones)]), rasters: HashMap::from([("cover".into(), &raster)]) };
+        let p = serde_json::json!({"raster":"cover", "zones":"zones", "unit":"m2"});
+        let one = tabulate_area::run_on(&m, &p, Some(1)).unwrap();
+        let many = tabulate_area::run_on(&m, &p, Some(3)).unwrap();
+        assert_eq!(one.messages, many.messages);
+        assert!(!one.messages.iter().any(|m| m.contains("uses the raster projection")));
+        assert!(one.messages.iter().any(|m| m.starts_with("1 zone feature(s)")));
+        let (Output::Table(a), Output::Table(b)) = (one.output, many.output) else { panic!("tables") };
+        assert_eq!(a.features, b.features);
+        let expected =
+            rustgis_geom::wgs84_ring_perimeter_area_m2(&[Coord::new(0., 1.), Coord::new(1., 1.), Coord::new(1., 0.), Coord::new(0., 0.)]).1;
+        assert_eq!(a.features[0].attrs[1], Value::Float(expected));
+        assert_eq!(a.fields[1].name, "class_0");
+        for bad in [serde_json::json!({"band": [1, 2]}), serde_json::json!({"band": 0}), serde_json::json!({"unit":"degrees"})] {
+            let mut bad_params = p.clone();
+            bad_params.as_object_mut().unwrap().extend(bad.as_object().unwrap().clone());
+            assert!(crate::run("tabulateArea", &m, &bad_params).is_err());
+        }
+        let many_classes = Raster::new(
+            "cover",
+            1001,
+            1,
+            vec![(0..1001).map(|i| i as f32).collect()],
+            raster.transform,
+            Crs::LonLat,
+            None,
+            ColorHint::Gray,
+            "Float32",
+        )
+        .unwrap();
+        let m = RasterMap { datasets: m.datasets, rasters: HashMap::from([("cover".into(), &many_classes)]) };
+        assert!(crate::run("tabulateArea", &m, &p).unwrap_err().contains("more than 1000 classes"));
+    }
+
+    /// Web Mercator and longitude/latitude grids covering the same strips give ground acres.
+    /// A per-cell geographic reference tolerates only longitude-rounding noise; 32 overlapping
+    /// zones exercise the shared row cache across worker batches with bit-exact thread results.
+    #[test]
+    fn tabulate_area_ground_acres_and_row_cache_are_deterministic() {
+        use rustgis_data::raster::{ColorHint, GeoTransform, Raster};
+        let (w, h) = (4, 3);
+        let gt = GeoTransform { origin_x: -90.12345, origin_y: 35.0003, pixel_width: 0.0003, pixel_height: -0.0003 };
+        let band: Vec<f32> = (0..w * h).map(|i| if i % 2 == 0 { 1. } else { 2. }).collect();
+        let geo = Raster::new("geo", w, h, vec![band.clone()], gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
+        let top = rustgis_geom::lonlat_to_merc(gt.to_world(0., 0.));
+        let bottom = rustgis_geom::lonlat_to_merc(gt.to_world(f64::from(w), f64::from(h)));
+        let merc_gt = GeoTransform {
+            origin_x: top.x,
+            origin_y: top.y,
+            pixel_width: (bottom.x - top.x) / f64::from(w),
+            pixel_height: (bottom.y - top.y) / f64::from(h),
+        };
+        let merc = Raster::new("merc", w, h, vec![band], merc_gt, Crs::WebMercator, None, ColorHint::Gray, "Float32").unwrap();
+        let lower = gt.to_world(0., f64::from(h));
+        let mut zones = Dataset::new("zones", GeometryType::Polygon, vec![]);
+        for _ in 0..32 {
+            zones.push(Some(sq(gt.origin_x - 0.001, lower.y - 0.001, 0.004)), vec![]);
+        }
+        let m = RasterMap {
+            datasets: HashMap::from([("zones".into(), zones)]),
+            rasters: HashMap::from([("geo".into(), &geo), ("merc".into(), &merc)]),
+        };
+        let divisor = rustgis_data::Measure::Area.unit("ac").unwrap();
+        let mut old = [0.; 2];
+        for row in 0..h {
+            for col in 0..w {
+                let (x, y) = (f64::from(col), f64::from(row));
+                let corners = [(x, y), (x + 1., y), (x + 1., y + 1.), (x, y + 1.)].map(|(c, r)| gt.to_world(c, r));
+                old[(col % 2) as usize] += rustgis_geom::wgs84_ring_perimeter_area_m2(&corners).1;
+            }
+        }
+        let mut geographic = Vec::new();
+        for raster in ["geo", "merc"] {
+            let p = serde_json::json!({"raster":raster,"zones":"zones","unit":"ac"});
+            let one = tabulate_area::run_on(&m, &p, Some(1)).unwrap();
+            assert!(!one.messages.iter().any(|m| m.contains("uses the raster projection")));
+            let Output::Table(table) = &one.output else { panic!("a table") };
+            for (i, expected) in old.iter().enumerate() {
+                let actual = table.features[0].attrs[i + 1].as_f64().unwrap();
+                assert!(
+                    (actual - expected / divisor).abs() <= expected.abs() / divisor * 1e-9,
+                    "{raster}: {actual} vs {}",
+                    expected / divisor
+                );
+                if raster == "geo" {
+                    geographic.push(actual);
+                } else {
+                    assert!((actual - geographic[i]).abs() <= geographic[i] * 1e-9);
+                    let planar = (merc_gt.pixel_width * merc_gt.pixel_height).abs() * f64::from(w * h / 2) / divisor;
+                    assert!(actual < planar * 0.8, "Web Mercator ground area must be smaller than its grid area at Memphis");
+                }
+            }
+            for threads in [2, 7] {
+                let many = tabulate_area::run_on(&m, &p, Some(threads)).unwrap();
+                let Output::Table(parallel) = many.output else { panic!("a table") };
+                assert_eq!(parallel.features, table.features, "{raster}, {threads} threads");
+                assert_eq!(many.messages, one.messages);
+            }
+        }
     }
 
     /// Zones worked out on several threads give the same statistics, bit for bit, as on one, in

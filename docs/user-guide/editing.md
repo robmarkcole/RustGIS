@@ -370,7 +370,7 @@ opens. A picture from any other server isn't: the pop-up shows **Show Picture** 
 name, and fetches nothing until you click it, because the request tells that server that someone
 opened the data (see [Privacy](../privacy.md)). A spinner shows while a picture is fetched. PNG, JPEG,
 WebP and GIF pictures of up to 4 MB and 2048 × 2048 pixels are shown (on every platform; any other
-format, such as BMP or TIFF, is "not supported"); the last 16 addresses' pictures are kept for the
+format, such as BMP or TIFF, shows "Picture unavailable: … pictures aren't supported"); the last 16 addresses' pictures are kept for the
 session, so opening the pop-up again shows the picture without asking again; they are forgotten with
 the web layers' cached tiles (signing out of ArcGIS, a login that ends, **Reload Web Layers**). When
 one can't be shown, the pop-up says why ("Picture unavailable: …": the server's answer, a network
@@ -417,7 +417,11 @@ constrained handles again, turn **Edit › Edit** on, select its loaded polygon 
 the object and choose **Convert to › Circle…** or **Rotated Box…**. The **Editing** pane also has
 **Convert Selected Polygon…**, and Command Search has **Convert Polygon to Shape…**. These tools
 are available independently of any annotation workflow. A right-click keeps the selected object
-under the pointer; Alt-right-click cycles overlapping objects.
+under the pointer; Alt-right-click cycles overlapping objects. In Explore, selection tools and
+Edit Vertices, right-clicking a polygon selects that object for the menu. Right-clicking empty
+space preserves the selection but offers no conversion target. Circle and Rotated Box instead
+clear the selection on empty space, ready to draw another shape. Drawing and measurement tools
+keep their current selection when opening the map menu.
 
 1. Choose Circle or Rotated Box and a construction grid. The default is **Web Mercator grid
    metres**, not ground metres. Choose an open GeoTIFF to fit in its **original image pixels**,

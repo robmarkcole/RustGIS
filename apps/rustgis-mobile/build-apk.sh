@@ -96,7 +96,9 @@ strip=$(ls "$ANDROID_NDK_HOME"/toolchains/llvm/prebuilt/*/bin/llvm-strip | head 
 find "$out/apk/lib" -name librustgis_mobile.so -exec "$strip" {} \;
 # Each segment aligned to 16 KB pages, which Android 15 phones may use and Google Play requires.
 readelf=$(ls "$ANDROID_NDK_HOME"/toolchains/llvm/prebuilt/*/bin/llvm-readelf | head -1)
+checked=0
 while IFS= read -r -d '' so; do
+    checked=$((checked + 1))
     # In an assignment of its own, so a readelf that fails stops the script.
     info=$("$readelf" -lW "$so")
     for align in $(awk '$1 == "LOAD" { print $NF }' <<< "$info"); do
@@ -106,6 +108,7 @@ while IFS= read -r -d '' so; do
         fi
     done
 done < <(find "$out/apk/lib" -name '*.so' -print0)
+[ "$checked" -gt 0 ] || { echo "build-apk: no native libraries to check for 16 KB alignment" >&2; exit 1; }
 
 # The activity's Java half, compiled without Gradle: javac, then d8 to Android's bytecode.
 rm -rf "$out/java" && mkdir -p "$out/java/classes" "$out/java/dex"
@@ -130,9 +133,22 @@ if [ -z "$code" ]; then
     fi
 fi
 
+# The launcher icon, which build.rs drew from the logo's code into its out folder, compiled for
+# linking. (Cargo keeps it in build/rustgis-mobile-<hash>/out, or build/rustgis-mobile/<hash>/out in
+# newer versions: the newest of either, of this profile's Android builds.)
+target_dir=${CARGO_TARGET_DIR:-target}
+case $target_dir in /*) ;; *) target_dir=$root/$target_dir ;; esac
+built=release
+[ -n "$profile" ] || built=debug
+icon=$(find "$target_dir"/*-linux-android*/"$built"/build -path '*rustgis-mobile*' -path '*/res/*' -name ic_launcher.xml \
+    -exec ls -t {} + 2>/dev/null | head -1) || true
+[ -n "$icon" ] || { echo "build-apk: build.rs drew no launcher icon" >&2; exit 1; }
+rm -rf "$out/res" && mkdir -p "$out/res"
+"$tools/aapt2" compile --dir "$(dirname "$(dirname "$icon")")" -o "$out/res/compiled.zip"
+
 unsigned=$out/unsigned.apk
 "$tools/aapt2" link -o "$unsigned" --manifest "$root/apps/rustgis-mobile/AndroidManifest.xml" -I "$platform/android.jar" \
-    --version-code "$code" --version-name "$version" --replace-version
+    --version-code "$code" --version-name "$version" --replace-version "$out/res/compiled.zip"
 # The libraries go in uncompressed and page-aligned, so Android maps them straight from the APK.
 (cd "$out/apk" && zip -q -0 -r "$unsigned" lib)
 (cd "$out/java/dex" && zip -q "$unsigned" classes.dex)
@@ -150,7 +166,7 @@ if [ -n "${BUNDLETOOL:-}" ]; then
     aab=$out/aab
     rm -rf "$aab" && mkdir -p "$aab/base/manifest" "$aab/base/dex"
     "$tools/aapt2" link --proto-format -o "$aab/proto.apk" --manifest "$root/apps/rustgis-mobile/AndroidManifest.xml" \
-        -I "$platform/android.jar" --version-code "$code" --version-name "$version" --replace-version
+        -I "$platform/android.jar" --version-code "$code" --version-name "$version" --replace-version "$out/res/compiled.zip"
     (cd "$aab/base" && unzip -q ../proto.apk && mv AndroidManifest.xml manifest/)
     cp "$out/java/dex/classes.dex" "$aab/base/dex/"
     cp -R "$out/apk/lib" "$aab/base/lib"

@@ -113,6 +113,25 @@ moves the ground is drawn whole, and labels, markers and extruded features outsi
 draw (hide those layers, or clip them to the box). The walls are schematic: say so in the
 figure's caption.
 
+`"walls": {"color": "#C8B89A", "layer": "Geology"}` colours the walls by a polygon layer, such as
+a geology or soil map: along each wall, the colour the layer's symbology gives the polygon under
+the box's edge at that point (its Unique Values or Graduated Colors classes, so the legend
+matches; the topmost polygon where they overlap, among the features its definition query keeps;
+a fill colour partly transparent is laid over `color`). The contacts go straight down to the base,
+outlined: only where they cross the box's edge comes from the map, and the walls show no dip or
+thickness. Off every polygon the walls are `color`, and so is the background of a polygon with
+no solid fill. The hatches and markers of the class's fill layers (Fill Layers) over its topmost
+solid fill, or over `color` when it has none, are drawn on the wall too, in its plane and in
+perspective, as a geologic block diagram shows its rock units: a hatch's angle is from the
+horizontal (0° gives bedding lines), and a pattern is as big on the wall as on the ground at the
+view's centre (a reference scale grows it as it does on the ground). A pattern too fine to draw
+on a wall shows as its colour mixed over the fill. Gradient and shapeburst fills aren't drawn on
+walls. The layer may be hidden, so the walls can show geology while the ground shows soils. It
+must be a polygon layer that holds all its
+features (not one read a view at a time), with a name of its own; it follows the layer's renames,
+and when it is removed, or a project opens without it, the walls are `color` (said) until a
+polygon layer of that name comes back. A plain `"walls": "#RRGGBB"` takes the layer off.
+
 **Water** on the terrain lies flat: `map.terrain` with `{"water": {"layer": "Lakes"}}` names a
 polygon layer of water bodies, and inside each polygon the ground is level, at the lowest height
 of the DEM along its shore, instead of rising and falling with a surface model that is noisy or
@@ -125,7 +144,10 @@ longer, all of them are read at one wider step, and a notice says how
 many polygons were. A layer read a view at a time (in chunks, by range) can't be the water. `{"water": false}` takes the water off;
 left out (or `null`), it stays as it was. The water layer is kept by name, follows its renames, and can stay
 hidden; its own symbology still draws it. Rivers stay lines. Over elevation tiles, the levels are
-read again until the tiles along the shores have come.
+read again until the tiles along the shores have come. A Shaded Relief layer draws the water's
+cells at their level with the even light of flat ground, flat or tilted: no hillshade, cast
+shadow, sky, fill light or rock on the water, so a semi-transparent water fill over it shows one
+tone. The relief's ramp colours them at the water's level.
 
 <figure markdown="span">
   ![Mount Rainier in USGS imagery draped over Terrarium elevation tiles, tilted 65°](https://assets.rustgis.app/images/terrain.webp)
@@ -446,7 +468,9 @@ selectable or editable; a tile not yet loaded may need another click once it arr
 **Reload** in the Basemap gallery (`map.reloadWebLayers`) clears cached tiles and styles and
 fetches them again.
 
-**Reloading a local tile archive (desktop).** After changing a PMTiles or MBTiles file on disk,
+### Reloading a local tile archive (desktop)
+
+After changing a PMTiles or MBTiles file on disk,
 right-click its row in Layers and choose **Reload Data** (**Reload Tile Archive** in Command
 Search). CLI, Python, MCP and the Assistant use
 `map.reloadTiles={"index":0}`; `"name"` or catalog `"id"` can select the archive instead.
@@ -494,6 +518,10 @@ every tile payload. It allows at most **64 MiB stored and 64 MiB decoded index b
 index entries**, **4,096 unique directories** (including the root), and **four leaf levels**;
 each stored directory read is limited to **16 MiB**. An invalid index or an exceeded validation
 budget is an explicit error without eviction, even if an unusually large index is otherwise valid.
+Validation also refuses a stored tile range over **16 MiB**, or one outside the header's declared
+tile-data section (including a zero-length section with nonempty tile entries). Ordinary loading
+can still draw other tiles from such an archive; reload and repair require the replacement's
+entire index to pass these checks before changing the source or dropping cached data.
 
 Neither action is available for local archives in the web app, or for remote tile services.
 On Windows, an open MBTiles file may not be replaceable while RustGIS holds it open: reload

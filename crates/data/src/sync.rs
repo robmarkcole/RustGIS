@@ -103,9 +103,8 @@ mod native {
     fn parts(path: &Path) -> Vec<(String, PathBuf)> {
         let mut paths = vec![path.to_path_buf()];
         if path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("shp")) {
-            for ext in ["shx", "dbf", "prj"] {
-                paths.push(path.with_extension(ext));
-            }
+            // The table in whichever case the reader finds it.
+            paths.extend([path.with_extension("shx"), crate::io::dbf_sidecar(path), path.with_extension("prj")]);
             let cpg = crate::dbf::CPG_SPELLINGS
                 .iter()
                 .map(|e| path.with_extension(e))
@@ -131,7 +130,8 @@ mod native {
     fn sha256(path: &Path) -> Result<String> {
         use sha2::Digest;
         use std::io::Read;
-        let mut file = std::fs::File::open(path)?;
+        let mut file = crate::provenance::open(path)?;
+        let metadata = file.metadata().ok();
         let mut hasher = sha2::Sha256::new();
         let mut buf = vec![0u8; 1 << 16];
         loop {
@@ -142,7 +142,9 @@ mod native {
             hasher.update(buf.get(..n).unwrap_or_default());
             crate::progress::step(n)?;
         }
-        Ok(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
+        let hash: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+        crate::provenance::hashed(path, metadata.as_ref(), hash.clone());
+        Ok(hash)
     }
 
     /// Bytes as a progress count.
