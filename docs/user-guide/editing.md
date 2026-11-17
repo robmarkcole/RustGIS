@@ -185,8 +185,15 @@ Removing/replacing an image invalidates its cached grid. Local and embedded GeoT
 first. In the browser, upload the original GeoTIFF.
 
 Space or middle-drag pans; releasing Space keeps the drawing tool. Use the selected object's
-existing handles and numeric controls, Undo/Redo, and **Export GeoJSON…**. Exports contain
+existing handles, Undo/Redo, and **Export GeoJSON…**. **Shape details** is collapsed by default;
+expand it for numeric dimensions and additional editing controls. Map handles remain available
+while the section is hidden. Exports contain
 ordinary geographic polygons and feature properties; circles are polygon approximations.
+Check **Use image filename** to suggest `img1.geojson` for an image named `img1.tiff`.
+The preview shows the suggested basename; the save dialog still chooses the folder and lets
+you change the name. The option starts unchecked and applies only to this pane’s GeoJSON
+export; ordinary layer exports keep their layer-based names.
+
 Image selection, grid choices and exact constructions are session-only. Reopened polygons can
 be explicitly converted again. No image-binding metadata or palette sidecars are added.
 

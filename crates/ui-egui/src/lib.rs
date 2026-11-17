@@ -3331,6 +3331,7 @@ impl RustGisApp {
                 }
             }
             "ui.annotationImage" => annotation::select_image(self, p)?,
+            "ui.annotationFilename" => annotation::filename_option(self, p.get("on").and_then(Value::as_bool).ok_or("on is required")?),
             "ui.annotationGrid" => annotation::select_grid(self, p.get("pixels").and_then(Value::as_bool).ok_or("pixels is required")?)?,
             "ui.annotationCancel" => annotation::cancel_read(self),
             "ui.annotationLayer" => annotation::select_layer(self, p)?,
@@ -4778,13 +4779,15 @@ impl RustGisApp {
             "ui.exportLayer" if p.get("format").and_then(Value::as_str).is_none() => {
                 self.dialogs.open("exportLayer", &self.session)?;
             }
-            "ui.exportLayer" if self.services.download.is_some() => {
+            "ui.exportLayer" | "ui.annotationExport" if self.services.download.is_some() => {
+                let annotation_export = id == "ui.annotationExport";
                 let id = self.export_target(p)?;
                 let construction_notes = self.session.layer_construction_output_notes(id)?;
                 let l = self.session.map().layer(id).ok_or_else(|| tl!("select a layer in the Layers pane first").to_string())?;
                 // Any format the dialog offers here (`dialogs::export_formats`): not GeoPackage or
                 // FlatGeobuf, which the data crate refuses in the browser.
                 let ext = p.get("format").and_then(Value::as_str).unwrap_or("geojson").to_ascii_lowercase();
+                let name = annotation::export_name(self, id, if ext == "shp" { "zip" } else { &ext }, annotation_export)?;
                 rustgis_engine::cmd::share::gpkg_table(p, &ext)?;
                 // A streamed layer exports its whole source, not the features read for the view.
                 let (whole, lost) = if l.is_streamed() {
@@ -4806,7 +4809,6 @@ impl RustGisApp {
                     }
                 };
                 let ext = if ext == "shp" { "zip".to_string() } else { ext };
-                let name = format!("{}.{ext}", l.name);
                 // The features written, read whole, give their own extent (not a raster's, or the
                 // one a streamed layer's source declares).
                 let mut notes = rustgis_engine::data::export_notes([(ds, ds.extent())], &name, crs);
@@ -4923,7 +4925,8 @@ impl RustGisApp {
                     return self.run("share.exportMap", args);
                 }
             }
-            "ui.exportLayer" => {
+            "ui.exportLayer" | "ui.annotationExport" => {
+                let annotation_export = id == "ui.annotationExport";
                 let ext = p.get("format").and_then(Value::as_str).unwrap_or("geojson").to_ascii_lowercase();
                 let label = dialogs::EXPORT_FORMATS
                     .iter()
@@ -4934,6 +4937,7 @@ impl RustGisApp {
                 // Checked as the command checks them, before a file is asked for; then passed on.
                 let gpkg = rustgis_engine::cmd::share::gpkg_table(p, &ext)?;
                 let id = self.export_target(p)?;
+                let name = annotation::export_name(self, id, &ext, annotation_export)?;
                 let with_table = |mut args: Value| {
                     for key in ["mode", "tableName"] {
                         if let Some(v) = p.get(key) {
@@ -4952,7 +4956,6 @@ impl RustGisApp {
                     }
                     return Ok(Value::Null);
                 }
-                let name = self.session.map().layer(id).map(|l| format!("{}.{ext}", l.name)).unwrap_or_default();
                 if let Some(path) = dialogs::pick_save(&name, &[ext.as_str()], label) {
                     // The format chosen decides: its extension is added unless it was typed (a dot
                     // in the name, as in "U.S. Cities", isn't taken for one).

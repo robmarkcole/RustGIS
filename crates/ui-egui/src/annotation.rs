@@ -8,6 +8,7 @@ pub(crate) struct State {
     context: Option<(u64, u64)>,
     image: Option<u32>,
     image_chosen: bool,
+    image_filename: bool,
     source: Option<Source>,
     pixels: bool,
     frame: Option<Frame>,
@@ -127,6 +128,38 @@ fn polygon_layer(app: &RustGisApp, id: u32) -> bool {
             && matches!(l.geometry_type(), rustgis_engine::data::GeometryType::Polygon | rustgis_engine::data::GeometryType::None)
     })
 }
+pub(crate) fn filename_option(app: &mut RustGisApp, on: bool) {
+    sync(app);
+    app.annotation.image_filename = on;
+}
+fn image_export_name(app: &RustGisApp) -> Option<String> {
+    if app.annotation.context != Some((app.session.opened, app.session.map().instance_id()))
+        || !app.annotation.source.as_ref()?.current(&app.session)
+    {
+        return None;
+    }
+    let raster = app.session.map().layer(app.annotation.image?)?.raster.as_ref()?;
+    let file = raster.file_name.as_deref().or_else(|| raster.path.as_deref().filter(|p| rustgis_engine::map::paths::is_local(p)))?;
+    // Use only the basename, including for Windows paths opened on another platform.
+    let leaf = file.rsplit(['/', '\\']).next()?;
+    let stem = std::path::Path::new(leaf).file_stem()?.to_str()?;
+    if stem.is_empty() || matches!(stem, "." | "..") {
+        return None;
+    }
+    Some(format!("{stem}.geojson"))
+}
+/// An annotation-only filename suggestion. The ordinary export action keeps its layer name.
+/// Returns a basename, never a destination path; the existing save dialog chooses the location.
+pub(crate) fn export_name(app: &RustGisApp, layer: u32, ext: &str, annotation: bool) -> Result<String, String> {
+    if annotation && ext != "geojson" {
+        return Err(tl!("Annotation export uses GeoJSON.").into());
+    }
+    if annotation && app.annotation.image_filename {
+        return image_export_name(app)
+            .ok_or_else(|| tl!("Select an image with an available filename, or uncheck Use image filename.").into());
+    }
+    Ok(app.session.map().layer(layer).map(|l| format!("{}.{ext}", l.name)).unwrap_or_default())
+}
 pub(crate) fn select_layer(app: &mut RustGisApp, p: &Value) -> Result<(), String> {
     let id = app.session.layer_id(p)?;
     if !polygon_layer(app, id) {
@@ -226,12 +259,32 @@ pub(crate) fn panel(app: &mut RustGisApp, ui: &mut egui::Ui) {
         ui.small(tl!("Drawing requires editing enabled, a loaded polygon layer and a flat Earth map with zero pitch."));
     }
     ui.small(tl!("Space or middle-drag pans; releasing Space returns to the active drawing tool. Undo/Redo use the existing commands."));
-    crate::boxedit::panel(app, ui);
-    crate::circleedit::panel(app, ui);
+    if matches!(app.session.tool, Tool::Circle | Tool::RotatedBox) {
+        egui::CollapsingHeader::new(tl!("Shape details")).id_salt("annotation_shape_details").default_open(false).show(ui, |ui| {
+            crate::boxedit::panel(app, ui);
+            crate::circleedit::panel(app, ui);
+        });
+    }
     ui.separator();
-    ui.add_enabled_ui(layer.is_some(), |ui| {
+    let mut image_filename = app.annotation.image_filename;
+    if ui
+        .checkbox(&mut image_filename, tl!("Use image filename"))
+        .on_hover_text(tl!("For img1.tiff, suggest img1.geojson. Choose the location in the save dialog."))
+        .changed()
+    {
+        let _ = app.run("ui.annotationFilename", json!({"on":image_filename}));
+    }
+    let name = if image_filename { image_export_name(app) } else { None };
+    if image_filename {
+        if let Some(name) = &name {
+            ui.small(crate::i18n::fmt("Suggested filename: {name}", &[("name", name)]));
+        } else {
+            ui.small(tl!("Select an image with an available filename, or uncheck Use image filename."));
+        }
+    }
+    ui.add_enabled_ui(layer.is_some() && (!image_filename || name.is_some()), |ui| {
         if ui.button(tl!("Export GeoJSON…")).clicked() {
-            let _ = app.run("ui.exportLayer", json!({"format":"geojson"}));
+            let _ = app.run("ui.annotationExport", json!({"format":"geojson"}));
         }
     });
     ui.small(tl!(
@@ -476,5 +529,111 @@ mod tests {
         h.get_by_role_and_label(egui::accesskit::Role::Button, "Circle").click();
         h.run();
         assert_eq!(h.state().session.tool, Tool::Circle);
+    }
+    #[test]
+    fn annotation_shape_details_start_hidden_and_toggle_without_changing_the_object() {
+        use egui_kittest::kittest::Queryable;
+        for tool in [Tool::Circle, Tool::RotatedBox] {
+            let (mut app, image, layer, frame) = app();
+            app.run("ui.annotationImage", json!({"image":image})).unwrap();
+            app.run("tool.set", json!({"tool":tool.code()})).unwrap();
+            drag(&mut app, &frame, [20., 20.], [80., 60.], true);
+            let feature = app.session.map().layer(layer).unwrap().dataset.features[0].clone();
+            let depth = app.session.undo_depth();
+            let mut h = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(600., 1400.))
+                .with_max_steps(1000)
+                .build_ui_state(|ui, app| panel(app, ui), app);
+            let dimension = if tool == Tool::Circle { "Radius" } else { "Width" };
+            assert!(h.query_by_label(dimension).is_none());
+            h.get_by_label("Shape details").click();
+            h.run();
+            assert!(h.query_by_label(dimension).is_some());
+            h.get_by_label("Shape details").click();
+            h.run();
+            assert!(h.query_by_label(dimension).is_none());
+            assert!(h.query_by_label("Export GeoJSON…").is_some());
+            assert_eq!(h.state().session.tool, tool);
+            assert_eq!(h.state().session.undo_depth(), depth);
+            assert_eq!(h.state().session.map().layer(layer).unwrap().dataset.features[0], feature);
+            assert!(if tool == Tool::Circle {
+                h.state().session.circle_spec(layer, 0).is_some()
+            } else {
+                h.state().session.box_spec(layer, 0).is_some()
+            });
+        }
+    }
+
+    #[test]
+    fn annotation_filename_uses_source_basename_instead_of_layer_title() {
+        for (file, expected, local) in [
+            ("img1.tiff", "img1.geojson", false),
+            ("folder/scene.v2.TIFF", "scene.v2.geojson", false),
+            ("C:\\images\\été 1.tif", "été 1.geojson", false),
+            ("/images/flight.v2.tiff", "flight.v2.geojson", true),
+        ] {
+            let (mut app, image, layer, _) = app();
+            let raster = app.session.map_mut().layer_mut(image).unwrap().raster.as_mut().unwrap();
+            raster.file_name = (!local).then(|| file.into());
+            raster.path = local.then(|| file.into());
+            app.run("ui.annotationImage", json!({"image":image})).unwrap();
+            app.run("layer.rename", json!({"layer":image,"name":"Renamed image title"})).unwrap();
+            assert_eq!(export_name(&app, layer, "geojson", true).unwrap(), "Objects.geojson");
+            app.run("ui.annotationFilename", json!({"on":true})).unwrap();
+            assert_eq!(export_name(&app, layer, "geojson", true).unwrap(), expected);
+            assert_eq!(export_name(&app, layer, "geojson", false).unwrap(), "Objects.geojson");
+        }
+    }
+    #[test]
+    fn annotation_filename_checkbox_controls_real_geojson_download_without_affecting_other_exports() {
+        use egui_kittest::kittest::Queryable;
+        let (mut app, image, _, frame) = app();
+        app.session.map_mut().layer_mut(image).unwrap().raster.as_mut().unwrap().file_name = Some("img1.tiff".into());
+        app.run("ui.annotationImage", json!({"image":image})).unwrap();
+        app.run("tool.set", json!({"tool":"circle"})).unwrap();
+        drag(&mut app, &frame, [20., 20.], [80., 60.], true);
+        let downloads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let output = downloads.clone();
+        app.services.download = Some(Box::new(move |name, bytes| {
+            output.lock().unwrap().push((name.to_string(), bytes));
+            Ok(())
+        }));
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(600., 1400.))
+            .with_max_steps(1000)
+            .build_ui_state(|ui, app| panel(app, ui), app);
+        h.get_by_label("Use image filename").click();
+        h.run();
+        assert!(h.state().annotation.image_filename);
+        assert!(h.query_by_label("Suggested filename: img1.geojson").is_some());
+        h.get_by_label("Export GeoJSON…").click();
+        h.run();
+        let mut app = h.into_state();
+        app.run("ui.exportLayer", json!({"format":"geojson"})).unwrap();
+        app.run("ui.annotationFilename", json!({"on":false})).unwrap();
+        app.run("ui.annotationExport", Value::Null).unwrap();
+        let output = downloads.lock().unwrap();
+        assert_eq!(
+            output.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(),
+            ["img1.geojson", "Objects.geojson", "Objects.geojson"]
+        );
+        let geojson: Value = serde_json::from_slice(&output[0].1).unwrap();
+        assert_eq!(geojson["type"], "FeatureCollection");
+        assert_eq!(geojson["features"].as_array().unwrap().len(), 1);
+    }
+    #[test]
+    fn annotation_filename_missing_image_does_not_silently_export_under_another_name() {
+        let (mut app, image, _, _) = app();
+        app.run("ui.annotationFilename", json!({"on":true})).unwrap();
+        app.run("ui.annotationImage", json!({"image":image})).unwrap();
+        app.run("ui.annotationImage", json!({"image":null})).unwrap();
+        let downloads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let output = downloads.clone();
+        app.services.download = Some(Box::new(move |_, _| {
+            output.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }));
+        assert!(app.run("ui.annotationExport", Value::Null).unwrap_err().contains("filename"));
+        assert_eq!(downloads.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }
