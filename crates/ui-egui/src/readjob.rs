@@ -47,7 +47,10 @@ impl Reads {
         if let Some(job) = &mut self.job
             && belongs(&job.asked)
         {
-            job.cancel_waiting = false;
+            // A request-specific cancel must not downgrade an earlier status-bar Cancel.
+            if !job.control.is_cancelled() {
+                job.cancel_waiting = false;
+            }
             job.control.cancel();
         }
         self.waiting.retain(|a| !belongs(a));
@@ -739,6 +742,15 @@ mod tests {
 
     #[test]
     fn annotation_grid_cancel_preserves_unrelated_waiting_reads() {
+        annotation_grid_cancel_case(false);
+    }
+
+    #[test]
+    fn annotation_grid_cancel_preserves_an_earlier_queue_wide_cancel() {
+        annotation_grid_cancel_case(true);
+    }
+
+    fn annotation_grid_cancel_case(queue_wide: bool) {
         use rustgis_engine::{
             Project, Session,
             data::raster::{ColorHint, Crs, GeoTransform, Raster, geotiff},
@@ -765,12 +777,17 @@ mod tests {
         let file = folder.path().join("queued.csv");
         std::fs::write(&file, "name,lon,lat\nQueued,1,2\n").unwrap();
         run(&mut app, "layer.addData", json!({"path":file,"name":"Queued after grid"})).unwrap();
+        if queue_wide {
+            app.reads.cancel_for_tests();
+        }
+        app.run("ui.annotationCancel", Value::Null).unwrap();
         app.run("ui.annotationCancel", Value::Null).unwrap();
         let job = app.reads.job.as_ref().unwrap();
-        assert!(job.control.is_cancelled() && !job.cancel_waiting);
+        assert!(job.control.is_cancelled());
+        assert_eq!(job.cancel_waiting, queue_wide);
         assert_eq!(app.reads.waiting.len(), 1);
         landed(&mut app, 60);
-        assert!(app.session.map().layer_by_name("Queued after grid").is_some());
+        assert_eq!(app.session.map().layer_by_name("Queued after grid").is_some(), !queue_wide);
         assert!(crate::annotation::drawing_frame(&app).is_err());
     }
 

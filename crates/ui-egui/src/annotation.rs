@@ -39,12 +39,15 @@ pub(crate) fn sync(app: &mut RustGisApp) {
     }
 }
 pub(crate) fn open(app: &mut RustGisApp) -> Result<(), String> {
+    sync(app);
     app.ui.open_right(RightPane::Annotation);
     if !app.annotation.image_chosen
         && app.annotation.image.is_none()
         && let Some(id) = app.session.active_layer.filter(|id| app.session.map().layer(*id).is_some_and(|l| l.raster.is_some()))
+        && let Err(error) = select_image(app, &json!({"image":id}))
     {
-        select_image(app, &json!({"image":id}))?;
+        app.annotation.image_chosen = true;
+        app.annotation.error = Some(error);
     }
     Ok(())
 }
@@ -52,7 +55,7 @@ pub(crate) fn select_image(app: &mut RustGisApp, p: &Value) -> Result<(), String
     sync(app);
     let image = p.get("image").filter(|v| !v.is_null()).map(|v| app.session.layer_id(&json!({"layer":v}))).transpose()?;
     let source = image.map(|id| Source::capture(&app.session, id)).transpose()?;
-    let request = app.annotation.next.checked_add(1).ok_or("image-grid request limit reached")?;
+    let request = app.annotation.next.checked_add(1).ok_or_else(|| tl!("Image-grid request limit reached").to_string())?;
     cancel(app);
     app.annotation.next = request;
     app.annotation.image = image;
@@ -171,10 +174,7 @@ pub(crate) fn grid_controls(app: &mut RustGisApp, ui: &mut egui::Ui) {
     sync(app);
     let mut image = app.annotation.image;
     let mut picked = false;
-    let name = image
-        .and_then(|id| app.session.map().layer(id))
-        .filter(|_| app.annotation.source.as_ref().is_some_and(|s| s.current(&app.session)))
-        .map_or_else(|| tl!("No image").to_string(), |l| l.name.clone());
+    let name = image.and_then(|id| app.session.map().layer(id)).map_or_else(|| tl!("No image").to_string(), |l| l.name.clone());
     egui::ComboBox::from_label(tl!("Image")).selected_text(name).show_ui(ui, |ui| {
         picked |= ui.selectable_value(&mut image, None, tl!("No image")).clicked();
         for l in app.session.map().layers.iter().filter(|l| l.raster.is_some()) {
@@ -503,6 +503,63 @@ mod tests {
         assert!(app.annotation.image.is_none());
         assert_eq!(drawing_frame(&app).unwrap(), Frame::default());
     }
+    #[test]
+    fn annotation_grid_open_keeps_automatic_selection_errors_inline() {
+        use egui_kittest::kittest::Queryable;
+        let (mut app, image, _, _) = app();
+        sync(&mut app);
+        app.annotation.next = u64::MAX;
+        app.run("layer.select", json!({"layer":image})).unwrap();
+        app.run("ui.pane.annotation", Value::Null).unwrap();
+        assert_eq!(app.ui.right, Some(RightPane::Annotation));
+        assert_eq!(app.annotation.error.as_deref(), Some("Image-grid request limit reached"));
+        assert!(app.annotation.image_chosen);
+        let mut h = egui_kittest::Harness::builder().build_ui_state(|ui, app: &mut RustGisApp| panel(app, ui), app);
+        assert!(h.query_by_label("Image-grid request limit reached").is_some());
+        h.state_mut().run("ui.pane.annotation", Value::Null).unwrap();
+        h.state_mut().annotation.error = None;
+        h.state_mut().run("ui.pane.annotation", Value::Null).unwrap();
+        assert!(h.state().annotation.error.is_none(), "reopening must not retry a failed automatic choice");
+        assert!(h.state_mut().run("ui.annotationImage", json!({"image":image})).is_err(), "explicit selection still reports errors");
+    }
+
+    #[test]
+    fn annotation_grid_stale_or_cancelled_image_keeps_its_selected_name() {
+        use egui_kittest::kittest::Queryable;
+        for replace in [false, true] {
+            let (mut app, image, _, _) = app();
+            app.reads_off_frame = !replace;
+            app.run("ui.annotationImage", json!({"image":image})).unwrap();
+            if replace {
+                app.session.map_mut().layer_mut(image).unwrap().raster.as_mut().unwrap().embedded = Some(std::sync::Arc::new(vec![0; 16]));
+            } else {
+                app.run("ui.annotationCancel", Value::Null).unwrap();
+            }
+            let h = egui_kittest::Harness::builder().build_ui_state(|ui, app: &mut RustGisApp| grid_controls(app, ui), app);
+            assert!(h.query_all_by_role(egui::accesskit::Role::ComboBox).any(|n| n.value().as_deref() == Some("Test TIFF")));
+            assert_eq!(h.state().annotation.image, Some(image));
+            assert!(h.state().annotation.error.is_some());
+            assert!(drawing_frame(h.state()).is_err());
+            assert!(h.query_by_label("Reload Grid").is_some());
+        }
+    }
+
+    #[test]
+    fn annotation_grid_search_queries_the_grid_without_toggling_the_pane() {
+        let (mut app, image, _, _) = app();
+        app.run("layer.select", json!({"layer":image})).unwrap();
+        open(&mut app).unwrap();
+        app.ui.command_search = Some("raster.imageGrid".into());
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1366., 900.))
+            .build_ui_state(|ui, app: &mut RustGisApp| crate::chrome::command_search(app, ui.ctx()), app);
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert!(h.state().ui.command_search.is_none());
+        assert_eq!(h.state().ui.right, Some(RightPane::Annotation));
+        assert!(h.state().session.notices_since(0).iter().all(|n| !n.error));
+    }
+
     #[test]
     fn annotation_grid_pane_entry_defaults_and_layer_selection_share_commands() {
         use egui_kittest::kittest::Queryable;

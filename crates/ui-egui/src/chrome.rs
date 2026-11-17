@@ -920,7 +920,6 @@ fn search_action(id: &str) -> Option<SearchAction> {
     Some(match id {
         "project.open" => Command("ui.open"),
         "project.save" => Command("ui.save"),
-        "raster.imageGrid" => Command("ui.pane.annotation"),
         "edit.previewShapeConversion" => Command("ui.convertShape"),
         "project.saveAs" => Command("ui.saveAs"),
         "project.addFolder" => Command("ui.addFolder"),
