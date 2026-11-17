@@ -215,9 +215,13 @@ accepted by `edit.addBox.box.frame` and `edit.addCircle.circle.frame`. The query
 requires Files permission, and uses the shared read worker on desktop/MCP. Headless synchronous
 callers must run file reads off their own UI thread. The desktop Script pane prepares grid queries
 on its worker and shows the actual frame in each line's result, rather than a queue acknowledgement.
-Queries may follow replayable selection/edit steps, but file-opening or project-changing setup
-must run in a separate script first. A changed image invalidates the prepared result instead of
-reopening its file on the UI thread. Scoped callers should use the individually approved query.
+Queries may follow replayable selection/edit steps or query embedded rasters produced by
+`gp.run` earlier in the same script. Accepted tool outputs retain their prepared raster data;
+repeated queries and tools with multiple raster outputs use the matching output's grid without
+rereading headers on the UI thread. Live output IDs and display styles are preserved. If a tool's
+inputs change while the script is being prepared, all dependent grid results are discarded and
+the script must be run again. File-opening or project-changing setup must run in a separate
+script first. Scoped callers should use the individually approved query.
 
 ### Image source checks
 

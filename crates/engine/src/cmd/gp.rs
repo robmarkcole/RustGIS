@@ -801,6 +801,8 @@ pub(crate) struct ToolAhead {
     result: Result<rustgis_analysis::ToolResult, String>,
     full_ids: FullIds,
     millis: u64,
+    /// Runtime identities of successfully installed outputs on the worker, in return order.
+    grid_outputs: Vec<rustgis_map::Layer>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -873,7 +875,7 @@ pub(crate) struct RanAheads {
 pub(crate) fn taking<T>(s: &mut Session, ran: RanAheads, run: impl FnOnce(&mut Session) -> T) -> T {
     s.tools_ahead = Some(Ahead::Taking(ran.tools.into()));
     s.files_ahead = Some(FilesAhead::Taking(ran.files.into()));
-    s.grids_ahead = Some(crate::image_grid::Ahead::Taking(ran.grids.into()));
+    s.grids_ahead = Some(crate::image_grid::Ahead::taking(ran.grids));
     s.zones_ahead = Some(super::imagery::ZonesAhead::Taking(ran.zones.into()));
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(s)));
     s.tools_ahead = None;
@@ -929,15 +931,19 @@ fn read_batch_file(s: &mut Session, path: &std::path::Path) -> Result<(Dataset, 
 #[cfg(not(target_arch = "wasm32"))]
 /// The next tool run ahead, if it is this one on the same inputs: its result, the streamed rows
 /// it read whole and how long it took. Any other drops the rest, which came after it.
-fn take_ahead(
-    s: &mut Session,
-    pin: &crate::policy::ToolPin,
-    params: &Value,
-) -> Option<(Result<rustgis_analysis::ToolResult, String>, FullIds, u64)> {
-    let Some(Ahead::Taking(ran)) = &mut s.tools_ahead else { return None };
-    let next = ran.pop_front()?;
+fn take_ahead(s: &mut Session, pin: &crate::policy::ToolPin, params: &Value) -> Option<Box<ToolAhead>> {
+    let Some(Ahead::Taking(ran)) = &mut s.tools_ahead else {
+        crate::image_grid::invalidate_script_grids(s);
+        return None;
+    };
+    let Some(next) = ran.pop_front() else {
+        s.tools_ahead = None;
+        crate::image_grid::invalidate_script_grids(s);
+        return None;
+    };
     let RanAhead::Tool(next) = next else {
         s.tools_ahead = None;
+        crate::image_grid::invalidate_script_grids(s);
         return None;
     };
     let now = Snapshot::of(s);
@@ -947,9 +953,10 @@ fn take_ahead(
         {
             s.tools_taken += 1;
         }
-        return Some((next.result, next.full_ids, next.millis));
+        return Some(next);
     }
     s.tools_ahead = None;
+    crate::image_grid::invalidate_script_grids(s);
     None
 }
 
@@ -2540,7 +2547,20 @@ pub(crate) fn execute(
     }
     let continuation = s.tool_continuation(&op)?;
     #[cfg(not(target_arch = "wasm32"))]
-    let ran = take_ahead(s, pin, params);
+    let output_slot = match &s.tools_ahead {
+        Some(Ahead::Recording(recorded)) => Some(recorded.len()),
+        _ => None,
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    let mut ran = take_ahead(s, pin, params);
+    #[cfg(not(target_arch = "wasm32"))]
+    if crate::image_grid::script_grids_invalidated(s) {
+        return Err("the script inputs changed; run the script again".into());
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    let replayed_outputs = ran.as_mut().map(|tool| std::mem::take(&mut tool.grid_outputs));
+    #[cfg(not(target_arch = "wasm32"))]
+    let ran = ran.map(|tool| (tool.result, tool.full_ids, tool.millis));
     #[cfg(target_arch = "wasm32")]
     let ran = None;
     let (mut res, ids, millis) = match ran {
@@ -2590,6 +2610,7 @@ pub(crate) fn execute(
                     result: res.clone(),
                     full_ids: ids.clone(),
                     millis,
+                    grid_outputs: Vec::new(),
                 })));
             }
             (res, ids, millis)
@@ -2598,7 +2619,29 @@ pub(crate) fn execute(
     pin.current()?;
     continuation.check()?;
     fit_to_windows(s, &mut res, &ids);
-    apply_with(s, run_of(t0), kept(), res, millis, opts)
+    let applied = apply_with(s, run_of(t0), kept(), res, millis, opts);
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Ok((out, _)) = &applied
+        && (recording || replayed_outputs.is_some())
+    {
+        let outputs = output_layers(s, out);
+        if let Some(recorded) = replayed_outputs {
+            crate::image_grid::replay_tool_outputs(s, &recorded, &outputs)?;
+        } else if let Some(index) = output_slot
+            && let Some(Ahead::Recording(recorded)) = &mut s.tools_ahead
+            && let Some(RanAhead::Tool(tool)) = recorded.get_mut(index)
+        {
+            tool.grid_outputs = outputs;
+        }
+    }
+    applied
+}
+
+/// The exact layers just installed by a tool, rather than similarly named layers in the map.
+#[cfg(not(target_arch = "wasm32"))]
+fn output_layers(s: &Session, out: &Value) -> Vec<rustgis_map::Layer> {
+    let ids = out.get("layer").into_iter().chain(out.get("layers").and_then(Value::as_array).into_iter().flatten());
+    ids.filter_map(Value::as_u64).filter_map(|id| u32::try_from(id).ok()).filter_map(|id| s.map().layer(id).cloned()).collect()
 }
 
 /// How [`execute`] applies a run: by default as `gp.run` does. A batch item keeps the

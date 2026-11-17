@@ -25,9 +25,22 @@ fn same_arc<T>(a: &Option<Arc<T>>, b: &Option<Arc<T>>) -> bool {
 }
 impl Source {
     pub fn capture(s: &Session, layer: u32) -> Result<Self, String> {
-        let l = s.map().layer(layer).ok_or("no image layer")?;
-        let raster = l.raster.clone().ok_or("choose a GeoTIFF image layer")?;
-        Ok(Self { map: s.map().instance_id(), layer, instance: l.instance_id(), replacement: l.replacement_revision(), raster })
+        Self::from_layer(s.map().instance_id(), s.map().layer(layer).ok_or("no image layer")?)
+    }
+    fn from_layer(map: u64, layer: &rustgis_map::Layer) -> Result<Self, String> {
+        let raster = layer.raster.clone().ok_or("choose a GeoTIFF image layer")?;
+        Ok(Self { map, layer: layer.id, instance: layer.instance_id(), replacement: layer.replacement_revision(), raster })
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    fn key(&self) -> (u64, u32, u64, u64) {
+        (self.map, self.layer, self.instance, self.replacement)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    fn same(&self, other: &Self) -> bool {
+        self.key() == other.key()
+            && self.raster.path == other.raster.path
+            && same_arc(&self.raster.embedded, &other.raster.embedded)
+            && same_arc(&self.raster.data, &other.raster.data)
     }
     pub fn current(&self, s: &Session) -> bool {
         s.map().instance_id() == self.map
@@ -93,7 +106,71 @@ pub(crate) struct Prepared {
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) enum Ahead {
     Recording(Vec<Prepared>),
-    Taking(std::collections::VecDeque<Prepared>),
+    Taking(Replay),
+}
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) struct Replay {
+    grids: std::collections::VecDeque<Prepared>,
+    // Only exact outputs of accepted tool results may bridge worker/live layer instances.
+    outputs: std::collections::HashMap<(u64, u32, u64, u64), (Source, Source)>,
+    invalidated: bool,
+}
+#[cfg(not(target_arch = "wasm32"))]
+impl Ahead {
+    pub(crate) fn taking(grids: Vec<Prepared>) -> Self {
+        Self::Taking(Replay { grids: grids.into(), outputs: Default::default(), invalidated: false })
+    }
+}
+/// A rejected tool invalidates all dependent queries, including queries of existing images.
+/// Keep an empty, invalid replay rather than letting a later query read on the UI thread.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn invalidate_script_grids(s: &mut Session) {
+    if let Some(Ahead::Taking(replay)) = &mut s.grids_ahead {
+        replay.invalidated |= !replay.grids.is_empty();
+        replay.grids.clear();
+        replay.outputs.clear();
+    }
+}
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn script_grids_invalidated(s: &Session) -> bool {
+    matches!(&s.grids_ahead, Some(Ahead::Taking(replay)) if replay.invalidated)
+}
+/// Called only after an admitted, snapshot-validated tool result has been applied successfully.
+/// Its newly created raster layers keep live IDs/style, but share the accepted worker pixels,
+/// embedded bytes and placeholder rows. Following tool snapshots can then consume that data too.
+/// Bind queries by output identity, never by a name or a layer ID alone; no headers are reread.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn replay_tool_outputs(s: &mut Session, recorded: &[rustgis_map::Layer], landed: &[rustgis_map::Layer]) -> Result<(), String> {
+    if !matches!(&s.grids_ahead, Some(Ahead::Taking(replay)) if !replay.grids.is_empty()) {
+        return Ok(());
+    }
+    if recorded.len() != landed.len()
+        || recorded.iter().zip(landed).any(|(old, new)| {
+            old.name != new.name
+                || match (&old.raster, &new.raster) {
+                    (None, None) => false,
+                    (Some(a), Some(b)) => a.path != b.path || a.file_name != b.file_name || a.placement != b.placement,
+                    _ => true,
+                }
+        })
+    {
+        invalidate_script_grids(s);
+        return Err("the script's tool outputs changed; run the script again".into());
+    }
+    let map = s.map().instance_id();
+    for (old, new) in recorded.iter().zip(landed).filter(|(old, _)| old.raster.is_some()) {
+        let from = Source::from_layer(map, old)?;
+        let layer = s.map_mut().layer_mut(new.id).ok_or("the script's output layer disappeared")?;
+        let raster = layer.raster.as_mut().ok_or("the script's raster output disappeared")?;
+        raster.data.clone_from(&from.raster.data);
+        raster.embedded.clone_from(&from.raster.embedded);
+        layer.dataset.features.clone_from(&old.dataset.features);
+        let to = Source::capture(s, new.id)?;
+        if let Some(Ahead::Taking(replay)) = &mut s.grids_ahead {
+            replay.outputs.insert(from.key(), (from, to));
+        }
+    }
+    Ok(())
 }
 pub(crate) fn ahead(s: &Session, p: &Value) -> Option<crate::cmd::reads::ReadWork> {
     let source = Source::capture(s, s.layer_id(p).ok()?).ok()?;
@@ -108,8 +185,18 @@ pub(crate) fn query(s: &mut Session, p: &Value) -> CmdResult {
     let source = Source::capture(s, s.layer_id(p)?)?;
     let ready = crate::cmd::reads::take::<Prepared>(s, "imageGrid");
     #[cfg(not(target_arch = "wasm32"))]
-    let ready = if let Some(Ahead::Taking(grids)) = &mut s.grids_ahead {
-        Some(grids.pop_front().ok_or("the script's image grid was not prepared; run the query separately")?)
+    let ready = if let Some(Ahead::Taking(replay)) = &mut s.grids_ahead {
+        if replay.invalidated {
+            return Err("the script inputs changed; run the script again".into());
+        }
+        let mut prepared = replay.grids.pop_front().ok_or("the script's image grid was not prepared; run the query separately")?;
+        if let Some((from, to)) = replay.outputs.get(&prepared.source.key()) {
+            if !prepared.source.same(from) {
+                return Err("the script's image source changed; run the script again".into());
+            }
+            prepared.source = to.clone();
+        }
+        Some(prepared)
     } else {
         ready
     };
@@ -391,6 +478,120 @@ mod tests {
         assert_eq!(inputs[0].path, path.display().to_string());
         assert_eq!(inputs[0].size, Some(std::fs::metadata(&path).unwrap().len()));
         assert!(inputs[0].sha256.is_none());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn interpolation_session() -> (Session, u32) {
+        use rustgis_data::{Dataset, Field, FieldType, Geometry, GeometryType, Value as Cell};
+        let (mut s, _, _) = session();
+        let mut samples = Dataset::new("Samples", GeometryType::Point, vec![Field::new("v", FieldType::Double)]);
+        samples.crs = Some(Crs::LonLat);
+        for (x, y, value) in [(0., 0., 1.), (2., 0., 2.), (0., 2., 3.), (2., 2., 4.)] {
+            samples.push(Some(Geometry::Point(rustgis_geom::Coord::new(x, y))), vec![Cell::Float(value)]);
+        }
+        let id = s.map_mut().add_dataset(samples);
+        (s, id)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    fn interpolation_line(tool: &str, cell: f64) -> String {
+        format!(
+            "gp.run {}",
+            json!({"tool":tool,"params":{"input":"Samples","field":"v","extent":"0,0,2,2","pixelSize":cell,"output":"Surface"}})
+        )
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    fn grid_line(layer: &str) -> String {
+        format!("raster.imageGrid {}", json!({"layer":layer}))
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn annotation_grid_script_replays_generated_rasters_and_every_queued_query() {
+        use rustgis_map::raster::Resampling;
+        for multi_output in [false, true] {
+            let (lines, indices, taken) = if multi_output {
+                (
+                    vec![
+                        interpolation_line("kriging", 0.5),
+                        grid_line("Surface"),
+                        grid_line("Surface_variance"),
+                        grid_line("Surface"),
+                        grid_line("Surface_variance"),
+                    ],
+                    vec![1, 2, 3, 4],
+                    1,
+                )
+            } else {
+                (
+                    vec![
+                        interpolation_line("idwInterpolation", 0.5),
+                        grid_line("Surface"),
+                        grid_line("Image"),
+                        grid_line("Surface"),
+                        interpolation_line("idwInterpolation", 1.),
+                        grid_line("Surface (2)"),
+                        grid_line("Surface"),
+                        grid_line("Image"),
+                    ],
+                    vec![1, 2, 3, 5, 6, 7],
+                    2,
+                )
+            };
+            let params = json!({"script":lines.join("\n")});
+            let (mut direct, _) = interpolation_session();
+            let expected = direct.run("script.run", &params).unwrap();
+            let (mut queued, _) = interpolation_session();
+            queued.statistics_need_read_ahead(true);
+            let ahead = crate::cmd::reads::read_ahead(&mut queued, "script.run", &params).unwrap();
+            let done = ahead.run(&rustgis_analysis::control::Control::new()).unwrap();
+            // Worker data identity must not replace the user's current display defaults.
+            queued.raster_defaults.resampling = Resampling::Bilinear;
+            let result = crate::cmd::reads::read_land(&mut queued, done).unwrap();
+            assert_eq!(queued.tools_taken, taken, "later tools must take their worker result too");
+            for index in indices {
+                let actual: Frame = serde_json::from_value(result["ran"][index]["result"].clone()).unwrap();
+                let expected: Frame = serde_json::from_value(expected["ran"][index]["result"].clone()).unwrap();
+                assert_eq!(actual, expected, "grid at script line {}", index + 1);
+            }
+            for name in if multi_output { ["Surface", "Surface_variance"] } else { ["Surface", "Surface (2)"] } {
+                let output = queued.map().layer_by_name(name).unwrap();
+                assert_eq!(output.raster.as_ref().unwrap().style.resampling, Resampling::Bilinear);
+            }
+            assert!(queued.grids_ahead.is_none() && queued.tools_ahead.is_none());
+        }
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn annotation_grid_rejected_tool_discards_all_script_grids_and_allows_a_fresh_retry() {
+        let (mut s, samples) = interpolation_session();
+        let script =
+            [interpolation_line("idwInterpolation", 0.5), grid_line("Surface"), grid_line("Image"), grid_line("Surface")].join("\n");
+        let params = json!({"script":script});
+        s.statistics_need_read_ahead(true);
+        let ahead = crate::cmd::reads::read_ahead(&mut s, "script.run", &params).unwrap();
+        let done = ahead.run(&rustgis_analysis::control::Control::new()).unwrap();
+        s.run("edit.enable", &json!({"on":true})).unwrap();
+        s.run("edit.setValue", &json!({"layer":samples,"row":0,"field":"v","value":9})).unwrap();
+        let before = (s.undo_depth(), s.map().layers.len());
+        let error = crate::cmd::reads::read_land(&mut s, done).unwrap_err();
+        assert!(error.contains("script inputs changed"), "{error}");
+        assert_eq!(s.tools_taken, 0);
+        assert_eq!((s.undo_depth(), s.map().layers.len()), before);
+        assert!(s.map().layer_by_name("Surface").is_none());
+        assert!(s.grids_ahead.is_none() && s.tools_ahead.is_none());
+        // A new read must prepare every result again, including the existing image's grid.
+        let ahead = crate::cmd::reads::read_ahead(&mut s, "script.run", &params).unwrap();
+        let done = ahead.run(&rustgis_analysis::control::Control::new()).unwrap();
+        let answer = crate::cmd::reads::read_land(&mut s, done).unwrap();
+        assert_eq!(s.tools_taken, 1);
+        for (index, name) in [(1, "Surface"), (2, "Image"), (3, "Surface")] {
+            let layer = s.map().layer_by_name(name).unwrap();
+            let expected = read(layer.raster.as_ref().unwrap()).unwrap();
+            let frame: Frame = serde_json::from_value(answer["ran"][index]["result"].clone()).unwrap();
+            assert_eq!(frame, expected);
+        }
+        assert!(s.grids_ahead.is_none() && s.tools_ahead.is_none());
     }
 
     #[test]
