@@ -190,6 +190,11 @@ device/inode/change time on Unix or creation time on Windows. A rewrite preservi
 compared field is not detected. In particular, Windows cannot detect an in-place rewrite that
 preserves length, modification time and creation time. Reload the image after known external edits
 even if no change was reported.
+If revision capture fails, the image can still load for viewing, but grid reads report the
+original metadata error. Check filesystem metadata support/access, or export the image as a
+GeoTIFF to another location and add it. Repeatedly reloading the same unsupported filesystem
+does not repair its metadata support. Stale project/map bindings in pixel mode refuse drawing
+until the image is selected again; only an explicit map-grid choice returns map metres.
 Removing/replacing an image invalidates its cached grid. Local and embedded GeoTIFFs are supported; download remote originals
 first. In the browser, upload the original GeoTIFF.
 An image removed from the map keeps its last name as **Unavailable image**. Pixel drawing stays

@@ -33,18 +33,41 @@ impl FileRevision {
             created: metadata.creation_time(),
         })
     }
+
+    fn check_metadata(&self, path: &Path, metadata: &Metadata) -> std::result::Result<(), String> {
+        let current = Self::capture(path, metadata).map_err(|e| format!("Could not verify the current image file metadata: {e}"))?;
+        if *self == current {
+            Ok(())
+        } else {
+            Err("The image file changed since its pixels were loaded. Use Reload Data, then retry the operation.".into())
+        }
+    }
 }
 
 impl super::Raster {
-    /// Metadata only, called on the grid reader's worker, never by per-frame UI checks.
-    /// Missing provenance is refused rather than pairing an arbitrary file with displayed pixels.
-    pub fn check_original_file(&self, path: &Path, metadata: &Metadata) -> std::result::Result<(), String> {
-        let current = FileRevision::capture(path, metadata).map_err(|e| e.to_string())?;
+    fn original_revision(&self) -> std::result::Result<&FileRevision, String> {
         match &self.source_file {
-            Some(original) if *original == current => Ok(()),
-            Some(_) => Err("The image file changed since its pixels were loaded. Use Reload Data, then retry the operation.".into()),
+            Some(Ok(original)) => Ok(original),
+            Some(Err(error)) => Err(format!(
+                "The original image file revision could not be captured ({error}). Check filesystem metadata support/access, or export the image as a GeoTIFF to another location and add it."
+            )),
             None => Err("The displayed image has no verified original file revision. Use Reload Data, then retry the operation.".into()),
         }
+    }
+
+    /// Checks fresh metadata at the live path on the reader's worker, never per frame.
+    pub fn check_original_file(&self, path: &Path) -> std::result::Result<(), String> {
+        let original = self.original_revision()?;
+        let metadata = std::fs::metadata(path).map_err(|e| format!("Could not read the current image file metadata: {e}"))?;
+        original.check_metadata(path, &metadata)
+    }
+
+    /// Checks fresh metadata from this open handle against the original source at `path`.
+    /// This does not verify that the live path still names the handle; check_original_file does.
+    pub fn check_original_handle(&self, path: &Path, file: &std::fs::File) -> std::result::Result<(), String> {
+        let original = self.original_revision()?;
+        let metadata = file.metadata().map_err(|e| format!("Could not read the open image file metadata: {e}"))?;
+        original.check_metadata(path, &metadata)
     }
 }
 
@@ -59,7 +82,8 @@ mod tests {
         let raster = super::super::geotiff::read_file(&path, "image").unwrap();
         let original = std::fs::File::open(&path).unwrap();
         let metadata = original.metadata().unwrap();
-        raster.check_original_file(&path, &metadata).unwrap();
+        raster.check_original_file(&path).unwrap();
+        raster.check_original_handle(&path, &original).unwrap();
         let replacement = folder.path().join("replacement.tif");
         std::fs::write(&replacement, &bytes).unwrap();
         let file = std::fs::File::options().write(true).open(&replacement).unwrap();
@@ -70,9 +94,24 @@ mod tests {
         let current = std::fs::metadata(&path).unwrap();
         assert_eq!(metadata.len(), current.len());
         assert_eq!(metadata.modified().unwrap(), current.modified().unwrap());
-        // Metadata captured before replacement still describes the old file, not the live path.
-        raster.check_original_file(&path, &metadata).unwrap();
-        assert!(raster.check_original_file(&path, &current).unwrap_err().contains("Reload Data"));
-        assert!(raster.clone().check_original_file(&path, &current).is_err());
+        // Retaining old metadata cannot make the live-path API accept the replacement.
+        assert!(raster.check_original_file(&path).unwrap_err().contains("Reload Data"));
+        let replacement_handle = std::fs::File::open(&path).unwrap();
+        assert!(raster.check_original_handle(&path, &replacement_handle).is_err());
+    }
+
+    #[test]
+    fn annotation_grid_handle_validation_rejects_a_different_file() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("image.tif");
+        let other = folder.path().join("other.tif");
+        let bytes = super::super::geotiff::write(&super::super::tests::small(), 0).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let mut other_bytes = bytes.clone();
+        other_bytes.push(0); // Distinct metadata even on filesystems with coarse timestamps.
+        std::fs::write(&other, &other_bytes).unwrap();
+        let raster = super::super::geotiff::read_file(&path, "image").unwrap();
+        assert!(raster.check_original_handle(&path, &std::fs::File::open(&other).unwrap()).is_err());
+        raster.check_original_file(&path).unwrap();
     }
 }

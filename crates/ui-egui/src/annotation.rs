@@ -135,8 +135,11 @@ pub(crate) fn grid_said(app: &mut RustGisApp, result: Landed) {
 }
 /// Only new objects use this choice. Existing objects keep their own frozen frame.
 pub(crate) fn drawing_frame(app: &RustGisApp) -> Result<Frame, String> {
-    if app.annotation.context != Some((app.session.opened, app.session.map().instance_id())) || !app.annotation.pixels {
+    if !app.annotation.pixels {
         return Ok(Frame::default());
+    }
+    if app.annotation.context != Some((app.session.opened, app.session.map().instance_id())) {
+        return Err(tl!("The image context changed. Select the image again before drawing.").into());
     }
     if !app.annotation.source.as_ref().is_some_and(|s| s.current(&app.session)) {
         return Err(tl!("The image changed. Reload its grid before drawing.").into());
@@ -574,6 +577,27 @@ mod tests {
         assert!(app.annotation.image.is_none());
         assert_eq!(drawing_frame(&app).unwrap(), Frame::default());
     }
+    #[test]
+    fn annotation_grid_stale_pixel_context_never_substitutes_map_metres() {
+        for project_changed in [false, true] {
+            let (mut app, image, _, frame) = app();
+            app.run("ui.annotationImage", json!({"image":image})).unwrap();
+            let context = app.annotation.context.unwrap();
+            // Model a stale binding before the next UI synchronization, while the source is live.
+            app.annotation.context =
+                Some(if project_changed { (context.0.wrapping_add(1), context.1) } else { (context.0, context.1.wrapping_add(1)) });
+            assert!(app.annotation.source.as_ref().unwrap().current(&app.session));
+            assert!(drawing_frame(&app).unwrap_err().contains("context changed"));
+            assert!(app.annotation.pixels);
+            assert_eq!(app.annotation.frame.as_ref(), Some(&frame));
+            app.annotation.pixels = false;
+            assert_eq!(drawing_frame(&app).unwrap(), Frame::default(), "explicit map units remain valid");
+            app.annotation.pixels = true;
+            app.annotation.context = Some(context);
+            assert_eq!(drawing_frame(&app).unwrap(), frame);
+        }
+    }
+
     #[test]
     fn annotation_grid_open_keeps_automatic_selection_errors_inline() {
         use egui_kittest::kittest::Queryable;

@@ -1437,21 +1437,67 @@ pub fn read_file(path: &std::path::Path, name: &str) -> Result<Raster> {
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) fn read_file_with_nodata(path: &std::path::Path, name: &str, sidecar_nodata: Option<f64>) -> Result<Raster> {
     let file = crate::provenance::open(path)?;
-    let revision = super::file_revision::FileRevision::capture(path, &file.metadata()?).ok();
+    let revision = file.metadata().and_then(|metadata| super::file_revision::FileRevision::capture(path, &metadata));
+    read_file_with_revision(path, name, sidecar_nodata, file, revision)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn read_file_with_revision(
+    path: &std::path::Path,
+    name: &str,
+    sidecar_nodata: Option<f64>,
+    file: std::fs::File,
+    revision: std::io::Result<super::file_revision::FileRevision>,
+) -> Result<Raster> {
+    let revision = revision.map_err(|e| e.to_string());
     let open = || -> std::io::Result<Reader<'static>> {
         let file = crate::provenance::open(path)?;
-        if revision.is_some() && super::file_revision::FileRevision::capture(path, &file.metadata()?).ok() != revision {
-            return Err(std::io::Error::other("the image file changed while its pixels were read; reload it"));
+        if let Ok(original) = &revision {
+            let current = super::file_revision::FileRevision::capture(path, &file.metadata()?)?;
+            if *original != current {
+                return Err(std::io::Error::other("the image file changed while its pixels were read; reload it"));
+            }
         }
         reader(std::io::BufReader::new(file))
     };
     let mut raster =
         read_limited_with_nodata(reader(std::io::BufReader::new(file)).map_err(err)?, name, max_samples(), Some(&open), sidecar_nodata)?;
-    raster.source_file = revision;
-    if raster.source_file.is_some() {
-        raster.check_original_file(path, &std::fs::metadata(path)?).map_err(err)?;
+    raster.source_file = Some(revision);
+    if raster.source_file.as_ref().is_some_and(|revision| revision.is_ok()) {
+        raster.check_original_file(path).map_err(err)?;
     }
     Ok(raster)
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[test]
+fn annotation_grid_capture_failure_preserves_pixels_and_reports_the_original_cause() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("image.tif");
+    let pixels = super::tests::small();
+    std::fs::write(&path, write(&pixels, 0).unwrap()).unwrap();
+    let file = std::fs::File::open(&path).unwrap();
+    let raster = read_file_with_revision(
+        &path,
+        "image",
+        None,
+        file,
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "modification timestamps unavailable")),
+    )
+    .unwrap();
+    assert_eq!((raster.width, raster.height), (pixels.width, pixels.height));
+    assert_eq!(raster.bands[0].data, pixels.bands[0].data);
+    let error = raster.check_original_file(&path).unwrap_err();
+    assert!(error.contains("modification timestamps unavailable"), "{error}");
+    assert!(error.contains("metadata support/access") && error.contains("another location"), "{error}");
+    assert!(!error.contains("Reload Data"), "{error}");
+    assert!(
+        raster
+            .clone()
+            .check_original_handle(&path, &std::fs::File::open(&path).unwrap())
+            .unwrap_err()
+            .contains("modification timestamps unavailable")
+    );
 }
 
 /// [`read`], holding at most `max` samples (the tests' small limit exercises the overviews), with

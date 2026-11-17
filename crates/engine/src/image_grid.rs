@@ -62,12 +62,12 @@ pub(crate) fn read(r: &RasterLayer) -> Result<Frame, String> {
             let input = std::fs::File::open(path).map_err(|e| e.to_string())?;
             let displayed = r.data.as_ref().ok_or("The image pixels are not loaded. Use Reload Data, then retry the operation.")?;
             let path = std::path::Path::new(path);
-            displayed.check_original_file(path, &input.metadata().map_err(|e| e.to_string())?)?;
+            displayed.check_original_handle(path, &input)?;
             let grid = rustgis_data::raster::geotiff::read_image_grid(&input);
             // Both the handle and path must still name the revision that supplied the display.
             // A replacement during parsing must not pair new coordinates with old pixels.
-            displayed.check_original_file(path, &input.metadata().map_err(|e| e.to_string())?)?;
-            displayed.check_original_file(path, &std::fs::metadata(path).map_err(|e| e.to_string())?)?;
+            displayed.check_original_handle(path, &input)?;
+            displayed.check_original_file(path)?;
             grid
         }
         #[cfg(target_arch = "wasm32")]

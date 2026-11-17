@@ -622,9 +622,9 @@ pub struct Raster {
     pub data_type: String,
     /// Where it was read from, if anywhere.
     pub source: Option<String>,
-    /// The original local GeoTIFF's revision, retained with these pixels and never serialized.
+    /// The original local GeoTIFF's revision or capture failure, retained with these pixels and never serialized.
     #[cfg(not(target_arch = "wasm32"))]
-    source_file: Option<file_revision::FileRevision>,
+    source_file: Option<std::result::Result<file_revision::FileRevision, String>>,
     /// Whether the pixels come from a reduced-resolution overview.
     pub overview: Option<(u32, u32)>,
     /// With `overview`, whether the pixels are every `step`-th of the file's, from its top-left
@@ -2448,13 +2448,12 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache = dir.path().join("converted.tif");
         std::fs::write(&cache, geotiff::write(&small(), 0).unwrap()).unwrap();
-        let metadata = std::fs::metadata(&cache).unwrap();
-        geotiff::read_file(&cache, "cache").unwrap().check_original_file(&cache, &metadata).unwrap();
+        geotiff::read_file(&cache, "cache").unwrap().check_original_file(&cache).unwrap();
         let converted = gdal::Converted { path: cache.clone(), subdataset: None, others: Vec::new(), assumed_lonlat: false };
         let source = dir.path().join("original.nc");
         let pixels = read_converted(&source, &converted).unwrap();
         assert_eq!(pixels.source.as_deref(), source.to_str());
-        let error = pixels.check_original_file(&cache, &metadata).unwrap_err();
+        let error = pixels.check_original_file(&cache).unwrap_err();
         assert!(error.contains("no verified original file revision"), "{error}");
         assert!(!error.contains("file changed"), "{error}");
     }
