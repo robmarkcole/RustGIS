@@ -3410,8 +3410,13 @@ impl RustGisApp {
                 }
             }
             "ui.annotationImage" => annotation::select_image(self, p)?,
-            "ui.annotationFilename" => annotation::filename_option(self, p.get("on").and_then(Value::as_bool).ok_or("on is required")?),
-            "ui.annotationGrid" => annotation::select_grid(self, p.get("pixels").and_then(Value::as_bool).ok_or("pixels is required")?)?,
+            "ui.annotationFilename" => {
+                annotation::filename_option(self, p.get("on").and_then(Value::as_bool).ok_or_else(|| tl!("on is required").to_string())?)
+            }
+            "ui.annotationGrid" => annotation::select_grid(
+                self,
+                p.get("pixels").and_then(Value::as_bool).ok_or_else(|| tl!("pixels is required").to_string())?,
+            )?,
             "ui.annotationCancel" => annotation::cancel_read(self),
             "ui.annotationLayer" => annotation::select_layer(self, p)?,
             "ui.pane.editing" => toggle_right(&mut self.ui, RightPane::Editing),
@@ -4873,7 +4878,8 @@ impl RustGisApp {
                 // Any format the dialog offers here (`dialogs::export_formats`): not GeoPackage or
                 // FlatGeobuf, which the data crate refuses in the browser.
                 let ext = p.get("format").and_then(Value::as_str).unwrap_or("geojson").to_ascii_lowercase();
-                let name = annotation::export_name(self, id, if ext == "shp" { "zip" } else { &ext }, annotation_export)?;
+                let download_ext = if ext == "shp" { "zip".to_string() } else { ext.clone() };
+                let name = annotation::export_name(self, id, &download_ext, annotation_export)?;
                 rustgis_engine::cmd::share::gpkg_table(p, &ext)?;
                 // A streamed layer exports its whole source, not the features read for the view.
                 let (whole, lost) = if l.is_streamed() {
@@ -4894,7 +4900,7 @@ impl RustGisApp {
                         return Err(e);
                     }
                 };
-                let ext = if ext == "shp" { "zip".to_string() } else { ext };
+                let ext = download_ext;
                 // The features written, read whole, give their own extent (not a raster's, or the
                 // one a streamed layer's source declares).
                 let mut notes = rustgis_engine::data::export_notes([(ds, ds.extent())], &name, crs);

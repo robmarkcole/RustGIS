@@ -1442,6 +1442,13 @@ pub(super) fn read_file_with_nodata(path: &std::path::Path, name: &str, sidecar_
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn load_revision_error(reason: impl std::fmt::Display) -> String {
+    format!(
+        "{reason}. Wait until the file is stable, or copy it to a stable local location. Retry Add Data; for an existing layer, retry Reload Data."
+    )
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn read_file_with_revision(
     path: &std::path::Path,
     name: &str,
@@ -1453,19 +1460,27 @@ fn read_file_with_revision(
     let open = || -> std::io::Result<Reader<'static>> {
         let file = crate::provenance::open(path)?;
         if let Ok(original) = &revision {
-            let current = super::file_revision::FileRevision::capture(path, &file.metadata()?)?;
+            let current = file
+                .metadata()
+                .and_then(|metadata| super::file_revision::FileRevision::capture(path, &metadata))
+                .map_err(|e| std::io::Error::other(load_revision_error(format!("Could not verify the image file while reading: {e}"))))?;
             if *original != current {
-                return Err(std::io::Error::other("the image file changed while its pixels were read; reload it"));
+                return Err(std::io::Error::other(load_revision_error("The image file changed while its pixels were read")));
             }
         }
         reader(std::io::BufReader::new(file))
     };
     let mut raster =
         read_limited_with_nodata(reader(std::io::BufReader::new(file)).map_err(err)?, name, max_samples(), Some(&open), sidecar_nodata)?;
-    raster.source_file = Some(revision);
-    if raster.source_file.as_ref().is_some_and(|revision| revision.is_ok()) {
-        raster.check_original_file(path).map_err(err)?;
+    if let Ok(original) = &revision {
+        let current = std::fs::metadata(path)
+            .and_then(|metadata| super::file_revision::FileRevision::capture(path, &metadata))
+            .map_err(|e| err(load_revision_error(format!("Could not verify the image file after reading: {e}"))))?;
+        if *original != current {
+            return Err(err(load_revision_error("The image file changed while its pixels were read")));
+        }
     }
+    raster.source_file = Some(revision);
     Ok(raster)
 }
 
@@ -2166,6 +2181,38 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let error = read_file(&dir.path().join("missing.tif"), "missing").unwrap_err().to_string();
         assert!(error.contains("GeoTIFF:"), "{error}");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn annotation_grid_load_change_and_missing_path_refuse_with_add_data_recovery() {
+        use std::io::Write;
+        for removed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("image.tif");
+            let pixels = small();
+            let bytes = write(&pixels, 0).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            let file = std::fs::File::open(&path).unwrap();
+            let revision = super::super::file_revision::FileRevision::capture(&path, &file.metadata().unwrap()).unwrap();
+            // Inject a change between the initial source snapshot and the final load check,
+            // without timers or filesystem races. The already-open TIFF remains decodable.
+            if removed {
+                std::fs::remove_file(&path).unwrap();
+            } else {
+                std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(&[0]).unwrap();
+            }
+            let error = read_file_with_revision(&path, "image", None, file, Ok(revision)).unwrap_err().to_string();
+            assert!(error.contains("GeoTIFF:") && error.contains("Retry Add Data"), "{error}");
+            assert!(error.contains("stable local location") && error.contains("for an existing layer, retry Reload Data"), "{error}");
+            assert!(!error.contains("Use Reload Data, then retry the operation"), "{error}");
+            assert!(error.contains(if removed { "Could not verify" } else { "file changed" }), "{error}");
+            // Once stable, an ordinary Add Data read succeeds and has a verified grid revision.
+            std::fs::write(&path, &bytes).unwrap();
+            let loaded = read_file(&path, "image").unwrap();
+            assert_eq!(loaded.bands[0].data, pixels.bands[0].data);
+            loaded.check_original_file(&path).unwrap();
+        }
     }
 
     #[cfg(not(target_arch = "wasm32"))]

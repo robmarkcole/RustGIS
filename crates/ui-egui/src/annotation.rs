@@ -797,6 +797,54 @@ mod tests {
         assert_eq!(h.state().session.tool, Tool::Circle);
     }
     #[test]
+    fn annotation_grid_refused_gestures_notify_with_shape_details_collapsed() {
+        use egui_kittest::kittest::Queryable;
+        for tool in [Tool::Circle, Tool::RotatedBox] {
+            let (mut app, image, layer, frame) = app();
+            app.run("ui.annotationImage", json!({"image":image})).unwrap();
+            app.run("ui.pane.annotation", Value::Null).unwrap();
+            app.run("tool.set", json!({"tool":tool.code()})).unwrap();
+            // A pending lookup has no frame yet; its failure must be visible outside details.
+            app.annotation.frame = None;
+            app.annotation.error = None;
+            app.annotation.pending = Some(app.annotation.next);
+            let depth = app.session.undo_depth();
+            let mark = app.session.notice_mark();
+            let origin = screen(&app, &frame, [32., 32.]);
+            let accepted = if tool == Tool::Circle {
+                crate::circleedit::drag_start(&mut app, rect(), origin, true)
+            } else {
+                crate::boxedit::drag_start(&mut app, rect(), origin, true)
+            };
+            assert!(!accepted);
+            let error = "Wait for the original image grid before drawing.";
+            assert_eq!(app.session.notices_since(mark).iter().filter(|n| n.error && n.text == error).count(), 1);
+            assert_eq!(app.session.undo_depth(), depth);
+            assert!(app.session.map().layer(layer).unwrap().dataset.features.is_empty());
+            let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1366., 900.)).with_max_steps(1000).build_ui_state(
+                |ui, app: &mut RustGisApp| {
+                    let ctx = ui.ctx().clone();
+                    app.logic(&ctx);
+                    app.ui(ui);
+                },
+                app,
+            );
+            // Pending reads keep the spinner repainting; inspect a frame rather than await idle.
+            h.run_steps(1);
+            assert!(h.query_by_label("Shape details").is_some());
+            assert!(h.query_by_label("Radius").is_none() && h.query_by_label("Width").is_none());
+            assert!(h.query_all_by_label(error).next().is_some(), "refusal is visible without expanding details");
+            let app = h.state_mut();
+            app.annotation.pending = None;
+            app.annotation.frame = Some(frame.clone());
+            let mark = app.session.notice_mark();
+            drag(app, &frame, [32., 32.], [64., 64.], true);
+            assert_eq!(app.session.map().layer(layer).unwrap().dataset.features.len(), 1);
+            assert!(!app.session.notices_since(mark).iter().any(|n| n.error), "valid recovery must not produce a refusal");
+        }
+    }
+
+    #[test]
     fn annotation_shape_details_start_hidden_and_toggle_without_changing_the_object() {
         use egui_kittest::kittest::Queryable;
         for tool in [Tool::Circle, Tool::RotatedBox] {

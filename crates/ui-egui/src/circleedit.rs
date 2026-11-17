@@ -115,7 +115,8 @@ pub(crate) fn drag_start(app: &mut RustGisApp, rect: Rect, origin: Pos2, force_n
             let frame = match crate::annotation::drawing_frame(app) {
                 Ok(frame) => frame,
                 Err(error) => {
-                    app.circles.error = Some(error);
+                    app.circles.error = Some(error.clone());
+                    app.session.notify(error, true);
                     return false;
                 }
             };

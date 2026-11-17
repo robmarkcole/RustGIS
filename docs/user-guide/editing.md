@@ -181,24 +181,14 @@ switching to Web Mercator or using **Cancel Grid Read** stops only that lookup a
 unrelated queued work. The status-bar Cancel retains its queue-wide behaviour. Pixel-based
 drawing waits for a valid grid; a failed or cancelled read never silently substitutes map metres.
 After changing a source file externally, reload the image layer first, then use **Reload Grid**.
-New grid reads from a linked GeoTIFF require loaded pixels and a recorded filesystem-metadata
-revision. A detected metadata mismatch, or an unverifiable revision, refuses the read rather
-than pairing an unchecked header with the displayed image. An already-read
-grid stays aligned with the pixels retained in the session.
-Detection compares filesystem metadata, not file contents: length and modification time, plus
-device/inode/change time on Unix or creation time on Windows. Rewrites preserving every compared
-field go undetected; on Windows this includes in-place rewrites preserving length, modification
-time and creation time. Reload after known external edits even without a reported change.
-If revision capture fails, the image can still load for viewing, but grid reads report the
-original metadata error. Check filesystem metadata support/access, or export the image as a
-GeoTIFF to another location and add it. Repeatedly reloading the same unsupported filesystem
-does not repair its metadata support. Changing projects or maps clears the old image binding,
-keeps pixel mode selected and reports a warning. Drawing stays blocked until you choose an image
-again or explicitly choose Web Mercator grid metres; opening the pane does not clear the warning.
+Original-pixel drawing and conversion share the same [source checks](#image-source-checks).
 Removing/replacing an image invalidates its cached grid. Local and embedded GeoTIFFs are supported;
 download remote originals first. In the browser, upload the original GeoTIFF. Other local formats
 (including PNG, JPEG, ASCII grids and GDAL-converted images) are refused with guidance to export
 the image as a GeoTIFF and add that file; reloading the unsupported source cannot supply its grid.
+Changing projects or maps clears the old image binding, keeps pixel mode selected and reports a
+warning. Drawing stays blocked until you choose an image again or explicitly choose Web Mercator
+grid metres; opening the pane does not clear the warning.
 An image removed from the map keeps its last name as **Unavailable image**. Pixel drawing stays
 blocked and **Reload Grid** is disabled until the image is restored or another image is chosen.
 Choose **No image** to return explicitly to Web Mercator grid metres.
@@ -208,7 +198,8 @@ EPSG coordinate system in a notice, while keeping the Annotate pane open.
 Space or middle-drag pans; releasing Space keeps the drawing tool. Use the selected object's
 existing handles, Undo/Redo, and **Export GeoJSON…**. **Shape details** is collapsed by default;
 expand it for numeric dimensions and additional editing controls. Map handles remain available
-while the section is hidden. Exports contain
+while the section is hidden. Refused drawing gestures show an error notification even when
+**Shape details** is collapsed. Exports contain
 ordinary geographic polygons and feature properties; circles are polygon approximations.
 Check **Use image filename** to suggest `img1.geojson` for an image named `img1.tiff`.
 The preview shows the suggested basename; the save dialog still chooses the folder and lets
@@ -227,6 +218,24 @@ on its worker and shows the actual frame in each line's result, rather than a qu
 Queries may follow replayable selection/edit steps, but file-opening or project-changing setup
 must run in a separate script first. A changed image invalidates the prepared result instead of
 reopening its file on the UI thread. Scoped callers should use the individually approved query.
+
+### Image source checks
+
+Local GeoTIFF loading records the file revision with its decoded pixels. If a verified file changes
+or becomes unverifiable during decoding, **Add Data** and **Reload Data** refuse that load rather
+than accepting potentially inconsistent pixels. Wait for writes/cloud synchronization to finish,
+or copy the image to a stable local location; then retry **Add Data**, or **Reload Data** for an
+existing layer. This load-time check also applies outside annotation workflows.
+
+Grid reads require loaded pixels and a matching verified revision. After known external edits,
+reload the image layer and retry the operation. Detection compares metadata, not content hashes:
+length and modification time, plus device/inode/change time on Unix or creation time on Windows.
+Rewrites preserving every compared field go undetected, so reload after known edits even without
+a warning. A cached grid remains aligned with the pixels retained in the session.
+
+If the initial revision capture fails, viewing can still load, but grid reads report the original
+metadata error. Check filesystem metadata support/access, or export the image as a GeoTIFF to
+another location and add it; repeated reloads cannot repair unsupported metadata.
 
 ### Rotated boxes
 
@@ -502,10 +511,8 @@ keep their current selection when opening the map menu.
    display overview. Local GeoTIFFs and embedded/browser-uploaded GeoTIFFs are supported; remote
    original grids must be downloaded and added first. An unreadable or unsupported source gives
    an error, without falling back to a different grid.
-   A local image must have loaded pixels and a verified file revision matching those pixels;
-   conversion does not read an unchecked header when pixels are missing or their revision is
-   unknown. If asked to reload, use **Reload Data** on the image, then retry **Preview Conversion**
-   or **Convert Now**. The same metadata-detection limits described above apply here.
+   The same [image source checks](#image-source-checks) apply. If asked to reload, use
+   **Reload Data** on the image, then retry **Preview Conversion** or **Convert Now**.
 2. For a quick conversion, click **Convert Now** to fit and apply using the chosen shape and
    grid, without a preview or another confirmation. Alternatively, click **Preview Conversion**
    to show an orange outline without changing the feature or undo history, review or adjust the
