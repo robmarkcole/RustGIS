@@ -186,22 +186,21 @@ revision. A detected metadata mismatch, or an unverifiable revision, refuses the
 than pairing an unchecked header with the displayed image. An already-read
 grid stays aligned with the pixels retained in the session.
 Detection compares filesystem metadata, not file contents: length and modification time, plus
-device/inode/change time on Unix or creation time on Windows. A rewrite preserving every
-compared field is not detected. In particular, Windows cannot detect an in-place rewrite that
-preserves length, modification time and creation time. Reload the image after known external edits
-even if no change was reported.
+device/inode/change time on Unix or creation time on Windows. Rewrites preserving every compared
+field go undetected; on Windows this includes in-place rewrites preserving length, modification
+time and creation time. Reload after known external edits even without a reported change.
 If revision capture fails, the image can still load for viewing, but grid reads report the
 original metadata error. Check filesystem metadata support/access, or export the image as a
 GeoTIFF to another location and add it. Repeatedly reloading the same unsupported filesystem
 does not repair its metadata support. Stale project/map bindings in pixel mode refuse drawing
 until the image is selected again; only an explicit map-grid choice returns map metres.
-Removing/replacing an image invalidates its cached grid. Local and embedded GeoTIFFs are supported; download remote originals
-first. In the browser, upload the original GeoTIFF.
+Removing/replacing an image invalidates its cached grid. Local and embedded GeoTIFFs are supported;
+download remote originals first. In the browser, upload the original GeoTIFF. Other local formats
+(including PNG, JPEG, ASCII grids and GDAL-converted images) are refused with guidance to export
+the image as a GeoTIFF and add that file; reloading the unsupported source cannot supply its grid.
 An image removed from the map keeps its last name as **Unavailable image**. Pixel drawing stays
 blocked and **Reload Grid** is disabled until the image is restored or another image is chosen.
-Choose **No image** to return explicitly to Web Mercator grid metres. Images loaded through GDAL
-(such as NetCDF or JPEG 2000) cannot supply an original GeoTIFF grid: export the image as a GeoTIFF
-and add that file instead of repeatedly reloading the converted source.
+Choose **No image** to return explicitly to Web Mercator grid metres.
 **Original Image Grid** in Command Search reports the active image's original dimensions and
 EPSG coordinate system in a notice, while keeping the Annotate pane open.
 

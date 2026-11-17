@@ -1469,37 +1469,6 @@ fn read_file_with_revision(
     Ok(raster)
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
-#[test]
-fn annotation_grid_capture_failure_preserves_pixels_and_reports_the_original_cause() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("image.tif");
-    let pixels = super::tests::small();
-    std::fs::write(&path, write(&pixels, 0).unwrap()).unwrap();
-    let file = std::fs::File::open(&path).unwrap();
-    let raster = read_file_with_revision(
-        &path,
-        "image",
-        None,
-        file,
-        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "modification timestamps unavailable")),
-    )
-    .unwrap();
-    assert_eq!((raster.width, raster.height), (pixels.width, pixels.height));
-    assert_eq!(raster.bands[0].data, pixels.bands[0].data);
-    let error = raster.check_original_file(&path).unwrap_err();
-    assert!(error.contains("modification timestamps unavailable"), "{error}");
-    assert!(error.contains("metadata support/access") && error.contains("another location"), "{error}");
-    assert!(!error.contains("Reload Data"), "{error}");
-    assert!(
-        raster
-            .clone()
-            .check_original_handle(&path, &std::fs::File::open(&path).unwrap())
-            .unwrap_err()
-            .contains("modification timestamps unavailable")
-    );
-}
-
 /// [`read`], holding at most `max` samples (the tests' small limit exercises the overviews), with
 /// `open` making more readers of the same file for decoding it on several threads.
 pub(super) fn read_limited(r: Reader<'_>, name: &str, max: usize, open: Option<Opener<'_>>) -> Result<Raster> {
@@ -2190,6 +2159,37 @@ fn encode(r: &Raster, band: usize, every: bool) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::raster::tests::small;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn annotation_grid_capture_failure_preserves_pixels_and_reports_the_original_cause() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image.tif");
+        let pixels = small();
+        std::fs::write(&path, write(&pixels, 0).unwrap()).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let raster = read_file_with_revision(
+            &path,
+            "image",
+            None,
+            file,
+            Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "modification timestamps unavailable")),
+        )
+        .unwrap();
+        assert_eq!((raster.width, raster.height), (pixels.width, pixels.height));
+        assert_eq!(raster.bands[0].data, pixels.bands[0].data);
+        let error = raster.check_original_file(&path).unwrap_err();
+        assert!(error.contains("modification timestamps unavailable"), "{error}");
+        assert!(error.contains("metadata support/access") && error.contains("another location"), "{error}");
+        assert!(!error.contains("Reload Data"), "{error}");
+        assert!(
+            raster
+                .clone()
+                .check_original_handle(&path, &std::fs::File::open(&path).unwrap())
+                .unwrap_err()
+                .contains("modification timestamps unavailable")
+        );
+    }
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]

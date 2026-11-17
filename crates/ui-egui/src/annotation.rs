@@ -120,7 +120,7 @@ pub(crate) fn landed(app: &mut RustGisApp, request: u64, result: Landed) {
     }
 }
 /// Command Search's read-only grid query says its answer after background or inline delivery.
-pub(crate) fn grid_said(app: &mut RustGisApp, result: Landed) {
+pub(crate) fn show_grid_result(app: &mut RustGisApp, result: Landed) {
     let Landed::Ran(Ok(value)) = result else { return };
     match serde_json::from_value::<Frame>(value) {
         Ok(frame) => app.session.notify(
@@ -222,7 +222,7 @@ pub(crate) fn grid_controls(app: &mut RustGisApp, ui: &mut egui::Ui) {
         let _ = app.run("ui.annotationImage", json!({"image":image}));
     }
     let mut pixels = app.annotation.pixels;
-    egui::ComboBox::from_label(tl!("New shape grid"))
+    egui::ComboBox::new("annotation-construction-grid", tl!("Grid"))
         .selected_text(if pixels { tl!("Original image pixels") } else { tl!("Web Mercator grid metres") })
         .show_ui(ui, |ui| {
             ui.add_enabled_ui(available, |ui| ui.selectable_value(&mut pixels, true, tl!("Original image pixels")));

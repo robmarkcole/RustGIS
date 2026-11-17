@@ -56,7 +56,11 @@ pub(crate) fn read(r: &RasterLayer) -> Result<Frame, String> {
             .ok_or("choose a local or embedded GeoTIFF; remote original grids must be downloaded and added first")?;
         #[cfg(not(target_arch = "wasm32"))]
         {
-            if rustgis_data::raster::gdal::is_gdal_raster_name(path) {
+            let tiff = std::path::Path::new(path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("tif") || e.eq_ignore_ascii_case("tiff"));
+            if !tiff {
                 return Err("Original image grids require a GeoTIFF source. Export this image as a GeoTIFF and add that file.".into());
             }
             let input = std::fs::File::open(path).map_err(|e| e.to_string())?;
@@ -91,8 +95,8 @@ pub(crate) fn ahead(s: &Session, p: &Value) -> Option<crate::cmd::reads::ReadWor
         Prepared { source, result }
     }))
 }
-/// Desktop UI calls require the cancellable read queue. Headless callers run on their own
-/// worker; the browser reads uploaded bytes inline. Reads only headers, never display pixels.
+/// Desktop UI calls require the cancellable read queue. Headless calls read synchronously on
+/// the caller's thread; the browser reads uploaded bytes inline. Reads only headers, never pixels.
 pub(crate) fn query(s: &mut Session, p: &Value) -> CmdResult {
     let source = Source::capture(s, s.layer_id(p)?)?;
     let ready = crate::cmd::reads::take::<Prepared>(s, "imageGrid");
@@ -238,6 +242,56 @@ mod tests {
         // Adding the actual GeoTIFF supplies a verified original grid.
         let pixels = rustgis_data::raster::read_path(&cache).unwrap();
         s.map_mut().layer_mut(id).unwrap().raster = Some(RasterLayer::from_path(pixels, cache.display().to_string()));
+        assert_eq!(serde_json::from_value::<Frame>(s.run("raster.imageGrid", &json!({"layer":id})).unwrap()).unwrap(), expected);
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn annotation_grid_other_local_formats_offer_geotiff_recovery_without_a_reload_loop() {
+        struct Dir(std::path::PathBuf);
+        impl Drop for Dir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = Dir(std::env::temp_dir().join(format!("rustgis-grid-local-formats-{}", std::process::id())));
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let (mut s, id, expected) = session();
+        for extension in ["asc", "png", "jpg", "jpeg"] {
+            let path = dir.0.join(format!("image.{extension}"));
+            if extension == "asc" {
+                std::fs::write(&path, "ncols 2\nnrows 2\nxllcorner 0\nyllcorner 0\ncellsize 1\n1 2\n3 4\n").unwrap();
+            } else {
+                image::RgbImage::from_pixel(2, 2, image::Rgb([64, 128, 192])).save(&path).unwrap();
+            }
+            let pixels = rustgis_data::raster::read_path(&path).unwrap();
+            s.map_mut().layer_mut(id).unwrap().raster = Some(RasterLayer::from_path(pixels, path.display().to_string()));
+            for queued in [false, true] {
+                for _ in 0..2 {
+                    let depth = s.undo_depth();
+                    let params = json!({"layer":id});
+                    let result = if queued {
+                        let read = crate::cmd::reads::read_ahead(&mut s, "raster.imageGrid", &params).unwrap();
+                        let done = read.run(&rustgis_analysis::control::Control::new()).unwrap();
+                        crate::cmd::reads::read_land(&mut s, done)
+                    } else {
+                        s.run("raster.imageGrid", &params)
+                    };
+                    let error = result.unwrap_err();
+                    assert!(error.contains("GeoTIFF") && error.contains("Export") && error.contains("add"), "{extension}: {error}");
+                    assert!(!error.contains("Reload Data") && !error.contains("file changed"), "{extension}: {error}");
+                    assert_eq!(s.undo_depth(), depth);
+                    s.run("layer.reloadData", &params).unwrap();
+                }
+            }
+        }
+        // A real TIFF, including an uppercase extension, still supplies its original grid.
+        let path = dir.0.join("original.TIFF");
+        let (source, source_id, _) = session();
+        std::fs::write(&path, source.map().layer(source_id).unwrap().raster.as_ref().unwrap().embedded.as_ref().unwrap().as_slice())
+            .unwrap();
+        let pixels = rustgis_data::raster::read_path(&path).unwrap();
+        s.map_mut().layer_mut(id).unwrap().raster = Some(RasterLayer::from_path(pixels, path.display().to_string()));
         assert_eq!(serde_json::from_value::<Frame>(s.run("raster.imageGrid", &json!({"layer":id})).unwrap()).unwrap(), expected);
     }
 

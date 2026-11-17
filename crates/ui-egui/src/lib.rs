@@ -2715,10 +2715,10 @@ impl RustGisApp {
         if id == "raster.imageGrid" {
             #[cfg(not(target_arch = "wasm32"))]
             if self.reads_off_frame {
-                return readjob::run_then(self, "raster.imageGrid", params, Some(annotation::grid_said));
+                return readjob::run_then(self, "raster.imageGrid", params, Some(annotation::show_grid_result));
             }
             let result = self.run(id, params);
-            annotation::grid_said(self, Landed::Ran(result.clone()));
+            annotation::show_grid_result(self, Landed::Ran(result.clone()));
             return result;
         }
         self.run(id, params)
