@@ -181,8 +181,14 @@ switching to Web Mercator or using **Cancel Grid Read** stops only that lookup a
 unrelated queued work. The status-bar Cancel retains its queue-wide behaviour. Pixel-based
 drawing waits for a valid grid; a failed or cancelled read never silently substitutes map metres.
 After changing a source file externally, reload the image layer first, then use **Reload Grid**.
+New grid reads from a linked GeoTIFF are refused if its file revision differs from the one
+that supplied the displayed pixels, or that revision cannot be verified. This prevents fitting
+new annotations with a changed file's grid over the previously loaded image. An already-read
+grid stays aligned with the pixels retained in the session.
 Removing/replacing an image invalidates its cached grid. Local and embedded GeoTIFFs are supported; download remote originals
 first. In the browser, upload the original GeoTIFF.
+**Original Image Grid** in Command Search reports the active image's original dimensions and
+EPSG coordinate system in a notice, while keeping the Annotate pane open.
 
 Space or middle-drag pans; releasing Space keeps the drawing tool. Use the selected object's
 existing handles, Undo/Redo, and **Export GeoJSON…**. **Shape details** is collapsed by default;

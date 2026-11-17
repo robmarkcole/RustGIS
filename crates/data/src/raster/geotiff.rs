@@ -1396,9 +1396,22 @@ pub fn read_file(path: &std::path::Path, name: &str) -> Result<Raster> {
 /// [`read_file`], with the no-data value a sidecar gives (see [`read_limited_with_nodata`]).
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) fn read_file_with_nodata(path: &std::path::Path, name: &str, sidecar_nodata: Option<f64>) -> Result<Raster> {
-    let path = path.to_path_buf();
-    let open = move || -> std::io::Result<Reader<'static>> { reader(std::io::BufReader::new(crate::provenance::open(&path)?)) };
-    read_limited_with_nodata(open().map_err(err)?, name, max_samples(), Some(&open), sidecar_nodata)
+    let file = crate::provenance::open(path)?;
+    let revision = super::file_revision::FileRevision::capture(path, &file.metadata()?).ok();
+    let open = || -> std::io::Result<Reader<'static>> {
+        let file = crate::provenance::open(path)?;
+        if revision.is_some() && super::file_revision::FileRevision::capture(path, &file.metadata()?).ok() != revision {
+            return Err(std::io::Error::other("the image file changed while its pixels were read; reload it"));
+        }
+        reader(std::io::BufReader::new(file))
+    };
+    let mut raster =
+        read_limited_with_nodata(reader(std::io::BufReader::new(file)).map_err(err)?, name, max_samples(), Some(&open), sidecar_nodata)?;
+    raster.source_file = revision;
+    if raster.source_file.is_some() {
+        raster.check_original_file(path, &std::fs::metadata(path)?).map_err(err)?;
+    }
+    Ok(raster)
 }
 
 /// [`read`], holding at most `max` samples (the tests' small limit exercises the overviews), with

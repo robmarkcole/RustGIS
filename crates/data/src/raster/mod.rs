@@ -15,6 +15,8 @@ mod epsg_gap;
 mod esri;
 mod esri_datums;
 #[cfg(not(target_arch = "wasm32"))]
+mod file_revision;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod gdal;
 pub mod geotiff;
 mod image_grid;
@@ -621,6 +623,9 @@ pub struct Raster {
     pub data_type: String,
     /// Where it was read from, if anywhere.
     pub source: Option<String>,
+    /// The original local GeoTIFF's revision, retained with these pixels and never serialized.
+    #[cfg(not(target_arch = "wasm32"))]
+    source_file: Option<file_revision::FileRevision>,
     /// Whether the pixels come from a reduced-resolution overview.
     pub overview: Option<(u32, u32)>,
     /// With `overview`, whether the pixels are every `step`-th of the file's, from its top-left
@@ -820,6 +825,8 @@ impl Raster {
             color,
             data_type,
             source: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            source_file: None,
             overview: None,
             step: 1,
             georeferenced: true,

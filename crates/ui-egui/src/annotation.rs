@@ -110,6 +110,20 @@ pub(crate) fn landed(app: &mut RustGisApp, request: u64, result: Landed) {
         Landed::Ran(Err(e)) | Landed::NotRun(e) => app.annotation.error = Some(e),
     }
 }
+/// Command Search's read-only grid query says its answer after background or inline delivery.
+pub(crate) fn grid_said(app: &mut RustGisApp, result: Landed) {
+    let Landed::Ran(Ok(value)) = result else { return };
+    match serde_json::from_value::<Frame>(value) {
+        Ok(frame) => app.session.notify(
+            crate::i18n::fmt(
+                "Original image grid: {width} × {height} pixels, EPSG:{epsg}",
+                &[("width", &frame.width.to_string()), ("height", &frame.height.to_string()), ("epsg", &frame.epsg.to_string())],
+            ),
+            false,
+        ),
+        Err(_) => app.session.notify(tl!("The original image grid result could not be displayed."), true),
+    }
+}
 /// Only new objects use this choice. Existing objects keep their own frozen frame.
 pub(crate) fn drawing_frame(app: &RustGisApp) -> Result<Frame, String> {
     if app.annotation.context != Some((app.session.opened, app.session.map().instance_id())) || !app.annotation.pixels {
@@ -452,6 +466,41 @@ mod tests {
         assert_eq!(drawing_frame(&app).unwrap(), Frame::default());
     }
     #[test]
+    fn annotation_grid_changed_linked_files_block_drawing_until_the_display_is_reloaded() {
+        let (mut app, image, layer, _) = app();
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("image.tif");
+        let bytes = app.session.map().layer(image).unwrap().raster.as_ref().unwrap().embedded.clone().unwrap();
+        std::fs::write(&path, bytes.as_slice()).unwrap();
+        let pixels = rustgis_engine::data::raster::read_path(&path).unwrap();
+        app.session.map_mut().layer_mut(image).unwrap().raster = Some(RasterLayer::from_path(pixels, path.display().to_string()));
+        let replacement = Frame { width: 128, height: 128, affine: [1000., 2., 0.4, 4000., 0.2, -3.], ..Frame::default() };
+        std::fs::write(&path, tiff(&replacement)).unwrap();
+        let depth = app.session.undo_depth();
+        app.run("ui.annotationImage", json!({"image":image})).unwrap();
+        assert!(app.annotation.error.as_deref().unwrap().contains("Reload Data"));
+        assert!(drawing_frame(&app).is_err());
+        for tool in ["circle", "rotatedBox"] {
+            app.run("tool.set", json!({"tool":tool})).unwrap();
+            let started = if tool == "circle" {
+                crate::circleedit::drag_start(&mut app, rect(), egui::pos2(400., 350.), true)
+            } else {
+                crate::boxedit::drag_start(&mut app, rect(), egui::pos2(400., 350.), true)
+            };
+            assert!(!started);
+        }
+        assert!(app.session.map().layer(layer).unwrap().dataset.features.is_empty());
+        assert_eq!(app.session.undo_depth(), depth);
+        app.run("layer.reloadData", json!({"layer":image})).unwrap();
+        app.run("ui.annotationImage", json!({"image":image})).unwrap();
+        assert_eq!(drawing_frame(&app).unwrap(), replacement);
+        app.session.map_mut().camera.center = replacement.to_lonlat([64., 64.]).unwrap();
+        app.run("tool.set", json!({"tool":"circle"})).unwrap();
+        drag(&mut app, &replacement, [20., 20.], [25., 20.], true);
+        assert_eq!(app.session.map().layer(layer).unwrap().dataset.features.len(), 1);
+    }
+
+    #[test]
     fn annotation_grid_source_changes_during_a_drag_cannot_commit_in_the_old_grid() {
         for tool in [Tool::Circle, Tool::RotatedBox] {
             let (mut app, image, layer, frame) = app();
@@ -546,18 +595,28 @@ mod tests {
 
     #[test]
     fn annotation_grid_search_queries_the_grid_without_toggling_the_pane() {
-        let (mut app, image, _, _) = app();
-        app.run("layer.select", json!({"layer":image})).unwrap();
-        open(&mut app).unwrap();
-        app.ui.command_search = Some("raster.imageGrid".into());
-        let mut h = egui_kittest::Harness::builder()
-            .with_size(egui::vec2(1366., 900.))
-            .build_ui_state(|ui, app: &mut RustGisApp| crate::chrome::command_search(app, ui.ctx()), app);
-        h.key_press(egui::Key::Enter);
-        h.run();
-        assert!(h.state().ui.command_search.is_none());
-        assert_eq!(h.state().ui.right, Some(RightPane::Annotation));
-        assert!(h.state().session.notices_since(0).iter().all(|n| !n.error));
+        for queued in [false, true] {
+            let (mut app, image, _, _) = app();
+            app.run("layer.select", json!({"layer":image})).unwrap();
+            open(&mut app).unwrap();
+            app.reads_off_frame = queued;
+            app.ui.command_search = Some("raster.imageGrid".into());
+            let mut h = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(1366., 900.))
+                .build_ui_state(|ui, app: &mut RustGisApp| crate::chrome::command_search(app, ui.ctx()), app);
+            h.key_press(egui::Key::Enter);
+            h.run();
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while crate::readjob::land(h.state_mut()) {
+                assert!(std::time::Instant::now() < end, "the grid query did not land");
+                std::thread::sleep(std::time::Duration::from_millis(5)); // test-wait: await the background grid result before checking its user-facing summary
+            }
+            assert!(h.state().ui.command_search.is_none());
+            assert_eq!(h.state().ui.right, Some(RightPane::Annotation));
+            let notices = h.state().session.notices_since(0);
+            assert!(notices.iter().all(|n| !n.error));
+            assert_eq!(notices.iter().filter(|n| n.text == "Original image grid: 128 × 128 pixels, EPSG:3857").count(), 1);
+        }
     }
 
     #[test]

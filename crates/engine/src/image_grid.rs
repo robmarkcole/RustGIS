@@ -57,7 +57,15 @@ pub(crate) fn read(r: &RasterLayer) -> Result<Frame, String> {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let input = std::fs::File::open(path).map_err(|e| e.to_string())?;
-            rustgis_data::raster::geotiff::read_image_grid(input)
+            let displayed = r.data.as_ref().ok_or("reload the image layer before reading its original grid")?;
+            let path = std::path::Path::new(path);
+            displayed.check_original_file(path, &input.metadata().map_err(|e| e.to_string())?)?;
+            let grid = rustgis_data::raster::geotiff::read_image_grid(&input);
+            // Both the handle and path must still name the revision that supplied the display.
+            // A replacement during parsing must not pair new coordinates with old pixels.
+            displayed.check_original_file(path, &input.metadata().map_err(|e| e.to_string())?)?;
+            displayed.check_original_file(path, &std::fs::metadata(path).map_err(|e| e.to_string())?)?;
+            grid
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -136,6 +144,54 @@ mod tests {
         let done = ahead.run(&rustgis_analysis::control::Control::new()).unwrap();
         assert_eq!(serde_json::from_value::<Frame>(crate::cmd::reads::read_land(&mut s, done).unwrap()).unwrap(), expected);
     }
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn annotation_grid_file_changes_before_selection_or_queued_read_require_a_pixel_reload() {
+        for queued in [false, true] {
+            let (mut s, id, original) = session();
+            let folder = std::env::temp_dir().join(format!("rustgis-annotation-grid-file-{}-{queued}", std::process::id()));
+            std::fs::create_dir_all(&folder).unwrap();
+            let path = folder.join("image.tif");
+            let bytes = s.map().layer(id).unwrap().raster.as_ref().unwrap().embedded.clone().unwrap();
+            std::fs::write(&path, bytes.as_slice()).unwrap();
+            let pixels = rustgis_data::raster::read_path(&path).unwrap();
+            s.map_mut().layer_mut(id).unwrap().raster = Some(RasterLayer::from_path(pixels, path.display().to_string()));
+            let displayed = s.map().layer(id).unwrap().raster.as_ref().unwrap().data.clone().unwrap();
+            assert_eq!(serde_json::from_value::<Frame>(s.run("raster.imageGrid", &json!({"layer":id})).unwrap()).unwrap(), original);
+            let ahead = queued.then(|| crate::cmd::reads::read_ahead(&mut s, "raster.imageGrid", &json!({"layer":id})).unwrap());
+            let replacement = Raster::new(
+                "new",
+                7,
+                3,
+                vec![vec![2.; 21]],
+                GeoTransform { origin_x: 5000., origin_y: 9000., pixel_width: 10., pixel_height: -10. },
+                Crs::from_epsg(3857).unwrap(),
+                None,
+                ColorHint::Gray,
+                "UInt8",
+            )
+            .unwrap();
+            let replacement = geotiff::write(&replacement, 0).unwrap();
+            std::fs::write(&path, &replacement).unwrap();
+            let depth = s.undo_depth();
+            let result = if let Some(ahead) = ahead {
+                let done = ahead.run(&rustgis_analysis::control::Control::new()).unwrap();
+                crate::cmd::reads::read_land(&mut s, done)
+            } else {
+                s.run("raster.imageGrid", &json!({"layer":id}))
+            };
+            assert!(result.unwrap_err().contains("Reload Data"));
+            assert_eq!(s.undo_depth(), depth);
+            assert!(Arc::ptr_eq(&displayed, s.map().layer(id).unwrap().raster.as_ref().unwrap().data.as_ref().unwrap()));
+            s.run("layer.reloadData", &json!({"layer":id})).unwrap();
+            let expected = Frame::from_grid(&geotiff::read_image_grid(std::io::Cursor::new(&replacement)).unwrap()).unwrap();
+            let frame: Frame = serde_json::from_value(s.run("raster.imageGrid", &json!({"layer":id})).unwrap()).unwrap();
+            assert_eq!(frame, expected);
+            assert_ne!(frame, original);
+            std::fs::remove_dir_all(folder).unwrap();
+        }
+    }
+
     #[test]
     fn annotation_grid_background_read_cancels_and_rejects_replaced_sources() {
         let (mut s, id, _) = session();
