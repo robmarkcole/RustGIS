@@ -1346,6 +1346,8 @@ pub fn read_converted(path: &Path, c: &gdal::Converted) -> Result<Raster> {
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("raster");
     crate::provenance::path(path);
     let mut r = crate::provenance::without(|| geotiff::read_file(&c.path, stem))?;
+    // This revision belongs to GDAL's cache copy, not the original source named below.
+    r.source_file = None;
     if let Some(s) = &c.subdataset {
         r.name = format!("{stem} {}", gdal::short_name(s));
     }
@@ -2438,6 +2440,23 @@ pub(crate) mod tests {
         let r = read_converted(Path::new("/data/climate.nc"), &clean).unwrap();
         assert!(r.lost.is_empty(), "{:?}", r.lost);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn annotation_grid_converted_pixels_do_not_claim_the_cache_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("converted.tif");
+        std::fs::write(&cache, geotiff::write(&small(), 0).unwrap()).unwrap();
+        let metadata = std::fs::metadata(&cache).unwrap();
+        geotiff::read_file(&cache, "cache").unwrap().check_original_file(&cache, &metadata).unwrap();
+        let converted = gdal::Converted { path: cache.clone(), subdataset: None, others: Vec::new(), assumed_lonlat: false };
+        let source = dir.path().join("original.nc");
+        let pixels = read_converted(&source, &converted).unwrap();
+        assert_eq!(pixels.source.as_deref(), source.to_str());
+        let error = pixels.check_original_file(&cache, &metadata).unwrap_err();
+        assert!(error.contains("no verified original file revision"), "{error}");
+        assert!(!error.contains("file changed"), "{error}");
     }
 }
 

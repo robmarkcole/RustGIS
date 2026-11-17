@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 pub(crate) struct State {
     context: Option<(u64, u64)>,
     image: Option<u32>,
+    image_name: Option<String>,
     image_chosen: bool,
     image_filename: bool,
     source: Option<Source>,
@@ -31,11 +32,18 @@ pub(crate) fn sync(app: &mut RustGisApp) {
     if app.annotation.context != Some(context) {
         cancel(app);
         app.annotation = State { context: Some(context), next: app.annotation.next, ..State::default() };
-    } else if app.annotation.source.as_ref().is_some_and(|s| !s.current(&app.session)) {
-        cancel(app);
-        app.annotation.frame = None;
-        app.annotation.source = None;
-        app.annotation.error = Some(tl!("The image changed or was removed. Select it again or reload its grid.").into());
+    } else {
+        if let Some(name) = app.annotation.image.and_then(|id| app.session.map().layer(id)).filter(|l| l.raster.is_some()).map(|l| &l.name)
+            && app.annotation.image_name.as_deref() != Some(name.as_str())
+        {
+            app.annotation.image_name = Some(name.clone());
+        }
+        if app.annotation.source.as_ref().is_some_and(|s| !s.current(&app.session)) {
+            cancel(app);
+            app.annotation.frame = None;
+            app.annotation.source = None;
+            app.annotation.error = Some(tl!("The image changed or was removed. Select it again or reload its grid.").into());
+        }
     }
 }
 pub(crate) fn open(app: &mut RustGisApp) -> Result<(), String> {
@@ -59,6 +67,7 @@ pub(crate) fn select_image(app: &mut RustGisApp, p: &Value) -> Result<(), String
     cancel(app);
     app.annotation.next = request;
     app.annotation.image = image;
+    app.annotation.image_name = image.and_then(|id| app.session.map().layer(id)).map(|l| l.name.clone());
     app.annotation.image_chosen = true;
     app.annotation.source = source;
     app.annotation.pixels = image.is_some();
@@ -188,7 +197,18 @@ pub(crate) fn grid_controls(app: &mut RustGisApp, ui: &mut egui::Ui) {
     sync(app);
     let mut image = app.annotation.image;
     let mut picked = false;
-    let name = image.and_then(|id| app.session.map().layer(id)).map_or_else(|| tl!("No image").to_string(), |l| l.name.clone());
+    let live = image.and_then(|id| app.session.map().layer(id)).filter(|l| l.raster.is_some());
+    let available = live.is_some();
+    let name = if let Some(layer) = live {
+        layer.name.clone()
+    } else if image.is_some() {
+        app.annotation
+            .image_name
+            .as_deref()
+            .map_or_else(|| tl!("Unavailable image").to_string(), |name| crate::i18n::fmt("Unavailable image: {name}", &[("name", name)]))
+    } else {
+        tl!("No image").to_string()
+    };
     egui::ComboBox::from_label(tl!("Image")).selected_text(name).show_ui(ui, |ui| {
         picked |= ui.selectable_value(&mut image, None, tl!("No image")).clicked();
         for l in app.session.map().layers.iter().filter(|l| l.raster.is_some()) {
@@ -202,7 +222,7 @@ pub(crate) fn grid_controls(app: &mut RustGisApp, ui: &mut egui::Ui) {
     egui::ComboBox::from_label(tl!("New shape grid"))
         .selected_text(if pixels { tl!("Original image pixels") } else { tl!("Web Mercator grid metres") })
         .show_ui(ui, |ui| {
-            ui.add_enabled_ui(image.is_some(), |ui| ui.selectable_value(&mut pixels, true, tl!("Original image pixels")));
+            ui.add_enabled_ui(available, |ui| ui.selectable_value(&mut pixels, true, tl!("Original image pixels")));
             ui.selectable_value(&mut pixels, false, tl!("Web Mercator grid metres"));
         });
     if pixels != app.annotation.pixels {
@@ -224,13 +244,15 @@ pub(crate) fn grid_controls(app: &mut RustGisApp, ui: &mut egui::Ui) {
             if ui.button(tl!("Cancel Grid Read")).clicked() {
                 let _ = app.run("ui.annotationCancel", Value::Null);
             }
-        } else if ui.button(tl!("Reload Grid")).clicked() {
+        } else if ui.add_enabled(available, egui::Button::new(tl!("Reload Grid"))).clicked() {
             let _ = app.run("ui.annotationImage", json!({"image":image}));
         }
     } else {
         ui.small(tl!("Web Mercator grid metres, not ground metres. Image pixels are the default when an image is selected."));
     }
-    if let Some(error) = &app.annotation.error {
+    if image.is_some() && !available {
+        ui.colored_label(egui::Color32::RED, tl!("This image is unavailable. Choose another image or No image."));
+    } else if let Some(error) = &app.annotation.error {
         ui.colored_label(egui::Color32::RED, error);
     }
 }
@@ -590,6 +612,57 @@ mod tests {
             assert!(h.state().annotation.error.is_some());
             assert!(drawing_frame(h.state()).is_err());
             assert!(h.query_by_label("Reload Grid").is_some());
+        }
+    }
+
+    #[test]
+    fn annotation_grid_removed_image_keeps_its_name_blocks_reload_and_has_explicit_recovery() {
+        use egui_kittest::kittest::{NodeT, Queryable};
+        for recovery in ["undo", "another", "none", "metres"] {
+            let (mut app, image, _, frame) = app();
+            let raster = app.session.map().layer(image).unwrap().raster.clone().unwrap();
+            app.run("ui.annotationImage", json!({"image":image})).unwrap();
+            app.run("layer.rename", json!({"layer":image,"name":"Survey image"})).unwrap();
+            app.run("layer.remove", json!({"layer":image})).unwrap();
+            let mut h = egui_kittest::Harness::builder().build_ui_state(|ui, app: &mut RustGisApp| grid_controls(app, ui), app);
+            assert!(
+                h.query_all_by_role(egui::accesskit::Role::ComboBox)
+                    .any(|n| n.value().as_deref() == Some("Unavailable image: Survey image"))
+            );
+            assert!(h.get_by_label("Reload Grid").accesskit_node().is_disabled());
+            assert!(h.query_by_label("This image is unavailable. Choose another image or No image.").is_some());
+            assert!(h.state().annotation.pixels);
+            assert!(drawing_frame(h.state()).is_err());
+            match recovery {
+                "undo" => {
+                    h.state_mut().run("edit.undo", json!({})).unwrap();
+                    h.run();
+                    assert!(!h.get_by_label("Reload Grid").accesskit_node().is_disabled());
+                    h.get_by_label("Reload Grid").click();
+                    h.run();
+                    assert_eq!(drawing_frame(h.state()).unwrap(), frame);
+                }
+                "another" => {
+                    let next = h.state_mut().session.map_mut().add_raster("Other image", raster);
+                    h.state_mut().run("ui.annotationImage", json!({"image":next})).unwrap();
+                    h.run();
+                    assert_eq!(h.state().annotation.image, Some(next));
+                    assert_eq!(drawing_frame(h.state()).unwrap(), frame);
+                }
+                "none" => {
+                    h.state_mut().run("ui.annotationImage", json!({"image":null})).unwrap();
+                    h.run();
+                    assert!(h.state().annotation.image_name.is_none());
+                    assert!(h.query_all_by_role(egui::accesskit::Role::ComboBox).any(|n| n.value().as_deref() == Some("No image")));
+                    assert_eq!(drawing_frame(h.state()).unwrap(), Frame::default());
+                }
+                _ => {
+                    h.state_mut().run("ui.annotationGrid", json!({"pixels":false})).unwrap();
+                    h.run();
+                    assert!(!h.state().annotation.pixels);
+                    assert_eq!(drawing_frame(h.state()).unwrap(), Frame::default());
+                }
+            }
         }
     }
 

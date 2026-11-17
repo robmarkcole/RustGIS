@@ -192,6 +192,11 @@ preserves length, modification time and creation time. Reload the image after kn
 even if no change was reported.
 Removing/replacing an image invalidates its cached grid. Local and embedded GeoTIFFs are supported; download remote originals
 first. In the browser, upload the original GeoTIFF.
+An image removed from the map keeps its last name as **Unavailable image**. Pixel drawing stays
+blocked and **Reload Grid** is disabled until the image is restored or another image is chosen.
+Choose **No image** to return explicitly to Web Mercator grid metres. Images loaded through GDAL
+(such as NetCDF or JPEG 2000) cannot supply an original GeoTIFF grid: export the image as a GeoTIFF
+and add that file instead of repeatedly reloading the converted source.
 **Original Image Grid** in Command Search reports the active image's original dimensions and
 EPSG coordinate system in a notice, while keeping the Annotate pane open.
 

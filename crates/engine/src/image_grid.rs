@@ -56,6 +56,9 @@ pub(crate) fn read(r: &RasterLayer) -> Result<Frame, String> {
             .ok_or("choose a local or embedded GeoTIFF; remote original grids must be downloaded and added first")?;
         #[cfg(not(target_arch = "wasm32"))]
         {
+            if rustgis_data::raster::gdal::is_gdal_raster_name(path) {
+                return Err("Original image grids require a GeoTIFF source. Export this image as a GeoTIFF and add that file.".into());
+            }
             let input = std::fs::File::open(path).map_err(|e| e.to_string())?;
             let displayed = r.data.as_ref().ok_or("The image pixels are not loaded. Use Reload Data, then retry the operation.")?;
             let path = std::path::Path::new(path);
@@ -190,6 +193,52 @@ mod tests {
             assert_ne!(frame, original);
             std::fs::remove_dir_all(folder).unwrap();
         }
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn annotation_grid_converted_sources_offer_geotiff_recovery_without_a_reload_loop() {
+        struct Dir(std::path::PathBuf);
+        impl Drop for Dir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = Dir(std::env::temp_dir().join(format!("rustgis-grid-converted-{}", std::process::id())));
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let (mut s, id, expected) = session();
+        let cache = dir.0.join("converted.tif");
+        std::fs::write(&cache, s.map().layer(id).unwrap().raster.as_ref().unwrap().embedded.as_ref().unwrap().as_slice()).unwrap();
+        let converted =
+            rustgis_data::raster::gdal::Converted { path: cache.clone(), subdataset: None, others: Vec::new(), assumed_lonlat: false };
+        for extension in ["nc", "jp2"] {
+            let source = dir.0.join(format!("original.{extension}"));
+            std::fs::write(&source, b"original source represented by the conversion result").unwrap();
+            for queued in [false, true] {
+                // Model the result of GDAL conversion, without needing GDAL installed for this test.
+                for _ in 0..2 {
+                    let pixels = rustgis_data::raster::read_converted(&source, &converted).unwrap();
+                    s.map_mut().layer_mut(id).unwrap().raster = Some(RasterLayer::from_path(pixels, source.display().to_string()));
+                    let depth = s.undo_depth();
+                    let params = json!({"layer":id});
+                    let result = if queued {
+                        let read = crate::cmd::reads::read_ahead(&mut s, "raster.imageGrid", &params).unwrap();
+                        let done = read.run(&rustgis_analysis::control::Control::new()).unwrap();
+                        crate::cmd::reads::read_land(&mut s, done)
+                    } else {
+                        s.run("raster.imageGrid", &params)
+                    };
+                    let error = result.unwrap_err();
+                    assert!(error.contains("GeoTIFF") && error.contains("Export") && error.contains("add"), "{error}");
+                    assert!(!error.contains("changed") && !error.contains("Reload Data"), "{error}");
+                    assert_eq!(s.undo_depth(), depth);
+                }
+            }
+        }
+        // Adding the actual GeoTIFF supplies a verified original grid.
+        let pixels = rustgis_data::raster::read_path(&cache).unwrap();
+        s.map_mut().layer_mut(id).unwrap().raster = Some(RasterLayer::from_path(pixels, cache.display().to_string()));
+        assert_eq!(serde_json::from_value::<Frame>(s.run("raster.imageGrid", &json!({"layer":id})).unwrap()).unwrap(), expected);
     }
 
     #[test]
