@@ -186,6 +186,8 @@ Removing/replacing an image invalidates its cached grid. Local and embedded GeoT
 download remote originals first. In the browser, upload the original GeoTIFF. Other local formats
 (including PNG, JPEG, ASCII grids and GDAL-converted images) are refused with guidance to export
 the image as a GeoTIFF and add that file; reloading the unsupported source cannot supply its grid.
+Construction grids require a supported EPSG coordinate system. Unsupported or custom systems
+are refused during the grid read; choose a supported image or **Web Mercator grid metres**.
 Changing projects or maps clears the old image binding, keeps pixel mode selected and reports a
 warning. Drawing stays blocked until you choose an image again or explicitly choose Web Mercator
 grid metres; opening the pane does not clear the warning.
