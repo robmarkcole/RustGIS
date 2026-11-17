@@ -2805,14 +2805,15 @@ impl RustGisApp {
             if id == "source.syncState" {
                 return readjob::run_then(self, "source.syncState", params, Some(sync_state_said));
             }
-            // Counting a column goes over every row of the layer: on a thread of its own, and the
-            // answer shown once it lands (the table's Statistics window).
+            // Direct desktop callers receive a queue acknowledgement; callbacks receive the frame.
+            // Script lines use engine dispatch and consume their prepared worker results instead.
             if id == "raster.imageGrid" {
                 return readjob::run(self, "raster.imageGrid", params);
             }
             if id == "edit.previewShapeConversion" {
                 return readjob::run_shape_conversion(self, params);
             }
+            // Counting a column goes over every row: the Statistics window shows the landed answer.
             if id == "table.statistics" {
                 return readjob::run_then(self, "table.statistics", params, Some(table::statistics_landed));
             }

@@ -31,7 +31,15 @@ pub(crate) fn sync(app: &mut RustGisApp) {
     let context = (app.session.opened, app.session.map().instance_id());
     if app.annotation.context != Some(context) {
         cancel(app);
-        app.annotation = State { context: Some(context), next: app.annotation.next, ..State::default() };
+        let pixels = app.annotation.pixels;
+        let error = pixels.then(|| {
+            tl!("The project or map changed. Choose an image again or select Web Mercator grid metres before drawing.").to_string()
+        });
+        app.annotation =
+            State { context: Some(context), next: app.annotation.next, pixels, image_chosen: pixels, error, ..State::default() };
+        if let Some(error) = &app.annotation.error {
+            app.session.notify(error.clone(), true);
+        }
     } else {
         if let Some(name) = app.annotation.image.and_then(|id| app.session.map().layer(id)).filter(|l| l.raster.is_some()).map(|l| &l.name)
             && app.annotation.image_name.as_deref() != Some(name.as_str())
@@ -140,6 +148,9 @@ pub(crate) fn drawing_frame(app: &RustGisApp) -> Result<Frame, String> {
     }
     if app.annotation.context != Some((app.session.opened, app.session.map().instance_id())) {
         return Err(tl!("The image context changed. Select the image again before drawing.").into());
+    }
+    if app.annotation.image.is_none() {
+        return Err(tl!("Choose an image or Web Mercator grid metres before drawing.").into());
     }
     if !app.annotation.source.as_ref().is_some_and(|s| s.current(&app.session)) {
         return Err(tl!("The image changed. Reload its grid before drawing.").into());
@@ -575,7 +586,7 @@ mod tests {
         assert!(drawing_frame(&app).is_err());
         app.run("project.new", json!({})).unwrap();
         assert!(app.annotation.image.is_none());
-        assert_eq!(drawing_frame(&app).unwrap(), Frame::default());
+        assert!(drawing_frame(&app).is_err());
     }
     #[test]
     fn annotation_grid_stale_pixel_context_never_substitutes_map_metres() {
@@ -595,6 +606,48 @@ mod tests {
             app.annotation.pixels = true;
             app.annotation.context = Some(context);
             assert_eq!(drawing_frame(&app).unwrap(), frame);
+        }
+    }
+
+    #[test]
+    fn annotation_grid_real_context_switch_preserves_pixels_and_requires_explicit_recovery() {
+        for command in ["project.new", "map.new"] {
+            for pixels in [false, true] {
+                let (mut app, image, _, _) = app();
+                app.run("ui.annotationImage", json!({"image":image})).unwrap();
+                app.run("ui.annotationGrid", json!({"pixels":pixels})).unwrap();
+                let old = app.annotation.context;
+                let next = app.annotation.next;
+                let old_request = next;
+                let mark = app.session.notice_mark();
+                app.run(command, json!({"name":"Other"})).unwrap();
+                app.logic(&egui::Context::default());
+                assert_ne!(app.annotation.context, old);
+                assert_eq!(app.annotation.pixels, pixels);
+                assert!(app.annotation.image.is_none() && app.annotation.source.is_none() && app.annotation.frame.is_none());
+                assert!(app.annotation.pending.is_none());
+                assert_eq!(app.annotation.next, next);
+                if pixels {
+                    assert!(drawing_frame(&app).unwrap_err().contains("Choose an image"));
+                    assert!(app.annotation.error.as_ref().unwrap().contains("project or map changed"));
+                    assert_eq!(app.session.notices_since(mark).iter().filter(|n| n.text.contains("project or map changed")).count(), 1);
+                    landed(&mut app, old_request, Landed::Ran(Ok(serde_json::to_value(Frame::default()).unwrap())));
+                    assert!(drawing_frame(&app).is_err(), "late completions must not repair another context");
+                    open(&mut app).unwrap();
+                    assert!(drawing_frame(&app).is_err(), "opening the pane must not clear the refusal");
+                    app.run("ui.annotationGrid", json!({"pixels":false})).unwrap();
+                    assert_eq!(drawing_frame(&app).unwrap(), Frame::default());
+                    let original = self::app();
+                    let raster = original.0.session.map().layer(original.1).unwrap().raster.clone().unwrap();
+                    let image = app.session.map_mut().add_raster("New image", raster);
+                    app.run("ui.annotationImage", json!({"image":image})).unwrap();
+                    assert_eq!(drawing_frame(&app).unwrap(), original.3);
+                } else {
+                    assert_eq!(drawing_frame(&app).unwrap(), Frame::default());
+                    assert!(app.annotation.error.is_none());
+                    assert!(!app.session.notices_since(mark).iter().any(|n| n.text.contains("project or map changed")));
+                }
+            }
         }
     }
 

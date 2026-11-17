@@ -43,6 +43,7 @@ impl Source {
 
 /// Cancel is checked before/after the bounded header parse; a filesystem read/seek itself
 /// cannot be interrupted until the OS returns. No raster pixel decoding takes place.
+/// This counts the header phase; conversion fitting starts its own progress phase afterwards.
 pub(crate) fn read(r: &RasterLayer) -> Result<Frame, String> {
     progress::begin(2);
     progress::step(1).map_err(|e| e.to_string())?;
@@ -63,7 +64,7 @@ pub(crate) fn read(r: &RasterLayer) -> Result<Frame, String> {
             if !tiff {
                 return Err("Original image grids require a GeoTIFF source. Export this image as a GeoTIFF and add that file.".into());
             }
-            let input = std::fs::File::open(path).map_err(|e| e.to_string())?;
+            let input = rustgis_data::provenance::open(path).map_err(|e| e.to_string())?;
             let displayed = r.data.as_ref().ok_or("The image pixels are not loaded. Use Reload Data, then retry the operation.")?;
             let path = std::path::Path::new(path);
             displayed.check_original_handle(path, &input)?;
@@ -84,9 +85,15 @@ pub(crate) fn read(r: &RasterLayer) -> Result<Frame, String> {
     progress::step(1).map_err(|e| e.to_string())?;
     Frame::from_grid(&grid)
 }
-struct Prepared {
+pub(crate) struct Prepared {
     source: Source,
     result: Result<Frame, String>,
+}
+/// Script workers record read-only grids; landing consumes them without repeating file I/O.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) enum Ahead {
+    Recording(Vec<Prepared>),
+    Taking(std::collections::VecDeque<Prepared>),
 }
 pub(crate) fn ahead(s: &Session, p: &Value) -> Option<crate::cmd::reads::ReadWork> {
     let source = Source::capture(s, s.layer_id(p).ok()?).ok()?;
@@ -101,13 +108,26 @@ pub(crate) fn query(s: &mut Session, p: &Value) -> CmdResult {
     let source = Source::capture(s, s.layer_id(p)?)?;
     let ready = crate::cmd::reads::take::<Prepared>(s, "imageGrid");
     #[cfg(not(target_arch = "wasm32"))]
+    let ready = if let Some(Ahead::Taking(grids)) = &mut s.grids_ahead {
+        Some(grids.pop_front().ok_or("the script's image grid was not prepared; run the query separately")?)
+    } else {
+        ready
+    };
+    #[cfg(not(target_arch = "wasm32"))]
     if ready.is_none() && s.statistics_window_thread == Some(std::thread::current().id()) {
         return Err("original image grids need the desktop background read queue".into());
     }
     let frame = match ready {
         Some(done) if done.source.current(s) && done.source.layer == source.layer => done.result?,
         Some(_) => return Err("image source changed while reading its grid; select the image again".into()),
-        None => read(&source.raster)?,
+        None => {
+            let result = read(&source.raster);
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some(Ahead::Recording(grids)) = &mut s.grids_ahead {
+                grids.push(Prepared { source, result: result.clone() });
+            }
+            result?
+        }
     };
     serde_json::to_value(frame).map_err(|e| e.to_string())
 }
@@ -293,6 +313,84 @@ mod tests {
         let pixels = rustgis_data::raster::read_path(&path).unwrap();
         s.map_mut().layer_mut(id).unwrap().raster = Some(RasterLayer::from_path(pixels, path.display().to_string()));
         assert_eq!(serde_json::from_value::<Frame>(s.run("raster.imageGrid", &json!({"layer":id})).unwrap()).unwrap(), expected);
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn annotation_grid_script_worker_returns_frames_without_reopening_on_the_window_thread() {
+        for replace in [false, true] {
+            let (mut s, id, expected) = session();
+            let dir = std::env::temp_dir().join(format!("rustgis-grid-script-{}-{replace}", std::process::id()));
+            struct Dir(std::path::PathBuf);
+            impl Drop for Dir {
+                fn drop(&mut self) {
+                    let _ = std::fs::remove_dir_all(&self.0);
+                }
+            }
+            let dir = Dir(dir);
+            std::fs::create_dir_all(&dir.0).unwrap();
+            let path = dir.0.join("image.tif");
+            let bytes = s.map().layer(id).unwrap().raster.as_ref().unwrap().embedded.clone().unwrap();
+            std::fs::write(&path, bytes.as_slice()).unwrap();
+            s.map_mut().layer_mut(id).unwrap().raster =
+                Some(RasterLayer::from_path(rustgis_data::raster::read_path(&path).unwrap(), path.display().to_string()));
+            let params = json!({"script":format!("raster.imageGrid {}\nraster.imageGrid {}", json!({"layer":id}), json!({"layer":id}))});
+            let direct = s.run("script.run", &params).unwrap();
+            assert_eq!(serde_json::from_value::<Frame>(direct["ran"][0]["result"].clone()).unwrap(), expected);
+            s.statistics_need_read_ahead(true);
+            let ahead = crate::cmd::reads::read_ahead(&mut s, "script.run", &params).unwrap();
+            let done = ahead.run(&rustgis_analysis::control::Control::new()).unwrap();
+            if replace {
+                let raster = s.map().layer(id).unwrap().raster.clone().unwrap();
+                s.map_mut().layer_mut(id).unwrap().raster = Some(RasterLayer::from_bytes(
+                    raster.data.as_ref().unwrap().as_ref().clone(),
+                    "replacement.tif",
+                    bytes.as_ref().clone(),
+                ));
+            }
+            // No file can be reopened at landing. Frames remain bound to the loaded pixels.
+            std::fs::remove_file(&path).unwrap();
+            let result = crate::cmd::reads::read_land(&mut s, done);
+            if replace {
+                assert!(result.unwrap_err().contains("source changed"));
+            } else {
+                let answer = result.unwrap();
+                for index in [0, 1] {
+                    assert_eq!(serde_json::from_value::<Frame>(answer["ran"][index]["result"].clone()).unwrap(), expected);
+                    assert!(answer["ran"][index]["result"].get("started").is_none());
+                }
+            }
+            assert!(s.grids_ahead.is_none(), "prepared queries must not leak into later scripts");
+            let unsafe_prefix = json!({"script":format!("project.new {{}}\nraster.imageGrid {}", json!({"layer":id}))});
+            let before = s.opened;
+            assert!(crate::cmd::reads::read_ahead(&mut s, "script.run", &unsafe_prefix).err().unwrap().contains("separate scripts"));
+            assert_eq!(s.opened, before);
+        }
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn annotation_grid_header_read_records_provenance_without_a_content_hash() {
+        let (s, id, expected) = session();
+        let dir = std::env::temp_dir().join(format!("rustgis-grid-provenance-{}", std::process::id()));
+        struct Dir(std::path::PathBuf);
+        impl Drop for Dir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = Dir(dir);
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let path = dir.0.join("image.tif");
+        std::fs::write(&path, s.map().layer(id).unwrap().raster.as_ref().unwrap().embedded.as_ref().unwrap().as_slice()).unwrap();
+        let layer = RasterLayer::from_path(rustgis_data::raster::read_path(&path).unwrap(), path.display().to_string());
+        let capture = rustgis_data::provenance::Capture::start();
+        assert_eq!(read(&layer).unwrap(), expected);
+        let inputs = capture.inputs();
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].path, path.display().to_string());
+        assert_eq!(inputs[0].size, Some(std::fs::metadata(&path).unwrap().len()));
+        assert!(inputs[0].sha256.is_none());
     }
 
     #[test]

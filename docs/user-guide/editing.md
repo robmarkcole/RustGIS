@@ -192,8 +192,9 @@ time and creation time. Reload after known external edits even without a reporte
 If revision capture fails, the image can still load for viewing, but grid reads report the
 original metadata error. Check filesystem metadata support/access, or export the image as a
 GeoTIFF to another location and add it. Repeatedly reloading the same unsupported filesystem
-does not repair its metadata support. Stale project/map bindings in pixel mode refuse drawing
-until the image is selected again; only an explicit map-grid choice returns map metres.
+does not repair its metadata support. Changing projects or maps clears the old image binding,
+keeps pixel mode selected and reports a warning. Drawing stays blocked until you choose an image
+again or explicitly choose Web Mercator grid metres; opening the pane does not clear the warning.
 Removing/replacing an image invalidates its cached grid. Local and embedded GeoTIFFs are supported;
 download remote originals first. In the browser, upload the original GeoTIFF. Other local formats
 (including PNG, JPEG, ASCII grids and GDAL-converted images) are refused with guidance to export
@@ -221,7 +222,11 @@ For CLI, Python, Assistant/MCP and permitted plugins, `raster.imageGrid={"layer"
 returns the original `epsg`, `width`, `height` and six affine coefficients in the same format
 accepted by `edit.addBox.box.frame` and `edit.addCircle.circle.frame`. The query is read-only,
 requires Files permission, and uses the shared read worker on desktop/MCP. Headless synchronous
-callers must run file reads off their own UI thread.
+callers must run file reads off their own UI thread. The desktop Script pane prepares grid queries
+on its worker and shows the actual frame in each line's result, rather than a queue acknowledgement.
+Queries may follow replayable selection/edit steps, but file-opening or project-changing setup
+must run in a separate script first. A changed image invalidates the prepared result instead of
+reopening its file on the UI thread. Scoped callers should use the individually approved query.
 
 ### Rotated boxes
 

@@ -24,6 +24,9 @@ pub struct Reads {
     job: Option<ReadJob>,
     /// The commands waiting for the read before, in order.
     waiting: VecDeque<Asked>,
+    /// Scoped cancellations deliver their callbacks on the next landing pass, after the UI
+    /// has replaced the old request, rather than dropping waiting completions silently.
+    cancelled: VecDeque<Asked>,
     #[cfg(test)]
     fail_spawn: bool,
 }
@@ -53,7 +56,14 @@ impl Reads {
             }
             job.control.cancel();
         }
-        self.waiting.retain(|a| !belongs(a));
+        let waiting = std::mem::take(&mut self.waiting);
+        for asked in waiting {
+            if belongs(&asked) {
+                self.cancelled.push_back(asked);
+            } else {
+                self.waiting.push_back(asked);
+            }
+        }
     }
 }
 
@@ -404,7 +414,7 @@ fn file_name(path: &str) -> &str {
 
 /// Whether a read is under way or waiting.
 fn busy(app: &RustGisApp) -> bool {
-    app.reads.job.is_some() || !app.reads.waiting.is_empty()
+    app.reads.job.is_some() || !app.reads.waiting.is_empty() || !app.reads.cancelled.is_empty()
 }
 
 /// Why a command asked for can't run now: what was open when it was asked isn't any more.
@@ -584,6 +594,12 @@ fn complete_here(app: &mut RustGisApp, asked: Asked, p: Value, done: Result<read
 /// Runs the command a read was for once it's done (or says why it wasn't), then starts the next
 /// waiting: called every frame. `true` while one is under way or waiting.
 pub fn land(app: &mut RustGisApp) -> bool {
+    for asked in std::mem::take(&mut app.reads.cancelled) {
+        let what = called(asked.command, &asked.what);
+        let why = crate::i18n::fmt("{what} was cancelled before starting", &[("what", what)]);
+        app.session.notify(why.clone(), false);
+        not_run_asked(app, &asked, why);
+    }
     if !busy(app) {
         return false;
     }
@@ -678,7 +694,7 @@ pub fn land(app: &mut RustGisApp) -> bool {
 pub fn stop(app: &mut RustGisApp, wait: std::time::Duration) {
     let why = tl!("RustGIS is closing").to_string();
     let job = app.reads.job.take();
-    let waiting: Vec<Asked> = app.reads.waiting.drain(..).collect();
+    let waiting: Vec<Asked> = app.reads.cancelled.drain(..).chain(app.reads.waiting.drain(..)).collect();
     if let Some(job) = job {
         job.control.cancel();
         let end = std::time::Instant::now() + wait;
@@ -805,6 +821,33 @@ mod tests {
         landed(&mut app, 60);
         assert_eq!(app.session.map().layer_by_name("Queued after grid").is_some(), !queue_wide);
         assert!(crate::annotation::drawing_frame(&app).is_err());
+    }
+
+    #[test]
+    fn annotation_grid_scoped_cancel_delivers_waiting_callbacks_once_and_keeps_other_reads() {
+        let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("points.csv");
+        std::fs::write(&path, "name,lon,lat\nA,1,2\n").unwrap();
+        app.reads_off_frame = true;
+        fn cancelled(app: &mut RustGisApp, result: Landed) {
+            let Landed::NotRun(why) = result else { panic!("cancelled waiting read must not run") };
+            assert!(why.contains("cancelled before starting"));
+            app.session.notify("Waiting callback delivered", false);
+        }
+        run(&mut app, "layer.addData", json!({"path":path,"name":"First"})).unwrap();
+        run_then(&mut app, "layer.addData", json!({"path":path,"name":"Cancel me"}), Some(cancelled)).unwrap();
+        run(&mut app, "layer.addData", json!({"path":path,"name":"Keep me"})).unwrap();
+        app.reads.cancel_where(|a| a.params["name"] == "Cancel me");
+        app.reads.cancel_where(|a| a.params["name"] == "Cancel me");
+        assert_eq!(app.reads.waiting.len(), 1);
+        landed(&mut app, 60);
+        assert!(app.session.map().layer_by_name("First").is_some());
+        assert!(app.session.map().layer_by_name("Keep me").is_some());
+        assert!(app.session.map().layer_by_name("Cancel me").is_none());
+        assert_eq!(app.session.notices.iter().filter(|n| n.text == "Waiting callback delivered").count(), 1);
+        assert!(app.reads.cancelled.is_empty());
+        assert!(!land(&mut app));
     }
 
     #[test]

@@ -1436,7 +1436,7 @@ pub fn read_file(path: &std::path::Path, name: &str) -> Result<Raster> {
 /// [`read_file`], with the no-data value a sidecar gives (see [`read_limited_with_nodata`]).
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) fn read_file_with_nodata(path: &std::path::Path, name: &str, sidecar_nodata: Option<f64>) -> Result<Raster> {
-    let file = crate::provenance::open(path)?;
+    let file = crate::provenance::open(path).map_err(err)?;
     let revision = file.metadata().and_then(|metadata| super::file_revision::FileRevision::capture(path, &metadata));
     read_file_with_revision(path, name, sidecar_nodata, file, revision)
 }
@@ -2159,6 +2159,14 @@ fn encode(r: &Raster, band: usize, every: bool) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::raster::tests::small;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn annotation_grid_geotiff_open_failure_retains_format_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = read_file(&dir.path().join("missing.tif"), "missing").unwrap_err().to_string();
+        assert!(error.contains("GeoTIFF:"), "{error}");
+    }
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
