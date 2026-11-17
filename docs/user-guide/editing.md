@@ -199,7 +199,10 @@ Space or middle-drag pans; releasing Space keeps the drawing tool. Use the selec
 existing handles, Undo/Redo, and **Export GeoJSON…**. **Shape details** is collapsed by default;
 expand it for numeric dimensions and additional editing controls. Map handles remain available
 while the section is hidden. Refused drawing gestures show an error notification even when
-**Shape details** is collapsed. Exports contain
+**Shape details** is collapsed. The reason stays visible in the pane, and repeated refusals with
+the same message do not add duplicate notices. Changing the image/grid or invalidating its source
+cancels an unfinished new shape with an explanation; releasing afterwards does not save that
+preview or create an Undo step. Exports contain
 ordinary geographic polygons and feature properties; circles are polygon approximations.
 Check **Use image filename** to suggest `img1.geojson` for an image named `img1.tiff`.
 The preview shows the suggested basename; the save dialog still chooses the folder and lets

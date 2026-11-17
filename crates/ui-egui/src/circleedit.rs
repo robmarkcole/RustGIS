@@ -50,6 +50,17 @@ fn selected(app: &RustGisApp) -> Option<(u32, usize, CircleSpec)> {
 pub(crate) fn drawing(app: &RustGisApp) -> bool {
     app.circles.gesture.is_some()
 }
+pub(crate) fn new_drawing(app: &RustGisApp) -> bool {
+    app.circles.gesture.as_ref().is_some_and(|g| g.row.is_none())
+}
+pub(crate) fn error(app: &RustGisApp) -> Option<&str> {
+    app.circles.error.as_deref()
+}
+pub(crate) fn clear_idle_error(app: &mut RustGisApp) {
+    if app.circles.gesture.is_none() {
+        app.circles.error = None;
+    }
+}
 pub(crate) fn cancel(app: &mut RustGisApp) {
     app.circles = State::default();
     app.map.cancel_circle_drag();
@@ -70,7 +81,16 @@ fn valid(app: &RustGisApp, g: &Gesture) -> bool {
         })
 }
 pub(crate) fn cancel_stale(app: &mut RustGisApp) {
-    if app.circles.gesture.as_ref().is_some_and(|g| !valid(app, g)) {
+    if let Some(grid_changed) = app.circles.gesture.as_ref().filter(|g| !valid(app, g)).map(|g| {
+        g.row.is_none()
+            && (g.project != app.session.opened
+                || g.map != app.session.project.active_map
+                || g.map_name != app.session.map().name
+                || !crate::annotation::drawing_frame(app).is_ok_and(|frame| frame == g.original.frame))
+    }) {
+        if grid_changed {
+            crate::annotation::drawing_cancelled(app);
+        }
         cancel(app);
     }
     if !app.forms.template.is_empty()
@@ -115,8 +135,10 @@ pub(crate) fn drag_start(app: &mut RustGisApp, rect: Rect, origin: Pos2, force_n
             let frame = match crate::annotation::drawing_frame(app) {
                 Ok(frame) => frame,
                 Err(error) => {
-                    app.circles.error = Some(error.clone());
-                    app.session.notify(error, true);
+                    if app.circles.error.as_deref() != Some(error.as_str()) {
+                        app.session.notify(error.clone(), true);
+                    }
+                    app.circles.error = Some(error);
                     return false;
                 }
             };

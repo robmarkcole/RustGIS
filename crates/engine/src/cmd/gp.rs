@@ -6695,3 +6695,65 @@ pub(crate) fn project_input<'a>(
 pub(crate) fn vector_file_input(spec: &rustgis_analysis::ToolSpec, map: &rustgis_map::Map, name: &str) -> bool {
     rustgis_analysis::TOOLS.iter().any(|t| std::ptr::eq(t, spec)) && map.layer_by_name(name).is_none()
 }
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod replay_rollback_tests {
+    use super::*;
+    use rustgis_data::{Field, FieldType, Geometry, GeometryType, Value as Cell};
+    fn prepare(s: &Session, params: &Value) -> RanAheads {
+        let mut worker = Session::new(s.project.clone());
+        worker.active_layer = s.active_layer;
+        worker.opened = s.opened;
+        worker.view_size = s.view_size;
+        worker.set_extensions(s.extensions().clone());
+        worker.tools_ahead = Some(Ahead::Recording(Vec::new()));
+        worker.grids_ahead = Some(crate::image_grid::Ahead::Recording(Vec::new()));
+        worker.run("script.run", params).unwrap();
+        ran_ahead(&mut worker)
+    }
+    #[test]
+    fn annotation_grid_post_apply_replay_error_rolls_back_outputs_history_and_undo() {
+        let mut s = Session::new(crate::Project::default());
+        let mut samples = Dataset::new("Samples", GeometryType::Point, vec![Field::new("v", FieldType::Double)]);
+        for (x, y, v) in [(0., 0., 1.), (2., 0., 2.), (0., 2., 3.), (2., 2., 4.)] {
+            samples.push(Some(Geometry::Point(rustgis_geom::Coord::new(x, y))), vec![Cell::Float(v)]);
+        }
+        s.active_layer = Some(s.map_mut().add_dataset(samples));
+        s.run("project.rename", &json!({"name":"Before"})).unwrap();
+        s.run("project.rename", &json!({"name":"Future"})).unwrap();
+        s.run("edit.undo", &json!({})).unwrap();
+        s.mark_saved();
+        let params = json!({"script":format!("gp.run {}\nraster.imageGrid {}", json!({"tool":"idwInterpolation","params":{"input":"Samples","field":"v","extent":"0,0,2,2","pixelSize":0.5,"output":"Surface"}}), json!({"layer":"Surface"}))});
+        let before = serde_json::to_value(&s.project).unwrap();
+        let history = (s.undo_depth(), s.undo_label(), s.redo_label(), s.dirty());
+        let mut ran = prepare(&s, &params);
+        // Corrupt only the recorded output identity: the tool's input snapshot and actual
+        // output still match, so replay accepts and applies it before binding fails.
+        let Some(RanAhead::Tool(tool)) = ran.tools.first_mut() else { panic!("expected prepared tool") };
+        tool.grid_outputs[0].name = "Injected output identity mismatch".into();
+        s.statistics_need_read_ahead(true);
+        let error = super::super::reads::taking(&mut s, "script.run", ran, |s| s.run("script.run", &params)).unwrap_err();
+        assert!(error.contains("tool outputs changed"), "{error}");
+        assert_eq!(s.tools_taken, 1, "the error must occur after the prepared tool was taken and applied");
+        assert_eq!(serde_json::to_value(&s.project).unwrap(), before, "outputs and successful GP history must roll back");
+        assert_eq!((s.undo_depth(), s.undo_label(), s.redo_label(), s.dirty()), history);
+        assert!(s.map().layer_by_name("Surface").is_none());
+        assert!(s.grids_ahead.is_none() && s.tools_ahead.is_none());
+        s.run("edit.redo", &json!({})).unwrap();
+        assert_eq!(s.project.name, "Future", "a failed replay must preserve the prior Redo entry");
+        s.run("edit.undo", &json!({})).unwrap();
+        let ran = prepare(&s, &params);
+        let answer = super::super::reads::taking(&mut s, "script.run", ran, |s| s.run("script.run", &params)).unwrap();
+        assert_eq!(answer["ran"][1]["result"]["width"], 4);
+        assert_eq!(s.map().layers.iter().filter(|layer| layer.name == "Surface").count(), 1);
+        assert!(s.map().layer_by_name("Surface (2)").is_none());
+        assert_eq!(s.undo_depth(), history.0 + 1);
+        s.run("edit.undo", &json!({})).unwrap();
+        // Undo deliberately bumps geometry revisions to invalidate rendering caches.
+        assert!(s.map().layer_by_name("Surface").is_none());
+        assert_eq!(s.map().layers.len(), 1);
+        assert_eq!(serde_json::to_value(&s.map().layers[0].dataset).unwrap(), before["maps"][0]["layers"][0]["dataset"]);
+        assert!(s.project.gp_history.is_empty());
+        assert_eq!(s.undo_depth(), history.0);
+    }
+}

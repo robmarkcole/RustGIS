@@ -24,8 +24,17 @@ fn cancel(app: &mut RustGisApp) {
         #[cfg(target_arch = "wasm32")]
         let _ = request;
     }
+    if crate::boxedit::new_drawing(app) || crate::circleedit::new_drawing(app) {
+        drawing_cancelled(app);
+    }
     crate::boxedit::cancel(app);
     crate::circleedit::cancel(app);
+}
+pub(crate) fn drawing_cancelled(app: &mut RustGisApp) {
+    app.session.notify(
+        tl!("Drawing cancelled because the map, image or construction grid changed. Check the grid, then start a new shape."),
+        false,
+    );
 }
 pub(crate) fn sync(app: &mut RustGisApp) {
     let context = (app.session.opened, app.session.map().instance_id());
@@ -126,6 +135,10 @@ pub(crate) fn landed(app: &mut RustGisApp, request: u64, result: Landed) {
         },
         Landed::Ran(Err(e)) | Landed::NotRun(e) => app.annotation.error = Some(e),
     }
+    // The pending reason is obsolete on success or failure; grid_controls shows any failure.
+    // Validation errors from an active gesture belong to that gesture and remain untouched.
+    crate::boxedit::clear_idle_error(app);
+    crate::circleedit::clear_idle_error(app);
 }
 /// Command Search's read-only grid query says its answer after background or inline delivery.
 pub(crate) fn show_grid_result(app: &mut RustGisApp, result: Landed) {
@@ -310,10 +323,16 @@ pub(crate) fn panel(app: &mut RustGisApp, ui: &mut egui::Ui) {
     }
     ui.small(tl!("Space or middle-drag pans; releasing Space returns to the active drawing tool. Undo/Redo use the existing commands."));
     if matches!(app.session.tool, Tool::Circle | Tool::RotatedBox) {
-        egui::CollapsingHeader::new(tl!("Shape details")).id_salt("annotation_shape_details").default_open(false).show(ui, |ui| {
-            crate::boxedit::panel(app, ui);
-            crate::circleedit::panel(app, ui);
-        });
+        let details =
+            egui::CollapsingHeader::new(tl!("Shape details")).id_salt("annotation_shape_details").default_open(false).show(ui, |ui| {
+                crate::boxedit::panel(app, ui);
+                crate::circleedit::panel(app, ui);
+            });
+        if details.body_response.is_none()
+            && let Some(error) = if app.session.tool == Tool::Circle { crate::circleedit::error(app) } else { crate::boxedit::error(app) }
+        {
+            ui.colored_label(egui::Color32::RED, error);
+        }
     }
     ui.separator();
     let mut image_filename = app.annotation.image_filename;
@@ -552,6 +571,7 @@ mod tests {
                 assert!(crate::boxedit::drag_start(&mut app, rect(), start, true));
                 crate::boxedit::drag_to(&mut app, rect(), end, false);
             }
+            let mark = app.session.notice_mark();
             // Also protects a source replacement received directly through MCP before UI sync.
             app.session.map_mut().layer_mut(image).unwrap().raster.as_mut().unwrap().embedded = Some(std::sync::Arc::new(vec![0; 32]));
             if tool == Tool::Circle {
@@ -559,10 +579,64 @@ mod tests {
             } else {
                 crate::boxedit::drag_stop(&mut app);
             }
+            sync(&mut app);
+            crate::boxedit::cancel_stale(&mut app);
+            crate::circleedit::cancel_stale(&mut app);
+            assert_eq!(app.session.notices_since(mark).iter().filter(|n| n.text.starts_with("Drawing cancelled")).count(), 1);
             assert!(app.session.map().layer(layer).unwrap().dataset.features.is_empty());
             assert_eq!(app.session.undo_depth(), depth);
         }
     }
+    #[test]
+    fn annotation_grid_changes_report_cancelled_new_drags_once_without_committing() {
+        for tool in [Tool::Circle, Tool::RotatedBox] {
+            for change in ["grid", "image", "reload", "map", "project"] {
+                let (mut app, image, _, frame) = app();
+                let folder = tempfile::tempdir().unwrap();
+                if change == "reload" {
+                    // Reload Data applies to linked local files; embedded snapshots are re-added.
+                    let path = folder.path().join("image.tif");
+                    std::fs::write(&path, tiff(&frame)).unwrap();
+                    let pixels = rustgis_engine::data::raster::read_path(&path).unwrap();
+                    app.session.map_mut().layer_mut(image).unwrap().raster =
+                        Some(RasterLayer::from_path(pixels, path.display().to_string()));
+                }
+                app.run("ui.annotationImage", json!({"image":image})).unwrap();
+                app.run("tool.set", json!({"tool":tool.code()})).unwrap();
+                let start = screen(&app, &frame, [20., 20.]);
+                let end = screen(&app, &frame, [60., 60.]);
+                if tool == Tool::Circle {
+                    assert!(crate::circleedit::drag_start(&mut app, rect(), start, true));
+                    crate::circleedit::drag_to(&mut app, rect(), end);
+                } else {
+                    assert!(crate::boxedit::drag_start(&mut app, rect(), start, true));
+                    crate::boxedit::drag_to(&mut app, rect(), end, false);
+                }
+                let mark = app.session.notice_mark();
+                match change {
+                    "grid" => app.run("ui.annotationGrid", json!({"pixels":false})),
+                    "image" => app.run("ui.annotationImage", json!({"image":image})),
+                    "reload" => app.run("layer.reloadData", json!({"layer":image})),
+                    "map" => app.run("map.new", json!({"name":"Other"})),
+                    _ => app.run("project.new", json!({})),
+                }
+                .unwrap();
+                assert!(!crate::boxedit::drawing(&app) && !crate::circleedit::drawing(&app));
+                let depth = app.session.undo_depth();
+                crate::boxedit::drag_stop(&mut app);
+                crate::circleedit::drag_stop(&mut app);
+                sync(&mut app);
+                assert_eq!(
+                    app.session.notices_since(mark).iter().filter(|n| n.text.starts_with("Drawing cancelled")).count(),
+                    1,
+                    "{tool:?}: {change}"
+                );
+                assert_eq!(app.session.undo_depth(), depth, "release must not commit the abandoned preview");
+                assert!(app.session.project.maps.iter().flat_map(|map| &map.layers).all(|layer| layer.dataset.features.is_empty()));
+            }
+        }
+    }
+
     #[test]
     fn annotation_grid_replaced_requests_ignore_old_failures_and_cancellation() {
         let (mut app, image, _, frame) = app();
@@ -811,32 +885,33 @@ mod tests {
             let depth = app.session.undo_depth();
             let mark = app.session.notice_mark();
             let origin = screen(&app, &frame, [32., 32.]);
-            let accepted = if tool == Tool::Circle {
-                crate::circleedit::drag_start(&mut app, rect(), origin, true)
-            } else {
-                crate::boxedit::drag_start(&mut app, rect(), origin, true)
-            };
-            assert!(!accepted);
+            for _ in 0..3 {
+                let accepted = if tool == Tool::Circle {
+                    crate::circleedit::drag_start(&mut app, rect(), origin, true)
+                } else {
+                    crate::boxedit::drag_start(&mut app, rect(), origin, true)
+                };
+                assert!(!accepted);
+            }
             let error = "Wait for the original image grid before drawing.";
             assert_eq!(app.session.notices_since(mark).iter().filter(|n| n.error && n.text == error).count(), 1);
             assert_eq!(app.session.undo_depth(), depth);
             assert!(app.session.map().layer(layer).unwrap().dataset.features.is_empty());
-            let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1366., 900.)).with_max_steps(1000).build_ui_state(
-                |ui, app: &mut RustGisApp| {
-                    let ctx = ui.ctx().clone();
-                    app.logic(&ctx);
-                    app.ui(ui);
-                },
-                app,
-            );
+            // Render the pane without the toast/status bar to prove the inline reason persists.
+            let mut h = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(600., 1000.))
+                .with_max_steps(1000)
+                .build_ui_state(|ui, app| panel(app, ui), app);
             // Pending reads keep the spinner repainting; inspect a frame rather than await idle.
             h.run_steps(1);
             assert!(h.query_by_label("Shape details").is_some());
             assert!(h.query_by_label("Radius").is_none() && h.query_by_label("Width").is_none());
             assert!(h.query_all_by_label(error).next().is_some(), "refusal is visible without expanding details");
+            let request = h.state().annotation.pending.unwrap();
+            landed(h.state_mut(), request, Landed::Ran(Ok(serde_json::to_value(&frame).unwrap())));
+            h.run_steps(1);
+            assert!(h.query_all_by_label(error).next().is_none(), "a completed grid clears the stale waiting reason");
             let app = h.state_mut();
-            app.annotation.pending = None;
-            app.annotation.frame = Some(frame.clone());
             let mark = app.session.notice_mark();
             drag(app, &frame, [32., 32.], [64., 64.], true);
             assert_eq!(app.session.map().layer(layer).unwrap().dataset.features.len(), 1);
