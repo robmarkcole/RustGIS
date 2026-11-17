@@ -659,6 +659,7 @@ fn web_data_menu(ui: &mut Ui, app: &mut RustGisApp) {
     let pane = |name: &str| json!({"name": name});
     menu_item(ui, app, "", "ArcGIS Portal…", "ui.searchOpenData", svc("arcgis-portal"));
     menu_item(ui, app, "", "Boundaries…", "ui.dialog", pane("boundaries"));
+    menu_item(ui, app, "", "Copernicus Data Space…", "ui.dialog", pane("copernicus"));
     menu_item(ui, app, "", "Data Cubes…", "ui.dialog", pane("dataCubes"));
     menu_item(ui, app, "", "Dynamical…", "ui.searchOpenData", svc("dynamical"));
     menu_item(ui, app, "", "Earthdata GIS…", "ui.searchOpenData", svc("earthdata-gis"));
@@ -1873,6 +1874,23 @@ fn graticule_menu(ui: &mut Ui, app: &mut RustGisApp) {
 }
 
 fn view_tab(app: &mut RustGisApp, ui: &mut Ui) {
+    // On a phone that left its touch interface for this one: the way back, first so a
+    // phone's narrow ribbon shows it.
+    if app.touch.is_some() {
+        group(ui, "Interface", |ui| {
+            big(
+                ui,
+                app,
+                "pane",
+                "Touch\nInterface",
+                "Go back to the phone's interface: the map with large buttons under it.",
+                "ui.touchInterface",
+                Value::Null,
+                false,
+                false,
+            );
+        });
+    }
     group(ui, "Display", |ui| {
         let g = app.session.map().graticule;
         big_split_form_menu(

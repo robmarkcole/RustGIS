@@ -165,7 +165,12 @@ impl ArchiveBatch {
                     || !matches!(
                         args.get("command").and_then(Value::as_str).map(str::trim),
                         Some(
-                            "map.reloadTiles" | "map.repairTiles" | "table.statistics" | "edit.previewShapeConversion" | "raster.imageGrid"
+                            "map.reloadTiles"
+                                | "map.repairTiles"
+                                | "table.statistics"
+                                | "edit.previewShapeConversion"
+                                | "raster.imageGrid"
+                                | "layer.sizeBy"
                         )
                     )
                 {

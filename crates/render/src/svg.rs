@@ -19,9 +19,11 @@ use crate::layout::{MAX_PIXELS, PageInfo, expand, page_geometry, record_element,
 /// Writes `layout` as an SVG document, pictures drawn at `dpi`, and the elements (id and name)
 /// drawn as pictures because their vectors would pass the budget. Refuses a source changed during drawing.
 pub fn layout_svg(layout: &Layout, maps: &mut [Map], dpi: f64, info: &PageInfo) -> Result<(String, Vec<(u32, String)>), String> {
+    let _budget = crate::layout::legend_budget();
     let revisions = crate::layout::archive_revisions(layout, maps);
     let mut source_error = None;
     let result = layout_svg_inner(layout, maps, dpi, info, &mut source_error);
+    crate::layout::finish_legends()?;
     revisions.finish_revision(
         crate::layout::archive_revisions(layout, maps),
         result,
@@ -461,6 +463,7 @@ mod tests {
                 exclude: vec![],
                 columns: 1,
                 labels: Default::default(),
+                color: None,
             },
         );
         assert_eq!(picture_dpi(&layout, 600.0, |e| !written_as_svg(e)), 600.0);
@@ -501,6 +504,7 @@ mod tests {
                 exclude: vec![],
                 columns: 1,
                 labels: Default::default(),
+                color: None,
             },
         );
         let info = PageInfo::default();

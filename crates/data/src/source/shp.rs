@@ -129,10 +129,29 @@ impl ShpSource {
             Some(c) => Reproject::from_crs(c, &mut notes),
             None => shp_reproject(crate::raster::read_prj(path).as_deref(), &mut notes)?,
         };
-        // A header box with a corner that isn't a number (a shape's NaN or infinity, #1985) is
-        // no extent at all.
-        let finite = [native.min_x, native.min_y, native.max_x, native.max_y].iter().all(|v| v.is_finite());
-        let extent = if native.is_empty() || !finite { Extent::EMPTY } else { reproject.extent_to_lonlat(&native) };
+        // The records' own boxes frame the layer, as the index holds them (rounded outward to f32);
+        // with none (no records, or every shape null or not a number) it has no extent, never the
+        // 0, 0, 0, 0 a header often holds then (Null Island). The header's box, exact, stands for
+        // them when it frames them all; one that doesn't (a corner that isn't a number, #1985, or
+        // stale after records were added) is set aside, and said.
+        let native = index.bounds.map(|[x0, y0, x1, y1]| {
+            // The header, a box itself, rounded outward as the records' boxes are, holds them all:
+            // so a header written exactly always passes, as does one short of a shape by so little
+            // that both round to the same f32 (under a meter in UTM).
+            let frames = [native.min_x, native.min_y, native.max_x, native.max_y].iter().all(|v| v.is_finite())
+                && !native.is_empty()
+                && f32_down(native.min_x) <= x0
+                && f32_down(native.min_y) <= y0
+                && f32_up(native.max_x) >= x1
+                && f32_up(native.max_y) >= y1;
+            if frames {
+                native
+            } else {
+                notes.push("the .shp header's bounding box doesn't frame its shapes: the layer's extent is taken from the shapes".into());
+                Extent::new(f64::from(x0), f64::from(y0), f64::from(x1), f64::from(y1))
+            }
+        });
+        let extent = native.map_or(Extent::EMPTY, |n| reproject.extent_to_lonlat(&n));
         if reproject.is_lonlat()
             && !extent.is_empty()
             && (extent.min_x < -180.5 || extent.max_x > 180.5 || extent.min_y < -90.5 || extent.max_y > 90.5)
@@ -191,7 +210,7 @@ impl FeatureSource for ShpSource {
         let mut buf = Vec::new();
         let mut row = vec![0u8; self.table.row_len];
         let mut features = Vec::new();
-        let (mut skipped, mut unread_dates) = (0, Vec::new());
+        let (mut skipped, mut unread_dates, mut null_text) = (0, Vec::new(), Vec::new());
         // An extent the file's system couldn't bound (#1925) has no boxes for the index to sample
         // by: every record is visited, tested, and the matches sampled as they come.
         let late = req.extent.is_some() && bounds.is_none();
@@ -250,7 +269,7 @@ impl FeatureSource for ShpSource {
                 if late && !sample.wants() {
                     return Ok(());
                 }
-                self.table.values(&row, &encoding, &mut unread_dates)
+                self.table.values(&row, &encoding, &mut unread_dates, &mut null_text)
             } else {
                 if late && !sample.wants() {
                     return Ok(());
@@ -272,7 +291,7 @@ impl FeatureSource for ShpSource {
         } else {
             self.index.visit(bounds, limit, &mut each)?
         };
-        Ok(Batch { features, matched, complete, skipped, unread_dates, rounded_dates: Vec::new() })
+        Ok(Batch { features, matched, complete, skipped, unread_dates, rounded_dates: Vec::new(), null_text })
     }
     fn streams_chunks(&self) -> bool {
         true
@@ -292,7 +311,7 @@ impl FeatureSource for ShpSource {
         let mut dbf = Cursor::open(&self.dbf)?;
         let mut buf = Vec::new();
         let mut row = vec![0u8; self.table.row_len];
-        let (mut skipped, mut unread_dates) = (0, Vec::new());
+        let (mut skipped, mut unread_dates, mut null_text) = (0, Vec::new(), Vec::new());
         // The same directory, ordering, extent rules and read-only scan fallback as sampled
         // reads, with no interaction row cap. The index visits records without materializing
         // their directory or the complete feature collection in memory.
@@ -344,14 +363,14 @@ impl FeatureSource for ShpSource {
                 if row.first() == Some(&b'*') {
                     return Ok(());
                 }
-                self.table.values(&row, &encoding, &mut unread_dates)
+                self.table.values(&row, &encoding, &mut unread_dates, &mut null_text)
             } else {
                 vec![Value::Null; self.table.columns.len()]
             };
             chunks.push(Feature { id: u64::from(i) + 1, geometry, attrs })
         })?;
         chunks.flush()?;
-        Ok(Batch { features: Vec::new(), matched, complete, skipped, unread_dates, rounded_dates: Vec::new() })
+        Ok(Batch { features: Vec::new(), matched, complete, skipped, unread_dates, rounded_dates: Vec::new(), null_text })
     }
 }
 
@@ -404,24 +423,41 @@ fn record_box(c: &[u8]) -> [f32; 4] {
             (Some(x), Some(y)) => [x, y, x, y],
             _ => return NONE,
         },
-        Some(3 | 5 | 8 | 13 | 15 | 18 | 23 | 25 | 28 | 31) => match (le_f64(c, 4), le_f64(c, 12), le_f64(c, 20), le_f64(c, 28)) {
-            (Some(a), Some(b), Some(x), Some(y)) => [a, b, x, y],
-            _ => return NONE,
-        },
+        Some(t @ (3 | 5 | 8 | 13 | 15 | 18 | 23 | 25 | 28 | 31)) => {
+            // A shape of no points, or no parts (an empty geometry some writers give a 0, 0, 0, 0
+            // box), has nothing to frame. The counts follow the box: a multipoint's points at 36,
+            // else the parts at 36 and the points at 40.
+            let empty = if matches!(t, 8 | 18 | 28) {
+                le_i32(c, 36).is_some_and(|n| n <= 0)
+            } else {
+                le_i32(c, 36).is_some_and(|n| n <= 0) || le_i32(c, 40).is_some_and(|n| n <= 0)
+            };
+            if empty {
+                return NONE;
+            }
+            match (le_f64(c, 4), le_f64(c, 12), le_f64(c, 20), le_f64(c, 28)) {
+                (Some(a), Some(b), Some(x), Some(y)) => [a, b, x, y],
+                _ => return NONE,
+            }
+        }
         _ => return NONE,
     };
     if b.iter().any(|v| !v.is_finite()) {
         return NONE;
     }
-    let down = |v: f64| {
-        let f = v as f32;
-        if f64::from(f) > v { f.next_down() } else { f }
-    };
-    let up = |v: f64| {
-        let f = v as f32;
-        if f64::from(f) < v { f.next_up() } else { f }
-    };
-    [down(b[0]), down(b[1]), up(b[2]), up(b[3])]
+    [f32_down(b[0]), f32_down(b[1]), f32_up(b[2]), f32_up(b[3])]
+}
+
+/// The nearest f32 at or below `v`, as the index rounds a box's low corner.
+fn f32_down(v: f64) -> f32 {
+    let f = v as f32;
+    if f64::from(f) > v { f.next_down() } else { f }
+}
+
+/// The nearest f32 at or above `v`, as the index rounds a box's high corner.
+fn f32_up(v: f64) -> f32 {
+    let f = v as f32;
+    if f64::from(f) < v { f.next_up() } else { f }
 }
 
 /// Most parts and points one shape may have (a record's own length bounds them first).
@@ -517,12 +553,23 @@ fn read_table(path: &Path) -> Result<Table> {
 
 impl Table {
     /// A row's values (after its deletion flag), counting in `unread_dates` the dates that
-    /// aren't ones ([`Batch::unread_dates`]).
-    fn values(&self, row: &[u8], encoding: &dyn shapefile::dbase::Encoding, unread_dates: &mut Vec<usize>) -> Vec<Value> {
+    /// aren't ones ([`Batch::unread_dates`]) and in `null_text` the text `<Null>` read as null
+    /// ([`Batch::null_text`]).
+    fn values(
+        &self,
+        row: &[u8],
+        encoding: &dyn shapefile::dbase::Encoding,
+        unread_dates: &mut Vec<usize>,
+        null_text: &mut Vec<usize>,
+    ) -> Vec<Value> {
         let mut out = Vec::with_capacity(self.columns.len());
         for (k, c) in self.columns.iter().enumerate() {
             let b = row.get(1 + c.offset..1 + c.offset + c.len).unwrap_or(&[]);
-            out.push(if c.ty == b'D' {
+            out.push(if c.ty == b'D' && std::str::from_utf8(padded(b)).is_ok_and(Value::is_null_marker) {
+                // `<Null>` is a missing value's marker, counted as one, not as a date that isn't.
+                super::null_text_at(null_text, k);
+                Value::Null
+            } else if c.ty == b'D' {
                 crate::dbf::date(b)
                     .unwrap_or_else(|()| {
                         super::unread_date(unread_dates, k);
@@ -530,7 +577,13 @@ impl Table {
                     })
                     .map_or(Value::Null, Value::Date)
             } else {
-                value(c, b, encoding)
+                let v = value(c, b, encoding);
+                if c.ty == b'C' && matches!(&v, Value::Text(t) if Value::is_null_marker(t)) {
+                    super::null_text_at(null_text, k);
+                    Value::Null
+                } else {
+                    v
+                }
             });
         }
         out
@@ -551,6 +604,13 @@ fn read_names(path: &Path, n: usize, encoding: &dyn shapefile::dbase::Encoding) 
         out.push(encoding.decode(name).unwrap_or_else(|_| String::from_utf8_lossy(name)).trim().to_string());
     }
     Ok(out)
+}
+
+/// A text field's bytes up to the first NUL, without the padding after them: spaces before the
+/// text are the text's, as a Shapefile read whole keeps them.
+fn padded(b: &[u8]) -> &[u8] {
+    let b = b.get(..b.iter().position(|c| *c == 0).unwrap_or(b.len())).unwrap_or(&[]);
+    b.get(..b.iter().rposition(|c| *c != b' ').map_or(0, |e| e + 1)).unwrap_or(&[])
 }
 
 /// A field's bytes up to the first NUL, without the spaces around them.
@@ -574,8 +634,12 @@ fn value(c: &Column, b: &[u8], encoding: &dyn shapefile::dbase::Encoding) -> Val
     };
     match c.ty {
         b'C' => {
-            let t = text();
-            if t.is_empty() { Value::Null } else { Value::Text(t) }
+            let t = padded(b);
+            if t.is_empty() {
+                Value::Null
+            } else {
+                Value::Text(encoding.decode(t).unwrap_or_else(|_| String::from_utf8_lossy(t)).into_owned())
+            }
         }
         // A whole-number column's values as integers, exactly (its at most 18 digits fit an i64);
         // one written with a point or exponent (`12.0`, `1e3`) too, and one that isn't whole is

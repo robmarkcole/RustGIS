@@ -77,6 +77,8 @@ same files. New and changed code follows these rules; not every existing reader 
   `.rgis` format 2 before any writes it (`READ_FORMAT` and `CAPABILITIES` in
   `crates/engine/src/project.rs`), so what is added to format 2 after that comes with a capability
   name, added to `CAPABILITIES` where it is read.
+  Independent sizes on classified point layers use `classified-point-size`; only documents
+  containing a `size_by` mapping list that requirement.
 - `schema/project.schema.json` is the JSON Schema of the project file, generated from the types
   it is saved from by `cargo xtask schema`. A pull request that changes what a project saves
   regenerates it and commits it in the same pull request; CI's `cargo xtask schema --check` fails
@@ -97,6 +99,7 @@ release has no such file format. Current-writer examples do not replace these hi
 
 New project saves and map/layer exports write format 2. Their `requires` header names only
 features present in the saved payload: `terrain-block`, `terrain-water`,
+`terrain-water-shore` (a terrain water's shore band other than the default),
 `shaded-relief-effects` (cast shadows, sky visibility, fill light or rock colour),
 `shaded-relief-light` (a Shaded Relief's ambient or balanced light) and
 `normalized-legend-urls` for normalized legend addresses. Project
@@ -105,6 +108,11 @@ command notebook cells and replayable history using Export Table sort or limit o
 Earlier format-2 readers refuse unknown required
 capabilities instead of opening and later saving away those settings; legacy format-1 files
 still open.
+
+Projects, map files and layer files whose symbology draws an image as a marker (`Marker::Picture`:
+a symbol's, a stacked stroke's or a dot fill's, saved styles included), or whose replayable
+commands set one (`layer.marker` with an `image`), require `picture-markers`:
+an older reader must refuse them rather than fail on the marker or lose it.
 
 Projects, model files and web tools that save a percent-slope function require `slope-percent`:
 an older reader must refuse them rather than run the saved function in degrees. Project
@@ -120,6 +128,15 @@ cell or history entry that gives one (`layout.addElement` or `layout.update` wit
 refuses them instead of opening the layout and saving it again, or running the command,
 without the background. Layout files (`.rgislayout`) carry no format header yet and are not
 covered (#2277).
+
+Projects with an ink on a legend, colorbar, table or chart (`color` on those elements) require
+`layout-element-ink`, so an older reader refuses them instead of drawing those elements in dark
+grey and saving them again without it. Saved `layout.addElement` and `layout.update` commands
+that set one need nothing: an older reader refuses `color` on those elements, so the command
+fails there instead of losing the ink. A saved `layout.import` whose `text` gives an element an
+ink requires `layout-element-ink`, and one whose `text` gives an element a background requires
+`layout-element-background`, since an older reader would read that layout without them. Layout
+files are not covered, as for backgrounds (#2277).
 
 ## New dependencies
 

@@ -28,6 +28,7 @@ mod connectionui;
 #[cfg(not(target_arch = "wasm32"))]
 mod connectui;
 mod coordreadout;
+mod copernicusui;
 mod cswui;
 mod cubesui;
 mod diagnosticlog;
@@ -910,6 +911,8 @@ pub struct UiState {
     pub session_log: sessionlog::State,
     /// NASA Earthaccess: the dataset, the granules found and the request under way.
     pub earthaccess: earthaccessui::State,
+    /// Copernicus Data Space: the sign-in being typed and what the last one said.
+    pub copernicus: copernicusui::State,
     /// Add From Service › Sign in to ArcGIS.
     pub arcgis: arcgisui::State,
     /// USGS NLDI: the point traced, its COMID, the navigation and the request under way.
@@ -1083,6 +1086,7 @@ impl Default for UiState {
             cubes: Default::default(),
             session_log: Default::default(),
             earthaccess: Default::default(),
+            copernicus: Default::default(),
             arcgis: Default::default(),
             nldi: Default::default(),
             geocode: Default::default(),
@@ -1191,6 +1195,9 @@ pub struct RustGisApp {
     /// bar (the touch interface, `rustgis-ui-touch`). `None` is the desktop interface. Dialogs
     /// and the Project menu's page are drawn either way.
     pub chrome: Option<Chrome>,
+    /// The touch interface a phone's shell offers (`rustgis-ui-touch`), kept while the desktop
+    /// interface is in its place so `ui.touchInterface` can bring it back. `None` elsewhere.
+    pub touch: Option<Chrome>,
     /// Whether the user wants the device's position shown: a shell that can report one (a
     /// phone's) starts and stops its positioning by this, and fills in [`RustGisApp::position`].
     pub locate: bool,
@@ -1304,6 +1311,8 @@ pub struct RustGisApp {
     fonts_for_data: Vec<rustgis_engine::render::fonts::CjkRegion>,
     /// CJK scripts `ensure_data_cjk_font` has dealt with: a face asked for, or none to be had said.
     cjk_scripts_handled: Vec<rustgis_engine::render::fonts::CjkScript>,
+    /// CJK scripts whose characters the downloaded face lacks, said once each.
+    cjk_lacking_said: Vec<rustgis_engine::render::fonts::CjkScript>,
     /// Fonts were installed this frame: `set_fonts` only takes effect on the next one.
     fonts_pending: bool,
     /// Whether the installed font families were indexed by a frame (see `families::warm_up`).
@@ -1491,6 +1500,7 @@ impl RustGisApp {
             reads: readjob::Reads::default(),
             reads_off_frame: false,
             chrome: None,
+            touch: None,
             locate: false,
             position: None,
             fixes: std::collections::VecDeque::new(),
@@ -1550,6 +1560,7 @@ impl RustGisApp {
             fonts_failed: Vec::new(),
             fonts_for_data: Vec::new(),
             cjk_scripts_handled: Vec::new(),
+            cjk_lacking_said: Vec::new(),
             fonts_pending: false,
             label_fonts_indexed: false,
             shown_lang: i18n::Lang::EN,
@@ -1879,6 +1890,20 @@ impl RustGisApp {
                 || self.extra_fonts.iter().any(|(_, _, x)| *x == Some(ScriptFont::Cjk(r)))
         };
         let wanted = cjk_downloads(&missing, han, asked);
+        // Characters the face for their script, already loaded, still lacks (rare ideographs past
+        // its coverage, say) are left out: said once a script.
+        for script in &missing {
+            let region = cjk_downloads(&[*script], han, |_| false).first().copied().unwrap_or(han);
+            let loaded = self.extra_fonts.iter().any(|(_, _, x)| *x == Some(ScriptFont::Cjk(region)));
+            if loaded && !self.cjk_lacking_said.contains(script) {
+                self.cjk_lacking_said.push(*script);
+                let msg = i18n::fmt(
+                    "Some characters of the {language} text on the map aren't in its downloaded font, so they are left out.",
+                    &[("language", Self::cjk_language(region).english())],
+                );
+                self.session.notify(msg, false);
+            }
+        }
         for script in missing {
             if !self.cjk_scripts_handled.contains(&script) {
                 self.cjk_scripts_handled.push(script);
@@ -1889,6 +1914,29 @@ impl RustGisApp {
             if !self.fonts_for_data.contains(&region) {
                 self.fonts_for_data.push(region);
             }
+            if let (Some(fetch), Some(url)) = (&self.services.fetch_font, script_font_url(ScriptFont::Cjk(region))) {
+                fetch(url);
+            }
+            let msg = i18n::fmt(
+                "Downloading the font for the {language} text on the map. Images exported before it arrives leave that text out.",
+                &[("language", Self::cjk_language(region).english())],
+            );
+            self.session.notify(msg, false);
+        }
+    }
+
+    /// Asks again for the CJK faces the map's text asked for that failed to download: picking a
+    /// language is the retry the failure notice offers, and text measured before (its widths
+    /// cached) notes nothing again to ask for them.
+    fn retry_data_cjk_fonts(&mut self) {
+        use rustgis_engine::render::fonts::{ScriptFont, script_font_url};
+        for region in self.fonts_for_data.clone() {
+            let name = format!("script-{:?}", ScriptFont::Cjk(region));
+            let loaded = self.extra_fonts.iter().any(|(_, _, x)| *x == Some(ScriptFont::Cjk(region)));
+            if loaded || self.fonts_requested.contains(&name) {
+                continue;
+            }
+            self.fonts_requested.push(name);
             if let (Some(fetch), Some(url)) = (&self.services.fetch_font, script_font_url(ScriptFont::Cjk(region))) {
                 fetch(url);
             }
@@ -2768,6 +2816,9 @@ impl RustGisApp {
             if id == "table.statistics" {
                 return readjob::run_then(self, "table.statistics", params, Some(table::statistics_landed));
             }
+            if id == "layer.sizeBy" {
+                return readjob::run(self, "layer.sizeBy", params);
+            }
             // Publishing hashes, reads and writes the whole file: on a thread of its own, with
             // progress and Cancel, as an export is.
             if id == "source.publish" {
@@ -2820,7 +2871,15 @@ impl RustGisApp {
             self.ui.ribbon_peek = false;
         }
         // Read before the command runs: removing or renaming the active layer changes it.
-        let active = if self.ws.recording.is_some() { self.layer_acted_on(id, &params) } else { None };
+        let active = match &dispatch {
+            _ if self.ws.recording.is_none() => None,
+            // A read on a thread bound to its layer's id (`readjob`): the step names the layer, as
+            // every step does, so it replays on that layer by name. One given no layer names the
+            // layer it acts on, as a command run here does.
+            #[cfg(not(target_arch = "wasm32"))]
+            AppDispatch::Read(_) => self.layer_named(&params).or_else(|| self.layer_acted_on(id, &params)),
+            _ => self.layer_acted_on(id, &params),
+        };
         // A step being edited is known by its place in the task: Undo or Redo of a move or a
         // deletion would leave that place naming another step.
         // What is compared: the task's length and the step at the edit's place (its words and
@@ -3047,6 +3106,16 @@ impl RustGisApp {
         }
         let map = self.session.map();
         let name = active.and_then(|l| map.layer(l)).map(|l| l.name.clone())?;
+        let shared = map.layers.iter().filter(|l| l.name.eq_ignore_ascii_case(&name)).count() > 1;
+        Some((name, shared))
+    }
+
+    /// The name of the layer `params` gives by id, and whether another layer shares it.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn layer_named(&self, params: &Value) -> Option<(String, bool)> {
+        let map = self.session.map();
+        let id = params.get("layer").and_then(Value::as_u64).and_then(|id| u32::try_from(id).ok())?;
+        let name = map.layer(id)?.name.clone();
         let shared = map.layers.iter().filter(|l| l.name.eq_ignore_ascii_case(&name)).count() > 1;
         Some((name, shared))
     }
@@ -3471,6 +3540,7 @@ impl RustGisApp {
                 }
                 self.ui.language = code.to_ascii_lowercase();
                 self.fonts_failed.clear();
+                self.retry_data_cjk_fonts();
                 self.save_pref("language", &self.ui.language);
                 self.map.invalidate();
             }
@@ -3718,6 +3788,12 @@ impl RustGisApp {
             }
             "ui.commandSearch" => self.ui.command_search = Some(String::new()),
             "ui.about" => self.ui.about = true,
+            // Back from the desktop interface to the phone's, which the shell left in `touch`.
+            "ui.touchInterface" => match (self.chrome, self.touch) {
+                (Some(_), _) => {}
+                (None, Some(touch)) => self.chrome = Some(touch),
+                (None, None) => return Err(tl!("There is no touch interface to go back to: it is on phones.").into()),
+            },
             "ui.checkUpdate" => self.update.check(),
             // The MCP relay for `rustgis-cli mcp --attach`: starts a loopback listener off until
             // asked. Running the command again reports its address; the app owns its lifetime.
@@ -6247,7 +6323,11 @@ impl RustGisApp {
             // interface language, those of the region the map's ideographs were downloaded in
             // (`han_region`), so a face downloaded for kana or Hangul doesn't take them over.
             if self.services.fetch_font.is_some() {
-                rustgis_engine::render::fonts::prefer_downloaded_cjk(Some(self.han_region()));
+                let han = self.han_region();
+                rustgis_engine::render::fonts::prefer_downloaded_cjk(Some(han));
+                // The interface falls back to the extra faces in order: that region's first, so
+                // the ideographs it draws take the same forms, whichever face arrived first.
+                put_first(&mut self.extra_fonts, rustgis_engine::render::fonts::ScriptFont::Cjk(han));
             }
             theme::install_fonts(ctx, &self.extra_fonts, self.installed_region);
             self.fonts_pending = true;
@@ -6550,6 +6630,17 @@ fn cjk_downloads(
     wanted
 }
 
+/// Moves the extra face for `region` ahead of the others, the rest kept in order.
+fn put_first(
+    fonts: &mut Vec<(String, std::sync::Arc<egui::FontData>, Option<rustgis_engine::render::fonts::ScriptFont>)>,
+    region: rustgis_engine::render::fonts::ScriptFont,
+) {
+    if let Some(i) = fonts.iter().position(|(_, _, r)| *r == Some(region)) {
+        let face = fonts.remove(i);
+        fonts.insert(0, face);
+    }
+}
+
 /// [`RustGisApp::han_region`] for the interface's script face `current` and the system's preferred
 /// language `tags`.
 fn han_region_for(
@@ -6639,6 +6730,51 @@ mod cjk_download_tests {
         }
         assert_eq!(*asked.lock().unwrap(), vec![cjk_font_url(CjkRegion::Japanese).to_string()]);
         assert_eq!(said(&app, mark), 1, "{:?}", app.session.notices_since(mark));
+
+        // Its face loaded, characters it still lacks are said once, and the face isn't asked for
+        // again.
+        let face = std::sync::Arc::new(egui::FontData::from_static(&[]));
+        app.extra_fonts.push(("web-test".into(), face, Some(rustgis_engine::render::fonts::ScriptFont::Cjk(CjkRegion::Japanese))));
+        let mark = app.session.notice_mark();
+        for _ in 0..2 {
+            note_missing_cjk('か');
+            app.ensure_data_cjk_font();
+        }
+        assert_eq!(said(&app, mark), 1, "{:?}", app.session.notices_since(mark));
+        assert_eq!(asked.lock().unwrap().len(), 1);
+
+        // A face the map's text asked for that failed is asked for again when a language is
+        // picked, the retry its failure notice offers, though nothing notes it again.
+        note_missing_cjk('한');
+        app.ensure_data_cjk_font();
+        let korean = cjk_font_url(CjkRegion::Korean).to_string();
+        assert_eq!(asked.lock().unwrap().last(), Some(&korean));
+        let name = format!("script-{:?}", rustgis_engine::render::fonts::ScriptFont::Cjk(CjkRegion::Korean));
+        app.fonts_requested.retain(|n| *n != name);
+        app.fonts_failed.push(name);
+        let mark = app.session.notice_mark();
+        app.run("ui.language", serde_json::json!({"code": "en"})).unwrap();
+        let urls = asked.lock().unwrap().clone();
+        assert_eq!(urls.iter().filter(|u| **u == korean).count(), 2, "{urls:?}");
+        let retrying = app.session.notices_since(mark).iter().filter(|n| n.text.contains("Downloading the font for the Korean")).count();
+        assert_eq!(retrying, 1, "the retry is said: {:?}", app.session.notices_since(mark));
+    }
+
+    /// The interface falls back to the face of the map's ideographs first, whichever face
+    /// arrived first, the other faces kept in order.
+    #[test]
+    fn the_ideographs_face_falls_back_first_whichever_arrived_first() {
+        use CjkRegion::{Japanese as Jp, TraditionalChinese as Tc};
+        use rustgis_engine::render::fonts::ScriptFont;
+        let face =
+            |name: &str, region: Option<ScriptFont>| (name.to_string(), std::sync::Arc::new(egui::FontData::from_static(&[])), region);
+        for (first, second) in [(Jp, Tc), (Tc, Jp)] {
+            let mut fonts = vec![face("symbols", None), face("a", Some(ScriptFont::Cjk(first))), face("b", Some(ScriptFont::Cjk(second)))];
+            super::put_first(&mut fonts, ScriptFont::Cjk(Tc));
+            let order: Vec<_> = fonts.iter().map(|(_, _, r)| *r).collect();
+            let other = if first == Tc { second } else { first };
+            assert_eq!(order, vec![Some(ScriptFont::Cjk(Tc)), None, Some(ScriptFont::Cjk(other))]);
+        }
     }
 }
 
@@ -8823,5 +8959,33 @@ mod look_tests {
         app.open_picked("picked.rgis", text.as_bytes()).expect("a picked peer project opens via open_peer_text");
         assert_eq!(app.session.project.name, "PickedFromEmbedder");
         assert_eq!(app.ui.web_file, None, "a picked project also goes through open_peer_text");
+    }
+}
+
+#[cfg(test)]
+mod touch_tests {
+    use super::RustGisApp;
+    use serde_json::Value;
+
+    /// A stand-in for a phone's touch interface.
+    fn touch(_: &mut RustGisApp, _: &mut egui::Ui) {}
+
+    /// After Use the Desktop Interface (the chrome cleared), `ui.touchInterface` brings back the
+    /// one the shell kept; a computer, which has none, is told so.
+    #[test]
+    fn the_desktop_interface_goes_back_to_the_touch_one() {
+        let mut app = RustGisApp::with_sample();
+        // A computer has no touch interface to go back to.
+        assert!(app.run("ui.touchInterface", Value::Null).is_err());
+        assert!(app.chrome.is_none());
+        // A phone: its shell sets both, and the More sheet's row clears the chrome.
+        app.touch = Some(touch);
+        app.chrome = app.touch;
+        app.chrome = None;
+        app.run("ui.touchInterface", Value::Null).unwrap();
+        assert!(app.chrome.is_some_and(|c| std::ptr::fn_addr_eq(c, touch as super::Chrome)));
+        // Already on it: nothing changes.
+        app.run("ui.touchInterface", Value::Null).unwrap();
+        assert!(app.chrome.is_some());
     }
 }

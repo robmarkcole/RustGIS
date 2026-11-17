@@ -6,10 +6,10 @@
 
 use egui::{Align2, Color32, CornerRadius, CursorIcon, Pos2, Rect, Sense, Stroke, Ui, pos2, vec2};
 use rustgis_engine::map::layout::{
-    Arrange, ArrowStyle, CoordFormat, Element, ElementKind, Grid, GridKind, GridStyle, Layout, LineHead, MAX_BACKGROUND_PADDING,
-    MAX_BACKGROUND_RADIUS, MAX_BACKGROUND_WIDTH, MAX_COLORBAR_TICKS, MAX_FRAME_SCALE, MAX_GRID_WIDTH, MAX_LEGEND_COLUMNS,
-    MAX_SCALE_DIVISIONS, MAX_TICK_MM, MIN_FRAME_SCALE, Orientation, PT_PER_MM, ScaleBarStyle, ScaleUnits, TickSide, frame_camera,
-    line_angle, line_length,
+    Arrange, ArrowStyle, Background, CoordFormat, Element, ElementKind, Grid, GridKind, GridStyle, INK, Layout, LineHead,
+    MAX_BACKGROUND_PADDING, MAX_BACKGROUND_RADIUS, MAX_BACKGROUND_WIDTH, MAX_COLORBAR_TICKS, MAX_FRAME_SCALE, MAX_GRID_WIDTH,
+    MAX_LEGEND_COLUMNS, MAX_SCALE_DIVISIONS, MAX_TICK_MM, MIN_FRAME_SCALE, Orientation, PT_PER_MM, ScaleBarStyle, ScaleUnits, TickSide,
+    frame_camera, line_angle, line_length,
 };
 use rustgis_engine::map::symbology::Dash;
 use serde_json::{Value, json};
@@ -93,8 +93,8 @@ fn landings() -> (u64, u64) {
     (rustgis_engine::render::rustgis_tiles::cache::generation(), rustgis_engine::map::source::generation())
 }
 
-/// A page drawn in the browser while something it shows was still on its way: a map frame's tiles
-/// or streamed reads, or a legend's pictures (WMS, WMTS).
+/// A page drawn while something it shows was still on its way: a map frame's tiles or streamed
+/// reads (in the browser), cast shadows, or a legend's pictures (on every platform).
 #[derive(Clone, Copy)]
 struct PageWait {
     /// [`landings`] when it was drawn: anything landing since changes it.
@@ -119,8 +119,7 @@ fn redraw_due(w: PageWait, landed: (u64, u64), now: f64, legends_pending: impl F
 pub struct LayoutView {
     texture: Option<egui::TextureHandle>,
     key: Option<(u64, usize, [usize; 2], i64, i64, i64)>,
-    /// What the page was drawn without (in the browser, which doesn't wait): drawn again once it
-    /// lands.
+    /// What the page was drawn without: drawn again once it lands.
     page_wait: Option<PageWait>,
     /// The last clipping warning shown, cleared when the text fits or another layout opens.
     text_warning: Option<String>,
@@ -734,17 +733,19 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
         let (drawn, said) = rustgis_engine::render::shadows_said(|| {
             rustgis_engine::render::layout::render_pending(&layout, &mut app.session.project.maps, dpi, &info)
         });
-        if let Ok((pm, frames_pending)) = drawn {
+        if let Ok((pm, pending)) = drawn {
             let img = egui::ColorImage::from_rgba_premultiplied([pm.width() as usize, pm.height() as usize], pm.data());
             match &mut app.layout.texture {
                 Some(tex) => tex.set(img, egui::TextureOptions::LINEAR),
                 None => app.layout.texture = Some(ui.ctx().load_texture("layout", img, egui::TextureOptions::LINEAR)),
             }
             app.layout.key = Some(key);
-            // Natively the page waited for them already: drawn again, it would wait again. Cast
-            // shadows still being worked out weren't waited for: drawn again as they land.
+            // Natively a frame's tiles were waited for, so drawing it again would wait again; only
+            // cast shadows still being worked out (`said.to_come`) come back as they land. Legend
+            // pictures are never waited for here, on any platform: `pending.legends` draws the page
+            // again once they have all landed (below).
             let web = cfg!(target_arch = "wasm32");
-            let frames = (web && frames_pending) || said.to_come;
+            let frames = (web && pending.frames) || said.to_come;
             say_frame_shadows(app, &said);
             let clipped = rustgis_engine::render::layout::clipped_text(&layout, &app.session.project.maps, dpi, &info);
             let note = rustgis_engine::render::layout::clipped_text_notice(&clipped);
@@ -756,7 +757,7 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
             }
             // Waiting for the frames draws it again anyway: the legends are asked about once
             // they are whole.
-            let legends = web && !frames && rustgis_engine::render::layout::legends_pending(&layout, &app.session.project.maps);
+            let legends = !frames && pending.legends;
             app.layout.page_wait = (legends || frames).then_some(PageWait { landed, frames, drawn: now });
         }
     }
@@ -1746,7 +1747,7 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                         }
                         ui.end_row();
                     }
-                    ElementKind::Colorbar { frame, layer, title, orientation, ticks, tick_side, reverse } => {
+                    ElementKind::Colorbar { frame, layer, title, orientation, ticks, tick_side, reverse, .. } => {
                         let input_label = ui.label(tl!("Title"));
                         if let Some(tt) = text_field(app, ui, (li, id, "title"), title, false, input_label.id) {
                             update(app, json!({"title": tt}));
@@ -2064,6 +2065,29 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                     }
                     _ => {}
                 }
+                // A legend's, colorbar's, table's or chart's ink (#2257), on and off as a background
+                // is: off is the default dark grey, which isn't the same as a dark grey ink (a table
+                // keeps its white cells only without one). Turned on, it starts white over a dark
+                // background and dark grey otherwise, so its text never disappears.
+                if e.kind.takes_ink() {
+                    let ink = e.kind.ink();
+                    let input_label = ui.label(tl!("Ink"));
+                    ui.horizontal(|ui| {
+                        let mut on = ink.is_some();
+                        let hint = tl!("Its own colour for its text and lines; off, the default dark grey");
+                        if ui.checkbox(&mut on, "").labelled_by(input_label.id).on_hover_text(hint).changed() {
+                            update(app, json!({"color": on.then(|| first_ink(e.background.as_ref()).hex())}));
+                        }
+                        let Some(current) = ink else { return };
+                        let mut c = crate::theme::c32(current);
+                        let resp = crate::widgets::color_button(ui, &mut c);
+                        if resp.changed() {
+                            crate::widgets::one_step_per_press(app, &resp);
+                            update(app, json!({"color": crate::theme::rgba(c).hex()}));
+                        }
+                    });
+                    ui.end_row();
+                }
             },
         );
     });
@@ -2355,15 +2379,42 @@ pub(crate) fn locked_delete() -> &'static str {
     tl!("It is locked, or one of its surrounds is: unlock it first")
 }
 
+/// The ink an element starts with when Ink is turned on (#2257): white over a background that is
+/// dark once drawn on the white page, else the default dark grey, so its text never disappears.
+fn first_ink(background: Option<&Background>) -> rustgis_engine::map::Rgba {
+    let Some(fill) = background.map(|b| b.fill) else { return INK };
+    let a = u16::from(fill.a());
+    let over = |c: u8| u8::try_from((u16::from(c) * a + 255 * (255 - a)) / 255).unwrap_or(u8::MAX);
+    let shown = Color32::from_rgb(over(fill.r()), over(fill.g()), over(fill.b()));
+    let white = rustgis_engine::map::Rgba::rgb(0xFF, 0xFF, 0xFF);
+    if crate::theme::contrast(shown, Color32::WHITE) > crate::theme::contrast(shown, crate::theme::c32(INK)) { white } else { INK }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        FRAMES_REDRAW_S, PageWait, RULER, handle_at, landing, page_rect, redraw_due, resized, rotate_handle, snap_to, to_screen, turned,
+        FRAMES_REDRAW_S, PageWait, RULER, first_ink, handle_at, landing, page_rect, redraw_due, resized, rotate_handle, snap_to, to_screen,
+        turned,
     };
     use crate::RustGisApp;
     use egui::{Event, Key, Modifiers, PointerButton, Pos2, Rect, vec2};
     use serde_json::json;
     use std::{cell::Cell, rc::Rc};
+
+    /// Ink starts white only over a dark background, so turning it on never hides the text (#2257).
+    #[test]
+    fn ink_starts_readable_on_its_background() {
+        use rustgis_engine::map::Rgba;
+        use rustgis_engine::map::layout::{Background, INK};
+        let on = |fill: Rgba| first_ink(Some(&Background { fill, ..serde_json::from_value(json!({})).unwrap() }));
+        let white = Rgba::rgb(0xFF, 0xFF, 0xFF);
+        assert_eq!(first_ink(None), INK);
+        assert_eq!(on(white), INK);
+        assert_eq!(on(Rgba::rgb(0x1E, 0x29, 0x3B)), white);
+        // A dark fill seen through mostly: the page shows, so it reads as light.
+        assert_eq!(on(Rgba::new(0x1E, 0x29, 0x3B, 0x20)), INK);
+        assert_eq!(on(Rgba::new(0x1E, 0x29, 0x3B, 0xE0)), white);
+    }
 
     /// In the browser, a page drawn while its frames' tiles were on their way is drawn again as
     /// they land, at most every `FRAMES_REDRAW_S`, without asking about legends.
@@ -2393,6 +2444,61 @@ mod tests {
         assert!(redraw_due(w, (8, 3), 10.0, || false), "the pictures landed");
         assert!(!redraw_due(w, (8, 3), 60.0, || true), "a fetch landed, but a picture is still on its way");
         assert!(!redraw_due(w, (7, 3), 60.0, || false), "nothing landed");
+    }
+
+    #[test]
+    fn the_desktop_page_waits_for_its_legend_not_unrelated_fetches() {
+        use rustgis_engine::map::{TileKind, TileLayer, layout::ElementKind};
+        use rustgis_engine::render::rustgis_tiles::cache::{self, Want};
+        let _turn = crate::fetching::turn();
+        let (tx, rx) = std::sync::mpsc::channel();
+        cache::set_fetcher(move |url, done| {
+            tx.send((url, done)).unwrap();
+        });
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::from_pixel(24, 24, image::Rgba([220, 20, 20, 255])).write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let png = png.into_inner();
+        let url = "https://layout-wait.test/legend.png";
+        let mut app = RustGisApp::with_sample();
+        app.run("layout.new", json!({"name": "Pending legend"})).unwrap();
+        let li = app.session.active_layout.unwrap();
+        for e in &mut app.session.project.layouts[li].elements {
+            match &mut e.kind {
+                ElementKind::MapFrame { .. } => e.visible = false,
+                ElementKind::Legend { all_classes, .. } => *all_classes = true,
+                _ => {}
+            }
+        }
+        let mut tile = TileLayer::new("Walls", TileKind::Raster, "https://layout-wait.test/{z}/{x}/{y}.png");
+        tile.legends = vec![rustgis_engine::data::ogc::Legend { url: url.into(), ..Default::default() }];
+        app.session.map_mut().tiles.push(tile);
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1000.0, 760.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                super::show(app, ui);
+            },
+            app,
+        );
+        h.run_steps(3);
+        let (asked, legend) = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert_eq!(asked, url);
+        let wait = h.state().layout.page_wait.expect("the desktop keeps the incomplete page pending");
+        assert!(!wait.frames, "legend-only loading must not use progressive frame redraws");
+        let _ = cache::get("https://layout-wait.test/unrelated.png", Want::Image);
+        let (_, unrelated) = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        unrelated(Ok(png.clone()));
+        h.step();
+        assert_eq!(h.state().layout.page_wait.unwrap().drawn, wait.drawn, "an unrelated fetch does not redraw the page");
+        legend(Ok(png));
+        h.step();
+        assert!(h.state().layout.page_wait.is_none(), "the legend's completion redraws and settles the page");
+        h.step();
+        assert!(h.state().layout.page_wait.is_none(), "the completed page stays settled");
     }
 
     #[test]

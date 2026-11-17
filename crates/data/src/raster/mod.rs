@@ -13,7 +13,6 @@ pub mod crs;
 pub(crate) mod epsg_axes;
 mod epsg_gap;
 mod esri;
-mod esri_datums;
 #[cfg(not(target_arch = "wasm32"))]
 mod file_revision;
 #[cfg(not(target_arch = "wasm32"))]

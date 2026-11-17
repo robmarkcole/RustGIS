@@ -2,10 +2,11 @@
 
 use std::path::Path;
 
-use rustgis_data::{GeometryType, photo};
+use rustgis_data::{Dataset, GeometryType, photo};
 use rustgis_map::symbology::{ClassRef, ClassStyle, LABEL_SIZE, MAX_STROKES};
 use rustgis_map::{
-    ClassMethod, Glyph, HiddenFills, LineCap, LineJoin, LineMark, LineMarkers, LineStroke, Marker, NoFill, Placements, Ramp, Renderer, Rgba,
+    ClassMethod, Glyph, HiddenFills, LineCap, LineJoin, LineMark, LineMarkers, LineStroke, Marker, NoFill, Picture, Placements, Ramp,
+    Renderer, Rgba,
 };
 use serde_json::{Value, json};
 
@@ -381,6 +382,9 @@ pub fn commands() -> Vec<C> {
         }).roles(&[]).effects(crate::policy::Effects::NONE)
         .when(need_points)
         .params(r#"{"layer"?, "field": numeric field name|null (each point's marker turned by the angle in it, in degrees; null: not turned), "counterclockwise"?: bool (the angles run counterclockwise, as in mathematics; default clockwise, as on a compass)}"#),
+        C::new("layer.sizeBy", "Size by Field", "Style › Drawing", size_by).roles(&[]).effects(crate::policy::Effects::NONE)
+        .when(need_points)
+        .params(r#"{"layer"?, "field"?: numeric field name|null (each marker sized by its value, keeping its Unique Values or Graduated Colors class's colours; null: the classes' own sizes; left out: the mapping's field, to change its other settings), "min"?: number (the value drawn smallest; default the field's smallest, or the mapping's), "max"?: number (the value drawn largest, above min; default the field's largest, or the mapping's), "minSize"?: points (default 4, or the mapping's), "maxSize"?: points (default 24, or the mapping's), "scaling"?: "area"|"radius" (area: the marker's area grows with the value, as Proportional Symbols; radius: its size grows in a straight line, as MapLibre's; default area, or the mapping's)} (values past min or max take the end's size; a null or non-numeric value keeps its class's size)"#),
         C::new("layer.symbolBy", "Symbol by Expression", "Style › Drawing", symbol_by).roles(&[]).effects(crate::policy::Effects::NONE)
             .when(need_feature_layer)
             .params(r#"{"layer"?, "size"?: expression|null (a point's marker size in points), "fill"?: expression|null (the fill colour: '#RRGGBB', a CSS colour name or 'r,g,b[,a]' as color_rgb gives it), "stroke"?: expression|null (the outline colour, a line's colour), "strokeWidth"?: expression|null (the outline's width in points, a line's width), "angle"?: expression|null (point layers: each marker turned by it, in degrees clockwise, in place of layer.markerRotation's field)} (each expression in the language of queries, per feature, @map_scale the map's scale; a key left out keeps its expression, null or "" removes it; where an expression gives null the symbol's own value is drawn)"#),
@@ -403,10 +407,22 @@ pub fn commands() -> Vec<C> {
             if shape.is_some() && ch.is_some() {
                 return Err("give a shape or a char, not both".into());
             }
+            // Refused before the image is kept: a call that changes nothing keeps nothing.
+            if p.get("image").is_some_and(|v| !v.is_null()) && (shape.is_some() || ch.is_some()) {
+                return Err("give a shape, a char or an image, only one".into());
+            }
+            let id = s.layer_id(p)?;
+            s.map().layer(id).ok_or("no such layer")?;
+            // Decoded here, on the UI thread, as any command runs: at most 2 MiB of base64, whose
+            // declared size is checked before the decoder, capped in memory, runs.
+            let image = picture(p)?;
             with(s, p, |l| {
                 l.renderer.map_symbols(|sym| {
                     if let Some(m) = shape {
                         sym.marker = m;
+                    }
+                    if let Some(img) = image {
+                        sym.marker = Marker::Picture(img);
                     }
                     let was = match sym.marker {
                         Marker::Char(g) => Some(g),
@@ -425,7 +441,7 @@ pub fn commands() -> Vec<C> {
             })
         }).roles(&[]).effects(crate::policy::Effects::NONE)
         .when(need_feature_layer)
-        .params(r#"{"layer"?, "shape"?: "circle"|"square"|"triangle"|"diamond"|"star", "char"?: text (a character of a font as the marker, its first; sized by the font's em), "font"?: text (the installed family the character is drawn from; "" or one not installed: the label font), "size"?: number}"#),
+        .params(r#"{"layer"?, "shape"?: "circle"|"square"|"triangle"|"diamond"|"star", "char"?: text (a character of a font as the marker, its first; sized by the font's em), "font"?: text (the installed family the character is drawn from; "" or one not installed: the label font), "image"?: text (a PNG or JPEG image as base64, at most 2 MiB, as the marker: as wide as the size, as tall as its proportions make it; its fill and outline don't show), "size"?: number}"#),
         C::new("layer.transparency", "Transparency", "Style › Effects", |s, p| {
             let t = f(p, "value").ok_or("value (0–100) is required")?.clamp(0.0, 100.0) as f32;
             with(s, p, |l| l.transparency = t)
@@ -723,6 +739,166 @@ fn need_lines(s: &Session) -> Option<&'static str> {
         Some(_) => Some("this works on line layers"),
         None => Some("select a layer in the Layers pane first"),
     }
+}
+
+/// `layer.sizeBy`: sets (or removes) a classified point layer's marker size from a numeric
+/// field ([`rustgis_map::Layer::size_by`]). What isn't given keeps the mapping's, else the
+/// field's range, 4 to 24 points and area scaling. Desktop range scans use the background read
+/// queue with progress and Cancel; synchronous adapters must dispatch off their window thread.
+fn size_by(s: &mut Session, p: &Value) -> CmdResult {
+    use rustgis_map::symbol_by::{MAX_SIZE, SizeBy, SizeScaling};
+    // Left out, the mapping's own field (to change its other settings); null or "" removes it.
+    let field = match p.get("field") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(Value::String(f)) if f.is_empty() => Some(None),
+        Some(Value::String(f)) => Some(Some(f.clone())),
+        Some(_) => return Err("field is a field's name, or null for none".into()),
+    };
+    let num = |k: &str| match p.get(k) {
+        None | Some(Value::Null) => Ok(None),
+        Some(_) => f(p, k).map(Some).ok_or_else(|| format!("{k} is a number")),
+    };
+    let (min, max, min_size, max_size) = (num("min")?, num("max")?, num("minSize")?, num("maxSize")?);
+    let scaling = match p.get("scaling") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(t)) => Some(SizeScaling::from_code(t).ok_or("scaling is \"area\" or \"radius\"")?),
+        Some(_) => return Err("scaling is \"area\" or \"radius\"".into()),
+    };
+    let id = s.layer_id(p)?;
+    let ahead = super::reads::take::<SizeRangeAhead>(s, &format!("layer.sizeBy:{id}"));
+    #[cfg(not(target_arch = "wasm32"))]
+    let on_window = s.statistics_window_thread == Some(std::thread::current().id());
+    let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
+    if l.geometry_type() != GeometryType::Point || l.graphics {
+        return Err("this works on point layers".into());
+    }
+    let field = match field {
+        Some(field) => field,
+        None => Some(l.size_by.as_ref().map(|b| b.field.clone()).ok_or("give a field: the layer has no size mapping to change")?),
+    };
+    let Some(field) = field else {
+        l.size_by = None;
+        return Ok(Value::Null);
+    };
+    if !matches!(l.renderer, rustgis_map::Renderer::Unique { .. } | rustgis_map::Renderer::Graduated { .. }) {
+        return Err(
+            "size by field goes with Unique Values or Graduated Colors; a single symbol sized by a field is Proportional Symbols".into()
+        );
+    }
+    let fi = l.dataset.field_index(&field).ok_or_else(|| format!("no field named '{field}'"))?;
+    if !l.dataset.fields.get(fi).is_some_and(|fd| fd.ty.is_numeric()) {
+        return Err(format!("'{field}' is not a numeric field"));
+    }
+    let field = l.dataset.fields.get(fi).map(|fd| fd.name.clone()).unwrap_or(field);
+    // The mapping's own where it is of the same field, else the field's range.
+    let had = l.size_by.as_ref().filter(|h| l.dataset.field_index(&h.field) == Some(fi));
+    let (min, max) = (min.or(had.map(|h| h.min)), max.or(had.map(|h| h.max)));
+    let range = if min.is_none() || max.is_none() {
+        // A streamed layer holds the view's features only, so their range would be the view's.
+        if l.is_streamed() {
+            return Err("a size range needs all of a streamed layer: layer.loadAll first, or give min and max".into());
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if ahead.is_none() && on_window {
+            return Err(
+                "size range detection needs the desktop background read queue; give min and max or run layer.sizeBy in the background"
+                    .into(),
+            );
+        }
+        match ahead {
+            Some(a) if a.field == fi && a.dataset.fields == l.dataset.fields && a.dataset.features.shares(&l.dataset.features) => a.range?,
+            Some(_) => return Err("the layer changed while its size range was read: ask again".into()),
+            None => size_range(&l.dataset, fi)?,
+        }
+    } else {
+        None
+    };
+    let min = min.or(range.map(|r| r.0)).ok_or_else(|| format!("'{field}' has no numeric values: give min and max"))?;
+    let max = max.or(range.map(|r| r.1)).ok_or_else(|| format!("'{field}' has no numeric values: give min and max"))?;
+    if max <= min {
+        return Err(format!("max ({max}) must be above min ({min})"));
+    }
+    if !(max - min).is_finite() {
+        return Err(format!("the range from {min} to {max} is too wide to scale sizes over"));
+    }
+    let size = |v: Option<f64>, had: Option<f32>, default: f32, k: &str| -> Result<f32, String> {
+        match v {
+            Some(v) if (0.0..=f64::from(MAX_SIZE)).contains(&v) => Ok(v as f32),
+            Some(_) => Err(format!("{k} is from 0 to {MAX_SIZE} points")),
+            None => Ok(had.unwrap_or(default)),
+        }
+    };
+    let prev = l.size_by.as_ref();
+    let min_size = size(min_size, prev.map(|h| h.min_size), 4.0, "minSize")?;
+    let max_size = size(max_size, prev.map(|h| h.max_size), 24.0, "maxSize")?;
+    let scaling = scaling.or(prev.map(|h| h.scaling)).unwrap_or_default();
+    let by = SizeBy { field, min, max, min_size, max_size, scaling };
+    let out = json!({"field": by.field, "min": by.min, "max": by.max, "minSize": by.min_size, "maxSize": by.max_size, "scaling": by.scaling.code()});
+    l.size_by = Some(by);
+    size_hidden_notice(s, id);
+    Ok(out)
+}
+
+/// Says when a layer's size mapping doesn't show because its points are aggregated into bins,
+/// which are drawn instead of them. Called by `layer.sizeBy` and `layer.aggregation`, whichever
+/// comes second, as for a diagram ([`super::diagram::hidden_notice`]).
+pub(crate) fn size_hidden_notice(s: &mut Session, id: u32) {
+    let text = s.map().layer(id).filter(|l| l.aggregation.is_some() && rustgis_map::symbol_by::SizeBy::applies_to(l)).and_then(|l| {
+        let by = l.size_by.as_ref()?;
+        Some(format!(
+            "Layer '{}': its sizes by {} don't show while its points are aggregated into bins; turn Aggregation off to see them",
+            crate::project::short_name(&l.name),
+            by.field
+        ))
+    });
+    if let Some(text) = text {
+        s.notify(text, false);
+    }
+}
+
+/// A size range prepared on shared rows; landing refuses edits to those rows or their fields.
+struct SizeRangeAhead {
+    dataset: Dataset,
+    field: usize,
+    range: Result<Option<(f64, f64)>, String>,
+}
+
+/// Scans one numeric field once, checking Cancel and advancing progress every 1024 rows.
+fn size_range(dataset: &Dataset, field: usize) -> Result<Option<(f64, f64)>, String> {
+    let count = dataset.features.len();
+    rustgis_data::progress::begin(count);
+    let mut range: Option<(f64, f64)> = None;
+    for (row, feature) in dataset.features.iter().enumerate() {
+        if row % 1024 == 0 {
+            rustgis_data::progress::step((count - row).min(1024)).map_err(|e| e.to_string())?;
+        }
+        if let Some(value) = feature.attrs.get(field).and_then(rustgis_data::Value::as_f64).filter(|v| v.is_finite()) {
+            range = Some(range.map_or((value, value), |(lo, hi)| (lo.min(value), hi.max(value))));
+        }
+    }
+    Ok(range)
+}
+
+/// Prepares range detection off the desktop frame only when the mapping needs bounds. Invalid
+/// requests are left to the command to explain without scanning their data.
+pub(crate) fn size_by_ahead(s: &Session, p: &Value) -> Option<super::reads::ReadWork> {
+    let id = s.layer_id(p).ok()?;
+    let layer = s.map().layer(id)?;
+    let field = layer.dataset.field_index(ps(p, "field")?)?;
+    if !rustgis_map::symbol_by::SizeBy::applies_to(layer) || layer.is_streamed() || !layer.dataset.fields.get(field)?.ty.is_numeric() {
+        return None;
+    }
+    if (f(p, "min").is_some() && f(p, "max").is_some())
+        || layer.size_by.as_ref().is_some_and(|by| layer.dataset.field_index(&by.field) == Some(field))
+    {
+        return None;
+    }
+    let dataset = layer.dataset.clone();
+    Some(super::reads::ahead("Size by Field", format!("layer.sizeBy:{id}"), move || {
+        let range = size_range(&dataset, field);
+        SizeRangeAhead { dataset, field, range }
+    }))
 }
 
 /// `layer.symbolBy`: sets (or removes) the expressions a layer's symbol takes per feature, each
@@ -1352,6 +1528,27 @@ fn character(p: &Value) -> Result<Option<char>, String> {
         Some(Value::String(c)) => c.chars().next().map(Some).ok_or_else(|| "char is a character".into()),
         Some(_) => Err("char is a character".into()),
     }
+}
+
+/// `layer.marker`'s `image`: a PNG or JPEG image as base64, which must decode.
+fn picture(p: &Value) -> Result<Option<Picture>, String> {
+    const WHAT: &str = "image is a PNG or JPEG image as base64";
+    let b64 = match p.get("image") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::String(b64)) => b64.trim(),
+        Some(_) => return Err(WHAT.into()),
+    };
+    if b64.len() > rustgis_map::symbology::MAX_PICTURE_BYTES {
+        return Err(format!("image is at most {} MiB of base64", rustgis_map::symbology::MAX_PICTURE_BYTES >> 20));
+    }
+    if !rustgis_render::picture_marker_readable(b64) {
+        return Err(WHAT.into());
+    }
+    let picture = Picture::new(b64);
+    if picture.is_default() {
+        return Err("no more images can be kept this session: restart RustGIS to use another".into());
+    }
+    Ok(Some(picture))
 }
 
 /// A stroke's `markers`: what it draws along the line instead of a line, and where.
@@ -3525,6 +3722,9 @@ pub(crate) fn add_layer_text(s: &mut Session, text: &str) -> CmdResult {
     }
     for notice in crate::project::label_losses::layer_notices(text, &layer, true) {
         s.notify(notice, false);
+    }
+    for notice in crate::project::picture_notices([&layer], []) {
+        s.notify_text(notice, false);
     }
     // A binding in a file is no authority to use a login here.
     crate::s3_connections::clear_bindings(layer.addresses_mut());

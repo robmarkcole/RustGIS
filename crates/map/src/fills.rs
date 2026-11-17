@@ -44,6 +44,11 @@ pub struct FillLayer {
     pub pattern: FillPattern,
 }
 
+/// Whether any of `fills` draws an image as its dots' marker that `f` holds true for.
+pub fn fills_have_pictures(fills: &[FillLayer], f: impl Fn(crate::symbology::Picture) -> bool) -> bool {
+    fills.iter().any(|fl| matches!(fl.pattern, FillPattern::Dots { marker: Marker::Picture(p), .. } if f(p)))
+}
+
 /// What a fill draws inside its polygon.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
@@ -381,8 +386,10 @@ impl FillLayer {
         match self.pattern {
             FillPattern::Solid => shown,
             FillPattern::Hatch { width, .. } => shown && width > 0.0,
-            FillPattern::Dots { size, outline, outline_width, .. } => {
-                size > 0.0 && (shown || (outline.is_some_and(|o| o.a() > 0) && outline_width > 0.0))
+            // An image shows whatever its colour, as a point's does.
+            FillPattern::Dots { marker, size, outline, outline_width, .. } => {
+                let image = matches!(marker, Marker::Picture(p) if !p.is_default());
+                size > 0.0 && (image || shown || (outline.is_some_and(|o| o.a() > 0) && outline_width > 0.0))
             }
             FillPattern::Gradient { color2, stops, .. } | FillPattern::Shapeburst { color2, stops, .. } => {
                 shown || color2.a() > 0 || stops.as_slice().iter().any(|s| s.color.a() > 0)

@@ -44,7 +44,7 @@ pub use globe::{Globe, Projection};
 pub use raster::{RasterDefaults, RasterLayer, RasterRenderer, RasterStyle, Resampling, Stretch};
 pub use symbology::{
     ClassMethod, Classer, FontName, Glyph, LabelBackground, LabelClass, LabelKey, LabelMatcher, LabelPlacement, Labeling, LineCap,
-    LineJoin, LineMark, LineMarkers, LineStroke, Marker, MarkerRotation, Placements, Renderer, SquareSide, SquareTo, Symbol,
+    LineJoin, LineMark, LineMarkers, LineStroke, Marker, MarkerRotation, Picture, Placements, Renderer, SquareSide, SquareTo, Symbol,
 };
 pub use tiles::{TileKind, TileLayer};
 
@@ -267,6 +267,11 @@ pub struct Layer {
     /// expression (none set: the renderer's symbol alone); drawn through [`Layer::styler`].
     #[serde(default, skip_serializing_if = "symbol_by::SymbolBy::is_empty", deserialize_with = "symbol_by::de_symbol_by")]
     pub symbol_by: symbol_by::SymbolBy,
+    /// A point layer's marker size from a numeric field, beside the colours of its Unique Values
+    /// or Graduated Colors classes; drawn through [`Layer::styler`], before [`Layer::symbol_by`]'s
+    /// size expression (which wins where it gives a size). Kept, unused, under another renderer.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "symbol_by::de_size_by")]
+    pub size_by: Option<symbol_by::SizeBy>,
     /// The scale (1:N) its symbol and label sizes are set for: drawn at another scale they grow
     /// and shrink with the map, as on paper (QGIS's reference scale). `None`: they keep their
     /// size on screen.
@@ -524,6 +529,7 @@ impl Layer {
             marker_rotation: None,
             diagram: None,
             symbol_by: Default::default(),
+            size_by: None,
             reference_scale: None,
             priority: 0,
             design: design::Design::default(),
@@ -643,6 +649,7 @@ impl Layer {
         match src.poll(block) {
             source::Polled::Done(_, batch) => {
                 src.saw_unread_dates(&batch.unread_dates, &batch.rounded_dates);
+                src.saw_null_text(&batch.null_text);
                 self.install(batch.features)
             }
             source::Polled::Failed(_) => self.install(Vec::new()),
@@ -654,6 +661,7 @@ impl Layer {
             match src.poll(block) {
                 source::Polled::Done(_, batch) => {
                     src.saw_unread_dates(&batch.unread_dates, &batch.rounded_dates);
+                    src.saw_null_text(&batch.null_text);
                     self.install(batch.features)
                 }
                 source::Polled::Failed(_) => self.install(Vec::new()),
@@ -1013,6 +1021,24 @@ impl Layer {
         !self.graphics && (!self.fill_layers.is_empty() || self.renderer.has_class_fills())
     }
 
+    /// Whether any marker the layer keeps is an image ([`Marker::Picture`]): its renderer's, its
+    /// stacked strokes' or its dot fills'.
+    pub fn has_picture_markers(&self) -> bool {
+        self.any_picture(|_| true)
+    }
+
+    /// Whether any image the layer keeps as a marker (as [`Layer::has_picture_markers`] finds
+    /// them) is one `f` holds true for.
+    pub fn any_picture(&self, f: impl Fn(symbology::Picture) -> bool + Copy) -> bool {
+        self.renderer.any_picture(f)
+            || symbology::strokes_have_pictures(&self.line_strokes, f)
+            || fills::fills_have_pictures(&self.fill_layers, f)
+            // What No Fill hid is saved too.
+            || self.hidden_fills.as_ref().is_some_and(|h| {
+                fills::fills_have_pictures(&h.fills, f) || h.class_fills.iter().any(|(_, fl)| fills::fills_have_pictures(fl, f))
+            })
+    }
+
     pub fn is_raster(&self) -> bool {
         self.raster.is_some()
     }
@@ -1309,10 +1335,32 @@ impl Layer {
         let query = self.definition_query.as_deref().is_some_and(|q| !q.trim().is_empty());
         let timed = self.time.as_ref().is_some_and(|t| t.window.is_some());
         if !query && !timed && self.display_filters.is_empty() {
-            return (!self.dataset.features.is_empty()).then(|| self.renderer.legend_at(&self.dataset, &[], Some(scale)));
+            return (!self.dataset.features.is_empty())
+                .then(|| self.with_size_legend(self.renderer.legend_at(&self.dataset, &[], Some(scale))));
         }
         let rows = self.drawn_rows(scale);
-        rows.contains(&true).then(|| self.renderer.legend_at(&self.dataset, &rows, Some(scale)))
+        rows.contains(&true).then(|| self.with_size_legend(self.renderer.legend_at(&self.dataset, &rows, Some(scale))))
+    }
+
+    /// A legend's colour classes with the sizes of [`Layer::size_by`] after them, where it applies:
+    /// the smallest, middle and largest value, drawn as the first class is. No size rows for a field
+    /// the layer doesn't have, which the map can't size by either, under a Size expression, or while
+    /// its points are aggregated into bins, which are drawn instead of them.
+    pub fn with_size_legend(&self, mut entries: Vec<symbology::LegendEntry>) -> Vec<symbology::LegendEntry> {
+        // Not under a Size expression either: where it gives a value it wins, so the rows would
+        // show sizes the map doesn't draw.
+        let sized = self.size_by.as_ref().filter(|s| {
+            symbol_by::SizeBy::applies_to(self)
+                && self.aggregation.is_none()
+                && self.dataset.field_index(&s.field).is_some()
+                && self.symbol_by.size.is_none()
+        });
+        if let Some(s) = sized {
+            let like = entries.first().map_or_else(|| self.renderer.base_symbol(), |e| e.symbol);
+            let strokes = entries.first().map(|e| e.strokes.as_slice()).filter(|s| !s.is_empty()).unwrap_or(&self.line_strokes);
+            entries.extend(s.legend(like, strokes));
+        }
+        entries
     }
 
     /// Rows passing the definition query (all rows when none or invalid).
@@ -3157,6 +3205,7 @@ impl Layer {
             stroke_levels: _,
             marker_rotation: _,
             symbol_by: _,
+            size_by: _,
             reference_scale: _,
             priority: _,
             design: _,
@@ -3637,6 +3686,29 @@ mod tests {
             v["hidden_fills"] = unknown.clone();
             assert_eq!(serde_json::from_value::<Layer>(v.clone()).unwrap().hidden_fills, None, "{unknown}");
         }
+    }
+
+    /// An image No Fill hid is saved with the layer, so it counts as one the layer keeps.
+    #[test]
+    fn an_image_no_fill_hid_is_one_the_layer_keeps() {
+        let mut l = Layer::new(1, Dataset::new("parcels", GeometryType::Polygon, vec![]));
+        let dots = fills::FillLayer {
+            color: None,
+            pattern: fills::FillPattern::Dots {
+                marker: symbology::Marker::Picture(symbology::Picture::new("aGlkZGVu")),
+                size: 2.0,
+                outline: None,
+                outline_width: 0.0,
+                spacing: [6.0, 6.0],
+                displacement: [0.0, 0.0],
+                offset: [0.0, 0.0],
+            },
+        };
+        assert!(!l.has_picture_markers());
+        l.hidden_fills = Some(HiddenFills { fills: vec![dots], ..HiddenFills::default() });
+        assert!(l.has_picture_markers());
+        l.hidden_fills = Some(HiddenFills { class_fills: vec![(symbology::ClassRef::Index(0), vec![dots])], ..HiddenFills::default() });
+        assert!(l.has_picture_markers());
     }
 
     #[test]
