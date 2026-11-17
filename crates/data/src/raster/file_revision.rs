@@ -1,4 +1,6 @@
 //! Runtime identity of the local GeoTIFF used to decode a displayed raster.
+//! Metadata comparison, not a content hash: rewrites preserving every compared field are not detected.
+//! Windows compares length, modification and creation times; Unix also compares device, inode and ctime.
 use std::{
     fs::Metadata,
     path::{Path, PathBuf},
@@ -40,8 +42,8 @@ impl super::Raster {
         let current = FileRevision::capture(path, metadata).map_err(|e| e.to_string())?;
         match &self.source_file {
             Some(original) if *original == current => Ok(()),
-            Some(_) => Err("The image file changed since its pixels were loaded. Use Reload Data, then Reload Grid.".into()),
-            None => Err("The displayed image has no verified original file revision. Use Reload Data, then Reload Grid.".into()),
+            Some(_) => Err("The image file changed since its pixels were loaded. Use Reload Data, then retry the operation.".into()),
+            None => Err("The displayed image has no verified original file revision. Use Reload Data, then retry the operation.".into()),
         }
     }
 }

@@ -181,10 +181,15 @@ switching to Web Mercator or using **Cancel Grid Read** stops only that lookup a
 unrelated queued work. The status-bar Cancel retains its queue-wide behaviour. Pixel-based
 drawing waits for a valid grid; a failed or cancelled read never silently substitutes map metres.
 After changing a source file externally, reload the image layer first, then use **Reload Grid**.
-New grid reads from a linked GeoTIFF are refused if its file revision differs from the one
-that supplied the displayed pixels, or that revision cannot be verified. This prevents fitting
-new annotations with a changed file's grid over the previously loaded image. An already-read
+New grid reads from a linked GeoTIFF require loaded pixels and a recorded filesystem-metadata
+revision. A detected metadata mismatch, or an unverifiable revision, refuses the read rather
+than pairing an unchecked header with the displayed image. An already-read
 grid stays aligned with the pixels retained in the session.
+Detection compares filesystem metadata, not file contents: length and modification time, plus
+device/inode/change time on Unix or creation time on Windows. A rewrite preserving every
+compared field is not detected. In particular, Windows cannot detect an in-place rewrite that
+preserves length, modification time and creation time. Reload the image after known external edits
+even if no change was reported.
 Removing/replacing an image invalidates its cached grid. Local and embedded GeoTIFFs are supported; download remote originals
 first. In the browser, upload the original GeoTIFF.
 **Original Image Grid** in Command Search reports the active image's original dimensions and
@@ -483,6 +488,10 @@ keep their current selection when opening the map menu.
    display overview. Local GeoTIFFs and embedded/browser-uploaded GeoTIFFs are supported; remote
    original grids must be downloaded and added first. An unreadable or unsupported source gives
    an error, without falling back to a different grid.
+   A local image must have loaded pixels and a verified file revision matching those pixels;
+   conversion does not read an unchecked header when pixels are missing or their revision is
+   unknown. If asked to reload, use **Reload Data** on the image, then retry **Preview Conversion**
+   or **Convert Now**. The same metadata-detection limits described above apply here.
 2. For a quick conversion, click **Convert Now** to fit and apply using the chosen shape and
    grid, without a preview or another confirmation. Alternatively, click **Preview Conversion**
    to show an orange outline without changing the feature or undo history, review or adjust the

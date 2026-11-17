@@ -57,7 +57,7 @@ pub(crate) fn read(r: &RasterLayer) -> Result<Frame, String> {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let input = std::fs::File::open(path).map_err(|e| e.to_string())?;
-            let displayed = r.data.as_ref().ok_or("reload the image layer before reading its original grid")?;
+            let displayed = r.data.as_ref().ok_or("The image pixels are not loaded. Use Reload Data, then retry the operation.")?;
             let path = std::path::Path::new(path);
             displayed.check_original_file(path, &input.metadata().map_err(|e| e.to_string())?)?;
             let grid = rustgis_data::raster::geotiff::read_image_grid(&input);
