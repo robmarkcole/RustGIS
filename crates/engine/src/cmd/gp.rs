@@ -6700,7 +6700,7 @@ pub(crate) fn vector_file_input(spec: &rustgis_analysis::ToolSpec, map: &rustgis
 mod replay_rollback_tests {
     use super::*;
     use rustgis_data::{Field, FieldType, Geometry, GeometryType, Value as Cell};
-    fn prepare(s: &Session, params: &Value) -> RanAheads {
+    fn prepare(s: &Session, params: &Value) -> Result<RanAheads, String> {
         let mut worker = Session::new(s.project.clone());
         worker.active_layer = s.active_layer;
         worker.opened = s.opened;
@@ -6708,8 +6708,8 @@ mod replay_rollback_tests {
         worker.set_extensions(s.extensions().clone());
         worker.tools_ahead = Some(Ahead::Recording(Vec::new()));
         worker.grids_ahead = Some(crate::image_grid::Ahead::Recording(Vec::new()));
-        worker.run("script.run", params).unwrap();
-        ran_ahead(&mut worker)
+        worker.run("script.run", params)?;
+        Ok(ran_ahead(&mut worker))
     }
     #[test]
     fn annotation_grid_post_apply_replay_error_rolls_back_outputs_history_and_undo() {
@@ -6726,7 +6726,7 @@ mod replay_rollback_tests {
         let params = json!({"script":format!("gp.run {}\nraster.imageGrid {}", json!({"tool":"idwInterpolation","params":{"input":"Samples","field":"v","extent":"0,0,2,2","pixelSize":0.5,"output":"Surface"}}), json!({"layer":"Surface"}))});
         let before = serde_json::to_value(&s.project).unwrap();
         let history = (s.undo_depth(), s.undo_label(), s.redo_label(), s.dirty());
-        let mut ran = prepare(&s, &params);
+        let mut ran = prepare(&s, &params).unwrap();
         // Corrupt only the recorded output identity: the tool's input snapshot and actual
         // output still match, so replay accepts and applies it before binding fails.
         let Some(RanAhead::Tool(tool)) = ran.tools.first_mut() else { panic!("expected prepared tool") };
@@ -6742,7 +6742,7 @@ mod replay_rollback_tests {
         s.run("edit.redo", &json!({})).unwrap();
         assert_eq!(s.project.name, "Future", "a failed replay must preserve the prior Redo entry");
         s.run("edit.undo", &json!({})).unwrap();
-        let ran = prepare(&s, &params);
+        let ran = prepare(&s, &params).unwrap();
         let answer = super::super::reads::taking(&mut s, "script.run", ran, |s| s.run("script.run", &params)).unwrap();
         assert_eq!(answer["ran"][1]["result"]["width"], 4);
         assert_eq!(s.map().layers.iter().filter(|layer| layer.name == "Surface").count(), 1);
