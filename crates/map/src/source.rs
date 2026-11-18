@@ -136,6 +136,10 @@ pub struct SourceLayer {
     /// explicit source reset discards them. Display-only resets preserve them in `sync_sources`.
     #[serde(skip)]
     pub(crate) saved_selection: Vec<u64>,
+    /// The datum grids this window was read with ([`rustgis_data::raster::crs::grid_generation`]):
+    /// a window read before a grid arrived is read again, as after a change of projection.
+    #[serde(skip)]
+    pub(crate) grids: Option<u64>,
     #[serde(skip)]
     pub(crate) window_fields: Option<usize>,
     /// The layer's definition query, applied while a view is read rather than to the rows read.
@@ -1420,7 +1424,7 @@ impl SourceLayer {
             n => n,
         };
         let count = h.info().count;
-        let query = Query { text: query.to_string(), fields: fields.to_vec() };
+        let query = Query { text: query.to_string(), fields: fields.to_vec(), env: Default::default() };
         let crowded = count.is_none_or(|c| c > most as u64) || self.sampled().is_some();
         (window::walked(h.as_ref(), &query).is_none() && crowded).then_some((count, most))
     }
@@ -1546,10 +1550,15 @@ impl SourceLayer {
 
     /// Applies the layer's definition query (`fields` are the layer's) as views are read; a
     /// different one reads the view again.
-    pub(crate) fn set_query(&mut self, text: Option<&str>, fields: &[rustgis_data::Field]) {
+    pub(crate) fn set_query(&mut self, text: Option<&str>, fields: &[rustgis_data::Field], env: &rustgis_data::query::Env) {
         let text = text.map(str::trim).filter(|t| !t.is_empty());
-        if self.query.as_ref().map(|q| (q.text.as_str(), q.fields.as_slice())) != text.map(|t| (t, fields)) {
-            self.query = text.map(|t| Query { text: t.to_string(), fields: fields.to_vec() });
+        let page = env.page.as_ref().filter(|_| text.is_some_and(rustgis_data::query::reads_series_page));
+        if self.query.as_ref().map(|q| (q.text.as_str(), q.fields.as_slice(), q.env.page.as_ref())) != text.map(|t| (t, fields, page)) {
+            self.query = text.map(|t| Query {
+                text: t.to_string(),
+                fields: fields.to_vec(),
+                env: rustgis_data::query::Env { page: page.cloned(), ..Default::default() },
+            });
             // A source that can't be walked reads the same rows whatever the query.
             if self.handle.as_ref().is_some_and(|h| h.visits_chunks()) {
                 self.reread();
@@ -1800,6 +1809,7 @@ impl SourceLayer {
             estimated_row_bytes: _,
             full_read: _,
             saved_selection: _,
+            grids: _,
             window_fields: _,
             query: _,
             opening: _,

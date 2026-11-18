@@ -13,6 +13,7 @@ mod construction;
 pub mod durable;
 pub mod extensions;
 pub mod geometry_calc;
+pub mod grids;
 pub mod image_grid;
 pub mod model;
 mod notice_text;
@@ -40,6 +41,7 @@ pub mod sample;
 #[cfg(feature = "schema")]
 pub mod schema;
 pub mod service_logins;
+pub mod service_tokens;
 pub mod sources;
 #[cfg(test)]
 mod tests;
@@ -197,6 +199,19 @@ pub fn param_keys(desc: &str) -> Option<Vec<&str>> {
     let mut keys = Vec::new();
     param_entries(desc, |key, _| keys.push(key))?;
     Some(keys)
+}
+
+/// The keys of a parameter description whose value is an expression in the language of queries:
+/// those whose type is written `sql` or `expression` (`"where": sql`, `"size"?: expression|null`).
+/// A quoted type (`"where": "an SQL condition…"`) is prose for another language (a database's,
+/// a service's) and isn't one.
+pub fn expression_keys(desc: &str) -> Vec<&str> {
+    let is_expression = |p: &Param| {
+        let Some((_, ty)) = p.text.split_once(':') else { return false };
+        let word = ty.trim_start().split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or("");
+        matches!(word, "sql" | "expression")
+    };
+    param_list(desc).unwrap_or_default().into_iter().filter(|p| is_expression(p)).map(|p| p.key).collect()
 }
 
 /// One entry of a parameter description: its key, whether it may be left out, and its text as
@@ -671,6 +686,8 @@ struct PutAside {
     landed_reads: Vec<(u64, LandedRead)>,
     #[cfg(not(target_arch = "wasm32"))]
     landed_windows: Vec<(u64, cmd::layer::CogWindow)>,
+    #[cfg(not(target_arch = "wasm32"))]
+    landed_pages: Vec<(u64, rustgis_data::raster::Raster)>,
     plugin_retries: Vec<cmd::plugins::fetch::Retry>,
     url_waits: cmd::plugins::fetch::UrlWaits,
     /// A style of the project still loading, which mustn't move the next one's view.
@@ -800,6 +817,20 @@ pub struct Session {
     pub(crate) crs_used_elsewhere: Vec<(String, String)>,
     /// When the frame path last looked for missing datum grids ([`Session::say_grid_notes`]).
     grid_notes_checked: Option<web_time::Instant>,
+    /// The datum grids the map's layers were last projected with
+    /// ([`rustgis_data::raster::crs::grid_generation`]).
+    grid_generation: u64,
+    /// The datum grids whose download was said ([`Self::want_grids_in_use`]).
+    grid_downloads_said: std::collections::HashSet<String>,
+    /// [`crate::grids::turns`] when [`Self::grid_downloads_said`] was last cleared.
+    grid_turns: u64,
+    /// The last datum grid download news this session said ([`crate::grids::news_since`]).
+    grid_news_seen: u64,
+    /// The rebuild failures this session said ([`rustgis_data::raster::crs::rebuild_failures_since`]).
+    rebuild_failures_seen: (usize, usize),
+    /// Whether this front end has the Download Datum Grids setting (the desktop and web apps), so
+    /// a note about a missing grid can point to it; the command line and Python have none.
+    pub offers_grid_downloads: bool,
     /// The count of cloud-optimised GeoTIFF headers landed when [`Session::notice_landed_rasters`]
     /// last looked back at the dates a dated series has shown (`cog::landed_count`).
     cog_headers_seen: u64,
@@ -924,6 +955,10 @@ pub struct Session {
     /// `layer.addDownload` too.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) landed_windows: Vec<(u64, cmd::layer::CogWindow)>,
+    /// PDF pages the app drew off the frame from a download whose bytes landed with them, waiting
+    /// for `layer.addDownload` too (#2336).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) landed_pages: Vec<(u64, rustgis_data::raster::Raster)>,
     /// Downloads a command asked for where nothing may wait (the browser): the parameters of
     /// `layer.addUrl` calls, for the front end to fetch and add (see [`Session::take_url_requests`]).
     pub(crate) url_requests: Vec<UrlRequest>,
@@ -1254,6 +1289,14 @@ impl Session {
             crs_notes_said: Vec::new(),
             crs_used_elsewhere: Vec::new(),
             grid_notes_checked: None,
+            grid_generation: rustgis_data::raster::crs::grid_generation(),
+            grid_downloads_said: Default::default(),
+            grid_turns: 0,
+            grid_news_seen: crate::grids::news_told(),
+            // From the run's start: the transformers are the process's, so one this session uses
+            // may have failed before it began.
+            rebuild_failures_seen: (0, 0),
+            offers_grid_downloads: false,
             cog_headers_seen: 0,
             terrain_blocks_checked: Default::default(),
             table_layer: None,
@@ -1311,6 +1354,8 @@ impl Session {
             landed_reads: Vec::new(),
             #[cfg(not(target_arch = "wasm32"))]
             landed_windows: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            landed_pages: Vec::new(),
             url_requests: Vec::new(),
             window_view: None,
             file_outputs: Vec::new(),
@@ -1422,6 +1467,19 @@ impl Session {
         let landed = self.landed(id);
         if landed {
             self.landed_windows.push((id, window));
+        }
+        landed
+    }
+
+    /// Hands over a PDF download's bytes with its page drawn off the frame
+    /// ([`cmd::raster::read_download_page`]), for `layer.addDownload {"id"}` as
+    /// [`Session::download_landed`] does.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn download_landed_page(&mut self, id: u64, bytes: Vec<u8>, page: rustgis_data::raster::Raster) -> bool {
+        let landed = self.landed(id);
+        if landed {
+            self.downloaded.push((id, bytes));
+            self.landed_pages.push((id, page));
         }
         landed
     }
@@ -2111,6 +2169,8 @@ impl Session {
             landed_reads: take(&mut self.landed_reads),
             #[cfg(not(target_arch = "wasm32"))]
             landed_windows: take(&mut self.landed_windows),
+            #[cfg(not(target_arch = "wasm32"))]
+            landed_pages: take(&mut self.landed_pages),
             url_requests: take(&mut self.url_requests),
             policy_work: self.take_policy_work(),
             plugin_retries: take(&mut self.plugin_retries),
@@ -2167,6 +2227,8 @@ impl Session {
             landed_reads,
             #[cfg(not(target_arch = "wasm32"))]
             landed_windows,
+            #[cfg(not(target_arch = "wasm32"))]
+            landed_pages,
             url_requests,
             policy_work,
             plugin_retries,
@@ -2199,6 +2261,7 @@ impl Session {
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.landed_windows = landed_windows;
+            self.landed_pages = landed_pages;
         }
         (self.trend_results, self.raster_results, self.raster_runs) = (trend_results, raster_results, raster_runs);
         #[cfg(feature = "geolibre")]
@@ -2221,6 +2284,32 @@ impl Session {
     /// each frame. Also reports streamed vector read failures once, naming their linked file
     /// and how to repair it when one is available.
     pub fn notice_landed_rasters(&mut self) {
+        // Datum grids that have arrived move what the map draws in a system they shift: its
+        // layers are projected again, and drawn.
+        let news = crate::grids::news_since(&mut self.grid_news_seen);
+        let missed: u64 = news.iter().map(|n| if let crate::grids::News::Missed(m) = n { *m } else { 0 }).sum();
+        if missed > 0 {
+            self.notify_text(crate::grids::missed_text(missed), false);
+        }
+        for (text, error) in crate::grids::news_texts(&news) {
+            self.notify(text, error);
+        }
+        for n in &news {
+            // Its download is over: one tried again (the setting turned on again) is said again.
+            if let crate::grids::News::Got { name, .. } | crate::grids::News::Failed { name, .. } = n {
+                self.grid_downloads_said.remove(name);
+            }
+        }
+        // A grid that arrived can bring up the next ones the systems in use need.
+        // (Missed news may have held one: asking again is harmless, downloads aren't repeated.)
+        if news.iter().any(|n| matches!(n, crate::grids::News::Got { .. } | crate::grids::News::Missed(_))) {
+            self.want_grids_in_use();
+        }
+        let grids = rustgis_data::raster::crs::grid_generation();
+        if grids != self.grid_generation {
+            self.grid_generation = grids;
+            self.touch_all_geometry();
+        }
         cmd::terrain_blocks::landed(self);
         self.notice_landed_pixels();
         // From frames too: a system a frame first drew needs no command after it to be said.
@@ -2562,9 +2651,77 @@ impl Session {
         // and the custom systems a run keeps.
         if !found.is_empty() {
             let labels: Vec<String> = found.iter().map(|(_, label)| label.clone()).collect();
+            // What gets the grids: the downloads started for them, when the user has them on,
+            // else where to turn them on, where this front end has the setting.
+            // The systems behind them, by definition, for downloading the grids a note says are missing.
+            let behind = self.systems_in_use();
+            let mut coming: Vec<String> = Vec::new();
+            for (_, crs) in behind.iter().filter(|(def, _)| found.iter().any(|(d, _)| d == def)) {
+                for name in crate::grids::want(*crs) {
+                    if !coming.contains(&name) {
+                        coming.push(name);
+                    }
+                }
+            }
+            let tail = if !self.offers_grid_downloads {
+                String::new()
+            } else if crate::grids::enabled() && !coming.is_empty() {
+                // Said here: not again by the next ask while they are under way.
+                self.sync_grid_turns();
+                self.grid_downloads_said.extend(coming.iter().cloned());
+                format!(". RustGIS is downloading {}", names_said(&coming))
+            } else if crate::grids::enabled() && found.iter().all(|(d, _)| behind.iter().any(|(b, _)| b == d)) {
+                ". None of the grids they need can be downloaded from PROJ's grid server now".to_string()
+            } else if crate::grids::enabled() {
+                // A system only a command used (an export's target): its grids aren't asked for
+                // here, so whether they can be downloaded isn't known.
+                String::new()
+            } else if behind
+                .iter()
+                .any(|(d, crs)| found.iter().any(|(f, _)| f == d) && !rustgis_data::raster::crs::missing_grids(*crs).is_empty())
+            {
+                ". Settings › Datum Grids › Download Datum Grids gets them from PROJ's grid server".to_string()
+            } else {
+                // None PROJ's grid server has openly, or a system only a command used: the
+                // setting wouldn't (or can't be known to) bring them.
+                String::new()
+            };
             // A few named, each cut, and the rest counted: the notice stays short however many.
-            self.notify(grid_notes_text(labels.len(), &names_said(&labels)), false);
+            self.notify(format!("{}{tail}", grid_notes_text(labels.len(), &names_said(&labels))), false);
             self.crs_notes_said.extend(found.into_iter().map(|(def, _)| def));
+        }
+        let (failed, shown) = rustgis_data::raster::crs::rebuild_failures_since(&mut self.rebuild_failures_seen);
+        if failed > 0 {
+            use notice_text::NoticeText;
+            // Those named, and the rest counted; with none named (all past those kept by name),
+            // the count alone. The names are the systems' own text, never translated.
+            let key = match (failed == 1, shown.is_empty(), failed > shown.len()) {
+                (true, false, _) => {
+                    "{count} coordinate system couldn't be built again with the datum grids that arrived, so it goes on without it: {names}"
+                }
+                (true, true, _) => {
+                    "{count} coordinate system couldn't be built again with the datum grids that arrived, so it goes on without it"
+                }
+                (false, true, _) => {
+                    "{count} coordinate systems couldn't be built again with the datum grids that arrived, so they go on without them"
+                }
+                (false, false, false) => {
+                    "{count} coordinate systems couldn't be built again with the datum grids that arrived, so they go on without them: {names}"
+                }
+                (false, false, true) => {
+                    "{count} coordinate systems couldn't be built again with the datum grids that arrived, so they go on without them: {names} and {more} more"
+                }
+            };
+            let text = NoticeText::format(
+                key,
+                [
+                    ("count", failed.to_string().into()),
+                    ("names", shown.join(", ").into()),
+                    ("more", (failed - shown.len()).to_string().into()),
+                ],
+            );
+            // As the note of a missing grid: it goes on as it was, places may be off.
+            self.notify_text(text, false);
         }
         if rustgis_data::raster::crs::take_unnamed_grid_need() {
             self.notify(
@@ -2572,6 +2729,66 @@ impl Session {
                 false,
             );
         }
+    }
+
+    /// Forgets the downloads said when the setting was turned on again since: those dropped when
+    /// it was turned off are said again when asked for again.
+    fn sync_grid_turns(&mut self) {
+        let turns = crate::grids::turns();
+        if turns != self.grid_turns {
+            self.grid_turns = turns;
+            self.grid_downloads_said.clear();
+        }
+    }
+
+    /// The coordinate systems the project's maps are drawn in and their layers are in, with the
+    /// definitions their transformers are kept under.
+    fn systems_in_use(&self) -> Vec<(String, rustgis_data::raster::Crs)> {
+        use rustgis_data::raster::crs::definition_and_label;
+        let mut out: Vec<(String, rustgis_data::raster::Crs)> = Vec::new();
+        let mut add = |def: String, crs: rustgis_data::raster::Crs| {
+            if !out.iter().any(|(d, _)| *d == def) {
+                out.push((def, crs));
+            }
+        };
+        for map in &self.project.maps {
+            if let rustgis_map::Projection::Custom(code) = &map.projection
+                && let (Ok((def, _)), Ok(crs)) = (rustgis_map::projection::lookup(code), rustgis_data::raster::Crs::parse(code))
+            {
+                add(def, crs);
+            }
+            for layer in &map.layers {
+                let raster = layer.raster.as_ref().and_then(|r| r.data.as_ref()).map(|r| r.crs);
+                for crs in layer.dataset.crs.into_iter().chain(raster) {
+                    if let Some((def, _)) = definition_and_label(crs) {
+                        add(def, crs);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Starts downloading the datum grids the systems in use need, when downloads are on (the
+    /// setting turned on, a grid that arrived and brings up the next), and says which: the names of
+    /// those on their way.
+    pub fn want_grids_in_use(&mut self) -> Vec<String> {
+        let mut coming: Vec<String> = Vec::new();
+        for (_, crs) in self.systems_in_use() {
+            for name in crate::grids::want(crs) {
+                if !coming.contains(&name) {
+                    coming.push(name);
+                }
+            }
+        }
+        // Each grid's download said once: a later ask finds those still coming.
+        self.sync_grid_turns();
+        let new: Vec<String> = coming.iter().filter(|n| !self.grid_downloads_said.contains(*n)).cloned().collect();
+        if !new.is_empty() {
+            self.notify(format!("Downloading the datum grids {} from PROJ's grid server", names_said(&new)), false);
+            self.grid_downloads_said.extend(new);
+        }
+        coming
     }
 
     /// [`Self::say_grid_notes`] from the frame path: at most once a second, as a frame comes many

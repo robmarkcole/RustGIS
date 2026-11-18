@@ -23,10 +23,11 @@ ecolor, eframe, egui, egui-wgpu, egui-winit, egui_extras, either, emath, encodin
 enum-map-derive, epaint, equivalent, errno, euclid, event-listener, event-listener-strategy,
 fastrand, fdeflate, fearless_simd, filetime, find-msvc-tools, fixedbitset, flagset, flatbuffers,
 flate2, form_urlencoded, futures-lite, futures-timer, geo, geo-traits, geo-types, geozero,
-gethostname, gif, gl_generator, glow, guillotiere, half, hash32, hashbrown, hashlink, heapless,
-heck, hkdf, hmac, httparse, hybrid-array, i_overlay, idna, idna_adapter, image, image-webp,
-indexmap, inout, io-enum, itertools, itoa, jobserver, js-sys, keyboard-types, khronos-egl,
-khronos_api, kurbo, laz, lazy_static, leb128fmt, lerc-core, lerc-reader, libc,
+gethostname, gif, gl_generator, glow, guillotiere, half, hash32, hashbrown, hashlink, hayro,
+hayro-ccitt, hayro-cmap, hayro-font, hayro-interpret, hayro-jbig2, hayro-jpeg2000, hayro-postscript,
+hayro-syntax, heapless, heck, hkdf, hmac, httparse, hybrid-array, i_overlay, idna, idna_adapter,
+image, image-webp, indexmap, inout, io-enum, itertools, itoa, jobserver, js-sys, keyboard-types,
+khronos-egl, khronos_api, kurbo, laz, lazy_static, leb128fmt, lerc-core, lerc-reader, libc,
 linebender_resource_handle, linux-raw-sys, litrs, lock_api, log, lyon, lyon_algorithms, lyon_geom,
 lyon_path, lyon_tessellation, md-5, md5, miniz_oxide, muda, multiversion_no_op, mysql, mysql_common,
 naga, naga-types, named_pipe, nohash-hasher, ntapi, num, num-bigint, num-complex, num-conv,
@@ -4119,7 +4120,7 @@ limitations under the License.
 
 ====================================================================================================
 Apache License 2.0
-Used by: moxcms, pxfm
+Used by: moxcms, pic-scale, pxfm
 ====================================================================================================
 
                                  Apache License
@@ -7946,7 +7947,7 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 
 ====================================================================================================
 BSD 3-Clause "New" or "Revised" License
-Used by: alloc-no-stdlib, brotli-decompressor
+Used by: alloc-no-stdlib, brotli, brotli-decompressor
 ====================================================================================================
 
 Copyright (c) 2016 Dropbox, Inc.
@@ -9217,6 +9218,31 @@ LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE A
 EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
 IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
 USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+====================================================================================================
+MIT License
+Used by: brotli
+====================================================================================================
+
+Copyright (c) 2009, 2010, 2013-2016 by the Brotli Authors.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
 
 ====================================================================================================
 MIT License
@@ -11958,13 +11984,20 @@ Terrio files derived from PROJ source files (each file's header names them):
   crates/terrio-crs/src/def.rs
   crates/terrio-crs/src/grid.rs
   crates/terrio-crs/src/math.rs
+  crates/terrio-crs/src/params.rs
   crates/terrio-crs/src/projections.rs
   crates/terrio-crs/src/projections/perspective.rs
   crates/terrio-crs/src/proj_write.rs
   crates/terrio-crs/src/rotation.rs
   crates/terrio-crs/src/route.rs
+  crates/terrio-crs/src/wkt2.rs
 
 The two-point form of the Hotine oblique Mercator follows src/projections/omerc.cpp in PROJ 9.8.1.
+
+The test data crates/terrio-crs/tests/data/proj_ellipsoid_shape.json is PROJ 9.8.1's output
+(pyproj 3.8.0, scripts/gen_proj_ellipsoid_shape.py): the coordinates and ellipsoids PROJ gives
+PROJ strings and WKTs, by its ellipsoid and datum definitions (src/ellps.cpp, src/datums.cpp)
+and, through its database, EPSG's transformations (EPSG dataset, see below).
 
 The copyright notices of those source files:
   Copyright (c) 2016, Thomas Knudsen / SDFE
@@ -12073,6 +12106,20 @@ crates/terrio-crs/src/projjson_gdal.rs come from it too.
 The EPSG names, areas of use and projection method names in
 crates/terrio-crs/data/crs_catalog.tsv.zst are derived from the same dataset (EPSG v12.029),
 through PROJ 9.8.1's database and GDAL (scripts/gen_crs_catalog.py), under the same terms.
+The EPSG names and aliases in crates/terrio-crs/data/crs_names.tsv.zst are derived from the
+same dataset, through PROJ 9.8.1's database (scripts/gen_crs_names.py), under the same terms.
+So are the EPSG WKTs and points of the test data crates/terrio-crs/tests/data/wkt_unresolved.json
+(PROJ 9.8.1's WKTs of EPSG CRSs and its placements of points in them, by
+scripts/gen_wkt_unresolved.py).
+So are the EPSG WKTs, datums and transformations of the test data in
+crates/terrio-crs/tests/data/: grads_and_prime_meridians.json, wkt_datum_shift.json,
+wkt1_axes.json, wkt1_proj_reads.json, wkt2_bound.json and proj_ellipsoid_shape.json (PROJ 9.8.1's
+WKTs and placements of points, by scripts/gen_grads_and_prime_meridians.py,
+gen_wkt_datum_shift.py, gen_wkt1_axes.py, gen_wkt1_proj_reads.py, gen_wkt2_bound.py and
+gen_proj_ellipsoid_shape.py).
+So are the EPSG codes, names and replacements of the deprecated EPSG CRSs in the test data
+crates/terrio-crs/tests/data/epsg_deprecated.json (PROJ 9.8.1's placements of points in them, by
+scripts/gen_epsg_deprecated.py).
 The EPSG rows of the test data crates/terrio-crs/tests/data/proj_string_export.tsv and
 wkt1_strict_export.tsv (PROJ 9.8.1's PROJ strings and WKT 1 of EPSG CRSs, by
 scripts/gen_proj_string_export.py and scripts/gen_wkt1_strict_export.py) and geokeys_gdal.tsv
@@ -12088,13 +12135,19 @@ crates/terrio-crs/data/esri.tsv.zst, and the Esri datum names in
 crates/terrio-crs/data/datums.tsv.zst, are derived, through PROJ 9.7.1's database, from Esri's
 projection engine documentation (https://github.com/Esri/projection-engine-db-doc), modified.
 The ESRI names, areas of use and projection method names in
-crates/terrio-crs/data/crs_catalog.tsv.zst are derived from the same documentation (ArcGIS Pro
-3.6), through PROJ 9.8.1's database, as are the ESRI rows of the test data
+crates/terrio-crs/data/crs_catalog.tsv.zst, the ESRI aliases in
+crates/terrio-crs/data/crs_names.tsv.zst, and the ESRI WKTs of the test data
+crates/terrio-crs/tests/data/wkt_unresolved.json, grads_and_prime_meridians.json and
+wkt_datum_shift.json, are derived from the same documentation (ArcGIS Pro 3.6), through PROJ
+9.8.1's database, as are the ESRI rows of the test data
 crates/terrio-crs/tests/data/proj_string_export.tsv and wkt1_strict_export.tsv (PROJ 9.8.1's
 PROJ strings and WKT 1 of ESRI CRSs), geokeys_gdal.tsv (GDAL 3.12.1's GeoKeys of ESRI CRSs) and
 crs_accessors.tsv (PROJ 9.8.1's axis orders, ellipsoids and conversion parameters of ESRI CRSs).
 The ESRI celestial bodies and their semi-major axes in crates/terrio-crs/src/bodies.rs are derived
 from the same documentation, through PROJ 9.8.1's database (scripts/gen_celestial_bodies.py).
+The ESRI names in the test data crates/terrio-crs/tests/data/wkt1_proj_reads.json (Makassar /
+NEIEZ as an ESRI `.prj` names it, `D_Makassar`) and wkt2_bound.json (`D_OSGB_1936`) follow the
+same documentation.
 
   Copyright © 2010-2025 Esri
 

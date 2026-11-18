@@ -532,10 +532,10 @@ fn sources_opening(app: &RustGisApp) -> bool {
     app.session.project.maps.iter().flat_map(|m| &m.layers).filter_map(|l| l.source.as_ref()).any(|s| s.opening_progress().is_some())
 }
 
-/// Whether windows are being read off the frame (none in the browser).
+/// Whether windows or PDF pages are being read off the frame (none in the browser).
 fn window_reads_under_way(app: &RustGisApp) -> bool {
     #[cfg(not(target_arch = "wasm32"))]
-    return !app.ui.window_reads.is_empty();
+    return !app.ui.window_reads.is_empty() || !app.ui.page_reads.is_empty() || !app.ui.page_queue.is_empty();
     #[cfg(target_arch = "wasm32")]
     {
         let _ = app;
@@ -657,10 +657,13 @@ pub fn shortcuts(app: &mut RustGisApp, ctx: &egui::Context) {
     }
     crate::modelbuilder::shortcuts(app, ctx);
     // The search box (or a table cell) was typed in until egui took its focus away on Escape:
-    // that Escape clears the box (leaves the cell as it was), not the tool.
+    // that Escape clears the box (leaves the cell as it was), not the tool. An open list (a
+    // clause's Functions) keeps the same keys as a box, those without Ctrl (⌘): Escape closes it.
     let pass = ctx.cumulative_pass_nr();
-    let typing =
-        ctx.egui_wants_keyboard_input() || crate::searchbox::had_focus(&app.ui.search, pass) || crate::table::had_focus(&app.table, pass);
+    let typing = ctx.egui_wants_keyboard_input()
+        || crate::completion::menu_is_open(ctx)
+        || crate::searchbox::had_focus(&app.ui.search, pass)
+        || crate::table::had_focus(&app.table, pass);
     // A text field focused, not any widget (a button reached with Tab): it has an undo of its own.
     let text_field = ctx.text_edit_focused();
     // An element selected in the open layout, for the layout's own keys.
@@ -890,6 +893,7 @@ pub(crate) const UI_COMMANDS: &[(&str, &str, &str)] = &[
     ("ui.themeLoad", "Load a Theme from File…", "Settings › Theme"),
     ("ui.themeReload", "Reload Themes", "Settings › Theme"),
     ("ui.scale", "Reset Interface Scale", "Settings › Theme"),
+    ("ui.datumGrids", "Toggle Downloading Datum Grids", "Settings › Datum Grids"),
     ("ui.map.gpu", "Toggle GPU Rendering", "View"),
     ("ui.importShapefile", "Import Shapefile with Projection…", "Home › Add"),
     ("ui.measurementUnits", "Toggle Imperial Measurements", "Home › Inspect › Measure"),

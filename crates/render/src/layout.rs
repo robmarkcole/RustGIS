@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 
 use crate::Canvas;
 use rustgis_data::GeometryType;
+use rustgis_data::query::{Env, SeriesPage};
 use rustgis_geom::{Coord, Extent};
 use rustgis_map::layout::{
     ArrowStyle, ColorScale, ElementKind, FrameShape, Grid, GridKind, INK, Layout, LineHead, MAX_LEGEND_COLUMNS, Orientation, PT_PER_MM,
@@ -24,6 +25,21 @@ pub struct PageInfo {
     pub pages: usize,
     /// The map series page's name.
     pub page_name: String,
+}
+
+/// Takes the series page's expression values before any frame changes a streamed layer's
+/// drawing window. An ordinary layout or a missing index row has no page variables.
+pub fn series_env(layout: &Layout, maps: &[Map]) -> Env {
+    let page = || {
+        let row = layout.series.as_ref()?.page;
+        let (layer, field) = layout.series_index(maps)?;
+        Some(std::sync::Arc::new(SeriesPage {
+            feature_id: layer.dataset.features.get(row)?.id,
+            name: rustgis_map::layout::series_page_name(layer, field, row),
+            number: row + 1,
+        }))
+    };
+    Env { page: page(), ..Env::default() }
 }
 
 /// Largest page drawn, in pixels per side and in all (less in the browser, where memory is
@@ -113,7 +129,8 @@ fn render_pending_inner(
     let (w, h, k) = page_geometry(layout, dpi);
     let bounds = tiny_skia::IntRect::from_xywh(0, 0, w, h)?;
     let mut pending = PagePending::default();
-    let pm = draw_page(layout, maps, info, k, bounds, None, None, (&mut pending, wait_legends), source_error)?.into_pixmap();
+    let env = series_env(layout, maps);
+    let pm = draw_page(layout, maps, (info, &env), k, bounds, None, None, (&mut pending, wait_legends), source_error)?.into_pixmap();
     Some((pm, pending))
 }
 
@@ -147,8 +164,10 @@ fn render_drawing_inner(
     let (w, h, k) = page_geometry(layout, dpi);
     let bounds = tiny_skia::IntRect::from_xywh(0, 0, w, h)?;
     let mut pictured = Vec::new();
-    let drawing = draw_page(layout, maps, info, k, bounds, None, Some(&mut pictured), (&mut PagePending::default(), true), source_error)?
-        .into_drawing()?;
+    let env = series_env(layout, maps);
+    let drawing =
+        draw_page(layout, maps, (info, &env), k, bounds, None, Some(&mut pictured), (&mut PagePending::default(), true), source_error)?
+            .into_drawing()?;
     Some((drawing, pictured))
 }
 
@@ -257,11 +276,11 @@ pub(crate) fn render_element(
     id: u32,
     maps: &mut [Map],
     dpi: f64,
-    info: &PageInfo,
+    page: (&PageInfo, &Env),
     source_error: &mut Option<String>,
 ) -> Option<Option<(Pixmap, [f64; 4])>> {
     let Some((bounds, k, mm)) = element_bounds(layout, id, dpi)? else { return Some(None) };
-    let pm = draw_page(layout, maps, info, k, bounds, Some(id), None, (&mut PagePending::default(), true), source_error)?.into_pixmap();
+    let pm = draw_page(layout, maps, page, k, bounds, Some(id), None, (&mut PagePending::default(), true), source_error)?.into_pixmap();
     Some(Some((pm, mm)))
 }
 
@@ -273,12 +292,12 @@ pub(crate) fn record_element(
     id: u32,
     maps: &mut [Map],
     dpi: f64,
-    info: &PageInfo,
+    page: (&PageInfo, &Env),
     pictured: &mut Vec<(u32, String)>,
     source_error: &mut Option<String>,
 ) -> Option<Option<(crate::vector::Drawing, [f64; 4], f64)>> {
     let Some((bounds, k, mm)) = element_bounds(layout, id, dpi)? else { return Some(None) };
-    let drawing = draw_page(layout, maps, info, k, bounds, Some(id), Some(pictured), (&mut PagePending::default(), true), source_error)?
+    let drawing = draw_page(layout, maps, page, k, bounds, Some(id), Some(pictured), (&mut PagePending::default(), true), source_error)?
         .into_drawing()?;
     Some(Some((drawing, mm, k)))
 }
@@ -306,7 +325,7 @@ fn element_bounds(layout: &Layout, id: u32, dpi: f64) -> Option<Option<(tiny_ski
 fn draw_page(
     layout: &Layout,
     maps: &mut [Map],
-    info: &PageInfo,
+    (info, env): (&PageInfo, &Env),
     k: f64,
     bounds: tiny_skia::IntRect,
     element: Option<u32>,
@@ -348,9 +367,9 @@ fn draw_page(
             let view = View { width: fw, height: fh, pixels_per_point: 1.0, camera: cam, sky: false };
             let lonlat = crate::view_lonlat(map, &view);
             let scale = map.ground_res_at(&cam) / rustgis_geom::PIXEL_M;
-            map.sync_sources(&lonlat, scale, true);
+            map.sync_sources_with(&lonlat, scale, true, env);
             let mut failed_source = None;
-            let Some(entries) = complete_shown_legends(map, scale, *show_no_data, &mut failed_source) else {
+            let Some(entries) = complete_shown_legends(map, scale, *show_no_data, &mut failed_source, env) else {
                 *source_error = failed_source_error(map, failed_source);
                 return None;
             };
@@ -383,8 +402,7 @@ fn draw_page(
                 // clear of the grid's labels.
                 let grid = grid.as_ref().map(|g| (g, layout.decimal_comma));
                 let mut failed_source = None;
-                let Some(mut frame_pm) =
-                    frame_canvas(map, cam, fw, fh, fppp, pm.is_recording(), &mut pending.frames, grid, &mut failed_source)
+                let Some(mut frame_pm) = frame_canvas(map, &view, pm.is_recording(), &mut pending.frames, grid, &mut failed_source, env)
                 else {
                     if frame_requires_complete(map, &view) {
                         *source_error = failed_source_error(map, failed_source);
@@ -399,7 +417,7 @@ fn draw_page(
                     frame_pm.overflowed() || pm.recorded_cost().saturating_add(frame_pm.recorded_cost()) > crate::vector::max_cost();
                 if frame_pm.is_recording()
                     && too_large
-                    && let Some(pixels) = frame_canvas(map, cam, fw, fh, fppp, false, &mut pending.frames, grid, &mut None)
+                    && let Some(pixels) = frame_canvas(map, &view, false, &mut pending.frames, grid, &mut None, env)
                 {
                     frame_pm = pixels;
                     if let Some(list) = record.as_deref_mut() {
@@ -651,7 +669,8 @@ fn draw_page(
 pub fn frame_map(map: &mut Map, camera: rustgis_map::Camera, w: f64, h: f64, ppp: f64) -> Result<Pixmap, String> {
     let revisions = crate::archive_revisions([&*map]);
     let mut failed_source = None;
-    let result = frame_canvas(map, camera, w, h, ppp, false, &mut false, None, &mut failed_source).map(Canvas::into_pixmap);
+    let view = View { width: w, height: h, pixels_per_point: ppp, camera, sky: false };
+    let result = frame_canvas(map, &view, false, &mut false, None, &mut failed_source, &Env::default()).map(Canvas::into_pixmap);
     revisions.finish(map, failed_source, result, "could not draw the map frame")
 }
 
@@ -662,32 +681,32 @@ pub fn frame_map(map: &mut Map, camera: rustgis_map::Camera, w: f64, h: f64, ppp
 /// still on their way (in the browser, which doesn't wait for them).
 fn frame_canvas(
     map: &mut Map,
-    camera: rustgis_map::Camera,
-    w: f64,
-    h: f64,
-    ppp: f64,
+    view: &View,
     record: bool,
     pending: &mut bool,
     grid: Option<(&Grid, bool)>,
     failed_source: &mut Option<u64>,
+    env: &Env,
 ) -> Option<Canvas> {
-    let view = View { width: w, height: h, pixels_per_point: ppp, camera, sky: false };
     // Why its layers were drawn without their cast shadows is kept for the page's caller (see
     // `crate::shadows_said`).
-    let (img, shadows) = crate::frame_with_shadows_to_come(|| {
-        if record { crate::render_complete_recorded(map, &view, failed_source) } else { crate::complete(map, &view, false, failed_source) }
-    });
+    let (img, shadows) = crate::frame_with_shadows_to_come(|| crate::complete(map, view, record, failed_source, env));
     let img = img?;
     *pending |= img.tiles_pending || img.data_pending || shadows;
-    Some(finish_frame(img, ppp, grid.map(|(g, comma)| (&*map, &view, g, comma))))
+    Some(finish_frame(img, view.pixels_per_point, grid.map(|(g, comma)| (&*map, view, g, comma))))
 }
 
 /// [`frame_map`] without waiting for tiles still on their way, for a preview drawn while the
 /// interface waits: a pan's preview, whose size is more than the frame's for the overscan slid
 /// under the pointer.
 pub fn frame_map_preview(map: &mut Map, camera: rustgis_map::Camera, w: f64, h: f64, ppp: f64) -> Option<Pixmap> {
+    frame_map_preview_with(map, camera, w, h, ppp, &Env::default())
+}
+
+/// Map preview during a layout pan, using the same expression context as its page.
+pub fn frame_map_preview_with(map: &mut Map, camera: rustgis_map::Camera, w: f64, h: f64, ppp: f64, env: &Env) -> Option<Pixmap> {
     let view = View { width: w, height: h, pixels_per_point: ppp, camera, sky: false };
-    crate::render(map, &view).map(|img| finish_frame(img, ppp, None).into_pixmap())
+    crate::render_cpu(map, &view, false, false, &mut None, env).map(|img| finish_frame(img, ppp, None).into_pixmap())
 }
 
 /// A rendered frame map with its labels, its `grid` (drawn on `map` in `view`, with a decimal
@@ -1367,14 +1386,30 @@ pub(crate) fn nice_step(span: f64, smallest: f64) -> f64 {
 fn draw_grid(pm: &mut Canvas, map: &Map, view: &View, g: &Grid, comma: bool) -> Vec<(Edge, [f32; 4])> {
     let ppp = view.pixels_per_point as f32;
     let (w, h) = (view.width, view.height);
+    // On a globe, through the globe as the frame draws it (#2337): through the flat camera the
+    // lines would be laid out as a flat world around it.
+    let globe = map.projection.is_globe().then(|| rustgis_map::globe::Globe::new(&view.camera, w, h));
+    let lonlat_at = |sx: f64, sy: f64| crate::mapgrid::at(map, view, globe.as_ref(), sx, sy);
     // The frame's edges in longitude/latitude: its corners and points along each side.
     let mut edge_points = Vec::new();
     for i in 0..=8 {
         let t = f64::from(i) / 8.0;
         edge_points.extend([(w * t, 0.0), (w * t, h), (0.0, h * t), (w, h * t)]);
     }
-    let lonlats: Vec<Coord> = edge_points.iter().filter_map(|&(sx, sy)| map.to_lonlat(view.camera.to_map(sx, sy, w, h))).collect();
-    let mut ext = Extent::EMPTY;
+    let mut lonlats: Vec<Coord> = edge_points.iter().filter_map(|&(sx, sy)| lonlat_at(sx, sy)).collect();
+    // A frame with an edge past the globe's rim sees the globe's limb: its graticule is the whole
+    // Earth's, the lines behind the globe left out where they are drawn. A measured grid takes its
+    // bounds from the part of the globe inside the frame too, the edges missing it.
+    let rim = globe.is_some() && lonlats.len() < edge_points.len();
+    if rim {
+        for i in 0..=16 {
+            for j in 0..=16 {
+                lonlats.extend(lonlat_at(w * f64::from(i) / 16.0, h * f64::from(j) / 16.0));
+            }
+        }
+    }
+    let world = Extent::new(-180.0, -90.0, 180.0, 90.0);
+    let mut ext = if rim { world } else { Extent::EMPTY };
     for c in &lonlats {
         ext.expand(*c);
     }
@@ -1390,16 +1425,16 @@ fn draw_grid(pm: &mut Canvas, map: &Map, view: &View, g: &Grid, comma: bool) -> 
         GridKind::Graticule => {
             // Over the extent of the frame's corners and midpoints, as it always was (its step and
             // lines unchanged for the layouts made before measured grids).
-            let mut corners = Extent::EMPTY;
+            let mut corners = if rim { world } else { Extent::EMPTY };
             for (sx, sy) in [(0.0, 0.0), (w, 0.0), (w, h), (0.0, h), (w / 2.0, 0.0), (w / 2.0, h), (0.0, h / 2.0), (w, h / 2.0)] {
-                if let Some(c) = map.to_lonlat(view.camera.to_map(sx, sy, w, h)) {
+                if let Some(c) = lonlat_at(sx, sy) {
                     corners.expand(c);
                 }
             }
             graticule_lines(g, corners, comma, &mut lines);
         }
         GridKind::Measured => {
-            let center = map.to_lonlat(view.camera.to_map(w / 2.0, h / 2.0, w, h)).unwrap_or_else(|| ext.center());
+            let center = lonlat_at(w / 2.0, h / 2.0).unwrap_or_else(|| ext.center());
             let Some(crs) = measured_crs(g, map, center) else { return Vec::new() };
             let Ok(tr) = crs.transformer() else { return Vec::new() };
             measured_lines(g, &tr, &lonlats, comma, &mut lines);
@@ -1408,16 +1443,18 @@ fn draw_grid(pm: &mut Canvas, map: &Map, view: &View, g: &Grid, comma: bool) -> 
                 && let Some((zone, _)) = rustgis_map::layout::utm_zone_of(&crs.epsg().to_string())
             {
                 let size = |s: &str| (text::measure(s, MGRS_LABEL_PT, true), MGRS_LABEL_PT * 1.33 * 1.2);
-                squares = mgrs_squares(map, view, zone, &tr, size);
+                squares = mgrs_squares(map, view, globe.as_ref(), zone, &tr, size);
             }
         }
     }
-    // A tilted frame's lines break where they pass behind the eye.
+    // A tilted frame's lines break where they pass behind the eye, a globe's behind its horizon.
     let to_px = |c: Coord| {
-        map.to_map(c)
-            .and_then(|m| view.camera.try_to_screen(m, w, h))
-            .map(|(x, y)| (x as f32 * ppp, y as f32 * ppp))
-            .filter(|(x, y)| x.is_finite() && y.is_finite())
+        match &globe {
+            Some(on) => on.forward(c),
+            None => map.to_map(c).and_then(|m| view.camera.try_to_screen(m, w, h)),
+        }
+        .map(|(x, y)| (x as f32 * ppp, y as f32 * ppp))
+        .filter(|(x, y)| x.is_finite() && y.is_finite())
     };
     let (pw, ph) = (pm.width() as f32, pm.height() as f32);
     let paint_line = paint(g.color, 1.0);
@@ -1506,23 +1543,26 @@ const MGRS_LABEL_PT: f32 = 10.0;
 const MGRS_SAMPLES: u32 = 32;
 
 /// Where a measured grid in UTM zone `zone` (`tr` its transformer) names its MGRS 100 km squares on
-/// a frame showing `map` in `view`: each square of the zone, and of each latitude band, that shows,
-/// by its grid zone designation and letters (`32T MT`), at the middle of what shows of it, in the
-/// frame's points. Only where all of the label, `size(text)` points across and down, stays in its
-/// square and well inside the frame, clear of the edge labels. Squares the zone's eastings reach
-/// past its edges (a frame across two zones) are named in the other zone, so not here.
+/// a frame showing `map` in `view` (through `globe` on a globe, as its lines): each square of the
+/// zone, and of each latitude band, that shows, by its grid zone designation and letters
+/// (`32T MT`), at the middle of what shows of it, in the frame's points. Only where all of the
+/// label, `size(text)` points across and down, stays in its square and well inside the frame,
+/// clear of the edge labels. Squares the zone's eastings reach past its edges (a frame across two
+/// zones) are named in the other zone, so not here.
 fn mgrs_squares(
     map: &Map,
     view: &View,
+    globe: Option<&rustgis_map::globe::Globe>,
     zone: u8,
     tr: &rustgis_data::raster::Transformer,
     size: impl Fn(&str) -> (f32, f32),
 ) -> Vec<(String, f32, f32)> {
     use rustgis_geom::utm;
     let (w, h) = (view.width, view.height);
-    // The square, and band, a place on the frame is in: none outside the zone.
+    // The square, and band, a place on the frame is in: none outside the zone. On a globe, the
+    // place the globe draws there, as the grid's lines (#2337).
     let square = |sx: f64, sy: f64| -> Option<(i64, i64, char)> {
-        let c = map.to_lonlat(view.camera.to_map(sx, sy, w, h))?;
+        let c = crate::mapgrid::at(map, view, globe, sx, sy)?;
         // (A copy of the world past ±180° is the same place.)
         let c = Coord::new((c.x + 180.0).rem_euclid(360.0) - 180.0, c.y);
         if utm::utm_zone(c)? != zone {
@@ -1883,11 +1923,11 @@ fn scale_bar(
 /// layer that draws nothing there isn't listed. The scale is the one the renderer draws the frame
 /// at (the one its layers' scale ranges and display filters see), not the paper scale `{scale}`
 /// prints, so the legend follows what the frame actually shows.
-fn shown_legends(map: &Map, scale: f64, show_no_data: bool) -> Vec<(u32, Vec<LegendEntry>)> {
+fn shown_legends(map: &Map, scale: f64, show_no_data: bool, env: &Env) -> Vec<(u32, Vec<LegendEntry>)> {
     map.layers
         .iter()
         .filter(|l| map.draws_at(l, scale) && legend_lists(l))
-        .filter_map(|l| layer_shown(l, scale, show_no_data).map(|entries| (l.id, entries)))
+        .filter_map(|l| layer_shown(l, scale, show_no_data, env).map(|entries| (l.id, entries)))
         .collect()
 }
 
@@ -1901,13 +1941,13 @@ pub fn legend_lists(l: &rustgis_map::Layer) -> bool {
 /// What a layer a legend lists draws at 1:`scale` ([`rustgis_map::Layer::shown_legend`]); for a
 /// classified raster, the classes it holds ([`raster_classes`]). `None` when it draws nothing
 /// there.
-fn layer_shown(l: &rustgis_map::Layer, scale: f64, show_no_data: bool) -> Option<Vec<LegendEntry>> {
+fn layer_shown(l: &rustgis_map::Layer, scale: f64, show_no_data: bool, env: &Env) -> Option<Vec<LegendEntry>> {
     if l.is_raster() {
         return raster_classes(l, false).filter(|classes| l.in_scale_range(scale) && !classes.is_empty());
     }
-    let mut entries = l.shown_legend(scale)?;
+    let mut entries = l.shown_legend_with(scale, env)?;
     if show_no_data {
-        entries.extend(l.renderer.no_data_legend(&l.dataset, Some(&l.drawn_rows(scale))));
+        entries.extend(l.renderer.no_data_legend(&l.dataset, Some(&l.drawn_rows_with(scale, env))));
     }
     Some(entries)
 }
@@ -1940,18 +1980,20 @@ fn complete_shown_legends(
     scale: f64,
     show_no_data: bool,
     failed_source: &mut Option<u64>,
+    env: &Env,
 ) -> Option<Vec<(u32, Vec<LegendEntry>)>> {
     *failed_source = None;
     if !map.layers.iter().any(|l| l.source.as_ref().and_then(|s| s.chunk_source()).is_some()) {
-        return Some(shown_legends(map, scale, show_no_data));
+        return Some(shown_legends(map, scale, show_no_data, env));
     }
+    let style_env = env.at_scale(Some(scale));
     let wanted: Vec<usize> =
         map.layers.iter().enumerate().filter(|(_, l)| map.draws_at(l, scale) && legend_lists(l)).map(|(i, _)| i).collect();
     let mut out = Vec::new();
     for index in wanted {
         let layer = map.layers.get_mut(index)?;
         let Some(source) = layer.source.as_ref().and_then(|s| s.chunk_source()) else {
-            if let Some(entries) = layer_shown(layer, scale, show_no_data) {
+            if let Some(entries) = layer_shown(layer, scale, show_no_data, env) {
                 out.push((layer.id, entries));
             }
             continue;
@@ -1979,11 +2021,11 @@ fn complete_shown_legends(
         chunk.clear_cache();
         let result = crate::visit_complete(source.as_ref(), &mut |features| {
             chunk.dataset.features = features.into();
-            let rows = chunk.drawn_rows(scale);
+            let rows = chunk.drawn_rows_with(scale, env);
             if show_no_data && no_data.is_none() {
                 no_data = chunk.renderer.no_data_legend(&chunk.dataset, Some(&rows));
             }
-            let classer = by_expression.then(|| chunk.renderer.classer(&chunk.dataset, Some(scale)));
+            let classer = by_expression.then(|| chunk.renderer.classer_with(&chunk.dataset, style_env.clone()));
             for row in rows.iter().enumerate().filter_map(|(row, keep)| keep.then_some(row)) {
                 any = true;
                 if let Some(c) = &classer {
@@ -2019,7 +2061,7 @@ fn complete_shown_legends(
         }
         if any {
             // (A sample of the classes seen: classed again at this scale, by expression.)
-            let mut entries = layer.with_size_legend(layer.renderer.legend_at(&sample, &[], Some(scale)));
+            let mut entries = layer.with_size_legend(layer.renderer.legend_with(&sample, &[], style_env.clone()));
             entries.extend(no_data);
             out.push((layer.id, entries));
         }
@@ -2595,7 +2637,7 @@ pub fn legend_sizes_with_no_data_mm(
     show_no_data: bool,
     (exclude, labels): (&[String], &BTreeMap<String, String>),
 ) -> Option<[(f64, f64); MAX_LEGEND_COLUMNS]> {
-    let drawn = if all_classes { None } else { Some(complete_shown_legends(map, scale, show_no_data, &mut None)?) };
+    let drawn = if all_classes { None } else { Some(complete_shown_legends(map, scale, show_no_data, &mut None, &Env::default())?) };
     let rows = legend_rows(map, drawn.as_deref(), &LegendOptions { show_no_data, hide_other, exclude, labels, scale });
     let mm = 25.4 / 96.0;
     Some(std::array::from_fn(|i| {
@@ -2731,6 +2773,8 @@ pub fn frame_coverage_judged_on(
             self.map.label_lock_line_anchors = std::mem::take(&mut self.anchors);
         }
     }
+    // The space a globe is drawn on here: the blank basemap's, light.
+    let space = map.projection.is_globe().then(|| crate::globe_space(false)).map(|c| (c.r(), c.g(), c.b()));
     let outlines = context_layers(map, center, scale, judged);
     for l in map.layers.iter_mut().filter(|l| outlines.contains(&l.id)) {
         l.visible = false;
@@ -2749,7 +2793,11 @@ pub fn frame_coverage_judged_on(
     let (gw, gh) = (pm.width(), pm.height());
     // Anything not the blank basemap's paper, pure opaque white (the graticule set aside too): a
     // pale or translucent fill counts (only a fill of that very white, invisible on it, doesn't).
-    let drawn = pm.pixels().iter().map(|p| p.alpha() > 0 && (p.red(), p.green(), p.blue(), p.alpha()) != (255, 255, 255, 255)).collect();
+    // On a globe, the space around it is paper too: counted, it took every cell and the surrounds
+    // landed on the globe (#2337). The atmosphere's glow at the rim is not, which keeps them off
+    // the globe's edge.
+    let paper = |r: u8, g: u8, b: u8| (r, g, b) == (255, 255, 255) || space == Some((r, g, b));
+    let drawn = pm.pixels().iter().map(|p| p.alpha() > 0 && !(p.alpha() == 255 && paper(p.red(), p.green(), p.blue()))).collect();
     Some((gw, gh, drawn))
 }
 
@@ -3297,6 +3345,92 @@ pub fn map_index(maps: &[rustgis_map::Map], name: &str) -> Option<usize> {
 mod tests {
     use super::*;
 
+    /// Both map frames share the index feature, even though the locator draws a different map.
+    /// A page using expressions draws exactly like the same page with its values written inline.
+    #[test]
+    fn series_style_follows_the_index_feature_in_both_frames() {
+        use rustgis_data::{Dataset, Feature, Field, FieldType, Geometry, Value};
+        use rustgis_map::layout::MapSeries;
+
+        let mut ds = Dataset::new("Tracts", GeometryType::Polygon, vec![Field::new("name", FieldType::Text)]);
+        for (x, id, name) in [(-0.18, 71, "West"), (0.04, 295, "East")] {
+            let ring = [(x, -0.06), (x + 0.14, -0.06), (x + 0.14, 0.06), (x, 0.06), (x, -0.06)];
+            ds.features.push(Feature {
+                id,
+                geometry: Some(Geometry::Polygon(vec![vec![ring.map(|(x, y)| Coord::new(x, y)).to_vec()]])),
+                attrs: vec![Value::Text(name.into())],
+            });
+        }
+        let mut main = Map::new("Main");
+        let mut locator = Map::new("Locator");
+        main.add_dataset(ds.clone());
+        locator.add_dataset(ds);
+        let mut maps = [main, locator];
+        let mut layout = Layout::new("Atlas", 140.0, 75.0);
+        let [frame, _] = std::array::from_fn(|i| {
+            let m = &maps[i];
+            let frame = serde_json::from_value(serde_json::json!({"MapFrame": {
+                "map": m.name, "center": {"x": 0, "y": 0}, "scale": 1_000_000
+            }}))
+            .unwrap();
+            layout.add(&m.name, (5.0 + i as f64 * 70.0, 5.0, 60.0, 65.0), frame)
+        });
+        let base = render(&layout, &mut maps, 72.0, &PageInfo::default()).unwrap();
+        layout.series = Some(MapSeries { frame, layer: "Tracts".into(), name_field: "name".into(), margin: 0.1, page: 0 });
+        let info = PageInfo::default();
+        let unchanged = render(&layout, &mut maps, 72.0, &info).unwrap();
+        assert_eq!(base.data(), unchanged.data());
+
+        let style = |maps: &mut [Map], id: &str, name: &str, number: &str| {
+            for (i, map) in maps.iter_mut().enumerate() {
+                let layer = map.layers.first_mut().unwrap();
+                let page_feature = format!("$id = {id}");
+                layer.definition_query = Some(format!("{number} > 0"));
+                layer.symbol_by.stroke_width = Some(format!("if({page_feature}, 3, 0.6)"));
+                if i == 0 {
+                    layer.symbol_by.fill = Some(format!("if({page_feature}, '#8bbce8', '#e5e7eb')"));
+                } else {
+                    // The locator keeps the two classes by a rule expression and filters by page.
+                    let mut renderer = rustgis_map::Renderer::unique(
+                        &layer.dataset,
+                        &[],
+                        "name",
+                        rustgis_map::Ramp::Harbour,
+                        rustgis_map::Symbol::default_for(GeometryType::Polygon, 0),
+                    )
+                    .unwrap();
+                    let rustgis_map::Renderer::Unique { expression, .. } = &mut renderer else { panic!() };
+                    *expression = Some(format!("CASE WHEN {page_feature} THEN 'West' ELSE 'East' END"));
+                    layer.renderer = renderer;
+                    layer.display_filters = vec![rustgis_map::effects::DisplayFilter {
+                        name: "Current tract".into(),
+                        min_scale: None,
+                        max_scale: None,
+                        where_: page_feature.clone(),
+                    }];
+                }
+                layer.labels.enabled = true;
+                layer.labels.default.where_ = Some(page_feature);
+                layer.labels.default.by.text = Some(format!("{name} || ' ' || {number}"));
+            }
+        };
+        let mut previous = base;
+        for (row, id, name) in [(0, "71", "'West'"), (1, "295", "'East'")] {
+            layout.series.as_mut().unwrap().page = row;
+            style(&mut maps, "@page_feature_id", "@page_name", "@page_number");
+            let (page, _) = render_pending(&layout, &mut maps, 72.0, &info).unwrap();
+            let svg = crate::svg::layout_svg(&layout, &mut maps, 72.0, &info).unwrap().0;
+            style(&mut maps, id, name, &(row + 1).to_string());
+            let mut ordinary = layout.clone();
+            ordinary.series = None;
+            let expected = render(&ordinary, &mut maps, 72.0, &info).unwrap();
+            assert!(page.data() == expected.data(), "series page {} differs from the literal expressions", row + 1);
+            assert_ne!(page.data(), previous.data());
+            assert_eq!(svg, crate::svg::layout_svg(&ordinary, &mut maps, 72.0, &info).unwrap().0);
+            previous = page;
+        }
+    }
+
     /// A legend's, colorbar's, table's or chart's ink colours its text and lines (#2257). Without
     /// one, they draw in dark grey as before, a table on its white cells; with one, a table has no
     /// white cells, only its header and stripes in a tint of the ink.
@@ -3372,7 +3506,7 @@ mod tests {
         .unwrap();
         let fallback = l.renderer.symbol_for(&l.dataset, 2);
         let listed = |map: &mut Map, all: bool, show: bool| {
-            let drawn = (!all).then(|| complete_shown_legends(map, 1e6, show, &mut None).unwrap());
+            let drawn = (!all).then(|| complete_shown_legends(map, 1e6, show, &mut None, &Env::default()).unwrap());
             let opts = LegendOptions { show_no_data: show, hide_other: true, exclude: &[], labels: &NO_LABELS, scale: 1e6 };
             legend_rows(map, drawn.as_deref(), &opts)
                 .into_iter()
@@ -4465,7 +4599,7 @@ mod tests {
             (0..pm.height()).filter(|&y| (0..pm.width()).any(|x| pm.pixel(x, y).is_some_and(|p| p.red() < 200))).max().unwrap_or(0)
         };
         let depth = |map: &Map, drawn: Option<&[(u32, Vec<LegendEntry>)]>, hide_other: bool| depth_without(map, drawn, hide_other, &[]);
-        let drawn = shown_legends(&map, 1e6, false);
+        let drawn = shown_legends(&map, 1e6, false, &Env::default());
         assert_eq!(drawn.len(), 1, "the empty layer draws nothing: {drawn:?}");
         let (shown, all) = (depth(&map, Some(&drawn), false), depth(&map, None, false));
         // The drawn legend is two rows (the layer's heading and "a"); every class makes it six
@@ -4518,7 +4652,7 @@ mod tests {
         {
             classes.retain(|(k, _)| k != "a");
         }
-        let drawn = shown_legends(&map, 1e6, false);
+        let drawn = shown_legends(&map, 1e6, false, &Env::default());
         assert!(depth(&map, Some(&drawn), false) > 0, "<all other values> alone is listed");
         assert_eq!(depth(&map, Some(&drawn), true), 0, "and hidden, the layer is left out");
         // So is one whose drawn features all fall in a fully transparent <all other values>,
@@ -4532,7 +4666,7 @@ mod tests {
             }
         };
         set_other_alpha(&mut map, 0);
-        let drawn = shown_legends(&map, 1e6, false);
+        let drawn = shown_legends(&map, 1e6, false, &Env::default());
         assert_eq!(depth(&map, Some(&drawn), false), 0, "the invisible fallback stands for nothing");
         set_other_alpha(&mut map, 255);
         // A class that bears the fallback's name is a class: hiding the fallback keeps it.
@@ -4549,7 +4683,7 @@ mod tests {
         if let Some(l) = map.layers.iter_mut().find(|l| l.id == pts) {
             l.dataset.features.iter_mut().for_each(|f| f.attrs = vec![Value::Text(rustgis_map::symbology::OTHER_VALUES.into())]);
         }
-        let drawn = shown_legends(&map, 1e6, false);
+        let drawn = shown_legends(&map, 1e6, false, &Env::default());
         assert!(depth(&map, Some(&drawn), true) > 0, "the class named like the fallback is still listed");
         // A Graduated layer with no classes still shows its plain swatch, as before #207.
         if let Some(l) = map.layers.iter_mut().find(|l| l.id == pts) {
@@ -4771,7 +4905,7 @@ mod tests {
         };
         let want = ["[Land cover]", "Forest", "2", "3", "4", "5"];
         assert_eq!(labels(&legend_rows(&map, None, &opts)), want);
-        let drawn = shown_legends(&map, 1e6, false);
+        let drawn = shown_legends(&map, 1e6, false, &Env::default());
         assert_eq!(labels(&legend_rows(&map, Some(&drawn), &opts)), want);
         // Its swatches are the pane's colours.
         let pane: Vec<Rgba> = map.layers[0]
@@ -4801,14 +4935,14 @@ mod tests {
         let exclude = ["land cover".to_string()];
         assert!(legend_rows(&map, None, &LegendOptions { exclude: &exclude, ..opts }).is_empty());
         map.layers[0].visible = false;
-        assert!(shown_legends(&map, 1e6, false).is_empty());
+        assert!(shown_legends(&map, 1e6, false, &Env::default()).is_empty());
         assert!(legend_rows(&map, None, &opts).is_empty());
         // A raster on a ramp: a colorbar keys it, the legend doesn't list it.
         let ramp = ramp_map(
             rustgis_map::raster::RasterRenderer::Stretch { band: 0, ramp: rustgis_map::Ramp::Harbour, invert: false },
             rustgis_map::raster::Stretch::MinMax,
         );
-        assert!(legend_rows(&ramp, None, &opts).is_empty() && shown_legends(&ramp, 1e6, false).is_empty());
+        assert!(legend_rows(&ramp, None, &opts).is_empty() && shown_legends(&ramp, 1e6, false, &Env::default()).is_empty());
     }
 
     /// A drawn legend fills each class's swatch with its colour, under the raster's name.
@@ -5595,12 +5729,12 @@ Elaboração: RustGIS",
         };
         let at = |v: &View, x: f32, y: f32| map.to_lonlat(v.camera.to_map(f64::from(x), f64::from(y), v.width, v.height)).unwrap();
         let near = view(Coord::new(8.73, 47.5), 25_000.0, 80.0);
-        let one = mgrs_squares(&map, &near, 32, &tr, size);
+        let one = mgrs_squares(&map, &near, None, 32, &tr, size);
         assert_eq!(one.len(), 1, "{one:?}");
         assert_eq!(one[0].0, "32T MT");
         assert!((f64::from(one[0].1) - near.width / 2.0).abs() < 2.0 && (f64::from(one[0].2) - near.height / 2.0).abs() < 2.0);
         let wide = view(Coord::new(8.73, 47.5), 2_000_000.0, 80.0);
-        let many = mgrs_squares(&map, &wide, 32, &tr, size);
+        let many = mgrs_squares(&map, &wide, None, 32, &tr, size);
         assert!(many.len() >= 2, "{many:?}");
         for (text, x, y) in &many {
             let named = rustgis_geom::to_mgrs(at(&wide, *x, *y), 0).unwrap().to_string();
@@ -5608,12 +5742,12 @@ Elaboração: RustGIS",
         }
         // Across the edge with zone 33 at 12° E: only zone 32's squares, west of it.
         let edge = view(Coord::new(11.0, 47.5), 2_000_000.0, 80.0);
-        let west = mgrs_squares(&map, &edge, 32, &tr, size);
+        let west = mgrs_squares(&map, &edge, None, 32, &tr, size);
         assert!(!west.is_empty() && west.iter().all(|(t, x, y)| t.starts_with("32") && at(&edge, *x, *y).x < 12.0), "{west:?}");
-        assert!(mgrs_squares(&map, &view(Coord::new(8.73, 47.5), 25_000.0, 15.0), 32, &tr, size).is_empty());
+        assert!(mgrs_squares(&map, &view(Coord::new(8.73, 47.5), 25_000.0, 15.0), None, 32, &tr, size).is_empty());
         // Across the Equator, a northern zone's grid names the southern squares too, as MGRS does.
         let equator = view(Coord::new(9.0, 0.0), 2_000_000.0, 80.0);
-        let both = mgrs_squares(&map, &equator, 32, &tr, size);
+        let both = mgrs_squares(&map, &equator, None, 32, &tr, size);
         for band in ["32N ", "32M "] {
             assert!(both.iter().any(|(t, ..)| t.starts_with(band)), "{band}: {both:?}");
         }
@@ -5640,6 +5774,130 @@ Elaboração: RustGIS",
         let named = Grid { crs: Some("EPSG:32733".into()), ..g.clone() };
         assert_eq!(measured_crs(&named, &map, c).map(|c| c.epsg()), Some(32733));
         assert_eq!(measured_crs(&Grid { crs: Some("EPSG:2056".into()), ..g }, &map, c), None);
+    }
+
+    #[test]
+    fn mgrs_labels_on_the_globe_name_the_squares_it_draws() {
+        // #2337: on a globe, a label names the square the globe draws under it, not the one the
+        // flat map would show at that place in the frame.
+        let mut map = Map::new("m");
+        map.set_projection(rustgis_map::Projection::Globe);
+        let tr = rustgis_data::raster::Crs::from_epsg(32632).unwrap().transformer().unwrap();
+        // Small labels at 1:20,000,000, where the globe's curve parts it from the flat map: the
+        // two agree at the middle of the frame and drift apart away from it.
+        let size = |_: &str| (6.0_f32, 4.0_f32);
+        let view = View {
+            width: 120.0 * PT_PER_MM,
+            height: 120.0 * PT_PER_MM,
+            pixels_per_point: 1.0,
+            camera: frame_camera(&map, Coord::new(9.0, 47.5), 20_000_000.0, 0.0, 0.0),
+            sky: false,
+        };
+        let globe = rustgis_map::globe::Globe::new(&view.camera, view.width, view.height);
+        // The square the globe draws at a label's place, if any.
+        let under =
+            |x: f32, y: f32| globe.inverse(f64::from(x), f64::from(y)).and_then(|c| rustgis_geom::to_mgrs(c, 0)).map(|m| m.to_string());
+        let squares = mgrs_squares(&map, &view, Some(&globe), 32, &tr, size);
+        assert!(squares.len() >= 2, "{squares:?}");
+        for (text, x, y) in &squares {
+            assert_eq!(under(*x, *y).as_ref(), Some(text));
+        }
+        // Through the flat camera, as before, some labels sit on another square of the globe.
+        let flat = mgrs_squares(&map, &view, None, 32, &tr, size);
+        assert!(flat.iter().any(|(text, x, y)| under(*x, *y).as_ref() != Some(text)), "{flat:?}");
+    }
+
+    #[test]
+    fn the_space_around_a_globe_is_free_in_its_coverage() {
+        // #2337: the light space a globe is drawn on leaves room for a layout's surrounds, as the
+        // blank basemap's white paper does (its ocean too, as open sea on a flat map); the
+        // atmosphere's glow at the globe's rim doesn't. Before, every cell was taken.
+        let mut map = Map::new("m");
+        map.set_projection(rustgis_map::Projection::Globe);
+        // A globe about 64 mm across in a frame 100 mm square.
+        let (gw, gh, cells) = frame_coverage(&mut map, Coord::new(0.0, 0.0), 2e8, 100.0, 100.0, 50).unwrap();
+        let cell = |x: u32, y: u32| cells[(y * gw + x) as usize];
+        assert!(cells.iter().any(|c| *c), "the glow at the rim is drawn");
+        for (x, y) in [(1, 1), (gw - 2, 1), (1, gh - 2), (gw - 2, gh - 2)] {
+            assert!(!cell(x, y), "the space at the corner ({x}, {y}) is free");
+        }
+    }
+
+    #[test]
+    fn a_measured_grid_on_the_globe_seen_whole_is_drawn() {
+        // #2337: with the whole globe inside the frame, no edge of it lands on the globe; the
+        // measured grid takes its bounds from the globe in the frame instead of drawing nothing.
+        use rustgis_map::layout::{Grid, GridKind};
+        let mut m = Map::new("m");
+        m.set_projection(rustgis_map::Projection::Globe);
+        let mut maps = vec![m];
+        let mut l = Layout::new("Layout", 100.0, 100.0);
+        let grid = Grid {
+            kind: GridKind::Measured,
+            crs: Some("EPSG:32632".into()),
+            step: 0.0,
+            color: Rgba::rgb(0xFF, 0, 0),
+            labels: false,
+            width: 1.0,
+            ..Grid::default()
+        };
+        l.add(
+            "Map",
+            (10.0, 10.0, 80.0, 80.0),
+            ElementKind::MapFrame {
+                map: "m".into(),
+                center: Coord::new(9.0, 45.0),
+                scale: 2e8,
+                shape: FrameShape::Rectangle,
+                grid: Some(grid),
+                extent_of: None,
+                extent_color: rustgis_map::layout::INDICATOR_COLOR,
+                extent_width: rustgis_map::layout::INDICATOR_WIDTH,
+                bearing: 0.0,
+                pitch: 0.0,
+            },
+        );
+        let pm = render(&l, &mut maps, 96.0, &PageInfo::default()).unwrap();
+        assert!(count(&pm, (30.0, 30.0, 70.0, 70.0), red) > 20, "the measured grid's lines on the globe");
+        assert_eq!(count(&pm, (11.0, 11.0, 20.0, 20.0), red), 0, "none past the rim");
+    }
+
+    #[test]
+    fn a_grid_on_the_globe_is_drawn_on_it() {
+        // #2337: a frame of a map on the globe draws its graticule through the globe, not as a
+        // flat world around it: none of it beyond the globe's rim, in the frame's corners.
+        use rustgis_map::layout::Grid;
+        let mut m = Map::new("m");
+        m.set_projection(rustgis_map::Projection::Globe);
+        let mut maps = vec![m];
+        let mut l = Layout::new("Layout", 100.0, 100.0);
+        let grid = Grid { step: 30.0, color: Rgba::rgb(0xFF, 0, 0), labels: true, width: 1.0, ..Grid::default() };
+        l.add(
+            "Map",
+            (10.0, 10.0, 80.0, 80.0),
+            ElementKind::MapFrame {
+                map: "m".into(),
+                center: Coord::new(0.0, 0.0),
+                // A globe about 64 mm across, in the middle of the 80 mm frame.
+                scale: 2e8,
+                shape: FrameShape::Rectangle,
+                grid: Some(grid),
+                extent_of: None,
+                extent_color: rustgis_map::layout::INDICATOR_COLOR,
+                extent_width: rustgis_map::layout::INDICATOR_WIDTH,
+                bearing: 0.0,
+                pitch: 0.0,
+            },
+        );
+        let pm = render(&l, &mut maps, 96.0, &PageInfo::default()).unwrap();
+        assert!(count(&pm, (40.0, 40.0, 60.0, 60.0), red) > 50, "lines on the globe");
+        // Neither lines nor labels (dark) past the rim: in the corners and along the edges.
+        let ink = |p: tiny_skia::PremultipliedColorU8| red(p) || (p.alpha() > 0 && p.red() < 120 && p.green() < 120 && p.blue() < 120);
+        let corners = [(11.0, 11.0, 20.0, 20.0), (80.0, 11.0, 89.0, 20.0), (11.0, 80.0, 20.0, 89.0), (80.0, 80.0, 89.0, 89.0)];
+        let edges = [(25.0, 11.0, 75.0, 15.0), (25.0, 85.0, 75.0, 89.0), (11.0, 25.0, 15.0, 75.0), (85.0, 25.0, 89.0, 75.0)];
+        for r in corners.into_iter().chain(edges) {
+            assert_eq!(count(&pm, r, ink), 0, "nothing past the rim at {r:?}");
+        }
     }
 
     #[test]
@@ -6635,7 +6893,7 @@ Elaboração: RustGIS",
         };
         assert!(at(30.0) && !at(-30.0), "turned clockwise");
         // Alone, the element's picture holds no background.
-        let (alone, _) = render_element(&l, id, &mut [], 96.0, &PageInfo::default(), &mut None).unwrap().unwrap();
+        let (alone, _) = render_element(&l, id, &mut [], 96.0, (&PageInfo::default(), &Env::default()), &mut None).unwrap().unwrap();
         assert!(alone.pixels().iter().all(|c| c.alpha() == 0 || c.green() > 0), "no red in the element's own picture");
     }
 }

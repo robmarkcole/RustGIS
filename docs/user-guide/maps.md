@@ -186,6 +186,27 @@ answers:
 rustgis-cli run --cmd 'project.open={"path":"massif.rgis"}' --cmd 'map.setPitch={"pitch":60}' --cmd 'map.exportOrbit={"path":"massif.gif","frames":72,"width":800,"height":500}'
 ```
 
+**Export Block** (`map.exportBlock`, on desktop) writes a map's block diagram as a 3D model, for
+Blender, a web viewer or a 3D printer's slicer: `{"path": "block.glb"}` gives binary glTF, one
+file; a path ending in `.gltf` gives the same model as glTF's JSON with everything embedded. The
+model has three meshes: **Ground**, the ground inside the block's box on the grid the settled view
+lays it on, with the map drawn top down over the box as its texture (its layers, symbology and
+labels, without the scale bar or the credits, at `"texture"` pixels on the box's longer side,
+default 4096, 256 to 8192); **Walls**, the box's four sides from the ground's edge down to the
+base, in the walls' colour; and **Base**, flat at the block's base. The texture holds no light:
+the 3D viewer lights the model, so a hillshade layer shown on the map is the one light baked in.
+Units are metres east (x), up (y) and south (z) of the box's south-west corner, scaled as at the
+box's centre, with heights above sea level times the exaggeration; the file's `extras` give the
+corner's longitude and latitude. The view's sky, fog and shadows aren't in the model, and walls
+coloured by a polygon layer come in their plain colour for now (said). In the desktop app it
+runs in the background, with the export and **Cancel** in the status bar (elevation tiles are
+waited for, up to a minute); from a script or the command line it runs to its end before it
+answers:
+
+```bash
+rustgis-cli run --cmd 'project.open={"path":"massif.rgis"}' --cmd 'map.exportBlock={"path":"massif.glb","texture":4096}'
+```
+
 MapLibre map links carry a view in their address, as
 `#zoom/latitude/longitude/bearing/pitch` (`https://…/#15.5/40.7484/-73.9857/30/60`). **Go To Map
 Link** (`map.goToLink {"url": …}`) takes such a link, or the part after its `#`, to that place,
@@ -268,6 +289,27 @@ itself is UTM. On the map of another body than the Earth the readout shows *No U
 `ui.coordinateFormat={"format":"utm"}` (`decimal`, `dms`, `utm` or `mgrs`); without `format`
 it steps to the next one. A saved format this version doesn't know, say from a newer RustGIS,
 reads as decimal degrees with a notice, and stays saved until you pick a format.
+
+`map.convertPosition` gives a place in all of these forms at once, without moving the map, for
+scripts, Python and the AI Assistant. It takes the place as `map.goToXY` does: `lon` and `lat`
+(numbers, or degrees, minutes and seconds), or a `position` written in any form the search box
+reads, and says what it assumed the same way. It answers with `lon` and `lat`, `decimal` and
+`dms` as the readout writes them, `grid` (`utm`, or `ups` in the polar areas), the reference in
+`utm` or `ups` (whichever `grid` names; the other is `null`), the UTM `zone` and latitude `band`
+(`null` in UPS), `hemisphere`, `easting` and `northing` in meters, and `mgrs` spaced as the
+readout writes it and `mgrsCompact` in one word. `digits` (0 to 5, 5 by default) sets the MGRS
+precision, from 100 km to 1 m. As in the readouts, the `utm` and `ups` text round to the meter
+while MGRS truncates, so the two can differ by a meter; `easting` and `northing` give the place
+to the millimeter (truncated). Every key is always there, `null` where it has no value; on
+another body's map the grids are `null`, and `note` says why.
+
+```
+rustgis-cli run --cmd 'map.convertPosition={"position":"18TWL8395907350"}'
+```
+
+```python
+s.run("map.convertPosition", {"lon": -74.006, "lat": 40.7128})["utm"]  # '18north 583959 4507351'
+```
 
 The [search box](#navigating) takes the same grid references, in any case (polar references have
 their own rules, below):
@@ -465,7 +507,9 @@ A blend mode (Multiply, Screen, Overlay, Darken, Lighten, Difference) combines a
 what is drawn beneath it (tile layers, the basemap, and map layers when it's placed over them): stack imagery over a hillshade and set it to Multiply to
 let the terrain show through. Overlays stay over the basemaps; choosing a built-in basemap
 removes the web basemaps but keeps the overlays. Tile layers are saved with the project, and
-their credits are shown in the corner of the map and drawn on exports.
+their credits are shown in the corner of the map and drawn on exports. A layer's own credit
+(`attribution`) stands in place of its tiles' (a TileJSON's or an archive's), which show when it
+names none; a MapLibre style keeps its sources' credits beside it.
 
 Use Explore to click features in vector PMTiles, MBTiles or MVT layers added as data and see
 their source-layer names and attributes in a pop-up. This works with **Topmost Layer** or
@@ -641,10 +685,33 @@ System** dialog, which also takes a projected EPSG code (such as `3035`, `32633`
 `ESRI:102033` for South America Albers Equal Area Conic, or `ESRI:54030` for World Robinson). A
 code whose projection method RustGIS can't compute is refused with the reason, rather than drawn
 in another projection. Projections and datum transformations are computed by
-[terrio-crs](https://github.com/opengeos/terrio), as PROJ 9.8 computes them. Datum shift grids
-aren't used yet, neither those installed for PROJ nor downloaded: a datum whose most accurate
-transformation needs one takes the next PROJ lists (a NAD27 code: NAD27 to WGS 84 (4), about
-10 m), and says so once.
+[terrio-crs](https://github.com/opengeos/terrio), as PROJ 9.8 computes them. On the desktop, the
+command line, Python and the phone apps, datum shift grids are read from RustGIS's own grid folder
+(`datum-grids` in its app data), then from those PROJ and terrio use on the computer
+(`TERRIO_GRID_DIR`, `PROJ_DATA`, `PROJ_LIB`, PROJ's user folder, terrio's download cache), so grids
+installed for PROJ count; a grid a definition names by its path is never read. A datum whose most
+accurate transformation needs a grid that isn't there takes the next PROJ lists (a NAD27 code
+without `us_noaa_conus.tif`: up to about 10 m off), and says so once.
+
+**Settings › Datum Grids › Download Datum Grids** (off by default, in the desktop and web apps)
+downloads such grids from PROJ's grid server (`cdn.proj.org`; only PROJ's openly licensed GeoTIFF
+grids, not the server's other files such as deformation models):
+
+- On the desktop, a file read then waits for its systems' grids before its features are placed, up
+  to two minutes in all, and stops waiting when you cancel it; the download goes on. In the web
+  app a read doesn't wait: a layer read before its grid arrives keeps its places until it is
+  opened again.
+- Rasters, streamed layers and the map follow a grid as soon as it arrives. A layer opened before
+  keeps its places until it is opened again.
+- Each download is said, with its size, and so is each that fails (not tried again until the
+  setting is turned off and on). An answer that isn't a grid file is refused.
+- Turned off, grids already downloaded stay in use, and downloads already under way finish. On a
+  computer, delete the `datum-grids` folder and start RustGIS again to stop using them (grids
+  installed for PROJ are still used). The web app keeps a grid for the session only.
+- Grids are downloaded three at a time, those a file read waits for first: at most 16 each time
+  the setting is turned on, and none is started once 2 GB of grids have been kept; past that, the grid is said
+  to be not downloaded. Turning the setting off drops those not started yet.
+
 RustGIS supports a subset of Esri's projected systems, checked against
 PROJ at representative points; unsupported codes such as World Miller (`ESRI:54003`) and the
 two-point oblique Mercators (`ESRI:53025`, `ESRI:54025`) are refused as unknown codes. The presets:

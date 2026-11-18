@@ -15,7 +15,7 @@ of use.
 
 | File | Author / source | Licence |
 |---|---|---|
-| Historical release projects and preferences (`crates/engine/testdata/releases/v*.rgis`, `v*.prefs.json`) | The RustGIS project: unchanged output of the published v0.2.0–v0.6.0 binaries, with made-up layer data; writers and archive checksums in the [fixture README](crates/engine/testdata/releases/README.md) | Apache-2.0 |
+| Historical release projects and preferences (`crates/engine/testdata/releases/v*.rgis`, `v*.prefs.json`) | The RustGIS project: unchanged output of the published binaries, with made-up layer data. The [fixture README](crates/engine/testdata/releases/README.md) lists writers and archive checksums. | Apache-2.0 |
 | Interface themes (`crates/ui-egui/themes/light.json`, `dark.json`) | The RustGIS project | Apache-2.0 |
 | Sample data (`countries`, `cities`, `rivers`, `lakes` GeoJSON), embedded at build time from [rustgis-assets](https://github.com/opengeos/rustgis-assets/tree/main/data) | Natural Earth 1:110m, attributes trimmed | Public domain |
 | Worldviews (`countries_<code>.geojson` and `original/countries_<code>.geojson.gz` on [source.coop](https://source.coop/opengeos/data/rustgis/worldviews)), downloaded by the app when one is chosen, not part of it | Natural Earth's Admin 0 Countries (1:10m) and its points of view, with the sample countries' attributes by `scripts/worldviews.py` in [rustgis-assets](https://github.com/opengeos/rustgis-assets): simplified to 1:110m density, or at their original detail | Public domain |
@@ -24,6 +24,7 @@ of use.
 | CFF test font (`crates/render/testdata/test-cff.otf`), read only by the PDF font tests | The RustGIS project: generated for this test with [fontTools](https://github.com/fonttools/fonttools) by the script in `crates/render/testdata/README.md`; its glyphs are made up | Apache-2.0 |
 | JAXA Earth catalog test copy (`crates/tiles/tests/data/jaxa_catalog.v2.md`), read only by tests | JAXA: the [JAXA Earth API](https://data.earth.jaxa.jp/) dataset catalog ([catalog.v2.md](https://data.earth.jaxa.jp/app/mcp/catalog.v2.md)), copied on 2026-11-08 | JAXA's [terms of use](https://earth.jaxa.jp/en/data/policy/): free to use and redistribute, with credit to JAXA |
 | CityGML test mesh (`crates/data/tests/data/rocking-chair.gml`), read only by tests | 97 faces of the rocking chair in OGC's CityGML 3.0 sample `Building_LOD3-EPSG25832.gml` ([CityGML-3.0Encodings](https://github.com/opengeospatial/CityGML-3.0Encodings/blob/master/Moved_to_CITYGML-3.0Encoding_CityGML/Examples/Examples-from-CityGML-2.0/building/CityGMLv3/Building_LOD3-EPSG25832.gml)), copyright (c) 2013 3DXScape, copied on 2026-11-12 and rewritten as a CityGML 2.0 object, coordinates unchanged | MIT |
+| Datum grid test files (`crates/data/tests/data/grids/us_noaa_conus.tif`, `us_noaa_ethpgn.tif`), read only by the datum grid tests | NOAA's NADCON and HARN grids as converted by [PROJ-data](https://github.com/OSGeo/PROJ-data) (`us_noaa`), copied unchanged from [cdn.proj.org](https://cdn.proj.org) | Public domain |
 | LERC GeoTIFF test files (`crates/data/tests/data/lerc/*.tif`), read only by the LERC tests | Written for the RustGIS project by `make_lerc.py` there with [GDAL](https://gdal.org) 3.9.3 through [rasterio](https://rasterio.readthedocs.io) 1.4.3, run only to write them; the values are made up | Apache-2.0 |
 | Analysis reference corpus (`crates/analysis/tests/reference/`: layers and expected results) | Written for the RustGIS project from `generate.py` there: the layers are made up; the expected results were computed by [GEOS](https://libgeos.org) 3.13.1 through [Shapely](https://shapely.readthedocs.io) 2.1.2, and distances, buffers, areas and lengths by GeographicLib in [PROJ](https://proj.org) 9.5.1 through [pyproj](https://pyproj4.github.io/pyproj/) 3.7.2, run only to write them (GEOS is LGPL-2.1, Shapely BSD-3-Clause, PROJ and pyproj MIT; none is included in or linked into RustGIS) | Apache-2.0 |
 
@@ -47,12 +48,13 @@ PROJ definitions by PROJ 9.7.1.
 Coordinates are transformed by [terrio-crs](https://github.com/opengeos/terrio) (MIT), which
 carries its own tables derived from the EPSG Geodetic Parameter Dataset (© IOGP, under its terms
 of use) through PROJ's database; its NOTICE, with their sources, is in THIRD-PARTY-LICENSES.txt.
-The WKT2 test corpus (`crates/data/src/raster/wkt2_corpus.tsv`) is 60 of those EPSG and Esri
-coordinate systems written as WKT2 by PROJ 9.7.1, through pyproj 3.7.2.
-The ESRI datum test corpus (`crates/data/src/raster/esri_datum_corpus.tsv`) contains 13 EPSG
-coordinate systems written as ESRI WKT1 through pyproj 3.7.2; reference coordinates use PROJ
-with the bundled `crs-definitions` Helmert definitions. The OSGB36, Amersfoort and GGRS87 WKT2
-reference coordinates use those same transformations.
+The WKT2 test corpus (`crates/data/src/raster/wkt2_corpus.tsv`) is 84 of those EPSG and Esri
+coordinate systems written as WKT2 by PROJ 9.7.1 through pyproj 3.7.2 (the Italian and Swiss
+rows by PROJ 9.8.1).
+The ESRI datum test corpus (`crates/data/src/raster/esri_datum_corpus.tsv`) contains 42 EPSG
+coordinate systems written as ESRI WKT1, 13 of them through pyproj 3.7.2, 17 Italian ones by
+GDAL 3.13 and 12 on datums known by their Esri name by a PROJ 9.9.0 build. Reference coordinates
+in both corpora are PROJ 9.8.1's (pyproj 3.8.0) for each row's WKT.
 
 The GeoLibre tool suite ([geolibre-rust](https://github.com/opengeos/geolibre-rust), MIT, built
 on [whitebox-wasm](https://github.com/opengeos/whitebox-wasm), MIT OR Apache-2.0) is not part of

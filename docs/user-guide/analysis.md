@@ -346,6 +346,8 @@ Use these ids in `gp.run`'s `tool` parameter (`gp.tools` lists the available too
 | --- | --- | --- |
 | Buffer | `buffer` | Analysis › Proximity |
 | Near | `near` | Analysis › Proximity |
+| Service Area | `serviceArea` | Analysis › Network |
+| OD Cost Matrix | `odCostMatrix` | Analysis › Network |
 | Clip | `clip` | Analysis › Extract |
 | Split | `split` | Analysis › Extract |
 | Erase | `erase` | Analysis › Overlay |
@@ -896,8 +898,10 @@ fields (one field, or several as a list such as `["county", "year"]`). Rows are 
 values; records with no value form a group of their own, first. Statistics follow record order
 (`FIRST`, `LAST`, `CONCATENATE`) and use only the selected records when the table has a
 selection. Each row has the case fields, then `FREQUENCY` (the group's records), then a field
-`<STAT>_<field>` for each statistic asked for. Name the statistics in `statistics`, a list of up
-to 256 (field, statistic) pairs in the order the fields should appear:
+`<STAT>_<field>` for each statistic asked for. With case fields, no statistics and no
+Statistics Field, each row holds only the case fields and `FREQUENCY`: a count of records by
+group. Name the statistics in `statistics`, a list of up to 256 (field, statistic) pairs in the
+order the fields should appear:
 
 ```text
 gp.run={"tool":"summaryStatistics","params":{"input":"parcels","case":["county","year"],"statistics":[{"field":"income","statistic":"MEAN"},{"field":"income","statistic":"MEDIAN"},{"field":"zoning","statistic":"MODE"}]}}
@@ -952,15 +956,14 @@ dataset's field definitions and exclude its sentinel first: set a **Definition Q
 `STATIC_BFE IS NOT NULL AND STATIC_BFE <> -9999` before running Summary Statistics.
 
 **Count records by month.** To count permits by issue month, start with `issue_date` as a Date/Date-time field or ISO text
-(`YYYY-MM-DD`, optionally followed by a time). Convert other date spellings with
-**Convert Field** first ([date formats](#the-attribute-table); it reads months and days as two
-digits, so `06/23/2021` converts but `6/23/2021` doesn't).
+(`YYYY-MM-DD`, optionally followed by a time). Convert other date spellings, such as
+`6/23/2021 5:00:00 AM`, with **Convert Field** first ([date formats](#the-attribute-table)).
 
 1. Clear any selection and definition query to include all records. Add a **Text** field named
    `issue_month`, turn editing on, and use **Calculate Field** with `substr(issue_date, 1, 7)`.
    A date such as `2026-03-05` becomes `2026-03`, keeping different years separate.
-2. Run **Summary Statistics** on the permits, with **Case Fields** = `issue_month` and a
-   **COUNT** statistic on `issue_date` (use **Add statistic**).
+2. Run **Summary Statistics** on the permits, with **Case Fields** = `issue_month`, no
+   statistics and **Statistics Field** left empty.
 3. Read `FREQUENCY` as the number of permits per month. A null date and an empty-text date form
    separate groups with null and empty-text keys; if both forms occur, there are two groups. The
    output contains months present in the data; it does not fill in missing months with zero.
@@ -1083,6 +1086,11 @@ metres), `km2` (square kilometres, the default), `ha` (hectares), `ac` (acres), 
 and `mi2` (square miles). It changes the area values and field name, for example `area_ac` for
 acres; percentages and sum shares stay the same. Existing calls keep `area_km2` and its values.
 
+Turn on **Include Empty Zones** (`includeEmptyZones: true`) to keep one row for each polygon
+zone with no class overlap, including when the class layer is empty. The class fields are blank,
+and the area, percentage and sum fields are zero. Zones with overlaps keep their usual rows.
+The option is off by default, so the tool omits zones with no overlap and reports how many it omitted.
+
 The area is measured on the ellipsoid, as Calculate Geometry Attributes measures it. The
 percentages and shares compare areas measured on a sphere with each edge as the map draws it (a
 straight line on the map), the lines the tool cuts along, so the shares of a feature that zones
@@ -1105,15 +1113,14 @@ being split there (the map, and with it the percentages and shares, takes them t
 while area_km2 takes their ground shape), how many have an edge beyond 85.05° running east or west
 (their percentages and shares follow the analysis plane, which takes such an edge straight in
 longitude and latitude, not clamped as the Web Mercator map draws it, so they and area_km2 can
-differ widely, as above), how many zones overlap no class feature and so have no rows, how many
-class features have no value in a sum field (they add nothing to its shares) and,
-with sum fields, how many class features lie partly or wholly outside the zones. Only selected
-features are used when a layer has a selection, and the table is named `<zones>_Tabulate` unless
-`output` names it.
+differ widely, as above), how many class features have no value in a sum field (they add nothing
+to its shares) and, with sum fields, how many class features lie partly or wholly outside the
+zones. Only selected features are used when a layer has a selection. The table is named
+`<zones>_Tabulate` unless `output` names it.
 
 ```text
 gp.run={"tool":"tabulateIntersection","params":{"zones":"districts","zoneFields":"district","classes":"blocks","sumFields":["population"]}}
-gp.run={"tool":"tabulateIntersection","params":{"zones":"counties","zoneFields":"county","classes":"landcover","classFields":"class"}}
+gp.run={"tool":"tabulateIntersection","params":{"zones":"counties","zoneFields":"county","classes":"landcover","classFields":"class","includeEmptyZones":true}}
 gp.run={"tool":"tabulateIntersection","params":{"zones":"parcels","classes":"floodplain","areaUnit":"ac"}}
 ```
 
@@ -1151,6 +1158,36 @@ with latitude or the map's projection.
 - Both write `a5` (the cell's 64-bit id in hex, as other A5 tools read it: DuckDB, PostgreSQL,
   Python's `pya5`, R), `resolution` and `area_km2`. A cell across the antimeridian, or round a pole, is
   split at ±180° into two parts of one polygon, each within −180° to 180°.
+
+### Network tools
+
+**Service Area** (`serviceArea`) and **OD Cost Matrix** (`odCostMatrix`) search a line layer as a
+network, as the Network Analysis workflow's route does: lines join where their vertices meet, each
+line's length is measured on the WGS 84 ellipsoid, and a **Cost Field** multiplies it (a line with
+no number there costs its length, and one costing 0 or less is closed; each is counted in a
+notice). Every line can be travelled both ways. The network's selection is honoured, and the graph
+is reused while the lines don't change, shared with routes.
+
+Points are moved onto the nearest line, at most **Snap Distance** metres (1,000 by default). A
+feature farther away, with no point, or with several (a multipoint) is left out and counted in a
+notice. A point in the middle of a line is reached from there, both ways along it.
+
+Service Area takes **Breaks**, costs in **Units** such as `1, 2, 5`, and makes the lines reachable
+within the largest. Each line is cut where it passes a break and where another facility becomes
+nearer, so each part keeps the line's attributes and adds `facility_fid` (the nearest facility),
+`from_break` and `to_break`. With several facilities, each part belongs to the nearest one only.
+
+OD Cost Matrix makes a table with a row for each origin and destination the network connects:
+`origin_fid`, `destination_fid`, `rank` (1 for the cheapest from that origin), `cost` and
+`length` in **Units** (they differ only with a cost field). **Cutoff** leaves out destinations
+costing more, and **Destinations to Find** keeps only the cheapest few from each origin. Pairs the
+network doesn't connect have no row, and a notice counts them. The origins are searched on several
+threads on the desktop; a matrix may hold up to 10 million rows.
+
+```text
+gp.run={"tool":"serviceArea","params":{"network":"streets","facilities":"fire_stations","breaks":"1, 2, 3","units":"Miles"}}
+gp.run={"tool":"odCostMatrix","params":{"network":"streets","origins":"homes","destinations":"clinics","count":1}}
+```
 
 ### Geometry conversions
 
@@ -1584,7 +1621,18 @@ In a `gp.run` line's `"params"`, a value offers what the tool's parameter takes,
 form does: the layers of its kind (polygon, point, raster, vector; any layer, then the tables),
 the fields of the tool's input that it takes (numeric, holding coordinates), or its choices
 (`"units": "` offers `Kilometers`, `Meters`, …). Accepting one writes its name
-as the line's JSON needs it (`"Big \"lakes\""`). A `{` or `[`
+as the line's JSON needs it (`"Big \"lakes\""`).
+In the string of a key that takes an expression (its type is `sql` or `expression` in the
+command's help: `"where"` in `select.byAttributes`, `"expression"` in `edit.calculateField`,
+`labels.by`'s keys…; in a `gp.run` line, a tool's expression, such as `selectByAttributes`'s
+`"where"`), the list is the one [Calculate Field](expressions.md#calculate-field) shows, anywhere
+in the string: the fields of the line's layer or table (in `gp.run`, of the tool's input, before
+or after it), the functions, the variables and the keywords that fit, with the same help beside.
+Where the line names no layer it can find, it offers the language's words without fields.
+Accepting one writes it as the string needs it, the rest of the string left as written: a field
+begun with an escaped quote is closed with one (`"where": "\"Pop Est\""`), and a function comes
+with its brackets, the cursor inside. A key inside another key's objects, such as a display
+filter's `"where"`, offers nothing yet. A `{` or `[`
 typed closes itself, the cursor inside, unless text follows it or it's in a string or a comment;
 so does a `"` where a string can start (after a space, `{`, `[`, `,` or `:`). A `}` or `]` typed
 before the same one steps over it, as does a `"` typed before the quote that ends its string, and

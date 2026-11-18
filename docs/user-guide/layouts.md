@@ -17,14 +17,16 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
 
 - **Publication layouts**: Home › New Layout › **Publication Layout** builds a finished sheet or
   figure of the map view in one step, with `layout.publication` behind it:
-  - **Sheets** (A4, A3 or A2, portrait or landscape): a frame and margin, the title and subtitle,
+  - **Sheets** (on every page size New Layout lists: Letter, Legal, Tabloid and A5 to A0,
+    portrait or landscape; the menu lists the sizes, each with its styles under Portrait and
+    under Landscape): a frame and margin, the title and subtitle,
     the map, and a footer of two boxed columns (sources, and the cartographic reference; one
     with nothing in it is left out, the other taking the width) with a note and the authorship
     under them. When the legend sits at the right of the map (its right edge in the frame's
     right tenth), starting between 45 % and 70 % of the frame's width, the right column starts
     where the legend does, unless its texts would then need a taller box. Text sizes follow the
-    sheet: an A3's are 1.41 times an A4's. Given its size alone (`"a4"`, the default, `"a3"`
-    or `"a2"`), a sheet is turned to
+    sheet's short side: an A3's are 1.41 times an A4's, an A0's four times. Given its size alone
+    (`"a4"`, the default, or any other: `"letter"`, `"a0"`…), a sheet is turned to
     portrait or landscape, whichever the map comes out larger on: the area's extent east to west
     against north to south, on the map's projection, with the room the style leaves the map. The
     result names the profile chosen (`"profile": "a4-landscape"`); give it with its orientation
@@ -116,6 +118,15 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
     latitude), the layout has no north arrow: the graticule gives north there, and one arrow can't
     point north across the whole frame. A warning says so; `"northArrow": "always"` draws one, and
     `"none"` leaves it out at any span.
+  - **On the globe**: with the map on the Globe projection and no `extent`, the sheet shows the
+    globe whole. The globe nearly fills the frame, centred where the view looks, and the
+    surrounds go in the room around it. It has no scale bar, since a globe's scale holds only at
+    its centre. A sheet has no locator by default either, since it would only show the same globe
+    again, smaller; `"locator": "globe"` or `"inset"` still adds one. Warnings say both. Near a
+    pole the frame can't draw the globe that small at the view's latitude, so the globe is
+    centred as near it as fits, and a warning says where. With an `extent`, a sheet on the globe
+    is laid out as on a flat map. In any frame on the globe, the light space around the globe is
+    room for the surrounds, as the blank page is.
   - **Legend box**: over the map, the legend's box is left clear where the map shows nothing under
     it but its light plain paper or water: no layer, label, context layer, basemap shape or graticule
     line, no web tiles, and no veil. Dark basemaps keep a white backing so the dark legend text
@@ -197,7 +208,9 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   running along the edge. From a command:
   `layout.addElement={"kind":"grid","step":0.5,"style":"ticks","format":"dms","edges":["top","bottom","left","right"],"labelOrientation":"vertical"}`
   (given again, it changes only the options it names), or `layout.update` with
-  `"grid": {…}` (`false` removes the grid).
+  `"grid": {…}` (`false` removes the grid). On a map on the globe the lines are drawn on the
+  globe, and stop at its horizon. A frame that shows the whole globe has nothing beyond its rim,
+  and so no labels along its edges.
 - **Measured grids**: a grid's **Type** is a **Graticule** (latitudes and longitudes, as above)
   or a **Measured grid**, as ArcGIS Pro has them: eastings and northings in a projected coordinate
   system, for maps read with UTM or national grid coordinates (a hiking map at 1:25,000 with a
@@ -547,6 +560,23 @@ The locator outlines the main frame's changing extent as the series turns its pa
 more, with a warning. Split longer books' index data into layers of at most 500 features.
 `layout.export` with `"allPages":false` writes only the current PDF page; PNG and SVG always
 write the current page.
+
+### Mark the page's own feature
+
+Set [Symbols by Expression](cartography.md#symbols-by-expression) on the index layer. Use
+`$id = @page_feature_id` to give the current feature a heavier outline and draw the rest in gray.
+For an index layer called **Tracts**, the command is:
+
+```text
+layer.symbolBy={"layer":"Tracts","strokeWidth":"if($id = @page_feature_id, 3, 0.6)","stroke":"if($id = @page_feature_id, '#174a7e', '#9ca3af')","fill":"if($id = @page_feature_id, '#8bbce8', '#e5e7eb')"}
+```
+
+Use a style rather than a definition query: a definition query such as `$id = @page_feature_id`
+leaves the layer empty in the map view, where the variables are null. Step through the pages to see the
+style follow the index feature. The expression also works in a
+locator frame that shows the index layer. Feature IDs are local to each layer, so use the ID
+comparison on the index layer. Outside a series page the comparison never matches, and every
+feature gets the gray style.
 
 ## Reports
 

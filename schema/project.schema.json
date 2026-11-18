@@ -53,6 +53,12 @@
                 },
                 "proj4": {
                   "type": "string"
+                },
+                "wkt": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 }
               },
               "required": [
@@ -1071,11 +1077,13 @@
           "shaded-relief-light",
           "table-export-order",
           "tabulate-intersection-unit",
+          "tabulate-intersection-empty-zones",
           "layout-element-background",
           "classified-point-size",
           "picture-markers",
           "layout-element-ink",
-          "field-generation"
+          "field-generation",
+          "crs-wkt"
         ],
         "type": "string"
       },
@@ -1150,11 +1158,13 @@
     "shaded-relief-light",
     "table-export-order",
     "tabulate-intersection-unit",
+    "tabulate-intersection-empty-zones",
     "layout-element-background",
     "classified-point-size",
     "picture-markers",
     "layout-element-ink",
-    "field-generation"
+    "field-generation",
+    "crs-wkt"
   ],
   "x-rustgis-reads-format": 2,
   "x-rustgis-writes-format": 2

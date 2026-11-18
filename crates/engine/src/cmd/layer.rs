@@ -21,7 +21,7 @@ pub const MAX_LAYER_NAME: usize = 200;
 pub fn commands() -> Vec<C> {
     vec![
         C::new("layer.addData", "Add Data", "Home › Add", add_data).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
-            .params(r#"{"path": string, "name"?: string, "layer"?: "GeoPackage, GDAL, DuckDB or DXF layer", "paperSpace"?: "bool: a DXF's layout entities too", "blocks"?: "bool: a DXF's block (图块) contents, true by default", "stream"?: bool, "as"?: "scan" (a TIFF, PNG or JPEG, even a photo or a GeoTIFF, as a picture with no coordinates), "crs"?: "EPSG:… (or WKT) for Shapefile coordinates (overrides .prj), a CSV, a DXF (which never says), a CityJSON or CityGML model (it replaces the system a model file names; in a zip, it is used for a model naming none RustGIS knows), or a GDAL or DuckDB file that doesn't say (GDAL takes an authority code such as EPSG:2263 or the exact names WGS84, WGS72, NAD27, NAD83, not WKT or a file)", "x"?: "CSV x/longitude column", "y"?: "CSV y/latitude column", "wkt"?: "CSV WKT geometry column", "delimiter"?: ","|";"|"\\t"|"|"}"#),
+            .params(r#"{"path": string, "name"?: string, "layer"?: "GeoPackage, GDAL, DuckDB or DXF layer, or a PDF's page number (the first when left out or blank)", "paperSpace"?: "bool: a DXF's layout entities too", "blocks"?: "bool: a DXF's block (图块) contents, true by default", "stream"?: bool, "as"?: "scan" (a TIFF, PNG, JPEG or PDF page, even a photo, a GeoTIFF or a GeoPDF, as a picture with no coordinates), "crs"?: "EPSG:… (or WKT) for Shapefile coordinates (overrides .prj), a CSV, a DXF (which never says), a CityJSON or CityGML model (it replaces the system a model file names; in a zip, it is used for a model naming none RustGIS knows), or a GDAL or DuckDB file that doesn't say (GDAL takes an authority code such as EPSG:2263 or the exact names WGS84, WGS72, NAD27, NAD83, not WKT or a file)", "x"?: "CSV x/longitude column", "y"?: "CSV y/latitude column", "wkt"?: "CSV WKT geometry column", "delimiter"?: ","|";"|"\\t"|"|"}"#),
         C::new("layer.addPhotos", "Add Photos", "Home › Add", add_photos).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).params(
             r#"{"paths"?: [JPEG photo files], "folder"?: "a folder of photos (every JPEG in it)", "name"?: "the layer (default Photos; photos join it when it exists)"}"#,
         ),
@@ -150,7 +150,7 @@ pub fn commands() -> Vec<C> {
         .when(need_layer),
         C::new("layer.symbology", "Symbology", "Style › Drawing", symbology).roles(&[]).effects(crate::policy::Effects::NONE)
             .when(need_feature_layer)
-            .params(r#"{"layer"?, "type": "single"|"unique"|"graduated"|"proportional", "field"?, "expression"?: text|null (unique: class by this expression's values instead of a field; blank or null: by a field; with neither key, Unique Values keep the layer's expression), "classes"?: 1..12, "method"?: "naturalBreaks"|"equalInterval"|"quantile"|"geometricInterval"|"standardDeviation"|"arithmeticProgression"|"headTailBreaks"|"manual", "breaks"?: [numbers] (manual: the classes' upper bounds, closed by the field's largest value), "ramp"?: string}"#),
+            .params(r#"{"layer"?, "type": "single"|"unique"|"graduated"|"proportional", "field"?, "expression"?: expression|null (unique: class by this expression's values instead of a field; blank or null: by a field; with neither key, Unique Values keep the layer's expression), "classes"?: 1..12, "method"?: "naturalBreaks"|"equalInterval"|"quantile"|"geometricInterval"|"standardDeviation"|"arithmeticProgression"|"headTailBreaks"|"manual", "breaks"?: [numbers] (manual: the classes' upper bounds, closed by the field's largest value), "ramp"?: string}"#),
         C::new("layer.ramp", "Color Scheme", "Style › Drawing", |s, p| {
             let r = s.ramp(s_req(p, "ramp")?)?;
             let mut dropped = None;
@@ -347,12 +347,12 @@ pub fn commands() -> Vec<C> {
         C::new("layer.lineStrokes", "Line Strokes", "Style › Drawing", line_strokes).roles(&[]).effects(crate::policy::Effects::NONE)
             .when(need_lines_or_points)
             .params(
-                r##"{"layer"?, "strokes": [{"color"?: "#RRGGBB"|"#RRGGBBAA"|null (null: the renderer's line colour), "width"?: points|null (null: the renderer's width), "offset"?: points (positive: right of the line's direction, negative: left), "cap"?: "round"|"flat"|"square", "join"?: "round"|"miter"|"bevel", "level"?: 0..255|null (with layer.strokeLevels: the level it draws at; null: its place in the stack), "dash"?: [points, …]|null (dash, gap, … in turn, at most 8; null: solid), "markers"?: {"mark"?: "circle"|"square"|"triangle"|"diamond"|"star"|"character"|"hash" (a mark across the line), "char"?: text (a character of a font as the marker instead of a shape), "font"?: text (the installed family it is drawn from; none: the label font), "size"?: points (a marker's size, a hash mark's length; default 4), "at"?: "interval"|"vertices"|"innerVertices"|"first"|"last"|"middle"|"segmentMiddles" or a list of them (default "interval"), "interval"?: points (default 12), "offsetAlong"?: points (from the start, back from the end, on from the middle), "rotate"?: bool (turned with the line; default true), "averageAngle"?: points (the stretch of line a marker at an interval turns with; 0: its segment), "angle"?: degrees clockwise (a hash mark at 0 crosses the line square), "outline"?: "#RRGGBB"|"#RRGGBBAA" (the markers' outline, as wide as the stroke)}|null (markers or hash marks along the line in the stroke's colour, instead of a line; cap, join and dash don't apply)}] (drawn bottom first; [] goes back to the single stroke, or for a class to the layer's strokes; on a point layer they are its marks: each stroke's markers drawn at the point in place of the symbol's, "offsetAlong" shifting a mark right and "offset" down, both turned with its "angle", and "rotate" turning it by layer.markerRotation's field), "value"?: text|number (a Unique Values class's own strokes), "index"?: number (a Graduated Colors class's, 0 = the lowest), "other"?: true (Unique Values' <all other values>)}"##,
+                r##"{"layer"?, "strokes": [{"color"?: "#RRGGBB"|"#RRGGBBAA"|null (null: the renderer's line colour), "width"?: points|null (null: the renderer's width), "offset"?: points (positive: right of the line's direction, negative: left), "cap"?: "round"|"flat"|"square", "join"?: "round"|"miter"|"bevel", "level"?: 0..255|null (with layer.strokeLevels: the level it draws at; null: its place in the stack), "dash"?: [points, …]|null (dash, gap, … in turn, at most 8; null: solid), "markers"?: {"mark"?: "circle"|"square"|"triangle"|"diamond"|"star"|"character"|"image"|"hash" (a mark across the line), "char"?: text (a character of a font as the marker instead of a shape), "font"?: text (the installed family it is drawn from; none: the label font), "image"?: text (a PNG or JPEG image as base64, at most 2 MiB, as the marker instead of a shape: as wide as its size, as tall as its proportions make it; the stroke's colour and the outline don't show), "size"?: points (a marker's size, a hash mark's length; default 4), "at"?: "interval"|"vertices"|"innerVertices"|"first"|"last"|"middle"|"segmentMiddles" or a list of them (default "interval"), "interval"?: points (default 12), "offsetAlong"?: points (from the start, back from the end, on from the middle), "rotate"?: bool (turned with the line; default true), "averageAngle"?: points (the stretch of line a marker at an interval turns with; 0: its segment), "angle"?: degrees clockwise (a hash mark at 0 crosses the line square), "outline"?: "#RRGGBB"|"#RRGGBBAA" (the markers' outline, as wide as the stroke)}|null (markers or hash marks along the line in the stroke's colour, instead of a line; cap, join and dash don't apply)}] (drawn bottom first; [] goes back to the single stroke, or for a class to the layer's strokes; on a point layer they are its marks: each stroke's markers drawn at the point in place of the symbol's, "offsetAlong" shifting a mark right and "offset" down, both turned with its "angle", and "rotate" turning it by layer.markerRotation's field), "value"?: text|number (a Unique Values class's own strokes), "index"?: number (a Graduated Colors class's, 0 = the lowest), "other"?: true (Unique Values' <all other values>)}"##,
             ),
         C::new("layer.fillLayers", "Fill Layers", "Style › Drawing", fill_layers).roles(&[]).effects(crate::policy::Effects::NONE)
             .when(need_polygon_features)
             .params(
-                r##"{"layer"?, "value"?|"index"?|"other"?: a class of Unique Values (its value, or other: true) or Graduated Colors (its index) to set its own fills (none: the layer's), "fills": [{"color"?: "#RRGGBB"|"#RRGGBBAA"|null (null: the feature's fill colour, so the fills follow the classes), "pattern"?: "solid" (default)|"hatch" (parallel lines)|"dots" (markers on a grid)|"gradient" (from color to color2 across the feature)|"shapeburst" (from color at the edge to color2 inside), "angle"?: degrees anticlockwise from east (hatch), "spacing"?: points between lines (hatch, 1 to 500; default 8) or points across and down between markers, a number or [across, down] (dots), "width"?: a hatch line's width in points (0 to 50; default 1), "offset"?: points across the lines (hatch) or [across, down] (dots), "marker"?: "circle"|"square"|"triangle"|"diamond"|"star" (dots), "char"?: text (dots: a character of a font as the marker instead of a shape), "font"?: text (the installed family it is drawn from; none: the label font), "size"?: a marker's size in points (default 3), "outline"?: a marker's outline colour or null, "outlineWidth"?: points, "displacement"?: [across, down] points every other row and column are shifted by (dots), "color2"?: "#RRGGBB"|"#RRGGBBAA" (gradient, shapeburst: the second colour; default white), "stops"?: [[0..1, "#RRGGBB"|"#RRGGBBAA"], …] (gradient, shapeburst: colours between the two, at most 16), "discrete"?: bool (each colour held until the next stop), "shape"?: "linear" (default)|"radial"|"conical" (gradient), "from"?: [across, down]|"centroid" (gradient: where color is, 0..1 in the feature's box; default [0.5, 0], the top middle), "to"?: [across, down]|"centroid" (where color2 is; default [0.5, 1]), "spread"?: "pad" (default)|"reflect"|"repeat" (gradient: past its points), "angle"?: degrees anticlockwise (gradient: turned round its box's middle), "inView"?: bool (gradient: from and to in the map view's box, not the feature's), "distance"?: points|null (shapeburst: how deep it shades; null or none: to the point deepest inside), "blur"?: 0..17 (shapeburst: pixels), "ignoreRings"?: bool (shapeburst: holes' edges left out)}] (bottom first, at most 8; [] for the symbol's single fill; the outline is drawn over them)}"##,
+                r##"{"layer"?, "value"?|"index"?|"other"?: a class of Unique Values (its value, or other: true) or Graduated Colors (its index) to set its own fills (none: the layer's), "fills": [{"color"?: "#RRGGBB"|"#RRGGBBAA"|null (null: the feature's fill colour, so the fills follow the classes), "pattern"?: "solid" (default)|"hatch" (parallel lines)|"dots" (markers on a grid)|"gradient" (from color to color2 across the feature)|"shapeburst" (from color at the edge to color2 inside), "angle"?: degrees anticlockwise from east (hatch), "spacing"?: points between lines (hatch, 1 to 500; default 8) or points across and down between markers, a number or [across, down] (dots), "width"?: a hatch line's width in points (0 to 50; default 1), "offset"?: points across the lines (hatch) or [across, down] (dots), "marker"?: "circle"|"square"|"triangle"|"diamond"|"star"|"image" (dots), "char"?: text (dots: a character of a font as the marker instead of a shape), "font"?: text (the installed family it is drawn from; none: the label font), "image"?: text (dots: a PNG or JPEG image as base64, at most 2 MiB, as the marker instead of a shape: as wide as its size, as tall as its proportions make it; the colour and the outline don't show), "size"?: a marker's size in points (default 3), "outline"?: a marker's outline colour or null, "outlineWidth"?: points, "displacement"?: [across, down] points every other row and column are shifted by (dots), "color2"?: "#RRGGBB"|"#RRGGBBAA" (gradient, shapeburst: the second colour; default white), "stops"?: [[0..1, "#RRGGBB"|"#RRGGBBAA"], …] (gradient, shapeburst: colours between the two, at most 16), "discrete"?: bool (each colour held until the next stop), "shape"?: "linear" (default)|"radial"|"conical" (gradient), "from"?: [across, down]|"centroid" (gradient: where color is, 0..1 in the feature's box; default [0.5, 0], the top middle), "to"?: [across, down]|"centroid" (where color2 is; default [0.5, 1]), "spread"?: "pad" (default)|"reflect"|"repeat" (gradient: past its points), "angle"?: degrees anticlockwise (gradient: turned round its box's middle), "inView"?: bool (gradient: from and to in the map view's box, not the feature's), "distance"?: points|null (shapeburst: how deep it shades; null or none: to the point deepest inside), "blur"?: 0..17 (shapeburst: pixels), "ignoreRings"?: bool (shapeburst: holes' edges left out)}] (bottom first, at most 8; [] for the symbol's single fill; the outline is drawn over them)}"##,
             ),
         C::new("layer.markerRotation", "Marker Rotation", "Style › Drawing", |s, p| {
             let field = match p.get("field") {
@@ -387,7 +387,7 @@ pub fn commands() -> Vec<C> {
         .params(r#"{"layer"?, "field"?: numeric field name|null (each marker sized by its value, keeping its Unique Values or Graduated Colors class's colours; null: the classes' own sizes; left out: the mapping's field, to change its other settings), "min"?: number (the value drawn smallest; default the field's smallest, or the mapping's), "max"?: number (the value drawn largest, above min; default the field's largest, or the mapping's), "minSize"?: points (default 4, or the mapping's), "maxSize"?: points (default 24, or the mapping's), "scaling"?: "area"|"radius" (area: the marker's area grows with the value, as Proportional Symbols; radius: its size grows in a straight line, as MapLibre's; default area, or the mapping's)} (values past min or max take the end's size; a null or non-numeric value keeps its class's size)"#),
         C::new("layer.symbolBy", "Symbol by Expression", "Style › Drawing", symbol_by).roles(&[]).effects(crate::policy::Effects::NONE)
             .when(need_feature_layer)
-            .params(r#"{"layer"?, "size"?: expression|null (a point's marker size in points), "fill"?: expression|null (the fill colour: '#RRGGBB', a CSS colour name or 'r,g,b[,a]' as color_rgb gives it), "stroke"?: expression|null (the outline colour, a line's colour), "strokeWidth"?: expression|null (the outline's width in points, a line's width), "angle"?: expression|null (point layers: each marker turned by it, in degrees clockwise, in place of layer.markerRotation's field)} (each expression in the language of queries, per feature, @map_scale the map's scale; a key left out keeps its expression, null or "" removes it; where an expression gives null the symbol's own value is drawn)"#),
+            .params(r#"{"layer"?, "size"?: expression|null (a point's marker size in points), "fill"?: expression|null (the fill colour: '#RRGGBB', a CSS colour name or 'r,g,b[,a]' as color_rgb gives it), "stroke"?: expression|null (the outline colour, a line's colour), "strokeWidth"?: expression|null (the outline's width in points, a line's width), "angle"?: expression|null (point layers: each marker turned by it, in degrees clockwise, in place of layer.markerRotation's field)} (each expression in the language of queries, per feature, @map_scale the map's scale, @page_feature_id, @page_name and @page_number the map series page (null off a series page); a key left out keeps its expression, null or "" removes it; where an expression gives null the symbol's own value is drawn)"#),
         C::new("layer.strokeLevels", "Stroke Levels", "Style › Drawing", |s, p| {
             let on = b(p, "on").ok_or("on is true or false")?;
             let id = s.layer_id(p)?;
@@ -652,7 +652,7 @@ pub fn commands() -> Vec<C> {
             with(s, p, |l| l.definition_query = if q.is_empty() { None } else { Some(q.clone()) })
         }).roles(&[]).effects(crate::policy::Effects::NONE)
         .when(need_feature_layer)
-        .params(r#"{"layer"?, "where": "SQL clause, empty to clear"}"#),
+        .params(r#"{"layer"?, "where": sql (empty to clear)}"#),
         C::new("table.open", "Attribute Table", "Data › Table", |s, p| {
             s.table_layer = Some(s.layer_id(p)?);
             Ok(Value::Null)
@@ -946,6 +946,17 @@ fn line_strokes(s: &mut Session, p: &Value) -> CmdResult {
     if list.len() > MAX_STROKES {
         return Err(format!("at most {MAX_STROKES} strokes"));
     }
+    // Refused before the strokes are read: a call on the wrong layer or class keeps none of their
+    // images.
+    let id = s.layer_id(p)?;
+    let l = s.map().layer(id).ok_or("no such layer")?;
+    let points = l.geometry_type() == GeometryType::Point;
+    if !(points || l.geometry_type() == GeometryType::Polyline) || l.graphics {
+        return Err("this works on line and point layers".into());
+    }
+    if let Some(c) = &class {
+        l.renderer.class_strokes(c)?;
+    }
     let mut strokes = Vec::with_capacity(list.len());
     for (i, v) in list.iter().enumerate() {
         let o = v.as_object().ok_or_else(|| format!("stroke {} is not an object", i + 1))?;
@@ -1004,6 +1015,10 @@ fn line_strokes(s: &mut Session, p: &Value) -> CmdResult {
             }
             Some(_) => return Err(bad_dash()),
         };
+        // A point draws marks only: a line stroke would draw nothing there.
+        if points && o.get("markers").is_none_or(Value::is_null) {
+            return Err(format!("stroke {}: a point layer's strokes are markers", i + 1));
+        }
         let markers = match o.get("markers") {
             None | Some(Value::Null) => None,
             Some(m) => Some(line_markers(m).map_err(|e| format!("stroke {}: markers: {e}", i + 1))?),
@@ -1012,16 +1027,7 @@ fn line_strokes(s: &mut Session, p: &Value) -> CmdResult {
             LineStroke { color, width: num("width")?, offset: num("offset")?.unwrap_or(0.0), cap, join, level, dash, markers }.clamped(),
         );
     }
-    let id = s.layer_id(p)?;
     let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
-    let points = l.geometry_type() == GeometryType::Point;
-    if !(points || l.geometry_type() == GeometryType::Polyline) || l.graphics {
-        return Err("this works on line and point layers".into());
-    }
-    // A point draws marks only: a line stroke would draw nothing there.
-    if let Some(i) = strokes.iter().position(|st| st.markers.is_none()).filter(|_| points) {
-        return Err(format!("stroke {}: a point layer's strokes are markers", i + 1));
-    }
     let n = strokes.len();
     match class {
         Some(c) => l.renderer.set_class_strokes(&c, strokes)?,
@@ -1276,6 +1282,44 @@ pub(crate) fn renderer_with_fills(l: &rustgis_map::Layer) -> (Renderer, usize) {
     (r, left_out)
 }
 
+/// The opacity a colour swatch shows for a fill No Fill made transparent: the one Restore Fill
+/// gives it back (the default when that wasn't kept), so that a colour picked from the swatch is
+/// drawn as Restore Fill would draw it, not kept at No Fill's 0 (#2308). The layer's base symbol,
+/// or `class`'s. `None` for a fill No Fill doesn't hide that way, which the swatch shows as it is.
+/// It reads in place, without a copy of the renderer: the swatches ask for it every frame.
+pub fn hidden_fill_opacity(l: &rustgis_map::Layer, class: Option<&ClassRef>) -> Option<u8> {
+    if l.no_fill != Some(NoFill::Symbols) {
+        return None;
+    }
+    let (at, count, now) = symbol_slot(&l.renderer, class)?;
+    // A fill shown since (given a colour of its own while No Fill was on) is drawn as it is.
+    if now > 0 {
+        return None;
+    }
+    // Kept only while they still match the symbols, as Restore Fill needs.
+    let kept = l.hidden_fills.as_ref().filter(|h| h.alphas.len() == count).and_then(|h| h.alphas.get(at).copied());
+    Some(kept.unwrap_or_else(shown_fill_alpha))
+}
+
+/// Where the layer's base symbol (as [`Renderer::base_symbol`] picks it), or `class`'s, comes
+/// among [`Renderer::map_symbols`]', which is the order No Fill keeps their opacities in; how many
+/// symbols that walks; and the symbol's fill opacity now.
+fn symbol_slot(r: &Renderer, class: Option<&ClassRef>) -> Option<(usize, usize, u8)> {
+    let at = match (r, class) {
+        (_, Some(c)) => symbol_position(r, c)?,
+        (Renderer::Graduated { symbols, .. }, None) => symbols.len().checked_sub(1)?,
+        (_, None) => 0,
+    };
+    let (symbol, count) = match r {
+        Renderer::Single(s) | Renderer::Proportional { base: s, .. } => ((at == 0).then_some(s), 1),
+        Renderer::Unique { classes, other, .. } => {
+            (if at == classes.len() { Some(other) } else { classes.get(at).map(|(_, s)| s) }, classes.len() + 1)
+        }
+        Renderer::Graduated { symbols, .. } => (symbols.get(at), symbols.len()),
+    };
+    Some((at, count, symbol?.fill.a()))
+}
+
 /// The layer's own fill layers No Fill hid come back unless it has fill layers of its own now;
 /// those stay, and a note says the hidden ones weren't put back.
 fn put_back_layer_fills(l: &mut rustgis_map::Layer, fills: Vec<rustgis_map::fills::FillLayer>, notes: &mut Vec<String>) {
@@ -1320,6 +1364,16 @@ fn fill_layers(s: &mut Session, p: &Value) -> CmdResult {
     if list.len() > MAX_FILLS {
         return Err(format!("at most {MAX_FILLS} fills"));
     }
+    // Refused before the fills are read: a call on the wrong layer or class keeps none of their
+    // images.
+    let id = s.layer_id(p)?;
+    let l = s.map().layer(id).ok_or("no such layer")?;
+    if !l.has_geometry(GeometryType::Polygon) || l.graphics || l.is_raster() {
+        return Err("this works on layers containing polygons".into());
+    }
+    if let Some(c) = &class {
+        l.renderer.class_fills(c)?;
+    }
     let mut fills = Vec::with_capacity(list.len());
     for (i, v) in list.iter().enumerate() {
         let n = i + 1;
@@ -1353,6 +1407,10 @@ fn fill_layers(s: &mut Session, p: &Value) -> CmdResult {
                 Some(v) => number(v).map(|x| [x, x]).ok_or_else(|| format!("fill {n}: {k} is a number or [across, down]")),
             }
         };
+        // An image is a dots fill's marker: another pattern would drop it.
+        if o.get("image").is_some_and(|v| !v.is_null()) && o.get("pattern").and_then(Value::as_str) != Some("dots") {
+            return Err(format!("fill {n}: an image is a dots fill's marker"));
+        }
         let pattern = match o.get("pattern").filter(|v| !v.is_null()).map(|v| v.as_str()) {
             None | Some(Some("solid")) => FillPattern::Solid,
             Some(Some("hatch")) => FillPattern::Hatch {
@@ -1362,21 +1420,37 @@ fn fill_layers(s: &mut Session, p: &Value) -> CmdResult {
                 offset: num("offset", 0.0)?,
             },
             Some(Some("dots")) => {
+                let image = o.get("image").is_some_and(|v| !v.is_null());
                 let marker = match o.get("marker") {
                     None | Some(Value::Null) => Marker::Circle,
+                    // Its `image` says which.
+                    Some(Value::String(m)) if m.trim().eq_ignore_ascii_case("image") => {
+                        if !image {
+                            return Err(format!("fill {n}: an image marker needs its image"));
+                        }
+                        Marker::Circle
+                    }
                     Some(Value::String(m)) => Marker::ALL
                         .into_iter()
                         .find(|s| s.label().eq_ignore_ascii_case(m.trim()))
                         .ok_or_else(|| format!("fill {n}: unknown marker '{m}'"))?,
-                    Some(_) => return Err(format!("fill {n}: marker is \"circle\", \"square\", \"triangle\", \"diamond\" or \"star\"")),
+                    Some(_) => {
+                        return Err(format!(
+                            "fill {n}: marker is \"circle\", \"square\", \"triangle\", \"diamond\", \"star\" or \"image\""
+                        ));
+                    }
                 };
+                image_alone(o, "marker").map_err(|e| format!("fill {n}: {e}"))?;
                 // A character of a font instead of a shape, as `layer.marker` takes it.
                 let marker = match character(v).map_err(|e| format!("fill {n}: {e}"))? {
                     Some(_) if o.get("marker").is_some_and(|m| !m.is_null()) => {
                         return Err(format!("fill {n}: give a marker or a char, not both"));
                     }
                     Some(c) => Marker::Char(Glyph::new(c, o.get("font").and_then(Value::as_str).unwrap_or_default())),
-                    None => marker,
+                    None => match picture(v).map_err(|e| format!("fill {n}: {e}"))? {
+                        Some(img) => Marker::Picture(img),
+                        None => marker,
+                    },
                 };
                 FillPattern::Dots {
                     marker,
@@ -1480,11 +1554,7 @@ fn fill_layers(s: &mut Session, p: &Value) -> CmdResult {
         };
         fills.push(FillLayer { color: hex("color")?, pattern }.clamped());
     }
-    let id = s.layer_id(p)?;
     let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
-    if !l.has_geometry(GeometryType::Polygon) || l.graphics || l.is_raster() {
-        return Err("this works on layers containing polygons".into());
-    }
     // A fill in the symbol's colour, or the symbol's own fill ([]), asked for after No Fill: the
     // symbols' fills are shown again, or they would draw nothing (#1301). A class's fills show
     // that class's alone.
@@ -1530,7 +1600,19 @@ fn character(p: &Value) -> Result<Option<char>, String> {
     }
 }
 
-/// `layer.marker`'s `image`: a PNG or JPEG image as base64, which must decode.
+/// A line marker's or a dot fill's `image` named with a shape, a character or a hash mark under
+/// `key` (`"mark"`, `"marker"`), or with a `char`: refused before the image is kept.
+fn image_alone(o: &serde_json::Map<String, Value>, key: &str) -> Result<(), String> {
+    let other = o.get("char").is_some_and(|c| !c.is_null())
+        || o.get(key).and_then(Value::as_str).is_some_and(|m| !m.trim().eq_ignore_ascii_case("image"));
+    if o.get("image").is_some_and(|v| !v.is_null()) && other {
+        return Err(format!("give a {key}, a char or an image, only one"));
+    }
+    Ok(())
+}
+
+/// An `image` (`layer.marker`'s, a line marker's, a dot fill's): a PNG or JPEG image as base64,
+/// which must decode.
 fn picture(p: &Value) -> Result<Option<Picture>, String> {
     const WHAT: &str = "image is a PNG or JPEG image as base64";
     let b64 = match p.get("image") {
@@ -1540,6 +1622,11 @@ fn picture(p: &Value) -> Result<Option<Picture>, String> {
     };
     if b64.len() > rustgis_map::symbology::MAX_PICTURE_BYTES {
         return Err(format!("image is at most {} MiB of base64", rustgis_map::symbology::MAX_PICTURE_BYTES >> 20));
+    }
+    // One given again (the editor sends a stroke's or a fill's image with every change, a slider
+    // every frame) is found where it's kept, and decoded once into the drawing's cache.
+    if let Some(kept) = Picture::kept(b64) {
+        return if rustgis_render::picture_marker_draws(kept) { Ok(Some(kept)) } else { Err(WHAT.into()) };
     }
     if !rustgis_render::picture_marker_readable(b64) {
         return Err(WHAT.into());
@@ -1563,9 +1650,17 @@ fn line_markers(v: &Value) -> Result<LineMarkers, String> {
         }
     };
     let d = LineMarkers::default();
+    let image = o.get("image").is_some_and(|v| !v.is_null());
     let mark = match o.get("mark") {
         None | Some(Value::Null) => d.mark,
         Some(Value::String(m)) if m.trim().eq_ignore_ascii_case("hash") => LineMark::Hash,
+        // Its `image` says which.
+        Some(Value::String(m)) if m.trim().eq_ignore_ascii_case("image") => {
+            if !image {
+                return Err("an image mark needs its image".into());
+            }
+            d.mark
+        }
         // Its `char` says which.
         Some(Value::String(m)) if m.trim().eq_ignore_ascii_case("character") => {
             if character(v)?.is_none() {
@@ -1576,8 +1671,11 @@ fn line_markers(v: &Value) -> Result<LineMarkers, String> {
         Some(Value::String(m)) => LineMark::Marker(
             Marker::ALL.into_iter().find(|s| s.label().eq_ignore_ascii_case(m.trim())).ok_or_else(|| format!("unknown mark '{m}'"))?,
         ),
-        Some(_) => return Err("mark is \"circle\", \"square\", \"triangle\", \"diamond\", \"star\", \"character\" or \"hash\"".into()),
+        Some(_) => {
+            return Err("mark is \"circle\", \"square\", \"triangle\", \"diamond\", \"star\", \"character\", \"image\" or \"hash\"".into());
+        }
     };
+    image_alone(o, "mark")?;
     // A character of a font instead of a shape.
     let mark = match (character(v)?, o.get("font")) {
         (Some(_), _) if mark == LineMark::Hash => return Err("hash marks take no char".into()),
@@ -1586,7 +1684,7 @@ fn line_markers(v: &Value) -> Result<LineMarkers, String> {
             return Err("give a shape or a char, not both".into());
         }
         (Some(c), font) => LineMark::Marker(Marker::Char(Glyph::new(c, font.and_then(Value::as_str).unwrap_or_default()))),
-        (None, _) => mark,
+        (None, _) => picture(v)?.map_or(mark, |img| LineMark::Marker(Marker::Picture(img))),
     };
     let bad_at = || format!("at is a placement or a list of them: {}", Placements::all_codes());
     let at = match o.get("at") {
@@ -1858,7 +1956,9 @@ fn add_data(s: &mut Session, p: &Value) -> CmdResult {
         return add_photos(s, &json!({"paths": [path], "name": name}));
     }
     if rustgis_data::raster::is_raster_name(path) {
-        return super::raster::add_path(s, path, ps(p, "name").map(str::trim).filter(|n| !n.is_empty()), scan);
+        let name = ps(p, "name").map(str::trim).filter(|n| !n.is_empty());
+        let page = super::raster::pdf_page(path, p)?;
+        return super::raster::add_path(s, path, name, page.as_deref(), scan);
     }
     // A Zarr store's folder: its first variable, or the one "layer" names.
     #[cfg(not(target_arch = "wasm32"))]
@@ -2258,8 +2358,10 @@ pub(crate) fn add_data_ahead(p: &Value) -> Option<super::reads::ReadWork> {
         return None;
     }
     if rustgis_data::raster::is_raster_name(&path) {
-        let key = super::raster::read_key(&path, scan);
-        return Some(ahead(NAME, key, move || super::raster::read_raster_as(&path, scan)));
+        // A page that isn't one is refused when the command runs.
+        let page = super::raster::pdf_page(&path, p).ok()?;
+        let key = super::raster::read_key(&path, page.as_deref(), scan);
+        return Some(ahead(NAME, key, move || super::raster::read_raster_as(&path, page.as_deref(), scan)));
     }
     if rustgis_data::raster::zarr::is_store(Path::new(&path)) {
         return None;
@@ -5733,7 +5835,12 @@ fn add_download(s: &mut Session, p: &Value) -> CmdResult {
         url_file_name(&url, &bytes).map_err(|e| crate::sources::message_with_address(&url, &e))?
     };
     let left_out = parts_left_out(&url, &bytes, p);
-    let r = super::raster::add_named_bytes(s, p, name, bytes, b(p, "zoom"))?;
+    // A PDF's page the app drew off the frame as it landed (#2336).
+    #[cfg(not(target_arch = "wasm32"))]
+    let drawn = s.landed_pages.iter().position(|(d, _)| *d == id).map(|i| s.landed_pages.remove(i).1);
+    #[cfg(target_arch = "wasm32")]
+    let drawn = None;
+    let r = super::raster::add_named_bytes_read(s, p, name, bytes, b(p, "zoom"), drawn)?;
     if let Some(n) = left_out {
         s.notify(n, false);
     }

@@ -131,6 +131,7 @@ pub(super) fn long_commands(boundaries: bool) {
         ("share.exportRaster", json!({"layer": dem, "path": out("dem.tif")})),
         ("share.exportMap", json!({"path": out("map.png"), "width": 64, "height": 48})),
         ("map.exportOrbit", json!({"path": out("orbit.zip"), "frames": 3, "width": 64, "height": 64, "dpi": 48})),
+        ("map.exportBlock", json!({"path": out("block.glb"), "texture": 256})),
         ("layout.export", json!({"path": out("layout.pdf"), "dpi": 36})),
         ("report.export", json!({"path": out("report.pdf"), "dpi": 36})),
         ("source.publish", json!({"layer": "towns"})),
@@ -141,7 +142,15 @@ pub(super) fn long_commands(boundaries: bool) {
     let registered = crate::cmd::exports::IN_BACKGROUND.iter().map(|(c, ..)| *c).collect::<std::collections::BTreeSet<_>>();
     assert_eq!(listed(&exports), registered, "add a new background export here");
     for (command, p) in &exports {
+        // A block's model needs a block on the DEM, which the other exports don't draw.
+        let block = *command == "map.exportBlock";
+        if block {
+            s.run("map.terrain", &json!({"layer": dem, "block": {}})).unwrap();
+        }
         exercise(&s, command, p, Kind::Export, &dir.0, boundaries);
+        if block {
+            s.run("map.terrain", &json!({"off": true})).unwrap();
+        }
     }
 
     // The Add Service dialog replays supplied metadata off the desktop frame too.
@@ -171,7 +180,45 @@ pub(super) fn long_commands(boundaries: bool) {
     }
     // Original TIFF headers share the read queue and both cancellation sweeps.
     exercise(&s, "raster.imageGrid", &json!({"layer": dem}), Kind::Read, &dir.0, boundaries);
+    // A PDF's page is read on the same queue: the file, then its drawing, Cancel looked at between
+    // (#2336).
+    s.run("layout.new", &json!({"page": "a4", "template": "map"})).unwrap();
+    s.run("layout.export", &json!({"path": out("page.pdf"), "dpi": 36, "allPages": false})).unwrap();
+    exercise(&s, "layer.addData", &json!({"path": out("page.pdf")}), Kind::Read, &dir.0, boundaries);
     exercise(&s, "table.statistics", &json!({"layer": "Cities", "field": "pop_max"}), Kind::Read, &dir.0, boundaries);
+    // A Zarr point series is read on a thread of its own by the Time Series pane (#2282). It isn't
+    // one of the queues above (it has no read-ahead), so it is run here: a local store, swept at
+    // each of its checks in the boundary mode. It changes nothing in the project.
+    {
+        // A store per mode: both run in one test process, and each removes its store when done.
+        let (store, path) = zarr_store_over_time(if boundaries { "cancel-series-boundaries" } else { "cancel-series-first" });
+        let p = json!({"path": path, "variable": "t", "lon": 1.0, "lat": 30.0});
+        let run = crate::cmd::zarr::series_start(&s, &p).unwrap();
+        let before = contents(&s.project);
+        if boundaries {
+            let count = Control::cancelled_at_look(u64::MAX);
+            let expected = run.run(&count).0.unwrap();
+            assert!(count.looked() > 0 && count.looked() < 256, "zarr.series: {} checks", count.looked());
+            for n in 1..=count.looked() + 1 {
+                let control = Control::cancelled_at_look(n);
+                let (result, _) = run.run(&control);
+                if n <= count.looked() {
+                    assert!(result.as_ref().is_err_and(|e| e.contains("cancelled")), "zarr.series, check {n}: {result:?}");
+                    // A retry at once gives the whole series.
+                    assert_eq!(run.run(&Control::new()).0.unwrap(), expected, "zarr.series, check {n}: retry");
+                } else {
+                    assert_eq!(result.unwrap(), expected, "zarr.series, check {n}: past its last check");
+                }
+            }
+        } else {
+            let control = Control::cancelled_once_started();
+            let (result, _) = run.run(&control);
+            assert!(result.as_ref().is_err_and(|e| e.contains("cancelled")), "zarr.series ran on after Cancel: {result:?}");
+            assert!(control.looked() > 0, "zarr.series never looks at Cancel");
+        }
+        assert!(contents(&s.project) == before, "zarr.series changed the project");
+        let _ = std::fs::remove_dir_all(store);
+    }
     // Automatic size bounds scan the numeric field on that queue too.
     s.run("layer.symbology", &json!({"layer": "Cities", "type": "unique", "field": "name"})).unwrap();
     exercise(&s, "layer.sizeBy", &json!({"layer": "Cities", "field": "pop_max"}), Kind::Read, &dir.0, boundaries);
@@ -219,8 +266,8 @@ pub(super) fn long_commands(boundaries: bool) {
     std::fs::remove_file(replacement).unwrap();
 
     // The tools whose work grows past a second or two on real data: buffers, overlays, joins,
-    // hulls, densities and interpolation. Run in the background as the Analysis pane runs them; a
-    // new long tool is added here (AGENTS.md › Never hold the window).
+    // hulls, densities, interpolation and network searches. Run in the background as the
+    // Analysis pane runs them; a new long tool is added here (AGENTS.md › Never hold the window).
     let tools = [
         ("buffer", json!({"input": "Cities", "distance": 100})),
         ("dissolve", json!({"input": "Countries"})),
@@ -235,11 +282,16 @@ pub(super) fn long_commands(boundaries: bool) {
         ("split", json!({"input": "Rivers", "split": "Countries"})),
         ("simplify", json!({"input": "Countries", "tolerance": 1})),
         ("countPoints", json!({"polygons": "Countries", "points": "Cities"})),
+        // Case fields alone: no statistic, so only the group loop looks at Cancel.
+        ("summaryStatistics", json!({"input": "Cities", "case": "featurecla"})),
         ("convexHull", json!({"input": "Countries", "group": "None", "output": "Hulls_each"})),
         ("convexHull", json!({"input": "Countries", "group": "All", "output": "Hulls_all"})),
         ("kernelDensity", json!({"input": "Cities", "crs": "EPSG:3857", "pixelSize": if boundaries { 2000 } else { 1000000 }})),
         ("kriging", json!({"input": "Cities", "field": "pop_max", "pixelSize": if boundaries { 0.01 } else { 1.0 }})),
         ("tabulateArea", json!({"raster": dem, "zones": "Countries"})),
+        ("tabulateIntersection", json!({"zones": "Countries", "classes": "Squares", "includeEmptyZones": true})),
+        ("serviceArea", json!({"network": "Rivers", "facilities": "Cities", "breaks": "50", "snapDistance": 100000})),
+        ("odCostMatrix", json!({"network": "Rivers", "origins": "Cities", "destinations": "Cities", "count": 1, "snapDistance": 100000})),
     ];
     for (tool, params) in &tools {
         exercise(&s, tool, params, Kind::Tool, &dir.0, boundaries);

@@ -202,10 +202,7 @@ impl Dialogs {
             "defineProjection" => {
                 self.projection_layer = active.map(|l| l.id);
                 self.projection_map = Some((s.opened, s.project.active_map, s.map().name.clone()));
-                self.text = active
-                    .and_then(|l| l.dataset.crs)
-                    .map(|c| c.custom_def().map(|d| d.proj4.clone()).unwrap_or_else(|| c.label()))
-                    .unwrap_or_else(|| "EPSG:4326".into());
+                self.text = active.and_then(|l| l.dataset.crs).map(|c| c.definition_text()).unwrap_or_else(|| "EPSG:4326".into());
             }
             "coordinateSystem" => {
                 self.text = s.map().projection.code();
@@ -2252,12 +2249,24 @@ pub(crate) fn text_box(text: &mut String) -> egui::TextEdit<'_> {
 
 /// OK/Cancel row; returns true when the dialog should close.
 pub(crate) fn buttons(app: &mut RustGisApp, ui: &mut egui::Ui, ok: &str, f: impl FnOnce(&mut RustGisApp) -> Result<(), String>) -> bool {
+    buttons_enabled(app, ui, ok, true, f)
+}
+
+/// OK/Cancel row whose submit can be disabled without disabling Cancel.
+pub(crate) fn buttons_enabled(
+    app: &mut RustGisApp,
+    ui: &mut egui::Ui,
+    ok: &str,
+    enabled: bool,
+    f: impl FnOnce(&mut RustGisApp) -> Result<(), String>,
+) -> bool {
     let mut close = false;
     ui.add_space(4.0);
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
         let t = Tokens::get(ui.ctx());
         let enter = ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
-        if crate::widgets::dialog_button(ui, tl!(ok), Some(t.accent), vec2(84.0, 28.0)).clicked() || enter {
+        let submit = ui.add_enabled_ui(enabled, |ui| crate::widgets::dialog_button(ui, tl!(ok), Some(t.accent), vec2(84.0, 28.0))).inner;
+        if enabled && (submit.clicked() || enter) {
             match f(app) {
                 Ok(()) => close = true,
                 Err(e) => app.dialogs.error = Some(e),
@@ -2294,8 +2303,8 @@ const MAX_FIELD_CHIPS: usize = 40;
 pub(crate) fn field_chips(ui: &mut egui::Ui, fields: &[rustgis_engine::data::Field], text: &mut String) {
     ui.horizontal_wrapped(|ui| {
         ui.label(egui::RichText::new(tl!("Fields:")).small().weak());
-        let named = fields.iter().enumerate().filter(|(i, f)| !fields.iter().take(*i).any(|g| g.name.eq_ignore_ascii_case(&f.name)));
-        for (_, f) in named.take(MAX_FIELD_CHIPS) {
+        let mut seen = std::collections::HashSet::new();
+        for f in fields.iter().filter(|f| seen.insert(f.name.to_ascii_lowercase())).take(MAX_FIELD_CHIPS) {
             if ui.small_button(&f.name).clicked() {
                 add_word(text, &crate::exprcomplete::field_ref(&f.name));
             }
@@ -2745,6 +2754,182 @@ mod tests {
         assert!(h.query_by_role_and_label(Role::Button, &past).is_none(), "no more");
     }
 
+    /// The Functions and Variables menus are lists as a box's suggestions are: each entry named
+    /// as the list names it, the first highlighted with its help beside (a function's description
+    /// and example), the help following the pointer; a click adds the entry (a function open),
+    /// ↓ and Enter add the next one, Escape closes the list.
+    #[test]
+    fn the_menus_are_lists_with_their_help() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        use rustgis_engine::data::query;
+        let fs: Vec<_> = query::functions().take(2).collect();
+        let (first, second) = (fs[0], fs[1]);
+        let name = |f: query::FuncSpec| format!("{}()", f.name);
+        let open = |f: query::FuncSpec| if f.max > 0 { format!("{}(", f.name) } else { format!("{}() ", f.name) };
+        let var = *query::VARS[1].names.first().unwrap();
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(vec2(1000.0, 700.0))
+            .allow_missing_glyphs()
+            .build_ui_state(move |ui, text: &mut String| field_chips(ui, &[], text), String::new());
+        h.run();
+        let shows = |h: &egui_kittest::Harness<'_, String>, label: &str| h.query_by_role_and_label(Role::Label, label).is_some();
+        h.get_by_role_and_label(Role::Button, "Functions ▾").click();
+        h.run();
+        assert!(h.query_by_role_and_label(Role::Button, &name(first)).is_some(), "named as the list names it");
+        assert!(shows(&h, first.description) && shows(&h, first.example), "the first highlighted, its help shown");
+        // Moved onto it: a first position has no motion (egui's pointer delta), so it starts beside.
+        let at = h.get_by_role_and_label(Role::Button, &name(second)).rect().center();
+        for at in [at - vec2(40.0, 0.0), at] {
+            h.event(egui::Event::PointerMoved(at));
+            h.run();
+        }
+        assert!(shows(&h, second.description) && shows(&h, second.example), "the help follows the pointer");
+        assert!(!shows(&h, first.description), "one help at a time");
+        h.get_by_role_and_label(Role::Button, &name(second)).click();
+        h.run();
+        assert_eq!(*h.state(), open(second), "added, a function open");
+        assert!(h.query_by_role_and_label(Role::Button, &name(second)).is_none(), "the list closed");
+        h.get_by_role_and_label(Role::Button, "Variables ▾").click();
+        h.run();
+        h.key_press(egui::Key::ArrowDown);
+        h.run();
+        assert!(shows(&h, query::VARS[1].description), "the help follows the highlight");
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert_eq!(*h.state(), format!("{}{var} ", open(second)), "↓ and Enter add the next");
+        h.get_by_role_and_label(Role::Button, "Functions ▾").click();
+        h.run();
+        h.key_press(egui::Key::Escape);
+        h.run();
+        assert!(h.query_by_role_and_label(Role::Button, &name(first)).is_none(), "Escape closes it");
+        assert_eq!(*h.state(), format!("{}{var} ", open(second)), "adding nothing");
+    }
+
+    /// From the keyboard: Tab to Functions ▾ and Enter opens it, ↓ moves the highlight and Enter
+    /// adds that function, the focus staying on the button (the arrows don't move it to another
+    /// button for Enter to press); Escape closes the list.
+    #[test]
+    fn the_menus_work_from_the_keyboard() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        use rustgis_engine::data::query;
+        let fs: Vec<_> = query::functions().take(2).collect();
+        let (first, second) = (format!("{}()", fs[0].name), fs[1]);
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(vec2(1000.0, 700.0))
+            .allow_missing_glyphs()
+            .build_ui_state(move |ui, text: &mut String| field_chips(ui, &[], text), String::new());
+        h.run();
+        let on_button = |h: &egui_kittest::Harness<'_, String>| h.get_by_role_and_label(Role::Button, "Functions ▾").is_focused();
+        for _ in 0..20 {
+            if on_button(&h) {
+                break;
+            }
+            h.key_press(egui::Key::Tab);
+            h.run();
+        }
+        assert!(on_button(&h), "reached with Tab");
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert!(h.query_by_role_and_label(Role::Button, &first).is_some(), "Enter opens it");
+        assert_eq!(*h.state(), "", "and adds nothing yet");
+        h.key_press(egui::Key::ArrowDown);
+        h.run();
+        assert!(on_button(&h), "the arrow moves the highlight, not the focus");
+        h.key_press(egui::Key::Enter);
+        h.run();
+        let added = if second.max > 0 { format!("{}(", second.name) } else { format!("{}() ", second.name) };
+        assert_eq!(*h.state(), added, "Enter adds the highlighted one");
+        assert!(h.query_by_role_and_label(Role::Button, &first).is_none(), "and closes the list");
+        h.key_press(egui::Key::Enter);
+        h.run();
+        h.key_press(egui::Key::Escape);
+        h.run();
+        assert!(h.query_by_role_and_label(Role::Button, &first).is_none(), "Escape closes it");
+        assert_eq!(*h.state(), added, "adding nothing");
+        // Tab on with the list open: it closes at once, and the very next Enter (the next frame)
+        // is the next widget's, Variables ▾, rather than the list's.
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert!(h.query_by_role_and_label(Role::Button, &first).is_some(), "open again");
+        h.key_press(egui::Key::Tab);
+        h.step();
+        h.key_press(egui::Key::Enter);
+        h.step();
+        h.run();
+        assert!(!on_button(&h), "the focus moved on");
+        assert!(h.query_by_role_and_label(Role::Button, &first).is_none(), "Tab closed it");
+        let var = rustgis_engine::data::query::VARS[0].names[0];
+        assert!(h.query_by_role_and_label(Role::Button, var).is_some(), "Enter opened Variables ▾");
+        assert_eq!(*h.state(), added, "and added nothing");
+    }
+
+    /// In the app, Enter on Functions ▾ (focused from the keyboard) opens its list and is taken
+    /// by it: the dialog doesn't also run with the clause half written.
+    #[test]
+    fn enter_on_a_clause_menu_does_not_run_the_dialog() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        let mut app = RustGisApp::with_sample();
+        app.run("ui.dialog", json!({"name": "selectByAttributes"})).unwrap();
+        app.dialogs.text = "pop_est >".into();
+        let mut h = app_harness(app);
+        h.run_steps(3);
+        h.get_by_role_and_label(Role::Button, "Functions ▾").focus();
+        h.run();
+        h.key_press(egui::Key::Enter);
+        h.run();
+        let first = format!("{}()", rustgis_engine::data::query::functions().next().unwrap().name);
+        assert!(h.query_by_role_and_label(Role::Button, &first).is_some(), "the list opened");
+        assert_eq!(h.state().dialogs.open, Some("selectByAttributes"), "the dialog is still open");
+        assert_eq!(h.state().dialogs.error, None, "and didn't run");
+    }
+
+    /// In the app (its whole frame, shortcuts included), Escape closes a clause's Functions list:
+    /// the Escape shortcut (the Explore tool) doesn't take it first, so the tool is left as it was.
+    #[test]
+    fn escape_closes_a_clause_list_in_the_app() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        let mut app = RustGisApp::with_sample();
+        app.run("tool.set", json!({"tool": "zoomIn"})).unwrap();
+        app.run("ui.dialog", json!({"name": "selectByAttributes"})).unwrap();
+        app.dialogs.text = "pop_est > 1".into();
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1400.0, 1000.0)).with_max_steps(64).build_ui_state(
+            |ui, app: &mut RustGisApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            app,
+        );
+        h.run_steps(4);
+        // Typing in the clause first: a click on the button doesn't leave the box's focus behind
+        // to close the list it opens.
+        h.query_all_by_role(Role::MultilineTextInput).find(|n| n.value().as_deref() == Some("pop_est > 1")).unwrap().click();
+        h.run_steps(2);
+        assert!(
+            h.query_all_by_role(Role::MultilineTextInput).any(|n| n.value().as_deref() == Some("pop_est > 1") && n.is_focused()),
+            "the clause has the focus"
+        );
+        h.get_by_role_and_label(Role::Button, "Functions ▾").click();
+        h.run_steps(2);
+        let first = format!("{}()", rustgis_engine::data::query::functions().next().unwrap().name);
+        assert!(h.query_by_role_and_label(Role::Button, &first).is_some(), "open, and still open a frame later");
+        // A shortcut with Ctrl (⌘) isn't the list's: it still runs (Mod+Minus zooms out).
+        let res = h.state().session.map().camera.res;
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Minus);
+        h.run_steps(2);
+        assert!(h.state().session.map().camera.res > res, "zoomed out");
+        assert!(h.query_by_role_and_label(Role::Button, &first).is_some(), "with the list still open");
+        h.key_press(egui::Key::Escape);
+        h.run_steps(2);
+        assert!(h.query_by_role_and_label(Role::Button, &first).is_none(), "Escape closed it");
+        assert_eq!(h.state().dialogs.open, Some("selectByAttributes"), "not the dialog");
+        assert_eq!(h.state().session.tool, rustgis_engine::Tool::ZoomIn, "nor switched the tool");
+    }
+
     /// A scale's commas go only where they group thousands: a decimal comma is left for the
     /// command to refuse, not read as a bigger number.
     #[test]
@@ -2887,6 +3072,16 @@ mod tests {
         h.run();
         assert_eq!(shown(&h) + 1, offered, "the field was offered, and no longer is");
         assert!(h.query_by_label_contains("no field named 'pop_x'").is_some(), "the error once nothing is");
+        // Offered again, then closed with Escape: the word is read as it is, and the dialog stays.
+        h.key_press(egui::Key::Backspace);
+        h.run();
+        assert_eq!(shown(&h), offered, "offered again");
+        assert!(h.query_by_label_contains("Invalid:").is_none(), "no error while it is offered");
+        h.key_press(egui::Key::Escape);
+        h.run();
+        assert_eq!(shown(&h) + 1, offered, "the list closed");
+        assert!(h.query_by_label_contains("no field named 'pop_'").is_some(), "the error once the list is closed");
+        assert_eq!(h.state().dialogs.open, Some("calculateField"), "Escape took the list, not the dialog");
     }
 
     /// The app in a harness, its fonts installed on the first pass (the dialog draws on the next).

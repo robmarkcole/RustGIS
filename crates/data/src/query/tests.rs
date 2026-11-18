@@ -63,7 +63,7 @@ fn hostile_input() {
 
 fn v(text: &str) -> Value {
     let d = ds();
-    value(&parse(text, &d).unwrap_or_else(|e| panic!("{text}: {e}")), &d, 0, &Env { map_scale: Some(25_000.0) })
+    value(&parse(text, &d).unwrap_or_else(|e| panic!("{text}: {e}")), &d, 0, &Env { map_scale: Some(25_000.0), ..Env::default() })
 }
 
 fn t(s: &str) -> Value {
@@ -381,7 +381,7 @@ fn junk_never_panics() {
         let s: String = (0..n).map(|_| g.pick(&bits)).collect::<Vec<_>>().join(if g.next().is_multiple_of(2) { " " } else { "" });
         if let Ok(e) = parse(&s, &d) {
             for r in [0, 1, 7, 999] {
-                let _ = value(&e, &d, r, &Env { map_scale: Some(f64::NAN) });
+                let _ = value(&e, &d, r, &Env { map_scale: Some(f64::NAN), ..Env::default() });
                 let _ = eval(&e, &d, r);
             }
         }
@@ -624,6 +624,8 @@ fn where_clauses_compare_dates() {
         assert!(parse(e, &n).is_ok(), "{e}");
     }
     assert!(parse("issued > ts", &d).is_ok(), "two dates compare");
+    assert!(parse("issued = @page_name", &d).is_ok(), "the name of a page can be date text");
+    assert!(parse("issued = @page_number", &d).is_err(), "the page number is numeric");
     // A date without dashes is text no date reads as: an error asking for YYYY-MM-DD. A shorter
     // partial date still compares as text.
     for e in [
@@ -674,7 +676,8 @@ fn catalog_layers() -> Vec<Dataset> {
 
 /// The value `text` gives on the first layer of `layers` it parses on.
 fn catalog_value(text: &str, layers: &[Dataset]) -> Option<Value> {
-    let env = Env { map_scale: Some(25_000.0) };
+    let env =
+        Env { map_scale: Some(25_000.0), page: Some(std::sync::Arc::new(SeriesPage { feature_id: 42, name: "North".into(), number: 1 })) };
     layers.iter().find_map(|d| parse(text, d).ok().map(|e| value(&e, d, 0, &env)))
 }
 
@@ -772,4 +775,127 @@ fn the_user_guide_lists_what_the_catalogs_hold() {
     for k in Kw::ALL {
         assert!(grammar.contains(&format!("\"{}\"", k.word())), "the grammar should use \"{}\"", k.word());
     }
+}
+
+#[test]
+fn page_variables_are_typed_and_null_without_a_series() {
+    let mut ds = ds();
+    let id = 1_u64 << 53;
+    ds.features[0].id = id;
+    ds.features[1].id = id + 1;
+    let env = Env { page: Some(std::sync::Arc::new(SeriesPage { feature_id: id, name: "North".into(), number: 2 })), ..Env::default() };
+    for (text, expected) in [
+        ("@PAGE_FEATURE_ID", Value::Int(i64::try_from(id).unwrap())),
+        ("@page_name", Value::Text("North".into())),
+        ("@page_number", Value::Int(2)),
+    ] {
+        let e = parse(text, &ds).unwrap();
+        assert_eq!(value(&e, &ds, 0, &env), expected);
+        assert_eq!(value(&e, &ds, 0, &Env::default()), Value::Null);
+        assert!(reads_series_page(text));
+    }
+    let same = parse("$id = @page_feature_id", &ds).unwrap();
+    assert!(matches(&same, &ds, 0, &env));
+    assert!(!matches(&same, &ds, 1, &env), "adjacent large feature IDs have different pages");
+    let different = parse("@page_feature_id <> $id", &ds).unwrap();
+    assert!(!matches(&different, &ds, 0, &env));
+    assert!(matches(&different, &ds, 1, &env));
+    let listed = parse("$id IN (@page_feature_id)", &ds).unwrap();
+    assert!(matches(&listed, &ds, 0, &env));
+    assert!(!matches(&listed, &ds, 1, &env), "IN keeps adjacent large IDs apart too");
+    let after = parse("$id > @page_feature_id", &ds).unwrap();
+    assert_eq!((matches(&after, &ds, 0, &env), matches(&after, &ds, 1, &env)), (false, true), "ordering is exact too");
+    let written = parse("$id = '9007199254740993'", &ds).unwrap();
+    assert_eq!((eval(&written, &ds, 0), eval(&written, &ds, 1)), (false, true), "an id written as text is that id");
+    assert!(!eval(&same, &ds, 0));
+    assert!(!reads_series_page("'@page_feature_id' = !@page_number!"));
+}
+
+/// Each error that gives null says which it was; a null read from a field, written, or left by
+/// a guarded branch, and an error whose null a later step replaced, say nothing.
+#[test]
+fn errors_say_why_they_are_null() {
+    let d = ds();
+    let why = |text: &str, row: usize| {
+        let e = parse(text, &d).unwrap_or_else(|e| panic!("{text}: {e}"));
+        value_or_fault(&e, &d, row, &Env::default())
+    };
+    for (text, fault) in [
+        ("pop / 0", Fault::DivisionByZero),
+        ("pop % 0", Fault::DivisionByZero),
+        ("1.5 % 0", Fault::DivisionByZero),
+        ("0 ^ -1", Fault::DivisionByZero),
+        ("sqrt(0 - pop)", Fault::NegativeRoot),
+        ("ln(0)", Fault::Logarithm),
+        ("log10(0 - 1)", Fault::Logarithm),
+        ("exp(1000)", Fault::Overflow),
+        ("10 ^ 400", Fault::Overflow),
+        ("(0 - 8) ^ 0.5", Fault::NotANumber),
+        ("name * 2", Fault::Text),
+        ("sqrt(name)", Fault::Text),
+        ("to_real(name)", Fault::Text),
+        ("clamp(10, pop, 0)", Fault::ClampBounds),
+        ("scale_exp(0, 0, 10, 1, 2, -1)", Fault::DivisionByZero),
+        ("round(pop / 0) + 1", Fault::DivisionByZero),
+        // An error's null in either position of an operator still reports.
+        ("(1 / 0) * 2", Fault::DivisionByZero),
+        ("2 * (1 / 0)", Fault::DivisionByZero),
+        ("1 / 0 * 2", Fault::DivisionByZero),
+        ("sqrt(1 / 0)", Fault::DivisionByZero),
+        ("round(1 / 0, 0)", Fault::DivisionByZero),
+        ("nullif(pop / 0, 1)", Fault::DivisionByZero),
+        ("'(' || (pop / 0) || ')'", Fault::DivisionByZero),
+    ] {
+        assert_eq!(why(text, 0), (Value::Null, Some(fault)), "{text}");
+    }
+    // A function that skips nulls has each null argument as a cause: fixing the error alone gives
+    // a value, so the error is said even beside a missing argument.
+    for text in ["coalesce(1 / 0, pop)", "max(1 / 0, pop)", "min(pop, sqrt(-1))"] {
+        assert!(why(text, 3).1.is_some(), "{text}");
+    }
+    // Null in, null out, without an error; what an expression asks for or guards against.
+    for (text, row) in [
+        ("pop / 2", 3),
+        ("null", 0),
+        ("if(pop > 0, 1)", 3),
+        ("if(pop / 0 > 1, 1, null)", 0),
+        ("CASE WHEN pop / 0 > 1 THEN 1 END", 0),
+        ("CASE pop WHEN 1 / 0 THEN 1 END", 0),
+        ("nullif(pop, pop)", 0),
+        // The division's null was replaced; the result is null because `pop` is.
+        ("coalesce(1 / 0, 0) / pop", 3),
+        // An error that only decided a condition, a CASE's arm or what nullif compares with.
+        ("if((1 / 0 IS NULL) AND NULL, 1)", 0),
+        ("CASE 1 / 0 WHEN 1 THEN 2 ELSE NULL END", 0),
+        ("nullif(NULL, 1 / 0)", 0),
+        // A missing operand makes an operator's result null whatever else failed.
+        ("1 / 0 + pop", 3),
+        ("pop * (1 / 0)", 3),
+        ("(1 / 0) || pop", 3),
+        ("clamp(pop, 1 / 0, 5)", 3),
+        // Empty or `<null>` text is missing, not text that isn't a number.
+        ("'' * 2", 0),
+        ("'' * (1 / 0)", 0),
+        ("(1 / 0) - '<null>'", 0),
+        ("sqrt('<null>')", 0),
+        ("clamp('', 1 / 0, 5)", 0),
+        ("'' + '' - (1 / 0)", 0),
+        ("round('', 1 / 0)", 0),
+    ] {
+        assert_eq!(why(text, row), (Value::Null, None), "{text}");
+    }
+    assert_eq!(why("coalesce(pop / 0, 7)", 0), (Value::Int(7), None));
+    // The arm a CASE takes keeps its own error.
+    assert_eq!(why("CASE 1 / 0 WHEN 1 THEN 2 ELSE sqrt(-1) END", 0), (Value::Null, Some(Fault::NegativeRoot)));
+    assert_eq!(why("(1 / 0 IS NULL) AND NULL", 0), (Value::Null, None));
+    assert_eq!(arith(Arith::Mod, &Value::Int(i64::MIN), &Value::Int(-1)), Ok(Value::Int(0)));
+    // A stored infinity or NaN isn't joined as text: `+` on it is null, and says why.
+    let mut odd = Dataset::new("odd", GeometryType::None, vec![Field::new("x", FieldType::Double)]);
+    odd.push(None, vec![Value::Float(f64::INFINITY)]);
+    odd.push(None, vec![Value::Float(f64::NAN)]);
+    for (text, row) in [("x + 1", 0), ("x + 1", 1), ("'pop ' + x", 0)] {
+        let e = parse(text, &odd).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(value_or_fault(&e, &odd, row, &Env::default()), (Value::Null, Some(Fault::NotANumber)), "{text}, row {row}");
+    }
+    assert_eq!(why("sqrt(0)", 0), (Value::Float(0.0), None));
 }
