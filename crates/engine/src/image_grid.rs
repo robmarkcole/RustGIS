@@ -58,9 +58,18 @@ impl Source {
 /// cannot be interrupted until the OS returns. No raster pixel decoding takes place.
 /// This counts the header phase; conversion fitting starts its own progress phase afterwards.
 pub(crate) fn read(r: &RasterLayer) -> Result<Frame, String> {
+    // A scan (or a picture laid over the view) is drawn where it was placed, not where its
+    // header puts it: the header's grid would put new shapes elsewhere than the image.
+    let placed = || -> Result<(), String> {
+        if r.placement.is_some() || r.data.as_ref().is_some_and(|d| !d.georeferenced) {
+            return Err("This image is drawn where it was placed, not on its file's own grid. Add the GeoTIFF as a georeferenced image (not as a scan) to draw in its original pixels, or choose map metres.".into());
+        }
+        Ok(())
+    };
     progress::begin(2);
     progress::step(1).map_err(|e| e.to_string())?;
     let grid = if let Some(bytes) = &r.embedded {
+        placed()?;
         rustgis_data::raster::geotiff::read_image_grid(std::io::Cursor::new(bytes.as_slice()))
     } else {
         let path = r
@@ -77,14 +86,18 @@ pub(crate) fn read(r: &RasterLayer) -> Result<Frame, String> {
             if !tiff {
                 return Err("Original image grids require a GeoTIFF source. Export this image as a GeoTIFF and add that file.".into());
             }
+            placed()?;
+            if r.in_place {
+                return Err("Original image grids need the image's pixels loaded whole, and this image is read in place a view at a time. Choose map metres, or add a clipped copy that opens whole.".into());
+            }
             let input = rustgis_data::provenance::open(path).map_err(|e| e.to_string())?;
             let displayed = r.data.as_ref().ok_or("The image pixels are not loaded. Use Reload Data, then retry the operation.")?;
             let path = std::path::Path::new(path);
-            displayed.check_original_handle(path, &input)?;
+            displayed.check_original_handle(&input)?;
             let grid = rustgis_data::raster::geotiff::read_image_grid(&input);
             // Both the handle and path must still name the revision that supplied the display.
             // A replacement during parsing must not pair new coordinates with old pixels.
-            displayed.check_original_handle(path, &input)?;
+            displayed.check_original_handle(&input)?;
             displayed.check_original_file(path)?;
             grid
         }
@@ -252,11 +265,30 @@ mod tests {
         assert_eq!(frame, expected);
         assert_eq!((frame.width, frame.height), (4, 6));
         assert_eq!(s.undo_depth(), depth);
+    }
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn annotation_grid_command_waits_for_the_desktop_queue_when_asked() {
+        let (mut s, id, expected) = session();
         s.statistics_need_read_ahead(true);
         assert!(s.run("raster.imageGrid", &json!({"layer":id})).unwrap_err().contains("background"));
         let ahead = crate::cmd::reads::read_ahead(&mut s, "raster.imageGrid", &json!({"layer":id})).unwrap();
         let done = ahead.run(&rustgis_analysis::control::Control::new()).unwrap();
         assert_eq!(serde_json::from_value::<Frame>(crate::cmd::reads::read_land(&mut s, done).unwrap()).unwrap(), expected);
+    }
+    #[test]
+    fn annotation_grid_refuses_an_image_drawn_as_a_scan() {
+        let (mut s, id, _) = session();
+        let raster = s.map_mut().layer_mut(id).unwrap().raster.as_mut().unwrap();
+        let shown = Arc::unwrap_or_clone(raster.data.clone().unwrap()).into_scan().unwrap();
+        raster.data = Some(Arc::new(shown));
+        let depth = s.undo_depth();
+        let error = s.run("raster.imageGrid", &json!({"layer":id})).unwrap_err();
+        assert!(error.contains("not on its file's own grid"), "{error}");
+        assert_eq!(s.undo_depth(), depth);
+        let raster = s.map_mut().layer_mut(id).unwrap().raster.as_mut().unwrap();
+        raster.placement = Some([0., 0., 1., 1.]);
+        assert!(s.run("raster.imageGrid", &json!({"layer":id})).unwrap_err().contains("not on its file's own grid"));
     }
     #[test]
     #[cfg(not(target_arch = "wasm32"))]
@@ -286,7 +318,15 @@ mod tests {
             )
             .unwrap();
             let replacement = geotiff::write(&replacement, 0).unwrap();
+            let original_modified = std::fs::metadata(&path).unwrap().modified().unwrap();
             std::fs::write(&path, &replacement).unwrap();
+            // Same length, and a coarse filesystem clock can keep the same time: make it differ.
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(original_modified + std::time::Duration::from_secs(1)))
+                .unwrap();
             let depth = s.undo_depth();
             let result = if let Some(ahead) = ahead {
                 let done = ahead.run(&rustgis_analysis::control::Control::new()).unwrap();

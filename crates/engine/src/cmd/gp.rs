@@ -6850,7 +6850,10 @@ mod replay_rollback_tests {
         for (x, y, v) in [(0., 0., 1.), (2., 0., 2.), (0., 2., 3.), (2., 2., 4.)] {
             samples.push(Some(Geometry::Point(rustgis_geom::Coord::new(x, y))), vec![Cell::Float(v)]);
         }
-        s.active_layer = Some(s.map_mut().add_dataset(samples));
+        // Another layer first, so a rollback that forgets the chosen one would pick it instead.
+        s.map_mut().add_dataset(Dataset::new("Other", GeometryType::Point, vec![]));
+        let chosen = s.map_mut().add_dataset(samples);
+        s.active_layer = Some(chosen);
         s.run("project.rename", &json!({"name":"Before"})).unwrap();
         s.run("project.rename", &json!({"name":"Future"})).unwrap();
         s.run("edit.undo", &json!({})).unwrap();
@@ -6868,6 +6871,7 @@ mod replay_rollback_tests {
         assert!(error.contains("tool outputs changed"), "{error}");
         assert_eq!(s.tools_taken, 1, "the error must occur after the prepared tool was taken and applied");
         assert_eq!(serde_json::to_value(&s.project).unwrap(), before, "outputs and successful GP history must roll back");
+        assert_eq!(s.active_layer, Some(chosen), "the layer chosen before the script must stay chosen");
         assert_eq!((s.undo_depth(), s.undo_label(), s.redo_label(), s.dirty()), history);
         assert!(s.map().layer_by_name("Surface").is_none());
         assert!(s.grids_ahead.is_none() && s.tools_ahead.is_none());
@@ -6883,7 +6887,7 @@ mod replay_rollback_tests {
         s.run("edit.undo", &json!({})).unwrap();
         // Undo deliberately bumps geometry revisions to invalidate rendering caches.
         assert!(s.map().layer_by_name("Surface").is_none());
-        assert_eq!(s.map().layers.len(), 1);
+        assert_eq!(s.map().layers.len(), 2);
         assert_eq!(serde_json::to_value(&s.map().layers[0].dataset).unwrap(), before["maps"][0]["layers"][0]["dataset"]);
         assert!(s.project.gp_history.is_empty());
         assert_eq!(s.undo_depth(), history.0);

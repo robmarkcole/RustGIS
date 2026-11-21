@@ -17,13 +17,16 @@ pub(crate) struct State {
     next: u64,
     error: Option<String>,
 }
-fn cancel(app: &mut RustGisApp) {
+fn retire_read(app: &mut RustGisApp) {
     if let Some(request) = app.annotation.pending.take() {
         #[cfg(not(target_arch = "wasm32"))]
         app.reads.cancel_annotation_grid(request);
         #[cfg(target_arch = "wasm32")]
         let _ = request;
     }
+}
+fn cancel(app: &mut RustGisApp) {
+    retire_read(app);
     if crate::boxedit::new_drawing(app) || crate::circleedit::new_drawing(app) {
         drawing_cancelled(app);
     }
@@ -56,7 +59,19 @@ pub(crate) fn sync(app: &mut RustGisApp) {
             app.annotation.image_name = Some(name.clone());
         }
         if app.annotation.source.as_ref().is_some_and(|s| !s.current(&app.session)) {
-            cancel(app);
+            // Only a new shape drawn in this image's grid depends on it: a resize keeps its own
+            // frame, and a new shape in map metres never used the image.
+            retire_read(app);
+            let (boxes, circles) = (crate::boxedit::new_drawing(app), crate::circleedit::new_drawing(app));
+            if app.annotation.pixels && (boxes || circles) {
+                if boxes {
+                    crate::boxedit::cancel(app);
+                }
+                if circles {
+                    crate::circleedit::cancel(app);
+                }
+                drawing_cancelled(app);
+            }
             app.annotation.frame = None;
             app.annotation.source = None;
             app.annotation.error = Some(tl!("The image changed or was removed. Select it again or reload its grid.").into());
@@ -78,7 +93,11 @@ pub(crate) fn open(app: &mut RustGisApp) -> Result<(), String> {
 }
 pub(crate) fn select_image(app: &mut RustGisApp, p: &Value) -> Result<(), String> {
     sync(app);
-    let image = p.get("image").filter(|v| !v.is_null()).map(|v| app.session.layer_id(&json!({"layer":v}))).transpose()?;
+    // The key is required: only an explicit null chooses No image (and map metres).
+    let image = match p.get("image").ok_or_else(|| tl!("image is required; use null for No image").to_string())? {
+        v if v.is_null() => None,
+        v => Some(app.session.layer_id(&json!({"layer": v}))?),
+    };
     let source = image.map(|id| Source::capture(&app.session, id)).transpose()?;
     let request = app.annotation.next.checked_add(1).ok_or_else(|| tl!("Image-grid request limit reached").to_string())?;
     cancel(app);
@@ -174,12 +193,13 @@ pub(crate) fn drawing_frame(app: &RustGisApp) -> Result<Frame, String> {
         .ok_or_else(|| app.annotation.error.clone().unwrap_or_else(|| tl!("Wait for the original image grid before drawing.").into()))
 }
 fn polygon_layer(app: &RustGisApp, id: u32) -> bool {
-    app.session.map().layer(id).is_some_and(|l| {
-        !l.is_streamed()
-            && !l.graphics
-            && l.raster.is_none()
-            && matches!(l.geometry_type(), rustgis_engine::data::GeometryType::Polygon | rustgis_engine::data::GeometryType::None)
-    })
+    app.session.map().layer(id).is_some_and(is_polygon_layer)
+}
+fn is_polygon_layer(l: &rustgis_engine::map::Layer) -> bool {
+    !l.is_streamed()
+        && !l.graphics
+        && l.raster.is_none()
+        && matches!(l.geometry_type(), rustgis_engine::data::GeometryType::Polygon | rustgis_engine::data::GeometryType::None)
 }
 pub(crate) fn filename_option(app: &mut RustGisApp, on: bool) {
     sync(app);
@@ -292,7 +312,7 @@ pub(crate) fn panel(app: &mut RustGisApp, ui: &mut egui::Ui) {
     let name =
         layer.and_then(|id| app.session.map().layer(id)).map_or_else(|| tl!("Choose a polygon layer").to_string(), |l| l.name.clone());
     egui::ComboBox::from_label(tl!("Target layer")).selected_text(name).show_ui(ui, |ui| {
-        for l in app.session.map().layers.iter().filter(|l| polygon_layer(app, l.id)) {
+        for l in app.session.map().layers.iter().filter(|l| is_polygon_layer(l)) {
             ui.selectable_value(&mut layer, Some(l.id), &l.name);
         }
     });
@@ -319,7 +339,14 @@ pub(crate) fn panel(app: &mut RustGisApp, ui: &mut egui::Ui) {
         });
     });
     if !crate::boxedit::ready(app) {
-        ui.small(tl!("Drawing requires editing enabled, a loaded polygon layer and a flat Earth map with zero pitch."));
+        let hidden = app.session.active_layer.and_then(|id| app.session.map().layer(id)).is_some_and(|l| {
+            rustgis_engine::box_edit::check_tool(&app.session, l.id).is_ok() && !app.session.map().draws_at(l, app.session.scale())
+        });
+        if hidden {
+            ui.small(tl!("The polygon layer doesn't draw at this scale. Zoom in or out until it draws, then draw."));
+        } else {
+            ui.small(tl!("Drawing requires editing enabled, a loaded polygon layer and a flat Earth map with zero pitch."));
+        }
     }
     ui.small(tl!("Space or middle-drag pans; releasing Space returns to the active drawing tool. Undo/Redo use the existing commands."));
     if matches!(app.session.tool, Tool::Circle | Tool::RotatedBox) {
@@ -530,7 +557,15 @@ mod tests {
         let pixels = rustgis_engine::data::raster::read_path(&path).unwrap();
         app.session.map_mut().layer_mut(image).unwrap().raster = Some(RasterLayer::from_path(pixels, path.display().to_string()));
         let replacement = Frame { width: 128, height: 128, affine: [1000., 2., 0.4, 4000., 0.2, -3.], ..Frame::default() };
+        let original_modified = std::fs::metadata(&path).unwrap().modified().unwrap();
         std::fs::write(&path, tiff(&replacement)).unwrap();
+        // A coarse filesystem clock could keep the same time: make the revision differ anyway.
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(original_modified + std::time::Duration::from_secs(1)))
+            .unwrap();
         let depth = app.session.undo_depth();
         app.run("ui.annotationImage", json!({"image":image})).unwrap();
         assert!(app.annotation.error.as_deref().unwrap().contains("Reload Data"));

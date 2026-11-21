@@ -240,8 +240,15 @@ script first. Scoped callers should use the individually approved query.
 Local GeoTIFF loading records the file revision with its decoded pixels. If a verified file changes
 or becomes unverifiable during decoding, **Add Data** and **Reload Data** refuse that load rather
 than accepting potentially inconsistent pixels. Wait for writes/cloud synchronization to finish,
-or copy the image to a stable local location; then retry **Add Data**, or **Reload Data** for an
-existing layer. This load-time check also applies outside annotation workflows.
+then retry **Add Data**, or **Reload Data** for an existing layer. Or copy the image to a stable
+local location: for a new layer, add the copy with **Add Data**; for an existing layer, point it at
+the copy with **Repair Data Source** (**Reload Data** reads only the layer's current source, so it
+does not pick up the copy). This load-time check also applies outside annotation workflows.
+
+Original image grids are not offered for an image opened as a scan or laid over the view, which is
+drawn where it was placed rather than where its file puts it, nor for an image read in place a view
+at a time; choose map metres, or add the georeferenced GeoTIFF (clipped, if it is too large to open
+whole).
 
 Grid reads require loaded pixels and a matching verified revision. After known external edits,
 reload the image layer and retry the operation. Detection compares metadata, not content hashes:

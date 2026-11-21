@@ -991,6 +991,11 @@ impl Raster {
     /// This raster as a scan: its pixels with no coordinates, as `"as": "scan"` opens a picture.
     pub fn into_scan(mut self) -> Result<Raster> {
         if self.georeferenced {
+            // Its pixels no longer follow the file's own grid, so no grid read may pair with them.
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                self.source_file = None;
+            }
             self.crs = Crs::LonLat;
             self.transformer = self.crs.transformer().map_err(DataError::Format)?;
             self.transform = unreferenced(self.width, self.height);

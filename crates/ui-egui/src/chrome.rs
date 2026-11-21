@@ -1394,6 +1394,12 @@ pub fn command_search(app: &mut RustGisApp, ctx: &egui::Context) {
                 hits.push((id.into(), tl!(label).into(), crate::i18n::location(loc)));
             }
         }
+        // A command whose label is the query comes first, so Enter runs it rather than one that
+        // matched only by its ribbon location ("Annotate" before Original Image Grid). The sort
+        // is stable: the rest keep their order.
+        if !ql.is_empty() {
+            hits.sort_by_key(|h| h.1.to_lowercase() != ql);
+        }
         // The ribbon location is dropped when the palette is too narrow to show it.
         let show_loc = width >= 400.0;
         // A solid scroll bar takes its own gutter instead of floating over the locations.

@@ -597,11 +597,24 @@ fn complete_here(app: &mut RustGisApp, asked: Asked, p: Value, done: Result<read
 pub fn land(app: &mut RustGisApp) -> bool {
     // History an ended edit set aside comes back now, not at the next command: Undo must see it.
     app.session.reclaim_rooms();
+    // Each one's caller hears why; the notices say it once a kind, with a count.
+    let mut cancelled: Vec<(String, usize)> = Vec::new();
     for asked in std::mem::take(&mut app.reads.cancelled) {
-        let what = called(asked.command, &asked.what);
-        let why = crate::i18n::fmt("{what} was cancelled before starting", &[("what", what)]);
-        app.session.notify(why.clone(), false);
+        let what = called(asked.command, &asked.what).to_string();
+        let why = crate::i18n::fmt("{what} was cancelled before starting", &[("what", &what)]);
+        match cancelled.iter_mut().find(|(w, _)| *w == what) {
+            Some((_, n)) => *n += 1,
+            None => cancelled.push((what, 1)),
+        }
         not_run_asked(app, &asked, why);
+    }
+    for (what, n) in cancelled {
+        let why = if n == 1 {
+            crate::i18n::fmt("{what} was cancelled before starting", &[("what", &what)])
+        } else {
+            crate::i18n::fmt("{what} was cancelled before starting ({n} requests)", &[("what", &what), ("n", &n.to_string())])
+        };
+        app.session.notify(why, false);
     }
     if !busy(app) {
         return false;

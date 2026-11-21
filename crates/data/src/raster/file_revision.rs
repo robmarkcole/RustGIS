@@ -1,14 +1,10 @@
 //! Runtime identity of the local GeoTIFF used to decode a displayed raster.
 //! Metadata comparison, not a content hash: rewrites preserving every compared field are not detected.
 //! Windows compares length, modification and creation times; Unix also compares device, inode and ctime.
-use std::{
-    fs::Metadata,
-    path::{Path, PathBuf},
-};
+use std::{fs::Metadata, path::Path};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct FileRevision {
-    path: PathBuf,
     len: u64,
     modified: std::time::SystemTime,
     #[cfg(unix)]
@@ -18,13 +14,14 @@ pub(super) struct FileRevision {
 }
 
 impl FileRevision {
-    pub(super) fn capture(path: &Path, metadata: &Metadata) -> std::io::Result<Self> {
+    /// The path a revision was read from is not part of it: the callers check the path they hold,
+    /// so a changed working directory never looks like a changed file.
+    pub(super) fn capture(metadata: &Metadata) -> std::io::Result<Self> {
         #[cfg(unix)]
         use std::os::unix::fs::MetadataExt;
         #[cfg(windows)]
         use std::os::windows::fs::MetadataExt;
         Ok(Self {
-            path: std::path::absolute(path)?,
             len: metadata.len(),
             modified: metadata.modified()?,
             #[cfg(unix)]
@@ -34,8 +31,8 @@ impl FileRevision {
         })
     }
 
-    fn check_metadata(&self, path: &Path, metadata: &Metadata) -> std::result::Result<(), String> {
-        let current = Self::capture(path, metadata).map_err(|e| format!("Could not verify the current image file metadata: {e}"))?;
+    fn check_metadata(&self, metadata: &Metadata) -> std::result::Result<(), String> {
+        let current = Self::capture(metadata).map_err(|e| format!("Could not verify the current image file metadata: {e}"))?;
         if *self == current {
             Ok(())
         } else {
@@ -59,15 +56,15 @@ impl super::Raster {
     pub fn check_original_file(&self, path: &Path) -> std::result::Result<(), String> {
         let original = self.original_revision()?;
         let metadata = std::fs::metadata(path).map_err(|e| format!("Could not read the current image file metadata: {e}"))?;
-        original.check_metadata(path, &metadata)
+        original.check_metadata(&metadata)
     }
 
-    /// Checks fresh metadata from this open handle against the original source at `path`.
+    /// Checks fresh metadata from this open handle against the original source.
     /// This does not verify that the live path still names the handle; check_original_file does.
-    pub fn check_original_handle(&self, path: &Path, file: &std::fs::File) -> std::result::Result<(), String> {
+    pub fn check_original_handle(&self, file: &std::fs::File) -> std::result::Result<(), String> {
         let original = self.original_revision()?;
         let metadata = file.metadata().map_err(|e| format!("Could not read the open image file metadata: {e}"))?;
-        original.check_metadata(path, &metadata)
+        original.check_metadata(&metadata)
     }
 }
 
@@ -83,7 +80,7 @@ mod tests {
         let original = std::fs::File::open(&path).unwrap();
         let metadata = original.metadata().unwrap();
         raster.check_original_file(&path).unwrap();
-        raster.check_original_handle(&path, &original).unwrap();
+        raster.check_original_handle(&original).unwrap();
         let replacement = folder.path().join("replacement.tif");
         std::fs::write(&replacement, &bytes).unwrap();
         let file = std::fs::File::options().write(true).open(&replacement).unwrap();
@@ -97,7 +94,7 @@ mod tests {
         // Retaining old metadata cannot make the live-path API accept the replacement.
         assert!(raster.check_original_file(&path).unwrap_err().contains("Reload Data"));
         let replacement_handle = std::fs::File::open(&path).unwrap();
-        assert!(raster.check_original_handle(&path, &replacement_handle).is_err());
+        assert!(raster.check_original_handle(&replacement_handle).is_err());
     }
 
     #[test]
@@ -111,7 +108,7 @@ mod tests {
         other_bytes.push(0); // Distinct metadata even on filesystems with coarse timestamps.
         std::fs::write(&other, &other_bytes).unwrap();
         let raster = super::super::geotiff::read_file(&path, "image").unwrap();
-        assert!(raster.check_original_handle(&path, &std::fs::File::open(&other).unwrap()).is_err());
+        assert!(raster.check_original_handle(&std::fs::File::open(&other).unwrap()).is_err());
         raster.check_original_file(&path).unwrap();
     }
 }
