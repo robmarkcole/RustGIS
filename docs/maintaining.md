@@ -103,10 +103,13 @@ the files by version and checks that the current reader still opens them correct
 in the fixtures' README and in the test's `SKIPS` when a release has no such file format.
 
 New project saves and map/layer exports write format 2. Their `requires` header names only
-features present in the saved payload: `terrain-block`, `terrain-water`,
+features present in the saved payload: `terrain-block`, `terrain-block-shape` (a block
+diagram cut to a circle), `terrain-water`,
 `terrain-water-shore` (a terrain water's shore band other than the default),
+`terrain-block-water` (water in a block diagram's walls),
 `shaded-relief-effects` (cast shadows, sky visibility, fill light or rock colour),
-`shaded-relief-light` (a Shaded Relief's ambient or balanced light) and
+`shaded-relief-light` (a Shaded Relief's ambient or balanced light),
+`blank-paper` (a blank basemap's paper colour) and
 `normalized-legend-urls` for normalized legend addresses. Project
 requirements include offline map snapshots. `table-export-order` protects saved task commands,
 command notebook cells and replayable history using Export Table sort or limit options.
@@ -135,7 +138,13 @@ cell or history entry that gives one (`layout.addElement` or `layout.update` wit
 `background` other than `null`), require `layout-element-background`, so an older reader
 refuses them instead of opening the layout and saving it again, or running the command,
 without the background. Layout files (`.rgislayout`) carry no format header yet and are not
-covered (#2277).
+covered. `layout.import` already reads one, ahead of the release that writes it: it refuses a
+newer format or an unknown `requires` entry by name (#2277).
+
+Projects, map files and layer files with a window of a Zarr variable that follows the time slider
+(`layer.addZarr` with `"time": true` and `"cells"` or `"bbox"`) require `zarr-window`, so an older
+reader refuses them instead of reading the whole map at each step. A saved `layer.addZarr` command
+with both needs nothing: an older RustGIS refuses it when it runs.
 
 Projects with an ink on a legend, colorbar, table or chart (`color` on those elements) require
 `layout-element-ink`, so an older reader refuses them instead of drawing those elements in dark
@@ -145,6 +154,49 @@ fails there instead of losing the ink. A saved `layout.import` whose `text` give
 ink requires `layout-element-ink`, and one whose `text` gives an element a background requires
 `layout-element-background`, since an older reader would read that layout without them. Layout
 files are not covered, as for backgrounds (#2277).
+
+Projects with a layout text that wraps to its box (`wrap` on a text element) require
+`layout-element-wrap`, so an older reader refuses them instead of drawing the text on its own
+line breaks and saving it again without the option. Saved `layout.addElement` and `layout.update`
+commands with `"wrap": true` require it too, since an older reader warns that it ignores the key
+and adds the text unwrapped; `"wrap": false` needs nothing. A saved `layout.import` whose `text`
+has a wrapped text requires it as well. Layout files are not covered, as for backgrounds (#2277).
+
+Projects with a layout chart grouped by a field, or with a statistic, an order or a number of bars
+other than the defaults, or with an Other bar (`group`, `statistic`, `order`, `bars`, `other` on a
+chart element) require `layout-chart-data`, so an older reader refuses them instead of drawing a
+bar per feature, the 20 largest, and saving the chart again without them. A statistic counts
+grouped or not: one kept while a chart is ungrouped would be lost too. Saved `layout.addElement`
+and `layout.update` commands that set one of them require it too, and so does a `layout.update`
+that gives a chart's `label` (`""` too), which an older reader's update doesn't take; giving the
+defaults, or `"group": ""`, needs nothing. A saved `layout.import` whose `text` has such a chart
+requires it as well. Layout files are not covered, as for backgrounds (#2277).
+
+Projects with a layout chart drawn as columns, with its values or their decimals, its own title
+or none, a bar colour or labels against its bars (`orientation`, `values`, `decimals`, `title`,
+`bar_color`, `label_align` on a chart element) require `layout-chart-look`, so an older reader
+refuses them instead of drawing bars running across in the default blue, with the title the
+chart is given, and saving it again without them. Saved `layout.addElement` commands for a chart
+that set one of them require it too. A saved `layout.update` requires it for `values`,
+`decimals`, `barColor` and `labelAlign` only: its `title` and `orientation` may be a legend's or
+a colorbar's, which the command alone doesn't tell, and the project the update ran on requires it
+for its chart anyway. Giving the defaults needs nothing. A saved `layout.import` whose `text` has
+such a chart requires it as well. Layout files are not covered, as for backgrounds (#2277).
+
+Projects with a layout chart coloured by its layer's classes (`classes` on a chart element)
+require `layout-chart-classes`, so an older reader refuses them instead of drawing every bar in
+the chart's bar colour and saving it again without. Saved `layout.addElement` commands for a
+chart and `layout.update` commands that set `"classes": true` require it too (only a chart takes
+the key); `false` needs nothing. A saved `layout.import` whose `text` has such a chart requires it
+as well. Layout files are not covered, as for backgrounds (#2277).
+
+Projects with a map frame whose border isn't the default dark grey 0.8 pt line (`border_color`,
+`border_width` on a map frame, a width of 0 drawing none) require `layout-frame-border`, so an
+older reader refuses them instead of drawing the default border and saving the frame again
+without its own (#2557). A saved `layout.update` that gives a frame a `border` object requires it
+too, since an older reader warns that it ignores the key; `"border": null` only gives the default
+back and needs nothing. A saved `layout.import` whose `text` has such a frame requires it as well.
+Layout files are not covered, as for backgrounds (#2277).
 
 A coordinate system read from WKT is saved with its PROJ definition, which older readers read,
 and its WKT beside it (`wkt`), which this release reads first. Projects, map files and layer

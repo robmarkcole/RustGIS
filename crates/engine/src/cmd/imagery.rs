@@ -453,6 +453,19 @@ fn report_resampled_classes(s: &mut Session, source: &Raster, out: &Raster, meth
 /// The largest whole number a raster's 32-bit float pixels hold exactly.
 const EXACT_WHOLE: f64 = 16_777_216.0;
 
+/// The conversion of a layer's own coordinates to longitude/latitude, for polygons read one by
+/// one ([`rasterops::transform_feature_polygons_to_lonlat`]): none while they are
+/// longitude/latitude, as they are unless the layer holds another system. The same operation
+/// as [`rustgis_data::Dataset::lonlat_conversion`]'s: a conversion to longitude/latitude is the
+/// system's own, never a direct one between two others.
+fn held_transformer(ds: &rustgis_data::Dataset) -> Result<Option<rustgis_data::raster::Transformer>, String> {
+    let crs = ds.coord_crs();
+    if crs == Crs::LonLat {
+        return Ok(None);
+    }
+    crs.transformer().map(Some).map_err(|e| format!("{}: {e}", ds.name))
+}
+
 /// `raster.rasterize`: a polygon layer's selected (or all) features burned onto a grid given as
 /// `raster.project`'s is, each cell whose centre falls in a polygon taking its field's value, a
 /// text field's code or one `value` (see `rustgis_analysis::warp::rasterize`). A new layer, and
@@ -491,10 +504,12 @@ fn rasterize(s: &mut Session, p: &Value) -> CmdResult {
     rows.dedup();
     let (mut no_value, mut no_polygon) = (0, 0);
     let mut burns: Vec<(Vec<Vec<Vec<Coord>>>, rustgis_data::Value)> = Vec::new();
+    // Burned from longitude/latitude, whatever system the layer holds its coordinates in.
+    let own = held_transformer(ds)?;
     for row in rows {
         let Some(feature) = ds.features.get(row) else { continue };
         let parts = match &feature.geometry {
-            Some(Geometry::Polygon(polys)) => rasterops::transform_feature_polygons_to_lonlat(polys, None).ok(),
+            Some(Geometry::Polygon(polys)) => rasterops::transform_feature_polygons_to_lonlat(polys, own.as_ref()).ok(),
             _ => None,
         };
         let Some(parts) = parts else {
@@ -758,10 +773,7 @@ fn grid_param(
                     let layer = s.map().layer_by_name(l).filter(|l| l.raster.is_none()).ok_or_else(|| format!("no vector layer '{l}'"))?;
                     let rows: Vec<usize> =
                         if layer.selection.is_empty() { (0..layer.dataset.features.len()).collect() } else { layer.selection.clone() };
-                    let e = rows
-                        .iter()
-                        .filter_map(|row| layer.dataset.features.get(*row).and_then(|f| f.geometry.as_ref()))
-                        .fold(Extent::EMPTY, |e, g| e.union(&g.extent()));
+                    let e = layer.rows_extent(rows);
                     if e.is_empty() {
                         return Err(format!("{l} has no features to take an extent from"));
                     }
@@ -1038,7 +1050,16 @@ fn zone_rings(s: &Session, z: &str) -> Result<Vec<Vec<Coord>>, String> {
     let l =
         s.map().layer_by_name(z).filter(|l| l.geometry_type() == GeometryType::Polygon).ok_or_else(|| format!("no polygon layer '{z}'"))?;
     let row = l.selection.first().copied().unwrap_or(0);
-    let Some(Geometry::Polygon(polys)) = l.dataset.features.get(row).and_then(|f| f.geometry.as_ref()) else {
+    let Some(g) = l.dataset.features.get(row).and_then(|f| f.geometry.as_ref()) else {
+        return Err("the zone has no polygon".into());
+    };
+    // In longitude/latitude, whatever system the layer holds its coordinates in.
+    let Geometry::Polygon(polys) = &*l
+        .dataset
+        .lonlat_conversion()
+        .and_then(|to| rustgis_data::Dataset::geometry_to_lonlat_by(&to, g))
+        .map_err(|e| format!("{z}: {e}"))?
+    else {
         return Err("the zone has no polygon".into());
     };
     polys.first().cloned().ok_or_else(|| "the zone has no polygon".into())
@@ -1233,10 +1254,12 @@ pub(crate) fn process_work(s: &Session, p: &Value) -> Result<super::workflows::W
             }
             let mut polygons: Vec<Vec<Vec<Coord>>> = Vec::new();
             let mut failed_features = Vec::new();
+            // In longitude/latitude, whatever system the layer holds its coordinates in.
+            let own = held_transformer(&l.dataset)?;
             for &row in &rows {
                 let Some(f) = l.dataset.features.get(row) else { continue };
                 match &f.geometry {
-                    Some(Geometry::Polygon(polys)) => match rasterops::transform_feature_polygons_to_lonlat(polys, None) {
+                    Some(Geometry::Polygon(polys)) => match rasterops::transform_feature_polygons_to_lonlat(polys, own.as_ref()) {
                         Ok(transformed) => {
                             polygons.extend(transformed);
                         }
@@ -1778,9 +1801,30 @@ fn edit_pixels(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"pixels": n}))
 }
 
+/// The ground distance on the WGS 84 ellipsoid from the start of a path to the point `along`
+/// metres along it as the sphere measures it (as `rasterops::profile` spaces its samples), given
+/// each leg's length on the sphere and on the ellipsoid: the legs before it at their ellipsoid
+/// length, and the same share of the leg it falls in.
+fn ellipsoid_along(legs: &[(f64, f64)], along: f64) -> f64 {
+    let (mut sphere, mut ground) = (0.0, 0.0);
+    for &(on_sphere, on_ellipsoid) in legs {
+        if along <= sphere + on_sphere {
+            let share = if on_sphere > 0.0 { ((along - sphere) / on_sphere).clamp(0.0, 1.0) } else { 0.0 };
+            return ground + on_ellipsoid * share;
+        }
+        sphere += on_sphere;
+        ground += on_ellipsoid;
+    }
+    ground
+}
+
 /// The most points `raster.measure` takes.
 const MAX_MEASURE_POINTS: usize = 10_000;
 
+/// `raster.measure`: one measurement of `points` on the map's body (a distance, with its length
+/// over the surface when `layer` gives heights; an area and perimeter; a height between two points;
+/// or a volume above a base), recorded in the session's results. The Earth measures on the WGS 84
+/// ellipsoid and another body on its sphere, as the Measure tool does.
 fn measure(s: &mut Session, p: &Value) -> CmdResult {
     let given = p.get("points").and_then(Value::as_array).ok_or("points is required")?;
     // Refused over the limit: a measurement of the first points would read as the whole
@@ -1796,16 +1840,35 @@ fn measure(s: &mut Session, p: &Value) -> CmdResult {
         d.require_coordinates()?;
     }
     let z = |c: Coord| dem.as_ref().and_then(|d| rasterops::elevation_at(d, 0, c));
-    // Ground lengths and areas on the map's body.
+    // Ground lengths and areas on the map's body: the Earth measures on the WGS 84 ellipsoid, as the
+    // Measure tool and the geoprocessing tools do (#939, #2568); another body measures on its
+    // sphere and scales.
     let body = s.map().body();
+    let earth = body.is_earth();
     let out = match kind {
         "distance" => {
             if pts.len() < 2 {
                 return Err("a distance needs two or more points".into());
             }
-            let flat = body.length(rustgis_geom::geodesic_length_m(&pts));
-            // Along the surface when there's an elevation raster.
+            // On the Earth, each leg's length on the sphere (as the profile below spaces its
+            // samples) and on the ellipsoid; the flat length is the ellipsoid's.
+            let legs: Vec<(f64, f64)> = if earth {
+                pts.windows(2)
+                    .map(|w| match w {
+                        [a, c] => (rustgis_geom::haversine_m(*a, *c), rustgis_geom::wgs84_distance_m(*a, *c)),
+                        _ => (0.0, 0.0),
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let flat = if earth { legs.iter().map(|l| l.1).sum() } else { body.length(rustgis_geom::geodesic_length_m(&pts)) };
+            // Along the surface when there's an elevation raster. The profile spaces its samples
+            // along the path on the sphere; on the Earth each step's ground run is taken from the
+            // legs it covers at their length on the ellipsoid, so level ground gives the flat
+            // length exactly.
             let surface = dem.as_ref().map(|d| {
+                let ground = |along: f64| if earth { ellipsoid_along(&legs, along) } else { body.length(along) };
                 let prof = rasterops::profile(d, 0, &pts, 500);
                 prof.windows(2)
                     .map(|w| match w {
@@ -1814,7 +1877,8 @@ fn measure(s: &mut Session, p: &Value) -> CmdResult {
                                 (Some(x), Some(y)) => y - x,
                                 _ => 0.0,
                             };
-                            (body.length(c.0 - a.0).powi(2) + dh * dh).sqrt()
+                            let run = ground(c.0) - ground(a.0);
+                            (run * run + dh * dh).sqrt()
                         }
                         _ => 0.0,
                     })
@@ -1833,11 +1897,15 @@ fn measure(s: &mut Session, p: &Value) -> CmdResult {
             if rustgis_geom::ring_area_is_ambiguous(&ring) {
                 return Err("the area is ambiguous: 1 ring winds beyond one whole surface".into());
             }
-            let area = body.area(rustgis_geom::geodesic_ring_area_m2(&ring));
+            let (perimeter, area) = if earth {
+                rustgis_geom::wgs84_ring_perimeter_area_m2(&ring)
+            } else {
+                (body.length(rustgis_geom::geodesic_ring_perimeter_m(&ring)), body.area(rustgis_geom::geodesic_ring_area_m2(&ring)))
+            };
             if !area.is_finite() {
                 return Err("the area cannot be measured from these coordinates".into());
             }
-            json!({"kind": "area", "squareMetres": area, "perimeterMetres": body.length(rustgis_geom::geodesic_ring_perimeter_m(&ring))})
+            json!({"kind": "area", "squareMetres": area, "perimeterMetres": perimeter})
         }
         "height" => {
             let (Some(a), Some(c)) = (pts.first(), pts.get(1)) else { return Err("a height needs two points (base, top)".into()) };

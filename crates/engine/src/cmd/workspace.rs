@@ -8,7 +8,7 @@ use rustgis_map::view::Keyframe;
 use serde_json::{Value, json};
 
 use super::{b, f, ps};
-use crate::project::{Job, OfflineArea};
+use crate::project::{Job, OfflineArea, Project};
 use crate::{CmdResult, CommandSpec as C, Session};
 
 /// Removes every Shapefile index not in use and says what it freed, what stayed and why, and which
@@ -268,14 +268,18 @@ pub fn commands() -> Vec<C> {
         C::new("offline.sync", "Sync", "Data › Offline", offline_sync).roles(&[]).effects(crate::policy::Effects::NONE).params(r#"{"name": offline area}"#),
         C::new("offline.remove", "Remove", "Data › Offline", |s, p| {
             let n = ps(p, "name").ok_or("name is required")?;
-            let before = s.project.offline_areas.len();
-            s.project.offline_areas.retain(|a| !a.name.eq_ignore_ascii_case(n));
-            if s.project.offline_areas.len() == before {
-                return Err(format!("no offline area '{n}'"));
+            let ai = s.project.offline_areas.iter().position(|a| a.name.eq_ignore_ascii_case(n)).ok_or_else(|| format!("no offline area '{n}'"))?;
+            let area = s.project.offline_areas.remove(ai);
+            let kept = offline_map_index(&s.project, &area);
+            // A copy kept as the only map is no longer the area's: neither its saved association
+            // nor its title may still claim the area that is gone.
+            for m in &mut s.project.maps {
+                if !area.id.is_empty() && m.offline_area_id.as_deref() == Some(area.id.as_str()) {
+                    m.offline_area_id = None;
+                }
             }
-            let map_name = format!("{n} (offline)");
-            if s.project.maps.len() > 1
-                && let Some(i) = s.project.maps.iter().position(|m| m.name.eq_ignore_ascii_case(&map_name))
+            if let Some(i) = kept
+                && s.project.maps.len() > 1
             {
                 s.project.maps.remove(i);
                 // The active map stays the same map; if it was the removed one, a neighbour.
@@ -284,24 +288,41 @@ pub fn commands() -> Vec<C> {
                 if a == i {
                     s.active_layer = s.map().layers.first().map(|l| l.id);
                 }
+            } else if let Some(m) = kept.and_then(|i| s.project.maps.get_mut(i))
+                && m.name.eq_ignore_ascii_case(&offline_map_name(&area.name))
+            {
+                let old = std::mem::replace(&mut m.name, format!("{} (kept)", area.name));
+                let kept = m.name.clone();
+                // Layouts, presentations and other areas made from it follow, as on a rename.
+                super::navigate::follow_renamed_map(s, &old, &kept);
+                s.notify(format!("The offline area's map was the only one, so it was kept as '{kept}'"), false);
             }
             Ok(Value::Null)
         }).roles(&[]).effects(crate::policy::Effects::NONE)
         .params(r#"{"name": offline area}"#),
         C::new("offline.open", "Open Offline Map", "Data › Offline", |s, p| {
             let n = ps(p, "name").ok_or("name is required")?;
-            let a =
-                s.project.offline_areas.iter().find(|a| a.name.eq_ignore_ascii_case(n)).ok_or_else(|| format!("no offline area '{n}'"))?;
+            let ai = s.project.offline_areas.iter().position(|a| a.name.eq_ignore_ascii_case(n)).ok_or_else(|| format!("no offline area '{n}'"))?;
+            let a = s.project.offline_areas.get_mut(ai).ok_or("no such area")?;
             crate::project::ensure_map_imports_complete(&a.data)?;
-            let map_name = format!("{} (offline)", a.name);
-            if let Some(i) = s.project.maps.iter().position(|m| m.name.eq_ignore_ascii_case(&map_name)) {
-                // An offline map saved before offline copies were unlinked from their tables.
-                let unbound = s.project.maps.get_mut(i).map_or(0, unbind_map_table_edits);
-                note_unbound(s, unbound, &format!("the offline map '{map_name}'"));
+            let id = ensure_area_id(a)?;
+            let a = s.project.offline_areas.get(ai).ok_or("no such area")?;
+            let extent = a.extent;
+            if let Some(i) = offline_map_index(&s.project, a) {
+                if let Some(m) = s.project.maps.get_mut(i) {
+                    // Upgrade a legacy name match while the association is still known.
+                    m.offline_area_id = Some(id);
+                    let unbound = unbind_map_table_edits(m);
+                    let copy = format!("the offline map '{}'", m.name);
+                    note_unbound(s, unbound, &copy);
+                }
                 s.project.active_map = i;
             } else {
                 let mut m = a.data.clone();
-                m.name = map_name;
+                let map_name = offline_map_name(&a.name);
+                let taken = |n: &str| s.project.maps.iter().any(|m| m.name.eq_ignore_ascii_case(n));
+                m.name = if taken(&map_name) { super::numbered(&map_name, taken) } else { map_name };
+                m.offline_area_id = Some(id);
                 m.renew_instance_id();
                 // An area saved before offline copies were unlinked from their tables.
                 let unbound = unbind_map_table_edits(&mut m);
@@ -320,8 +341,7 @@ pub fn commands() -> Vec<C> {
                 s.project.active_map = s.project.maps.len() - 1;
             }
             s.active_layer = s.map().layers.first().map(|l| l.id);
-            let e = s.project.offline_areas.iter().find(|a| a.name.eq_ignore_ascii_case(n)).map(|a| a.extent).unwrap_or(Extent::EMPTY);
-            s.zoom_to(&e);
+            s.zoom_to(&extent);
             Ok(Value::Null)
         }).roles(&[]).effects(crate::policy::Effects::NONE)
         .params(r#"{"name": offline area}"#),
@@ -476,14 +496,20 @@ fn selected_lines(s: &Session, p: &Value, all: bool) -> Result<Vec<Vec<Coord>>, 
         _ if all => l.selection.clone(),
         _ => l.selection.iter().take(1).copied().collect(),
     };
-    let out: Vec<Vec<Coord>> = rows
-        .iter()
-        .filter_map(|r| match l.dataset.features.get(*r)?.geometry.as_ref()? {
-            Geometry::Line(parts) => Some(parts.iter().flatten().copied().collect()),
-            _ => None,
-        })
-        .filter(|v: &Vec<Coord>| v.len() >= 2)
-        .collect();
+    // Sampled in longitude/latitude, whatever system the layer holds its coordinates in.
+    let mut out: Vec<Vec<Coord>> = Vec::new();
+    let to = l.dataset.lonlat_conversion().map_err(|e| format!("{n}: {e}"))?;
+    for f in rows.iter().filter_map(|r| l.dataset.features.row(*r)) {
+        let Some(g) = f.geometry().filter(|g| matches!(g, Geometry::Line(_))) else { continue };
+        if let Geometry::Line(parts) =
+            &*rustgis_data::Dataset::geometry_to_lonlat_by(&to, g).map_err(|e| format!("{n}: feature {}: {e}", f.id()))?
+        {
+            let v: Vec<Coord> = parts.iter().flatten().copied().collect();
+            if v.len() >= 2 {
+                out.push(v);
+            }
+        }
+    }
     if out.is_empty() { Err("no usable lines".into()) } else { Ok(out) }
 }
 
@@ -589,11 +615,15 @@ pub fn infographic_of(s: &Session, only: Option<&str>) -> Value {
         if only.as_ref().is_some_and(|o| *o != l.name.to_ascii_lowercase()) {
             continue;
         }
+        // The view in the layer's own coordinates, as its features' boxes are.
+        let own = l.dataset.extent_from_lonlat(&e);
         let rows: Vec<usize> = l
             .visible_rows()
             .iter()
             .enumerate()
-            .filter(|(r, v)| **v && l.dataset.features.get(*r).and_then(|f| f.geometry.as_ref()).is_some_and(|g| g.extent().intersects(&e)))
+            .filter(|(r, v)| {
+                **v && l.dataset.features.get(*r).and_then(|f| f.geometry.as_ref()).is_some_and(|g| g.extent().intersects(&own))
+            })
             .map(|(r, _)| r)
             .collect();
         let numbers: Vec<Value> = l
@@ -632,13 +662,16 @@ fn snapshot(m: &mut rustgis_map::Map, e: &Extent) -> rustgis_map::Map {
     // feature layer is copied without its features, and only the features in the extent added.
     let layers = std::mem::take(&mut m.layers);
     let mut out = m.clone();
+    out.offline_area_id = None;
     m.layers = layers;
     for l in m.layers.iter_mut().filter(|l| !l.is_raster()) {
         let features = std::mem::take(&mut l.dataset.features);
         let mut c = l.clone();
         l.dataset.features = features;
+        // The extent in the layer's own coordinates, as its features' boxes are.
+        let own = l.dataset.extent_from_lonlat(e);
         c.dataset.features =
-            l.dataset.features.iter().filter(|f| f.geometry.as_ref().is_some_and(|g| g.extent().intersects(e))).cloned().collect();
+            l.dataset.features.iter().filter(|f| f.geometry.as_ref().is_some_and(|g| g.extent().intersects(&own))).cloned().collect();
         c.selection.clear();
         // Only part of the rows read: no longer the layer its file's record describes.
         c.synced = None;
@@ -667,11 +700,57 @@ pub(crate) fn unbind_map_table_edits(m: &mut rustgis_map::Map) -> usize {
     m.layers.iter_mut().map(unbind_table_edits).filter(|had| *had).count()
 }
 
-/// [`unbind_map_table_edits`] for each of `project`'s offline areas' maps (`<area> (offline)`),
-/// as the number of layers that had a link. The project's other maps keep theirs.
-pub(crate) fn unbind_offline_maps(project: &mut crate::project::Project) -> usize {
-    let names: Vec<String> = project.offline_areas.iter().map(|a| format!("{}{}", a.name, super::field::OFFLINE)).collect();
-    project.maps.iter_mut().filter(|m| names.iter().any(|n| m.name.eq_ignore_ascii_case(n))).map(unbind_map_table_edits).sum()
+fn offline_map_name(area: &str) -> String {
+    format!("{area}{}", super::field::OFFLINE)
+}
+
+/// Legacy areas were saved without IDs. Give one an ID before binding a map to it.
+fn ensure_area_id(area: &mut OfflineArea) -> Result<String, String> {
+    if area.id.is_empty() {
+        area.id = crate::project::field_id()?;
+    }
+    Ok(area.id.clone())
+}
+
+/// Finds the open copy by identity before trying the original title of an unmarked map.
+fn offline_map_index(project: &Project, area: &OfflineArea) -> Option<usize> {
+    let maps = &project.maps;
+    let by_id = maps.iter().position(|m| m.offline_area_id.as_deref().is_some_and(|id| id == area.id));
+    by_id.or_else(|| {
+        let name = offline_map_name(&area.name);
+        maps.iter()
+            .position(|m| m.offline_area_id.is_none() && m.name.eq_ignore_ascii_case(&name) && !m.name.eq_ignore_ascii_case(&area.map))
+    })
+}
+
+/// Resolves the reverse association using the same precedence as opening the area.
+pub(crate) fn map_area_index(project: &Project, map: usize) -> Option<usize> {
+    project.offline_areas.iter().position(|area| offline_map_index(project, area) == Some(map))
+}
+
+/// Before a rename takes away a legacy copy's only link to its area, record the area ID.
+pub(crate) fn bind_offline_map_before_rename(project: &mut Project, map: usize) -> Result<(), String> {
+    if project.maps.get(map).is_some_and(|m| m.offline_area_id.is_none())
+        && let Some(area) = map_area_index(project, map).and_then(|i| project.offline_areas.get_mut(i))
+    {
+        let id = ensure_area_id(area)?;
+        if let Some(m) = project.maps.get_mut(map) {
+            m.offline_area_id = Some(id);
+        }
+    }
+    Ok(())
+}
+
+/// Unlinks table edits on marked offline copies and on legacy copies matched to an area.
+pub(crate) fn unbind_offline_maps(project: &mut Project) -> usize {
+    let offline: Vec<usize> = project.offline_areas.iter().filter_map(|a| offline_map_index(project, a)).collect();
+    project
+        .maps
+        .iter_mut()
+        .enumerate()
+        .filter(|(i, m)| m.offline_area_id.is_some() || offline.contains(i))
+        .map(|(_, m)| unbind_map_table_edits(m))
+        .sum()
 }
 
 /// Says that `n` layers of an offline copy no longer save to their tables, when `n` isn't 0.
@@ -718,7 +797,7 @@ pub(crate) fn offline_download(s: &mut Session, p: &Value) -> CmdResult {
     // Unique among areas, and its offline map's name ("<area> (offline)") unused by other maps.
     let taken = |s: &Session, n: &str| {
         s.project.offline_areas.iter().any(|a| a.name.eq_ignore_ascii_case(n))
-            || s.project.maps.iter().any(|m| m.name.eq_ignore_ascii_case(&format!("{n} (offline)")))
+            || s.project.maps.iter().any(|m| m.name.eq_ignore_ascii_case(&offline_map_name(n)))
     };
     while taken(s, &name) {
         i += 1;
@@ -748,9 +827,21 @@ pub(crate) fn offline_download(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"name": name, "features": features}))
 }
 
-fn offline_fields_match(a: &[rustgis_data::Field], b: &[rustgis_data::Field]) -> bool {
-    // Attribute values are positional; aliases are display metadata and field lookup ignores case.
-    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.name.eq_ignore_ascii_case(&y.name) && x.ty == y.ty)
+/// Where each of `from`'s fields is in `to`, by name (field lookup ignores case; aliases are display
+/// metadata): `None` for one `to` hasn't.
+fn by_name(from: &[rustgis_data::Field], to: &[rustgis_data::Field]) -> Vec<Option<usize>> {
+    from.iter().map(|f| to.iter().position(|t| t.name.eq_ignore_ascii_case(&f.name))).collect()
+}
+
+/// Whether rows `a` and `b` hold the same place and the same value in each of `a`'s fields, `map[i]`
+/// being `a`'s field `i` in `b`. A field of `a` that `b` hasn't is passed over, or, when `strict`,
+/// the same only while Null.
+fn same_on(a: rustgis_data::RowRef<'_>, b: rustgis_data::RowRef<'_>, map: &[Option<usize>], strict: bool) -> bool {
+    a.geometry() == b.geometry()
+        && a.values().enumerate().all(|(i, v)| match map.get(i).copied().flatten() {
+            Some(j) => b.value(j) == v,
+            None => !strict || *v == rustgis_data::Value::Null,
+        })
 }
 
 /// Copies edits made to an offline area (in its offline map, if open) back to its source map by
@@ -763,9 +854,14 @@ fn offline_sync(s: &mut Session, p: &Value) -> CmdResult {
     let n = ps(p, "name").ok_or("name is required")?;
     let ai = s.project.offline_areas.iter().position(|a| a.name.eq_ignore_ascii_case(n)).ok_or_else(|| format!("no offline area '{n}'"))?;
     let area = s.project.offline_areas.get(ai).cloned().ok_or("no such area")?;
-    let offline_map = format!("{} (offline)", area.name);
-    let edited = s.project.maps.iter().find(|m| m.name.eq_ignore_ascii_case(&offline_map)).cloned().unwrap_or_else(|| area.data.clone());
+    let edited = offline_map_index(&s.project, &area).and_then(|i| s.project.maps.get(i)).cloned().unwrap_or_else(|| area.data.clone());
     sync_area(s, ai, &edited)
+}
+
+/// A layer's conversion error in a sync, named by the layer; a cancel stays a cancel, as the
+/// command's other cancels read.
+fn sync_error(layer: &str, e: String) -> String {
+    if e == rustgis_data::DataError::Cancelled.to_string() { e } else { format!("cannot sync layer '{layer}': {e}") }
 }
 
 /// Copies the edits `edited` holds of offline area `ai` (its offline map, here or from a field
@@ -780,7 +876,7 @@ fn offline_sync(s: &mut Session, p: &Value) -> CmdResult {
 /// said as a conflict).
 pub(crate) fn sync_area(s: &mut Session, ai: usize, edited: &rustgis_map::Map) -> CmdResult {
     let area = s.project.offline_areas.get(ai).cloned().ok_or("no such area")?;
-    let offline_map = format!("{} (offline)", area.name);
+    let offline_map = offline_map_index(&s.project, &area);
     let si = s
         .project
         .maps
@@ -805,75 +901,183 @@ pub(crate) fn sync_area(s: &mut Session, ai: usize, edited: &rustgis_map::Map) -
             // Layers are matched by id (the snapshot keeps them), so same-named layers don't mix.
             // Layers removed from either side since the download are left alone.
             let Some(sl) = src.layers.iter_mut().find(|l| l.id == ol.id && !l.is_raster()) else { continue };
-            let baseline = area.data.layers.iter().find(|l| l.id == ol.id);
-            if !offline_fields_match(&sl.dataset.fields, &ol.dataset.fields)
-                && baseline.is_none_or(|l| {
-                    !offline_fields_match(&l.dataset.fields, &ol.dataset.fields) || l.dataset.features != ol.dataset.features
+            let lname = sl.name.clone();
+            // Compared and merged in longitude/latitude, as a package returns its features, whatever
+            // system the source, its last synced copy or the package hold them in; the source is
+            // written back in its own, its unchanged places as stored (`results_from_lonlat`).
+            let ol_ds = ol.dataset.in_lonlat().map_err(|e| sync_error(&ol.name, e))?;
+            let last_synced = area.data.layers.iter().find(|l| l.id == ol.id).map(|l| &l.dataset);
+            let baseline = last_synced.map(|d| d.in_lonlat()).transpose().map_err(|e| sync_error(&ol.name, e))?;
+            // Fields are matched by name, not by position: a field added to the source meanwhile, or
+            // the fields put in another order, changes no feature's values. `to_source[i]` is the
+            // area's field `i` in the source.
+            let to_source = by_name(&ol_ds.fields, &sl.dataset.fields);
+            let same_as_last = match (last_synced, &baseline) {
+                (Some(b), Some(_)) if b.coord_crs() == ol.dataset.coord_crs() => b.features == ol.dataset.features,
+                (_, Some(b)) => b.features == ol_ds.features,
+                _ => false,
+            };
+            // An area field the source hasn't (removed there, or added offline), or has with another
+            // type, has no place for the area's values; a field removed offline that the source
+            // still has would come back with the refresh. Either is refused unless nothing changed
+            // offline, its fields included.
+            let mut misfits: Vec<&str> = ol_ds
+                .fields
+                .iter()
+                .zip(&to_source)
+                .filter(|(f, j)| j.and_then(|j| sl.dataset.fields.get(j)).is_none_or(|s| s.ty != f.ty))
+                .map(|(f, _)| f.name.as_str())
+                .collect();
+            if let Some(b) = &baseline {
+                misfits.extend(
+                    b.fields
+                        .iter()
+                        .filter(|f| ol_ds.field_index(&f.name).is_none() && sl.dataset.field_index(&f.name).is_some())
+                        .map(|f| f.name.as_str()),
+                );
+            }
+            let fields_as_last = baseline.as_ref().is_some_and(|b| {
+                b.fields.len() == ol_ds.fields.len()
+                    && b.fields.iter().zip(&ol_ds.fields).all(|(x, y)| x.name.eq_ignore_ascii_case(&y.name) && x.ty == y.ty)
+            });
+            if !misfits.is_empty() && !(same_as_last && fields_as_last) {
+                return Err(format!(
+                    "cannot sync layer '{}': source and offline fields differ ({} not in both the area and the map '{}', or of another type in one); align the fields before syncing",
+                    ol.name,
+                    misfits.join(", "),
+                    area.map
+                ));
+            }
+            // Whether a feature was edited offline: the returned copy against the last synced one,
+            // as they are when both are held in the same system (as an offline map in the project
+            // and its area are), so a conversion that changed meanwhile (a datum grid downloaded)
+            // can't make an unedited feature look edited; else both in longitude/latitude.
+            type ById<'a> = std::collections::HashMap<u64, rustgis_data::RowRef<'a>>;
+            fn by_id(d: &rustgis_data::Dataset) -> ById<'_> {
+                d.features.rows().map(|r| (r.id(), r)).collect()
+            }
+            let raw: Option<(ById<'_>, ById<'_>, Vec<Option<usize>>)> = last_synced
+                .filter(|b| b.coord_crs() == ol.dataset.coord_crs())
+                .map(|b| (by_id(b), by_id(&ol.dataset), by_name(&ol.dataset.fields, &b.fields)));
+            // The area's copies as last synced, in longitude/latitude: only features changed offline
+            // since then go back, so edits made to the source meanwhile aren't overwritten by stale
+            // copies.
+            let base: ById<'_> = baseline.as_deref().map(by_id).unwrap_or_default();
+            let to_base = baseline.as_ref().map(|b| by_name(&ol_ds.fields, &b.fields)).unwrap_or_default();
+
+            let unchanged_offline = |fid: u64, now: rustgis_data::RowRef<'_>| match &raw {
+                Some((raw_base, raw_now, map)) => {
+                    raw_base.get(&fid).is_some_and(|b| raw_now.get(&fid).is_some_and(|n| same_on(*n, *b, map, true)))
+                }
+                None => base.get(&fid).is_some_and(|b| same_on(now, *b, &to_base, true)),
+            };
+            // Changed in the source since the last sync, in the fields it shares with the area: a
+            // field the last synced copy lacks (added on both sides since) counts as Null there.
+            let changed_at_home = |x: rustgis_data::RowRef<'_>| {
+                base.get(&x.id()).is_some_and(|b| {
+                    b.geometry() != x.geometry()
+                        || to_source.iter().enumerate().any(|(i, j)| {
+                            j.is_some_and(|j| {
+                                to_base.get(i).copied().flatten().map_or(&rustgis_data::Value::Null, |k| b.value(k)) != x.value(j)
+                            })
+                        })
                 })
-            {
-                return Err(format!("cannot sync layer '{}': source and offline fields differ; align the fields before syncing", ol.name));
+            };
+            // The source's fields the area hasn't (added there since): a deletion offline loses their
+            // values too.
+            let source_only: Vec<usize> = (0..sl.dataset.fields.len()).filter(|j| !to_source.contains(&Some(*j))).collect();
+            let held = (sl.dataset.coord_crs() != rustgis_data::raster::Crs::LonLat).then(|| sl.dataset.clone());
+            if held.is_some() {
+                sl.dataset = sl.dataset.in_lonlat().map_err(|e| sync_error(&ol.name, e))?.into_owned();
             }
             // The ids the area held when it was last synced.
-            let had: std::collections::HashSet<u64> =
-                baseline.map(|l| l.dataset.features.iter().map(|f| f.id).collect()).unwrap_or_default();
-            let now_ids: std::collections::HashSet<u64> = ol.dataset.features.iter().map(|f| f.id).collect();
-            // The area's copies as last synced: only features changed offline since then go back,
-            // so edits made to the source meanwhile aren't overwritten by stale copies.
-            let base: std::collections::HashMap<u64, &rustgis_data::Feature> =
-                baseline.map(|l| l.dataset.features.iter().map(|f| (f.id, f)).collect()).unwrap_or_default();
+            let had: std::collections::HashSet<u64> = base.keys().copied().collect();
+            let now_ids: std::collections::HashSet<u64> = ol_ds.features.rows().map(|r| r.id()).collect();
+            // The features this sync writes, by their ids in the source: only these are converted
+            // back to a held source's system.
+            let mut written = std::collections::HashSet::new();
             // Deletions first, so a fresh id given to a new feature below can't be swept away.
             let before = sl.dataset.features.len();
-            sl.dataset.features.retain(|x| {
-                let keep = !had.contains(&x.id) || now_ids.contains(&x.id);
-                // Deleted offline but changed in the source meanwhile.
-                if !keep && base.get(&x.id).is_some_and(|b| *b != x) {
-                    conflicts.push(tag(&sl.name, x.id));
+            sl.dataset.features.retain_rows(|x| {
+                let keep = !had.contains(&x.id()) || now_ids.contains(&x.id());
+                // Deleted offline but changed in the source meanwhile, a value in a field only the
+                // source has included.
+                if !keep && (changed_at_home(x) || source_only.iter().any(|&j| *x.value(j) != rustgis_data::Value::Null)) {
+                    conflicts.push(tag(&lname, x.id()));
                 }
                 keep
             });
             deleted += before - sl.dataset.features.len();
-            for f in &ol.dataset.features {
-                if had.contains(&f.id) {
-                    let changed_offline = base.get(&f.id).is_none_or(|b| *b != f);
-                    match sl.dataset.features.iter_mut().find(|x| x.id == f.id) {
-                        Some(x) if changed_offline && x != f => {
-                            if base.get(&f.id).is_some_and(|b| *b != x) {
-                                conflicts.push(tag(&sl.name, f.id));
+            // Where each id is in the source, and the id a feature added offline takes when its own
+            // is taken: one above any the source and the area have.
+            let mut at: std::collections::HashMap<u64, usize> = sl.dataset.features.rows().enumerate().map(|(i, r)| (r.id(), i)).collect();
+            let mut top = at.keys().chain(had.iter()).copied().max().unwrap_or(0);
+            for f in ol_ds.features.rows() {
+                let fid = f.id();
+                if had.contains(&fid) {
+                    let changed_offline = !unchanged_offline(fid, f);
+                    let row = at.get(&fid).copied();
+                    let differs = row.and_then(|r| sl.dataset.features.row(r)).map(|x| !same_on(f, x, &to_source, false));
+                    match (row, differs) {
+                        (Some(r), Some(true)) if changed_offline => {
+                            if sl.dataset.features.row(r).is_some_and(changed_at_home) {
+                                conflicts.push(tag(&lname, fid));
                             }
-                            *x = f.clone();
+                            sl.dataset.features.set_geometry(r, f.geometry().cloned());
+                            for (i, j) in to_source.iter().enumerate() {
+                                if let Some(j) = *j {
+                                    sl.dataset.features.set_value(r, j, f.value(i).clone());
+                                }
+                            }
+                            written.insert(fid);
                             updated += 1;
                         }
                         // Changed offline but deleted from the source meanwhile: left deleted, and
                         // reported.
-                        None if changed_offline => {
+                        (None, _) if changed_offline => {
                             skipped += 1;
-                            dropped.push(tag(&sl.name, f.id));
+                            dropped.push(tag(&lname, fid));
                         }
                         _ => {}
                     }
                 } else {
                     // Added offline: its own id when the source and the area haven't used it, else
                     // a fresh one above any they have (its id clashed with one outside the area).
-                    let taken = sl.dataset.features.iter().any(|x| x.id == f.id) || had.contains(&f.id);
-                    let id = if taken {
+                    let id = if at.contains_key(&fid) || had.contains(&fid) {
                         renumbered += 1;
-                        sl.dataset.features.iter().map(|x| x.id).chain(had.iter().copied()).max().unwrap_or(0).saturating_add(1)
+                        top.saturating_add(1)
                     } else {
-                        f.id
+                        fid
                     };
-                    sl.dataset.features.push(rustgis_data::Feature { id, ..f.clone() });
+                    top = top.max(id);
+                    let mut attrs = vec![rustgis_data::Value::Null; sl.dataset.fields.len()];
+                    for (i, j) in to_source.iter().enumerate() {
+                        if let Some(cell) = j.and_then(|j| attrs.get_mut(j)) {
+                            *cell = f.value(i).clone();
+                        }
+                    }
+                    at.insert(id, sl.dataset.features.len());
+                    sl.dataset.features.push_row(rustgis_data::Feature { id, geometry: f.geometry().cloned(), attrs });
+                    written.insert(id);
                     added += 1;
                 }
+            }
+            if let Some(own) = held {
+                // Its own coordinates back while the merge is converted (and kept, should that fail):
+                // the features it left as they were stay as stored, only those it wrote are converted.
+                let merged = std::mem::replace(&mut sl.dataset, own);
+                sl.dataset = sl.dataset.merged_from_lonlat(merged, &written).map_err(|e| sync_error(&ol.name, e))?;
             }
             sl.selection.clear();
             sl.touch_geometry();
         }
     }
     let fresh = s.project.maps.get_mut(si).map(|m| snapshot(m, &area.extent)).ok_or("the source map is gone")?;
-    if let Some(m) = s.project.maps.iter_mut().find(|m| m.name.eq_ignore_ascii_case(&offline_map)) {
+    if let Some(m) = offline_map.and_then(|i| s.project.maps.get_mut(i)) {
         let name = m.name.clone();
         *m = fresh.clone();
         m.name = name;
+        m.offline_area_id = (!area.id.is_empty()).then(|| area.id.clone());
         // A copy of the source map: a map, and layers, of its own.
         m.renew_instance_id();
         for l in &mut m.layers {

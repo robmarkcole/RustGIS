@@ -196,8 +196,9 @@ impl Host for Messages<'_> {
 fn layer_geojson(inputs: &dyn Inputs, name: &str) -> Result<Value, String> {
     let ds = inputs.dataset(name).ok_or_else(|| format!("no layer named '{name}'"))?;
     let sel = inputs.selection(name);
+    // GeoJSON is longitude/latitude, whatever system the layer holds its coordinates in.
     if sel.is_empty() {
-        return Ok(rustgis_data::io::to_geojson(ds));
+        return Ok(rustgis_data::io::to_geojson(&*ds.in_lonlat()?));
     }
     let sub = rustgis_data::Dataset {
         name: ds.name.clone(),
@@ -209,8 +210,10 @@ fn layer_geojson(inputs: &dyn Inputs, name: &str) -> Result<Value, String> {
         crs_incomplete: false,
         zm_dropped: false,
         windowed: false,
+        held_in: ds.held_in,
+        shown_in: None,
     };
-    Ok(rustgis_data::io::to_geojson(&sub))
+    Ok(rustgis_data::io::to_geojson(&*sub.in_lonlat()?))
 }
 
 fn run(spec: &ToolSpec, inputs: &dyn Inputs, params: &Value) -> Result<ToolResult, String> {
@@ -419,7 +422,7 @@ fn output(reply: &Value, tool: &str) -> Result<ToolResult, String> {
             .and_then(Value::as_array)
             .map(|a| a.iter().filter_map(Value::as_u64).filter_map(|r| usize::try_from(r).ok()).collect())
             .unwrap_or_default();
-        return Ok(ToolResult { output: Output::Selection { layer, rows }, messages });
+        return Ok(ToolResult { losses: Vec::new(), output: Output::Selection { layer, rows }, messages });
     }
     let mut outs = Vec::new();
     for v in reply.get("layers").and_then(Value::as_array).into_iter().flatten().take(64) {
@@ -428,5 +431,43 @@ fn output(reply: &Value, tool: &str) -> Result<ToolResult, String> {
     for v in reply.get("tables").and_then(Value::as_array).into_iter().flatten().take(64) {
         outs.push(OutputLayer::Table(dataset(v, tool)?));
     }
-    Ok(ToolResult { output: Output::Layers(outs), messages })
+    Ok(ToolResult { losses: Vec::new(), output: Output::Layers(outs), messages })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustgis_data::raster::Crs;
+    use rustgis_data::{Coord, Dataset, Geometry, GeometryType};
+
+    /// A plugin tool is given a layer held in another system in longitude/latitude, as GeoJSON is,
+    /// whole or as its selection.
+    #[test]
+    fn a_held_layer_reaches_a_tool_in_longitude_latitude() {
+        struct Held(Dataset, Vec<usize>);
+        impl Inputs for Held {
+            fn dataset(&self, l: &str) -> Option<&Dataset> {
+                (l == "Wells").then_some(&self.0)
+            }
+            fn selection(&self, _: &str) -> &[usize] {
+                &self.1
+            }
+        }
+        let mut ds = Dataset::new("Wells", GeometryType::Point, vec![]);
+        ds.push(Some(Geometry::Point(Coord::new(11.5, 48.7))), vec![]);
+        ds.push(Some(Geometry::Point(Coord::new(11.6, 48.8))), vec![]);
+        ds.hold_in(Crs::Epsg(32632)).unwrap();
+        let near = |v: &Value, lon: f64, lat: f64| {
+            let c = &v["geometry"]["coordinates"];
+            (c[0].as_f64().unwrap() - lon).abs() < 1e-9 && (c[1].as_f64().unwrap() - lat).abs() < 1e-9
+        };
+        let whole = layer_geojson(&Held(ds.clone(), vec![]), "Wells").unwrap();
+        let f = whole["features"].as_array().unwrap();
+        assert_eq!(f.len(), 2);
+        assert!(near(&f[0], 11.5, 48.7) && near(&f[1], 11.6, 48.8), "{whole}");
+        let picked = layer_geojson(&Held(ds, vec![1]), "Wells").unwrap();
+        let f = picked["features"].as_array().unwrap();
+        assert_eq!(f.len(), 1);
+        assert!(near(&f[0], 11.6, 48.8), "{picked}");
+    }
 }

@@ -21,9 +21,12 @@ import java.util.ArrayList;
  *   picked    purpose  name  path    a chosen file, copied to the app's storage
  *   ended     purpose               a request whose every file failed to be copied
  *   cancelled                        a picker closed without a choice
- *   saved     name                   a file written where the user chose
- *   position  lon  lat  accuracy  time   where the device is (accuracy in metres, or empty;
- *                                        time in milliseconds since 1970)
+ *   saved     name                   an export written where the user chose
+ *   project-saved        name        a project written where the user chose
+ *   project-save-failed  reason      a project save that failed or was cancelled
+ *   position  lon  lat  accuracy  time  elapsed   where the device is (accuracy in metres, or
+ *                                        empty; time in milliseconds since 1970; elapsed in
+ *                                        nanoseconds since boot, from getElapsedRealtimeNanos)
  *   stopped                          positioning ended without being asked to
  *   photo     name  path             a photo the camera took, in the app's photos folder
  *   failed    text                   what went wrong, to show the user
@@ -81,6 +84,7 @@ public class MainActivity extends NativeActivity {
     private File photo;
     private String saveName = "";
     private byte[] saveBytes;
+    private boolean saveProject;
 
     @Override
     protected void onCreate(android.os.Bundle saved) {
@@ -310,7 +314,8 @@ public class MainActivity extends NativeActivity {
             @Override
             public void onLocationChanged(android.location.Location fix) {
                 add("position\t" + fix.getLongitude() + "\t" + fix.getLatitude() + "\t"
-                        + (fix.hasAccuracy() ? Float.toString(fix.getAccuracy()) : "") + "\t" + fix.getTime());
+                        + (fix.hasAccuracy() ? Float.toString(fix.getAccuracy()) : "") + "\t" + fix.getTime()
+                        + "\t" + fix.getElapsedRealtimeNanos());
             }
 
             @Override
@@ -441,15 +446,16 @@ public class MainActivity extends NativeActivity {
         });
     }
 
-    /** Asks the user where to write a file, then writes it; a "saved" or "failed" event follows. */
-    public void save(final String name, final byte[] bytes) {
+    /** Asks where to write a file. Project saves return a distinct result to the save prompt. */
+    public void save(final String name, final byte[] bytes, final boolean project) {
         runOnUiThread(() -> {
-            if (saveBytes != null) {
-                add("failed\t" + name + " wasn't saved: another file is waiting for its place to be chosen.");
+            if (saveBytes != null || picking) {
+                saveFailed(project, name, "another file is being chosen.");
                 return;
             }
             saveName = name;
             saveBytes = bytes;
+            saveProject = project;
             Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
             intent.addCategory(Intent.CATEGORY_OPENABLE);
             // The file's own type where Android knows its extension: some providers name the
@@ -463,6 +469,10 @@ public class MainActivity extends NativeActivity {
                 saveBytes = null;
             }
         });
+    }
+
+    private void saveFailed(boolean project, String name, String reason) {
+        add((project ? "project-save-failed\t" : "failed\t") + name + " wasn't saved: " + reason);
     }
 
     /** What happened since the last call, oldest first, one event to a line. */
@@ -541,7 +551,11 @@ public class MainActivity extends NativeActivity {
             }
             return true;
         } catch (RuntimeException e) {
-            add("failed\tThis device has no file picker: " + e.getMessage());
+            if (request == SAVE) {
+                saveFailed(saveProject, saveName, "the file picker couldn't be shown: " + e.getMessage());
+            } else {
+                add("failed\tThis device has no file picker: " + e.getMessage());
+            }
             return false;
         }
     }
@@ -665,11 +679,12 @@ public class MainActivity extends NativeActivity {
         } else if (request == SAVE) {
             final byte[] bytes = saveBytes;
             final String name = saveName;
+            final boolean project = saveProject;
             saveBytes = null;
             final Uri uri = result == RESULT_OK && data != null ? data.getData() : null;
             if (uri == null || bytes == null) {
                 // Said, as the app has already told the user to choose a place for it.
-                add("failed\t" + name + " wasn't saved: no place was chosen for it.");
+                saveFailed(project, name, "no place was chosen for it.");
                 answered();
                 return;
             }
@@ -682,9 +697,9 @@ public class MainActivity extends NativeActivity {
                         out.write(bytes);
                     }
                     // Said once the file is closed: a failure to close is a failure to save.
-                    add("saved\t" + name);
+                    add((project ? "project-saved\t" : "saved\t") + name);
                 } catch (Throwable e) {
-                    add("failed\t" + name + " wasn't saved: " + e.getMessage());
+                    saveFailed(project, name, e.getMessage());
                 } finally {
                     answered();
                 }

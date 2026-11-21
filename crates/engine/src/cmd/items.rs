@@ -535,7 +535,21 @@ fn import_maps(s: &mut Session, p: &Value) -> CmdResult {
     };
     let mut names = Vec::new();
     let first_map = s.project.maps.len();
+    let mut detached_offline = 0;
+    let mut renamed_offline = 0;
     for mut m in maps.into_iter().take(MAX_IMPORTED_MAPS) {
+        // A map imported without its home area becomes an independent copy.
+        detached_offline += usize::from(m.offline_area_id.take().is_some());
+        // Nor may its title make it one: an older project matches its offline copy by the name
+        // "<area> (offline)", and syncing an unrelated map would delete what it lacks.
+        let suffix = super::field::OFFLINE;
+        if m.name.len() > suffix.len()
+            && m.name.is_char_boundary(m.name.len() - suffix.len())
+            && m.name[m.name.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+        {
+            m.name = format!("{} (imported)", &m.name[..m.name.len() - suffix.len()]);
+            renamed_offline += 1;
+        }
         // A binding in a file is no authority to use a login here.
         crate::s3_connections::clear_bindings(m.addresses_mut());
         crate::project::clear_login_bindings(m.addresses_mut());
@@ -548,6 +562,18 @@ fn import_maps(s: &mut Session, p: &Value) -> CmdResult {
         names.push(m.name.clone());
         m.renew_instance_id();
         s.project.maps.push(m);
+    }
+    if detached_offline > 0 {
+        s.notify(
+            format!("{detached_offline} imported map(s) were detached from their offline areas, which aren't imported with maps"),
+            false,
+        );
+    }
+    if renamed_offline > 0 {
+        s.notify(
+            format!("{renamed_offline} imported map(s) titled as offline copies were renamed \"… (imported)\", so they aren't taken for this project's offline maps"),
+            false,
+        );
     }
     if let Some(message) = super::design::display_area_messages(s.project.maps.iter().skip(first_map).flat_map(|map| map.layers.iter())) {
         s.notify(message, false);
@@ -747,6 +773,7 @@ fn template(p: &Project) -> (Project, TemplateLosses) {
         })
         .saturating_add(t.tables.iter().filter(|table| table.source.is_some()).count());
     for m in &mut t.maps {
+        m.offline_area_id = None;
         for l in &mut m.layers {
             l.dataset.features.clear();
             l.selection.clear();
@@ -835,6 +862,11 @@ fn package_map(s: &mut Session, mobile: bool, tol: f64) -> Result<Vec<u8>, Strin
             if l.is_raster() || tol <= 0.0 {
                 continue;
             }
+            // Simplified in longitude/latitude, as the package saves it, whatever system the
+            // layer holds its coordinates in.
+            if let std::borrow::Cow::Owned(ds) = l.dataset.in_lonlat()? {
+                l.dataset = ds;
+            }
             for f in &mut l.dataset.features {
                 if let Some(g) = &f.geometry {
                     let (simple, said) = rustgis_analysis::simplify_geometry(g, tol * 111_320.0);
@@ -878,7 +910,9 @@ fn package_gp(s: &mut Session) -> Result<Vec<u8>, String> {
             k += 1;
             file = format!("results/{base}_{k}.geojson");
         }
-        entries.push((file, rustgis_data::io::to_geojson(&l.dataset).to_string().into_bytes()));
+        // GeoJSON is longitude/latitude, whatever system the result holds its coordinates in.
+        let ds = l.dataset.in_lonlat()?;
+        entries.push((file, rustgis_data::io::to_geojson(&ds).to_string().into_bytes()));
     }
     rustgis_data::zip::write(&entries)
 }
@@ -1246,14 +1280,15 @@ fn layer_mesh(s: &Session, p: &Value, keep_lines: bool) -> Result<Mesh, String> 
     };
     let mut mesh = Mesh { keep_lines, ..Mesh::default() };
     let rows = l.visible_rows();
+    let to = l.dataset.lonlat_conversion().map_err(|e| format!("{}: {e}", l.name))?;
     for (row, ft) in l.dataset.features.iter().enumerate() {
         if row.is_multiple_of(256) {
             rustgis_data::progress::check().map_err(|e| e.to_string())?;
         }
         // A feature with no geometry draws nothing, so its height is neither used nor reported.
-        if rows.get(row) != Some(&true) || ft.geometry.is_none() {
-            continue;
-        }
+        let Some(g) = ft.geometry.as_ref().filter(|_| rows.get(row) == Some(&true)) else { continue };
+        // Placed from longitude/latitude, whatever system the layer holds its coordinates in.
+        let g = rustgis_data::Dataset::geometry_to_lonlat_by(&to, g).map_err(|e| format!("{}: feature {}: {e}", l.name, ft.id))?;
         // A height that isn't a finite number takes the default, and is counted.
         let height = match hf {
             Some(fi) => match l.dataset.value(row, fi).as_f64().filter(|h| h.is_finite()) {
@@ -1271,13 +1306,13 @@ fn layer_mesh(s: &Session, p: &Value, keep_lines: bool) -> Result<Mesh, String> 
         let below = h < 0.0;
         let orient = |o: Orient| if below { o.reversed() } else { o };
         // A solid of zero height would be two coincident caps facing apart: STL leaves it out.
-        if !mesh.keep_lines && h == 0.0 && !matches!(ft.geometry, Some(Geometry::Line(_))) {
+        if !mesh.keep_lines && h == 0.0 && !matches!(&*g, Geometry::Line(_)) {
             mesh.flat += 1;
             continue;
         }
         let before = mesh.vertices;
-        match &ft.geometry {
-            Some(Geometry::Polygon(polys)) => {
+        match &*g {
+            Geometry::Polygon(polys) => {
                 for rings in polys {
                     // Each ring open (no closing vertex), outer first then holes.
                     let mut open: Vec<Vec<(f64, f64)>> = rings
@@ -1342,7 +1377,7 @@ fn layer_mesh(s: &Session, p: &Value, keep_lines: bool) -> Result<Mesh, String> 
                     }
                 }
             }
-            Some(Geometry::Line(parts)) => {
+            Geometry::Line(parts) => {
                 for part in parts {
                     let n = part.len();
                     if n < 2 {
@@ -1361,7 +1396,7 @@ fn layer_mesh(s: &Session, p: &Value, keep_lines: bool) -> Result<Mesh, String> 
                     mesh.face(Item::Polyline((0..n).map(|i| v + i).collect()))?;
                 }
             }
-            Some(g @ (Geometry::Point(_) | Geometry::MultiPoint(_))) => {
+            g @ (Geometry::Point(_) | Geometry::MultiPoint(_)) => {
                 let pts: Vec<rustgis_geom::Coord> = match g {
                     Geometry::Point(c) => vec![*c],
                     Geometry::MultiPoint(c) => c.clone(),
@@ -1384,7 +1419,6 @@ fn layer_mesh(s: &Session, p: &Value, keep_lines: bool) -> Result<Mesh, String> 
                     }
                 }
             }
-            None => {}
         }
         if mesh.vertices > before {
             s.constructions.count_feature(s.map().instance_id(), l, ft, &mut mesh.constructions);

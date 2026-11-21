@@ -146,9 +146,12 @@ A field package (`.rgisfield`) carries a map to the phone and its edits back.
 1. **On the computer**, with the map in view, **Data › Offline › Package for the Field** makes
    the package: a project of that map, the features in view, and the MBTiles and PMTiles
    archives its tile layers use. The package records the area it was made from in your project,
-   so save the project after packaging. Raster layers are left out, and the package says so.
+   so save the project after packaging. A layer read in place from a supported local file is
+   copied within the area while it fits the package budget. The copy is for reference, and
+   Bring Back skips edits to it. The sender gets a notice about anything left behind, including
+   rasters and streamed layers that could not be copied.
 2. **On the phone**, open the package with **Open Project** (or **Add Data**). It is unpacked into
-   a folder of its own and its map opens.
+   a folder of its own and its map opens. Any notices about what stayed behind appear as it opens.
 3. **In the field**, capture and edit as above.
 4. **Back from the field**, **Send Field Package**, in the More sheet, saves the map as a field
    package again, with the photos its features name, wherever you choose (a cloud drive, email,
@@ -216,6 +219,13 @@ after packaging; legacy recovery cannot change that association.
   download code that adds to what it does.
 - **Choosing a folder** is not possible with the phone's picker; the app says so where one is
   asked for.
-- **Preferences, saved passwords and autosave** are not available on a phone yet.
+- **Recovery** keeps a copy of completed edits in the app's private storage. On the next launch,
+  the app offers to recover unsaved work if a complete copy is available. The first edit submits
+  a copy immediately. Edits made within two seconds of a submission are grouped into another copy
+  due at the end of that interval. When the exit hook runs, it submits any waiting edit and gives
+  the writer up to two seconds to finish. The system can stop the app without running that hook.
+  If a copy is still waiting or being written when the process ends, recovery uses the most recent
+  completed copy, if one exists. Recovered field packages can still be sent back with their photos.
+- **Preferences and saved passwords** are not available on a phone yet.
 - **HTTPS** on Android is checked against a bundled list of trusted roots rather than the
   device's own, and the app says so once. An iPhone or iPad uses the device's own.

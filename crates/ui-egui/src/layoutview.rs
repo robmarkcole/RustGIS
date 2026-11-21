@@ -6,11 +6,12 @@
 
 use egui::{Align2, Color32, CornerRadius, CursorIcon, Pos2, Rect, Sense, Stroke, Ui, pos2, vec2};
 use rustgis_engine::map::layout::{
-    Arrange, ArrowStyle, Background, CoordFormat, Element, ElementKind, Grid, GridKind, GridStyle, INK, Layout, LineHead,
-    MAX_BACKGROUND_PADDING, MAX_BACKGROUND_RADIUS, MAX_BACKGROUND_WIDTH, MAX_COLORBAR_TICKS, MAX_FRAME_SCALE, MAX_GRID_WIDTH,
-    MAX_LEGEND_COLUMNS, MAX_SCALE_DIVISIONS, MAX_TICK_MM, MIN_FRAME_SCALE, Orientation, PT_PER_MM, ScaleBarStyle, ScaleUnits, TickSide,
-    frame_camera, line_angle, line_length,
+    Arrange, ArrowStyle, Background, ChartOrder, CoordFormat, Element, ElementKind, Grid, GridKind, GridStyle, INK, Layout, LineHead,
+    MAX_BACKGROUND_PADDING, MAX_BACKGROUND_RADIUS, MAX_BACKGROUND_WIDTH, MAX_CHART_BARS, MAX_CHART_DECIMALS, MAX_COLORBAR_TICKS,
+    MAX_FRAME_SCALE, MAX_GRID_WIDTH, MAX_LEGEND_COLUMNS, MAX_SCALE_DIVISIONS, MAX_TICK_MM, MIN_FRAME_SCALE, Orientation, PT_PER_MM,
+    ScaleBarStyle, ScaleUnits, TextAlign, TickSide, frame_camera, line_angle, line_length,
 };
+use rustgis_engine::map::report::StatKind;
 use rustgis_engine::map::symbology::Dash;
 use serde_json::{Value, json};
 
@@ -123,6 +124,9 @@ pub struct LayoutView {
     page_wait: Option<PageWait>,
     /// The last clipping warning shown, cleared when the text fits or another layout opens.
     text_warning: Option<String>,
+    /// The texts of the layout drawn (by its index) cut off on its page, with their lines left
+    /// out of their box, as the Format pane tells them (#2346).
+    text_losses: Option<(usize, Vec<rustgis_engine::render::layout::TextLoss>)>,
     /// Page zoom (0 or 1 = fit) and pan, in screen points, of the layout `viewed` names.
     zoom: f32,
     pan: egui::Vec2,
@@ -209,6 +213,7 @@ pub(crate) fn follow_project(app: &mut RustGisApp) {
         app.layout.typing.clear();
         app.layout.viewed = None;
         app.layout.text_warning = None;
+        app.layout.text_losses = None;
         app.layout.views.clear();
     }
     app.layout.project = Some(opened);
@@ -272,6 +277,7 @@ impl LayoutView {
             return;
         }
         self.text_warning = None;
+        self.text_losses = None;
         if let Some(old) = self.viewed.replace(name.to_string()) {
             self.views.insert(old, (self.zoom, self.pan));
         }
@@ -748,13 +754,21 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
             let web = cfg!(target_arch = "wasm32");
             let frames = (web && pending.frames) || said.to_come;
             say_frame_shadows(app, &said);
-            let clipped = rustgis_engine::render::layout::clipped_text(&layout, &app.session.project.maps, dpi, &info);
-            let note = rustgis_engine::render::layout::clipped_text_notice(&clipped);
+            let losses = rustgis_engine::render::layout::text_losses(&layout, &app.session.project.maps, dpi, &info);
+            let clipped = losses.iter().map(|l| (l.id, l.name.clone())).collect::<Vec<_>>();
+            let note = rustgis_engine::render::layout::clipped_text_notice(&layout, &clipped);
             if note != app.layout.text_warning {
                 if let Some(note) = &note {
                     app.session.warn(note.clone());
                 }
                 app.layout.text_warning = note;
+            }
+            // The Format pane is drawn before the page: a count that changed shows on the next
+            // frame, without waiting for an input event.
+            let losses = Some((li, losses));
+            if app.layout.text_losses != losses {
+                app.layout.text_losses = losses;
+                ui.ctx().request_repaint();
             }
             // Waiting for the frames draws it again anyway: the legends are asked about once
             // they are whole.
@@ -1327,12 +1341,28 @@ pub(crate) fn save_drafts(app: &mut RustGisApp) {
             ("name", _) => Some(e.name.clone()),
             ("text", ElementKind::Text { text, .. }) => Some(text.clone()),
             ("title", ElementKind::Legend { title, .. } | ElementKind::Colorbar { title, .. }) => Some(title.clone()),
+            ("title", ElementKind::Chart { title, .. }) => title.clone(),
             _ => None,
         });
         if current.is_some_and(|c| c != text) {
             let _ = app.run("layout.update", json!({"layout": l, "element": id, field: text}));
         }
     }
+}
+
+/// A row picking horizontal or vertical: the one picked when it changes, as its command code.
+fn orientation_row(ui: &mut Ui, current: Orientation) -> Option<&'static str> {
+    ui.label(tl!("Orientation"));
+    let mut picked = None;
+    ui.horizontal(|ui| {
+        for (label, o, code) in [("Horizontal", Orientation::Horizontal, "horizontal"), ("Vertical", Orientation::Vertical, "vertical")] {
+            if ui.selectable_label(current == o, tl!(label)).clicked() && current != o {
+                picked = Some(code);
+            }
+        }
+    });
+    ui.end_row();
+    picked
 }
 
 /// Saves all text being typed, the field the Format pane shows included: for a command that
@@ -1369,6 +1399,52 @@ fn text_field(
 }
 
 /// A map frame's grid options; `set` sends the changed ones (`false` removes the grid).
+/// An outline in a map frame's properties (its extent indicator, its border): the command key its
+/// changes go under, its width's drag id, and its colour and width (points) within `range`.
+struct Outline {
+    key: &'static str,
+    drag: egui::Id,
+    color: rustgis_engine::map::Rgba,
+    width: f64,
+    range: std::ops::RangeInclusive<f64>,
+}
+
+/// An outline's Color and Line width rows, one component for the extent indicator and the border
+/// (#2557): each change goes to `update` as `{key: {"color"|"width": …}}`, the width with `hint`
+/// on hover.
+fn outline_rows(
+    app: &mut RustGisApp,
+    ui: &mut Ui,
+    grid: impl egui::AsIdSalt,
+    line: Outline,
+    hint: Option<&str>,
+    update: &dyn Fn(&mut RustGisApp, Value),
+) {
+    egui::Grid::new(grid).num_columns(2).show(ui, |ui| {
+        ui.label(tl!("Color"));
+        let mut c = crate::theme::c32(line.color);
+        let resp = crate::widgets::color_button(ui, &mut c);
+        if resp.changed() {
+            crate::widgets::one_step_per_press(app, &resp);
+            update(app, json!({line.key: {"color": crate::theme::rgba(c).hex()}}));
+        }
+        ui.end_row();
+        let input_label = ui.label(tl!("Line width"));
+        let mut w = line.width;
+        let drag = Dragged::lend(ui, line.drag, &mut w);
+        let mut r = ui
+            .add(egui::DragValue::new(&mut w).update_while_editing(false).range(line.range).speed(0.05).max_decimals(2).suffix(" pt"))
+            .labelled_by(input_label.id);
+        if let Some(hint) = hint {
+            r = r.on_hover_text(hint);
+        }
+        if drag.settled(ui, &r, &mut w) && (w - line.width).abs() > 1e-6 {
+            update(app, json!({line.key: {"width": w}}));
+        }
+        ui.end_row();
+    });
+}
+
 fn grid_properties(app: &mut RustGisApp, ui: &mut Ui, grid: Option<&Grid>, id: u32, set: &dyn Fn(&mut RustGisApp, Value)) {
     let mut on = grid.is_some();
     if ui.checkbox(&mut on, tl!("Show grid")).changed() {
@@ -1643,6 +1719,25 @@ pub fn format(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     }
 }
 
+/// What the Format pane says of a text's lines left out (#2346), below its box or past the 200
+/// a text draws, as the page drawn counts them: `None` when they all fit.
+fn lines_left_out_label(loss: &rustgis_engine::render::layout::TextLoss) -> Option<String> {
+    // Lines past the 200 a text draws aren't the box's: no box draws them. Lines left out of
+    // both are said of both, as the command's notice says them.
+    let n = || loss.left_out.max(1).to_string();
+    match (loss.left_out, loss.at_least, loss.below_box, loss.past_limit) {
+        (0, false, ..) => None,
+        (1, false, _, false) => Some(tl!("1 line doesn't fit the box").to_string()),
+        (_, false, _, false) => Some(crate::i18n::fmt("{n} lines don't fit the box", &[("n", &n())])),
+        (_, true, _, false) => Some(crate::i18n::fmt("{n} or more lines don't fit the box", &[("n", &n())])),
+        (_, false, true, true) => Some(crate::i18n::fmt("{n} lines don't fit the box or the 200 a text draws", &[("n", &n())])),
+        (_, true, true, true) => Some(crate::i18n::fmt("{n} or more lines don't fit the box or the 200 a text draws", &[("n", &n())])),
+        (1, false, false, true) => Some(tl!("1 line isn't drawn: a text draws 200 at most").to_string()),
+        (_, false, false, true) => Some(crate::i18n::fmt("{n} lines aren't drawn: a text draws 200 at most", &[("n", &n())])),
+        (_, true, false, true) => Some(crate::i18n::fmt("{n} or more lines aren't drawn: a text draws 200 at most", &[("n", &n())])),
+    }
+}
+
 /// The selected element's properties.
 fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
     let Some(e) = app.layout.selected.and_then(|id| layout.element(id)).cloned() else { return };
@@ -1784,15 +1879,9 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                             .labelled_by(input_label.id);
                         ui.end_row();
                         let vertical = *orientation == Orientation::Vertical;
-                        ui.label(tl!("Orientation"));
-                        ui.horizontal(|ui| {
-                            for (label, v) in [("Horizontal", false), ("Vertical", true)] {
-                                if ui.selectable_label(vertical == v, tl!(label)).clicked() && vertical != v {
-                                    update(app, json!({"orientation": if v { "vertical" } else { "horizontal" }}));
-                                }
-                            }
-                        });
-                        ui.end_row();
+                        if let Some(o) = orientation_row(ui, *orientation) {
+                            update(app, json!({"orientation": o}));
+                        }
                         ui.label(tl!("Labels"));
                         ui.horizontal(|ui| {
                             let sides =
@@ -1954,6 +2043,190 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                             ui.end_row();
                         }
                     }
+                    ElementKind::Chart {
+                        frame,
+                        layer,
+                        field,
+                        label,
+                        group,
+                        statistic,
+                        order,
+                        bars,
+                        other,
+                        orientation,
+                        values,
+                        decimals,
+                        title,
+                        label_align,
+                        classes,
+                        ..
+                    } => {
+                        // The feature layers of the frame's map, and the fields of the chart's layer (#2487).
+                        let map = match layout.element(*frame).map(|f| &f.kind) {
+                            Some(ElementKind::MapFrame { map, .. }) => {
+                                app.session.project.maps.iter().find(|m| m.name.eq_ignore_ascii_case(map))
+                            }
+                            _ => None,
+                        };
+                        let layers: Vec<String> = map
+                            .map(|m| m.layers.iter().filter(|l| !l.is_raster() && !l.graphics).map(|l| l.name.clone()).collect())
+                            .unwrap_or_default();
+                        let fields: Vec<(String, bool)> = map
+                            .and_then(|m| m.layer_by_name(layer))
+                            .map(|l| l.dataset.fields.iter().map(|f| (f.name.clone(), f.ty.is_numeric())).collect())
+                            .unwrap_or_default();
+                        let none = tl!("None");
+                        let named = |current: &Option<String>| {
+                            let mut items = vec![(none.to_string(), current.is_none(), json!(""))];
+                            items.extend(fields.iter().map(|(n, _)| (n.clone(), current.as_deref() == Some(n.as_str()), json!(n))));
+                            items
+                        };
+                        let input_label = ui.label(tl!("Layer"));
+                        let items: Vec<_> = layers.iter().map(|n| (n.clone(), n == layer, json!(n))).collect();
+                        if let Some(v) = choice(ui, ("chart_layer", id), input_label.id, layer, &items) {
+                            update(app, json!({"layer": v}));
+                        }
+                        ui.end_row();
+                        // A count reads no number, so it charts any field.
+                        let counts = group.is_some() && *statistic == StatKind::Count;
+                        let input_label = ui.label(tl!("Field"));
+                        let items: Vec<_> =
+                            fields.iter().filter(|(_, num)| counts || *num).map(|(n, _)| (n.clone(), n == field, json!(n))).collect();
+                        if let Some(v) = choice(ui, ("chart_field", id), input_label.id, field, &items) {
+                            update(app, json!({"field": v}));
+                        }
+                        ui.end_row();
+                        let input_label = ui.label(tl!("Group by"));
+                        if let Some(v) = choice(ui, ("chart_group", id), input_label.id, group.as_deref().unwrap_or(none), &named(group)) {
+                            update(app, json!({"group": v}));
+                        }
+                        ui.end_row();
+                        // Grouped, a bar is labelled with its value and measures a statistic;
+                        // otherwise it is a feature's, labelled by a field.
+                        if group.is_some() {
+                            let input_label = ui.label(tl!("Statistic"));
+                            let items: Vec<_> = [StatKind::Sum, StatKind::Count, StatKind::Mean, StatKind::Min, StatKind::Max]
+                                .into_iter()
+                                .map(|k| (tl!(k.label()).to_string(), k == *statistic, json!(k)))
+                                .collect();
+                            if let Some(v) = choice(ui, ("chart_statistic", id), input_label.id, tl!(statistic.label()), &items) {
+                                update(app, json!({"statistic": v}));
+                            }
+                        } else {
+                            let input_label = ui.label(tl!("Label"));
+                            if let Some(v) =
+                                choice(ui, ("chart_label", id), input_label.id, label.as_deref().unwrap_or(none), &named(label))
+                            {
+                                update(app, json!({"label": v}));
+                            }
+                        }
+                        ui.end_row();
+                        let input_label = ui.label(tl!("Order"));
+                        let items: Vec<_> =
+                            ChartOrder::ALL.into_iter().map(|o| (tl!(o.label()).to_string(), o == *order, json!(o.code()))).collect();
+                        if let Some(v) = choice(ui, ("chart_order", id), input_label.id, tl!(order.label()), &items) {
+                            update(app, json!({"order": v}));
+                        }
+                        ui.end_row();
+                        let input_label = ui.label(tl!("Bars"));
+                        let mut n = *bars as u64;
+                        let drag = Dragged::lend(ui, drag_key("bars"), &mut n);
+                        let r = ui
+                            .add(egui::DragValue::new(&mut n).update_while_editing(false).range(1..=MAX_CHART_BARS as u64))
+                            .labelled_by(input_label.id);
+                        if drag.settled(ui, &r, &mut n) && n as usize != *bars {
+                            update(app, json!({"bars": n}));
+                        }
+                        ui.end_row();
+                        // The bars past the limit: left out (and said), or gathered in a last bar.
+                        ui.label(tl!("Past the limit"));
+                        ui.horizontal(|ui| {
+                            for (text, gather) in [("Leave out", false), ("Other bar", true)] {
+                                if ui.selectable_label(*other == gather, tl!(text)).clicked() && *other != gather {
+                                    update(app, json!({"other": gather}));
+                                }
+                            }
+                        });
+                        ui.end_row();
+                        // How it draws its bars (#2487).
+                        let vertical = *orientation == Orientation::Vertical;
+                        if let Some(o) = orientation_row(ui, *orientation) {
+                            update(app, json!({"orientation": o}));
+                        }
+                        // Its own title is typed below; picking it starts from the title it is given.
+                        ui.label(tl!("Title"));
+                        let own = title.as_deref().is_some_and(|t| !t.is_empty());
+                        ui.horizontal(|ui| {
+                            let modes = [("Automatic", title.is_none()), ("None", title.as_deref() == Some("")), ("Own", own)];
+                            for (text, on) in modes {
+                                if ui.selectable_label(on, tl!(text)).clicked() && !on {
+                                    // Its own title starts as the one it is given, cut to a title's 200 characters.
+                                    let value = match text {
+                                        "Automatic" => Value::Null,
+                                        "None" => json!(""),
+                                        _ => json!(e.kind.chart_given_title().unwrap_or_default().chars().take(200).collect::<String>()),
+                                    };
+                                    // Its own title being typed is dropped, so the field losing its
+                                    // focus, now or with the selection, doesn't bring it back.
+                                    app.layout.typing.remove(&(li, id, "title"));
+                                    update(app, json!({"title": value}));
+                                }
+                            }
+                        });
+                        ui.end_row();
+                        if let Some(t) = title.as_deref().filter(|_| own) {
+                            let input_label = ui.label(tl!("Title text"));
+                            if let Some(tt) = text_field(app, ui, (li, id, "title"), t, false, input_label.id) {
+                                update(app, json!({"title": tt}));
+                            }
+                            ui.end_row();
+                        }
+                        let input_label = ui.label(tl!("Values"));
+                        let mut on = *values;
+                        if ui.checkbox(&mut on, "").labelled_by(input_label.id).changed() {
+                            update(app, json!({"values": on}));
+                        }
+                        ui.end_row();
+                        if *values {
+                            let input_label = ui.label(tl!("Decimals"));
+                            let auto = tl!("Automatic");
+                            let mut items = vec![(auto.to_string(), decimals.is_none(), json!("auto"))];
+                            items.extend((0..=MAX_CHART_DECIMALS).map(|d| (d.to_string(), *decimals == Some(d), json!(d))));
+                            let current = decimals.map_or(auto.to_string(), |d| d.to_string());
+                            if let Some(v) = choice(ui, ("chart_decimals", id), input_label.id, &current, &items) {
+                                update(app, json!({"decimals": v}));
+                            }
+                            ui.end_row();
+                        }
+                        // Each bar in its features' colour on the map; the colour below for the rest (#2487).
+                        let input_label = ui.label(tl!("Color by class"));
+                        let mut on = *classes;
+                        if ui.checkbox(&mut on, "").labelled_by(input_label.id).changed() {
+                            update(app, json!({"classes": on}));
+                        }
+                        ui.end_row();
+                        ui.label(tl!("Bar color"));
+                        let mut c = crate::theme::c32(e.kind.chart_look().unwrap_or_default().bar_color);
+                        let resp = crate::widgets::color_button(ui, &mut c);
+                        if resp.changed() {
+                            crate::widgets::one_step_per_press(app, &resp);
+                            update(app, json!({"barColor": crate::theme::rgba(c).hex()}));
+                        }
+                        ui.end_row();
+                        // Columns have their labels centred under them.
+                        if !vertical {
+                            ui.label(tl!("Labels"));
+                            ui.horizontal(|ui| {
+                                let right = *label_align == TextAlign::Right;
+                                for (text, v) in [("Left", false), ("By the bars", true)] {
+                                    if ui.selectable_label(right == v, tl!(text)).clicked() && right != v {
+                                        update(app, json!({"labelAlign": if v { "right" } else { "left" }}));
+                                    }
+                                }
+                            });
+                            ui.end_row();
+                        }
+                    }
                     ElementKind::Table { rows, .. } => {
                         let input_label = ui.label(tl!("Rows"));
                         let mut n = *rows as u64;
@@ -2093,12 +2366,20 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
         );
     });
     // A layout's text: the form a text graphic has too (#516, #535), with the page's dynamic text.
-    if let ElementKind::Text { text, size, color, bold, italic, align, letter_spacing, font, font_name, .. } = &e.kind {
+    if let ElementKind::Text { text, size, color, bold, italic, align, letter_spacing, font, font_name, wrap, .. } = &e.kind {
         let key = (li, id, "text");
         let mut buf = app.layout.typing.remove(&key).unwrap_or_else(|| text.clone());
         let (mut sz, mut c, mut bb) = (*size, crate::theme::c32(*color), *bold);
         let (mut it, mut al, mut ls, mut fam, mut named) = (*italic, *align, *letter_spacing, *font, font_name.clone());
+        let mut wr = *wrap;
         let tokens = [rustgis_engine::map::graphics::TOKENS, rustgis_engine::map::layout::PAGE_TOKENS];
+        let warning = app
+            .layout
+            .text_losses
+            .as_ref()
+            .filter(|(drawn, _)| *drawn == li)
+            .and_then(|(_, losses)| losses.iter().find(|l| l.id == id))
+            .and_then(lines_left_out_label);
         let fields = crate::textform::Fields {
             text: &mut buf,
             size: &mut sz,
@@ -2106,6 +2387,8 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
             bold: Some(&mut bb),
             italic: Some(&mut it),
             align: Some(&mut al),
+            wrap: Some(&mut wr),
+            warning,
             letter_spacing: Some(&mut ls),
             font: Some(&mut fam),
             font_name: Some(&mut named),
@@ -2134,6 +2417,9 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
         }
         if settled.align {
             update(app, json!({"align": al.code()}));
+        }
+        if settled.wrap {
+            update(app, json!({"wrap": wr}));
         }
         if settled.letter_spacing {
             update(app, json!({"letterSpacing": ls}));
@@ -2208,35 +2494,23 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
         ui.add_space(4.0);
         egui::CollapsingHeader::new(tl!("Extent Indicator")).id_salt(("frame_indicator", id)).default_open(true).show(ui, |ui| {
             ui.label(egui::RichText::new(crate::i18n::fmt("Outlines {frame}", &[("frame", &other)])).size(11.5));
-            egui::Grid::new(("indicator_props", id)).num_columns(2).show(ui, |ui| {
-                ui.label(tl!("Color"));
-                let mut c = crate::theme::c32(*extent_color);
-                let resp = crate::widgets::color_button(ui, &mut c);
-                if resp.changed() {
-                    crate::widgets::one_step_per_press(app, &resp);
-                    update(app, json!({"extentIndicator": {"color": crate::theme::rgba(c).hex()}}));
-                }
-                ui.end_row();
-                let input_label = ui.label(tl!("Line width"));
-                let mut w = *extent_width;
-                let drag = Dragged::lend(ui, drag_key("extentWidth"), &mut w);
-                let r = ui
-                    .add(
-                        egui::DragValue::new(&mut w)
-                            .update_while_editing(false)
-                            .range(rustgis_engine::map::layout::MIN_INDICATOR_WIDTH..=rustgis_engine::map::layout::MAX_INDICATOR_WIDTH)
-                            .speed(0.05)
-                            .max_decimals(2)
-                            .suffix(" pt"),
-                    )
-                    .labelled_by(input_label.id);
-                if drag.settled(ui, &r, &mut w) && (w - extent_width).abs() > 1e-6 {
-                    update(app, json!({"extentIndicator": {"width": w}}));
-                }
-                ui.end_row();
-            });
+            let range = rustgis_engine::map::layout::MIN_INDICATOR_WIDTH..=rustgis_engine::map::layout::MAX_INDICATOR_WIDTH;
+            let line = Outline { key: "extentIndicator", drag: drag_key("extentWidth"), color: *extent_color, width: *extent_width, range };
+            outline_rows(app, ui, ("indicator_props", id), line, None, &update);
             if ui.button(tl!("Remove Extent Indicator")).clicked() {
                 update(app, json!({"extentIndicator": false}));
+            }
+        });
+    }
+    // Its border along its shape (#2557): its colour and width, 0 for none.
+    if let ElementKind::MapFrame { border_color, border_width, .. } = &e.kind {
+        ui.add_space(4.0);
+        egui::CollapsingHeader::new(tl!("Border")).id_salt(("frame_border", id)).show(ui, |ui| {
+            let range = 0.0..=rustgis_engine::map::layout::MAX_FRAME_BORDER_WIDTH;
+            let line = Outline { key: "border", drag: drag_key("borderWidth"), color: *border_color, width: *border_width, range };
+            outline_rows(app, ui, ("border_props", id), line, Some(tl!("0 draws no border")), &update);
+            if e.kind.has_custom_border() && ui.button(tl!("Default Border")).clicked() {
+                update(app, json!({"border": null}));
             }
         });
     }
@@ -2378,6 +2652,24 @@ fn dash_picked(ui: &mut Ui, salt: (&str, u32), dash: Option<Dash>, width: f64, l
 /// Why a locked element, or a frame with a locked surround, isn't deleted.
 pub(crate) fn locked_delete() -> &'static str {
     tl!("It is locked, or one of its surrounds is: unlock it first")
+}
+
+/// A drop-down of `items` (shown text, whether it is the one set, the value it sends) showing
+/// `current`, labelled by `label`; the value of the item picked, when it isn't the one set.
+fn choice(ui: &mut Ui, salt: (&str, u32), label: egui::Id, current: &str, items: &[(String, bool, Value)]) -> Option<Value> {
+    let mut picked = None;
+    egui::ComboBox::from_id_salt(salt)
+        .selected_text(current)
+        .show_ui(ui, |ui| {
+            for (text, set, value) in items {
+                if ui.selectable_label(*set, text.as_str()).clicked() && !*set {
+                    picked = Some(value.clone());
+                }
+            }
+        })
+        .response
+        .labelled_by(label);
+    picked
 }
 
 /// The ink an element starts with when Ink is turned on (#2257): white over a background that is
@@ -3289,6 +3581,93 @@ mod tests {
         assert_eq!(said, !rustgis_engine::render::fonts::serif_available());
     }
 
+    /// A text element's "Wrap to the box" (#2346): off as it is added, on when ticked, as one
+    /// undoable step, and off again.
+    #[test]
+    fn a_text_element_wraps_to_its_box_when_ticked() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        use rustgis_engine::map::layout::ElementKind;
+        let mut app = RustGisApp::with_sample();
+        app.run("layout.new", json!({"name": "Notes"})).unwrap();
+        let li = app.session.active_layout.unwrap();
+        let title = app.session.project.layouts[li].elements.iter().find(|e| e.name == "Title").unwrap().id;
+        app.layout.selected = Some(title);
+        let wraps =
+            |app: &RustGisApp| matches!(app.session.project.layouts[li].element(title).unwrap().kind, ElementKind::Text { wrap: true, .. });
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                with_format(app, ui);
+            },
+            app,
+        );
+        h.run_steps(3);
+        assert!(!wraps(h.state()));
+        h.get_by_role_and_label(Role::CheckBox, "Wrap to the box").click();
+        h.run_steps(3);
+        assert!(wraps(h.state()));
+        h.state_mut().run("edit.undo", json!({})).unwrap();
+        assert!(!wraps(h.state()), "one step undoes it");
+        h.run_steps(3);
+        h.get_by_role_and_label(Role::CheckBox, "Wrap to the box").click();
+        h.run_steps(3);
+        assert!(wraps(h.state()));
+        h.get_by_role_and_label(Role::CheckBox, "Wrap to the box").click();
+        h.run_steps(3);
+        assert!(!wraps(h.state()));
+    }
+
+    /// The Format pane tells lines below a text's box from lines past the 200 a text draws, and
+    /// says both when it loses both, as the command's notice does (#2346).
+    #[test]
+    fn the_format_pane_tells_the_box_from_the_200_line_limit() {
+        use crate::layoutview::lines_left_out_label;
+        use rustgis_engine::render::layout::TextLoss;
+        let loss =
+            |left_out, below_box, past_limit| TextLoss { id: 1, name: "Note".into(), left_out, at_least: false, below_box, past_limit };
+        assert_eq!(lines_left_out_label(&loss(0, false, false)), None);
+        assert_eq!(lines_left_out_label(&loss(3, true, false)).as_deref(), Some("3 lines don't fit the box"));
+        assert_eq!(lines_left_out_label(&loss(50, false, true)).as_deref(), Some("50 lines aren't drawn: a text draws 200 at most"));
+        assert_eq!(lines_left_out_label(&loss(200, true, true)).as_deref(), Some("200 lines don't fit the box or the 200 a text draws"));
+    }
+
+    /// The Format pane says how many lines of the text selected don't fit its box, as the page
+    /// drawn counts them, and says nothing once they fit (#2346).
+    #[test]
+    fn the_format_pane_says_the_lines_left_out_of_a_text() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = RustGisApp::with_sample();
+        app.run("layout.new", json!({"name": "Notes", "template": "blank"})).unwrap();
+        let out =
+            app.run("layout.addElement", json!({"kind": "text", "text": "one\ntwo\nthree", "x": 10, "y": 10, "w": 60, "h": 2})).unwrap();
+        let id = out["element"].as_u64().unwrap() as u32;
+        app.run("ui.pane.format", json!({})).unwrap();
+        app.layout.selected = Some(id);
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                with_format(app, ui);
+            },
+            app,
+        );
+        h.run_steps(3);
+        assert!(h.query_by_label("2 lines don't fit the box").is_some());
+        h.state_mut().run("layout.update", json!({"element": id, "h": 40})).unwrap();
+        h.run_steps(3);
+        assert!(h.query_by_label("2 lines don't fit the box").is_none(), "they fit");
+    }
+
     /// A number dragged in the Format pane and let go is applied (#607): X moves the element by
     /// the drag, though the pane lends the saved X each frame (it used to end where it started).
     #[test]
@@ -3566,6 +3945,43 @@ mod tests {
         assert!(h.query_by_label("Remove Extent Indicator").is_none(), "and its section with it");
     }
 
+    /// A frame's Border section (#2557): Default Border shows only for a border of its own, and
+    /// gives the frame the default one back.
+    #[test]
+    fn a_frame_border_goes_back_to_the_default() {
+        use egui_kittest::kittest::Queryable;
+        use rustgis_engine::map::layout::ElementKind;
+        let mut app = RustGisApp::with_sample();
+        app.run("layout.new", json!({"name": "Borders"})).unwrap();
+        let li = app.session.active_layout.unwrap();
+        let frame = app.session.project.layouts[li].elements.iter().find(|e| matches!(e.kind, ElementKind::MapFrame { .. })).unwrap().id;
+        app.layout.selected = Some(frame);
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 1400.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                with_format(app, ui);
+            },
+            app,
+        );
+        h.run_steps(3);
+        h.get_by_label("Border").click();
+        h.run_steps(3);
+        assert!(h.query_by_label("Default Border").is_none(), "the default border has nothing to go back to");
+        h.state_mut().run("layout.update", json!({"layout": li, "element": frame, "border": {"width": 0}})).unwrap();
+        h.run_steps(3);
+        h.get_by_label("Default Border").click();
+        h.run_steps(2);
+        let kind = &h.state().session.project.layouts[li].element(frame).unwrap().kind;
+        assert!(!kind.has_custom_border(), "the default border again");
+        h.run_steps(2);
+        assert!(h.query_by_label("Default Border").is_none(), "and its button gone");
+    }
+
     /// A legend's properties list the layers of its frame's map; unticking one leaves it out of
     /// the legend.
     #[test]
@@ -3764,6 +4180,74 @@ mod tests {
         h.state_mut().layout.selected = ids.get(1).copied();
         h.run_steps(2);
         assert_eq!(h.state().ui.right, Some(Format));
+    }
+
+    /// Picking Automatic or None for a chart's title drops its own title being typed, so the
+    /// field losing its focus doesn't bring it back (#2487).
+    #[test]
+    fn a_charts_title_mode_drops_the_title_being_typed() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        use rustgis_engine::map::layout::ElementKind;
+        let mut app = RustGisApp::with_sample();
+        app.run("layout.new", json!({"name": "Charts"})).unwrap();
+        let li = app.session.active_layout.unwrap();
+        let p = json!({"layout": li, "kind": "chart", "layer": "Cities", "title": "Mine"});
+        let id = app.run("layout.addElement", p).unwrap()["element"].as_u64().unwrap() as u32;
+        app.layout.selected = Some(id);
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(420.0, 1600.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                let layout = app.session.project.layouts[li].clone();
+                egui::ScrollArea::vertical().show(ui, |ui| super::properties(app, ui, &layout, li));
+            },
+            app,
+        );
+        h.run_steps(2);
+        h.query_all_by_role(Role::TextInput).find(|n| n.value().as_deref() == Some("Mine")).unwrap().focus();
+        h.run_steps(2);
+        h.query_all_by_role(Role::TextInput).find(|n| n.is_focused()).unwrap().type_text(" draft");
+        h.run_steps(2);
+        assert!(!h.state().layout.typing.is_empty(), "being typed");
+        h.get_by_role_and_label(Role::Button, "None").click();
+        h.run_steps(3);
+        let title = match &h.state().session.project.layouts[li].element(id).unwrap().kind {
+            ElementKind::Chart { title, .. } => title.clone(),
+            k => panic!("{k:?}"),
+        };
+        assert_eq!(title.as_deref(), Some(""), "no title, not the one typed");
+        assert!(h.state().layout.typing.is_empty());
+    }
+
+    /// The Color by class box colours a chart's bars by its layer's classes, and clears it again
+    /// (#2487 part 3).
+    #[test]
+    fn color_by_class_colours_a_charts_bars() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        use rustgis_engine::map::layout::ElementKind;
+        let mut app = RustGisApp::with_sample();
+        app.run("layout.new", json!({"name": "Charts"})).unwrap();
+        let li = app.session.active_layout.unwrap();
+        let p = json!({"layout": li, "kind": "chart", "layer": "Countries", "field": "pop_est", "group": "continent"});
+        let id = app.run("layout.addElement", p).unwrap()["element"].as_u64().unwrap() as u32;
+        app.layout.selected = Some(id);
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(420.0, 1600.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                let layout = app.session.project.layouts[li].clone();
+                egui::ScrollArea::vertical().show(ui, |ui| super::properties(app, ui, &layout, li));
+            },
+            app,
+        );
+        let classes = |h: &egui_kittest::Harness<RustGisApp>| {
+            matches!(h.state().session.project.layouts[li].element(id).map(|e| &e.kind), Some(ElementKind::Chart { classes: true, .. }))
+        };
+        h.run_steps(2);
+        assert!(!classes(&h));
+        for on in [true, false] {
+            h.get_by_role_and_label(Role::CheckBox, "Color by class").click();
+            h.run_steps(2);
+            assert_eq!(classes(&h), on);
+        }
     }
 
     /// Capture To Clipboard draws the text still being typed into the Format pane.

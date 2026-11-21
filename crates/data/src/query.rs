@@ -35,7 +35,7 @@ mod complete;
 #[cfg(test)]
 mod legacy;
 
-pub use complete::{Call, Completion, Place, complete_at};
+pub use complete::{Call, Completion, FieldValue, FieldValues, Place, VALUES_READ, complete_at, field_values, literal};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
@@ -159,6 +159,9 @@ pub enum Fault {
     Date,
     /// `clamp(low, x, high)` with `low` above `high`.
     ClampBounds,
+    /// `$area`, `$perimeter` or `$length` of a feature with a place its system can't give in
+    /// longitude/latitude, where it is measured.
+    Unmeasurable,
 }
 
 impl Fault {
@@ -173,6 +176,7 @@ impl Fault {
             Fault::Text => "text that isn't a number",
             Fault::Date => "a date used as a number",
             Fault::ClampBounds => "a clamp whose low bound is above its high bound",
+            Fault::Unmeasurable => "a feature with a place that can't be given in longitude/latitude",
         }
     }
 
@@ -388,10 +392,10 @@ impl Func {
             ),
             Func::Floor => ("floor", 1, 1, "floor(x)", "Rounded down", "floor(2.7)"),
             Func::Ceil => ("ceil", 1, 1, "ceil(x)", "Rounded up", "ceil(2.1)"),
-            Func::Sqrt => ("sqrt", 1, 1, "sqrt(x)", "Square root", "sqrt(16)"),
-            Func::Exp => ("exp", 1, 1, "exp(x)", "e to the power x", "exp(1)"),
-            Func::Ln => ("ln", 1, 1, "ln(x)", "Natural logarithm", "ln(10)"),
-            Func::Log10 => ("log10", 1, 1, "log10(x)", "Base-10 logarithm", "log10(1000)"),
+            Func::Sqrt => ("sqrt", 1, 1, "sqrt(x)", "Square root; null for a negative number", "sqrt(16)"),
+            Func::Exp => ("exp", 1, 1, "exp(x)", "e to the power x; null when too large to represent", "exp(1)"),
+            Func::Ln => ("ln", 1, 1, "ln(x)", "Natural logarithm; null for zero or a negative number", "ln(10)"),
+            Func::Log10 => ("log10", 1, 1, "log10(x)", "Base-10 logarithm; null for zero or a negative number", "log10(1000)"),
             Func::Pi => ("pi", 0, 0, "pi()", "π", "pi()"),
             Func::Min => {
                 ("min", 1, MAX_ARGS, "min(a, b, …)", "The smallest number; values that aren't numbers are skipped", "min(3, 1, 2)")
@@ -413,7 +417,7 @@ impl Func {
                 6,
                 6,
                 "scale_exp(x, d0, d1, r0, r1, exponent)",
-                "As scale_linear, along a curve: 0.5 grows fast then slowly, 2 slowly then fast",
+                "As scale_linear, along a curve: 0.5 grows fast then slowly, 2 slowly then fast; null with a negative exponent at the domain's start",
                 "scale_exp(50, 0, 100, 2, 12, 0.5)",
             ),
             Func::ToString => ("to_string", 1, 1, "to_string(x)", "x as text", "to_string(42)"),
@@ -815,6 +819,8 @@ struct Probe {
     call: Option<(Option<Func>, usize, usize)>,
     /// The field a value at the end is compared with (`name = ▮`, `name IN (▮`).
     field: Option<usize>,
+    /// Whether that value is a `LIKE` / `ILIKE` pattern (`name LIKE ▮`).
+    pattern: bool,
 }
 
 /// How a token is written, for the symbols [`Probe`] notes.
@@ -860,8 +866,15 @@ impl Parser<'_> {
     }
     /// Notes that a value at the end would be compared with `l`, when `l` is a field.
     fn note_compared(&self, l: &Expr) {
+        self.note_compared_as(l, false);
+    }
+    /// As [`note_compared`](Self::note_compared), the value a `LIKE` pattern when `pattern`.
+    fn note_compared_as(&self, l: &Expr, pattern: bool) {
         if let Expr::Field(f) = l {
-            self.note(self.pos, |p| p.field = Some(*f));
+            self.note(self.pos, |p| {
+                p.field = Some(*f);
+                p.pattern = pattern;
+            });
         }
     }
     fn probing(&self) -> bool {
@@ -967,7 +980,7 @@ impl Parser<'_> {
         }
         let negate = self.eat_kw(Kw::Not);
         if self.eat_kw(Kw::Like) || self.eat_kw(Kw::Ilike) {
-            self.note_compared(&l);
+            self.note_compared_as(&l, true);
             let p = self.concat()?;
             return Ok(match (l, p) {
                 (Expr::Field(field), Expr::Lit(Value::Text(pattern))) => Expr::Like { field, pattern, negate },
@@ -1224,7 +1237,7 @@ impl Parser<'_> {
         if self.validate_areas
             && m == Measure::Area
             && let Some(message) =
-                self.area_check.get_or_init(|| crate::ambiguous_area_message(self.ds.features.iter().filter_map(|f| f.geometry.as_ref())))
+                self.area_check.get_or_init(|| self.ds.ambiguous_area_message(self.ds.features.iter().filter_map(|f| f.geometry.as_ref())))
         {
             return Err(format!("{}: {message}", self.ds.name));
         }
@@ -1596,6 +1609,14 @@ pub fn matches(e: &Expr, ds: &Dataset, row: usize, env: &Env) -> bool {
     Eval::new(ds, row, env).cond(e) == Some(true)
 }
 
+/// Tests a row in a chunk whose first row has `offset` preceding rows in the source.
+pub(crate) fn eval_in_chunk(e: &Expr, ds: &Dataset, row: usize, offset: usize) -> bool {
+    let env = Env::default();
+    let mut eval = Eval::new(ds, row, &env);
+    eval.row_offset = offset;
+    eval.cond(e) == Some(true)
+}
+
 /// The expression's value for one row.
 pub fn value(e: &Expr, ds: &Dataset, row: usize, env: &Env) -> Value {
     Eval::new(ds, row, env).value(e).into_owned()
@@ -1739,6 +1760,7 @@ fn channel(v: f64) -> u8 {
 struct Eval<'a> {
     ds: &'a Dataset,
     row: usize,
+    row_offset: usize,
     env: &'a Env,
     /// The steps left for the expression's `LIKE`s on this row ([`MAX_ROW_LIKE_STEPS`] in all).
     like_steps: Cell<usize>,
@@ -1748,7 +1770,7 @@ struct Eval<'a> {
 
 impl<'a> Eval<'a> {
     fn new(ds: &'a Dataset, row: usize, env: &'a Env) -> Self {
-        Eval { ds, row, env, like_steps: Cell::new(MAX_ROW_LIKE_STEPS), fault: Cell::new(None) }
+        Eval { ds, row, row_offset: 0, env, like_steps: Cell::new(MAX_ROW_LIKE_STEPS), fault: Cell::new(None) }
     }
 
     /// Null, for the error `fault`, kept when it is the row's first.
@@ -1916,18 +1938,21 @@ impl<'a> Eval<'a> {
                 }
                 Var::PageName => self.env.page.as_ref().map(|p| Value::Text(p.name.clone())).unwrap_or(Value::Null),
                 Var::PageNumber => self.env.page.as_ref().and_then(|p| i64::try_from(p.number).ok()).map(Value::Int).unwrap_or(Value::Null),
-                Var::RowNumber => i64::try_from(self.row).ok().and_then(|r| r.checked_add(1)).map(Value::Int).unwrap_or(Value::Null),
-                Var::Id => self.ds.features.get(self.row).and_then(|f| i64::try_from(f.id).ok()).map(Value::Int).unwrap_or(Value::Null),
-                Var::Measure(m, size) => self
-                    .ds
-                    .features
-                    .get(self.row)
-                    .and_then(|f| f.geometry.as_ref())
-                    .and_then(|g| g.wgs84_measure(*m))
-                    // A hole larger than its polygon measures below zero: no sensible area.
-                    .filter(|v| *v >= 0.0)
-                    .map(|v| real(v / size))
+                Var::RowNumber => i64::try_from(self.row.saturating_add(self.row_offset))
+                    .ok()
+                    .and_then(|r| r.checked_add(1))
+                    .map(Value::Int)
                     .unwrap_or(Value::Null),
+                Var::Id => self.ds.features.get(self.row).and_then(|f| i64::try_from(f.id).ok()).map(Value::Int).unwrap_or(Value::Null),
+                Var::Measure(m, size) => match self.ds.features.get(self.row).and_then(|f| f.geometry.as_ref()) {
+                    None => Value::Null,
+                    // Measured in longitude/latitude: a place that can't be converted is an error.
+                    Some(g) => match self.ds.wgs84_measure(g, *m) {
+                        Err(_) => self.fail(Fault::Unmeasurable),
+                        // A hole larger than its polygon measures below zero: no sensible area.
+                        Ok(v) => v.filter(|v| *v >= 0.0).map(|v| real(v / size)).unwrap_or(Value::Null),
+                    },
+                },
             }),
             // An operand that is missing (null without an error) makes the result null whatever
             // else failed, so an error is the result's only when no operand is missing:

@@ -17,6 +17,7 @@ pub(crate) mod external;
 pub mod fgb;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod gdal;
+pub mod geodatabase;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod geojson;
 #[cfg(not(target_arch = "wasm32"))]
@@ -34,6 +35,7 @@ pub mod pgconn;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod postgis;
 pub mod remote;
+pub mod sdefile;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod shp;
 #[cfg(not(target_arch = "wasm32"))]
@@ -350,6 +352,12 @@ pub trait FeatureSource: Send + Sync {
     fn visits_chunks(&self) -> bool {
         self.streams_chunks()
     }
+    /// Whether a complete bounded traversal for a geographic extent is available. This also
+    /// covers readers whose view and whole-export paths still use their existing sample or
+    /// whole-read contracts.
+    fn visits_extent_chunks(&self) -> bool {
+        self.visits_chunks()
+    }
     /// Visits every matching feature in source painter order: the features and ids a complete
     /// [`FeatureSource::read`] of the same extent gives, in the same order and with the same
     /// skipped count when there is no extent (an extent read through an index may order and skip
@@ -364,6 +372,14 @@ pub trait FeatureSource: Send + Sync {
         Err(DataError::Unsupported("a source that can't be read a chunk at a time".into()))
     }
     fn info(&self) -> &SourceInfo;
+    /// The coordinate system of the features it gives: a file read in place gives them as the file
+    /// holds them, in its own system (Shapefile, GeoPackage, FlatGeobuf, GeoParquet, GeoJSON); a
+    /// source that converts them (a database or service that answers in longitude/latitude) says
+    /// longitude/latitude, the default. One that wraps another says the other's. A request's
+    /// extent is in longitude/latitude whatever this is.
+    fn coord_crs(&self) -> crate::raster::Crs {
+        crate::raster::Crs::LonLat
+    }
     /// Whether features were left out of every read because the coordinate system the source
     /// declares can't place them, so that defining its projection again can't bring them back.
     fn lost_to_crs(&self) -> bool {
@@ -617,6 +633,10 @@ impl FeatureSource for Fetching {
         self.0.info()
     }
 
+    fn coord_crs(&self) -> crate::raster::Crs {
+        self.0.coord_crs()
+    }
+
     fn lost_to_crs(&self) -> bool {
         self.0.lost_to_crs()
     }
@@ -658,6 +678,8 @@ fn materialize_within(src: &dyn FeatureSource, budget: u64) -> Result<(Dataset, 
     ds.crs_incomplete = (info.format == "Shapefile" && skipped > 0) || src.lost_to_crs();
     ds.zm_dropped = info.zm_dropped;
     ds.features = features.into();
+    // Held as the source gives its features, in its own system.
+    ds.held_in = src.coord_crs();
     let rounded = rounded_dates_note(&info.fields, &rounded_dates);
     let unread_dates = unread_dates_note(&info.fields, &unread_dates);
     let mut report = ReadReport {
@@ -667,6 +689,7 @@ fn materialize_within(src: &dyn FeatureSource, budget: u64) -> Result<(Dataset, 
         unread_dates: unread_dates.clone(),
         rounded_dates: rounded.clone(),
         extrusion: None,
+        losses: Vec::new(),
     };
     let null_text = null_text_note(&info.fields, &null_text);
     report.messages.extend(unread_dates.into_iter().chain(rounded).chain(null_text).chain(notes).map(|n| format!("{}: {n}", info.name)));
@@ -869,13 +892,41 @@ impl Reproject {
         self.crs.definition_text()
     }
 
-    /// The geometry in longitude/latitude; `None` when a coordinate can't be converted.
-    pub(crate) fn geometry(&self, g: Geometry) -> Option<Geometry> {
+    /// The system the source's features are given in ([`FeatureSource::coord_crs`]): its own, as
+    /// the file holds them (longitude/latitude for one read as such).
+    pub(crate) fn crs(&self) -> Crs {
+        self.crs
+    }
+
+    /// The geometry converted to longitude/latitude; `None` when a coordinate can't be converted:
+    /// for a source that gives its features there (a database, a GeoPackage table loaded for
+    /// editing), unlike [`Reproject::read`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn to_lonlat_geometry(&self, g: Geometry) -> Option<Geometry> {
         let Some(t) = &self.t else { return Some(g) };
         let mut ok = true;
         let out = g.map_coords(&|c| t.to_lonlat(c).unwrap_or(Coord::new(f64::NAN, f64::NAN)));
         out.for_each_coord(|c| ok &= c.is_finite());
         ok.then_some(out)
+    }
+
+    /// A geometry as the file holds it, kept in the source's own coordinates
+    /// ([`Reproject::crs`]), with its box in longitude/latitude for a request's extent to test
+    /// ([`Placed::in_request`]); `None` when a coordinate can't be converted to longitude/latitude,
+    /// as a feature that can't be placed is left out. Each coordinate is converted to be checked,
+    /// none is kept converted.
+    pub(crate) fn read(&self, g: Geometry) -> Option<Placed> {
+        let Some(t) = &self.t else {
+            let lonlat = g.extent();
+            return Some(Placed { geometry: g, lonlat });
+        };
+        let mut ok = true;
+        let mut lonlat = Extent::EMPTY;
+        g.for_each_coord(|c| match t.to_lonlat(c).filter(|l| l.is_finite()) {
+            Some(l) => lonlat.expand(l),
+            None => ok = false,
+        });
+        ok.then_some(Placed { geometry: g, lonlat })
     }
 
     /// A longitude/latitude geometry in the source's coordinates.
@@ -1208,10 +1259,26 @@ pub(crate) fn clamp_limit(limit: usize) -> usize {
 }
 
 /// Whether a feature's geometry falls in a request's extent (always true without one).
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn in_request(g: &Geometry, req: &Request) -> bool {
     match &req.extent {
         Some(e) => g.extent().intersects(e),
         None => true,
+    }
+}
+
+/// A geometry a source read, in its own coordinates, and its box in longitude/latitude
+/// ([`Reproject::read`]).
+pub(crate) struct Placed {
+    pub(crate) geometry: Geometry,
+    pub(crate) lonlat: Extent,
+}
+
+impl Placed {
+    /// Whether it is within a request's extent (in longitude/latitude), as [`in_request`] asks
+    /// of a geometry there.
+    pub(crate) fn in_request(&self, req: &Request) -> bool {
+        req.extent.is_none_or(|e| self.lonlat.intersects(&e))
     }
 }
 

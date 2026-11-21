@@ -188,10 +188,11 @@ impl Engine {
                 if let Some(note) = rustgis_engine::data::zm_export_note([&ds], &format!("{name} as GeoJSON")) {
                     session.notify(note, false);
                 }
-                return Ok(rustgis_engine::data::io::to_geojson(&ds).to_string());
+                // GeoJSON is longitude/latitude, whatever system the source holds its coordinates in.
+                return Ok(rustgis_engine::data::io::to_geojson(&*ds.in_lonlat()?).to_string());
             }
             if !selected {
-                let text = rustgis_engine::data::io::to_geojson(&found.dataset).to_string();
+                let text = rustgis_engine::data::io::to_geojson(&*found.dataset.in_lonlat()?).to_string();
                 let note = rustgis_engine::data::zm_export_note([&found.dataset], &format!("{} as GeoJSON", found.name));
                 if let Some(note) = note {
                     session.notify(note, false);
@@ -200,8 +201,24 @@ impl Engine {
             }
             let mut ds = rustgis_engine::data::Dataset::new(found.name.clone(), found.geometry_type(), found.dataset.fields.clone());
             ds.zm_dropped = found.dataset.zm_dropped;
-            for f in found.selection.iter().filter_map(|r| found.dataset.features.get(*r)) {
-                ds.push(f.geometry.clone(), f.attrs.clone());
+            // Copied in longitude/latitude, the system a new dataset holds its coordinates in:
+            // exactly through WGS 84, as the whole layer's GeoJSON is, whatever map it is shown on.
+            // A layer whose system can't be converted fails only with a geometry to convert, as
+            // it did when each geometry was converted on its own.
+            let to = found.dataset.lonlat_conversion();
+            for r in found.selection.iter().filter_map(|&i| found.dataset.features.row(i)) {
+                let g = match r.geometry() {
+                    Some(g) => {
+                        let to = to.as_ref().map_err(|e| format!("{}: {e}", found.name))?;
+                        Some(
+                            rustgis_engine::data::Dataset::geometry_to_lonlat_by(to, g)
+                                .map_err(|e| format!("{}: feature {}: {e}", found.name, r.id()))?
+                                .into_owned(),
+                        )
+                    }
+                    None => None,
+                };
+                ds.push(g, r.values().cloned().collect());
             }
             let text = rustgis_engine::data::io::to_geojson(&ds).to_string();
             if let Some(note) = rustgis_engine::data::zm_export_note([&ds], &format!("{} as GeoJSON", ds.name)) {

@@ -11,8 +11,10 @@
 //! fails here until the case is moved to [`Expect::Said`], so the list only shrinks. Exports have
 //! their own test, `never_silent_roundtrip.rs`.
 //!
-//! The table includes text, CityJSON, CityGML, KMZ and GeoPackage. More binary formats and
-//! loss kinds remain to add (ROADMAP.md); coverage of one loss is not certification of a reader.
+//! The table includes text, CityJSON, CityGML, KMZ, GeoPackage, FlatGeobuf, GeoParquet, FileGDB,
+//! Shapefile, XLSX, ODS, XLS, XLSB and OSM PBF. More formats and loss kinds remain to add (ROADMAP.md); one loss
+//! does not certify a reader.
+use rustgis_engine::data::loss::LossCode;
 use rustgis_engine::{Project, Session};
 use serde_json::json;
 
@@ -21,10 +23,14 @@ use serde_json::json;
 enum Expect {
     /// Says the loss: a notice the clean file doesn't give, or a refusal, holding these words.
     Said(&'static str),
+    /// Imports the layer and says the loss in a notice; refusing this valid fixture is a failure.
+    Imported(&'static str),
+    /// Imports successfully and identifies the loss with a code.
+    Classified(LossCode),
     /// Loses it without a notice today, still adding a layer: what is lost.
     Silent(&'static str),
 }
-use Expect::{Said, Silent};
+use Expect::{Imported, Said, Silent};
 
 /// A clean file and the same file with a loss in it.
 struct Case {
@@ -34,13 +40,13 @@ struct Case {
     file: &'static str,
     clean: Vec<u8>,
     lossy: Vec<u8>,
-    /// Files beside it, the same in both (a MapInfo `.mid`).
-    beside: Vec<(&'static str, String)>,
+    /// Files beside the clean and lossy inputs (binary indexes can differ).
+    beside: [Vec<(&'static str, Vec<u8>)>; 2],
     expect: Expect,
 }
 
 fn case(name: &'static str, file: &'static str, clean: impl AsRef<[u8]>, lossy: impl AsRef<[u8]>, expect: Expect) -> Case {
-    Case { name, file, clean: clean.as_ref().to_vec(), lossy: lossy.as_ref().to_vec(), beside: Vec::new(), expect }
+    Case { name, file, clean: clean.as_ref().to_vec(), lossy: lossy.as_ref().to_vec(), beside: [Vec::new(), Vec::new()], expect }
 }
 
 /// A GeoJSON feature collection of these geometries.
@@ -94,6 +100,7 @@ fn landxml(content: &str) -> String {
     format!(r#"<?xml version="1.0"?><LandXML xmlns="http://www.landxml.org/schema/LandXML-1.2" version="1.2">{content}</LandXML>"#)
 }
 
+/// Builds paired inputs, keeping sidecars specific to each input when their binary layout differs.
 fn cases(fixture_dir: &std::path::Path) -> Vec<Case> {
     let point = r#"{"type":"Point","coordinates":[1,2]}"#;
     let topo_line = |arcs: &str| format!(r#"{{"type":"Topology","objects":{{"o":{{"type":"LineString","arcs":[0]}}}},"arcs":[{arcs}]}}"#);
@@ -251,6 +258,35 @@ fn cases(fixture_dir: &std::path::Path) -> Vec<Case> {
             gpx(r#"<trk><trkseg><trkpt lat="1" lon="1"/><trkpt lat="2" lon="2"/></trkseg><trkseg><trkpt lat="3" lon="3"/></trkseg></trk>"#),
             Silent("the segment is left out of the track's line"),
         ),
+        // OSM PBF: keep the outer polygon while one inner member is lost.
+        case(
+            "OSM PBF: a missing inner member way",
+            "a.osm.pbf",
+            include_bytes!("../testdata/reading-losses/hole-clean.osm.pbf"),
+            include_bytes!("../testdata/reading-losses/hole-missing-member.osm.pbf"),
+            Silent("the hole whose member way the file does not hold is left out"),
+        ),
+        case(
+            "OSM PBF: a missing inner node",
+            "a.osm.pbf",
+            include_bytes!("../testdata/reading-losses/hole-clean.osm.pbf"),
+            include_bytes!("../testdata/reading-losses/hole-missing-node.osm.pbf"),
+            Silent("the hole whose member way refers to a missing node is left out"),
+        ),
+        case(
+            "OSM PBF: an unclosed inner ring",
+            "a.osm.pbf",
+            include_bytes!("../testdata/reading-losses/hole-clean.osm.pbf"),
+            include_bytes!("../testdata/reading-losses/hole-unclosed.osm.pbf"),
+            Silent("the inner member way that does not close is left out"),
+        ),
+        case(
+            "OSM PBF: an inner ring outside its outer",
+            "a.osm.pbf",
+            include_bytes!("../testdata/reading-losses/hole-clean.osm.pbf"),
+            include_bytes!("../testdata/reading-losses/hole-outside.osm.pbf"),
+            Silent("the inner ring outside every outer ring is left out"),
+        ),
         // GML.
         case(
             "GML: a height",
@@ -274,7 +310,7 @@ fn cases(fixture_dir: &std::path::Path) -> Vec<Case> {
             "a.rss",
             georss(&[&georss_polygon("1 1 1 2 2 2 1 1")]),
             georss(&[&georss_polygon("1 x")]),
-            Said("hole in a polygon was unreadable"),
+            Expect::Classified(LossCode::DroppedRing),
         ),
         case(
             "GeoRSS: a point with more than one pair",
@@ -322,10 +358,91 @@ fn cases(fixture_dir: &std::path::Path) -> Vec<Case> {
         ),
     ];
 
+    out.extend([
+        case(
+            "XLSX: a height in WKT",
+            "a.xlsx",
+            include_bytes!("../testdata/reading-losses/book-clean.xlsx"),
+            include_bytes!("../testdata/reading-losses/book-z.xlsx"),
+            Imported("Z or M"),
+        ),
+        case(
+            "XLSX: a WKT geometry collection's later members",
+            "a.xlsx",
+            include_bytes!("../testdata/reading-losses/book-clean.xlsx"),
+            include_bytes!("../testdata/reading-losses/book-collection.xlsx"),
+            Silent("only the collection's first member is kept"),
+        ),
+        case(
+            "XLSX: an error-valued attribute cell",
+            "a.xlsx",
+            include_bytes!("../testdata/reading-losses/book-clean.xlsx"),
+            include_bytes!("../testdata/reading-losses/book-error.xlsx"),
+            Silent("the error-valued note cell is read as Null"),
+        ),
+    ]);
+
+    out.extend([
+        case(
+            "ODS: a height in WKT",
+            "a.ods",
+            include_bytes!("../testdata/reading-losses/book-clean.ods"),
+            include_bytes!("../testdata/reading-losses/book-z.ods"),
+            Imported("Z or M"),
+        ),
+        case(
+            "ODS: a WKT geometry collection's later members",
+            "a.ods",
+            include_bytes!("../testdata/reading-losses/book-clean.ods"),
+            include_bytes!("../testdata/reading-losses/book-collection.ods"),
+            Silent("only the collection's first member is kept"),
+        ),
+    ]);
+
+    out.extend([
+        case(
+            "XLS: a height in WKT",
+            "a.xls",
+            include_bytes!("../testdata/reading-losses/book-clean.xls"),
+            include_bytes!("../testdata/reading-losses/book-z.xls"),
+            Imported("Z or M"),
+        ),
+        case(
+            "XLS: a WKT geometry collection's later members",
+            "a.xls",
+            include_bytes!("../testdata/reading-losses/book-clean.xls"),
+            include_bytes!("../testdata/reading-losses/book-collection.xls"),
+            Silent("only the collection's first member is kept"),
+        ),
+        case(
+            "XLSB: a height in WKT",
+            "a.xlsb",
+            include_bytes!("../testdata/reading-losses/book-clean.xlsb"),
+            include_bytes!("../testdata/reading-losses/book-z.xlsb"),
+            Imported("Z or M"),
+        ),
+        case(
+            "XLSB: short cell records lose attribute fields and values",
+            "a.xlsb",
+            include_bytes!("../testdata/reading-losses/book-clean.xlsb"),
+            include_bytes!("../testdata/reading-losses/book-short.xlsb"),
+            Silent("the point remains but all attribute fields and values are lost"),
+        ),
+        case(
+            "XLSB: a WKT geometry collection's later members",
+            "a.xlsb",
+            include_bytes!("../testdata/reading-losses/book-clean.xlsb"),
+            include_bytes!("../testdata/reading-losses/book-collection.xlsb"),
+            Silent("only the collection's first member is kept"),
+        ),
+    ]);
+
     // MapInfo: the .mid beside each .mif holds one row per object.
     let mut mapinfo = |name, clean: &str, lossy: &str, mid: &str, expect| {
         let mut c = case(name, "a.mif", mif(clean), mif(lossy), expect);
-        c.beside.push(("a.mid", mid.to_string()));
+        for beside in &mut c.beside {
+            beside.push(("a.mid", mid.as_bytes().to_vec()));
+        }
         out.push(c);
     };
     mapinfo("MapInfo: an unreadable object", "Point 0 0\nPoint 1 1\n", "Point 0 0\nPoint 1 x\n", "1\n2\n", Said("couldn't be read"));
@@ -354,7 +471,7 @@ fn cases(fixture_dir: &std::path::Path) -> Vec<Case> {
             file: "a.kmz",
             clean: rustgis_engine::data::zip::write(&[("doc.kml".into(), c.clean.clone())]).unwrap(),
             lossy: rustgis_engine::data::zip::write(&[("doc.kml".into(), c.lossy.clone())]).unwrap(),
-            beside: Vec::new(),
+            beside: [Vec::new(), Vec::new()],
             expect: c.expect,
         })
         .collect::<Vec<_>>();
@@ -363,7 +480,70 @@ fn cases(fixture_dir: &std::path::Path) -> Vec<Case> {
         case("CityJSON: varying line heights", "a.city.json", cityjson(0), cityjson(5), Said("Z or M")),
         case("CityGML: varying line heights", "a.gml", citygml(0), citygml(5), Said("Z or M")),
         case("GeoPackage: a height", "a.gpkg", gpkg(fixture_dir, false), gpkg(fixture_dir, true), Said("Z or M")),
+        case(
+            "FlatGeobuf: a height",
+            "a.fgb",
+            include_bytes!("../testdata/reading-losses/xy.fgb"),
+            include_bytes!("../testdata/reading-losses/xyz.fgb"),
+            Imported("Z or M"),
+        ),
+        case(
+            "GeoParquet: a height",
+            "a.parquet",
+            include_bytes!("../testdata/reading-losses/xy.parquet"),
+            include_bytes!("../testdata/reading-losses/xyz.parquet"),
+            Imported("Z or M"),
+        ),
+        case(
+            "FileGDB: a height",
+            "a.gdb",
+            include_bytes!("../testdata/reading-losses/xy.gdb.zip"),
+            include_bytes!("../testdata/reading-losses/xyz.gdb.zip"),
+            Imported("Z or M"),
+        ),
     ]);
+    // Independently encoded shapes: scalar Z, scalar M, and arrays with/without optional M.
+    for (name, clean, lossy, clean_index, lossy_index) in [
+        (
+            "Shapefile: a point height",
+            include_bytes!("../testdata/reading-losses/shp-point-xy.shp").as_slice(),
+            include_bytes!("../testdata/reading-losses/shp-point-z.shp").as_slice(),
+            include_bytes!("../testdata/reading-losses/shp-point-xy.shx"),
+            include_bytes!("../testdata/reading-losses/shp-point-z.shx"),
+        ),
+        (
+            "Shapefile: a point measure",
+            include_bytes!("../testdata/reading-losses/shp-point-xy.shp").as_slice(),
+            include_bytes!("../testdata/reading-losses/shp-point-m.shp").as_slice(),
+            include_bytes!("../testdata/reading-losses/shp-point-xy.shx"),
+            include_bytes!("../testdata/reading-losses/shp-point-m.shx"),
+        ),
+        (
+            "Shapefile: line heights without measures",
+            include_bytes!("../testdata/reading-losses/shp-line-xy.shp").as_slice(),
+            include_bytes!("../testdata/reading-losses/shp-line-z.shp").as_slice(),
+            include_bytes!("../testdata/reading-losses/shp-line-xy.shx"),
+            include_bytes!("../testdata/reading-losses/shp-line-z.shx"),
+        ),
+        (
+            "Shapefile: line heights and measures",
+            include_bytes!("../testdata/reading-losses/shp-line-xy.shp").as_slice(),
+            include_bytes!("../testdata/reading-losses/shp-line-zm.shp").as_slice(),
+            include_bytes!("../testdata/reading-losses/shp-line-xy.shx"),
+            include_bytes!("../testdata/reading-losses/shp-line-zm.shx"),
+        ),
+    ] {
+        let mut c = case(name, "a.shp", clean, lossy, Imported("Z or M"));
+        for (beside, index) in c.beside.iter_mut().zip([clean_index, lossy_index]) {
+            beside.extend([
+                ("a.shx", index.to_vec()),
+                ("a.dbf", include_bytes!("../testdata/reading-losses/shp-row.dbf").to_vec()),
+                ("a.cpg", b"UTF-8\n".to_vec()),
+                ("a.prj", br#"GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]]"#.to_vec()),
+            ]);
+        }
+        out.push(c);
+    }
     out
 }
 
@@ -423,21 +603,109 @@ fn gpkg(dir: &std::path::Path, z: bool) -> Vec<u8> {
     std::fs::read(path).unwrap()
 }
 
+/// Both Shapefile inputs must retain the one attribute row and every XY vertex, through
+/// the native reader and the command. A notice over an empty or partial import isn't enough.
+fn check_shapefile_xy(ds: &rustgis_engine::data::Dataset, shape_type: Option<u8>) -> std::io::Result<()> {
+    use rustgis_engine::data::{Geometry, Value};
+    use rustgis_engine::geom::Coord;
+    let expected = match shape_type {
+        Some(1 | 11 | 21) => Geometry::Point(Coord::new(1.0, 2.0)),
+        Some(3 | 13) => Geometry::Line(vec![vec![Coord::new(1.0, 2.0), Coord::new(3.0, 4.0)]]),
+        _ => return Err(std::io::Error::other("Shapefile fixture has the wrong geometry type")),
+    };
+    if ds.features.len() != 1 || ds.features[0].geometry.as_ref() != Some(&expected) || ds.features[0].attrs != vec![Value::Int(1)] {
+        return Err(std::io::Error::other("Shapefile fixture didn't retain its XY geometry and ID"));
+    }
+    Ok(())
+}
+
+/// Workbooks retain the point and two attributes except the pinned XLSB short-cell loss,
+/// which retains the point but drops every attribute field and value.
+fn check_workbook(ds: &rustgis_engine::data::Dataset, short_cells: bool) -> std::io::Result<()> {
+    use rustgis_engine::data::{Field, FieldType, Geometry, Value};
+    use rustgis_engine::geom::Coord;
+    let fields = if short_cells { vec![] } else { vec![Field::new("id", FieldType::Integer), Field::new("note", FieldType::Text)] };
+    let attrs = if short_cells { vec![] } else { vec![Value::Int(7), Value::Null] };
+    if ds.fields != fields
+        || ds.features.len() != 1
+        || ds.features[0].geometry != Some(Geometry::Point(Coord::new(1.0, 2.0)))
+        || ds.features[0].attrs != attrs
+    {
+        return Err(std::io::Error::other(format!(
+            "spreadsheet fixture has unexpected retained data: fields={:?}, features={:?}",
+            ds.fields, ds.features
+        )));
+    }
+    Ok(())
+}
+
 /// What `layer.addData` did with a file: the notices it gave and whether it added a layer or table,
 /// or why it refused the file.
-type Reading = Result<(Vec<String>, bool), String>;
+type SaidNotices = Vec<(String, Option<LossCode>)>;
+type Reading = Result<(SaidNotices, bool), String>;
 
 /// Writes `file` with `content`, and `beside`, into `dir` (emptied first) and reads it. `Err` when
-/// the files can't be written: a failure of the test, never taken for a refusal. Each file of a
+/// the fixture can't be prepared: a failure of the test, never taken for a refusal. Each file of a
 /// case is read from the same `dir`, so notices naming its path are the same for both.
-fn read(dir: &std::path::Path, file: &str, content: &[u8], beside: &[(&str, String)]) -> std::io::Result<Reading> {
+/// A `.gdb` fixture is stored as a ZIP of its table files, extracted and checked with the native
+/// reader before the command opens it, so an optional GDAL fallback cannot mask a regression.
+fn read(dir: &std::path::Path, file: &str, content: &[u8], beside: &[(&str, Vec<u8>)]) -> std::io::Result<Reading> {
     let _ = std::fs::remove_dir_all(dir);
     std::fs::create_dir_all(dir)?;
-    for (name, text) in beside {
-        std::fs::write(dir.join(name), text)?;
+    for (name, bytes) in beside {
+        std::fs::write(dir.join(name), bytes)?;
     }
     let path = dir.join(file);
-    std::fs::write(&path, content)?;
+    let short_cells = content == include_bytes!("../testdata/reading-losses/book-short.xlsb");
+    if file.ends_with(".gdb") {
+        // The archive is fixture storage only: RustGIS opens the extracted folder. Its ZIP
+        // importer deliberately refuses FileGDB folders, so do not test that refusal as a loss.
+        std::fs::create_dir_all(&path)?;
+        for (name, bytes) in rustgis_engine::data::zip::read(content).map_err(std::io::Error::other)? {
+            if std::path::Path::new(&name).components().count() != 1
+                || !matches!(std::path::Path::new(&name).components().next(), Some(std::path::Component::Normal(_)))
+            {
+                return Err(std::io::Error::other("a FileGDB fixture member isn't a plain file name"));
+            }
+            std::fs::write(path.join(name), bytes)?;
+        }
+        // GDAL can supply the same loss notice if the native reader fails. Treat a native
+        // failure as fixture preparation failure, never as an acceptable import refusal.
+        let native = rustgis_engine::data::filegdb::read_dir(&path, None)
+            .map_err(|e| std::io::Error::other(format!("native FileGDB fixture: {e}")))?;
+        if native.layers.len() != 1 || !native.unread.is_empty() {
+            return Err(std::io::Error::other(format!("native FileGDB fixture wasn't read completely: {:?}", native.unread)));
+        }
+    } else {
+        std::fs::write(&path, content)?;
+    }
+    if file.ends_with(".shp") {
+        let (native, report) =
+            rustgis_engine::data::io::read_path(&path).map_err(|e| std::io::Error::other(format!("native Shapefile fixture: {e}")))?;
+        check_shapefile_xy(&native, content.get(32).copied())?;
+        let zm = matches!(content.get(32), Some(11 | 13 | 21));
+        if native.zm_dropped != zm || report.messages.iter().any(|m| m.contains("Z or M")) != zm {
+            return Err(std::io::Error::other(format!("native Shapefile fixture has the wrong loss report: {report:?}")));
+        }
+        if report.skipped != 0 {
+            return Err(std::io::Error::other("native Shapefile fixture skipped a record"));
+        }
+    }
+    if rustgis_engine::data::sheets::is_sheet_name(file) {
+        let (native, report) = rustgis_engine::data::sheets::read(content, "a", None, &Default::default())
+            .map_err(|e| std::io::Error::other(format!("native spreadsheet fixture: {e}")))?;
+        check_workbook(&native, short_cells)?;
+        let height = content == include_bytes!("../testdata/reading-losses/book-z.xlsx")
+            || content == include_bytes!("../testdata/reading-losses/book-z.ods")
+            || content == include_bytes!("../testdata/reading-losses/book-z.xls")
+            || content == include_bytes!("../testdata/reading-losses/book-z.xlsb");
+        if report.skipped != 0
+            || native.zm_dropped != height
+            || if height { report.messages.len() != 1 || !report.messages[0].contains("Z or M") } else { !report.messages.is_empty() }
+        {
+            return Err(std::io::Error::other(format!("native spreadsheet fixture has the wrong loss report: {report:?}")));
+        }
+    }
     let mut s = Session::new(Project::default());
     // Layers and standalone tables (what a file without geometry adds).
     let held = |s: &Session| s.map().layers.len() + s.project.tables.len();
@@ -446,7 +714,27 @@ fn read(dir: &std::path::Path, file: &str, content: &[u8], beside: &[(&str, Stri
     if let Err(e) = s.run("layer.addData", &json!({"path": path})) {
         return Ok(Err(e));
     }
-    let said = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+    if file.ends_with(".shp") {
+        if s.map().layers.len() != 1 {
+            return Err(std::io::Error::other("Shapefile fixture didn't add exactly one layer"));
+        }
+        check_shapefile_xy(&s.map().layers[0].dataset, content.get(32).copied())?;
+    }
+    if rustgis_engine::data::sheets::is_sheet_name(file) {
+        if s.map().layers.len() != 1 || !s.project.tables.is_empty() {
+            return Err(std::io::Error::other("spreadsheet fixture didn't add exactly one layer"));
+        }
+        check_workbook(&s.map().layers[0].dataset, short_cells)?;
+        if (content == include_bytes!("../testdata/reading-losses/book-clean.xlsx")
+            || content == include_bytes!("../testdata/reading-losses/book-clean.ods")
+            || content == include_bytes!("../testdata/reading-losses/book-clean.xls")
+            || content == include_bytes!("../testdata/reading-losses/book-clean.xlsb"))
+            && !s.notices_since(mark).is_empty()
+        {
+            return Err(std::io::Error::other("clean spreadsheet fixture gave a notice"));
+        }
+    }
+    let said = s.notices_since(mark).iter().map(|n| (n.text.clone(), n.loss())).collect();
     Ok(Ok((said, held(&s) > before)))
 }
 
@@ -457,7 +745,7 @@ fn a_reading_that_loses_something_says_so() {
     let mut failures = Vec::new();
     for c in cases(&root.join("fixtures")) {
         let name = format!("{} [{}]", c.name, c.file);
-        let clean = match read(&dir, c.file, &c.clean, &c.beside) {
+        let clean = match read(&dir, c.file, &c.clean, &c.beside[0]) {
             Err(e) => {
                 failures.push(format!("{name}: the clean file couldn't be written: {e}"));
                 continue;
@@ -473,7 +761,7 @@ fn a_reading_that_loses_something_says_so() {
             Ok(Ok((said, true))) => said,
         };
         // What the lossy file says that the clean one doesn't, and whether it added a layer.
-        let (new, added): (Vec<String>, bool) = match read(&dir, c.file, &c.lossy, &c.beside) {
+        let (new, added): (SaidNotices, bool) = match read(&dir, c.file, &c.lossy, &c.beside[1]) {
             Err(e) => {
                 failures.push(format!("{name}: the lossy file couldn't be written: {e}"));
                 continue;
@@ -483,15 +771,27 @@ fn a_reading_that_loses_something_says_so() {
                 failures.push(format!("{name}: reading crashed: {e}"));
                 continue;
             }
-            Ok(Err(e)) => (vec![e], false),
+            Ok(Err(e)) => (vec![(e, None)], false),
             Ok(Ok((said, added))) => (said.into_iter().filter(|n| !clean.contains(n)).collect(), added),
         };
+        if let Expect::Classified(code) = c.expect {
+            if !added
+                || new.iter().filter(|(_, loss)| *loss == Some(code)).count() != 1
+                || clean.iter().any(|(_, loss)| *loss == Some(code))
+            {
+                failures.push(format!("{name}: expected one {code:?} only for the lossy import; clean: {clean:?}, new: {new:?}"));
+            }
+            continue;
+        }
         match c.expect {
             // Both ways (AGENTS.md, Never silent): the clean file doesn't say the loss.
-            Said(words) if clean.iter().any(|n| n.contains(words)) => {
+            Said(words) | Imported(words) if clean.iter().any(|(text, _)| text.contains(words)) => {
                 failures.push(format!("{name}: the clean file says the loss it doesn't have ({words:?}): {clean:?}"))
             }
-            Said(words) if !new.iter().any(|n| n.contains(words)) => {
+            Imported(_) if !added => {
+                failures.push(format!("{name}: the valid lossy fixture was refused instead of imported: {new:?}"))
+            }
+            Said(words) | Imported(words) if !new.iter().any(|(text, _)| text.contains(words)) => {
                 failures.push(format!("{name}: not said: nothing new holds {words:?}; new: {new:?}; the clean file said {clean:?}"))
             }
             Silent(lost) if !new.is_empty() => failures.push(format!(

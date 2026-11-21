@@ -1068,8 +1068,10 @@
       "items": {
         "enum": [
           "terrain-block",
+          "terrain-block-shape",
           "terrain-water",
           "terrain-water-shore",
+          "terrain-block-water",
           "shaded-relief-effects",
           "normalized-legend-urls",
           "field-origin",
@@ -1082,8 +1084,16 @@
           "classified-point-size",
           "picture-markers",
           "layout-element-ink",
+          "layout-element-wrap",
+          "layout-chart-data",
+          "layout-chart-look",
+          "layout-chart-classes",
           "field-generation",
-          "crs-wkt"
+          "offline-map-area-id",
+          "crs-wkt",
+          "zarr-window",
+          "blank-paper",
+          "layout-frame-border"
         ],
         "type": "string"
       },
@@ -1149,8 +1159,10 @@
   "type": "object",
   "x-rustgis-capabilities": [
     "terrain-block",
+    "terrain-block-shape",
     "terrain-water",
     "terrain-water-shore",
+    "terrain-block-water",
     "shaded-relief-effects",
     "normalized-legend-urls",
     "field-origin",
@@ -1163,8 +1175,16 @@
     "classified-point-size",
     "picture-markers",
     "layout-element-ink",
+    "layout-element-wrap",
+    "layout-chart-data",
+    "layout-chart-look",
+    "layout-chart-classes",
     "field-generation",
-    "crs-wkt"
+    "offline-map-area-id",
+    "crs-wkt",
+    "zarr-window",
+    "blank-paper",
+    "layout-frame-border"
   ],
   "x-rustgis-reads-format": 2,
   "x-rustgis-writes-format": 2

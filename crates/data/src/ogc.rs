@@ -1255,7 +1255,7 @@ fn wms_candidates(crs: &[String]) -> Vec<Candidate> {
 /// candidates (see [`wms_candidates`]), and the one a Web Mercator map takes its pictures in: Web
 /// Mercator itself (`mercator`), else the first. `None` for a layer offered in Web Mercator
 /// alone (its address stays as it was) or in nothing usable. In WMS 1.3.0 a bounding box follows
-/// the system's axes as EPSG defines them ([`crate::raster::epsg_axes`]); for a system whose
+/// the system's axes as EPSG defines them ([`crate::raster::crs::epsg_north_first`]); for a system whose
 /// order RustGIS doesn't know, as the layer's own `BoundingBox` in it is written (else latitude
 /// first in a geographic system other than CRS:84).
 fn wms_native<'a, 'i>(
@@ -1325,11 +1325,11 @@ fn wms_native<'a, 'i>(
 type LayerBoxes<'a, 'i> = std::collections::HashMap<roxmltree::NodeId, std::collections::HashMap<u32, Node<'a, 'i>>>;
 
 /// Whether `system` is written north (or latitude) first as EPSG defines its axes, when
-/// RustGIS's table knows it ([`crate::raster::epsg_axes`]).
+/// it is known ([`crate::raster::crs::epsg_north_first`]).
 fn epsg_north_first(system: crate::raster::Crs) -> Option<bool> {
     match system {
         crate::raster::Crs::Custom(_) => None,
-        s => crate::raster::epsg_axes::north_first(s.epsg()),
+        s => crate::raster::crs::epsg_north_first(s.epsg()),
     }
 }
 
@@ -3098,8 +3098,9 @@ pub const PAGED_FEATURES_CEILING: usize = 1_000_000;
 /// Most features read from a collection that comes in pages: on the desktop, as many as a quarter
 /// of the computer's memory holds at 20 KB each (about 100,000 for every 8 GB, the pages read
 /// included), from [`PAGED_FEATURES_FLOOR`] up to [`PAGED_FEATURES_CEILING`] (#1318).
+/// Less once RustGIS holds more than half the memory, never below the floor ([`crate::memory::planned`], #2431).
 pub fn max_paged_features() -> usize {
-    crate::memory::scaled(crate::memory::physical(), PAGED_FEATURES_FLOOR, PAGED_FEATURES_CEILING, 20 << 10)
+    crate::memory::planned(PAGED_FEATURES_FLOOR, PAGED_FEATURES_CEILING, 20 << 10)
 }
 
 /// The most bytes of why a layer's protocol buffer pages couldn't be read that its note says.
@@ -3123,8 +3124,9 @@ pub const DECODED_CEILING: usize = 3 << 30;
 /// Most memory, in bytes, an ArcGIS layer's protocol buffer pages may take once read: on the
 /// desktop a quarter of the computer's memory, from [`DECODED_FLOOR`] up to [`DECODED_CEILING`].
 /// The download budget doesn't bound it: a vertex takes 1 to 3 bytes in a page and 16 read.
+/// Less once RustGIS holds more than half the memory, never below the floor ([`crate::memory::planned`], #2431).
 pub fn max_decoded_bytes() -> usize {
-    crate::memory::scaled(crate::memory::physical(), DECODED_FLOOR, DECODED_CEILING, 1)
+    crate::memory::planned(DECODED_FLOOR, DECODED_CEILING, 1)
 }
 
 /// A feature collection page's JSON `next` link, resolved against the page's address.

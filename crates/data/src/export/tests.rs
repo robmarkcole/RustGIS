@@ -51,6 +51,8 @@ struct Runs {
     chunks: bool,
     /// Rows it reports as unreadable, as a GeoPackage's bad rows are.
     unreadable: usize,
+    /// The system it gives its features in.
+    held: Crs,
 }
 
 impl Runs {
@@ -77,6 +79,7 @@ impl Runs {
             passes: Default::default(),
             chunks: true,
             unreadable: 0,
+            held: Crs::LonLat,
         }
     }
 }
@@ -84,6 +87,9 @@ impl Runs {
 impl FeatureSource for Runs {
     fn info(&self) -> &SourceInfo {
         &self.info
+    }
+    fn coord_crs(&self) -> Crs {
+        self.held
     }
     fn read(&self, _: &Request) -> Result<Batch> {
         Ok(Batch {
@@ -133,6 +139,20 @@ fn an_explicit_export_format_ignores_case_and_the_filename() {
     std::fs::remove_dir_all(d).unwrap();
 }
 
+#[test]
+fn a_streamed_csv_counts_guarded_values_across_chunks() {
+    let d = folder("csv-guarded");
+    let mut ds = Dataset::new("places", GeometryType::None, vec![Field::new("value", FieldType::Text)]);
+    for value in ["-007", "-093.1445780", "=SUM(A1)"] {
+        ds.push_next(None, vec![Value::Text(value.into())]);
+    }
+    let path = d.join("places.csv");
+    let exported = write_chunks_in(&Runs::new(&ds, 1), &ds, &path, Crs::LonLat, 1).unwrap();
+    assert_eq!(exported.csv.guarded, [2]);
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "value\n'-007\n-093.1445780\n'=SUM(A1)\n");
+    std::fs::remove_dir_all(d).unwrap();
+}
+
 /// An export in Web Mercator written a chunk at a time counts the vertices beyond 85.05° it
 /// writes at 85.05°, as it writes them: from a source that declares no extent, whose features
 /// beyond aren't in its first chunk. In longitude/latitude, or within 85.05°, it counts none.
@@ -153,7 +173,8 @@ fn a_streamed_web_mercator_export_counts_what_it_writes_at_85_degrees() {
             assert_eq!(e.beyond_web_mercator, n, ".{ext} in {}", crs.label());
             // As many as the file holds at 85.05°.
             let mut at_edge = 0;
-            for g in read_back(&path).features.iter().filter_map(|f| f.geometry.as_ref()) {
+            let back = read_back(&path);
+            for g in back.in_lonlat().unwrap().features.iter().filter_map(|f| f.geometry.as_ref()) {
                 g.for_each_coord(|c| at_edge += usize::from((c.y.abs() - rustgis_geom::MAX_LAT).abs() < 1e-6));
             }
             assert_eq!(at_edge, n, ".{ext} in {}", crs.label());
@@ -199,12 +220,17 @@ fn a_streamed_export_writes_what_a_whole_export_writes() {
                 let expected = Exported {
                     written: whole.features.len() - left_out,
                     left_out,
+                    query: Default::default(),
                     skipped: 0,
                     null_numbers: 0,
                     unfit,
                     beyond_web_mercator: 0,
                     // Counted over the chunks as the whole layer counts it.
-                    csv: if ext == "csv" { crate::io::CsvLosses::of(&whole.features, whole.geometry_type) } else { Default::default() },
+                    csv: if ext == "csv" {
+                        crate::io::CsvLosses::of(&whole.features, whole.geometry_type, &whole.fields).unwrap()
+                    } else {
+                        Default::default()
+                    },
                     unread_dates: Vec::new(),
                     rounded_dates: Vec::new(),
                     null_text: Vec::new(),
@@ -222,6 +248,24 @@ fn a_streamed_export_writes_what_a_whole_export_writes() {
             }
         }
     }
+}
+
+/// Row positions span chunks, even when an entire chunk is filtered out.
+#[test]
+fn streamed_export_counts_query_omissions_across_chunks() {
+    let d = folder("query");
+    let ds = squares();
+    let src = Runs::new(&ds, 3);
+    let layer = Dataset::new(ds.name.clone(), ds.geometry_type, ds.fields.clone());
+    let query = Query::compile(Some("@row_number BETWEEN 5 AND 7"), &layer).unwrap();
+    let path = d.join("export.geojson");
+    let (exported, _) = write_chunks_to(&src, &layer, &path, Crs::LonLat, &GpkgTable::default(), CHUNK_BYTES, Some(&query)).unwrap();
+    assert_eq!((exported.written, exported.query.filtered, exported.left_out), (3, ds.features.len() - 3, 0));
+    let written = read_back(&path);
+    let count_field = written.field_index("count").unwrap();
+    let counts = (0..written.features.len()).map(|row| written.value(row, count_field).clone()).collect::<Vec<_>>();
+    assert_eq!(counts, [Value::Int(4), Value::Int(5), Value::Int(6)]);
+    std::fs::remove_dir_all(d).unwrap();
 }
 
 /// Every chunk contributes to the loss count; a finite export remains quiet.
@@ -416,7 +460,7 @@ fn a_streamed_export_into_an_existing_geopackage_starts_again_inside_its_transac
     let layer = Dataset::new("both", GeometryType::Point, fields);
     let add = GpkgTable { mode: crate::io::GpkgMode::AddTable, name: None };
     let src = Runs::new(&both, 4);
-    let (e, table) = write_chunks_to(&src, &layer, &county, Crs::LonLat, &add, 1).unwrap();
+    let (e, table) = write_chunks_to(&src, &layer, &county, Crs::LonLat, &add, 1, None).unwrap();
     assert_eq!(src.passes.load(std::sync::atomic::Ordering::Relaxed), 3, "written three times");
     assert_eq!((e.written, table), (20, Some(GpkgWritten { table: "both".into(), replaced: false, dependents: vec![] })));
     let whole = d.join("whole.gpkg");
@@ -436,7 +480,7 @@ fn a_streamed_export_into_an_existing_geopackage_starts_again_inside_its_transac
     layer2.name = "again".into();
     let mut failing = Runs::new(&both, 4);
     (failing.fail_after, failing.fail_pass) = (Some(2), Some(1));
-    assert!(write_chunks_to(&failing, &layer2, &county, Crs::LonLat, &add, 1).is_err());
+    assert!(write_chunks_to(&failing, &layer2, &county, Crs::LonLat, &add, 1, None).is_err());
     assert_eq!(std::fs::read(&county).unwrap(), before);
 }
 
@@ -603,7 +647,7 @@ fn a_mixed_layer_added_to_a_geopackage_keeps_every_kind() {
         let path = d.join(format!("county-{i}.gpkg"));
         crate::io::write_path(&other, &path).unwrap();
         if streamed {
-            let (e, _) = write_chunks_to(&Runs::new(&mixed, 4), &layer, &path, Crs::LonLat, &add, 1).unwrap();
+            let (e, _) = write_chunks_to(&Runs::new(&mixed, 4), &layer, &path, Crs::LonLat, &add, 1, None).unwrap();
             assert_eq!((e.left_out, e.written), (0, 301));
         } else {
             assert_eq!(crate::io::write_path_to(&mixed, &path, Crs::LonLat, &add).unwrap().0, 0);
@@ -616,5 +660,35 @@ fn a_mixed_layer_added_to_a_geopackage_keeps_every_kind() {
         assert_eq!((kind("mixed"), kind("other")), ("GEOMETRY".to_string(), "MULTIPOLYGON".to_string()));
         let rows: i64 = c.query_row("SELECT count(*) FROM mixed WHERE geom IS NOT NULL", [], |r| r.get(0)).unwrap();
         assert_eq!(rows, 300);
+    }
+}
+
+/// A source that gives its features in its own system (UTM 32N here; every source gives
+/// longitude/latitude until #2032 C2) is exported a chunk at a time from it: a GeoJSON in
+/// longitude/latitude, a GeoPackage in its own system and one in Web Mercator, which counts places
+/// past where Web Mercator ends by their latitude (a square's 5 vertices at 86° N), not by the
+/// source's northings.
+#[test]
+fn a_streamed_export_is_written_from_the_system_its_source_gives() {
+    let d = folder("held");
+    let mut lonlat = squares();
+    let ring = vec![Coord::new(9.0, 86.0), Coord::new(9.5, 86.0), Coord::new(9.5, 86.5), Coord::new(9.0, 86.5), Coord::new(9.0, 86.0)];
+    lonlat.push_next(Some(Geometry::Polygon(vec![vec![ring]])), vec![Value::Null, Value::Int(-2), Value::Null, Value::Null]);
+    let utm = Crs::Epsg(32632);
+    let ds = crate::io::project(&lonlat, utm).unwrap();
+    let layer = Dataset::new(ds.name.clone(), ds.geometry_type, ds.fields.clone());
+    let src = Runs { held: utm, ..Runs::new(&ds, 10) };
+    let first = |ds: &Dataset| match &ds.features[0].geometry {
+        Some(Geometry::Polygon(p)) => p[0][0][0],
+        g => panic!("{g:?}"),
+    };
+    let want = first(&lonlat);
+    for (name, crs, beyond) in [("out.geojson", Crs::LonLat, 0), ("own.gpkg", utm, 0), ("merc.gpkg", Crs::WebMercator, 5)] {
+        let e = write_source_in(&src, &layer, &d.join(name), crs).unwrap();
+        assert_eq!(e.written, 302, "{name}");
+        // Northings in the millions: only the square at 86° N is past 85.05°.
+        assert_eq!(e.beyond_web_mercator, beyond, "{name}");
+        let p = first(&read_back(&d.join(name)).in_lonlat().unwrap());
+        assert!((p.x - want.x).abs() < 1e-7 && (p.y - want.y).abs() < 1e-7, "{name}: {p:?} {want:?}");
     }
 }

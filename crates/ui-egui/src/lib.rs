@@ -29,6 +29,7 @@ mod connectionui;
 mod connectui;
 mod coordreadout;
 mod copernicusui;
+mod crspicker;
 mod cswui;
 mod cubesui;
 mod diagnosticlog;
@@ -66,6 +67,9 @@ mod localagents;
 mod mapgpu;
 mod mapmenu;
 mod mapview;
+mod markerimages;
+mod markerpick;
+pub use markerpick::{MarkerImage, marker_file_too_large};
 mod measure_units;
 mod modelbuilder;
 mod navui;
@@ -195,6 +199,24 @@ pub const TOOL_FILE_PURPOSE: &str = "toolfile:";
 
 /// Marks a returned shortcut picker file; cancellation leaves no pending routing state.
 pub const SHORTCUT_PICK: &str = "\u{1}shortcuts:";
+
+/// Starts the name of a script file the shell's `"script"` picker put in the inbox, for the
+/// Script pane's Load….
+pub const SCRIPT_PICK: &str = "\u{1}script:";
+
+/// Starts the name of an image the shell's `"marker:<id>"` picker put in the inbox, followed by
+/// `<id>:`: it goes to the marker whose «Image…» asked for it, and only a file so marked, for the
+/// request still waiting, does.
+pub const MARKER_PICK: &str = "\u{1}marker:";
+
+/// The largest image file a marker takes: one whose base64 fits the engine's limit
+/// ([`rustgis_engine::map::symbology::MAX_PICTURE_BYTES`]). The browser's and the phone's shells
+/// refuse a larger one before reading it.
+pub const MARKER_FILE_MAX_BYTES: usize = rustgis_engine::map::symbology::MAX_PICTURE_BYTES / 4 * 3;
+
+/// The largest script file the Script pane's Load… reads, as the assistant's command file; the
+/// browser's shell refuses a larger one before reading it.
+pub const SCRIPT_FILE_MAX_BYTES: usize = 1024 * 1024;
 
 /// Maximum portable shortcut document size: saved overrides plus room for version metadata.
 pub const SHORTCUT_FILE_MAX_BYTES: usize = keymap::MAX_PREF_BYTES + 100;
@@ -387,6 +409,9 @@ pub struct Services {
     /// Offers bytes as a download named `file_name`; success means submission to the host's
     /// download mechanism. Browsers do not expose confirmation that the file was saved.
     pub download: Option<Box<dyn Fn(&str, Vec<u8>) -> Result<(), String>>>,
+    /// Starts saving a project through the phone's native picker. The shell reports the
+    /// eventual result through [`RustGisApp::complete_project_save`].
+    pub save_project: Option<Box<dyn Fn(&str, Vec<u8>) -> Result<(), String>>>,
     pub inbox: Option<Inbox>,
     /// Reads a saved preference (`language`, …).
     pub load_pref: Option<Box<dyn Fn(&str) -> Option<String>>>,
@@ -408,7 +433,7 @@ pub struct Services {
     /// Makes an HTTP request (the AI assistant's calls to its model) and puts the response, of any
     /// status, in the slot (the browser's fetch; the desktop sends it on a thread).
     pub http: Option<Box<dyn Fn(rustgis_assistant::HttpRequest, Slot<Result<rustgis_assistant::HttpResponse, rustgis_assistant::Error>>)>>,
-    /// Where autosave keeps the recovery copy of unsaved work (the desktop's recovery folder).
+    /// Where autosave keeps the recovery copy of unsaved work (the native app's recovery folder).
     /// `None` turns autosave off: the browser for now, and a second copy of the desktop app
     /// running alongside the first, which mustn't touch its copy.
     pub recovery: Option<Box<dyn RecoveryStore>>,
@@ -420,6 +445,10 @@ pub struct Services {
     /// Online and RustGIS's own app) in a pop-up window, putting who signed in, or why not, in the
     /// slot (the browser; the desktop runs `arcgis.signIn`).
     pub arcgis_sign_in: Option<Box<dyn Fn(String, String, Slot<Result<String, String>>)>>,
+    /// Signs in to Copernicus Data Space with a username, a password and a one-time code (blank
+    /// for an account without two-factor authentication), putting who signed in, or why not, in
+    /// the slot (the browser, which sends the request itself; the desktop runs `copernicus.login`).
+    pub copernicus_sign_in: Option<Box<dyn Fn(String, String, String, Slot<Result<String, String>>)>>,
 }
 
 /// A new private folder for one print job: unique, created fresh (never an existing path) and,
@@ -768,6 +797,9 @@ pub struct UiState {
     /// Whether datum grids a coordinate system needs are downloaded from PROJ's grid server
     /// (#2032 A4): off unless turned on, as it reaches a server.
     pub download_grids: bool,
+    /// Whether raster tiles and single pictures are fetched for a HiDPI display's own pixels
+    /// (#2390): on unless turned off.
+    pub sharp_tiles: bool,
     /// Key combinations the native menu bar keeps for itself (macOS: Quit, Close Window, Hide…):
     /// a shortcut on one would never reach the app, so the shortcut editor refuses them.
     pub reserved_shortcuts: Vec<egui::KeyboardShortcut>,
@@ -784,6 +816,9 @@ pub struct UiState {
     pub start_projection_input: String,
     /// The coordinate system typed in View › Graticule's menu for the measured grid.
     pub graticule_crs_input: String,
+    /// The coordinate systems last chosen in a coordinate system box, the latest first
+    /// (`crspicker::RECENT_PREF`).
+    pub recent_crs: Vec<String>,
     /// Start-up preference: the extent the map opens on, `[minLon, minLat, maxLon, maxLat]`;
     /// `None` for the full extent.
     pub start_extent: Option<[f64; 4]>,
@@ -812,6 +847,7 @@ pub struct UiState {
     pub hidden_tabs: Vec<String>,
     /// Extra Quick Access Toolbar commands.
     pub quick_access: Vec<String>,
+    pub(crate) history_jump: Option<chrome::HistoryJump>,
     /// Whether a layout's PDF georeferences its map frames (Layout › Export › Georeference PDF).
     pub(crate) pdf_georeference: bool,
     /// The native title bar the header is drawn into; set by the desktop app on macOS.
@@ -971,6 +1007,9 @@ pub struct UiState {
     pub pending_layout_picture: bool,
     /// The corners of a picture graphic waiting for its image file.
     pub pending_picture: Option<Vec<rustgis_engine::geom::Coord>>,
+    /// A marker whose «Image…» waits for its file (web and phone), which comes back marked
+    /// ([`MARKER_PICK`]).
+    pub pending_marker_image: Option<MarkerImage>,
     /// The value picked under Edit › Dynamic Text (a token such as `{scale}`): the text tool's
     /// dialog starts with it. Cleared when the tool changes.
     pub dynamic_text: Option<&'static str>,
@@ -1043,12 +1082,14 @@ impl Default for UiState {
             start_with: StartWith::Sample,
             ask_layers: true,
             download_grids: false,
+            sharp_tiles: true,
             reserved_shortcuts: Vec::new(),
             choosing: Vec::new(),
             last_project: None,
             start_projection: String::new(),
             start_projection_input: String::new(),
             graticule_crs_input: String::new(),
+            recent_crs: Vec::new(),
             start_extent: None,
             start_view: None,
             ribbon_minimized: false,
@@ -1067,6 +1108,7 @@ impl Default for UiState {
             open_url: None,
             copy_image: None,
             pending_picture: None,
+            pending_marker_image: None,
             pending_layout_picture: false,
             pending_open: None,
             web_file: None,
@@ -1130,6 +1172,7 @@ impl Default for UiState {
             geolibre_zarr: Vec::new(),
             hidden_tabs: Vec::new(),
             quick_access: Vec::new(),
+            history_jump: None,
             pdf_georeference: true,
             titlebar: None,
             pane_sets: Vec::new(),
@@ -1175,17 +1218,50 @@ const CAPTURE_MIN_DPI: f64 = 36.0;
 pub const FIXES_KEPT: usize = 200_000;
 
 impl RustGisApp {
-    /// Keeps a position the shell reported: the last one in [`RustGisApp::position`], and each in
-    /// [`RustGisApp::fixes`] until an interface takes them (the oldest dropped past
-    /// [`FIXES_KEPT`]).
+    /// Updates the live position if this fix is recent and accurate enough. Queues every fix
+    /// for tracking and averaging (the oldest dropped past [`FIXES_KEPT`]).
     pub fn report_position(&mut self, fix: rustgis_engine::platform::Fix) {
-        self.position = Some(fix);
+        if self.position.is_none_or(|current| replaces_live_position(current, fix)) {
+            self.position = Some(fix);
+        }
         if self.fixes.len() >= FIXES_KEPT {
             self.fixes.pop_front();
             self.fixes_dropped += 1;
         }
         self.fixes.push_back(fix);
     }
+}
+
+/// Whether `fix` replaces the shown position: not when it is older, nor when it is much less
+/// accurate and the shown one is recent. Android compares its monotonic time, which a change to
+/// the wall clock doesn't move. iOS has only the fix's UTC timestamp: a fix a little behind the
+/// shown one is a late one and is dropped, while one further behind than the hold means the clock
+/// was set back, and it is taken rather than freezing the position until the clock catches up.
+fn replaces_live_position(current: rustgis_engine::platform::Fix, fix: rustgis_engine::platform::Fix) -> bool {
+    use std::time::Duration;
+    const HOLD: Duration = Duration::from_secs(5);
+
+    let age = match (current.elapsed_realtime_nanos, fix.elapsed_realtime_nanos) {
+        (Some(current), Some(new)) => match new.checked_sub(current) {
+            Some(age) => Duration::from_nanos(age),
+            None => return false,
+        },
+        (None, None) => match current.time.zip(fix.time) {
+            Some((current, new)) if new >= current => Duration::from_millis(new.abs_diff(current)),
+            Some((current, new)) => return Duration::from_millis(new.abs_diff(current)) >= HOLD,
+            None => return true,
+        },
+        _ => return true,
+    };
+    // At the usual one fix per second this bridges a brief GPS dropout. After five seconds a
+    // walking crew may already be outside the old fix's accuracy radius.
+    if age >= HOLD {
+        return true;
+    }
+    // Held back only when much worse (a network fix after a GPS one), so the usual jitter of a
+    // few metres in GPS accuracy still moves the marker with every fix.
+    let shown = current.accuracy.unwrap_or(f64::INFINITY);
+    fix.accuracy.unwrap_or(f64::INFINITY) <= shown * 2.0
 }
 
 pub struct RustGisApp {
@@ -1223,13 +1299,12 @@ pub struct RustGisApp {
     /// Whether the user wants the device's position shown: a shell that can report one (a
     /// phone's) starts and stops its positioning by this, and fills in [`RustGisApp::position`].
     pub locate: bool,
-    /// Where the device is, as the shell last reported it; `None` until it has, and again once
-    /// positioning is off. An interface draws it on the map and can capture at it.
+    /// The selected live fix for the marker and capture cross, if positioning is on and a fix
+    /// has arrived.
     pub position: Option<rustgis_engine::platform::Fix>,
-    /// Every position the shell reported since an interface last took them, oldest first (at most
-    /// [`FIXES_KEPT`]: the oldest go first). [`RustGisApp::position`] is only the last: a track
-    /// or an average needs each, including those that arrived together after the app was out of
-    /// sight.
+    /// Every fix the shell reported since an interface last took them, in arrival order (at most
+    /// [`FIXES_KEPT`]). A track or average needs each, including those that arrived together after
+    /// the app was out of sight.
     pub fixes: std::collections::VecDeque<rustgis_engine::platform::Fix>,
     /// Whether the interface wants positions while the app is out of sight too (a track being
     /// recorded): a phone's shell keeps them coming then, with the notice its system requires.
@@ -1654,6 +1729,8 @@ impl RustGisApp {
         self.ui.ask_layers = self.services.load_pref.as_ref().and_then(|load| load("ask_file_layers")).is_none_or(|v| v != "off");
         self.ui.download_grids = self.services.load_pref.as_ref().and_then(|load| load("download_datum_grids")).is_some_and(|v| v == "on");
         rustgis_engine::grids::set_enabled(self.ui.download_grids);
+        self.ui.sharp_tiles = self.services.load_pref.as_ref().and_then(|load| load("sharp_tiles")).is_none_or(|v| v != "off");
+        rustgis_engine::render::rustgis_tiles::template::set_sharp(self.ui.sharp_tiles);
         // A stored projection this version can't use means Web Mercator.
         if let Some(code) = self.services.load_pref.as_ref().and_then(|load| load("start_projection"))
             && let Ok(p) = rustgis_engine::map::Projection::from_code(&code)
@@ -1661,6 +1738,13 @@ impl RustGisApp {
             self.ui.start_projection = p.code();
         }
         self.ui.start_extent = self.services.load_pref.as_ref().and_then(|load| load("start_extent")).and_then(|v| parse_extent(&v));
+        self.ui.recent_crs = self
+            .services
+            .load_pref
+            .as_ref()
+            .and_then(|load| load(crspicker::RECENT_PREF))
+            .map(|v| crspicker::from_pref(&v))
+            .unwrap_or_default();
         // How new single-band rasters are drawn (Save as Default in the raster Symbology pane).
         if let Some(d) = self.services.load_pref.as_ref().and_then(|load| load(RASTER_DEFAULTS_PREF))
             && let Ok(d) = serde_json::from_str::<rustgis_engine::map::RasterDefaults>(&d)
@@ -1810,8 +1894,7 @@ impl RustGisApp {
         }
         let found = [CjkRegion::SimplifiedChinese, CjkRegion::Japanese, CjkRegion::Korean].into_iter().find_map(cjk_font);
         if let Some((bytes, index)) = found {
-            let mut face = egui::FontData::from_static(bytes);
-            face.index = *index;
+            let face = theme::installed_face(bytes, *index, true);
             self.extra_fonts.push(("cjk-fallback".into(), std::sync::Arc::new(face), None));
         }
     }
@@ -1824,8 +1907,7 @@ impl RustGisApp {
             return;
         }
         if let Some((bytes, index)) = rustgis_engine::render::fonts::symbol_font() {
-            let mut face = egui::FontData::from_static(bytes);
-            face.index = *index;
+            let face = theme::installed_face(bytes, *index, false);
             self.extra_fonts.push(("symbol-fallback".into(), std::sync::Arc::new(face), None));
         }
     }
@@ -1866,8 +1948,7 @@ impl RustGisApp {
         }
         self.fonts_requested.push(name.clone());
         if let Some((bytes, index)) = script_font(region) {
-            let mut face = egui::FontData::from_static(bytes);
-            face.index = *index;
+            let face = theme::installed_face(bytes, *index, matches!(region, rustgis_engine::render::fonts::ScriptFont::Cjk(_)));
             self.extra_fonts.push((name, std::sync::Arc::new(face), Some(region)));
             self.fonts_dirty = true;
         } else if let (Some(fetch), Some(url)) = (&self.services.fetch_font, script_font_url(region)) {
@@ -2032,11 +2113,32 @@ impl RustGisApp {
     /// Opens a file from the inbox: one the `"text"` picker marked ([`DELIMITED_PICK`]) opens Add
     /// Delimited Text for it, or is read with a script's options; one the tool file picker marked
     /// ([`TOOL_FILE_PICK`]) goes to the Tools pane. Source-CRS picks carry [`SHAPEFILE_PICK`];
-    /// shortcut picks carry [`SHORTCUT_PICK`] and open the validated merge preview; DXF picks
-    /// carry [`DXF_PICK`] and open Import DXF.
+    /// shortcut picks carry [`SHORTCUT_PICK`] and open the validated merge preview; script picks
+    /// carry [`SCRIPT_PICK`] and open in the Script pane; marker picks carry [`MARKER_PICK`] and
+    /// become the waiting marker's image; DXF picks carry [`DXF_PICK`] and open Import DXF.
     pub fn open_picked(&mut self, name: &str, bytes: &[u8]) -> Result<Value, String> {
         if name.starts_with(SHORTCUT_PICK) {
             return shortcutfile::picked(self, bytes);
+        }
+        if let Some(name) = name.strip_prefix(SCRIPT_PICK) {
+            // An answer with no name is a cancelled picker.
+            return if name.is_empty() { Ok(Value::Null) } else { analysispane::script_picked(self, name, bytes) };
+        }
+        if let Some(picked) = name.strip_prefix(MARKER_PICK) {
+            // Only the request still waiting takes its answer: an earlier one's file, still on its
+            // way when another «Image…» was clicked, is dropped, and said. An answer with no name
+            // is a cancelled picker, which ends the wait.
+            let (id, name) = picked.split_once(':').unwrap_or_default();
+            if self.ui.pending_marker_image.as_ref().is_none_or(|m| m.request.to_string() != id) {
+                if !name.is_empty() {
+                    self.session.notify(tl!("An image picked for an earlier Image… was dropped: pick it again for that marker"), true);
+                }
+                return Ok(Value::Null);
+            }
+            return match self.ui.pending_marker_image.take() {
+                Some(marker) if !name.is_empty() => marker.apply(self, bytes),
+                _ => Ok(Value::Null),
+            };
         }
         if let Some(name) = name.strip_prefix(TOOL_FILE_PICK) {
             panes::received_file(self, name, bytes);
@@ -2053,6 +2155,11 @@ impl RustGisApp {
                 self.session.notify(error.clone(), true);
                 return Err(error);
             };
+            // Remembered once a file is picked, as on the desktop, not when the picker opened.
+            if let Some(crs) = options.get("crs").and_then(Value::as_str) {
+                let crs = crs.to_string();
+                self.remember_crs_if_listed(&crs);
+            }
             return self.open_bytes_with(name, bytes, Some(options));
         }
         if let Some(picked) = name.strip_prefix(DXF_PICK) {
@@ -2272,14 +2379,9 @@ impl RustGisApp {
             // Save As changed the document even when it began clean. Offering a download
             // cannot confirm that this renamed document reached a file.
             self.session.mark_unsaved();
+            self.ui.history_jump = None;
         }
-        // On Android the file is written once the user has chosen its place, and the shell
-        // says then whether it was.
-        let offered = if cfg!(any(target_os = "android", target_os = "ios")) {
-            crate::i18n::fmt("Choose where to save {name}.", &[("name", &file)])
-        } else {
-            crate::i18n::fmt("Download offered: {name}. The browser doesn't say whether it saved the file.", &[("name", &file)])
-        };
+        let offered = crate::i18n::fmt("Download offered: {name}. The browser doesn't say whether it saved the file.", &[("name", &file)]);
         self.session.notify(offered, false);
         report.notify(&mut self.session);
         for note in construction_notes {
@@ -2429,6 +2531,30 @@ impl RustGisApp {
                 ),
                 false,
             );
+        }
+    }
+
+    /// Notes `code` as the latest coordinate system used, for the coordinate system boxes, and
+    /// keeps the list.
+    fn remember_crs(&mut self, code: &str) {
+        if crspicker::remember(&mut self.ui.recent_crs, code) {
+            self.save_pref(crspicker::RECENT_PREF, &self.ui.recent_crs.join("\n"));
+        }
+    }
+
+    /// Forgets the recently used coordinate systems.
+    pub(crate) fn clear_recent_crs(&mut self) {
+        self.ui.recent_crs.clear();
+        self.save_pref(crspicker::RECENT_PREF, "");
+    }
+
+    /// [`Self::remember_crs`] for a code the catalog lists (`EPSG:2056`), not a preset or a
+    /// PROJ string, which the coordinate system boxes offer otherwise or can't name.
+    pub(crate) fn remember_crs_if_listed(&mut self, code: &str) {
+        // As the catalog spells it, so `epsg: 2056` and `EPSG:2056` are one system.
+        if let Some(found) = rustgis_engine::data::raster::crs_search::lookup(code) {
+            let code = found.code.clone();
+            self.remember_crs(&code);
         }
     }
 
@@ -2653,10 +2779,26 @@ impl RustGisApp {
         }
     }
 
+    /// Enables foreground recovery for a phone. The store must be in the app's private storage
+    /// and must be installed before the first frame, so it can offer the last run's copy.
+    /// Call this after [`Self::with_services`], which replaces the entire service bundle.
+    pub fn with_edit_recovery(mut self, store: Box<dyn RecoveryStore>) -> Self {
+        self.services.recovery = Some(store);
+        self.autosave.phone = true;
+        autosave::next_offer(&mut self);
+        self
+    }
+
     /// A clean exit (the desktop app's `on_exit`): the recovery copy of this run's unsaved work
     /// is removed, as recovery is for a run that didn't close. Call it once, as the app closes.
     pub fn end_autosave(&mut self) {
         autosave::end(self);
+    }
+
+    /// The phone's activity ending (Back): submit the latest edit and give the writer a short
+    /// chance to finish. The last complete copy stays available for the next launch.
+    pub fn finish_recovery_copy(&mut self) {
+        autosave::finish(self);
     }
 
     /// The app closing (the desktop app's `on_exit`): an export still writing is cancelled and
@@ -2861,10 +3003,11 @@ impl RustGisApp {
                 let mark = self.session.notice_mark();
                 return exportjob::start(self, "map.exportBlock", params).inspect_err(|e| self.command_failed(id, e, mark));
             }
-            // Ordering and writing a standalone table grows with its rows, like Export Features.
-            if id == "share.exportTable" {
+            // Table exports and field packages can both read and write large inputs.
+            if matches!(id, "share.exportTable" | "offline.package") {
+                let command = if id == "offline.package" { "offline.package" } else { "share.exportTable" };
                 let mark = self.session.notice_mark();
-                return exportjob::start(self, "share.exportTable", params).inspect_err(|e| self.command_failed(id, e, mark));
+                return exportjob::start(self, command, params).inspect_err(|e| self.command_failed(id, e, mark));
             }
             // Converting the labels of a layer read in place reads all of its source first, on a
             // thread of its own, whoever asks (a click, the assistant).
@@ -3657,6 +3800,22 @@ impl RustGisApp {
                 }
                 return Ok(json!({"on": self.ui.download_grids}));
             }
+            // Whether raster tiles are sharp on a HiDPI display (#2390).
+            "ui.sharpTiles" => {
+                // Without `on` it toggles; a value that isn't true or false is refused.
+                self.ui.sharp_tiles = match p.get("on") {
+                    None | Some(Value::Null) => !self.ui.sharp_tiles,
+                    Some(v) => v.as_bool().ok_or("on must be true or false")?,
+                };
+                rustgis_engine::render::rustgis_tiles::template::set_sharp(self.ui.sharp_tiles);
+                if let Some(save) = &self.services.save_pref {
+                    save("sharp_tiles", if self.ui.sharp_tiles { "on" } else { "off" });
+                }
+                // The map and an open layout page are drawn again with tiles at the new detail.
+                self.map.invalidate();
+                self.layout.redraw();
+                return Ok(json!({"on": self.ui.sharp_tiles}));
+            }
             "ui.recover" => return autosave::recover(self, p),
             "ui.startup" => {
                 // `project` (#377) or, as before, `blank`; `project` wins when both are given.
@@ -4181,6 +4340,8 @@ impl RustGisApp {
                     }
                     open("shapefile");
                 } else if let Some(path) = dialogs::pick_open(&["shp", "zip"], tl!("Shapefile")) {
+                    let text = text.to_string();
+                    self.remember_crs_if_listed(&text);
                     // Read on a thread of its own, as Add Data's other files are.
                     #[cfg(not(target_arch = "wasm32"))]
                     return readjob::run(self, "layer.addData", json!({"path": path, "crs": text}));
@@ -4294,6 +4455,9 @@ impl RustGisApp {
                     }
                     return r;
                 }
+            }
+            "ui.save" | "ui.saveAs" if self.services.save_project.is_some() => {
+                saveprompt::start_project_save(self)?;
             }
             // The browser can't write a file in place: Save downloads the project again under the
             // file name it was saved or opened as, and Save As (or a first Save) asks for one.
@@ -4450,6 +4614,20 @@ impl RustGisApp {
             }
             "ui.saveItem" => {
                 let kind = p.get("kind").and_then(Value::as_str).ok_or("kind is required")?;
+                #[cfg(not(target_arch = "wasm32"))]
+                if kind == "fieldPackage" && self.reads_off_frame && self.services.download.is_none() {
+                    exportjob::idle(self)?;
+                    let name = rustgis_engine::cmd::field::suggested_name(&self.session, p);
+                    let Some(path) = dialogs::pick_save(&name, &["rgisfield"], tl!("RustGIS field package")) else {
+                        return Ok(Value::Null);
+                    };
+                    let mut params = p.clone();
+                    if let Some(fields) = params.as_object_mut() {
+                        fields.remove("kind");
+                        fields.insert("path".into(), json!(path));
+                    }
+                    return self.run("offline.package", params);
+                }
                 // A field package makes an offline area first: one not saved after all goes again.
                 let areas = self.session.project.offline_areas.len();
                 let session = &mut self.session;
@@ -4934,17 +5112,20 @@ impl RustGisApp {
                 let name = annotation::export_name(self, id, &download_ext, annotation_export)?;
                 rustgis_engine::cmd::share::gpkg_table(p, &ext)?;
                 // A streamed layer exports its whole source, not the features read for the view.
-                let (whole, lost) = if l.is_streamed() {
-                    let (ds, lost) = l.load_all_counted()?;
-                    (Some(ds), lost)
+                use std::borrow::Cow;
+                let (mut ds, lost) = if l.is_streamed() {
+                    let (dataset, lost) = l.load_all_counted()?;
+                    (Cow::Owned(dataset), lost)
                 } else {
-                    (None, Default::default())
+                    (Cow::Borrowed(&l.dataset), Default::default())
                 };
+                let query_report =
+                    rustgis_engine::data::export::filter_dataset(&mut ds, l.definition_query.as_deref()).map_err(|e| e.to_string())?;
+                let layer_name = l.name.clone();
                 // In the layer's own coordinate system, as share.exportLayer writes a file.
-                let ds = whole.as_ref().unwrap_or(&l.dataset);
                 use rustgis_engine::data::io;
-                let crs = io::default_export_crs(ds, &ext);
-                let written = io::write_bytes_in(ds, &ext, crs).map_err(|e| e.to_string());
+                let crs = io::default_export_crs(&ds, &ext);
+                let written = io::write_bytes_in(&ds, &ext, crs).map_err(|e| e.to_string());
                 let (bytes, left_out) = match written {
                     Ok(w) => w,
                     Err(e) => {
@@ -4953,27 +5134,27 @@ impl RustGisApp {
                     }
                 };
                 let ext = download_ext;
-                // The features written, read whole, give their own extent (not a raster's, or the
-                // one a streamed layer's source declares).
-                let mut notes = rustgis_engine::data::export_notes([(ds, ds.extent())], &name, crs);
-                rustgis_engine::cmd::share::coalesce_read_zm(&mut notes, &name, ds, &lost);
+                // The features written, read whole, give their own extent, in longitude/latitude
+                // (not a raster's, or the one a streamed layer's source declares).
+                let mut notes = rustgis_engine::data::export_notes([(ds.as_ref(), ds.lonlat_extent())], &name, crs);
+                rustgis_engine::cmd::share::coalesce_read_zm(&mut notes, &name, &ds, &lost);
                 let mut dbf_notes = Vec::new();
                 if ext == "zip" {
                     dbf_notes.extend(io::shapefile_names_note(&ds.fields, &name));
-                    dbf_notes.extend(io::shapefile_values_notes(ds, &name));
-                    dbf_notes.extend(io::shapefile_geometry_notes(ds, &name, crs));
+                    dbf_notes.extend(io::shapefile_values_notes(&ds, &name));
+                    dbf_notes.extend(io::shapefile_geometry_notes(&ds, &name, crs));
                 }
                 if matches!(ext.as_str(), "parquet" | "geoparquet") {
-                    dbf_notes.extend(rustgis_engine::data::source::parquet::values_note(ds, &name));
+                    dbf_notes.extend(rustgis_engine::data::source::parquet::values_note(&ds, &name));
                 }
                 dbf_notes.extend(io::dates_as_text_note(&ds.fields, &name));
-                dbf_notes.extend(rustgis_engine::cmd::share::gpkg_dates_note(ds, &ext, &name));
+                dbf_notes.extend(rustgis_engine::cmd::share::gpkg_dates_note(&ds, &ext, &name));
                 if lost.rows > 0 {
                     dbf_notes.push(format!("{name}: {} rows couldn't be read and were left out", lost.rows));
                 }
                 dbf_notes.extend(rustgis_engine::cmd::share::read_notes(&name, &l.name, &lost));
-                // CSV holds a point a row, GPX a name for each feature and no areas.
-                dbf_notes.extend(io::export_losses_notes(ds, &ext, io::name_field(ds), &name));
+                dbf_notes.extend(io::export_losses_notes(&ds, &ext, io::name_field(&ds), &name).map_err(|e| e.to_string())?);
+                drop(ds);
                 if let Some(note) = io::left_out_note(&name, &ext, left_out) {
                     self.session.notify(note, false);
                 }
@@ -4981,6 +5162,7 @@ impl RustGisApp {
                     self.session.notify(format!("{name}: no .prj written, as {} has no WKT form", crs.label()), false);
                 }
                 if self.download(&name, bytes) {
+                    rustgis_engine::cmd::share::notify_export_query(&mut self.session, &name, &layer_name, &query_report);
                     for note in notes.into_iter().chain(dbf_notes).chain(construction_notes) {
                         self.session.notify(note, false);
                     }
@@ -6270,6 +6452,8 @@ impl RustGisApp {
         // never waits for cast shadows still being worked out: it says they were (Never hold the
         // window). Exports drawn off it wait for them.
         rustgis_engine::render::on_the_interface_thread();
+        // Layers landed from a background read meanwhile learn their map's system too.
+        self.session.note_shown_systems();
         // A pass egui asks to repeat is the same frame: `ui` sets the delay once, from the first pass.
         if ctx.current_pass_index() == 0 {
             self.frame_start = Some(web_time::Instant::now());
@@ -6434,7 +6618,9 @@ impl RustGisApp {
         // reach.
         self.note_last_project();
         saveprompt::close_requested(self, ctx);
-        autosave::tick(self, ctx);
+        if !self.autosave.phone {
+            autosave::tick(self, ctx);
+        }
         #[cfg(not(target_arch = "wasm32"))]
         if self.watch_files {
             diskwatch::tick(self, ctx);
@@ -6567,6 +6753,15 @@ impl RustGisApp {
         for (name, bytes) in arrived {
             let _ = self.open_picked(&name, &bytes);
         }
+        // A script file for the Script pane's Load…, opened with the context its undo needs; said,
+        // not dropped, if something in the inbox started a run meanwhile.
+        if let Some(script) = self.workflow.script_picked.take() {
+            if analysispane::script_running(self) {
+                self.session.notify(tl!("Wait for the run to finish").to_string(), true);
+            } else {
+                analysispane::open_script(self, ctx, script);
+            }
+        }
         // Files dropped on the desktop window arrive as paths. (The web shell reads browser drops
         // asynchronously and passes them through the inbox instead.)
         if !cfg!(target_arch = "wasm32") {
@@ -6668,6 +6863,7 @@ impl RustGisApp {
         self.themes_revision
     }
 
+    /// Draws the current workspace and processes toolbar actions once the interface fonts are ready.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let _diagnostics = self.session.diagnostics.enter();
         // See `logic`.
@@ -6758,6 +6954,13 @@ impl RustGisApp {
             self.sent_title = title;
         }
         pluginstart::frame_drawn(self, &ctx);
+        // Cancel, save prompts and any project changes from UI controls take effect first.
+        chrome::advance_history_jump(self, &ctx);
+        // Capture and photo attachment land during UI handling. Submit a due checkpoint
+        // in the same frame, after those edits.
+        if self.autosave.phone {
+            autosave::tick(self, &ctx);
+        }
         // CJK text this frame drew with no face for it: the next frame's `logic` deals with it
         // (`ensure_data_cjk_font`), so there must be a next frame, though no input comes.
         if rustgis_engine::render::fonts::peek_missing_cjk().iter().any(|s| !self.cjk_scripts_handled.contains(s)) {
@@ -8437,6 +8640,37 @@ mod download_service_tests {
         assert!(!app.session.notices.iter().any(|n| n.text.contains("Downloaded")));
     }
 
+    /// The web download encodes the filtered rows and reports the count once the bytes are accepted.
+    #[test]
+    fn feature_download_respects_the_definition_query() {
+        let file = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let downloaded = file.clone();
+        let mut app = RustGisApp::with_sample().with_services(Services {
+            download: Some(Box::new(move |_, bytes| {
+                *downloaded.lock().unwrap() = bytes;
+                Ok(())
+            })),
+            ..Default::default()
+        });
+        let layer = app.session.map().layer_by_name("Cities").unwrap();
+        let (id, total) = (layer.id, layer.dataset.features.len());
+        for (query, count) in [("@row_number = 1", 1), ("", total)] {
+            app.run("layer.definitionQuery", json!({"layer": id, "where": query})).unwrap();
+            let mark = app.session.notice_mark();
+            app.run("ui.exportLayer", json!({"layer": id, "format": "geojson"})).unwrap();
+            let data: serde_json::Value = serde_json::from_slice(&file.lock().unwrap()).unwrap();
+            assert_eq!(data["features"].as_array().unwrap().len(), count);
+            let notes: Vec<_> = app.session.notices_since(mark).iter().filter(|n| n.text.contains("definition query")).collect();
+            assert_eq!(notes.len(), usize::from(!query.is_empty()));
+            if let Some(note) = notes.first() {
+                assert_eq!(
+                    note.text,
+                    format!("Cities.geojson: the definition query on Cities left out {} of the source features", total - 1)
+                );
+            }
+        }
+    }
+
     /// The web app's Shapefile download says which field names it changed, once the browser takes
     /// the file; names that fit, other formats and a refused download say nothing of them.
     #[test]
@@ -9258,6 +9492,31 @@ mod datum_grid_setting_tests {
     use super::RustGisApp;
     use rustgis_engine::{Project, Session};
     use serde_json::json;
+
+    /// Sharp tiles on HiDPI displays (#2390) are on by default, kept as a choice, read at start
+    /// and turned off by it; a value that isn't true or false is refused.
+    #[test]
+    fn sharp_tiles_are_a_kept_choice_on_by_default() {
+        let saved = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = saved.clone();
+        let services = crate::Services {
+            load_pref: Some(Box::new(|k| (k == "sharp_tiles").then(|| "off".to_string()))),
+            save_pref: Some(Box::new(move |k, v| log.lock().unwrap().push((k.to_string(), v.to_string())))),
+            ..crate::Services::default()
+        };
+        let mut app = RustGisApp::new(Session::new(Project::default())).with_services(services);
+        // The setting itself is shared by the tests running beside this one: only the choice is
+        // looked at, and it is left on.
+        assert!(!app.ui.sharp_tiles, "read at start");
+        assert_eq!(app.run("ui.sharpTiles", json!({"on": true})).unwrap(), json!({"on": true}));
+        assert_eq!(saved.lock().unwrap().last().cloned(), Some(("sharp_tiles".to_string(), "on".to_string())));
+        for junk in [json!({"on": "false"}), json!({"on": 0})] {
+            assert!(app.run("ui.sharpTiles", junk).is_err());
+            assert!(app.ui.sharp_tiles);
+        }
+        // Without a choice kept: on.
+        assert!(RustGisApp::new(Session::new(Project::default())).ui.sharp_tiles);
+    }
 
     /// Downloading datum grids is off unless turned on (it reaches a server), and the choice is
     /// kept as a preference. Turned on only by `rustgis-engine`'s own test, which reaches no

@@ -157,7 +157,7 @@ pub fn chrome(app: &mut RustGisApp, ui: &mut Ui) {
                     } else {
                         0
                     }
-                    + usize::from(app.session.map().name.ends_with(" (offline)"))
+                    + usize::from(can_send_field_package(app))
                     + copies_rows(&ctx)
             }
             Sheet::Capture => capture_rows(app, &ctx),
@@ -233,7 +233,7 @@ pub fn chrome(app: &mut RustGisApp, ui: &mut Ui) {
                 && let (Some(target), Some(editing)) = (capture_layer(app, &state), state.editing)
                 && let Some(shape) = edit::row_of(app, target.id, editing.feature).and_then(|row| edit::shape_ref(app, target.id, row))
             {
-                edit::draw(app, &painter, shape, editing.vertex, &t);
+                edit::draw(app, &painter, &shape, editing.vertex, &t);
             }
             if let Some(snapped) = state.snap {
                 edit::draw_snap(app, &painter, snapped, map.center(), &t);
@@ -265,6 +265,20 @@ fn stop_track(app: &mut RustGisApp, ctx: &egui::Context) -> bool {
     track::set_field(ctx, state);
     app.session.notify(tl!("The track is kept and still recorded: Stop tries to add it again."), true);
     false
+}
+
+/// Field provenance survives a tab rename. Old field packages can still have just the title. A
+/// field package goes back with its one map only, so a field project with a map added doesn't
+/// offer it (sending would refuse it).
+fn can_send_field_package(app: &RustGisApp) -> bool {
+    let map = app.session.map();
+    let project = &app.session.project;
+    if project.field_origin.is_some() {
+        return project.maps.len() == 1;
+    }
+    // An area ID with no area (a damaged file) is no copy to send.
+    let area = map.offline_area_id.as_deref().map(|id| project.offline_areas.iter().any(|a| a.id == id));
+    area.unwrap_or_else(|| map.name.ends_with(" (offline)"))
 }
 
 /// Draws where the device is: a dot, in a ring as wide as the position is good to.
@@ -910,23 +924,47 @@ fn sketch(app: &RustGisApp, painter: &egui::Painter, cross: egui::Pos2, t: &Toke
 /// is the one to tap next. Says whether it was tapped.
 fn action(ui: &mut Ui, t: &Tokens, label: &str, width: f32, main: bool, enabled: bool) -> bool {
     let text = RichText::new(label).size(16.0).color(if main { t.on_accent } else { t.text });
-    let button = egui::Button::new(text).fill(if main { t.accent } else { t.input }).min_size(Vec2::new(width, TARGET));
-    ui.add_enabled(enabled, button).clicked()
+    let button = egui::Button::new(text).fill(if main { t.accent } else { t.input }).wrap();
+    ui.add_enabled_ui(enabled, |ui| ui.add_sized(Vec2::new(width, TARGET), button)).inner.clicked()
 }
 
 /// The Capture sheet: the layer to capture into, where the cross is, the buttons that capture
 /// there, and a field for each of the layer's attributes. A point is added where the cross is.
-/// A line or polygon is drawn a vertex at a time, each where the cross is when Add Vertex is
-/// tapped, and added by Finish. The sheet stays up after a feature, emptied, for the next one.
+/// A line or polygon is drawn a vertex at a time and added by Finish. Keep the actions pinned
+/// while at least one field row fits below them. A shorter sheet scrolls as a single body.
 fn capture(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     heading(ui, t, tl!("Capture"));
+    let ctx = ui.ctx().clone();
+    let available = ui.available_height();
+    let crowded = ctx.egui_wants_keyboard_input() && available < CROWDED_ROWS * TARGET;
+    // Measure the drawn controls so location, edit mode and wrapped labels all count.
+    let layout_id = egui::Id::unique("touch_capture_layout");
+    let previous = ctx.data(|data| data.get_temp::<(f32, bool)>(layout_id));
+    let form_room = TARGET + ui.spacing().item_spacing.y;
+    let fits = |actions_height| actions_height + form_room <= available;
+    let scroll_all = crowded || previous.is_none_or(|(height, _)| !fits(height));
+    let layout_changed = previous.is_none_or(|(_, scrolled)| scrolled != scroll_all);
+    let height = if scroll_all {
+        egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| capture_body(app, ui, t, crowded, true, layout_changed)).inner
+    } else {
+        capture_body(app, ui, t, crowded, false, layout_changed)
+    };
+    ctx.data_mut(|data| data.insert_temp(layout_id, (height, scroll_all)));
+    if scroll_all != (crowded || !fits(height)) {
+        ctx.request_repaint();
+    }
+}
+
+/// Draws the Capture controls and form once, then returns the height needed to pin the controls.
+fn capture_body(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens, crowded: bool, scroll_all: bool, layout_changed: bool) -> f32 {
+    let start = ui.next_widget_position().y;
     let ctx = ui.ctx().clone();
     let mut state = form(&ctx);
     let layers = capture_layers(app);
     let Some(target) = capture_layer(app, &state) else {
         ui.label(RichText::new(tl!("This map has no layer to capture into. Add Data puts one on it.")).color(t.text_dim));
         ui.add_space(8.0);
-        return;
+        return ui.next_widget_position().y - start;
     };
     state = state.for_layer(target.instance);
     // A template chosen and since removed from the layer is let go, and said, before a button can
@@ -942,7 +980,7 @@ fn capture(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     // The feature being edited, while it is still there (an undo may have taken it away).
     let picked = state.editing.and_then(|e| edit::row_of(app, target.id, e.feature).map(|row| (row, e)));
     // A picked vertex an Undo moved or took away is let go.
-    let picked = picked.map(|(row, e)| (row, e.checked(edit::shape_ref(app, target.id, row))));
+    let picked = picked.map(|(row, e)| (row, e.checked(edit::shape_ref(app, target.id, row).as_deref())));
     state.editing = picked.map(|(_, e)| e);
     // Photos the camera took: for the feature being edited, attached to it now; else kept for
     // the next feature.
@@ -980,11 +1018,9 @@ fn capture(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     // Typing in a window the soft keyboard leaves short (a phone held sideways), the rows above
     // the fields would take all of it and hide the field: they step aside until the keyboard
     // goes.
-    let crowded = ctx.egui_wants_keyboard_input() && ui.available_height() < CROWDED_ROWS * TARGET;
     if crowded {
         ui.label(RichText::new(tl!("Close the keyboard for the buttons.")).size(13.0).color(t.text_dim));
     } else {
-        // The buttons stay in reach above the fields, however many the layer has.
         let place = match (cross, state.snap) {
             (Some((lon, lat)), Some(snapped)) => rustgis_ui_egui::i18n::fmt(
                 "At the cross, {snapped}: {lon}, {lat}",
@@ -1066,32 +1102,48 @@ fn capture(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             });
         }
     }
-    let edit_mode = state.edit_mode;
-    egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
-        // The layer: one chip for each layer that takes features, in a row that scrolls sideways.
-        egui::ScrollArea::horizontal().id_salt("touch_capture_layers").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.set_min_height(TARGET);
-                for layer in &layers {
-                    let on = layer.id == target.id;
-                    let text = RichText::new(&layer.name).size(15.0).color(if on { t.accent_text } else { t.text });
-                    let chip = egui::Button::new(text).fill(if on { t.checked } else { t.input }).min_size(Vec2::new(TARGET, TARGET - 8.0));
-                    // The next frame shows the chosen layer's fields, empty (`Form::for_layer`).
-                    if ui.add(chip).clicked() && !on {
-                        state.layer = Some(layer.instance);
-                    }
+    // The layer: one chip for each layer that takes features, in a row that scrolls sideways.
+    egui::ScrollArea::horizontal().id_salt("touch_capture_layers").show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.set_min_height(TARGET);
+            for layer in &layers {
+                let on = layer.id == target.id;
+                let text = RichText::new(&layer.name).size(15.0).color(if on { t.accent_text } else { t.text });
+                let chip = egui::Button::new(text).fill(if on { t.checked } else { t.input }).min_size(Vec2::new(TARGET, TARGET - 8.0));
+                // The next frame shows the chosen layer's fields, empty (`Form::for_layer`).
+                if ui.add(chip).clicked() && !on {
+                    state.layer = Some(layer.instance);
                 }
-            });
-        });
-        // Edit mode changes shapes, not attributes: the form is for a new feature.
-        // Photos for the next feature, where the device has a camera to ask; in Edit mode those
-        // already taken stay in sight (a photo for the feature edited is Add Photo's).
-        if edit_mode {
-            if !state.photos.is_empty() {
-                photo_row(app, ui, t, &mut state.photos, false);
             }
-            return;
+        });
+    });
+    let actions_height = ui.next_widget_position().y - start;
+    let mut fields = |ui: &mut Ui| {
+        // Keep focused fields and their widget state when the scroll viewport moves.
+        ui.scope_builder(egui::UiBuilder::new().scope_id(egui::Id::unique("touch_capture_fields")), |ui| {
+            capture_fields(app, ui, t, &target, &mut state, layout_changed);
+        });
+    };
+    if scroll_all {
+        fields(ui);
+    } else {
+        egui::ScrollArea::vertical().id_salt("touch_capture_form").auto_shrink([false, true]).show(ui, fields);
+    }
+    // The layer is kept only when a chip chose it: until then the sheet follows the active layer.
+    set_form(&ctx, state);
+    actions_height
+}
+
+/// Draws the rows for a new feature, keeping the focused field in view when the viewport changes.
+fn capture_fields(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens, target: &Target, state: &mut Form, layout_changed: bool) {
+    // Edit mode changes shapes, not attributes: the form is for a new feature.
+    // Photos for the next feature, where the device has a camera to ask; in Edit mode those
+    // already taken stay in sight (a photo for the feature edited is Add Photo's).
+    if state.edit_mode {
+        if !state.photos.is_empty() {
+            photo_row(app, ui, t, &mut state.photos, false);
         }
+    } else {
         if app.services.take_photo.is_some() || !state.photos.is_empty() {
             photo_row(app, ui, t, &mut state.photos, true);
         }
@@ -1130,8 +1182,8 @@ fn capture(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             });
         }
         // The soft keyboard came or went: the field being typed in is brought back into view.
-        let window = ctx.content_rect().height();
-        let resized = (window - state.window).abs() > 0.5;
+        let window = ui.ctx().content_rect().height();
+        let resized = layout_changed || (window - state.window).abs() > 0.5;
         state.window = window;
         for (i, (field, list)) in fields.iter().zip(lists).enumerate() {
             use rustgis_ui_egui::rustgis_engine::data::FieldType;
@@ -1228,9 +1280,7 @@ fn capture(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 }
             }
         }
-    });
-    // The layer is kept only when a chip chose it: until then the sheet follows the active layer.
-    set_form(&ctx, state);
+    }
 }
 
 /// The Capture sheet's buttons for the device's position: Go to My Position and Average, or,
@@ -1338,7 +1388,7 @@ fn edit_sheet(
         return;
     };
     // The shape is borrowed for each look at it, not copied each frame: the buttons change it.
-    let Some(status) = edit::shape_ref(app, target.id, row).map(|shape| edit::status(target.kind, shape, editing.vertex)) else {
+    let Some(status) = edit::shape_ref(app, target.id, row).map(|shape| edit::status(target.kind, &shape, editing.vertex)) else {
         state.editing = None;
         return;
     };
@@ -1357,8 +1407,8 @@ fn edit_sheet(
         let has = editing.vertex.is_some();
         if action(ui, t, tl!("Pick Vertex at Cross"), width, !has, true) {
             let middle = app.map.view_rect.map(|(rect, _)| rect.center());
-            match middle.and_then(|at| edit::vertex_near(app, edit::shape_ref(app, target.id, row)?, at)) {
-                Some(v) => state.editing = Some(editing.picking(Some(v), edit::shape_ref(app, target.id, row))),
+            match middle.and_then(|at| edit::vertex_near(app, edit::shape_ref(app, target.id, row)?.as_ref(), at)) {
+                Some(v) => state.editing = Some(editing.picking(Some(v), edit::shape_ref(app, target.id, row).as_deref())),
                 None => app.session.notify(tl!("No vertex is near the cross. Move the map so the cross is on one."), true),
             }
         }
@@ -1374,14 +1424,14 @@ fn edit_sheet(
                     if act != "delete" && at.is_none() {
                         app.session.notify(off(), true);
                     } else if let Some(at) = at
-                        && edit::shape_ref(app, target.id, row).is_some_and(|shape| edit::doubles(app, shape, v, act, at))
+                        && edit::shape_ref(app, target.id, row).is_some_and(|shape| edit::doubles(app, &shape, v, act, at))
                     {
                         app.session.notify(
                             tl!("Nothing was changed: the cross is on the vertex next to it, and two in one place make an edge of no length. Move the map."),
                             true,
                         );
                     } else if let Some(next) = edit::vertex(app, target.id, row, v, act, at) {
-                        state.editing = Some(editing.picking(next, edit::shape_ref(app, target.id, row)));
+                        state.editing = Some(editing.picking(next, edit::shape_ref(app, target.id, row).as_deref()));
                     }
                 }
             }
@@ -1459,7 +1509,7 @@ fn more(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         }
         // A map opened from a field package goes back as one: its edits and photos, for Bring Back
         // on the computer it came from.
-        if app.session.map().name.ends_with(" (offline)") && row(ui, t, "package", tl!("Send Field Package")) {
+        if can_send_field_package(app) && row(ui, t, "package", tl!("Send Field Package")) {
             set_sheet(&ctx, Sheet::None);
             run(app, "ui.saveItem", json!({"kind": "fieldPackage"}));
         }
@@ -1583,6 +1633,123 @@ mod tests {
         let input =
             egui::RawInput { screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(411.0, 914.0))), ..Default::default() };
         ctx.run_ui(input, |ui| chrome(app, ui)).drop_without_applying_deltas();
+    }
+
+    /// The polygon actions, layer chip and first field can all scroll through the short sheet.
+    #[test]
+    fn landscape_capture_scrolls_actions_and_form_into_view() {
+        let ctx = egui::Context::default();
+        let mut app = RustGisApp::with_sample();
+        app.chrome = Some(chrome);
+        let target = target(&mut app, GeometryType::Polygon);
+        let field = &app.session.map().layer(target.id).unwrap().dataset.fields[0];
+        let field_label = field.alias.as_ref().unwrap_or(&field.name).clone();
+        set_sheet(&ctx, Sheet::Capture);
+        let mut seen = [false; 4];
+        let labels = ["Undo Vertex", "Finish Polygon", &target.name, &field_label];
+        for step in 0..44 {
+            let mut input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(800.0, 360.0))),
+                time: Some(f64::from(step) * 0.1),
+                ..Default::default()
+            };
+            if step >= 4 {
+                use egui::TouchPhase::{End, Move, Start};
+                let (phase, y) = match step % 4 {
+                    0 => (Start, 271.0),
+                    1 => (Move, 241.0),
+                    2 => (Move, 211.0),
+                    _ => (End, 211.0),
+                };
+                let pos = egui::pos2(400.0, y);
+                input.events.push(egui::Event::Touch { device_id: egui::TouchDeviceId(0), id: egui::TouchId(0), phase, pos, force: None });
+                if phase != End {
+                    input.events.push(egui::Event::PointerMoved(pos));
+                }
+                if matches!(phase, Start | End) {
+                    input.events.push(egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: phase == Start,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                }
+                if phase == End {
+                    input.events.push(egui::Event::PointerGone);
+                }
+            }
+            let output = ctx.run_ui(input, |ui| {
+                app.logic(&ctx);
+                app.ui(ui);
+            });
+            for painted in &output.shapes {
+                if let egui::epaint::Shape::Text(text) = &painted.shape
+                    && painted.clip_rect.contains_rect(text.visual_bounding_rect())
+                {
+                    for (visible, label) in seen.iter_mut().zip(labels) {
+                        *visible |= text.galley.text() == label;
+                    }
+                }
+            }
+            output.drop_without_applying_deltas();
+            if seen.iter().all(|visible| *visible) {
+                return;
+            }
+        }
+        assert!(seen.iter().all(|visible| *visible), "visibility for {labels:?}: {seen:?}");
+    }
+
+    #[test]
+    fn portrait_capture_keeps_finish_visible_while_the_form_scrolls() {
+        let ctx = egui::Context::default();
+        let mut app = RustGisApp::with_sample();
+        app.chrome = Some(chrome);
+        let target = target(&mut app, GeometryType::Polygon);
+        for i in 0..8 {
+            app.session.run("edit.addField", &json!({"layer": target.id, "name": format!("Extra_{i}"), "type": "text"})).unwrap();
+        }
+        set_sheet(&ctx, Sheet::Capture);
+        set_form(&ctx, Form { shown: Some(target.instance), vertices: vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)], ..Form::default() });
+        let pos = egui::pos2(190.0, 660.0);
+        let mut last_field_visible = false;
+        for step in 0..18 {
+            let mut input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(360.0, 760.0))),
+                time: Some(f64::from(step) * 0.1),
+                events: vec![egui::Event::PointerMoved(pos)],
+                ..Default::default()
+            };
+            if step >= 5 {
+                input.events.push(egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: Vec2::new(0.0, -160.0),
+                    modifiers: egui::Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Wheel,
+                });
+            }
+            let output = ctx.run_ui(input, |ui| {
+                app.logic(&ctx);
+                app.ui(ui);
+            });
+            let visible = |label| {
+                output.shapes.iter().any(|painted| {
+                    matches!(&painted.shape, egui::epaint::Shape::Text(text)
+                        if text.galley.text() == label && painted.clip_rect.contains_rect(text.visual_bounding_rect()))
+                })
+            };
+            let (finish, layer, last_field) = (visible("Finish Polygon"), visible(&target.name), visible("Extra_7"));
+            output.drop_without_applying_deltas();
+            if step == 4 {
+                assert!(!last_field, "last field starts below the scroll viewport");
+            }
+            if step >= 4 {
+                assert!(finish, "Finish went out of view on frame {step}");
+                assert!(layer, "layer choice went out of view on frame {step}");
+            }
+            last_field_visible |= last_field;
+        }
+        assert!(last_field_visible, "the form scrolled to the last field");
     }
 
     #[test]
@@ -1863,18 +2030,84 @@ mod tests {
         assert_eq!(app.session.notices_since(mark).len(), 1);
         // With one, the map's middle (the capture cross) goes to it.
         app.locate = true;
-        app.position = Some(Fix { lon: 30.0, lat: -2.0, accuracy: Some(5.0), time: None });
+        app.position = Some(Fix { lon: 30.0, lat: -2.0, accuracy: Some(5.0), time: None, elapsed_realtime_nanos: None });
         go_to_position(&mut app);
         let (lon, lat) = cross_place(&app).unwrap();
         assert!((lon - 30.0).abs() < 1e-6 && (lat + 2.0).abs() < 1e-6, "{lon} {lat}");
         // Every sheet draws with the position on the map, its ring too (a wide one, to be drawn).
         // An accuracy out of all measure draws too, without its ring.
         for accuracy in [500_000.0, 1e300, f64::INFINITY] {
-            app.position = Some(Fix { lon: 30.0, lat: -2.0, accuracy: Some(accuracy), time: None });
+            app.position = Some(Fix { lon: 30.0, lat: -2.0, accuracy: Some(accuracy), time: None, elapsed_realtime_nanos: None });
             for shown in [Sheet::None, Sheet::Capture, Sheet::More] {
                 frame(&mut app, &ctx, shown);
             }
         }
+    }
+
+    #[test]
+    fn a_map_naming_a_missing_area_is_not_offered_for_sending() {
+        let mut app = RustGisApp::with_sample();
+        app.session.map_mut().offline_area_id = Some("gone".into());
+        assert!(!can_send_field_package(&app));
+    }
+
+    #[test]
+    fn live_position_prefers_a_recent_accurate_android_fix() {
+        use rustgis_ui_egui::rustgis_engine::platform::Event;
+
+        let mut app = RustGisApp::with_sample();
+        app.locate = true;
+        let mut received = Vec::new();
+        for (line, expected_lat) in [
+            ("position\t2.2945\t48.85840\t5\t10000\t1000000000", 48.85840),
+            // One second later, the network fix is 150 m north. The wall clock jumped ahead.
+            ("position\t2.2945\t48.85975\t150\t20000\t2000000000", 48.85840),
+            // Exactly five seconds after the GPS fix, the network fix can replace it.
+            ("position\t2.2945\t48.85975\t150\t24000\t6000000000", 48.85975),
+            // A newer, better fix replaces the network fix even if the wall clock went back.
+            ("position\t2.2945\t48.85850\t4\t8000\t7000000000", 48.85850),
+            // A late GPS fix is older, even though its wall clock time and accuracy look better.
+            ("position\t2.2945\t48.85830\t3\t30000\t6999999999", 48.85850),
+        ] {
+            let Event::Position(fix) = Event::parse(line) else { panic!("invalid position event: {line}") };
+            received.push(fix);
+            app.report_position(fix);
+            assert_eq!(app.position.unwrap().lat, expected_lat);
+            go_to_position(&mut app);
+            let (_, lat) = cross_place(&app).unwrap();
+            assert!((lat - expected_lat).abs() < 1e-6, "{lat}");
+        }
+        // Track recording and averaging still receive every fix in arrival order.
+        assert_eq!(app.fixes.into_iter().collect::<Vec<_>>(), received);
+    }
+
+    #[test]
+    fn live_position_uses_the_fix_timestamp_without_a_monotonic_clock() {
+        use rustgis_ui_egui::rustgis_engine::platform::Fix;
+
+        let mut app = RustGisApp::with_sample();
+        let current = Fix { lon: 30.0, lat: -2.0, accuracy: Some(5.0), time: Some(10_000), elapsed_realtime_nanos: None };
+        app.report_position(current);
+        // A little less accurate: GPS jitter still moves the marker.
+        let jitter = Fix { accuracy: Some(8.0), time: Some(11_000), ..current };
+        app.report_position(jitter);
+        assert_eq!(app.position, Some(jitter));
+        // Much less accurate and recent: held back until five seconds have passed.
+        app.report_position(Fix { accuracy: None, time: Some(15_999), ..jitter });
+        assert_eq!(app.position, Some(jitter));
+        let stale = Fix { accuracy: None, time: Some(16_000), ..jitter };
+        app.report_position(stale);
+        assert_eq!(app.position, Some(stale));
+        // A late fix, a little older than the shown one, is dropped even though it is better.
+        app.report_position(Fix { accuracy: Some(1.0), time: Some(15_999), ..current });
+        assert_eq!(app.position, Some(stale));
+        // The clock set back: the fix is taken instead of freezing the position.
+        let after_step = Fix { accuracy: Some(5.0), time: Some(1_000), ..current };
+        app.report_position(after_step);
+        assert_eq!(app.position, Some(after_step));
+        let next = Fix { accuracy: Some(5.0), time: Some(2_000), ..current };
+        app.report_position(next);
+        assert_eq!(app.position, Some(next));
     }
 
     #[test]
@@ -2247,7 +2480,7 @@ mod tests {
         start_track(&mut app, &ctx);
         // A position the line can't hold makes the layer refuse the track.
         for lon in [f64::NAN, 10.0, 10.01] {
-            app.report_position(Fix { lon, lat: 5.0, accuracy: Some(3.0), time: None });
+            app.report_position(Fix { lon, lat: 5.0, accuracy: Some(3.0), time: None, elapsed_realtime_nanos: None });
         }
         frame(&mut app, &ctx, Sheet::None);
         let mark = app.session.notice_mark();
@@ -2270,7 +2503,13 @@ mod tests {
         let mut app = RustGisApp::with_sample();
         start_track(&mut app, &ctx);
         for i in 0..rustgis_ui_egui::FIXES_KEPT + 5 {
-            app.report_position(Fix { lon: 10.0, lat: 5.0, accuracy: Some(3.0), time: i64::try_from(i).ok() });
+            app.report_position(Fix {
+                lon: 10.0,
+                lat: 5.0,
+                accuracy: Some(3.0),
+                time: i64::try_from(i).ok(),
+                elapsed_realtime_nanos: None,
+            });
         }
         let mark = app.session.notice_mark();
         frame(&mut app, &ctx, Sheet::None);
@@ -2285,7 +2524,13 @@ mod tests {
         let mut app = RustGisApp::with_sample();
         start_track(&mut app, &ctx);
         for i in 0..3 {
-            app.report_position(Fix { lon: 10.0 + f64::from(i) * 0.01, lat: 5.0, accuracy: Some(3.0), time: Some(i64::from(i) * 1000) });
+            app.report_position(Fix {
+                lon: 10.0 + f64::from(i) * 0.01,
+                lat: 5.0,
+                accuracy: Some(3.0),
+                time: Some(i64::from(i) * 1000),
+                elapsed_realtime_nanos: None,
+            });
         }
         frame(&mut app, &ctx, Sheet::None);
         // As the More sheet's row does: the track is added, then the interface goes.

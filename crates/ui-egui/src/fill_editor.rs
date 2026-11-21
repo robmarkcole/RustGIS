@@ -84,6 +84,15 @@ fn spread_name(s: Spread) -> &'static str {
 
 /// Runs `layer.fillLayers` with `fills` for the class picked (`None`: the layer's).
 pub(crate) fn set_fills(app: &mut RustGisApp, class: Option<&ClassRef>, fills: &[FillLayer]) {
+    let (p, replaced) = fills_params(class, fills);
+    if app.run("layer.fillLayers", p).is_ok() {
+        crate::panes::notify_image_replaced(app, replaced);
+    }
+}
+
+/// `layer.fillLayers`' parameters for `fills`, the layer's or `class`'s own, with images that
+/// can't be drawn sent as circles, and how many were.
+fn fills_params(class: Option<&ClassRef>, fills: &[FillLayer]) -> (Value, usize) {
     let mut replaced = 0;
     let fills: Vec<FillLayer> = fills
         .iter()
@@ -103,9 +112,19 @@ pub(crate) fn set_fills(app: &mut RustGisApp, class: Option<&ClassRef>, fills: &
         Some(ClassRef::Other) => p["other"] = json!(true),
         None => {}
     }
-    if app.run("layer.fillLayers", p).is_ok() {
-        crate::panes::notify_image_replaced(app, replaced);
+    (p, replaced)
+}
+
+/// Fill `i`'s markers as an image, waiting for its file: the fills as they are, the layer's
+/// (`layer`) or `class`'s own, for `layer.fillLayers`.
+pub(crate) fn fill_image(layer: u32, class: Option<&ClassRef>, fills: &[FillLayer], i: usize) -> crate::MarkerImage {
+    let mut fills = fills.to_vec();
+    // The marker the image replaces isn't counted as an image replaced by a circle.
+    if let Some(FillLayer { pattern: FillPattern::Dots { marker, .. }, .. }) = fills.get_mut(i) {
+        *marker = Marker::Circle;
     }
+    let (p, replaced) = fills_params(class, &fills);
+    crate::MarkerImage::in_list("layer.fillLayers", p, layer, "fills", i, replaced)
 }
 
 /// A fill's kind, as the Draw list names it.
@@ -178,7 +197,7 @@ pub(crate) fn fills_editor(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tok
         let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 44.0), Sense::hover());
         ui.painter().rect_filled(r, CornerRadius::same(4), t.ribbon);
         let swatch = Rect::from_center_size(r.center(), vec2(r.width().min(120.0) - 8.0, r.height() - 10.0));
-        preview(ui, swatch, &fills, &base);
+        preview(ui.painter(), swatch, &fills, &base);
         if borrowed {
             ui.label(
                 egui::RichText::new(tl!("This class is drawn with the layer's fills. Changing them here gives it its own."))
@@ -443,6 +462,9 @@ pub(crate) fn fills_editor(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tok
                                         set(app, dots(m, size, spacing, displacement));
                                     }
                                 }
+                                if crate::markerpick::entry(ui, matches!(marker, Marker::Picture(_))) {
+                                    crate::markerpick::pick(app, fill_image(l.id, class, &fills, i));
+                                }
                             })
                             .response
                             .labelled_by(input_label.id);
@@ -467,10 +489,10 @@ pub(crate) fn fills_editor(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tok
 }
 
 /// The stacked `fills` on `r`, bottom first: a colour fills it, hatch lines cross it at their
-/// angle and spacing, markers sit on their grid (as circles), a gradient or shapeburst shades it
-/// (in cells), each in its colour or `base`'s.
-fn preview(ui: &Ui, r: Rect, fills: &[FillLayer], base: &Symbol) {
-    let p = ui.painter().with_clip_rect(r);
+/// angle and spacing, markers sit on their grid (as circles, images as themselves), a gradient or
+/// shapeburst shades it (in cells), each in its colour or `base`'s.
+pub(crate) fn preview(p: &egui::Painter, r: Rect, fills: &[FillLayer], base: &Symbol) {
+    let p = p.with_clip_rect(r);
     let one = [FillLayer::default()];
     let shown = if fills.is_empty() { &one[..] } else { fills };
     // (Only what the map draws: a hatch of no width, a marker of no size, no colour to show.)
@@ -493,7 +515,9 @@ fn preview(ui: &Ui, r: Rect, fills: &[FillLayer], base: &Symbol) {
                     k += step;
                 }
             }
-            FillPattern::Dots { size, spacing, displacement, .. } => {
+            FillPattern::Dots { marker, size, spacing, displacement, .. } => {
+                // An image, looked up once for all its dots.
+                let image = crate::markerimages::image(p.ctx(), marker);
                 // (No finer than 4 points in the swatch: it is a picture, not every dot.)
                 let [dx, dy] = spacing.map(|s| s.max(4.0));
                 // (Shifts widened with the spacing, so a half shift stays a half.)
@@ -505,7 +529,12 @@ fn preview(ui: &Ui, r: Rect, fills: &[FillLayer], base: &Symbol) {
                     for col in -1..=cols {
                         let x = r.min.x + (col as f32 + 0.5) * dx + if row.rem_euclid(2) == 1 { shift[0] } else { 0.0 };
                         let y = r.min.y + (row as f32 + 0.5) * dy + if col.rem_euclid(2) == 1 { shift[1] } else { 0.0 };
-                        p.circle_filled(pos2(x, y), (size / 2.0).max(0.5), c);
+                        match &image {
+                            Some(image) => image.paint(&p, pos2(x, y), size.max(1.0)),
+                            None => {
+                                p.circle_filled(pos2(x, y), (size / 2.0).max(0.5), c);
+                            }
+                        }
                     }
                 }
             }
@@ -577,6 +606,40 @@ mod tests {
     use egui_kittest::kittest::Queryable;
 
     use super::*;
+
+    /// A fill of image markers shows its image on the preview's grid, not circles (#2266).
+    #[test]
+    fn a_fill_of_image_markers_shows_its_image() {
+        use base64::Engine;
+        let mut png = Vec::new();
+        image::RgbaImage::from_pixel(6, 3, image::Rgba([10, 120, 230, 255]))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let pic = rustgis_engine::map::Picture::new(&base64::engine::general_purpose::STANDARD.encode(&png));
+        let dots = |marker| FillLayer {
+            color: None,
+            pattern: FillPattern::Dots {
+                marker,
+                size: 6.0,
+                outline: None,
+                outline_width: 0.0,
+                spacing: [10.0, 10.0],
+                displacement: [0.0, 0.0],
+                offset: [0.0, 0.0],
+            },
+        };
+        let base = Symbol { stroke_width: 0.0, ..Symbol::default_for(rustgis_engine::data::GeometryType::Polygon, 0) };
+        let ctx = egui::Context::default();
+        let r = Rect::from_min_size(pos2(0.0, 0.0), vec2(40.0, 20.0));
+        let textured =
+            |c: &egui::epaint::ClippedShape| matches!(&c.shape, egui::Shape::Mesh(m) if m.texture_id != egui::TextureId::default());
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| preview(ui.painter(), r, &[dots(Marker::Picture(pic))], &base));
+        assert!(!out.shapes.is_empty() && out.shapes.iter().all(textured));
+        out.textures_delta.clear();
+        // A shape is still circles.
+        let shapes = ctx.run_ui(egui::RawInput::default(), |ui| preview(ui.painter(), r, &[dots(Marker::Circle)], &base)).shapes;
+        assert!(shapes.iter().all(|c| matches!(c.shape, egui::Shape::Circle(_))));
+    }
 
     /// Fills are added (the first the symbol's colour, the next hatch lines over it), drawn as
     /// markers or removed, each a `layer.fillLayers`.

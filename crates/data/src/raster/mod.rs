@@ -10,9 +10,8 @@ pub mod ascii;
 pub mod cog;
 pub mod cogwrite;
 pub mod crs;
-pub(crate) mod epsg_axes;
-mod epsg_gap;
-mod esri;
+pub mod crs_search;
+mod decoded;
 #[cfg(not(target_arch = "wasm32"))]
 mod file_revision;
 #[cfg(not(target_arch = "wasm32"))]
@@ -26,6 +25,7 @@ pub mod pam;
 #[cfg(feature = "pdf")]
 pub mod pdf;
 pub mod planetary;
+pub mod reproject;
 pub mod wkt;
 pub mod world;
 pub mod zarr;
@@ -34,6 +34,7 @@ use std::path::Path;
 
 pub use crs::{Crs, Transformer};
 pub use image_grid::ImageGrid;
+pub use reproject::Reprojection;
 use rustgis_geom::{Coord, Extent};
 use serde::{Deserialize, Serialize};
 
@@ -92,8 +93,9 @@ pub const SAMPLES_CEILING: usize = 1_000_000_000;
 /// Most samples (pixels × bands) held in memory: on the desktop, as many as a quarter of the
 /// computer's memory holds at 8 bytes each (a sample takes 4, and reading briefly needs about
 /// twice that), from [`SAMPLES_FLOOR`] up to [`SAMPLES_CEILING`] (#1291 step 2, #1318).
+/// Less once RustGIS holds more than half the memory, never below the floor ([`crate::memory::planned`], #2431).
 pub fn max_samples() -> usize {
-    crate::memory::scaled(crate::memory::physical(), SAMPLES_FLOOR, SAMPLES_CEILING, 8)
+    crate::memory::planned(SAMPLES_FLOOR, SAMPLES_CEILING, 8)
 }
 /// Largest ASCII grid file read (1 GiB).
 pub const MAX_ASCII_BYTES: u64 = 1 << 30;
@@ -1626,6 +1628,7 @@ fn north_up<B: AsRef<[f32]>>(bands: &[B], w: u32, h: u32, affine: [f64; 6], max:
     Ok((out, ow, oh, GeoTransform { origin_x: min_x, origin_y: max_y, pixel_width: cell, pixel_height: -cell }))
 }
 
+/// Decodes a bounded image and reserves each output band fallibly before converting its pixels.
 fn from_image_unrotated(name: &str, bytes: &[u8], bbox: [f64; 4]) -> Result<Raster> {
     let [w, s, e, n] = bbox;
     if !(w < e && s < n) {
@@ -1641,7 +1644,7 @@ fn from_image_unrotated(name: &str, bytes: &[u8], bbox: [f64; 4]) -> Result<Rast
     reader.limits(limits);
     let img = reader.decode().map_err(|e| DataError::Format(format!("{name}: {e}")))?.into_rgba8();
     let (width, height) = img.dimensions();
-    let mut bands: Vec<Vec<f32>> = (0..4).map(|_| Vec::with_capacity(width as usize * height as usize)).collect();
+    let mut bands = (0..4).map(|_| grid::<f32>(width as usize, height as usize)).collect::<Result<Vec<_>>>()?;
     for px in img.pixels() {
         for (b, v) in bands.iter_mut().zip(px.0) {
             b.push(f32::from(v));
@@ -2597,7 +2600,13 @@ mod scan_tests {
         let e = r.extent();
         assert!((e.min_x - 10.0).abs() < 1e-9 && (e.max_y - 41.0).abs() < 1e-9);
         assert!(r.place([1.0, 1.0, 0.0, 2.0]).is_err() && r.place([0.0, f64::NAN, 1.0, 2.0]).is_err());
-        assert!(from_image("o", &encode(picture(4, 4, true), image::ImageFormat::Png), [0.0, 0.0, 1.0, 1.0], 0.0).unwrap().georeferenced);
+        let placed = from_image("o", &encode(picture(4, 4, true), image::ImageFormat::Png), [0.0, 0.0, 1.0, 1.0], 0.0).unwrap();
+        assert!(placed.georeferenced);
+        assert_eq!(placed.color, ColorHint::Rgb { alpha: true });
+        for (band, expected) in placed.bands.iter().zip([3.0, 2.0, 7.0, 200.0]) {
+            assert_eq!(band.data.len(), 16);
+            assert_eq!(band.data.get(11).copied(), Some(expected));
+        }
     }
 
     #[test]

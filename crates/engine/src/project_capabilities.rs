@@ -70,6 +70,22 @@ impl Project {
         if !required.contains(&"layout-element-ink") && self.layouts.iter().any(|l| l.elements.iter().any(|e| e.kind.ink().is_some())) {
             required.push("layout-element-ink");
         }
+        if !required.contains(&"layout-element-wrap") && self.layouts.iter().any(|l| l.elements.iter().any(wraps)) {
+            required.push("layout-element-wrap");
+        }
+        if !required.contains(&"layout-chart-data") && self.layouts.iter().any(|l| l.elements.iter().any(charts_data)) {
+            required.push("layout-chart-data");
+        }
+        if !required.contains(&"layout-chart-look") && self.layouts.iter().any(|l| l.elements.iter().any(charts_look)) {
+            required.push("layout-chart-look");
+        }
+        if !required.contains(&"layout-chart-classes") && self.layouts.iter().any(|l| l.elements.iter().any(charts_classes)) {
+            required.push("layout-chart-classes");
+        }
+        if !required.contains(&"layout-frame-border") && self.layouts.iter().any(|l| l.elements.iter().any(|e| e.kind.has_custom_border()))
+        {
+            required.push("layout-frame-border");
+        }
         // A coordinate system whose PROJ definition, which an older reader reads, doesn't place
         // points as its WKT does (angles in grads, a datum transformation the definition can't
         // hold).
@@ -108,7 +124,38 @@ const COMMAND_CAPABILITIES: &[(&str, CommandCheck)] = &[
     ("layout-element-background", command_uses_element_background),
     ("picture-markers", command_uses_picture_marker),
     ("layout-element-ink", command_uses_element_ink),
+    ("layout-element-wrap", command_uses_element_wrap),
+    ("layout-chart-data", command_uses_chart_data),
+    ("layout-chart-look", command_uses_chart_look),
+    ("layout-chart-classes", command_uses_chart_classes),
+    ("blank-paper", command_uses_blank_paper),
+    ("layout-frame-border", command_uses_frame_border),
 ];
+
+/// A layout command that changes a map frame's border (#2557): an older reader warns that it
+/// ignores `border` and draws the default one. `null` only gives the default back, which an older
+/// reader's frames always have.
+fn command_uses_frame_border(id: &str, params: &Value) -> bool {
+    match id {
+        "layout.update" => params.get("border").is_some_and(|b| !b.is_null()),
+        "layout.import" => imported_layout_uses(params, "\"border_", |e| e.kind.has_custom_border()),
+        "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_uses_frame_border)),
+        _ => false,
+    }
+}
+
+/// A `map.basemap` command that gives the blank basemap a paper colour (#2532): an older reader
+/// ignores `color` and draws white. White, `null` or another basemap leaves no paper to keep.
+fn command_uses_blank_paper(id: &str, params: &Value) -> bool {
+    match id {
+        "map.basemap" => {
+            params.get("name").and_then(Value::as_str).is_some_and(|n| n.trim().eq_ignore_ascii_case("blank"))
+                && params.get("color").and_then(Value::as_str).is_some_and(|c| !c.trim().eq_ignore_ascii_case("#FFFFFF"))
+        }
+        "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_uses_blank_paper)),
+        _ => false,
+    }
+}
 
 /// A layout command that gives an element a background: an older reader warns that it ignores
 /// the key and makes the element without one. `null` only takes a background away, which an
@@ -129,6 +176,109 @@ fn command_uses_element_ink(id: &str, params: &Value) -> bool {
     match id {
         "layout.import" => imported_layout_uses(params, "\"color\"", |e| e.kind.ink().is_some()),
         "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_uses_element_ink)),
+        _ => false,
+    }
+}
+
+/// Whether a layout element is a text that wraps to its box (#2346).
+fn wraps(e: &rustgis_map::layout::Element) -> bool {
+    matches!(e.kind, rustgis_map::layout::ElementKind::Text { wrap: true, .. })
+}
+
+/// A layout command that makes a text wrap (#2346): an older reader warns that it ignores
+/// `wrap` and draws the text unwrapped. `"wrap": false` only keeps a text as an older reader's
+/// texts always are.
+fn command_uses_element_wrap(id: &str, params: &Value) -> bool {
+    match id {
+        "layout.addElement" | "layout.update" => params.get("wrap").and_then(crate::cmd::bool_value) == Some(true),
+        "layout.import" => imported_layout_uses(params, "\"wrap\"", wraps),
+        "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_uses_element_wrap)),
+        _ => false,
+    }
+}
+
+/// Whether a layout element is a chart grouped, ordered, cut or gathered as an older reader's
+/// can't be (#2487): it would draw a bar per feature, the 20 largest.
+fn charts_data(e: &rustgis_map::layout::Element) -> bool {
+    e.kind.chart_uses_data_options()
+}
+
+/// A layout command that groups, orders or cuts a chart, or gathers its rest in an Other bar:
+/// an older reader warns that it ignores those keys and draws a bar per feature, the 20 largest.
+/// One that gives the defaults, or takes a group away, keeps a chart as an older reader draws it;
+/// a label given to `layout.update`, which an older reader's update doesn't take, needs it too.
+fn command_uses_chart_data(id: &str, params: &Value) -> bool {
+    use rustgis_map::layout::{CHART_BARS, ChartOrder};
+    use rustgis_map::report::StatKind;
+    match id {
+        "layout.addElement" | "layout.update" => {
+            let text = |k: &str| params.get(k).and_then(Value::as_str).map(str::trim);
+            // An older reader's update takes no chart label: it would say nothing and keep the old.
+            (id == "layout.update" && params.get("label").is_some_and(|v| !v.is_null()))
+                || text("group").is_some_and(|g| !g.is_empty())
+                || text("statistic").and_then(StatKind::from_code).is_some_and(|s| s != StatKind::default())
+                || text("order").and_then(ChartOrder::from_code).is_some_and(|o| o != ChartOrder::default())
+                || params.get("bars").and_then(Value::as_u64).is_some_and(|n| n != CHART_BARS as u64)
+                || params.get("other").and_then(crate::cmd::bool_value) == Some(true)
+        }
+        "layout.import" => ["\"group\"", "\"statistic\"", "\"order\"", "\"bars\"", "\"other\""]
+            .iter()
+            .any(|key| imported_layout_uses(params, key, charts_data)),
+        "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_uses_chart_data)),
+        _ => false,
+    }
+}
+
+fn charts_look(e: &rustgis_map::layout::Element) -> bool {
+    e.kind.chart_uses_look_options()
+}
+
+/// A layout command that draws a chart as columns, writes its values or their decimals, gives it
+/// its own title or none, a bar colour, or labels against its bars (#2487): an older reader
+/// ignores those keys and draws bars running across in the default blue, with the title it is
+/// given. A `layout.update`'s `title` and `orientation` may be a legend's or a colorbar's, which
+/// it can't tell apart, so only the keys a chart alone takes are read there; the layout saved
+/// with the chart requires it anyway. Keys at their defaults keep a chart as an older reader
+/// draws it.
+fn command_uses_chart_look(id: &str, params: &Value) -> bool {
+    let text = |k: &str| params.get(k).and_then(Value::as_str).map(|t| t.trim().to_ascii_lowercase());
+    let only_chart = || {
+        params.get("values").and_then(crate::cmd::bool_value) == Some(true)
+            || params.get("decimals").is_some_and(|d| d.is_u64())
+            || params.get("barColor").is_some_and(|c| !c.is_null())
+            || text("labelAlign").as_deref() == Some("right")
+    };
+    match id {
+        "layout.addElement" => {
+            text("kind").as_deref() == Some("chart")
+                && (only_chart() || text("orientation").as_deref() == Some("vertical") || params.get("title").is_some_and(|t| !t.is_null()))
+        }
+        "layout.update" => only_chart(),
+        "layout.import" => ["\"orientation\"", "\"values\"", "\"decimals\"", "\"title\"", "\"bar_color\"", "\"label_align\""]
+            .iter()
+            .any(|key| imported_layout_uses(params, key, charts_look)),
+        "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_uses_chart_look)),
+        _ => false,
+    }
+}
+
+fn charts_classes(e: &rustgis_map::layout::Element) -> bool {
+    e.kind.chart_uses_classes()
+}
+
+/// A layout command that colours a chart's bars by its layer's classes (#2487 part 3): an older
+/// reader ignores the key and draws every bar in the chart's bar colour. `false` keeps a chart
+/// as an older reader draws it; only a chart takes the key, so a `layout.update` is read by it
+/// alone.
+fn command_uses_chart_classes(id: &str, params: &Value) -> bool {
+    let classes = || params.get("classes").and_then(crate::cmd::bool_value) == Some(true);
+    match id {
+        "layout.addElement" => {
+            params.get("kind").and_then(Value::as_str).is_some_and(|k| k.trim().eq_ignore_ascii_case("chart")) && classes()
+        }
+        "layout.update" => classes(),
+        "layout.import" => imported_layout_uses(params, "\"classes\"", charts_classes),
+        "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_uses_chart_classes)),
         _ => false,
     }
 }
@@ -246,13 +396,20 @@ fn relief_light(layer: &Layer) -> bool {
     )
 }
 
-/// The renderer capabilities a layer needs, in [`map_capabilities`]'s order.
+/// Whether a layer is a window of a Zarr variable following the time slider (#1720): an older
+/// reader would drop the window and read the whole map at each step.
+fn zarr_window(layer: &Layer) -> bool {
+    layer.raster.as_ref().and_then(|r| r.time_zarr.as_ref()).is_some_and(|z| z.window.is_some())
+}
+
+/// The capabilities a layer needs, in [`map_capabilities`]'s order.
 fn layer_capabilities(layer: &Layer) -> Vec<&'static str> {
     [
         (relief_effects(layer), "shaded-relief-effects"),
         (relief_light(layer), "shaded-relief-light"),
         (layer.size_by.is_some(), super::SIZE_BY_CAPABILITY),
         (layer.has_picture_markers(), "picture-markers"),
+        (zarr_window(layer), "zarr-window"),
     ]
     .into_iter()
     .filter_map(|(used, name)| used.then_some(name))
@@ -260,32 +417,57 @@ fn layer_capabilities(layer: &Layer) -> Vec<&'static str> {
 }
 
 fn map_capabilities<'a>(maps: impl IntoIterator<Item = &'a Map>) -> Vec<&'static str> {
-    let (mut block, mut water, mut shore, mut relief, mut light, mut legends, mut sized, mut pictures) =
-        (false, false, false, false, false, false, false, false);
+    let (
+        mut block,
+        mut shape,
+        mut water,
+        mut shore,
+        mut block_water,
+        mut relief,
+        mut light,
+        mut legends,
+        mut sized,
+        mut pictures,
+        mut zarr,
+    ) = (false, false, false, false, false, false, false, false, false, false, false);
+    let (mut offline_area_id, mut paper) = (false, false);
     for map in maps {
+        offline_area_id |= map.offline_area_id.is_some();
+        // A blank basemap's paper colour (#2532), which an older reader would draw and save white.
+        paper |= map.paper.is_some();
         if let Some(t) = &map.view.terrain {
             block |= t.block.is_some();
+            // A round block (#2318), which an older reader would draw and save as a box.
+            shape |= t.block.as_ref().is_some_and(|b| !b.shape.is_box());
             water |= t.water.is_some();
             // A shore band other than the default, which an older reader would save away.
             shore |= t.water.as_ref().is_some_and(|w| w.shore != rustgis_map::view::WATER_SHORE);
+            // The water in a block's walls (#2317), which an older reader would save away.
+            block_water |= t.block.as_ref().is_some_and(|b| b.water.is_some());
         }
         relief |= map.layers.iter().any(relief_effects);
         light |= map.layers.iter().any(relief_light);
         sized |= map.layers.iter().any(|layer| layer.size_by.is_some());
         pictures |= map.layers.iter().any(Layer::has_picture_markers);
+        zarr |= map.layers.iter().any(zarr_window);
         legends |= map.tiles.iter().any(|tile| {
             tile.legends.iter().any(|legend| rustgis_data::login_address::inner(&legend.url).len() > rustgis_map::tiles::MAX_LEGEND_URL)
         });
     }
     [
         (block, "terrain-block"),
+        (shape, "terrain-block-shape"),
         (water, "terrain-water"),
         (shore, "terrain-water-shore"),
+        (block_water, "terrain-block-water"),
         (relief, "shaded-relief-effects"),
         (light, "shaded-relief-light"),
         (legends, "normalized-legend-urls"),
         (sized, super::SIZE_BY_CAPABILITY),
         (pictures, "picture-markers"),
+        (zarr, "zarr-window"),
+        (offline_area_id, "offline-map-area-id"),
+        (paper, "blank-paper"),
     ]
     .into_iter()
     .filter_map(|(used, name)| used.then_some(name))
@@ -630,6 +812,239 @@ mod tests {
         }
     }
 
+    /// A text that wraps to its box is required where it is saved (#2346), so an older reader
+    /// refuses the project instead of drawing it on its own line breaks; so is a saved command
+    /// that makes one wrap, which an older reader would run without it. Unwrapping needs nothing.
+    #[test]
+    fn element_wrap_capability_follows_saved_layouts_and_commands() {
+        use rustgis_map::layout::ElementKind;
+        let fixture = Project::from_json(include_str!("../../../schema/fixtures/layout_element_wrap.rgis")).unwrap();
+        let saved = serde_json::to_value(&fixture).unwrap();
+        assert_eq!(saved["requires"], json!(["layout-element-wrap"]));
+        let wrapped = |p: &Project| p.layouts[0].elements.iter().filter(|e| matches!(e.kind, ElementKind::Text { wrap: true, .. })).count();
+        assert_eq!(wrapped(&Project::from_json(&saved.to_string()).unwrap()), 1);
+        let mut clean = fixture;
+        for e in &mut clean.layouts[0].elements {
+            if let ElementKind::Text { wrap, .. } = &mut e.kind {
+                *wrap = false;
+            }
+        }
+        let base = serde_json::to_value(&clean).unwrap();
+        assert!(base.get("requires").is_none(), "unwrapped texts need nothing");
+        assert!(!base["layouts"].to_string().contains("wrap"), "nor write it");
+        let layout = &saved["layouts"][0];
+        for (id, params, required) in [
+            ("layout.addElement", json!({"kind": "text", "wrap": true}), true),
+            ("layout.update", json!({"element": 2, "wrap": "on"}), true),
+            ("layout.update", json!({"element": 2, "wrap": false}), false),
+            ("layout.update", json!({"element": 2, "wrap": null}), false),
+            ("layout.update", json!({"element": 2, "text": "wrap"}), false),
+            ("layout.import", json!({"text": layout.to_string()}), true),
+            ("layout.import", json!({"text": base["layouts"][0].to_string()}), false),
+            ("layout.import", json!({"path": "notes.rgislayout"}), false),
+        ] {
+            let script = format!("{id}= {params}");
+            for value in [
+                json!([{"name": "Task", "steps": [{"title": "Note", "command": id, "params": params}]}]),
+                json!([{"name": "Script", "steps": [{"title": "Note", "command": "script.run", "params": {"script": script}}]}]),
+            ] {
+                let mut document = base.clone();
+                document["tasks"] = value;
+                let saved = serde_json::to_value(Project::from_json(&document.to_string()).unwrap()).unwrap();
+                let expected = if required { json!(["layout-element-wrap"]) } else { Value::Null };
+                assert_eq!(saved.get("requires").cloned().unwrap_or(Value::Null), expected, "{id} {params}");
+            }
+        }
+    }
+
+    /// A chart grouped, ordered, cut or with an Other bar is required where it is saved, so an
+    /// older reader refuses the project instead of drawing a bar per feature, the 20 largest; so
+    /// is a saved command that makes one. Options at their defaults, or a group taken away, need
+    /// nothing, nor are they written.
+    #[test]
+    fn chart_data_capability_follows_saved_layouts_and_commands() {
+        use rustgis_map::layout::{CHART_BARS, ChartOrder, ElementKind};
+        use rustgis_map::report::StatKind;
+        let fixture = Project::from_json(include_str!("../../../schema/fixtures/layout_chart_data.rgis")).unwrap();
+        let saved = serde_json::to_value(&fixture).unwrap();
+        assert_eq!(saved["requires"], json!(["layout-chart-data"]));
+        let reread = Project::from_json(&saved.to_string()).unwrap();
+        assert!(matches!(
+            &reread.layouts[0].elements[1].kind,
+            ElementKind::Chart { group: Some(g), statistic: StatKind::Mean, order: ChartOrder::Category, bars: 5, other: true, .. } if g == "region"
+        ));
+        let mut clean = fixture;
+        for e in &mut clean.layouts[0].elements {
+            if let ElementKind::Chart { group, statistic, order, bars, other, .. } = &mut e.kind {
+                (*group, *statistic, *order, *bars, *other) = (None, StatKind::default(), ChartOrder::default(), CHART_BARS, false);
+            }
+        }
+        let base = serde_json::to_value(&clean).unwrap();
+        assert!(base.get("requires").is_none(), "a plain chart needs nothing");
+        for key in ["group", "statistic", "order", "bars", "other"] {
+            assert!(!base["layouts"].to_string().contains(&format!("\"{key}\"")), "nor writes {key}");
+        }
+        let layout = &saved["layouts"][0];
+        for (id, params, required) in [
+            ("layout.addElement", json!({"kind": "chart", "group": "region"}), true),
+            ("layout.update", json!({"element": 2, "statistic": "count"}), true),
+            ("layout.update", json!({"element": 2, "order": "layer"}), true),
+            ("layout.update", json!({"element": 2, "bars": 8}), true),
+            ("layout.update", json!({"element": 2, "other": "on"}), true),
+            ("layout.update", json!({"element": 2, "group": ""}), false),
+            ("layout.update", json!({"element": 2, "statistic": "sum", "order": "descending", "bars": 20, "other": false}), false),
+            ("layout.update", json!({"element": 2, "label": "name"}), true),
+            ("layout.update", json!({"element": 2, "label": ""}), true),
+            ("layout.addElement", json!({"kind": "chart", "label": "name"}), false),
+            ("layout.import", json!({"text": layout.to_string()}), true),
+            ("layout.import", json!({"text": base["layouts"][0].to_string()}), false),
+            ("layout.import", json!({"path": "regions.rgislayout"}), false),
+        ] {
+            let script = format!("{id}= {params}");
+            for value in [
+                json!([{"name": "Task", "steps": [{"title": "Chart", "command": id, "params": params}]}]),
+                json!([{"name": "Script", "steps": [{"title": "Chart", "command": "script.run", "params": {"script": script}}]}]),
+            ] {
+                let mut document = base.clone();
+                document["tasks"] = value;
+                let saved = serde_json::to_value(Project::from_json(&document.to_string()).unwrap()).unwrap();
+                let expected = if required { json!(["layout-chart-data"]) } else { Value::Null };
+                assert_eq!(saved.get("requires").cloned().unwrap_or(Value::Null), expected, "{id} {params}");
+            }
+        }
+    }
+
+    /// A chart drawn as columns, with its values, their decimals, its own title or none, a bar
+    /// colour or labels against its bars is required where it is saved, so an older reader
+    /// refuses the project instead of drawing it as bars running across in the default blue; so
+    /// is a saved command that draws one so. Options at their defaults need nothing, nor are
+    /// they written, and a legend's or colorbar's title or orientation needs nothing either.
+    #[test]
+    fn chart_look_capability_follows_saved_layouts_and_commands() {
+        use rustgis_map::layout::{CHART_BARS, ChartOrder, ElementKind, Orientation, TextAlign};
+        use rustgis_map::report::StatKind;
+        let fixture = Project::from_json(include_str!("../../../schema/fixtures/layout_chart_look.rgis")).unwrap();
+        let saved = serde_json::to_value(&fixture).unwrap();
+        assert_eq!(saved["requires"], json!(["layout-chart-data", "layout-chart-look"]));
+        let reread = Project::from_json(&saved.to_string()).unwrap();
+        assert!(matches!(
+            &reread.layouts[0].elements[1].kind,
+            ElementKind::Chart {
+                orientation: Orientation::Vertical,
+                values: true,
+                decimals: Some(1),
+                title: Some(t),
+                bar_color: Some(c),
+                label_align: TextAlign::Right,
+                ..
+            } if t == "Mean people by region" && c.hex() == "#C2185B"
+        ));
+        let mut clean = fixture;
+        for e in &mut clean.layouts[0].elements {
+            if let ElementKind::Chart {
+                group,
+                statistic,
+                order,
+                bars,
+                other,
+                orientation,
+                values,
+                decimals,
+                title,
+                bar_color,
+                label_align,
+                ..
+            } = &mut e.kind
+            {
+                (*group, *statistic, *order, *bars, *other) = (None, StatKind::default(), ChartOrder::default(), CHART_BARS, false);
+                (*orientation, *values, *decimals, *title, *bar_color, *label_align) =
+                    (Orientation::Horizontal, false, None, None, None, TextAlign::Left);
+            }
+        }
+        let base = serde_json::to_value(&clean).unwrap();
+        assert!(base.get("requires").is_none(), "a chart drawn as before needs nothing");
+        for key in ["orientation", "values", "decimals", "title", "bar_color", "label_align"] {
+            assert!(!base["layouts"].to_string().contains(&format!("\"{key}\"")), "nor writes {key}");
+        }
+        let mut document = base.clone();
+        document["tasks"] = json!([{"name": "Task", "steps": [{"title": "Chart", "command": "layout.import", "params": {"text": saved["layouts"][0].to_string()}}]}]);
+        let imported = serde_json::to_value(Project::from_json(&document.to_string()).unwrap()).unwrap();
+        assert_eq!(imported["requires"], json!(["layout-chart-data", "layout-chart-look"]));
+        for (id, params, required) in [
+            ("layout.addElement", json!({"kind": "chart", "orientation": "vertical"}), true),
+            ("layout.addElement", json!({"kind": "chart", "orientation": "horizontal"}), false),
+            ("layout.addElement", json!({"kind": "chart", "title": ""}), true),
+            ("layout.addElement", json!({"kind": "chart", "values": true}), true),
+            ("layout.addElement", json!({"kind": "chart", "decimals": "auto"}), false),
+            ("layout.addElement", json!({"kind": "colorbar", "orientation": "vertical", "title": "Height"}), false),
+            ("layout.addElement", json!({"kind": "legend", "title": "Key"}), false),
+            ("layout.update", json!({"element": 2, "decimals": 0}), true),
+            ("layout.update", json!({"element": 2, "barColor": "#C2185B"}), true),
+            ("layout.update", json!({"element": 2, "labelAlign": "right"}), true),
+            ("layout.update", json!({"element": 2, "labelAlign": "left", "values": false, "barColor": null}), false),
+            ("layout.update", json!({"element": 2, "title": "Key"}), false),
+            ("layout.import", json!({"text": base["layouts"][0].to_string()}), false),
+        ] {
+            let script = format!("{id}= {params}");
+            for value in [
+                json!([{"name": "Task", "steps": [{"title": "Chart", "command": id, "params": params}]}]),
+                json!([{"name": "Script", "steps": [{"title": "Chart", "command": "script.run", "params": {"script": script}}]}]),
+            ] {
+                let mut document = base.clone();
+                document["tasks"] = value;
+                let saved = serde_json::to_value(Project::from_json(&document.to_string()).unwrap()).unwrap();
+                let expected = if required { json!(["layout-chart-look"]) } else { Value::Null };
+                assert_eq!(saved.get("requires").cloned().unwrap_or(Value::Null), expected, "{id} {params}");
+            }
+        }
+    }
+
+    /// A chart coloured by its layer's classes (#2487 part 3) is required where it is saved, so an
+    /// older reader refuses the project instead of drawing every bar in the chart's colour; so is
+    /// a saved command that colours one. `false` needs nothing, nor is it written.
+    #[test]
+    fn chart_classes_capability_follows_saved_layouts_and_commands() {
+        use rustgis_map::layout::ElementKind;
+        let fixture = Project::from_json(include_str!("../../../schema/fixtures/layout_chart_classes.rgis")).unwrap();
+        let saved = serde_json::to_value(&fixture).unwrap();
+        assert_eq!(saved["requires"], json!(["layout-chart-classes"]));
+        let reread = Project::from_json(&saved.to_string()).unwrap();
+        assert!(matches!(&reread.layouts[0].elements[1].kind, ElementKind::Chart { classes: true, .. }));
+        let mut clean = fixture;
+        for e in &mut clean.layouts[0].elements {
+            if let ElementKind::Chart { classes, .. } = &mut e.kind {
+                *classes = false;
+            }
+        }
+        let base = serde_json::to_value(&clean).unwrap();
+        assert!(base.get("requires").is_none(), "a chart in one colour needs nothing");
+        assert!(!base["layouts"].to_string().contains("\"classes\""), "nor writes classes");
+        let mut document = base.clone();
+        document["tasks"] = json!([{"name": "Task", "steps": [{"title": "Chart", "command": "layout.import", "params": {"text": saved["layouts"][0].to_string()}}]}]);
+        let imported = serde_json::to_value(Project::from_json(&document.to_string()).unwrap()).unwrap();
+        assert_eq!(imported["requires"], json!(["layout-chart-classes"]));
+        for (id, params, required) in [
+            ("layout.addElement", json!({"kind": "chart", "classes": true}), true),
+            ("layout.addElement", json!({"kind": "chart", "classes": false}), false),
+            ("layout.addElement", json!({"kind": "legend", "classes": true}), false),
+            ("layout.update", json!({"element": 2, "classes": true}), true),
+            ("layout.update", json!({"element": 2, "classes": false}), false),
+            ("layout.import", json!({"text": base["layouts"][0].to_string()}), false),
+        ] {
+            let script = format!("{id}= {params}");
+            for value in [
+                json!([{"name": "Task", "steps": [{"title": "Chart", "command": id, "params": params}]}]),
+                json!([{"name": "Script", "steps": [{"title": "Chart", "command": "script.run", "params": {"script": script}}]}]),
+            ] {
+                let mut document = base.clone();
+                document["tasks"] = value;
+                let saved = serde_json::to_value(Project::from_json(&document.to_string()).unwrap()).unwrap();
+                let expected = if required { json!(["layout-chart-classes"]) } else { Value::Null };
+                assert_eq!(saved.get("requires").cloned().unwrap_or(Value::Null), expected, "{id} {params}");
+            }
+        }
+    }
+
     #[test]
     fn field_identity_is_preserved_and_required_in_a_plain_saved_project() {
         let project = Project::from_json(include_str!("../../../schema/fixtures/field_origin.rgis")).unwrap();
@@ -742,6 +1157,137 @@ mod tests {
         let mut unknown = saved;
         unknown["requires"] = json!(["future-terrain"]);
         assert!(Project::from_json(&unknown.to_string()).unwrap_err().contains("future-terrain"));
+    }
+
+    /// A Zarr window following the time slider (#1720) is required by name in a project, a map
+    /// file and a layer file: an older reader would drop it and read the whole map at each step.
+    #[test]
+    fn a_zarr_window_is_required_where_it_is_saved() {
+        let mut p = Project::from_json(include_str!("../../../schema/fixtures/zarr_window.rgis")).unwrap();
+        let layer = p.map().layers[0].clone();
+        assert_eq!(
+            layer.raster.as_ref().and_then(|r| r.time_zarr.as_ref()).and_then(|z| z.window),
+            Some([1526419, 1162633, 1526643, 1162857])
+        );
+        let saved = serde_json::to_value(&p).unwrap();
+        assert_eq!(saved["requires"], json!(["zarr-window"]));
+        assert_eq!(json_bytes(&map_file_bytes(p.map()).unwrap())["requires"], saved["requires"]);
+        assert_eq!(json_bytes(&layer_file_bytes(&layer).unwrap())["requires"], saved["requires"]);
+        // The whole variable following the slider needs nothing new.
+        if let Some(z) = p.maps[0].layers[0].raster.as_mut().and_then(|r| r.time_zarr.as_mut()) {
+            z.window = None;
+        }
+        assert!(serde_json::to_value(&p).unwrap().get("requires").is_none());
+        let mut unknown = saved;
+        unknown["requires"] = json!(["zarr-window", "future-zarr"]);
+        assert!(Project::from_json(&unknown.to_string()).unwrap_err().contains("future-zarr"));
+    }
+
+    /// A blank basemap's paper colour (#2532) is required by name in a project and a map file: an
+    /// older reader would draw the paper white and save the colour away. White paper needs nothing.
+    #[test]
+    fn a_blank_paper_colour_is_required_where_it_is_saved() {
+        let mut p = Project::from_json(include_str!("../../../schema/fixtures/blank_paper.rgis")).unwrap();
+        assert_eq!(p.map().blank_paper(), Some(rustgis_map::Rgba::rgb(241, 234, 223)));
+        let saved = serde_json::to_value(&p).unwrap();
+        assert_eq!(saved["requires"], json!(["blank-paper"]));
+        assert_eq!(saved["maps"][0]["paper"], json!([241, 234, 223, 255]));
+        assert_eq!(json_bytes(&map_file_bytes(p.map()).unwrap())["requires"], saved["requires"]);
+        p.maps[0].paper = None;
+        let clean = serde_json::to_value(&p).unwrap();
+        assert!(clean.get("requires").is_none());
+        assert!(clean["maps"][0].get("paper").is_none());
+        // A saved command that gives the blank basemap a colour needs it too; white, null or
+        // another basemap doesn't.
+        for (params, required) in [
+            (json!({"name": "blank", "color": "#F1EADF"}), true),
+            (json!({"name": "Blank", "color": "#101820"}), true),
+            (json!({"name": "blank", "color": "#ffffff"}), false),
+            (json!({"name": "blank", "color": null}), false),
+            (json!({"name": "blank"}), false),
+            (json!({"name": "paper", "color": "#F1EADF"}), false),
+        ] {
+            let script = format!("# Paper\nmap.basemap= {params}");
+            for (field, value) in [
+                ("tasks", json!([{"name": "Task", "steps": [{"title": "Paper", "command": "map.basemap", "params": params}]}])),
+                (
+                    "tasks",
+                    json!([{"name": "Script", "steps": [{"title": "Paper", "command": "script.run", "params": {"script": script}}]}]),
+                ),
+                ("notebooks", json!([{"name": "Notebook", "cells": [{"kind": "code", "source": script}]}])),
+            ] {
+                let mut document = clean.clone();
+                document[field] = value;
+                let saved = serde_json::to_value(Project::from_json(&document.to_string()).unwrap()).unwrap();
+                if required {
+                    assert_eq!(saved["requires"], json!(["blank-paper"]), "{field} {params}");
+                } else {
+                    assert!(saved.get("requires").is_none(), "{field} {params}");
+                }
+            }
+        }
+        let mut unknown = saved;
+        unknown["requires"] = json!(["blank-paper", "future-paper"]);
+        assert!(Project::from_json(&unknown.to_string()).unwrap_err().contains("future-paper"));
+    }
+
+    /// A map frame's border other than the default (#2557) is required where it is saved, so an
+    /// older reader refuses the project instead of drawing the default line and saving it so. The
+    /// default border is not written and needs nothing.
+    #[test]
+    fn frame_border_capability_follows_saved_layouts_and_commands() {
+        let fixture = Project::from_json(include_str!("../../../schema/fixtures/layout_frame_border.rgis")).unwrap();
+        let saved = serde_json::to_value(&fixture).unwrap();
+        assert_eq!(saved["requires"], json!(["layout-frame-border"]));
+        let frames = &saved["layouts"][0]["elements"];
+        assert!(frames[0]["kind"]["MapFrame"].get("border_color").is_none());
+        assert!(frames[0]["kind"]["MapFrame"].get("border_width").is_none());
+        assert_eq!(frames[1]["kind"]["MapFrame"]["border_width"], json!(0.0));
+        assert_eq!(frames[2]["kind"]["MapFrame"]["border_color"], json!([200, 184, 154, 255]));
+        let reopened = Project::from_json(&saved.to_string()).unwrap();
+        assert_eq!(reopened.layouts, fixture.layouts);
+        let mut clean = fixture;
+        for e in &mut clean.layouts[0].elements {
+            if let rustgis_map::layout::ElementKind::MapFrame { border_color, border_width, .. } = &mut e.kind {
+                *border_color = rustgis_map::layout::FRAME_BORDER_COLOR;
+                *border_width = rustgis_map::layout::FRAME_BORDER_WIDTH;
+            }
+        }
+        let base = serde_json::to_value(&clean).unwrap();
+        assert!(base.get("requires").is_none(), "default borders need nothing");
+        // A saved update that changes a border needs it; null only gives the default back.
+        for (params, required) in [
+            (json!({"element": 1, "border": {"width": 0}}), true),
+            (json!({"element": 1, "border": {"color": "#C8B89A"}}), true),
+            (json!({"element": 1, "border": null}), false),
+            (json!({"element": 1, "name": "Main"}), false),
+        ] {
+            let script = format!("layout.update {params}");
+            for value in [
+                json!([{"name": "Task", "steps": [{"title": "Border", "command": "layout.update", "params": params}]}]),
+                json!([{"name": "Script", "steps": [{"title": "Border", "command": "script.run", "params": {"script": script}}]}]),
+            ] {
+                let mut document = base.clone();
+                document["tasks"] = value;
+                let saved = serde_json::to_value(Project::from_json(&document.to_string()).unwrap()).unwrap();
+                if required {
+                    assert_eq!(saved["requires"], json!(["layout-frame-border"]), "{params}");
+                } else {
+                    assert!(saved.get("requires").is_none(), "{params}");
+                }
+            }
+        }
+        // An imported layout's text with a changed border needs it; with the default, none.
+        for (layout, required) in [(&saved["layouts"][0], true), (&base["layouts"][0], false)] {
+            let params = json!({"text": layout.to_string()});
+            let mut document = base.clone();
+            document["tasks"] = json!([{"name": "Task", "steps": [{"title": "Import", "command": "layout.import", "params": params}]}]);
+            let saved = serde_json::to_value(Project::from_json(&document.to_string()).unwrap()).unwrap();
+            assert_eq!(saved.get("requires").is_some(), required, "{layout}");
+        }
+        let mut unknown = saved;
+        unknown["requires"] = json!(["layout-frame-border", "future-border"]);
+        assert!(Project::from_json(&unknown.to_string()).unwrap_err().contains("future-border"));
     }
 
     /// Nondefault relief effects survive project, map and layer files; ordinary relief needs none.

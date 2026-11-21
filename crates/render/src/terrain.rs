@@ -15,7 +15,7 @@ use rustgis_tiles::template::{self, TileId};
 
 mod water;
 
-pub(crate) use water::{Glint, Water, paint_shore};
+pub(crate) use water::{Glint, SHORE_PX, Water, paint_shore};
 
 /// Cells along each side of a tilted view's band laid over the relief while the map moves (the
 /// drape, `tilt_drape` in the app): few enough to lay out every frame.
@@ -110,6 +110,9 @@ pub struct Block {
     /// that arrives, so the walls wait (the ground is cut all the same).
     pub settled: bool,
     pub walls: Rgba,
+    /// A round block (#2318): its circle's centre and radius (Web Mercator), the box above being
+    /// the one round it. None: the box.
+    pub circle: Option<(Coord, f64)>,
 }
 
 impl Block {
@@ -140,7 +143,7 @@ impl Ground {
     /// there.
     pub fn of(map: &Map, camera: &Camera) -> Option<Ground> {
         let mut ground = Ground::heights_of(map, camera)?;
-        ground.attach_water(map);
+        ground.attach_water(map, camera);
         Some(ground)
     }
 
@@ -148,8 +151,8 @@ impl Ground {
     /// on their way, taken again from its cache, leaves these heights pending too: inside its
     /// lakes no tile is read, and a frame or an export waiting for tiles must still wait for the
     /// levels to be read again.
-    fn attach_water(&mut self, map: &Map) {
-        self.water = water::of(map, self);
+    fn attach_water(&mut self, map: &Map, camera: &Camera) {
+        self.water = water::of(map, camera, self);
         if self.water.as_ref().is_some_and(|w| w.waits_for_tiles())
             && let Heights::Tiles { pending, .. } = &self.heights
         {
@@ -161,7 +164,13 @@ impl Ground {
     /// cell of the heights a view of `camera` reads (#1915; see [`Ground::water_coarse`]), from
     /// their shapes alone: nothing is read, no elevation tile asked for. 0 without water.
     pub fn water_coarse_unread(map: &Map, camera: &Camera) -> usize {
-        Ground::heights_of(map, camera).map_or(0, |g| water::coarse_shores(map, &g))
+        Ground::heights_of(map, camera).map_or(0, |g| water::coarse_shores(map, camera, &g))
+    }
+
+    /// Whether a view of `camera` has terrain on `map` ([`Ground::of`] is `Some`), without reading
+    /// its water.
+    pub(crate) fn has_heights(map: &Map, camera: &Camera) -> bool {
+        Ground::heights_of(map, camera).is_some()
     }
 
     /// [`Ground::of`] without its water.
@@ -256,6 +265,11 @@ impl Ground {
         per_unit(m, self.body)
     }
 
+    /// How much the heights are stretched (`Terrain::exaggeration`, as read).
+    pub(crate) fn exaggeration(&self) -> f64 {
+        self.exaggeration
+    }
+
     /// Where the Web Mercator point `m` falls on the ground's grid, in its cells (column, row):
     /// a DEM's pixels; elevation tiles' pixels at the zoom read. `None` off the DEM's plane.
     pub fn grid_point(&self, m: Coord) -> Option<(f64, f64)> {
@@ -334,8 +348,9 @@ impl Ground {
     }
 
     /// The block diagram `map`'s terrain is cut to, when it has one: its box (the DEM's extent
-    /// when none is given; none over elevation tiles then), and its base `depth` metres below the
-    /// lowest ground read in it (on a grid of [`BLOCK_SAMPLES`] cells a side; where a DEM has no
+    /// when none is given; none over elevation tiles then) or the circle in it, and its base
+    /// `depth` metres below the lowest ground read in it (on a grid of [`BLOCK_SAMPLES`] cells a
+    /// side, inside the circle for a round block; where a DEM has no
     /// height, 0, as the ground is drawn there; while elevation tiles are on their way, not
     /// [`Block::settled`]), or
     /// half its relief, at least `BLOCK_MIN_DEPTH`, both exaggerated as the heights are.
@@ -350,6 +365,16 @@ impl Ground {
             (None, Heights::Raster { raster, .. }) => raster_box(raster)?,
             (None, Heights::Tiles { .. }) => return None,
         };
+        // A round block (#2318): the largest circle in the box, or a smaller one, centred in it;
+        // the box is then the one round the circle.
+        let circle = match b.shape {
+            rustgis_map::view::BlockShape::Box => None,
+            rustgis_map::view::BlockShape::Circle { radius } => {
+                let r = (x1 - x0).min(y1 - y0) / 2.0;
+                Some((Coord::new((x0 + x1) / 2.0, (y0 + y1) / 2.0), radius.map_or(r, |q| q.min(r))))
+            }
+        };
+        let [x0, y0, x1, y1] = circle.map_or([x0, y0, x1, y1], |(c, r)| [c.x - r, c.y - r, c.x + r, c.y + r]);
         let world = 2.0 * std::f64::consts::PI * MERCATOR_R;
         let coarse = (world / (x1 - x0).max(y1 - y0).max(1e-9)).log2().floor();
         let coarse = if coarse.is_finite() { coarse.clamp(0.0, f64::from(MAX_TILE_ZOOM)) as u8 } else { 0 };
@@ -370,7 +395,12 @@ impl Ground {
         let n = BLOCK_SAMPLES as f64;
         let (mut lo, mut hi, mut missing) = (f64::INFINITY, f64::NEG_INFINITY, false);
         for (i, j) in (0..=BLOCK_SAMPLES).flat_map(|j| (0..=BLOCK_SAMPLES).map(move |i| (i as f64, j as f64))) {
-            match sample(Coord::new(x0 + (x1 - x0) * i / n, y0 + (y1 - y0) * j / n)) {
+            let m = Coord::new(x0 + (x1 - x0) * i / n, y0 + (y1 - y0) * j / n);
+            // A round block's ground off its circle isn't drawn, so doesn't set its base.
+            if circle.is_some_and(|(c, r)| (m.x - c.x).hypot(m.y - c.y) > r * (1.0 + 1e-9)) {
+                continue;
+            }
+            match sample(m) {
                 Some(h) => (lo, hi) = (lo.min(h), hi.max(h)),
                 None => missing = true,
             }
@@ -390,7 +420,7 @@ impl Ground {
             Some(d) => d * self.exaggeration,
             None => (0.5 * (hi - lo)).max(rustgis_map::view::BLOCK_MIN_DEPTH * self.exaggeration),
         };
-        Some(Block { x0, y0, x1, y1, base: lo - depth, settled, walls: b.walls })
+        Some(Block { x0, y0, x1, y1, base: lo - depth, settled, walls: b.walls, circle })
     }
 
     /// Whether elevation tiles are still on their way (drawing again later shows more).
@@ -629,6 +659,8 @@ mod tests {
             depth: Some(1000.0),
             walls: rustgis_map::view::BLOCK_WALLS,
             walls_layer: None,
+            water: None,
+            shape: rustgis_map::view::BlockShape::Box,
         };
         m.view.terrain = Some(rustgis_map::view::Terrain {
             source: rustgis_map::view::TerrainSource::Layer("dem".into()),
@@ -672,6 +704,8 @@ mod tests {
             depth: Some(300.0),
             walls: rustgis_map::view::BLOCK_WALLS,
             walls_layer: None,
+            water: None,
+            shape: rustgis_map::view::BlockShape::Box,
         };
         m.view.terrain = Some(rustgis_map::view::Terrain {
             source: rustgis_map::view::TerrainSource::Tiles {

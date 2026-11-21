@@ -11,6 +11,13 @@ use crate::{RustGisApp, icons};
 pub const CONTENT_H: f32 = 72.0;
 pub const LABEL_H: f32 = 18.0;
 
+/// The least width of a ribbon button's menu.
+pub const MENU_MIN_W: f32 = 200.0;
+
+/// The least width of a submenu, so one of short rows (a page size's styles) doesn't open as a
+/// strip; narrower than a menu, whose rows have room for an icon and a shortcut (#2398).
+pub const SUBMENU_MIN_W: f32 = 100.0;
+
 /// A number its caller lends saved each frame and saves only once it is settled, kept across a
 /// drag (#597, #607). egui's `DragValue` keeps the value dragged so far in its own memory and
 /// forgets it when the pointer is released, a frame on which `dragged()` is false: lent the saved
@@ -275,18 +282,23 @@ fn tooltip_for(app: &RustGisApp, resp: Response, title: &str, desc: &str, id: &s
 }
 
 fn bg(ui: &Ui, r: Rect, resp: &Response, checked: bool, t: &Tokens) {
-    let fill = if resp.is_pointer_button_down_on() {
-        t.pressed
-    } else if checked {
-        t.checked
-    } else if resp.hovered() {
-        t.hover
-    } else {
-        return;
-    };
+    let Some(fill) = bg_fill(resp, checked, t) else { return };
     ui.painter().rect_filled(r, CornerRadius::same(6), fill);
     if checked {
         ui.painter().rect_stroke(r, CornerRadius::same(6), Stroke::new(1.0, t.accent.gamma_multiply(0.55)), egui::StrokeKind::Inside);
+    }
+}
+
+/// The fill a ribbon button paints behind its icon in `resp`'s state, if any (none at rest).
+pub fn bg_fill(resp: &Response, checked: bool, t: &Tokens) -> Option<egui::Color32> {
+    if resp.is_pointer_button_down_on() {
+        Some(t.pressed)
+    } else if checked {
+        Some(t.checked)
+    } else if resp.hovered() {
+        Some(t.hover)
+    } else {
+        None
     }
 }
 
@@ -327,9 +339,8 @@ pub fn big(
 /// The shared icon and label layout of large ribbon controls. A split button gives this only
 /// its primary region, keeping even a long translated label clear of the adjacent arrow.
 fn paint_big(ui: &Ui, r: Rect, icon: &str, label: &str, on: bool, menu: bool, t: &Tokens) {
-    let ic = Rect::from_center_size(pos2(r.center().x, r.min.y + 21.0), vec2(32.0, 32.0));
     let (c, a) = if on { (t.icon, t.accent) } else { (t.text_disabled, t.text_disabled) };
-    icons::paint(ui.painter(), ic, icon, c, a);
+    icons::paint(ui.painter(), big_icon_rect(r), icon, c, a);
     let mut lines = label.split('\n').peekable();
     let mut y = r.min.y + 42.0;
     while let Some(l) = lines.next() {
@@ -450,11 +461,13 @@ fn big_split_menu_with(
         let _ = app.run_by_user(id, params);
     }
     egui::Popup::menu(&arrow).close_behavior(close).show(|ui| {
-        ui.set_min_width(200.0);
+        ui.set_min_width(MENU_MIN_W);
         menu(ui, app);
     });
     (primary, arrow)
 }
+
+pub(crate) const SMALL_ICON_BUTTON_WIDTH: f32 = 26.0;
 
 /// A small button: 18 px icon with an optional label.
 pub fn small(ui: &mut Ui, app: &mut RustGisApp, icon: &str, label: &str, desc: &str, id: &str, params: Value, checked: bool) -> Response {
@@ -495,10 +508,10 @@ fn small_button(
     let (label, desc) = (tl!(label), tl!(desc));
     let t = Tokens::get(ui.ctx());
     let tw = if label.is_empty() { 0.0 } else { text_w(ui, label, regular(11.5)) + 8.0 };
-    let (r, resp) = ui.allocate_exact_size(vec2(26.0 + tw, 22.0), Sense::click());
+    let (r, resp) = ui.allocate_exact_size(vec2(SMALL_ICON_BUTTON_WIDTH + tw, 22.0), Sense::click());
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, on, if label.is_empty() { desc } else { label }));
     bg(ui, r, &resp, checked, &t);
-    let ic = Rect::from_center_size(pos2(r.min.x + 13.0, r.center().y), vec2(18.0, 18.0));
+    let ic = small_icon_rect(r);
     let (c, a) = if on { (t.icon, t.accent) } else { (t.text_disabled, t.text_disabled) };
     icons::paint(ui.painter(), ic, icon, c, a);
     if !label.is_empty() {
@@ -523,7 +536,7 @@ fn small_button(
 pub fn big_menu(ui: &mut Ui, app: &mut RustGisApp, icon: &str, label: &str, desc: &str, menu: impl FnOnce(&mut Ui, &mut RustGisApp)) {
     let resp = big(ui, app, icon, label, desc, "ui.menu", Value::Null, false, true);
     egui::Popup::menu(&resp).show(|ui| {
-        ui.set_min_width(200.0);
+        ui.set_min_width(MENU_MIN_W);
         menu(ui, app);
     });
 }
@@ -533,7 +546,7 @@ pub fn big_menu(ui: &mut Ui, app: &mut RustGisApp, icon: &str, label: &str, desc
 pub fn big_form_menu(ui: &mut Ui, app: &mut RustGisApp, icon: &str, label: &str, desc: &str, menu: impl FnOnce(&mut Ui, &mut RustGisApp)) {
     let resp = big(ui, app, icon, label, desc, "ui.menu", Value::Null, false, true);
     egui::Popup::menu(&resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
-        ui.set_min_width(200.0);
+        ui.set_min_width(MENU_MIN_W);
         menu(ui, app);
     });
 }
@@ -575,8 +588,13 @@ fn small_menu_with(
     ui.painter().text(pos2(r.min.x + 26.0, r.center().y), Align2::LEFT_CENTER, label, regular(11.5), t.text);
     caret(ui.painter(), pos2(r.max.x - 9.0, r.center().y), t.text);
     let resp = tooltip(app, resp, label, desc, "ui.menu", &Value::Null);
+    // A click on the suggestion list of a box in the menu (Display Filters) isn't one outside it,
+    // even past the menu's edge.
+    let on_list = crate::completion::pressed_over_menu(ui.ctx());
+    let close =
+        if on_list && close == egui::PopupCloseBehavior::CloseOnClickOutside { egui::PopupCloseBehavior::IgnoreClicks } else { close };
     egui::Popup::menu(&resp).close_behavior(close).show(|ui| {
-        ui.set_min_width(200.0);
+        ui.set_min_width(MENU_MIN_W);
         menu(ui, app);
     });
 }
@@ -586,12 +604,23 @@ fn small_menu_with(
 pub fn row_button(ui: &mut Ui, on: bool, button: egui::Button<'_>, expand: f32) -> Response {
     let under = ui.painter().add(egui::Shape::Noop);
     let resp = ui.add_enabled(on, button);
-    if on && (resp.hovered() || resp.is_pointer_button_down_on()) {
-        let t = Tokens::get(ui.ctx());
-        let fill = if resp.is_pointer_button_down_on() { t.pressed } else { t.hover };
+    if let Some(fill) = row_fill(on, &resp, &Tokens::get(ui.ctx())) {
         ui.painter().set(under, egui::Shape::rect_filled(resp.rect.expand2(vec2(expand, 0.0)), CornerRadius::same(5), fill));
     }
     resp
+}
+
+/// The highlight a menu row paints under itself in `resp`'s state, if any (none at rest or disabled).
+pub fn row_fill(on: bool, resp: &Response, t: &Tokens) -> Option<egui::Color32> {
+    if !on {
+        None
+    } else if resp.is_pointer_button_down_on() {
+        Some(t.pressed)
+    } else if resp.hovered() {
+        Some(t.hover)
+    } else {
+        None
+    }
 }
 
 /// Room for a menu row's icon before its label.
@@ -599,12 +628,34 @@ const MENU_ICON_W: f32 = 22.0;
 
 /// A menu row that runs a command (disabled when the command is).
 pub fn menu_item(ui: &mut Ui, app: &mut RustGisApp, icon: &str, label: &str, id: &str, params: Value) {
+    menu_item_response(ui, app, icon, label, id, params);
+}
+
+/// [`menu_item`], returning the row's response.
+pub fn menu_item_response(ui: &mut Ui, app: &mut RustGisApp, icon: &str, label: &str, id: &str, params: Value) -> Response {
     let on = enabled(app, id);
     let shortcut = crate::keymap::shortcut_text(ui.ctx(), app, id, &params);
-    if menu_row(ui, icon, tl!(label), &shortcut, on).clicked() {
+    let resp = menu_row(ui, icon, tl!(label), &shortcut, on);
+    if resp.clicked() {
         let _ = app.run_by_user(id, params);
         ui.close();
     }
+    resp
+}
+
+/// Where a menu row draws its icon.
+pub fn menu_icon_rect(ui: &Ui, resp: &Response) -> Rect {
+    Rect::from_center_size(resp.rect.left_center() + vec2(ui.spacing().button_padding.x + MENU_ICON_W / 2.0 - 2.0, 0.0), vec2(16.0, 16.0))
+}
+
+/// Where a large button draws its icon.
+pub fn big_icon_rect(r: Rect) -> Rect {
+    Rect::from_center_size(pos2(r.center().x, r.min.y + 21.0), vec2(32.0, 32.0))
+}
+
+/// Where a small button draws its icon.
+pub fn small_icon_rect(r: Rect) -> Rect {
+    Rect::from_center_size(pos2(r.min.x + 13.0, r.center().y), vec2(18.0, 18.0))
 }
 
 /// A menu row with an icon (empty for none) before an already translated label, and a shortcut
@@ -620,13 +671,35 @@ pub fn menu_row(ui: &mut Ui, icon: &str, label: &str, shortcut: &str, on: bool) 
     resp
 }
 
-/// A menu row with an icon that opens a submenu of `add`'s rows.
+/// A menu row with an icon and a highlight when it represents the current choice.
+pub(crate) fn selectable_menu_row(ui: &mut Ui, icon: &str, label: &str, selected: bool) -> Response {
+    let button = egui::Button::selectable(selected, menu_text(ui, icon, label)).min_size(vec2(ui.available_width(), 0.0));
+    let response = ui.add(button);
+    menu_icon(ui, &response, icon);
+    response
+}
+
+/// A menu row with an icon that opens a submenu of `add`'s rows, at least [`SUBMENU_MIN_W`]
+/// wide: in a menu of [`menu_item`] rows, as tall as they are.
 pub fn submenu_row(ui: &mut Ui, icon: &str, label: &str, add: impl FnOnce(&mut Ui)) {
     let button = egui::Button::new(menu_text(ui, icon, label))
         .min_size(vec2(0.0, 24.0))
         .right_text(egui::containers::menu::SubMenuButton::arrow_atom(None));
-    let (resp, _) = egui::containers::menu::SubMenuButton::from_button(button).ui(ui, add);
+    let (resp, _) = egui::containers::menu::SubMenuButton::from_button(button).ui(ui, |ui| {
+        ui.set_min_width(SUBMENU_MIN_W);
+        add(ui);
+    });
     menu_icon(ui, &resp, icon);
+}
+
+/// A row that opens a submenu of `add`'s rows, at least [`SUBMENU_MIN_W`] wide: in a menu of
+/// plain buttons, as tall as they are (a menu of [`menu_item`] rows uses [`submenu_row`]).
+pub fn submenu(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui)) -> Response {
+    ui.menu_button(label, |ui| {
+        ui.set_min_width(SUBMENU_MIN_W);
+        add(ui);
+    })
+    .response
 }
 
 /// A menu row's label: with an icon, it starts after it, so the icon is drawn inside the row (and the menu).
@@ -646,16 +719,7 @@ fn menu_icon(ui: &Ui, resp: &Response, icon: &str) {
         return;
     }
     let t = Tokens::get(ui.ctx());
-    icons::paint(
-        ui.painter(),
-        Rect::from_center_size(
-            resp.rect.left_center() + vec2(ui.spacing().button_padding.x + MENU_ICON_W / 2.0 - 2.0, 0.0),
-            vec2(16.0, 16.0),
-        ),
-        icon,
-        t.icon,
-        t.accent,
-    );
+    icons::paint(ui.painter(), menu_icon_rect(ui, resp), icon, t.icon, t.accent);
 }
 
 /// A ribbon group: controls laid out left to right over a centred label, with a separator.
@@ -742,6 +806,11 @@ pub fn primary_button(ui: &mut Ui, label: &str, enabled: bool, min_size: egui::V
     ui.painter().rect_filled(r, CornerRadius::same(6), fill);
     centred_label(ui, r, label, font, egui::Color32::WHITE);
     if enabled { resp.on_hover_cursor(egui::CursorIcon::PointingHand) } else { resp }
+}
+
+/// Maximum content width inside the dialog frame and a small margin at each edge of the viewport.
+pub(crate) fn dialog_width(ctx: &egui::Context, preferred: f32, frame: egui::Frame) -> f32 {
+    preferred.min((ctx.content_rect().width() - frame.total_margin().sum().x - 16.0).max(0.0))
 }
 
 /// A dialog button (OK, Cancel…): `fill` paints it as the default action, otherwise it takes the

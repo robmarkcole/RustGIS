@@ -75,6 +75,11 @@ pub fn commands() -> Vec<C> {
                 return Err("nothing is selected in this layer".into());
             }
             let mut ds = rustgis_data::Dataset::new(format!("{} selection", l.name), l.geometry_type(), l.dataset.fields.clone());
+            // Its coordinates as they are, held in the layer's system, which it exports in.
+            ds.held_in = l.dataset.held_in;
+            ds.crs = l.dataset.crs;
+            // What the import lost, Define Projection can't recover in the copy either.
+            ds.crs_incomplete = l.dataset.crs_incomplete;
             for r in &l.selection {
                 if let Some(f) = l.dataset.features.get(*r) {
                     ds.push(f.geometry.clone(), f.attrs.clone());
@@ -185,7 +190,9 @@ fn by_rect(s: &mut Session, p: &Value) -> CmdResult {
     if !matches!(s.map().flat(), rustgis_map::projection::Flat::Mercator) {
         for (id, rows) in &mut hits {
             if let Some(l) = s.map().layer(*id) {
-                rows.retain(|r| l.dataset.features.get(*r).and_then(|f| f.geometry.as_ref()).is_some_and(|g| g.extent().intersects(&ll)));
+                // The rectangle in the layer's own coordinates, as its features' boxes are.
+                let own = l.dataset.extent_from_lonlat(&ll);
+                rows.retain(|r| l.dataset.features.get(*r).and_then(|f| f.geometry.as_ref()).is_some_and(|g| g.extent().intersects(&own)));
             }
         }
         hits.retain(|(_, rows)| !rows.is_empty());

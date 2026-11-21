@@ -344,8 +344,12 @@ fn check_compound(bytes: &[u8]) -> Result<()> {
         if let Some((_, start, len)) = streams.iter().find(|(name, ..)| name.eq_ignore_ascii_case(want)) {
             let ids = if *len < 4096 { mini.read(*start, *len)? } else { main.read(*start, *len)? };
             if want == "Workbook" || (want == "Book" && !has_workbook) {
-                if *len as u64 > crate::io::MAX_BYTES {
-                    return Err(DataError::Format("spreadsheet: the XLS Workbook stream is too large".into()));
+                // Fixed, whatever the memory: spreadsheets keep their own limits.
+                if *len as u64 > crate::io::BYTES_FLOOR {
+                    return Err(DataError::Format(format!(
+                        "spreadsheet: the XLS Workbook stream is too large ({len} bytes; at most {} MiB)",
+                        crate::io::BYTES_FLOOR >> 20
+                    )));
                 }
                 // Read only the chosen stream. In the mini stream a 64-byte sector is a slice
                 // of the root's sector chain, which may itself be fragmented.
@@ -768,7 +772,7 @@ mod tests {
         // The header row comes after a blank one; the coordinates are UTM 33N.
         let opts = CsvOptions { crs: crate::raster::Crs::from_epsg(32633), ..CsvOptions::default() };
         let (ds, _) = read(&book, "book", Some("utm"), &opts).unwrap();
-        let e = ds.features[0].geometry.as_ref().unwrap().extent();
+        let e = ds.in_lonlat().unwrap().features[0].geometry.as_ref().unwrap().extent();
         assert!((e.min_x - 15.0).abs() < 0.01 && (e.min_y - 42.0).abs() < 0.05, "{e:?}");
         let (ds, _) = read(&book, "book", Some("Notes"), &CsvOptions::default()).unwrap();
         assert_eq!(ds.geometry_type, crate::GeometryType::None);
@@ -929,6 +933,23 @@ mod tests {
         assert!(ods::check(xml.as_bytes(), 2, 12).unwrap_err().to_string().contains("too large"));
         let (ds, report) = read(&ods(xml), "book", None, &CsvOptions::default()).unwrap();
         assert_eq!(ds.value(0, 0), &Value::Text("bad  value".into()));
+        assert!(report.messages.is_empty());
+    }
+
+    #[test]
+    fn ods_rejects_malformed_nesting_but_preserves_ordinary_annotated_text() {
+        let book = |content| {
+            ods(&format!(
+                r#"<table:table table:name="S"><table:table-row><table:table-cell office:string-value="message"/></table:table-row><table:table-row><table:table-cell office:value-type="string">{content}</table:table-cell></table:table-row></table:table>"#
+            ))
+        };
+        refused_before_calamine(&book("<office:annotation><office:annotation/></office:annotation>"), "nested annotation");
+        for cell in ["<table:table-cell/>", "<table:covered-table-cell/>"] {
+            refused_before_calamine(&book(cell), "nested cell");
+        }
+        let clean = book("<office:annotation><text:p>note</text:p></office:annotation><text:p><text:span>value</text:span></text:p>");
+        let (ds, report) = read(&clean, "book", None, &CsvOptions::default()).unwrap();
+        assert_eq!(ds.value(0, 0), &Value::Text("value".into()));
         assert!(report.messages.is_empty());
     }
 

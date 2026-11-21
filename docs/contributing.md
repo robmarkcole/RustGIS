@@ -12,9 +12,9 @@ for the conventions.
    and ARM64); pushes to `main` test them all. `ci:full` also builds the release apps. The nightly
    workflow tests and release-builds them all when there are new commits, and opens an issue on
    failure.
-5. The docs workflow builds a site and web-app preview. A first-time fork contributor's preview
-   needs a maintainer to add `preview` or re-run the workflow; returning contributors' previews
-   publish automatically.
+5. The docs workflow builds a site and web-app preview. A fork's preview needs a maintainer to
+   add `preview` or re-run the workflow, for each new commit. Previews share one origin, so the
+   preview app keeps its settings, including AI provider keys, only until the page closes.
 
 Pull requests merge through a merge queue: the queue tests each one merged with `main` and the
 pull requests ahead of it, and squash-merges it only if that passes, so two changes that pass apart
@@ -313,6 +313,15 @@ with `RUSTGIS_WORKFLOW_DATA` naming their folder (the list of files is in `night
 it locally, download the files listed there into one folder, check them with `sha256sum` against
 the checksums beside them, and run
 `RUSTGIS_WORKFLOW_DATA=<folder> cargo test -p rustgis-engine --test workflows -- --ignored`.
+
+### Performance regressions
+
+When changing a large-data path, add a work budget to an ordinary test. Count what the operation
+does, such as bytes fetched, tiles requested, features decoded or passes over a raster. Use a
+small fixture, check the result as well as the count, and explain the budget beside the assertion.
+Count at the read or processing boundary so repeated work counts too. For example, the
+[GeoTIFF window test](../crates/tiles/src/cog/raster.rs) counts response bytes for a view that
+crosses one source tile boundary. Use timed benchmarks to measure processing speed.
 
 ### Property tests
 

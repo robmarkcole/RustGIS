@@ -289,6 +289,9 @@ class Layer:
     ) -> Any:
         """Writes the layer's features to a file (``share.exportLayer``).
 
+        The layer's definition query applies to the whole source. When it excludes features,
+        the export reports how many in the session's notices.
+
         Args:
             path: The file; its extension picks the format: ``.geojson``, ``.csv``, ``.fgb``,
                 ``.gpkg``, ``.parquet``, ``.shp``, ``.zip``, ``.kml``, ``.kmz`` or ``.gpx``.
@@ -678,13 +681,16 @@ class _Api:
         """What the map shows, as ``(west, south, east, north)`` in degrees."""
         return tuple(self.info()["extent"])  # type: ignore[return-value]
 
-    def set_basemap(self, name: str) -> Any:
+    def set_basemap(self, name: str, color: Optional[str] = None) -> Any:
         """Sets the map's basemap.
 
         Args:
             name: ``"paper"``, ``"midnight"``, ``"ocean"``, ``"atlas"`` or ``"blank"``.
+            color: The blank basemap's paper colour, ``"#RRGGBB"`` (left as it was when not given).
         """
-        return self.run("map.basemap", name=name)
+        if color is None:
+            return self.run("map.basemap", name=name)
+        return self.run("map.basemap", name=name, color=color)
 
     def set_center(
         self,

@@ -104,9 +104,9 @@ An unknown field, variable or function is an error that names it.
 
 | Operator | Result |
 | --- | --- |
-| `+ - * /` | Arithmetic; `/` always divides exactly (`7 / 2` is 3.5) |
-| `%` | Remainder |
-| `^` | Power |
+| `+ - * /` | Arithmetic; `/` always divides exactly (`7 / 2` is 3.5); null for a division by zero |
+| `%` | Remainder; null for a division by zero |
+| `^` | Power; null for a division by zero (`0 ^ -1`) or a result that isn't a finite number (`(-8) ^ 0.5`) |
 | `\|\|` | Joins the two values as text; null when either is null |
 | `= <> < <= > >=` | Comparison; `==` and `!=` are also accepted |
 | `LIKE`, `ILIKE` | Text pattern: `%` matches any run of characters, `_` one character |
@@ -140,9 +140,12 @@ Rules shared by all of them:
 - **Nulls.** Arithmetic with a null gives null. A comparison with a null is *unknown*: it
   matches neither `pop > 100` nor `NOT pop > 100`; `IS NULL` tests for it. `AND` is false when
   either side is false and `OR` true when either side is true, whatever the other side is.
-- **Errors give null**: a division by zero, the square root of a negative number, a result too
-  large to represent. Where the result is stored (Calculate Field, calculation attribute rules),
-  a notice says how many rows an error made null, which error, and the first three of those rows.
+- **Errors give null**: a division by zero, the square root of a negative number, the logarithm
+  of zero or a negative number, a result too large to represent, a value that isn't a finite
+  number, text that isn't a number in `-`, `*`, `/`, `%` or `^` or as a number argument, a clamp
+  whose low bound is above its high bound. Where the result is stored (Calculate Field,
+  calculation attribute rules), a notice says how many rows an error made null, which error,
+  and the first three of those rows.
 - **`IN`** compares with each value as `=` does; a `NULL` in the list matches nothing, so
   `x NOT IN (1, NULL)` is true for 2.
 - **As a condition**, a value that isn't true or false counts as true when it is a non-zero
@@ -158,12 +161,12 @@ Rules shared by all of them:
 | `abs(x)` | Absolute value |
 | `round(x[, places])` | Rounded half away from zero to `places` decimals (0 by default; negative rounds to tens, hundreds…) |
 | `floor(x)`, `ceil(x)` | Rounded down, up |
-| `sqrt(x)`, `exp(x)`, `ln(x)`, `log10(x)` | Square root, eˣ, natural and base-10 logarithm |
+| `sqrt(x)`, `exp(x)`, `ln(x)`, `log10(x)` | Square root, eˣ, natural and base-10 logarithm; null for a negative number (`sqrt`), when too large to represent (`exp`), for zero or a negative number (`ln`, `log10`) |
 | `pi()` | π |
 | `min(a, b, …)`, `max(a, b, …)` | The smallest, largest number; values that aren't numbers are skipped |
 | `clamp(low, x, high)` | `x` kept within `low`…`high`; null when `low` is above `high` |
 | `scale_linear(x, d0, d1, r0, r1)` | `x` mapped from the domain `d0`…`d1` to the range `r0`…`r1`, clamped to the domain |
-| `scale_exp(x, d0, d1, r0, r1, exponent)` | As `scale_linear`, along a curve: 0.5 grows fast then slowly, 2 slowly then fast |
+| `scale_exp(x, d0, d1, r0, r1, exponent)` | As `scale_linear`, along a curve: 0.5 grows fast then slowly, 2 slowly then fast; null with a negative exponent at the domain's start |
 | `to_string(x)` | `x` as text |
 | `to_int(x)`, `to_real(x)` | `x` as a whole number (cut toward zero), as a decimal number; null if it isn't a number |
 | `length(s)` | Number of characters |
@@ -220,8 +223,18 @@ that start with what's typed, each with its help beside (a function's signature,
 and example; a field's type). Ctrl+Space opens it with nothing typed (on macOS, where Ctrl+Space
 may switch the input source, type the first letter instead). ↑/↓ move through it, Enter
 or Tab take the highlighted item (Enter doesn't calculate while the list is open) and Escape
-closes it. Inside a quoted field name (`"Pop`) only fields are suggested. A function taken from
-the list comes with its brackets, the cursor inside them (after them when it takes no arguments).
+closes it. Inside a quoted field name (`"Pop`) only fields are suggested. Inside a text compared
+with a text, date or date-time field (`name = 'Pa`, `name LIKE '`, `name IN ('Lima', '`), the list
+suggests that field's values that start with what's typed, and the one taken is written with its
+quotes (`'Paris'`, a `'` in it doubled), over the closing quote. Where a value goes with nothing
+typed (`pop > `, `name IN ('Lima', `), Ctrl+Space lists the field's values first, numbers as they
+are. No null, true or false is suggested (use `IS NULL`, `TRUE`, `FALSE`), nor a value longer than
+100 characters, nor after `LIKE` a value with `%` or `_` (which would match others too), and at most
+50 values show at a time: typing narrows them. The values are read from
+up to 10,000 of the layer's features, evenly spread, so a value few features hold may be missing; a
+streamed layer's come from the features read for the view. The value's help says so when it's
+either. A function taken from the list comes with its brackets, the cursor inside them (after
+them when it takes no arguments).
 While the list is open the expression isn't checked: `pop_`, with `pop_est` suggested, is a word
 still being chosen. It is checked once the list closes (an item taken, Escape, the cursor moved
 away, the box left, or nothing matching what's typed), and its error shown then if it's still
@@ -236,6 +249,21 @@ Inside a function's brackets, its signature floats by the cursor while no list i
 argument being typed marked (`round(x[, places])`) and what the function gives. A list that
 opens hides it, and it comes back when the list closes; Escape with no list open closes it until
 the cursor leaves that call.
+
+The same list, signature and closing brackets help in the other one-line expression boxes: the
+**By Expression** boxes of a layer's symbol and of a label class, Unique Values' **Expression**,
+a report's **Where**, an attribute rule's expression and the ribbon's **Display Filters** box
+(Style › Drawing Effects). Apart from the rule's, which **Add** applies, and the display filter's,
+which **Set Filter** applies, those boxes apply what's written when they lose focus, and a click
+in the list keeps the focus, so a field taken from it isn't applied half written; while the list
+is open Escape closes it, not the box nor the Display Filters menu.
+
+They help too in the clause boxes of several lines: Select By Attributes' **Where**, the Layer
+Properties **Query** tab and a label class's SQL query. There the list shows under the cursor's
+line and the signature over the line of its call. While the list is open, Enter takes its item
+rather than break the line or apply the clause, and Escape closes it, not the dialog. In the Query
+tab, Escape with the list or a signature shown closes that and keeps the clause typed; the next
+Escape drops the clause.
 
 A number goes into a number field as it is: a decimal field keeps every digit of `1 / 3` (a
 whole number past 2^53 becomes the nearest decimal, as a decimal field holds it). A whole-number

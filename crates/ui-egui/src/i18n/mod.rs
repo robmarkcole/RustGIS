@@ -461,9 +461,13 @@ fn plugin_tr_raw(lang: Lang, s: &str) -> Option<&'static str> {
 /// A location such as `Map › Navigate`, translated segment by segment and shown in
 /// display form as one line.
 pub fn location(loc: &str) -> String {
+    rtl::visual(&location_raw(loc))
+}
+
+/// A translated location in logical order, as typed into Command Search.
+pub(crate) fn location_raw(loc: &str) -> String {
     let lang = current();
-    let loc = loc.split(" › ").map(|s| tr_raw(lang, s)).collect::<Vec<_>>().join(" › ");
-    rtl::visual(&loc)
+    loc.split(" › ").map(|s| tr_raw(lang, s)).collect::<Vec<_>>().join(" › ")
 }
 
 /// Translates `template`, fills its `{name}` placeholders in one pass (values are never
@@ -481,6 +485,25 @@ pub fn fmt(template: &str, args: &[(&str, &str)]) -> String {
 /// display form itself.
 pub fn fmt_raw(template: &str, args: &[(&str, &str)]) -> String {
     fill_placeholders(tr_raw(current(), template), args)
+}
+
+/// Translates a whole-file size refusal, keeping the file name and limit as literal arguments.
+pub(crate) fn file_size_error(error: &str, format: impl FnOnce(&str, &[(&str, &str)]) -> String) -> Option<String> {
+    use rustgis_engine::data::io::FileSizeAdvice;
+    let (name, limit, advice) = rustgis_engine::data::io::file_size_error_args(error)?;
+    let args = &[("name", name), ("limit", limit)];
+    let template = match advice {
+        FileSizeAdvice::Split => {
+            "{name} is too large to open (limit {limit} MiB). Split the data into smaller files and import each one separately."
+        }
+        FileSizeAdvice::Vector => {
+            "{name} is too large to open (limit {limit} MiB). Split it into smaller files, or convert vector data to FlatGeobuf or GeoPackage and open it on the desktop."
+        }
+        FileSizeAdvice::Shapefile => {
+            "{name} is too large to open (limit {limit} MiB). Split the whole Shapefile, or convert it to FlatGeobuf or GeoPackage and open it on the desktop."
+        }
+    };
+    Some(format(template, args))
 }
 
 /// Translates a template in its context, then fills placeholders before RTL display conversion.

@@ -20,11 +20,12 @@ csv = { workspace = true }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 shapefile = { workspace = true }
 encoding_rs = { workspace = true }
+# Coordinate column names compared in one Unicode form (NFC), whatever form a file saved them in.
+unicode-normalization = "0.1"
 # Zstandard, the usual compression of COGs, is C code that compiles to WebAssembly with clang
 # (on the CI runners), so the browser decodes it too.
 tiff = { workspace = true, features = ["zstd"] }
 weezl.workspace = true
-crs-definitions = { workspace = true }
 terrio-crs = { workspace = true }
 miniz_oxide = { workspace = true }
 roxmltree = { workspace = true }
@@ -84,6 +85,9 @@ rustix = { version = "1.1", features = ["process", "fs"] }
 pdf = ["dep:hayro"]
 # The JSON Schema of the saved types (`cargo xtask schema`).
 schema = ["dep:schemars", "rustgis-geom/schema"]
+# Marks direct uses of the row vector and of `Feature`'s fields as deprecated, so that
+# `cargo xtask rows` can count them outside this crate (#2431). Nothing else turns it on.
+count-row-uses = []
 
 [dev-dependencies]
 # Writing sample GeoParquet files.

@@ -129,7 +129,7 @@ jobs:
         with:
           # Only main saves the cache (see test-rust.yml).
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2
         with:
           tool: cargo-ndk
       # The platform the manifest targets (build-apk.sh refuses an older one).
@@ -151,7 +151,7 @@ jobs:
         with:
           # Only main saves the cache (see test-rust.yml).
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2
         with:
           tool: cargo-deny,cargo-about@0.9.2
       - name: Cargo source replacements
@@ -198,6 +198,24 @@ jobs:
       # and failed main (#2289). This runs on the whole workspace every time.
       - name: Test hygiene
         run: cargo run --locked -q -p xtask -- test-hygiene
+
+  # Direct uses of a layer's rows outside rustgis-data may not rise above xtask/row-uses.txt
+  # (`cargo xtask rows`, #2431). The compiler counts them as deprecation warnings, so this job
+  # leaves warnings as warnings; the lint job denies them in the normal build.
+  rows:
+    name: Direct row uses
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          # Only main saves the cache (see test-rust.yml).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Count direct row uses
+        run: cargo run --locked -q -p xtask -- rows
 
   # The packages whose tests this run needs, for `test` (.github/scripts/test-selection.sh). Only
   # tests are narrowed: lint, the wasm build, licences and the schema check run whole every time.
@@ -298,7 +316,7 @@ jobs:
   # unless their conditions below hold (the same as on the jobs), and every other job always runs.
   tests_pass:
     name: Tests pass
-    needs: [lint, wasm, ios, android, licenses, schema, plan, select, test]
+    needs: [lint, wasm, ios, android, licenses, schema, rows, plan, select, test]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:

@@ -84,8 +84,7 @@ pub fn run(s: &mut Session, p: &Json) -> CmdResult {
         return Err("no features to calculate".into());
     }
     if property == "area"
-        && let Some(message) =
-            rustgis_data::ambiguous_area_message(rows.iter().filter_map(|&r| l.dataset.features.get(r)?.geometry.as_ref()))
+        && let Some(message) = l.dataset.ambiguous_area_message(rows.iter().filter_map(|&r| l.dataset.features.get(r)?.geometry.as_ref()))
     {
         return Err(format!("{}: {message}", l.dataset.name));
     }
@@ -96,12 +95,22 @@ pub fn run(s: &mut Session, p: &Json) -> CmdResult {
     };
     let mut values = Vec::with_capacity(rows.len());
     let mut nulls = 0;
+    // Made at the first feature with a geometry, once for the layer.
+    let mut conversion = None;
     for row in &rows {
         let f = l.dataset.features.get(*row).ok_or("selection contains a missing feature")?;
         let value = if let Some(g) = &f.geometry {
             if g.kind() != l.geometry_type() {
                 return Err("feature geometry does not match the layer".into());
             }
+            // Measured and placed in longitude/latitude, from the layer's own coordinates through
+            // WGS 84, whatever map it is shown on.
+            let to = match &mut conversion {
+                Some(to) => &*to,
+                slot @ None => slot.insert(l.dataset.lonlat_conversion().map_err(|e| format!("feature {}: {e}", f.id))?),
+            };
+            let g = rustgis_data::Dataset::geometry_to_lonlat_by(to, g).map_err(|e| format!("feature {}: {e}", f.id))?;
+            let g = g.as_ref();
             // Lengths and areas use longitude differences, so a shape drawn or buffered across the
             // antimeridian may run past ±180°; a coordinate has to be a real longitude.
             let max_x = if matches!(property, "x" | "y") { 180.0 } else { 360.0 };

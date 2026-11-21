@@ -61,6 +61,19 @@ Work that splits into independent parts runs on several threads where practical:
   `available_parallelism` or a fixed number, and scratch memory within `memory::thread_scratch`;
 - a thread the OS refuses costs speed, not the run (`Builder::spawn_scoped`).
 
+## Size for real data
+Real data dwarfs the sample project: a parcel layer of half a million rows and a hundred fields
+loads at about 2.5 GB, national layers run to tens of millions of rows and more, and a 1 m
+elevation model of 1,000 km² is a billion cells. When a change stores, copies or compares layer
+data, give in the pull request what it holds as a multiple of the layer, as `cargo xtask memory`
+measures.
+- Memory follows what an operation changes or produces: an Undo step, a version, a sync base or a
+  cache holds only the changed rows or shares storage with the original. New work adds no second
+  full copy of a layer or raster; #2431 measured what one costs.
+- Work that grows with its input goes in pieces (chunks, tiles, slices) that it doesn't keep, or
+  sizes its limit with `memory::planned` and refuses past it with a way out, such as filtering or
+  clipping first. Running out of memory partway counts as a crash.
+
 ## Architecture
 | Layer | Crate | Job |
 |---|---|---|
@@ -134,6 +147,14 @@ the pull request which of these it reaches and why the rest don't apply:
 `cargo xtask ci` (fmt, clippy -D warnings, tests, layers) before every commit.
 `cargo xtask test-hygiene` (also in CI) requires `// test-wait: reason` on timer waits in tests and
 `#[ignore = "reason"]` on ignored tests; prefer completion or progress signals.
+`cargo xtask memory` (in CI on Linux) fails when a command line workflow's peak memory grows past
+its limit in `xtask/memory-limits.txt`; a change that lowers one commits the lower limit with it.
+`cargo xtask rows` (also in CI) fails when code outside `rustgis-data` uses a layer's rows directly
+(`Feature` fields, the row vector) more often than `xtask/row-uses.txt` allows: use the accessors on
+`Features` (`row`, `rows`, `value`, `set_value`, …), and `--update` when you lower the count (#2431).
+It counts only the libraries and programs built for the host, not tests, examples, benches or code
+built only for other targets, nor a row indexed without reading a field (`features[i]` alone); use
+the accessors there too.
 While you work, `cargo xtask changed` runs the same checks on only the packages your branch changes
 and those that depend on them (and `test-hygiene` on the whole workspace), or everything when a
 changed file such as `Cargo.lock` is outside every package and nothing includes it.

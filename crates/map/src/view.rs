@@ -225,6 +225,48 @@ pub struct TerrainBlock {
     /// straight down (schematic: no dip or thickness). None: the walls are `walls` all along.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub walls_layer: Option<String>,
+    /// The outline the ground is cut to inside the box (#2318).
+    #[serde(default, skip_serializing_if = "BlockShape::is_box")]
+    pub shape: BlockShape,
+    /// The terrain's water in the walls' section (#2317): where the box's edge runs inside a
+    /// water polygon, a band of water from its level down to its floor. None: the walls rise to
+    /// the water's level as ground.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub water: Option<BlockWater>,
+}
+
+/// The outline a block diagram's ground is cut to (#2318).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BlockShape {
+    /// The box itself.
+    #[default]
+    Box,
+    /// The largest circle inside the box, centred in it, or one of `radius` (map units) when
+    /// that is smaller.
+    Circle {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        radius: Option<f64>,
+    },
+}
+
+impl BlockShape {
+    pub fn is_box(&self) -> bool {
+        *self == BlockShape::Box
+    }
+}
+
+/// How deep the water a block diagram's walls cut through is (#2317). A DEM holds the water's
+/// surface, not its bed, so the depth is given: schematic unless it comes from a field.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BlockWater {
+    /// Metres from the level down to the floor, before exaggeration: every water body's, or
+    /// those with no value of `field`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth: Option<f64>,
+    /// A numeric field of the terrain's water layer holding each water body's depth (metres).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
 }
 
 /// The least depth (metres, before exaggeration) of a block diagram's base below its lowest
@@ -241,8 +283,9 @@ pub const BLOCK_MAX_DEPTH: f64 = 20_000.0;
 impl TerrainBlock {
     /// Why this block can't be drawn, when it can't: its box (ordered, within the Web Mercator
     /// world, at least [`BLOCK_MIN_SIDE`] a side and not in degrees), its depth (0 to
-    /// [`BLOCK_MAX_DEPTH`]) and opaque walls. Checked where a block is set and where a project is
-    /// read, so a saved block that fails it is never drawn.
+    /// [`BLOCK_MAX_DEPTH`]), a circle's radius (at least half that side) and opaque walls.
+    /// Checked where a block is set and where a project is read, so a saved block that fails it
+    /// is never drawn.
     pub fn check(&self) -> Result<(), String> {
         if let Some([x0, y0, x1, y1]) = self.extent {
             if !([x0, y0, x1, y1].iter().all(|v| v.is_finite()) && x0 < x1 && y0 < y1) {
@@ -266,8 +309,23 @@ impl TerrainBlock {
         {
             return Err(format!("block's depth is metres, 0 to {BLOCK_MAX_DEPTH:.0}"));
         }
+        if let BlockShape::Circle { radius: Some(r) } = self.shape
+            && !(r.is_finite() && r >= BLOCK_MIN_SIDE / 2.0)
+        {
+            return Err(format!("block's radius is in Web Mercator metres, at least {}", BLOCK_MIN_SIDE / 2.0));
+        }
         if self.walls.a() != 255 {
             return Err("block's walls is an opaque colour, #RRGGBB".into());
+        }
+        if let Some(w) = &self.water {
+            if w.depth.is_none() && w.field.is_none() {
+                return Err("block's water needs a depth (metres) or a field of the water layer holding them".into());
+            }
+            if let Some(d) = w.depth
+                && !(d.is_finite() && (0.0..=BLOCK_MAX_DEPTH).contains(&d))
+            {
+                return Err(format!("block's water depth is metres, 0 to {BLOCK_MAX_DEPTH:.0}"));
+            }
         }
         Ok(())
     }

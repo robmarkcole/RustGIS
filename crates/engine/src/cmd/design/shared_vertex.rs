@@ -20,8 +20,14 @@ pub(super) fn run(s: &mut Session, p: &Value) -> CmdResult {
     if !(lon.is_finite() && lat.is_finite()) || lon.abs() > 360.0 || lat.abs() > 90.0 {
         return Err("lon and lat are degrees".into());
     }
-    let at = Coord::new(lon, lat);
     let layer = s.map().layer(id).ok_or("no such layer")?;
+    // The place in the layer's own coordinates, where its vertices are matched exactly: a stored
+    // place it was snapped to, as stored.
+    let place = Geometry::Point(Coord::new(lon, lat));
+    let held = super::held_places(s, id, &[], &[&place]);
+    let Geometry::Point(at) = layer.dataset.edit_from_lonlat(place, &held)? else {
+        return Err("the place can't be given in the layer's coordinates".into());
+    };
     let source = layer.dataset.features.get(row).ok_or("no such row")?.geometry.as_ref().ok_or("the feature has no shape")?;
     if !matches!(source, Geometry::Polygon(_)) {
         return Err("shared vertices can only be moved in polygons".into());

@@ -44,6 +44,15 @@ fn bad(m: impl Into<String>) -> DataError {
     DataError::Format(m.into())
 }
 
+/// Adds the store or array path to decoding failures without turning Cancel into a format error.
+fn read_error(path: &str, error: DataError) -> DataError {
+    match error {
+        DataError::Cancelled => DataError::Cancelled,
+        DataError::Format(message) => bad(format!("{path}: {message}")),
+        error => bad(format!("{path}: {error}")),
+    }
+}
+
 /// How a value is stored.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -317,11 +326,8 @@ impl Array {
     /// value `i` is at `i * size`.
     pub fn decode_bytes(&self, bytes: &[u8]) -> Result<(Vec<u8>, DType)> {
         self.chunk_values()?;
-        let (data, little) = decode_chunk(&self.codecs, bytes, &self.chunks, self.dtype, self.fill).map_err(|e| match e {
-            e if self.path.is_empty() => e,
-            DataError::Format(m) => bad(format!("{}: {m}", self.path)),
-            e => bad(format!("{}: {e}", self.path)),
-        })?;
+        let (data, little) = decode_chunk(&self.codecs, bytes, &self.chunks, self.dtype, self.fill)
+            .map_err(|e| if self.path.is_empty() { e } else { read_error(&self.path, e) })?;
         Ok((data, DType { little, ..self.dtype }))
     }
 }
@@ -337,18 +343,34 @@ fn unsupported(codecs: &[Codec]) -> Option<String> {
 
 /// Undoes `codecs` on a chunk of `shape` values of type `dtype`: its values' bytes (as many as
 /// the shape holds, never more) and their byte order. `fill` stands for a shard's missing chunks.
+/// Size-preserving steps and CRC32C's four bytes give the exact limit before the first variable-size
+/// encoder. Other intermediate stages use the existing chunk-file limit, since encoded data can
+/// be larger than the final values. Limits apply to each decompressor, not just Zstandard.
+/// Zlib, gzip, LZ4 and Blosc's non-Zstandard decoding have no internal Cancel checks: a whole
+/// stage can finish before its caller observes cancellation. Zstandard checks between reads
+/// of at most 64 KiB.
 fn decode_chunk(codecs: &[Codec], bytes: &[u8], shape: &[u64], dtype: DType, fill: Option<f64>) -> Result<(Vec<u8>, bool)> {
     let n = shape.iter().try_fold(1u64, |a, &c| a.checked_mul(c)).ok_or_else(|| bad("a chunk too large"))?;
     let want = usize::try_from(n).ok().and_then(|n| n.checked_mul(dtype.size)).ok_or_else(|| bad("a chunk too large"))?;
+    // In encoding order, the fixed-size prefix gives the first variable codec's output size
+    // when decoded. Each checksum is part of that output until its own decoder removes it.
+    let first_variable = codecs.iter().position(|c| !matches!(c, Codec::Bytes { .. } | Codec::Shuffle(_) | Codec::Crc32c));
+    let known_limit = codecs.iter().take(first_variable.unwrap_or(codecs.len())).try_fold(want, |limit, c| {
+        if matches!(c, Codec::Crc32c) { limit.checked_add(4).ok_or_else(|| bad("a chunk's encoded stage is too large")) } else { Ok(limit) }
+    })?;
+    if known_limit as u64 > MAX_CHUNK_FILE {
+        return Err(bad("a chunk's encoded stage is too large"));
+    }
     let mut data = bytes.to_vec();
     let mut little = dtype.little;
-    for c in codecs.iter().rev() {
+    for (i, c) in codecs.iter().enumerate().rev() {
+        let limit = if Some(i) == first_variable { known_limit } else { MAX_CHUNK_FILE as usize };
         data = match c {
-            Codec::Blosc => blosc(&data, want)?,
-            Codec::Zlib => inflate(&data, true, want)?,
-            Codec::Gzip => gunzip(&data, want)?,
-            Codec::Zstd => unzstd(&data, want)?,
-            Codec::Lz4 => numcodecs_lz4(&data, want)?,
+            Codec::Blosc => blosc(&data, limit)?,
+            Codec::Zlib => inflate(&data, true, limit)?,
+            Codec::Gzip => gunzip(&data, limit)?,
+            Codec::Zstd => unzstd(&data, limit)?,
+            Codec::Lz4 => numcodecs_lz4(&data, limit)?,
             Codec::Shuffle(e) => unshuffle(&data, *e),
             Codec::Crc32c => data.get(..data.len().saturating_sub(4)).unwrap_or_default().to_vec(),
             Codec::Bytes { little: l } => {
@@ -902,12 +924,25 @@ fn gunzip(d: &[u8], want: usize) -> Result<Vec<u8>> {
     inflate(d.get(at..).ok_or_else(|| bad("a cut gzip header"))?, false, want)
 }
 
+/// Decodes within the chunk's existing byte limit without reserving its claimed length. The
+/// caller still checks for a short decoded chunk against the array metadata.
 fn unzstd(d: &[u8], want: usize) -> Result<Vec<u8>> {
-    use std::io::Read;
     let dec = ruzstd::decoding::StreamingDecoder::new(d).map_err(|e| bad(format!("a zstd chunk: {e}")))?;
-    let mut out = Vec::with_capacity(want.min(64 << 20));
-    dec.take(want as u64 + 1).read_to_end(&mut out).map_err(|e| bad(format!("a zstd chunk: {e}")))?;
-    Ok(out)
+    super::decoded::read(dec, want, "a zstd chunk")
+}
+
+/// A short valid frame with a large expected chunk length must not reserve that length before
+/// the caller can report the mismatch. The coarse capacity bound catches the old 64 MiB reserve.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[test]
+fn a_short_zstd_frame_does_not_reserve_its_claimed_chunk_length() {
+    let raw = [0u8; 8];
+    let frame = zstd::encode_all(raw.as_slice(), 1).unwrap();
+    let bytes = unzstd(&frame, 64 << 20).unwrap();
+    assert_eq!(bytes, raw);
+    assert!(bytes.capacity() < 1 << 20, "reserved {} bytes for eight decoded bytes", bytes.capacity());
+    assert_eq!(unzstd(&frame, raw.len()).unwrap(), raw);
+    assert!(unzstd(&frame, raw.len() - 1).is_err());
 }
 
 /// The most bytes an LZ4 block can make from each byte of itself: a match's length grows by up to
@@ -1647,7 +1682,7 @@ fn shard_chunk_parts(store: &Store, var: &str, shards: &[ShardRead], got: &HashM
     let (mut parts, mut total) = (Vec::new(), read);
     for s in shards {
         let Some(raw) = got.get(&format!("{}#index", s.key)) else { continue };
-        let idx = shard_index(raw, s.count, index).map_err(|e| bad(format!("{}: {e}", s.key)))?;
+        let idx = shard_index(raw, s.count, index).map_err(|e| read_error(&s.key, e))?;
         for &c in &s.chunks {
             let Some(&(off, len)) = idx.get(c) else { continue };
             if off == u64::MAX && len == u64::MAX {
@@ -1893,7 +1928,7 @@ pub fn assemble(store: &Store, plan: &Plan, chunks: &HashMap<String, Vec<u8>>, n
             };
             let (vals, dt) = match (chunks.get(&id), inner) {
                 (Some(bytes), Some((i, codecs, _))) => {
-                    let (d, little) = decode_chunk(codecs, bytes, i, a.dtype, a.fill).map_err(|e| bad(format!("{}: {e}", a.path)))?;
+                    let (d, little) = decode_chunk(codecs, bytes, i, a.dtype, a.fill).map_err(|e| read_error(&a.path, e))?;
                     (d, DType { little, ..a.dtype })
                 }
                 (Some(bytes), None) => a.decode_bytes(bytes)?,
@@ -1906,7 +1941,7 @@ pub fn assemble(store: &Store, plan: &Plan, chunks: &HashMap<String, Vec<u8>>, n
                     let Some(raw) = chunks.get(&format!("{key}#index")) else { continue };
                     if !indexes.contains_key(key) {
                         let count = per.iter().product::<u64>() as usize;
-                        indexes.insert(key.clone(), shard_index(raw, count, index).map_err(|e| bad(format!("{key}: {e}")))?);
+                        indexes.insert(key.clone(), shard_index(raw, count, index).map_err(|e| read_error(key, e))?);
                     }
                     if indexes.get(key).and_then(|x| x.get(*c)).is_some_and(|&e| e != (u64::MAX, u64::MAX)) {
                         return Err(bad(format!("{}: a chunk of shard {key} wasn't read", a.path)));
@@ -2281,7 +2316,10 @@ fn grid_axes(store: &Store, a: &Array, chunks: &HashMap<String, Vec<u8>>) -> Res
     let (Some((y0, dy)), Some((x0, dx))) = (axis(&ys), axis(&xs)) else {
         return Err(bad(format!("{}: its coordinates aren't evenly spaced", a.path)));
     };
-    Ok(((y0, dy, ys.len() as u64), (x0, dx, xs.len() as u64), geographic(xc)))
+    // Longitude by the coordinate's name or units, or by the geographic system the store gives
+    // (`assemble` wraps such a grid by it too, whatever its axes are called).
+    let geo = geographic(xc) || crs_of(store, a).is_some_and(|(c, _)| c.is_geographic());
+    Ok(((y0, dy, ys.len() as u64), (x0, dx, xs.len() as u64), geo))
 }
 
 /// The chunk keys of `variable`'s map coordinates, for [`window_of`]: each is read whole (its
@@ -2482,11 +2520,11 @@ fn shard_chunk(a: &Array, idx: &[u64], per: &[u64], chunks: &HashMap<String, Vec
     let count = shard_count(a, per)?;
     let (key, c) = shard_of(a, idx, per);
     if let Some(bytes) = chunks.get(&inner_id(&key, c)) {
-        let (d, little) = decode_chunk(codecs, bytes, inner, a.dtype, a.fill).map_err(|e| bad(format!("{}: {e}", a.path)))?;
+        let (d, little) = decode_chunk(codecs, bytes, inner, a.dtype, a.fill).map_err(|e| read_error(&a.path, e))?;
         return Ok(Some((d, DType { little, ..a.dtype })));
     }
     let Some(raw) = chunks.get(&format!("{key}#index")) else { return Ok(None) };
-    let placed = shard_index(raw, count, index).map_err(|e| bad(format!("{key}: {e}")))?;
+    let placed = shard_index(raw, count, index).map_err(|e| read_error(&key, e))?;
     if placed.get(c).is_some_and(|&e| e != (u64::MAX, u64::MAX)) {
         return Err(bad(format!("{}: a chunk of shard {key} wasn't read", a.path)));
     }
@@ -3440,6 +3478,43 @@ mod tests {
         }
     }
 
+    /// A grid whose axes are named `x`/`y` but whose store gives a geographic system is wrapped by
+    /// `assemble` (0–360 read as -180–180), so a box or a point is placed with the same ±360° turns;
+    /// a projected one isn't turned.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_geographic_system_turns_boxes_and_points_on_named_x_y_axes() {
+        let f64s = |v: Vec<f64>| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        for (code, geo) in [(4326, true), (3857, false)] {
+            let mut files = window_store(false);
+            let mut root: Value = serde_json::from_slice(&files[0].1).unwrap();
+            root["consolidated_metadata"]["metadata"]["v"]["attributes"] = serde_json::json!({"epsg_code": code});
+            files[0].1 = root.to_string().into_bytes();
+            // Columns centred on 185°…295°: east of 180, as a 0–360 grid stores them.
+            files[2].1 = zstd::encode_all(&f64s((0..12).map(|i| 185.0 + 10.0 * i as f64).collect())[..], 3).unwrap();
+            let store = parse_store(&files).unwrap();
+            let coords: HashMap<String, Vec<u8>> =
+                files.iter().filter(|(k, _)| window_keys(&store, "v").unwrap().contains(k)).cloned().collect();
+            let found = locate(&store, "v", &coords, -165.0, 50.0).unwrap();
+            let placed = window_of(&store, "v", &coords, [-170.0, 30.0, -150.0, 60.0]);
+            if !geo {
+                assert_eq!(found, None, "EPSG:{code}");
+                assert!(placed.is_err(), "EPSG:{code}");
+                continue;
+            }
+            assert_eq!(found, Some((3, 1)), "EPSG:{code}");
+            let window = Window { x0: 1, y0: 2, x1: 3, y1: 5 };
+            assert_eq!(placed.unwrap(), (window, false, false), "EPSG:{code}");
+            // The same box written 0–360 is the same window.
+            assert_eq!(window_of(&store, "v", &coords, [190.0, 30.0, 210.0, 60.0]).unwrap().0, window);
+            let selection = Selection { variable: "v".into(), index: vec![("time".into(), 1)], window: Some(window) };
+            let plan = plan(&store, &selection).unwrap();
+            let raster = assemble(&store, &plan, &read_plan(&files, &plan), "v", None).unwrap();
+            assert_eq!(raster.crs, Crs::LonLat);
+            assert!((raster.transform.origin_x - -170.0).abs() < 1e-9, "{}", raster.transform.origin_x);
+        }
+    }
+
     /// A store with longitude/latitude axes is in the geographic system it gives (ED50 with its
     /// TOWGS84 shift, a datum with no shift, another body's), whether as WKT, a PROJ definition or an
     /// EPSG code, not in WGS 84 (#2008). What reading it said is kept once: another body by its body,
@@ -3649,6 +3724,72 @@ mod tests {
         assert_eq!(to_f16(1.0), 0x3c00);
         assert_eq!(f16(to_f16(-2.5)), -2.5);
         assert_eq!(DType::parse_v2(">i2").unwrap().encode(-2.0, false), vec![0xff, 0xfe]);
+    }
+
+    /// An intermediate gzip member can be one byte larger than its final chunk. The outer
+    /// Zstandard stage must return the complete member for the next codec to decode.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn bounded_zstd_keeps_an_intermediate_gzip_member() {
+        use std::io::Write;
+        let raw = [0u8; 64];
+        let gzip = |filename: Option<Vec<u8>>| {
+            let mut header = flate2::GzBuilder::new();
+            if let Some(name) = filename {
+                header = header.filename(name);
+            }
+            let mut encoder = header.write(Vec::new(), flate2::Compression::default());
+            encoder.write_all(&raw).unwrap();
+            encoder.finish().unwrap()
+        };
+        let base = gzip(None);
+        let member = gzip(Some(vec![b'a'; raw.len() - base.len()]));
+        assert_eq!(member.len(), raw.len() + 1);
+        assert_eq!(gunzip(&member, raw.len()).unwrap(), raw);
+        let frame = zstd::encode_all(member.as_slice(), 1).unwrap();
+        let codecs = [Codec::Bytes { little: true }, Codec::Gzip, Codec::Zstd];
+        let decoded = decode_chunk(&codecs, &frame, &[64], DType::parse_v3("uint8").unwrap(), None).unwrap();
+        assert_eq!(decoded.0, raw);
+    }
+
+    /// The reverse pipeline has a Zstandard frame larger than its final values too; gzip must
+    /// return that complete frame instead of applying the final array size to it.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn bounded_gzip_keeps_an_intermediate_zstd_frame() {
+        use std::io::Write;
+        let raw: Vec<u8> = (0..64u16).map(|i| ((i * 73 + 17) % 251) as u8).collect();
+        let frame = zstd::encode_all(raw.as_slice(), 1).unwrap();
+        assert!(frame.len() > raw.len());
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&frame).unwrap();
+        let encoded = encoder.finish().unwrap();
+        let codecs = [Codec::Bytes { little: true }, Codec::Zstd, Codec::Gzip];
+        let decoded = decode_chunk(&codecs, &encoded, &[64], DType::parse_v3("uint8").unwrap(), None).unwrap();
+        assert_eq!(decoded.0, raw);
+    }
+
+    /// CRC32C has a fixed four-byte overhead: reject excess before stripping the checksum can
+    /// copy it or the final chunk-length handling can silently accept a prefix.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn bounded_zstd_before_crc32c_uses_the_known_length() {
+        let codecs = [Codec::Bytes { little: true }, Codec::Crc32c, Codec::Zstd];
+        // Little-endian CRC32C checksums of 64 and 128 zero bytes (Zarr's CRC32C codec).
+        for (n, checksum) in [(64, 0x03c8eb67u32), (128, 0x082764dbu32)] {
+            let mut encoded = vec![0u8; n];
+            encoded.extend(checksum.to_le_bytes());
+            let frame = zstd::encode_all(encoded.as_slice(), 1).unwrap();
+            let decoded = decode_chunk(&codecs, &frame, &[64], DType::parse_v3("uint8").unwrap(), None);
+            if n == 64 {
+                assert_eq!(decoded.unwrap().0, [0u8; 64]);
+            } else {
+                assert!(
+                    matches!(decoded, Err(DataError::Format(ref message)) if message.contains("a zstd chunk: decoded data is too large")),
+                    "{decoded:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -3945,6 +4086,50 @@ mod tests {
             }
         }
         files
+    }
+
+    /// The named-array error context must retain a decoder's cancellation variant.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn bounded_zstd_named_arrays_keep_cancellation() {
+        let files = window_store(false);
+        let store = parse_store(&files[..1]).unwrap();
+        let a = store.array("v").unwrap();
+        let bytes = &files.iter().find(|(key, _)| key == "v/c/0/0/0").unwrap().1;
+        let _guard = crate::progress::install(Some(crate::progress::tests::Counted::cancelling_after(0)));
+        let result = a.decode_bytes(bytes);
+        assert!(matches!(result, Err(DataError::Cancelled)), "{result:?}");
+    }
+
+    /// A fetched inner chunk uses its own decoding path when assembling a sharded window.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn bounded_zstd_shard_windows_keep_cancellation() {
+        let files = window_store(true);
+        let store = parse_store(&files[..1]).unwrap();
+        let selection = Selection { variable: "v".into(), window: Some(Window { x0: 0, y0: 0, x1: 2, y1: 2 }), ..Default::default() };
+        let p = plan(&store, &selection).unwrap();
+        let mut got = read_plan(&files, &p);
+        got.extend(read_spans(&files, &inner_parts(&store, &p, &got).unwrap()));
+        assert!(got.contains_key("v/c/0/0/0#0"));
+        let _guard = crate::progress::install(Some(crate::progress::tests::Counted::cancelling_after(0)));
+        let result = assemble(&store, &p, &got, "v", None);
+        assert!(matches!(result, Err(DataError::Cancelled)), "{result:?}");
+    }
+
+    /// A point series reaches the separate fetched-inner-chunk path in `shard_chunk`.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn bounded_zstd_shard_series_keep_cancellation() {
+        let files = window_store(true);
+        let store = parse_store(&files[..1]).unwrap();
+        let sel = Selection { variable: "v".into(), ..Default::default() };
+        let p = plan_series(&store, &sel, "time", 0, 1, 0, 0).unwrap();
+        let mut got = read_spans(&files, &p.parts);
+        got.extend(read_spans(&files, &series_inner_parts(&store, &p, &got).unwrap()));
+        let _guard = crate::progress::install(Some(crate::progress::tests::Counted::cancelling_after(0)));
+        let result = assemble_series(&store, &p, &got);
+        assert!(matches!(result, Err(DataError::Cancelled)), "{result:?}");
     }
 
     /// What `p` reads of `files`: its whole files by key, its parts by their ids (as a web store

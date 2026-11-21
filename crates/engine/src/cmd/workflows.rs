@@ -475,7 +475,17 @@ fn environments(s: &mut Session, p: &Value) -> CmdResult {
         "densityCells": rustgis_analysis::max_density_cells(),
         "bufferBytes": rustgis_analysis::max_buffer_bytes(),
         "threadScratchBytes": rustgis_analysis::scratch_budget(),
+        "undoBytes": s.undo_memory.limit,
+        // What the limits follow: the computer, a container's limit, or RUSTGIS_MEMORY_BYTES.
+        "memorySource": rustgis_data::memory::source(),
+        // What the process holds (layers, tables, rasters, Undo history, copies being made), as of
+        // the last command: past half the memory, the limits that follow it plan for less (#2431).
+        "heldBytes": rustgis_data::memory::held(),
+        // What the computer has free now (null: not known, or RUSTGIS_MEMORY_BYTES is set): the
+        // limits plan for no more than this, less what is kept for drawing (#2431).
+        "freeBytes": rustgis_data::memory::available(),
         "projectBytes": crate::project::max_bytes(),
+        "fileBytes": rustgis_data::io::max_bytes(),
         // The threads one piece of work uses now, and the cores they come from (#1562).
         "threads": rustgis_data::threads::max(),
         "cores": rustgis_data::threads::cores(),
@@ -823,6 +833,9 @@ pub(crate) fn ahead_on_copy(s: &Session, command: &'static str, p: &Value) -> su
         copy.view_size = view_size;
         copy.active_layer = active_layer;
         copy.opened = opened;
+        // The copy shares this session's rows, which this session already counts in what the
+        // process holds (#2431): it neither measures nor adds them again.
+        copy.undo_memory.memory = None;
         copy.sync_policy_generation();
         copy.tools_ahead = Some(super::gp::Ahead::Recording(Vec::new()));
         copy.files_ahead = Some(super::gp::FilesAhead::Recording(Vec::new()));
@@ -1557,8 +1570,21 @@ fn interpolate_work(s: &Session, p: &Value) -> Result<Work, String> {
     // Features without a place or a number are left out, and said (by kind, with a count).
     let (mut no_point, mut no_value) = (0usize, 0usize);
     let mut pts: Vec<(Coord, f64)> = Vec::with_capacity(ds.features.len());
+    // Each place in longitude/latitude, whatever system the layer holds its coordinates in; one
+    // that can't be given there has no place. A point is converted alone; any other shape is
+    // converted first, so its label point (a polygon's centroid) is the one it has in
+    // longitude/latitude, not the one in the layer's own system. A shape with a place that can't
+    // be converted gives its label point in its own system, converted, as long as that converts.
+    let to = ds.lonlat_conversion()?;
+    let place = |g: &Geometry| match g {
+        Geometry::Point(c) => to.point(*c),
+        g => match Dataset::converted_to_lonlat(&to, g) {
+            Some(g) => g.label_point(),
+            None => g.label_point().and_then(|c| to.point(c)),
+        },
+    };
     for (r, ft) in ds.features.iter().enumerate() {
-        let Some(c) = ft.geometry.as_ref().and_then(|g| g.label_point()).filter(|c| c.is_finite()) else {
+        let Some(c) = ft.geometry.as_ref().and_then(place).filter(|c| c.is_finite()) else {
             no_point += 1;
             continue;
         };
@@ -1673,7 +1699,8 @@ fn interpolate_work(s: &Session, p: &Value) -> Result<Work, String> {
     }))
 }
 
-/// Creates a route layer and reports invalid source segments omitted from its network.
+/// Routes over the query-visible resident network, independently of selection. Invalid
+/// source segments and unreadable-query fallback are reported after a successful route.
 fn route(s: &mut Session, p: &Value) -> CmdResult {
     let id = s.layer_id(p)?;
     let l = s.map().layer(id).ok_or("no such layer")?;
@@ -1682,9 +1709,24 @@ fn route(s: &mut Session, p: &Value) -> CmdResult {
     }
     let name = out_name(p, format!("Route on {}", l.name))?;
     let cost = ps(p, "costField").map(|n| l.dataset.field_index(n).ok_or_else(|| format!("no field named '{n}'"))).transpose()?;
-    let rows: Vec<usize> = l.visible_rows().iter().enumerate().filter(|(_, v)| **v).map(|(i, _)| i).collect();
-    let r = network::shortest_route(
+    let resolved = l.resolve_rows(&l.dataset, rustgis_map::rows::Policy::Query, None)?;
+    let query_notice = resolved.query_error.map(|error| {
+        crate::notice_text::NoticeText::format(
+            "1 layer with an unreadable definition query; reading without that query: {layer}: {error}",
+            [("layer", l.name.clone().into()), ("error", error.into())],
+        )
+    });
+    let rows: Vec<usize> = match resolved.rows {
+        rustgis_map::rows::Rows::All => (0..l.dataset.features.len()).collect(),
+        rustgis_map::rows::Rows::Subset(rows) => rows,
+    };
+    // The network in longitude/latitude, as `from` and `to` are, whatever system the layer holds
+    // its coordinates in: converted only when its graph is built, which is kept for the layer's
+    // rows, so routes over a held network reuse it as they do over one in longitude/latitude.
+    let system = (l.dataset.coord_crs(), l.dataset.crs);
+    let r = network::shortest_route_held(
         &l.dataset,
+        || l.dataset.in_lonlat(),
         &rows,
         point(p, "from")?,
         point(p, "to")?,
@@ -1695,7 +1737,11 @@ fn route(s: &mut Session, p: &Value) -> CmdResult {
     let mut ds =
         Dataset::new(name, GeometryType::Polyline, vec![Field::new("length_km", FieldType::Double), Field::new("cost", FieldType::Double)]);
     ds.push(Some(Geometry::Line(vec![r.path.clone()])), vec![Attr::Float(r.length_m / 1000.0), Attr::Float(r.cost)]);
+    hold_as(s, &mut ds, system)?;
     let nid = super::layer::add_dataset(s, ds);
+    if let Some(notice) = query_notice {
+        s.notify_text(notice, false);
+    }
     if r.skipped_segments > 0 {
         s.notify(
             format!("{source_name}: {} segments with invalid coordinates were omitted from the route network", r.skipped_segments),
@@ -1705,6 +1751,8 @@ fn route(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"layer": nid, "lengthKm": r.length_m / 1000.0, "cost": r.cost, "segments": r.rows.len()}))
 }
 
+/// Searches query-visible resident rows independently of selection, replacing selection only
+/// when requested. Unreadable-query fallbacks are counted after a successful search.
 fn neighborhood(s: &mut Session, p: &Value) -> CmdResult {
     let at = Coord::new(f(p, "lon").ok_or("lon is required")?, f(p, "lat").ok_or("lat is required")?);
     if !(at.x.is_finite() && at.y.abs() <= 90.0) {
@@ -1717,11 +1765,27 @@ fn neighborhood(s: &mut Session, p: &Value) -> CmdResult {
     let mut found: Vec<(u32, Vec<usize>)> = Vec::new();
     let mut bounded = Vec::new();
     let mut invalid = Vec::new();
+    let mut query_errors = Vec::new();
+    let mut query_error_count = 0;
     for l in s.map().layers.iter().filter(|l| s.map().shows(l) && !l.is_raster() && !l.graphics) {
         if only.as_ref().is_some_and(|o| !o.contains(&l.name.to_ascii_lowercase())) {
             continue;
         }
-        let rows: Vec<usize> = l.visible_rows().iter().enumerate().filter(|(_, v)| **v).map(|(i, _)| i).collect();
+        let resolved = l.resolve_rows(&l.dataset, rustgis_map::rows::Policy::Query, None)?;
+        if let Some(error) = resolved.query_error {
+            query_error_count += 1;
+            // NoticeText::list nests entries; keep its depth independent of the layer count.
+            if query_errors.len() < 5 {
+                query_errors.push(crate::notice_text::NoticeText::format(
+                    "{layer}: {error}",
+                    [("layer", l.name.clone().into()), ("error", error.into())],
+                ));
+            }
+        }
+        let rows: Vec<usize> = match resolved.rows {
+            rustgis_map::rows::Rows::All => (0..l.dataset.features.len()).collect(),
+            rustgis_map::rows::Rows::Subset(rows) => rows,
+        };
         let report = network::within_report(&l.dataset, &rows, at, radius);
         let (near, n) = (report.rows, report.bounded);
         invalid.push((l.name.clone(), report.invalid_latitudes, report.missing_coordinates));
@@ -1751,9 +1815,25 @@ fn neighborhood(s: &mut Session, p: &Value) -> CmdResult {
             super::select::set(s, id, rows, super::select::Mode::Add);
         }
     }
+    if query_error_count > 0 {
+        use crate::notice_text::NoticeText;
+        let key = if query_error_count == 1 {
+            "{count} layer with an unreadable definition query; reading without that query: {layers}"
+        } else {
+            "{count} layers with unreadable definition queries; reading without those queries: {layers}"
+        };
+        let more = query_error_count - query_errors.len();
+        let mut layers = NoticeText::list(query_errors);
+        if more > 0 {
+            layers = NoticeText::format("{layers}; {count} more layers", [("layers", layers), ("count", more.to_string().into())]);
+        }
+        s.notify_text(NoticeText::format(key, [("count", query_error_count.to_string().into()), ("layers", layers)]), false);
+    }
     Ok(json!({"radiusKm": radius / 1000.0, "layers": out}))
 }
 
+/// Generate points in resident polygons kept by the selection and definition query. An
+/// unreadable saved query leaves those polygons unfiltered and is reported once.
 fn simulate(s: &mut Session, p: &Value) -> CmdResult {
     let id = s.layer_id(p)?;
     let l = s.map().layer(id).ok_or("no such layer")?;
@@ -1761,12 +1841,21 @@ fn simulate(s: &mut Session, p: &Value) -> CmdResult {
         return Err("points are simulated inside polygons".into());
     }
     let name = out_name(p, format!("{}_simulated", l.name))?;
-    // The selected polygons, or every visible one.
-    let rows: Vec<usize> = if l.selection.is_empty() {
-        l.visible_rows().iter().enumerate().filter(|(_, v)| **v).map(|(i, _)| i).collect()
-    } else {
-        l.selection.clone()
+    let resolved = l.resolve_rows(&l.dataset, rustgis_map::rows::Policy::SelectionAndQuery, None)?;
+    let query_notice = resolved.query_error.map(|error| {
+        crate::notice_text::NoticeText::format(
+            "1 layer with an unreadable definition query; reading without that query: {layer}: {error}",
+            [("layer", l.name.clone().into()), ("error", error.into())],
+        )
+    });
+    let rows: Vec<usize> = match resolved.rows {
+        rustgis_map::rows::Rows::All => (0..l.dataset.features.len()).collect(),
+        rustgis_map::rows::Rows::Subset(rows) => rows,
     };
+    // Placed in longitude/latitude, whatever system the polygons' layer holds its coordinates in,
+    // then held in that system, as the polygons are.
+    let polygons = l.dataset.in_lonlat()?;
+    let system = (l.dataset.coord_crs(), l.dataset.crs);
     let seed = f(p, "seed").map_or(42, |v| v.max(0.0) as u64);
     let pts: Vec<(usize, Coord)> = match ps(p, "field") {
         Some(fname) => {
@@ -1776,7 +1865,7 @@ fn simulate(s: &mut Session, p: &Value) -> CmdResult {
             let mut out = Vec::new();
             for r in &rows {
                 let n = (l.dataset.value(*r, fi).as_f64().unwrap_or(0.0) * rate).round().clamp(0.0, 100_000.0) as usize;
-                out.extend(network::random_points(&l.dataset, &[*r], n, seed.wrapping_add(*r as u64)));
+                out.extend(network::random_points(&polygons, &[*r], n, seed.wrapping_add(*r as u64)));
                 if out.len() > 1_000_000 {
                     return Err("that would make more than a million points; lower the rate".into());
                 }
@@ -1788,7 +1877,7 @@ fn simulate(s: &mut Session, p: &Value) -> CmdResult {
             if rows.len().saturating_mul(per) > 1_000_000 {
                 return Err("that would make more than a million points; lower the count".into());
             }
-            network::random_points(&l.dataset, &rows, per, seed)
+            network::random_points(&polygons, &rows, per, seed)
         }
     };
     let mut ds = Dataset::new(name, GeometryType::Point, vec![Field::new("polygon", FieldType::Integer)]);
@@ -1796,8 +1885,31 @@ fn simulate(s: &mut Session, p: &Value) -> CmdResult {
         ds.push(Some(Geometry::Point(*c)), vec![Attr::Int(*r as i64)]);
     }
     let n = ds.features.len();
+    hold_as(s, &mut ds, system)?;
+    if let Some(notice) = query_notice {
+        s.notify_text(notice, false);
+    }
     let nid = super::layer::add_dataset(s, ds);
     Ok(json!({"layer": nid, "points": n}))
+}
+
+/// Holds `ds`, a layer made in longitude/latitude from another, as that layer is
+/// ([`Dataset::hold_as`]; `system` is its [`Dataset::coord_crs`] and [`Dataset::crs`]), and says
+/// so when it can't be: it stays in longitude/latitude then, as it was made. A cancel stops the
+/// command, which adds nothing.
+pub(crate) fn hold_as(
+    s: &mut Session,
+    ds: &mut Dataset,
+    (held, crs): (rustgis_data::raster::Crs, Option<rustgis_data::raster::Crs>),
+) -> Result<(), String> {
+    match ds.hold_as(held, crs) {
+        Err(e) if matches!(rustgis_data::DataError::of_conversion(e.clone()), rustgis_data::DataError::Cancelled) => Err(e),
+        Err(e) => {
+            s.notify(format!("{}: kept in longitude/latitude, as it was made, not in {}: {e}", ds.name, held.label()), false);
+            Ok(())
+        }
+        Ok(()) => Ok(()),
+    }
 }
 
 fn numeric_fields(ds: &Dataset, p: &Value) -> Result<Vec<usize>, String> {
@@ -1887,22 +1999,31 @@ fn similar(s: &mut Session, p: &Value) -> CmdResult {
 /// needs a file path so its full source can be read off the desktop frame, rather than returning
 /// only its loaded view. File conversions use the shared export lifecycle.
 fn convert(s: &mut Session, p: &Value) -> CmdResult {
+    use std::borrow::Cow;
+
     if ps(p, "path").is_some() {
         return super::exports::write_here(s, p, "data.convert");
     }
     let id = s.layer_id(p)?;
-    if s.map().layer(id).is_some_and(|l| l.is_streamed()) {
+    let layer = s.map().layer(id).ok_or("no such layer")?;
+    if layer.is_streamed() {
         return Err("a streamed layer needs a path to convert its whole source; text conversion would contain only the loaded view".into());
     }
-    let construction_notes = s.constructions.export_notes(s.map().instance_id(), s.map().layer(id).ok_or("no such layer")?)?;
-    let ds = feature_ds(s, p)?;
-    let (text, notes) = converted(ds, p)?;
+    let construction_notes = s.constructions.export_notes(s.map().instance_id(), layer)?;
+    let mut ds = Cow::Borrowed(feature_ds(s, p)?);
+    let report = rustgis_data::export::filter_dataset(&mut ds, layer.definition_query.as_deref()).map_err(|e| e.to_string())?;
+    let (text, notes) = converted(&ds, p)?;
     let null_numbers = rustgis_data::export::numbers_written_as_null(&ds.features, &ds.fields, conversion_format(p)?);
     let target = ds.name.clone();
+    let query_note = super::share::query_export_note(&target, &layer.name, &report);
+    drop(ds);
     for note in notes.into_iter().chain(construction_notes) {
         s.notify(note, false);
     }
     super::share::notify_null_numbers(s, &target, null_numbers);
+    if let Some(note) = query_note {
+        s.notify_text(note, false);
+    }
     Ok(json!({"text": text}))
 }
 
@@ -1910,6 +2031,8 @@ fn convert(s: &mut Session, p: &Value) -> CmdResult {
 /// GeoJSON and CSV use the chunk writer; KML, GPX and WKT read whole within the existing memory
 /// limits, then check Cancel between features (one geometry's serialization is indivisible).
 pub(crate) fn convert_work(s: &Session, p: &Value) -> Result<super::exports::Work, String> {
+    use std::borrow::Cow;
+
     feature_ds(s, p)?;
     let id = s.layer_id(p)?;
     let layer = s.map().layer(id).ok_or("no such layer")?.clone();
@@ -1921,18 +2044,20 @@ pub(crate) fn convert_work(s: &Session, p: &Value) -> Result<super::exports::Wor
         let construction_notes = constructions.export_notes(map, &layer)?;
         let format = conversion_format(&params)?;
         let chunks = if layer.is_streamed() && matches!(format, "geojson" | "csv") { layer.chunk_export()? } else { None };
-        let (mut notes, null_numbers) = if let Some((source, ds)) = chunks {
-            let result = rustgis_data::export::write_source_as_in(
+        let query = layer.definition_query.as_deref();
+        let (mut notes, null_numbers, query_report) = if let Some((source, ds)) = chunks {
+            let result = rustgis_data::export::write_source_as_filtered(
                 source.as_ref(),
                 &ds,
                 std::path::Path::new(&path),
                 rustgis_data::raster::Crs::LonLat,
                 format,
+                query,
             )
             .map_err(|e| e.to_string())?;
             let mut notes = rustgis_data::export_notes([(&ds, layer.extent())], &path, rustgis_data::raster::Crs::LonLat);
             if format == "csv" {
-                notes.extend(result.csv.notes(&path));
+                notes.extend(result.csv.notes(&ds.fields, &path));
             }
             if result.skipped > 0 {
                 notes.push(format!("{path}: {} rows couldn't be read and were left out", result.skipped));
@@ -1950,32 +2075,35 @@ pub(crate) fn convert_work(s: &Session, p: &Value) -> Result<super::exports::Wor
                     .map(|n| format!("{path}: {}: {n}, so they're empty in the export", ds.name)),
             );
             notes.extend(result.read_notes.iter().map(|n| format!("{path}: {}: {n} when read for the export", ds.name)));
-            (notes, result.null_numbers)
+            (notes, result.null_numbers, result.query)
         } else {
-            let (whole, unreadable) = if layer.is_streamed() {
-                layer.load_all_counted().map(|(ds, n)| (Some(ds), n))?
+            let (mut ds, unreadable) = if layer.is_streamed() {
+                let (ds, unreadable) = layer.load_all_counted()?;
+                (Cow::Owned(ds), unreadable)
             } else {
-                (None, rustgis_map::Unreadable::default())
+                (Cow::Borrowed(&layer.dataset), rustgis_map::Unreadable::default())
             };
-            let ds = whole.as_ref().unwrap_or(&layer.dataset);
+            let report = rustgis_data::export::filter_dataset(&mut ds, query).map_err(|e| e.to_string())?;
             rustgis_data::progress::begin(ds.features.len());
-            let (text, mut notes) = converted(ds, &params)?;
-            super::share::coalesce_read_zm(&mut notes, &path, ds, &unreadable);
+            let (text, mut notes) = converted(&ds, &params)?;
+            super::share::coalesce_read_zm(&mut notes, &path, &ds, &unreadable);
             rustgis_data::io::write_atomic(std::path::Path::new(&path), text.as_bytes()).map_err(|e| format!("{path}: {e}"))?;
             if unreadable.rows > 0 {
                 notes.push(format!("{path}: {} rows couldn't be read and were left out", unreadable.rows));
             }
             notes.extend(super::share::read_notes(&path, &ds.name, &unreadable));
-            (notes, rustgis_data::export::numbers_written_as_null(&ds.features, &ds.fields, format))
+            (notes, rustgis_data::export::numbers_written_as_null(&ds.features, &ds.fields, format), report)
         };
         let bytes = std::fs::metadata(&path).map_err(|e| format!("{path}: {e}"))?.len();
         notes.extend(construction_notes);
         notes.push(format!("Exported {path}"));
         let target = path.clone();
-        let refused_notes = super::share::null_numbers_note(&target, null_numbers).map(|n| n.english()).into_iter().collect();
-        let then = (null_numbers > 0).then(|| {
+        let query_note = super::share::query_export_note(&target, &layer.name, &query_report);
+        let refused_notes = super::share::null_numbers_note(&target, null_numbers).iter().chain(&query_note).map(|n| n.english()).collect();
+        let then = (null_numbers > 0 || query_note.is_some()).then(|| {
             Box::new(move |s: &mut Session, _: &mut Value| {
                 super::share::notify_null_numbers(s, &target, null_numbers);
+                super::share::notify_written_query(s, query_note);
                 Ok(())
             }) as super::exports::Then
         });
@@ -2007,18 +2135,19 @@ fn converted(ds: &Dataset, p: &Value) -> Result<(String, Vec<String>), String> {
     let name_field =
         ps(p, "nameField").and_then(|n| ds.field_index(n)).or_else(|| ds.fields.iter().position(|f| f.name.eq_ignore_ascii_case("name")));
     let format = conversion_format(p)?;
+    // Every format here is longitude/latitude, whatever system the layer holds its coordinates
+    // in; the notes below read the layer itself, converting as they need.
+    let lonlat = ds.in_lonlat()?;
     let text = match format {
-        "geojson" => rustgis_data::io::to_geojson_text(ds).map_err(|e| e.to_string())?,
-        "csv" => rustgis_data::io::to_csv(ds).map_err(|e| e.to_string())?,
-        "kml" => rustgis_data::interop::to_kml(ds, name_field).map_err(|e| e.to_string())?,
-        "gpx" => rustgis_data::interop::to_gpx(ds, name_field).map_err(|e| e.to_string())?,
-        _ => rustgis_data::interop::to_wkt_csv(ds).map_err(|e| e.to_string())?,
+        "geojson" => rustgis_data::io::to_geojson_text(&lonlat).map_err(|e| e.to_string())?,
+        "csv" => rustgis_data::io::to_csv(&lonlat).map_err(|e| e.to_string())?,
+        "kml" => rustgis_data::interop::to_kml(&lonlat, name_field).map_err(|e| e.to_string())?,
+        "gpx" => rustgis_data::interop::to_gpx(&lonlat, name_field).map_err(|e| e.to_string())?,
+        _ => rustgis_data::interop::to_wkt_csv(&lonlat).map_err(|e| e.to_string())?,
     };
-    // Every format here is longitude/latitude.
     let target = ps(p, "path").unwrap_or(&ds.name);
-    let mut notes = rustgis_data::export_notes([(ds, ds.extent())], target, rustgis_data::raster::Crs::LonLat);
-    // CSV holds a point a row, GPX a name for each feature and no areas.
-    notes.extend(rustgis_data::io::export_losses_notes(ds, format, name_field, target));
+    let mut notes = rustgis_data::export_notes([(ds, ds.lonlat_extent())], target, rustgis_data::raster::Crs::LonLat);
+    notes.extend(rustgis_data::io::export_losses_notes(ds, format, name_field, target).map_err(|e| e.to_string())?);
     // KML and GPX hold features with geometry only.
     if let ext @ ("kml" | "gpx") = format {
         let without =

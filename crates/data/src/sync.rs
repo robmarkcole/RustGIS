@@ -68,9 +68,17 @@ pub fn rows_digest(ds: &crate::Dataset) -> crate::Result<u64> {
         field.alias = None;
     }
     put(&mut h, &(&fields, &ds.crs));
+    // Its geometry in longitude/latitude, as every release before #2032 C2 held a file's rows
+    // (converted by the same transformer the readers converted them with), so a digest saved
+    // then still matches the file read now in its own coordinates.
+    let to = ds.lonlat_conversion().map_err(crate::DataError::Format)?;
     crate::progress::begin(ds.features.len());
     for f in ds.features.iter() {
-        put(&mut h, &(&f.geometry, &f.attrs));
+        if to.is_identity() {
+            put(&mut h, &(&f.geometry, &f.attrs));
+        } else {
+            put(&mut h, &(&f.geometry.as_ref().map(|g| to.geometry(g)), &f.attrs));
+        }
         for (index, value) in f.attrs.iter().enumerate() {
             if let crate::Value::Float(number) = value
                 && !number.is_finite()
@@ -195,8 +203,11 @@ mod native {
         /// as they were just before it ran (`None` when a part couldn't be read). Hashed before
         /// the read, the record can only be older than what was read: a write while it ran, or
         /// after, leaves the file unlike the record, so it shows as changed and is never written
-        /// over. That costs one more pass over the files than the read, about a second for a
-        /// part of the largest a reader takes (256 MiB) where SHA-256 runs at 250 MB/s. Errs,
+        /// over. That costs one more pass over the files than the read, about a second for every
+        /// 250 MB of them where SHA-256 runs at 250 MB/s: about 17 for a part of the largest a reader
+        /// takes ([`crate::io::max_bytes`], 4 GiB at most). It runs on the thread that reads: off the UI
+        /// thread for a file read ahead, on the calling thread for one `layer.addData` reads
+        /// whole there (a GeoJSON file that isn't a FeatureCollection). Errs,
         /// without reading, when the run is cancelled while the files are hashed.
         pub fn around<R>(path: &Path, read: impl FnOnce() -> R) -> Result<(R, Option<FileSync>)> {
             let before = match FileSync::read(path) {

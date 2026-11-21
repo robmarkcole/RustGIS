@@ -304,6 +304,8 @@ fn add(s: &mut Session, p: &Value) -> CmdResult {
     let (fill, outline) = (color(p, "fill")?, color(p, "outline")?);
     let style = TextStyle::of(p)?;
     let id = target(s, p)?;
+    // A place snapped to a stored one stays as stored.
+    let held = super::design::held_places(s, id, &[], &[&g]);
     let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
     let num = |k: &str, min: f64, max: f64| f(p, k).map(|v| Attr::Float(v.clamp(min, max))).unwrap_or(Attr::Null);
     let opt = |v: Option<String>| v.map(Attr::Text).unwrap_or(Attr::Null);
@@ -317,6 +319,8 @@ fn add(s: &mut Session, p: &Value) -> CmdResult {
         num("fontSize", *graphics::FONT_SIZE.start(), *graphics::FONT_SIZE.end()),
         opt(image),
     ];
+    // Drawn in longitude/latitude, written in the layer's own coordinates.
+    let g = l.dataset.edit_from_lonlat(g, &held)?;
     l.dataset.push(Some(g), attrs);
     let row = l.dataset.features.len() - 1;
     // By name, as a layer made before the field lacks it.
@@ -371,7 +375,10 @@ fn edit(s: &mut Session, p: &Value) -> CmdResult {
         None => None,
     };
     if let Some(g) = placed {
+        let held = super::design::held_places(s, id, &[], &[&g]);
         let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
+        // Placed in longitude/latitude, written in the layer's own coordinates.
+        let g = l.dataset.edit_from_lonlat(g, &held)?;
         if let Some(ft) = l.dataset.features.get_mut(row) {
             ft.geometry = Some(g);
         }

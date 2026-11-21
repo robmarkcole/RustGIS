@@ -565,8 +565,12 @@ polygon split there), measured as the meridian it runs along. A ring winding aro
 measured as the region it traces by the attribute table
 and the Measure tools (a ring that goes all the way round at 60° N gives the larger region),
 while **Calculate Geometry Attributes** gives the smaller polar cap. On the Moon or another body, the Measure tools measure on
-that body's sphere. The Radius tools still measure a local Mercator distance, and **Mensuration
-Tools** (`raster.measure`) still measure on the sphere, so those can differ from the numbers above.
+that body's sphere. **Mensuration Tools** (`raster.measure`) measure distances, areas and perimeters
+the same way, on the ellipsoid on the Earth and on the body's sphere elsewhere. A distance along the
+surface spaces its height samples along the path on the sphere and takes each step's ground run
+from the leg it lies on at that leg's length on the ellipsoid, so over level ground it equals the
+distance. A volume still takes one cell size for the whole raster, at its centre's latitude. The
+Radius tools still measure a local Mercator distance, so those can differ from the numbers above.
 
 For an ambiguous area, the `raster.measure` command with `kind: "area"` returns an error without a measurement object. To request its finite closed-ring perimeter, use `kind: "distance"` and repeat the first point at the end. The on-map Measure overlay continues to show perimeter alongside the area refusal.
 
@@ -799,7 +803,7 @@ gp.run={"tool":"near","params":{"input":"addresses","near":"hydrants","units":"F
 
 **Spatial Join** (`spatialJoin`, also `gp.spatialJoin`) copies attributes from `join` features
 to `target` features. Layers may have different source coordinate systems: their geometry is
-stored in longitude/latitude before the join. `match` is one of:
+converted to longitude/latitude for the join. `match` is one of:
 
 - **Intersects** (default), **Contains** (target contains join) or **Within** (target lies within
   join).
@@ -1203,7 +1207,8 @@ CRS metadata. Coordinates are used directly, without projection or snapping.
   output memory, including repeated text attributes, before building the segments; unavailable
   memory returns an error.
 - **Feature Envelope To Polygon** (`featureEnvelopeToPolygon`) writes one axis-aligned rectangle
-  around all coordinates of each feature in stored longitude/latitude axes. Point features and
+  around all coordinates of each feature in longitude/latitude axes (converted from the layer's
+  own system). Point features and
   horizontal or vertical lines have zero-area envelopes and are skipped with a count. Longitude
   bounds are literal, including for features spanning the antimeridian.
 - **Unsplit Line** (`unsplitLine`) joins line parts at exactly equal endpoints where precisely
@@ -1438,6 +1443,11 @@ list syntax, and check the tool's own help for what a weight field left blank me
   become standalone tables; text reports appear in the tool's messages.
 - LiDAR and other inputs RustGIS doesn't open as layers take a file path, read like Add Data
   reads one. Outputs are written to a fresh scratch folder and loaded from there.
+- **Output Name** names the new layer, as on the built-in tools; left empty, the layer takes the
+  tool's name (in English). A tool with several outputs adds each output's name to it
+  (`Flow streams`, `Flow basins`). A name a layer or table already has gets a number
+  (`Contours 2`), and a name you typed that gets one is said in the messages. From the command
+  line it is the same `output` key: `"params":{"input":"dem","output":"Slope 30 m"}`.
 - Each run is a separate `geolibre` process, so a tool that fails can't take RustGIS down.
 - From the command line: `gp.run={"tool":"geolibre:slope","params":{"input":"dem"}}`;
   `gp.tools` lists every tool's parameters, `gp.geolibre` shows the runner in use and
@@ -1544,8 +1554,36 @@ cores; `gp.env` returns the threads and cores as `limits.threads` and `limits.co
 runs on one thread.
 
 `gp.env` also returns the memory limits on this computer (`limits`). On the desktop they follow the
-computer's memory, or a container's limit when it is lower: each plans for a quarter of it, never
-below the web app's fixed limits and never above a ceiling.
+computer's memory, or a memory limit set on RustGIS (a container's, or a service's such as systemd's `MemoryMax`) when it is lower: each plans for a quarter of it, never
+below the web app's fixed limits and never above a ceiling. `limits.memorySource` says what they
+follow: `computer`, `container` (such a limit, lower than the computer's memory),
+`override` or `unknown`. For tests, or to reproduce a smaller computer, set the environment
+variable `RUSTGIS_MEMORY_BYTES` to the memory in bytes (such as `8589934592` for 8 GiB) before
+starting RustGIS: it replaces the memory read from the computer and any container limit, and the
+command line says so on every run. It isn't a way to go faster: a value above the computer's
+memory raises every limit past what it has, and a large job can then run out of memory.
+
+The limits below other than `threadScratchBytes`, `undoBytes` and `projectBytes` plan for less
+when memory is short, never below their floors. They plan for the smallest of three figures:
+- a quarter of the memory;
+- what is left of three quarters of it after what RustGIS holds, which matters once it holds more
+  than half: on a 16 GiB computer holding 10 GiB, 2 GiB instead of 4 GiB;
+- what the computer has free now, less what is kept for drawing and the window (a twentieth of the
+  memory, from 256 MiB up to 2 GiB), which matters when other programs use most of it.
+
+What is held counts the open layers, tables and rasters, what only Undo and Redo keep and the
+copies of edits running in the background, in every project open in the process, as of the last
+command; `limits.heldBytes` gives it, and `limits.freeBytes` what is free. What is free is read each
+time, so the same job can pass now and be refused a minute later when another program has taken
+memory meanwhile. It isn't read when `RUSTGIS_MEMORY_BYTES` is set (`freeBytes` is then `null`), so
+tests give the same limits whatever else runs, nor in a container whose memory limit RustGIS
+follows (the container's own count includes file cache, so the limit bounds it instead). On macOS
+the system counts memory other programs are using as available too, so this figure rarely lowers
+anything there. A file refused for its size says what is held and
+free, and the limit otherwise. Removing layers or tables you no longer need raises the limits once
+Undo no longer keeps them: saving and reopening the project lets go of the Undo history. Reading a
+file again, or opening another project while a large one is open, plans against the lowered limits
+too, so a file that opened earlier in the session can be refused later.
 
 | Limit | Floor (web app value in brackets) | Desktop: a quarter of memory at | Ceiling |
 |---|---|---|---|
@@ -1555,7 +1593,34 @@ below the web app's fixed limits and never above a ceiling.
 | `densityCells`: cells of a Kernel Density raster | 16 million | 16 bytes a cell | 512 million |
 | `bufferBytes`: memory for Buffer's output and Select Layer By Location's buffered selectors | 512 MiB (128 MiB in the web app) | the bytes themselves | 8 GiB |
 | `threadScratchBytes`: working memory a tool's threads take together, beyond one thread's | 256 MiB | a sixteenth of memory, on top of the quarter | 4 GiB |
+| `undoBytes`: estimated feature rows, attributes and geometry kept only in Undo and Redo | 256 MiB | the bytes themselves | 4 GiB |
 | `projectBytes`: the largest project file saved or opened (see [Projects](workspace.md#projects)) | 512 MiB | 5 bytes for each byte of the file (about 800 MiB for every 16 GB) | 4 GiB |
+| `fileBytes`: the largest file read into memory whole (CityGML, CityJSON, zips, DXF, GeoJSON not read in place, and the like; KML, KMZ, LandXML, RSS, Atom and GeoRSS stay at 256 MiB, as does every file on a phone; see [Data formats](data-formats.md)) | 256 MiB | 8 bytes for each byte of the file (about 512 MiB for every 16 GiB) | 4 GiB |
+
+Undo history keeps up to 40 steps. When the estimated memory for saved copies of features
+exceeds `undoBytes`, RustGIS drops the oldest Undo steps first, then the farthest Redo steps.
+It keeps the newest Undo step even if that step alone exceeds the limit. The first time this
+happens in a project, a message says so. Edits can still create a temporary full copy of a layer.
+
+Before an edit of a layer's or table's features or fields, RustGIS checks that this copy fits
+beside what it already holds: the open layers, tables and rasters, what only Undo and Redo keep,
+and the copies of edits still running in the background, all within three quarters of the
+computer's memory, and that the copy fits in what the computer has free now, less what is kept for
+drawing (Undo steps set aside count as free for it, as the copy reuses their memory). When it doesn't fit, Redo steps are set aside first (the edit clears them
+anyway), then the oldest Undo steps. They are freed only once the edit starts copying; an edit
+that fails before that, or is cancelled before it starts copying, gives them back, unless the
+project was changed while it ran in the background. One that fails after it started copying has
+used them, as a finished edit would have. A message says when steps are freed to make room, the
+first time in a project, and each time steps set aside for a background edit are freed because the
+Undo history changed while it ran. Undo and Redo copy nothing and aren't checked. An edit that
+wouldn't fit even with no Undo history is refused before anything changes, and the message gives
+the size of the copy and what is held, or what is free when other programs use the memory. An edit the desktop runs in the background is checked when it starts; one that needs Undo
+steps set aside while another such edit is still running is refused, to run again once that one
+has finished. Edits made by a
+script, model, task or plugin aren't checked, nor is Paste Special (it makes a layer of its own) or
+reloading or repairing a layer's data. Nothing is checked where RustGIS can't read the computer's
+memory: in the web app, and on a computer that doesn't report it. Sizes are estimated, counting
+each text and part as the block of memory it takes, so they come out above the bytes themselves.
 
 So a computer with 16 GB reads rasters of up to about 500 million samples. A run that passes on one
 computer can be refused on a smaller one; the error names the limit there. Project Raster (`raster.project`) puts a raster
@@ -1574,7 +1639,11 @@ read, **Copy** for one and **Copy All** for the run, and why it stopped, if it d
 empties the pane: the script, its results, the count (the next run is Run #1 again) and the
 Details window. It asks nothing: the box keeps the focus, so Ctrl+Z (⌘+Z) brings the script back;
 after a click elsewhere, Ctrl+Z undoes in the project instead, so click into the box first. It is
-off with nothing to clear, and while a run is under way. Opening a
+off with nothing to clear, and while a run is under way. **Load…**, off then too, reads a script
+from a file (a `.txt` file in the browser; any file on the desktop and phone) in place of the pane's, emptying its
+results as Clear does, and Ctrl+Z (⌘+Z) brings the old script back; in the browser it uses the
+browser's file picker. A file that isn't UTF-8 text, or is over 1 MB, is refused with a notice
+naming it, and the script stays. Opening a
 project (New, Open, the sample, a template, or the same one again), from the app, a script, the
 assistant or an agent, starts the pane blank: the script, its results, the count and the Details
 window go with the old project. A script that opens a project itself stays, with its results, as
@@ -1591,7 +1660,9 @@ themes: `#` comments in green italics, the command id, and the JSON's strings, n
 `notebook.run`), and parameters that aren't valid JSON are red and underlined. A script is read to
 its 10,000th line; any further are dimmed, as Run doesn't read them. Typing a line's first word
 opens a list of the commands it starts, under the cursor: ↑/↓ to move, Enter or Tab to accept,
-Escape to close, or a click. Beside it, the highlighted command's help: its signature (keys with `?`
+Escape to close, or a click; Ctrl+Space opens it with nothing typed yet (on an empty line, every
+command), or again after Escape closed it (on macOS, where Ctrl+Space may switch the input source,
+type the first letter instead). Beside it, the highlighted command's help: its signature (keys with `?`
 may be left out), its name, its parameters one per line, and where it sits in the interface.
 Accepting a command on a line of its own adds its braces: with its required keys ready for their
 values, the cursor at the first (`map.goToXY {"lon": , "lat": }`), or empty with the cursor inside
@@ -1622,17 +1693,29 @@ form does: the layers of its kind (polygon, point, raster, vector; any layer, th
 the fields of the tool's input that it takes (numeric, holding coordinates), or its choices
 (`"units": "` offers `Kilometers`, `Meters`, …). Accepting one writes its name
 as the line's JSON needs it (`"Big \"lakes\""`).
+In a `task.addStep` line's `"params"`, a value offers what the step's command takes, as in a line
+of that command: its layers, maps, layouts, tables, label classes and fields, over the layer or
+table its `"params"` give (a `"layer"` outside them doesn't count), the active layer without one.
 In the string of a key that takes an expression (its type is `sql` or `expression` in the
 command's help: `"where"` in `select.byAttributes`, `"expression"` in `edit.calculateField`,
 `labels.by`'s keys…; in a `gp.run` line, a tool's expression, such as `selectByAttributes`'s
-`"where"`), the list is the one [Calculate Field](expressions.md#calculate-field) shows, anywhere
-in the string: the fields of the line's layer or table (in `gp.run`, of the tool's input, before
-or after it), the functions, the variables and the keywords that fit, with the same help beside.
-Where the line names no layer it can find, it offers the language's words without fields.
+`"where"`; in a `task.addStep` line's `"params"`, the step's command's), the list is the one
+[Calculate Field](expressions.md#calculate-field) shows, anywhere in the string: the fields of
+the line's layer or table, the active layer without one (in `gp.run`, of the tool's input,
+before or after it; in `task.addStep`, of the layer or table its `"params"` give, the active
+layer without one), the functions, the variables and the keywords that fit, with the same help
+beside. Where the line names a layer it can't find, or a tool has no input, it offers the
+language's words without fields. A
+layer's name with escapes (`"Big \"lakes\""`) is read as the name it writes, for these lists and
+the field lists alike.
 Accepting one writes it as the string needs it, the rest of the string left as written: a field
 begun with an escaped quote is closed with one (`"where": "\"Pop Est\""`), and a function comes
 with its brackets, the cursor inside. A key inside another key's objects, such as a display
-filter's `"where"`, offers nothing yet. A `{` or `[`
+filter's `"where"`, offers nothing yet. There too Ctrl+Space opens the list with nothing typed
+(`"where": "` lists all the fields, functions and variables). With the cursor in a function's
+call, the help by it is the function's signature instead of the command's, the argument the cursor
+is in marked (`round(x[, places])`), with what the function gives, as in Calculate Field; Escape
+closes it until the cursor leaves the call, and out of it the command's help is back. A `{` or `[`
 typed closes itself, the cursor inside, unless text follows it or it's in a string or a comment;
 so does a `"` where a string can start (after a space, `{`, `[`, `,` or `:`). A `}` or `]` typed
 before the same one steps over it, as does a `"` typed before the quote that ends its string, and

@@ -135,19 +135,27 @@ pub(super) fn long_commands(boundaries: bool) {
         ("layout.export", json!({"path": out("layout.pdf"), "dpi": 36})),
         ("report.export", json!({"path": out("report.pdf"), "dpi": 36})),
         ("source.publish", json!({"layer": "towns"})),
+        ("offline.package", json!({"path": out("crew.rgisfield")})),
     ];
     s.run("report.new", &json!({"layer": "Cities"})).unwrap();
     // A standalone table to export ranked and limited.
     s.run("layer.addDataText", &json!({"fileName": "ranks.csv", "text": "name,score\na,1\nb,3\n"})).unwrap();
     let registered = crate::cmd::exports::IN_BACKGROUND.iter().map(|(c, ..)| *c).collect::<std::collections::BTreeSet<_>>();
     assert_eq!(listed(&exports), registered, "add a new background export here");
+    // Reuse the same origin and generation on every retry. The open area includes a real
+    // streamed layer to exercise cancellation during its source traversal as well as the write.
+    let mut field = session(&s);
+    field.run("layer.addData", &json!({"path": out("towns.shp"), "name": "Streamed towns", "stream": true})).unwrap();
+    field.run("offline.package", &json!({"path": out("seed.rgisfield"), "name": "Crew", "extent": [9, 44, 11, 46]})).unwrap();
+    field.run("offline.open", &json!({"name": "Crew"})).unwrap();
     for (command, p) in &exports {
         // A block's model needs a block on the DEM, which the other exports don't draw.
         let block = *command == "map.exportBlock";
         if block {
             s.run("map.terrain", &json!({"layer": dem, "block": {}})).unwrap();
         }
-        exercise(&s, command, p, Kind::Export, &dir.0, boundaries);
+        let input = if *command == "offline.package" { &field } else { &s };
+        exercise(input, command, p, Kind::Export, &dir.0, boundaries);
         if block {
             s.run("map.terrain", &json!({"off": true})).unwrap();
         }
@@ -178,6 +186,18 @@ pub(super) fn long_commands(boundaries: bool) {
         assert!(control.looked() > 0, "edit.previewShapeConversion never looks at Cancel");
         assert!(contents(&shapes.project) == before, "edit.previewShapeConversion changed the project after Cancel");
     }
+    // A Shapefile and a GeoJSON file read in place are opened on the same queue: the Shapefile's
+    // records indexed, the GeoJSON file's features found, Cancel looked at as they go (#2446).
+    for file in ["in-place.shp", "in-place.geojson"] {
+        s.run("share.exportLayer", &json!({"layer": "Cities", "path": out(file)})).unwrap();
+        exercise(&s, "layer.addData", &json!({"path": out(file), "stream": true}), Kind::Read, &dir.0, boundaries);
+    }
+    // Past the first few thousand features, the GeoJSON scan looks at Cancel again.
+    let many: Vec<Value> = (0..4097)
+        .map(|i| json!({"type": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [10.0 + f64::from(i) * 1e-4, 45.0]}}))
+        .collect();
+    std::fs::write(out("many.geojson"), json!({"type": "FeatureCollection", "features": many}).to_string()).unwrap();
+    exercise(&s, "layer.addData", &json!({"path": out("many.geojson"), "stream": true}), Kind::Read, &dir.0, boundaries);
     // Original TIFF headers share the read queue and both cancellation sweeps.
     exercise(&s, "raster.imageGrid", &json!({"layer": dem}), Kind::Read, &dir.0, boundaries);
     // A PDF's page is read on the same queue: the file, then its drawing, Cancel looked at between

@@ -2291,15 +2291,23 @@ pub(crate) fn text_graphic_at(app: &RustGisApp, ctx: &egui::Context, rect: Rect,
     let tokens = graphics::TokenValues::of(map, scale);
     // Only what is drawn, as render_frame draws it: the first layer on top, and in a layer the
     // last row. Fully transparent layers and rows beyond the view clipping distance are not drawn.
-    let clip = map.view.clip_distance.map(|d| (map.camera.center_lonlat(), d));
+    let clip = map.view.clip_distance.and_then(|d| Some((map.to_lonlat(map.camera.center)?, d)));
     map.layers.iter().filter(|l| l.graphics && l.selectable && map.draws_at(l, scale) && map.layer_opacity(l) > 0.0).find_map(|l| {
         let drawn = l.drawn_rows(scale);
+        // Boxes in longitude/latitude, as the view distance is measured there: none when the
+        // layer's coordinates can't be converted, as none of it is drawn then.
+        let to_lonlat = l.dataset.lonlat_conversion().ok()?;
         (0..l.dataset.features.len()).rev().filter(|r| drawn.get(*r) == Some(&true)).find_map(|row| {
             let g = l.dataset.features.get(row)?.geometry.as_ref()?;
             if let Some((centre, d)) = clip {
-                let e = g.extent();
+                // No extent (an empty geometry, or one whose conversion isn't a number): nothing
+                // of it is drawn, and clamping to its extent would panic.
+                let e = to_lonlat.feature_extent(&g.extent());
+                if e.is_empty() {
+                    return None;
+                }
                 let near = Coord::new(centre.x.clamp(e.min_x, e.max_x), centre.y.clamp(e.min_y, e.max_y));
-                if e.is_empty() || rustgis_engine::geom::haversine_m(centre, near) > d {
+                if rustgis_engine::geom::haversine_m(centre, near) > d {
                     return None;
                 }
             }
@@ -2322,7 +2330,11 @@ fn text_shown(
     use rustgis_engine::map::graphics;
     let ds = &l.dataset;
     let text = graphics::expand(graphics::label(ds, row)?, tokens);
-    let at = lonlat_to_screen(app, rect, ds.features.get(row)?.geometry.as_ref()?.label_point()?)?;
+    // Its place in longitude/latitude, from the layer's own coordinates, as the map shows them.
+    let place = ds.features.get(row)?.geometry.as_ref()?.label_point()?;
+    let to_lonlat = ds.shown_conversion().ok()?;
+    let place = if to_lonlat.is_identity() { place } else { to_lonlat.point(place)? };
+    let at = lonlat_to_screen(app, rect, place)?;
     let job = label_job(
         &text,
         graphics::font_size(ds, row),
@@ -3540,7 +3552,10 @@ fn overlays(app: &mut RustGisApp, ui: &mut Ui, p: &egui::Painter, rect: Rect, t:
         let mut verts: Vec<Coord> = Vec::new();
         for l in app.session.map().layers.iter().filter(|l| !l.selection.is_empty() && !l.is_raster() && !l.graphics) {
             for r in &l.selection {
-                if let Some(g) = l.dataset.features.get(*r).and_then(|f| f.geometry.as_ref()) {
+                // In longitude/latitude, from the layer's own coordinates, as they are drawn.
+                if let Some(g) = l.dataset.features.get(*r).and_then(|f| f.geometry.as_ref())
+                    && let Ok(g) = l.dataset.geometry_to_lonlat(g)
+                {
                     g.for_each_coord(|c| {
                         if verts.len() < 4000 {
                             verts.push(c);
@@ -4378,13 +4393,8 @@ fn popup(app: &mut RustGisApp, ui: &mut Ui, rect: Rect) {
     // Zooms to the feature shown, found by its id, as Zoom To Selection does: the selection and
     // the undo history are left as they are.
     if let (true, Some((id, fid))) = (zoom, shown) {
-        let extent = app
-            .session
-            .map()
-            .layer(id)
-            .and_then(|l| l.dataset.features.iter().find(|f| f.id == fid))
-            .and_then(|f| f.geometry.as_ref())
-            .map(|g| g.extent());
+        let extent =
+            app.session.map().layer(id).and_then(|l| l.dataset.features.iter().position(|f| f.id == fid).map(|row| l.rows_extent([row])));
         if let Some(e) = extent.filter(|e| !e.is_empty()) {
             app.session.zoom_to(&e);
         }
@@ -4803,7 +4813,17 @@ fn shown_layers(session: &rustgis_engine::Session) -> u64 {
     let mut h = std::hash::DefaultHasher::new();
     let project = &session.project;
     let map = project.map();
-    (&session.path, &project.name, project.active_map, &map.name, map.basemap, map.graticule, map.graticule_type, &map.graticule_crs)
+    (
+        &session.path,
+        &project.name,
+        project.active_map,
+        &map.name,
+        map.basemap,
+        map.paper,
+        map.graticule,
+        map.graticule_type,
+        &map.graticule_crs,
+    )
         .hash(&mut h);
     for l in &map.layers {
         (l.id, l.visible).hash(&mut h);
@@ -5932,47 +5952,27 @@ mod tests {
     fn a_moving_flat_maps_gap_frame_is_drawn_off_the_ui_thread() {
         let _turn = crate::fetching::turn();
         let app = RustGisApp::with_sample();
-        let mut h =
-            egui_kittest::Harness::builder().with_size(vec2(900.0, 550.0)).with_step_dt(0.000_05).with_max_steps(10_000).build_ui_state(
-                |ui, app: &mut RustGisApp| {
-                    let ctx = ui.ctx().clone();
-                    app.logic(&ctx);
-                    app.ui(ui);
-                },
-                app,
-            );
-        let exact = |h: &mut egui_kittest::Harness<'_, RustGisApp>, what: &str| {
-            let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
-            loop {
-                h.step();
-                let st = h.state();
-                let res = (st.session.map().camera.res * 1000.0) as i64;
-                if st.map.key.is_some_and(|k| k.rev == st.session.revision && !k.draft && k.cam.2 == res) && !st.map.drawing() {
-                    break;
-                }
-                assert!(std::time::Instant::now() < end, "{what}");
-                std::thread::sleep(std::time::Duration::from_millis(2)); // test-wait: legacy polling for the moving flat frame
-            }
-        };
-        exact(&mut h, "the first frame did not arrive");
-        let before = h.state().map.key.expect("a frame");
+        // Give the map widget a fixed viewport so changes in surrounding UI cannot request a redraw.
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(vec2(900.0, 550.0))
+            .with_context_setup(|ctx| crate::theme::install_fonts(ctx, &[], None))
+            .build_ui_state(|ui, app| show(app, ui), app);
+        let before = h.state().map.key.expect("the first frame");
+        assert!(!before.draft && !h.state().map.drawing());
         // The wheel zooming out, mid-gesture (the camera moved as the wheel moves it, not by a
         // command, which changes the map's revision): the frame no longer covers the view.
         h.state_mut().map.last_interaction = f64::MAX;
         h.state_mut().session.map_mut().camera.res *= 2.0;
         let res = h.state().session.map().camera.res;
         h.step();
-        assert!(h.state().map.motion_frame.busy(), "the gap's frame is drawn on the worker");
+        let gap = h.state().map.motion_frame.key().expect("the gap's frame is drawn on the worker");
+        assert!(gap.draft && gap.rev == before.rev, "the worker draws a draft for the same map: {gap:?}");
         assert_eq!(h.state().map.key, Some(before), "the last frame stays on screen meanwhile");
         // It lands while the map still moves, drawn for the zoomed-out camera.
-        let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while h.state().map.key == Some(before) {
-            assert!(std::time::Instant::now() < end, "the gap's frame never landed");
-            std::thread::sleep(std::time::Duration::from_millis(2)); // test-wait: legacy polling for the gap frame
-            h.step();
-        }
+        h.state_mut().map.motion_frame.wait_for_result().expect("the gap frame worker must return a result");
+        h.step();
         let st = h.state();
-        assert!(st.map.key.is_some_and(|k| k.draft && k.rev == before.rev), "a frame drawn mid-motion stands in for the exact one");
+        assert_eq!(st.map.key, Some(gap), "the worker's draft is shown mid-motion");
         assert_eq!(st.map.tex_camera.res, res, "it was drawn for the camera the map had zoomed out to");
         assert!(st.map.tex_size.0 > st.session.view_size.0 * 1.2, "and over more than the view, for the next steps");
         // One still being drawn when the map comes to rest is stopped and dropped; the exact frame
@@ -5981,8 +5981,17 @@ mod tests {
         h.step();
         assert!(h.state().map.motion_frame.busy(), "the next gap's frame is drawn on the worker");
         h.state_mut().map.last_interaction = -10.0;
-        exact(&mut h, "the frame of the resting map did not arrive");
-        assert!(!h.state().map.motion_frame.busy() && !h.state().map.motion_dropped);
+        h.step();
+        let st = h.state_mut();
+        if st.map.motion_frame.busy() {
+            st.map.motion_frame.wait_for_result().expect("the obsolete gap frame worker must return a result");
+        }
+        let exact = st.map.tilt_settle.key().expect("the resting map draws an exact frame on the worker");
+        assert!(!exact.draft && exact.rev == before.rev && exact.cam.2 == (st.session.map().camera.res * 1000.0) as i64);
+        st.map.tilt_settle.wait_for_result().expect("the exact frame worker must return a result");
+        h.step();
+        assert_eq!(h.state().map.key, Some(exact), "the worker's exact frame is shown at rest");
+        assert!(!h.state().map.drawing() && !h.state().map.motion_dropped);
     }
 
     /// #1750: where frames are drawn on the UI thread (the browser), a slow map's gap frame
@@ -6349,6 +6358,31 @@ mod tests {
         assert_eq!(probe(&app), hit);
         app.run("group.set", json!({"group": "Notes", "transparency": 100})).unwrap();
         assert_eq!(probe(&app), None, "on a fully transparent layer");
+    }
+
+    /// #2008: with the view clipped at a distance, a graphic with no extent (an empty geometry)
+    /// is passed over, as it isn't drawn: the view's centre was clamped to its extent, from +∞
+    /// to −∞, which panicked. The text under it is still found.
+    #[test]
+    fn a_graphic_without_an_extent_is_passed_over_at_a_clipping_distance() {
+        let mut app = RustGisApp::with_sample();
+        let c = app.session.map().center_lonlat();
+        let r = app.run("graphics.add", json!({"shape": "text", "points": [[c.x, c.y]], "text": "Here", "fontSize": 20})).unwrap();
+        let hit = r["layer"].as_u64().zip(r["row"].as_u64()).map(|(l, r)| (l as u32, r as usize));
+        let id = hit.map(|(l, _)| l).expect("a graphics layer");
+        // Rows are looked at last first: the empty one, above the text, comes first.
+        let l = app.session.map_mut().layer_mut(id).expect("the graphics layer");
+        l.dataset.push(Some(rustgis_engine::data::Geometry::MultiPoint(Vec::new())), Vec::new());
+        l.touch_geometry();
+        app.run("map.clipping", json!({"distance": 1_000_000.0})).unwrap();
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0));
+        let mut found = None;
+        let mut out = egui::Context::default().run_ui(Default::default(), |ui| {
+            let at = lonlat_to_screen(&app, rect, c).unwrap();
+            found = text_graphic_at(&app, ui.ctx(), rect, at);
+        });
+        out.textures_delta.clear();
+        assert_eq!(found, hit);
     }
 
     /// Trace follows the edge under two clicks; finishing a Reshape or Cut Polygon sketch (what a
