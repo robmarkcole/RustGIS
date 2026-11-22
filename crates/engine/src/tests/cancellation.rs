@@ -198,6 +198,18 @@ pub(super) fn long_commands(boundaries: bool) {
         .collect();
     std::fs::write(out("many.geojson"), json!({"type": "FeatureCollection", "features": many}).to_string()).unwrap();
     exercise(&s, "layer.addData", &json!({"path": out("many.geojson"), "stream": true}), Kind::Read, &dir.0, boundaries);
+    // Creating a class column also visits every feature, on the same field-edit worker.
+    {
+        let mut classes = Session::new(Project::default());
+        // The shared harness renames Cities to seed Undo/Redo before each cancellation.
+        let mut data = rustgis_data::Dataset::new("Cities", rustgis_data::GeometryType::Polygon, vec![]);
+        for _ in 0..3 {
+            data.push(None, vec![]);
+        }
+        let layer = classes.map_mut().add_dataset(data);
+        classes.active_layer = Some(layer);
+        exercise(&classes, "edit.addField", &json!({"layer":layer,"name":"class","type":"text"}), Kind::Read, &dir.0, boundaries);
+    }
     // Original TIFF headers share the read queue and both cancellation sweeps.
     exercise(&s, "raster.imageGrid", &json!({"layer": dem}), Kind::Read, &dir.0, boundaries);
     // A PDF's page is read on the same queue: the file, then its drawing, Cancel looked at between

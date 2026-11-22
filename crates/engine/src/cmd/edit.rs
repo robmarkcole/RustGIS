@@ -744,8 +744,14 @@ fn typed(raw: Json, ty: FieldType) -> Result<Value, String> {
 
 /// Adds an empty field of a type: long, double, text, boolean, date or datetime. Table rows
 /// are filled on the desktop worker ([`table_ahead`]), with progress and Cancel.
+/// Fills a new column on the desktop field-edit worker, with Cancel between rows.
+/// The shared row storage's first copy cannot be interrupted.
 fn add_field(s: &mut Session, p: &Json) -> CmdResult {
-    if let Some(result) = land_table_edit(s, p, "edit.addField") {
+    let landed = match target(s, p)? {
+        Target::Layer(_) => land_layer_schema(s, p, "edit.addField"),
+        Target::Table(_) => land_table_edit(s, p, "edit.addField"),
+    };
+    if let Some(result) = landed {
         return result;
     }
     let t = write_target(s, p)?;
@@ -766,15 +772,10 @@ fn add_field(s: &mut Session, p: &Json) -> CmdResult {
     if ds.field_index(name).is_some() {
         return Err(format!("a field named '{name}' already exists"));
     }
-    let table = matches!(t, Target::Table(_));
     ds.fields.push(Field::new(name, ty));
-    if table {
-        rustgis_data::progress::begin(ds.features.len());
-    }
+    rustgis_data::progress::begin(ds.features.len());
     for row in &mut ds.features {
-        if table {
-            rustgis_data::progress::step(1).map_err(|e| e.to_string())?;
-        }
+        rustgis_data::progress::step(1).map_err(|e| e.to_string())?;
         // Adding one column to shared rows should not double every row's attribute capacity.
         row.attrs.reserve_exact(1);
         row.attrs.push(Value::Null);
@@ -795,7 +796,7 @@ fn add_field(s: &mut Session, p: &Json) -> CmdResult {
 fn convert_field(s: &mut Session, p: &Json) -> CmdResult {
     // A prepared result has one concrete type: do not consume it while probing another type.
     let landed = match target(s, p)? {
-        Target::Layer(_) => land_layer_dates(s, p),
+        Target::Layer(_) => land_layer_schema(s, p, "edit.convertField"),
         Target::Table(_) => land_table_edit(s, p, "edit.convertField"),
     };
     if let Some(result) = landed {
@@ -1267,7 +1268,7 @@ pub(crate) const TABLE_EDITS: &[(&str, &str, fn(&mut Session, &Json) -> CmdResul
 ];
 
 /// The registered command and progress label for a table write. Layer invocations keep their
-/// existing path; the desktop uses this worker only when parameters name a standalone table.
+/// existing path except Add Field and date conversion, which also prepare loaded layer rows.
 pub fn table_edit_in_background(command: &str) -> Option<(&'static str, &'static str)> {
     TABLE_EDITS.iter().find(|(id, ..)| *id == command).map(|(id, name, _)| (*id, *name))
 }
@@ -1346,7 +1347,11 @@ pub(crate) fn script_table(
 /// shared row storage's first copy and one expression evaluation cannot be interrupted.
 pub(crate) fn table_ahead(s: &Session, command: &str, p: &Json) -> Result<Option<super::reads::ReadWork>, String> {
     let Target::Table(i) = target(s, p)? else {
-        return if command == "edit.convertField" { layer_dates_ahead(s, p).map(Some) } else { Ok(None) };
+        return if matches!(command, "edit.convertField" | "edit.addField") {
+            layer_schema_ahead(s, command, p).map(Some)
+        } else {
+            Ok(None)
+        };
     };
     let &(_, name, handler) = TABLE_EDITS.iter().find(|(id, ..)| *id == command).ok_or("not a table edit")?;
     let table = s.project.tables.get(i).ok_or("no such table")?.clone();
@@ -1368,8 +1373,8 @@ pub(crate) fn table_ahead(s: &Session, command: &str, p: &Json) -> Result<Option
     })))
 }
 
-/// A layer conversion installs only its rows and fields, after checking its identity and schema.
-struct LayerDates {
+/// A layer field edit installs only its rows and fields, after checking its identity and schema.
+struct LayerSchema {
     opened: u64,
     id: u32,
     instance: u64,
@@ -1379,19 +1384,22 @@ struct LayerDates {
 
 /// Captures shared rows only; the worker uses an isolated table session. Layer schema
 /// consumers are checked before capture and again at landing, without cloning edit archives.
-fn layer_dates_ahead(s: &Session, p: &Json) -> Result<super::reads::ReadWork, String> {
+fn layer_schema_ahead(s: &Session, command: &str, p: &Json) -> Result<super::reads::ReadWork, String> {
     let id = s.layer_id(p)?;
     let layer = s.map().layer(id).ok_or("no layer")?;
-    let fi = field_of(s, Target::Layer(id), ps(p, "field").ok_or("field is required")?)?;
-    let ty = match ps(p, "type").unwrap_or("").to_ascii_lowercase().as_str() {
-        "date" => FieldType::Date,
-        "datetime" | "date-time" | "timestamp" => FieldType::DateTime,
-        _ => return Err("type must be date or datetime".into()),
-    };
-    check_layer_dates(s, id, fi, ty)?;
+    if command == "edit.convertField" {
+        let fi = field_of(s, Target::Layer(id), ps(p, "field").ok_or("field is required")?)?;
+        let ty = match ps(p, "type").unwrap_or("").to_ascii_lowercase().as_str() {
+            "date" => FieldType::Date,
+            "datetime" | "date-time" | "timestamp" => FieldType::DateTime,
+            _ => return Err("type must be date or datetime".into()),
+        };
+        check_layer_dates(s, id, fi, ty)?;
+    }
+    let &(command, name, handler) = TABLE_EDITS.iter().find(|(id, ..)| *id == command).ok_or("not a field edit")?;
     let (opened, instance, input) = (s.opened, layer.instance_id(), layer.dataset.clone());
     let (dataset, mut p) = (input.clone(), p.clone());
-    Ok(super::reads::ahead("Convert Field", "edit.convertField".into(), move || {
+    Ok(super::reads::ahead(name, command.into(), move || {
         let result = (|| {
             rustgis_data::progress::begin(0);
             rustgis_data::progress::check().map_err(|e| e.to_string())?;
@@ -1399,19 +1407,19 @@ fn layer_dates_ahead(s: &Session, p: &Json) -> Result<super::reads::ReadWork, St
             let table = copy.project.put_table(dataset);
             p.as_object_mut().ok_or("parameters must be an object")?.remove("layer");
             p["table"] = json!(table);
-            let answer = convert_field(&mut copy, &p)?;
+            let answer = handler(&mut copy, &p)?;
             rustgis_data::progress::check().map_err(|e| e.to_string())?;
             let output = copy.project.table(table).ok_or("no table")?.dataset.clone();
             Ok((output, answer, copy.notices))
         })();
-        LayerDates { opened, id, instance, input, result }
+        LayerSchema { opened, id, instance, input, result }
     }))
 }
 
 /// Rejects stale worker output and rechecks current design constraints before installing one
-/// conversion as one undo step. Changes to unrelated map properties remain in place.
-fn land_layer_dates(s: &mut Session, p: &Json) -> Option<CmdResult> {
-    let ahead = super::reads::take::<LayerDates>(s, "edit.convertField")?;
+/// field edit as one undo step. Changes to unrelated map properties remain in place.
+fn land_layer_schema(s: &mut Session, p: &Json, command: &str) -> Option<CmdResult> {
+    let ahead = super::reads::take::<LayerSchema>(s, command)?;
     Some((|| {
         let id = s.layer_id(p)?;
         let layer = s.map().layer(id).ok_or("no layer")?;
@@ -1421,12 +1429,19 @@ fn land_layer_dates(s: &mut Session, p: &Json) -> Option<CmdResult> {
             || layer.dataset.fields != ahead.input.fields
             || !layer.dataset.features.shares(&ahead.input.features)
         {
-            return Err("the layer changed while it was converted: run the conversion again".into());
+            return Err(if command == "edit.convertField" {
+                "the layer changed while it was converted: run the conversion again"
+            } else {
+                "the layer changed while its field was added: run Add Field again"
+            }
+            .into());
         }
         let (output, answer, notices) = ahead.result?;
-        let fi = field_of(s, Target::Layer(id), ps(p, "field").ok_or("field is required")?)?;
-        let ty = output.fields.get(fi).ok_or("no field")?.ty;
-        check_layer_dates(s, id, fi, ty)?;
+        if command == "edit.convertField" {
+            let fi = field_of(s, Target::Layer(id), ps(p, "field").ok_or("field is required")?)?;
+            let ty = output.fields.get(fi).ok_or("no field")?.ty;
+            check_layer_dates(s, id, fi, ty)?;
+        }
         let layer = s.map_mut().layer_mut(id).ok_or("no layer")?;
         (layer.dataset.fields, layer.dataset.features) = (output.fields, output.features);
         for notice in notices {

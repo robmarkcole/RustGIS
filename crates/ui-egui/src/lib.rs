@@ -96,6 +96,7 @@ pub enum Landed {
     NotRun(String),
 }
 mod annotation;
+mod annotation_classes;
 mod boxedit;
 mod circleedit;
 #[cfg(not(target_arch = "wasm32"))]
@@ -3002,7 +3003,7 @@ impl RustGisApp {
             if let Some(command) = archive {
                 return readjob::run(self, command, params);
             }
-            if (id == "edit.convertField" || params.get("table").is_some_and(|t| !t.is_null()))
+            if (matches!(id, "edit.convertField" | "edit.addField") || params.get("table").is_some_and(|t| !t.is_null()))
                 && let Some((command, _)) = rustgis_engine::cmd::edit::table_edit_in_background(id)
             {
                 return readjob::run(self, command, params);
@@ -3637,6 +3638,11 @@ impl RustGisApp {
             )?,
             "ui.annotationCancel" => annotation::cancel_read(self),
             "ui.annotationLayer" => annotation::select_layer(self, p)?,
+            "ui.annotationClassField" => annotation_classes::select_field(self, p)?,
+            "ui.annotationClass" => annotation_classes::select_class(self, p)?,
+            "ui.annotationCreateClassField" => annotation_classes::create_field(self)?,
+            "ui.annotationAssignClass" => annotation_classes::assign(self)?,
+            "ui.annotationClassColours" => annotation_classes::colours(self)?,
             "ui.pane.editing" => toggle_right(&mut self.ui, RightPane::Editing),
             "ui.pane.design" => toggle_right(&mut self.ui, RightPane::Design),
             "ui.pane.script" => toggle_right(&mut self.ui, RightPane::Script),

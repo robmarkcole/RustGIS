@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 
 #[derive(Default)]
 pub(crate) struct State {
+    pub(crate) classes: crate::annotation_classes::State,
     context: Option<(u64, u64)>,
     image: Option<u32>,
     image_name: Option<String>,
@@ -77,6 +78,7 @@ pub(crate) fn sync(app: &mut RustGisApp) {
             app.annotation.error = Some(tl!("The image changed or was removed. Select it again or reload its grid.").into());
         }
     }
+    crate::annotation_classes::sync(app);
 }
 pub(crate) fn open(app: &mut RustGisApp) -> Result<(), String> {
     sync(app);
@@ -328,6 +330,7 @@ pub(crate) fn panel(app: &mut RustGisApp, ui: &mut egui::Ui) {
     if ui.checkbox(&mut enabled, tl!("Enable editing")).changed() {
         let _ = app.run("edit.enable", json!({"on":enabled}));
     }
+    crate::annotation_classes::panel(app, ui);
     let ready = crate::boxedit::ready(app) && drawing_frame(app).is_ok();
     ui.add_enabled_ui(ready, |ui| {
         ui.horizontal(|ui| {
@@ -397,6 +400,199 @@ mod tests {
         data::{Dataset, GeometryType},
         map::RasterLayer,
     };
+
+    #[test]
+    fn annotation_classes_draw_assign_and_round_trip_without_losing_constructions() {
+        use rustgis_engine::data::Value as Cell;
+        for tool in [Tool::Circle, Tool::RotatedBox] {
+            let (mut app, image, layer, frame) = app();
+            app.run("ui.annotationImage", json!({"image":image})).unwrap();
+            app.run("ui.annotationCreateClassField", json!({})).unwrap();
+            app.run("edit.addField", json!({"name":"notes","type":"text"})).unwrap();
+            app.session.map_mut().layer_mut(layer).unwrap().design.templates.push(rustgis_engine::map::design::FeatureTemplate {
+                name: "Defaults".into(),
+                description: String::new(),
+                defaults: vec![("class".into(), Cell::Text("template".into())), ("notes".into(), Cell::Text("keep".into()))],
+            });
+            app.forms.template = "Defaults".into();
+            app.run("ui.annotationClass", json!({"value":"car"})).unwrap();
+            app.run("tool.set", json!({"tool":tool.code()})).unwrap();
+            let depth = app.session.undo_depth();
+            drag(&mut app, &frame, [20., 20.], [60., 60.], true);
+            assert_eq!(app.session.undo_depth(), depth + 1, "class and geometry are one edit");
+            let original = app.session.map().layer(layer).unwrap().dataset.features[0].clone();
+            assert_eq!(original.attrs, vec![Cell::Text("car".into()), Cell::Text("keep".into())]);
+            let circle = app.session.circle_spec(layer, 0);
+            let bbox = app.session.box_spec(layer, 0);
+            app.run("ui.annotationClass", json!({"value":"truck"})).unwrap();
+            let depth = app.session.undo_depth();
+            app.run("ui.annotationAssignClass", json!({})).unwrap();
+            assert_eq!(app.session.undo_depth(), depth + 1);
+            let after = &app.session.map().layer(layer).unwrap().dataset.features[0];
+            assert_eq!((after.id, &after.geometry), (original.id, &original.geometry));
+            assert_eq!(after.attrs, vec![Cell::Text("truck".into()), Cell::Text("keep".into())]);
+            assert_eq!(app.session.circle_spec(layer, 0), circle);
+            assert_eq!(app.session.box_spec(layer, 0), bbox);
+            app.run("ui.annotationAssignClass", json!({})).unwrap();
+            assert_eq!(app.session.undo_depth(), depth + 1, "assigning the same value is a no-op");
+            app.run("edit.undo", json!({})).unwrap();
+            assert_eq!(app.session.map().layer(layer).unwrap().dataset.features[0], original);
+            app.run("edit.redo", json!({})).unwrap();
+            assert_eq!(app.session.circle_spec(layer, 0), circle);
+            assert_eq!(app.session.box_spec(layer, 0), bbox);
+            let exported = rustgis_engine::data::io::to_geojson(&app.session.map().layer(layer).unwrap().dataset);
+            assert_eq!(exported["features"][0]["properties"]["class"], "truck");
+            let (loaded, _) = rustgis_engine::data::io::read_geojson(&exported.to_string(), "Shared annotations").unwrap();
+            let fi = loaded.field_index("class").unwrap();
+            assert_eq!(loaded.value(0, fi), &Cell::Text("truck".into()));
+            app.run("ui.annotationClass", json!({"value":null})).unwrap();
+            drag(&mut app, &frame, [75., 75.], [95., 95.], true);
+            assert_eq!(app.session.map().layer(layer).unwrap().dataset.value(1, 0), &Cell::Text("template".into()));
+        }
+    }
+    #[test]
+    fn annotation_classes_capture_the_default_at_pointer_down() {
+        for tool in [Tool::Circle, Tool::RotatedBox] {
+            let (mut app, image, layer, frame) = app();
+            app.run("ui.annotationImage", json!({"image":image})).unwrap();
+            app.run("ui.annotationCreateClassField", json!({})).unwrap();
+            app.run("ui.annotationClass", json!({"value":"car"})).unwrap();
+            app.run("tool.set", json!({"tool":tool.code()})).unwrap();
+            let (start, end) = (screen(&app, &frame, [20., 20.]), screen(&app, &frame, [60., 60.]));
+            if tool == Tool::Circle {
+                assert!(crate::circleedit::drag_start(&mut app, rect(), start, true));
+                crate::circleedit::drag_to(&mut app, rect(), end);
+            } else {
+                assert!(crate::boxedit::drag_start(&mut app, rect(), start, true));
+                crate::boxedit::drag_to(&mut app, rect(), end, false);
+            }
+            app.run("ui.annotationClass", json!({"value":"truck"})).unwrap();
+            if tool == Tool::Circle {
+                crate::circleedit::drag_stop(&mut app);
+            } else {
+                crate::boxedit::drag_stop(&mut app);
+            }
+            assert_eq!(app.session.map().layer(layer).unwrap().dataset.value(0, 0).to_string(), "car");
+            drag(&mut app, &frame, [75., 75.], [95., 95.], true);
+            assert_eq!(app.session.map().layer(layer).unwrap().dataset.value(1, 0).to_string(), "truck");
+        }
+    }
+    #[test]
+    fn annotation_classes_validate_fields_and_reset_on_layer_map_and_project_changes() {
+        for change in ["layer", "map", "project"] {
+            let (mut app, _, layer, _) = app();
+            app.run("edit.addField", json!({"name":"number","type":"long"})).unwrap();
+            assert!(app.run("ui.annotationClassField", json!({"field":"number"})).is_err());
+            assert!(app.run("ui.annotationClassField", json!({})).is_err());
+            app.run("ui.annotationCreateClassField", json!({})).unwrap();
+            assert!(app.run("ui.annotationClass", json!({"value":"  "})).is_err());
+            app.run("ui.annotationClass", json!({"value":"car"})).unwrap();
+            assert!(app.run("ui.annotationAssignClass", json!({})).is_err());
+            match change {
+                "layer" => {
+                    let next = app.session.map_mut().add_dataset(Dataset::new("Other", GeometryType::Polygon, vec![]));
+                    app.run("ui.annotationLayer", json!({"layer":next})).unwrap();
+                    assert_eq!(crate::annotation_classes::drawing_attributes(&app).unwrap(), json!({}));
+                    app.run("ui.annotationLayer", json!({"layer":layer})).unwrap();
+                }
+                "map" => {
+                    app.run("map.new", json!({"name":"Other"})).unwrap();
+                }
+                _ => {
+                    app.run("project.new", json!({})).unwrap();
+                }
+            }
+            assert_eq!(crate::annotation_classes::drawing_attributes(&app).unwrap(), json!({}));
+        }
+    }
+    #[test]
+    fn annotation_classes_refuse_a_deleted_field_and_create_does_not_overwrite_existing_fields() {
+        let (mut app, image, layer, frame) = app();
+        app.run("ui.annotationImage", json!({"image":image})).unwrap();
+        app.run("ui.annotationCreateClassField", json!({})).unwrap();
+        let depth = app.session.undo_depth();
+        assert!(app.run("ui.annotationCreateClassField", json!({})).is_err());
+        assert_eq!(app.session.undo_depth(), depth);
+        app.run("ui.annotationClass", json!({"value":"car"})).unwrap();
+        app.run("edit.deleteField", json!({"field":"class"})).unwrap();
+        assert!(crate::annotation_classes::drawing_attributes(&app).unwrap_err().contains("missing"));
+        app.run("tool.set", json!({"tool":"circle"})).unwrap();
+        let start = screen(&app, &frame, [20., 20.]);
+        assert!(!crate::circleedit::drag_start(&mut app, rect(), start, true));
+        assert!(app.session.map().layer(layer).unwrap().dataset.features.is_empty());
+        app.run("edit.undo", json!({})).unwrap();
+        assert_eq!(crate::annotation_classes::drawing_attributes(&app).unwrap(), json!({"class":"car"}));
+        app.run("edit.enable", json!({"on":false})).unwrap();
+        assert!(app.run("ui.annotationAssignClass", json!({})).is_err());
+    }
+    #[test]
+    fn annotation_classes_colours_reuse_symbology_without_resetting_existing_styles() {
+        let (mut app, image, layer, frame) = app();
+        app.run("ui.annotationImage", json!({"image":image})).unwrap();
+        app.run("ui.annotationCreateClassField", json!({})).unwrap();
+        app.run("ui.annotationClass", json!({"value":"car"})).unwrap();
+        app.run("tool.set", json!({"tool":"circle"})).unwrap();
+        drag(&mut app, &frame, [20., 20.], [60., 60.], true);
+        app.run("ui.annotationClassColours", json!({})).unwrap();
+        assert_eq!(app.ui.symbology_pending.as_ref().unwrap().field, "class");
+        assert_eq!(app.ui.right, Some(RightPane::Symbology));
+        app.run("layer.symbology", json!({"type":"unique","field":"class"})).unwrap();
+        app.run("layer.classStyle", json!({"value":"car","color":"#FF0000"})).unwrap();
+        let renderer = app.session.map().layer(layer).unwrap().renderer.clone();
+        app.run("ui.annotationClassColours", json!({})).unwrap();
+        assert!(app.ui.symbology_pending.is_none());
+        assert_eq!(app.session.map().layer(layer).unwrap().renderer, renderer);
+    }
+    #[test]
+    fn annotation_classes_refuse_ambiguous_fields_and_multiple_selected_features_without_mutation() {
+        use rustgis_engine::data::{Field, FieldType};
+        let (mut app, image, layer, frame) = app();
+        app.run("ui.annotationImage", json!({"image":image})).unwrap();
+        app.session.map_mut().layer_mut(layer).unwrap().dataset.fields =
+            vec![Field::new("Class", FieldType::Text), Field::new("class", FieldType::Text)];
+        assert!(app.run("ui.annotationClassField", json!({"field":"class"})).unwrap_err().contains("unique ignoring case"));
+        assert_eq!(crate::annotation_classes::drawing_attributes(&app).unwrap(), json!({}));
+        app.session.map_mut().layer_mut(layer).unwrap().dataset.fields = vec![Field::new("class", FieldType::Text)];
+        app.run("ui.annotationClassField", json!({"field":"class"})).unwrap();
+        app.run("ui.annotationClass", json!({"value":"car"})).unwrap();
+        app.run("tool.set", json!({"tool":"circle"})).unwrap();
+        drag(&mut app, &frame, [20., 20.], [60., 60.], true);
+        drag(&mut app, &frame, [75., 75.], [95., 95.], true);
+        app.session.map_mut().layer_mut(layer).unwrap().selection = vec![0, 1];
+        app.run("ui.annotationClass", json!({"value":"truck"})).unwrap();
+        let before = serde_json::to_value(&app.session.project).unwrap();
+        let depth = app.session.undo_depth();
+        assert!(app.run("ui.annotationAssignClass", json!({})).is_err());
+        assert_eq!(serde_json::to_value(&app.session.project).unwrap(), before);
+        assert_eq!(app.session.undo_depth(), depth);
+        app.session.map_mut().layer_mut(layer).unwrap().selection = vec![0];
+        app.run("edit.enable", json!({"on":false})).unwrap();
+        assert!(app.run("ui.annotationAssignClass", json!({})).is_err());
+        assert_eq!(app.session.map().layer(layer).unwrap().dataset.value(0, 0).to_string(), "car");
+    }
+    #[test]
+    fn annotation_classes_pane_can_create_a_field_and_choose_a_default_without_mutating_features() {
+        use egui_kittest::kittest::{NodeT, Queryable};
+        let (mut app, _, layer, _) = app();
+        app.run("ui.pane.annotation", json!({})).unwrap();
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(600., 1100.)).build_ui_state(|ui, app| panel(app, ui), app);
+        h.run();
+        h.get_by_label("Create class field").click();
+        h.run();
+        let depth = h.state().session.undo_depth();
+        h.get_by_role_and_label(egui::accesskit::Role::TextInput, "New class").focus();
+        h.get_by_role_and_label(egui::accesskit::Role::TextInput, "New class").type_text("car");
+        h.run();
+        h.get_by_label("Use class").click();
+        h.run();
+        assert_eq!(crate::annotation_classes::drawing_attributes(h.state()).unwrap(), json!({"class":"car"}));
+        assert_eq!(h.state().session.undo_depth(), depth, "class defaults are session-only");
+        assert!(h.state().session.map().layer(layer).unwrap().dataset.features.is_empty());
+        assert!(h.get_by_label("Assign to selected annotation").accesskit_node().is_disabled());
+        h.get_by_label("Class colours…").click();
+        h.run();
+        assert_eq!(h.state().ui.symbology_pending.as_ref().unwrap().field, "class");
+    }
 
     // A minimal uncompressed TIFF with the original ModelTransformation, not a north-up
     // display raster. Encoded here so the end-to-end test needs no external image or library.

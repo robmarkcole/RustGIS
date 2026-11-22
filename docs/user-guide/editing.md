@@ -204,6 +204,27 @@ Choose **No image** to return explicitly to Web Mercator grid metres.
 **Original Image Grid** in Command Search reports the active image's original dimensions and
 EPSG coordinate system in a notice, while keeping the Annotate pane open.
 
+For multiclass annotation, choose an existing text **Class field**, or explicitly **Create class
+field** to add a text field named `class`. Choose an **Active class** or enter a new name and
+click **Use class**. On desktop, creating the field runs in the background with progress and
+Cancel; wait for it before choosing a class. If cancelled, use **Retry class field creation**.
+Each new circle or rotated box captures that class when the drag starts;
+changing the default afterwards affects subsequent shapes. Other template defaults are kept.
+**No class default** leaves the class to the normal template/default rules.
+
+Select one annotation, choose the desired active class, then **Assign to selected annotation**.
+This edits only its class property, preserves its ID, geometry and constrained handles, and is
+undoable. Class defaults reset when changing target layer, project or map; a removed class field
+must be restored or another field chosen before drawing with that default.
+
+**Class colours…** opens the existing Symbology pane with **Unique Values** and the class field
+ready to apply. To include later values, reselect the same field in Symbology; this rebuilds its
+classes and colours, so configure colours after the class set is ready. Opening this pane for an
+already matching renderer preserves its colours. The Active class list offers
+up to 64 styled values and the last 32 choices; other names can be entered directly. Class values
+are ordinary GeoJSON properties and survive export/import. Colours are layer styling, saved in
+projects/layer styles; they are not exported as a GeoJSON palette or custom annotation metadata.
+
 Space or middle-drag pans; releasing Space keeps the drawing tool. Use the selected object's
 existing handles, Undo/Redo, and **Export GeoJSON…**. **Shape details** is collapsed by default;
 expand it for numeric dimensions and additional editing controls. Map handles remain available

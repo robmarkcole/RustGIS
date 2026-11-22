@@ -32,6 +32,17 @@ pub struct Reads {
 }
 
 impl Reads {
+    pub(crate) fn adding_class_field(&self, session: &rustgis_engine::Session, layer: u32) -> bool {
+        let Some(instance) = session.map().layer(layer).map(|l| l.instance_id()) else { return false };
+        let matches = |a: &Asked| {
+            a.command == "edit.addField"
+                && a.opened == session.opened
+                && a.map == session.map().instance_id()
+                && a.layer == Some(instance)
+                && a.params.get("name").and_then(Value::as_str) == Some("class")
+        };
+        self.job.as_ref().is_some_and(|job| matches(&job.asked)) || self.waiting.iter().any(matches)
+    }
     /// Closing a conversion preview cancels only its read, leaving unrelated queued work alone.
     pub(crate) fn cancel_shape_conversion(&mut self, request: u64) {
         let belongs = |a: &Asked| {
@@ -180,9 +191,9 @@ fn run_presented(
         let r = app.run(command, p);
         return answered(app, then, r);
     }
-    // A field conversion given no layer or table works on the active layer: bound to it now, so
+    // A field edit given no layer or table works on the active layer: bound to it now, so
     // it lands on that layer and its recorded step names it, whichever layer is active by then.
-    if command == "edit.convertField"
+    if matches!(command, "edit.convertField" | "edit.addField")
         && ["layer", "table"].iter().all(|k| p.get(*k).is_none_or(Value::is_null))
         && let Ok(id) = app.session.layer_id(&p)
     {
@@ -193,7 +204,7 @@ fn run_presented(
             params.insert("layer".into(), json!(id));
         }
     }
-    let layer = matches!(
+    let layer = (matches!(
         command,
         "layer.loadAll"
             | "layer.reloadData"
@@ -204,7 +215,7 @@ fn run_presented(
             | "raster.imageGrid"
             | "edit.previewShapeConversion"
             | "layer.sizeBy"
-    )
+    ) || (matches!(command, "edit.convertField" | "edit.addField") && p.get("table").is_none_or(Value::is_null)))
     .then(|| app.session.layer_id(&p).ok().and_then(|id| app.session.map().layer(id)).map(|l| (l.instance_id(), l.name.clone())))
     .flatten();
     let notice_mark = app.session.notice_mark();
@@ -791,6 +802,64 @@ mod tests {
     #[test]
     fn annotation_grid_cancel_preserves_unrelated_waiting_reads() {
         annotation_grid_cancel_case(false);
+    }
+    #[test]
+    fn annotation_classes_create_field_on_worker_and_refuse_stale_rows() {
+        use rustgis_engine::{
+            Project, Session,
+            data::{Dataset, GeometryType},
+        };
+        let mut session = Session::new(Project::default());
+        let mut data = Dataset::new("Objects", GeometryType::Polygon, vec![]);
+        data.push(None, vec![]);
+        session.active_layer = Some(session.map_mut().add_dataset(data));
+        let mut app = RustGisApp::new(session);
+        app.reads_off_frame = true;
+        let layer = app.session.active_layer.unwrap();
+        app.run("edit.enable", json!({"on":true})).unwrap();
+        app.run("edit.addCircle", json!({"circle":{"center":[0,0],"radius":100,"tolerance":1}})).unwrap();
+        let circle = app.session.circle_spec(layer, 1).unwrap();
+        let depth = app.session.undo_depth();
+        app.run("ui.annotationCreateClassField", json!({})).unwrap();
+        app.reads.job.as_ref().unwrap().control.cancel();
+        landed(&mut app, 30);
+        assert_eq!(app.session.undo_depth(), depth);
+        assert!(app.session.map().layer(layer).unwrap().dataset.field_index("class").is_none());
+        app.run("ui.annotationCreateClassField", json!({})).unwrap();
+        assert!(app.reads.adding_class_field(&app.session, layer));
+        assert!(app.session.map().layer(layer).unwrap().dataset.field_index("class").is_none());
+        assert!(app.run("ui.annotationCreateClassField", json!({})).is_err());
+        assert!(app.run("ui.annotationClass", json!({"value":"car"})).is_err());
+        app.run("tool.set", json!({"tool":"circle"})).unwrap();
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800., 600.));
+        assert!(!crate::circleedit::drag_start(&mut app, rect, rect.center(), true));
+        assert_eq!(crate::circleedit::error(&app), Some("Wait for the class field before drawing."));
+        let before = app.session.undo_depth();
+        landed(&mut app, 30);
+        assert_eq!(app.session.undo_depth(), before + 1);
+        assert!(crate::circleedit::error(&app).is_none(), "a landed field clears its idle waiting reason");
+        assert_eq!(app.session.circle_spec(layer, 1), Some(circle));
+        app.run("ui.annotationClass", json!({"value":"car"})).unwrap();
+        assert_eq!(crate::annotation_classes::drawing_attributes(&app).unwrap(), json!({"class":"car"}));
+        app.run("edit.undo", json!({})).unwrap();
+        assert!(app.session.map().layer(layer).unwrap().dataset.field_index("class").is_none());
+        assert!(crate::annotation_classes::drawing_attributes(&app).is_err());
+        app.run("edit.redo", json!({})).unwrap();
+        assert_eq!(crate::annotation_classes::drawing_attributes(&app).unwrap(), json!({"class":"car"}));
+        let p = json!({"layer":layer,"name":"other","type":"text"});
+        let ahead = reads::read_ahead(&mut app.session, "edit.addField", &p).unwrap();
+        let done = ahead.run(&Control::new()).unwrap();
+        app.session.map_mut().layer_mut(layer).unwrap().dataset.push(None, vec![rustgis_engine::data::Value::Null]);
+        let before = serde_json::to_value(&app.session.project).unwrap();
+        assert!(reads::read_land(&mut app.session, done).unwrap_err().contains("changed"));
+        assert_eq!(serde_json::to_value(&app.session.project).unwrap(), before);
+        // A request without an explicit layer stays bound when the user selects another layer.
+        app.run("edit.addField", json!({"name":"notes","type":"text"})).unwrap();
+        let other = app.session.map_mut().add_dataset(Dataset::new("Other", GeometryType::Polygon, vec![]));
+        app.run("layer.select", json!({"layer":other})).unwrap();
+        landed(&mut app, 30);
+        assert!(app.session.map().layer(layer).unwrap().dataset.field_index("notes").is_some());
+        assert!(app.session.map().layer(other).unwrap().dataset.fields.is_empty());
     }
 
     #[test]
