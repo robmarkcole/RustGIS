@@ -704,6 +704,75 @@ pub(crate) fn project_features(features: &mut [crate::Feature], to: &crate::rast
     project_each(features, to, true)
 }
 
+/// [`project`] for an export: a feature with a place `crs` can't hold keeps its attributes and is
+/// written without its geometry, rather than failing the export; returns how many were
+/// ([`unplaced_export_note`]).
+pub fn project_leaving_out(ds: &Dataset, crs: Crs) -> Result<(Dataset, usize)> {
+    let from = ds.coord_crs();
+    if crs == from {
+        return Ok((ds.clone(), 0));
+    }
+    let mut out = ds.clone();
+    let to = from.to(crs).map_err(DataError::Format)?;
+    crate::progress::begin(out.features.len());
+    let unplaced = project_each_leaving_out(&mut out.features, &to, true)?;
+    out.held_in = crs;
+    Ok((out, unplaced))
+}
+
+/// [`project_each`] for an export: a feature with a place the target can't hold loses its
+/// geometry rather than failing; returns how many did. A coordinate that is missing already (NaN,
+/// infinite) stays missing, as [`crate::Dataset::in_lonlat`] keeps it, and loses nothing.
+pub(crate) fn project_each_leaving_out(features: &mut [crate::Feature], to: &crate::raster::Reprojection, count: bool) -> Result<usize> {
+    let mut unplaced = 0usize;
+    for f in features {
+        if count {
+            crate::progress::step(1)?;
+        } else {
+            crate::progress::check()?;
+        }
+        if let Some(g) = f.geometry.take() {
+            // A coordinate that isn't a number is kept as it is: converting it could give it a
+            // place (Web Mercator takes an infinite latitude to 85.05°).
+            let out = if to.is_identity() {
+                g.clone()
+            } else {
+                g.map_coords(&|c| if c.is_finite() { to.point(c).unwrap_or(Coord::new(f64::NAN, f64::NAN)) } else { c })
+            };
+            if lost_a_place(&g, &out) {
+                unplaced += 1;
+            } else {
+                f.geometry = Some(out);
+            }
+        }
+    }
+    Ok(unplaced)
+}
+
+/// Whether `out`, `g` converted place for place, lost a place: one that was a number in `g` and
+/// isn't in `out`.
+fn lost_a_place(g: &Geometry, out: &Geometry) -> bool {
+    let mut was = Vec::new();
+    g.for_each_coord(|c| was.push(c.is_finite()));
+    let mut k = 0usize;
+    let mut lost = false;
+    out.for_each_coord(|c| {
+        lost |= was.get(k).copied().unwrap_or(true) && !c.is_finite();
+        k += 1;
+    });
+    lost
+}
+
+/// What an export to `target` says of the `n` features of `layer` with a place `crs` can't hold
+/// ([`project_leaving_out`]): their geometry is left out, and in a format that holds only
+/// features with geometry the feature too. `None` for none.
+pub fn unplaced_export_note(target: &str, layer: &str, n: usize, crs: Crs) -> Option<String> {
+    let system = if crs == Crs::LonLat { "WGS 84 (EPSG:4326)".to_string() } else { crs.label() };
+    (n > 0).then(|| {
+        format!("{target}: {n} feature(s) of {layer} have a place that can't be given in {system}, so their geometry is left out (and the feature, in a format that holds only features with geometry)")
+    })
+}
+
 /// [`project_features`] without a step of its own: it counts each feature in the step under way
 /// when `count` is set, and otherwise only stops once the run is cancelled.
 pub(crate) fn project_each(features: &mut [crate::Feature], to: &crate::raster::Reprojection, count: bool) -> Result<()> {
@@ -782,6 +851,8 @@ pub(crate) fn check_projected(ext: &str, crs: Crs) -> Result<()> {
 
 /// As [`write_bytes`], in the coordinate system `crs`: a GeoPackage, Shapefile or FlatGeobuf (see
 /// [`PROJECTED_FORMATS`]) says it; any other format is written only in longitude/latitude.
+/// Refused on a place `crs` can't hold, naming its feature; [`write_bytes_noted`] writes the
+/// feature without its geometry instead, and says so.
 pub fn write_bytes_in(ds: &Dataset, ext: &str, crs: Crs) -> Result<(Vec<u8>, usize)> {
     let ext = ext.to_ascii_lowercase();
     if crs != Crs::LonLat {
@@ -795,6 +866,26 @@ pub fn write_bytes_in(ds: &Dataset, ext: &str, crs: Crs) -> Result<(Vec<u8>, usi
         return projected_bytes(ds, &ext, crs);
     }
     projected_bytes(&project(ds, crs)?, &ext, crs)
+}
+
+/// [`write_bytes_in`] for an export (named `name` in its notes): a feature with a place `crs`
+/// can't hold is written without its geometry ([`project_leaving_out`]), and the notes say how
+/// many ([`unplaced_export_note`]).
+pub fn write_bytes_noted(ds: &Dataset, ext: &str, crs: Crs, name: &str) -> Result<(Vec<u8>, usize, Vec<String>)> {
+    let ext = ext.to_ascii_lowercase();
+    if crs != Crs::LonLat {
+        if !holds_a_system(&ext) {
+            return Err(DataError::Unsupported(format!(".{ext} in {} (it holds longitude/latitude only)", crs.label())));
+        }
+        check_projected(&ext, crs)?;
+    }
+    if crs == ds.coord_crs() {
+        let (bytes, left_out) = projected_bytes(ds, &ext, crs)?;
+        return Ok((bytes, left_out, Vec::new()));
+    }
+    let (projected, unplaced) = project_leaving_out(ds, crs)?;
+    let (bytes, left_out) = projected_bytes(&projected, &ext, crs)?;
+    Ok((bytes, left_out, unplaced_export_note(name, &ds.name, unplaced, crs).into_iter().collect()))
 }
 
 /// [`write_bytes_in`] for a dataset already in `crs`'s coordinates.
@@ -865,28 +956,46 @@ pub struct GpkgWritten {
 }
 
 /// As [`write_path`], in the coordinate system `crs` (a GeoPackage, Shapefile or FlatGeobuf; see
-/// [`write_bytes_in`]).
+/// [`write_bytes_in`]). Refused on a place `crs` can't hold, naming its feature, as it gives no
+/// notes to say it; [`write_path_to`] writes the feature without its geometry instead, and says so.
 pub fn write_path_in(ds: &Dataset, path: &Path, crs: Crs) -> Result<usize> {
-    write_path_to(ds, path, crs, &GpkgTable::default()).map(|(left_out, _, _)| left_out)
+    write_path_as(ds, path, crs, &GpkgTable::default(), false).map(|(left_out, _, _)| left_out)
 }
 
 /// As [`write_path_in`], a GeoPackage's table placed as `gpkg` says (other formats ignore it):
 /// also returns the table written, and notes to give with the export (a Shapefile's old parts it
-/// couldn't remove once the new ones landed, [`kept_backups_note`]).
+/// couldn't remove once the new ones landed, [`kept_backups_note`]). A feature with a place `crs`
+/// can't hold is written without its geometry, and the notes say how many
+/// ([`unplaced_export_note`]).
 pub fn write_path_to(ds: &Dataset, path: &Path, crs: Crs, gpkg: &GpkgTable) -> Result<(usize, Option<GpkgWritten>, Vec<String>)> {
+    write_path_as(ds, path, crs, gpkg, true)
+}
+
+/// [`write_path_to`], leaving out a geometry `crs` can't hold (`leaving_out`, said in the notes)
+/// or refusing it ([`write_path_in`]).
+fn write_path_as(
+    ds: &Dataset,
+    path: &Path,
+    crs: Crs,
+    gpkg: &GpkgTable,
+    leaving_out: bool,
+) -> Result<(usize, Option<GpkgWritten>, Vec<String>)> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     if crs != Crs::LonLat && PROJECTED_FORMATS.contains(&ext.as_str()) {
         check_projected(&ext, crs)?;
     }
     let projected;
-    // From the system the dataset holds its coordinates in ([`project`]): as they are when that
-    // is `crs`, and when `crs` is one the format can't hold, which is refused below.
+    // From the system the dataset holds its coordinates in ([`project_leaving_out`]): as they are
+    // when that is `crs`, and when `crs` is one the format can't hold, which is refused below. A
+    // feature with a place `crs` can't hold is written without its geometry, and said.
+    let mut unplaced = 0;
     let ds = if crs == ds.coord_crs() || (crs != Crs::LonLat && !holds_a_system(&ext)) {
         ds
     } else {
-        projected = project(ds, crs)?;
+        (projected, unplaced) = if leaving_out { project_leaving_out(ds, crs)? } else { (project(ds, crs)?, 0) };
         &projected
     };
+    let unplaced = unplaced_export_note(&path.display().to_string(), &ds.name, unplaced, crs);
     match ext.as_str() {
         "gpkg" => {
             #[cfg(not(target_arch = "wasm32"))]
@@ -895,7 +1004,7 @@ pub fn write_path_to(ds: &Dataset, path: &Path, crs: Crs, gpkg: &GpkgTable) -> R
                 // Every feature is written: a layer of several kinds of geometry gets a GEOMETRY
                 // column, and one that declares no type takes its geometry's.
                 let table = crate::source::gpkg::write_table_in(ds, path, crs, gpkg)?;
-                Ok((0, Some(table), Vec::new()))
+                Ok((0, Some(table), unplaced.into_iter().collect()))
             }
             #[cfg(target_arch = "wasm32")]
             {
@@ -908,7 +1017,7 @@ pub fn write_path_to(ds: &Dataset, path: &Path, crs: Crs, gpkg: &GpkgTable) -> R
             let (parts, left_out) = shapefile_parts_in(ds, crs)?;
             let parts: Vec<(std::path::PathBuf, Vec<u8>)> = parts.into_iter().map(|(e, bytes)| (shapefile_part(path, e), bytes)).collect();
             let kept = place_shapefile(path, &stage_shapefile(&parts)?)?;
-            Ok((left_out, None, kept_backups_note(path, &kept).into_iter().collect()))
+            Ok((left_out, None, unplaced.into_iter().chain(kept_backups_note(path, &kept)).collect()))
         }
         _ if crs != Crs::LonLat && !holds_a_system(&ext) => {
             Err(DataError::Unsupported(format!(".{ext} in {} (it holds longitude/latitude only)", crs.label())))
@@ -916,7 +1025,7 @@ pub fn write_path_to(ds: &Dataset, path: &Path, crs: Crs, gpkg: &GpkgTable) -> R
         _ => {
             let (bytes, left_out) = projected_bytes(ds, &ext, crs)?;
             write_atomic(path, &bytes)?;
-            Ok((left_out, None, Vec::new()))
+            Ok((left_out, None, unplaced.into_iter().collect()))
         }
     }
 }
@@ -4830,6 +4939,12 @@ struct FieldText {
     /// Text with spaces around it in a KML or GPX name, which reading trims whatever its
     /// extended data column's type.
     name_padded: usize,
+    /// dBase text with a NUL in what the file keeps: reading keeps only the text before it, and
+    /// reads it as null when that is blank (#2415).
+    nul: usize,
+    /// CSV text starting with an apostrophe before a formula's first character (`'=x`), which
+    /// reading takes for the formula guard and drops ([`unguard`], #2415).
+    apostrophe: usize,
     /// Blank text, read as null.
     blank: usize,
     /// Text `<Null>` ([`Value::is_null_marker`]), which CSV and dBase read as null.
@@ -4948,14 +5063,28 @@ impl TextLosses {
                     }
                 }
                 let Value::Text(s) = v else { continue };
-                let trimmed = s.trim();
                 // A value is counted once, however many copies of it are written (a KML name
                 // field's extended data, a GPX multipoint's waypoints): by its first copy, the
                 // name, whose loss is never less than the extended data's.
                 if let Some(read) = reads.first() {
+                    // dBase keeps only the text before a NUL in the 254 bytes a Character column
+                    // keeps: counted apart, and what's kept then loses its trailing spaces as
+                    // other text does; a blank one, read as null, the NUL's notice says (#2415).
+                    let mut s = s.as_str();
+                    if *read == TextRead::Dbf
+                        && let Some(at) = s.bytes().take(254).position(|b| b == 0)
+                    {
+                        loss.nul += 1;
+                        s = s.get(..at).unwrap_or_default();
+                        if s.trim_end_matches(' ').is_empty() {
+                            continue;
+                        }
+                    }
+                    let trimmed = s.trim();
                     let count = match read {
                         TextRead::Cell if s.is_empty() => &mut loss.blank,
                         TextRead::Cell | TextRead::Dbf if Value::is_null_marker(s) => &mut loss.markers,
+                        TextRead::Cell if s.strip_prefix('\'').is_some_and(|rest| rest.starts_with(FORMULA_START)) => &mut loss.apostrophe,
                         TextRead::Cell if trimmed.is_empty() => &mut loss.blank_in_numbers,
                         // A Character column; text cut to 254 bytes is said as cut.
                         TextRead::Dbf if s.len() <= 254 && s.trim_end_matches(' ').is_empty() => &mut loss.blank,
@@ -5007,6 +5136,24 @@ impl TextLosses {
             };
             notes.push(format!("{target}: {what} back as empty (null), in {}", named_fields(fields, &blank)));
         }
+        let nul = counts(&|t| t.nul);
+        let n: usize = nul.iter().sum();
+        if n > 0 {
+            let what = if n == 1 { "1 text value holds".to_string() } else { format!("{n} text values hold") };
+            notes.push(format!(
+                "{target}: {what} a NUL character, and reading the file back keeps only the text before it, read as empty (null) when that is blank, in {}",
+                named_fields(fields, &nul)
+            ));
+        }
+        let apostrophe = counts(&|t| t.apostrophe);
+        let n: usize = apostrophe.iter().sum();
+        if n > 0 {
+            let what = if n == 1 { "1 text value starts".to_string() } else { format!("{n} text values start") };
+            notes.push(format!(
+                "{target}: {what} with an apostrophe before =, +, -, @, a tab or a line break, which reading the file back takes for the formula guard and drops, in {}",
+                named_fields(fields, &apostrophe)
+            ));
+        }
         if self.unread > 0 {
             let what = if self.unread == 1 { "1 feature is".to_string() } else { format!("{} features are", self.unread) };
             notes.push(format!(
@@ -5035,6 +5182,8 @@ impl std::ops::AddAssign for TextLosses {
         for (a, b) in self.layers.iter_mut().zip(other.layers).flat_map(|(a, b)| a.iter_mut().zip(b)) {
             a.padded += b.padded;
             a.name_padded += b.name_padded;
+            a.nul += b.nul;
+            a.apostrophe += b.apostrophe;
             a.blank += b.blank;
             a.markers += b.markers;
             a.blank_in_numbers += b.blank_in_numbers;
@@ -5063,8 +5212,16 @@ pub fn export_losses_notes_in(ds: &Dataset, ext: &str, name_field: Option<usize>
             // geographic system's, whose points alone are converted to be checked (no copy of the
             // layer); a projected system's aren't degrees, so aren't checked as such.
             let losses = if crs == Crs::LonLat {
-                let ds = ds.in_lonlat().map_err(DataError::of_conversion)?;
-                CsvLosses::of(&ds.features, ds.geometry_type, &ds.fields)?
+                match ds.in_lonlat() {
+                    Ok(ds) => CsvLosses::of(&ds.features, ds.geometry_type, &ds.fields)?,
+                    // A place that can't be given there (written without its geometry, and said
+                    // by [`unplaced_export_note`]): its points converted one by one, those that
+                    // can't be counted as unusable.
+                    Err(_) => {
+                        let to = ds.lonlat_conversion().map_err(DataError::of_conversion)?;
+                        CsvLosses::of_placed(&ds.features, ds.geometry_type, &ds.fields, &|c| to.point(c))?
+                    }
+                }
             } else if crs.is_geographic() && crs != ds.coord_crs() {
                 let to = ds.coord_crs().to(crs).map_err(DataError::Format)?;
                 CsvLosses::of_placed(&ds.features, ds.geometry_type, &ds.fields, &|c| to.point(c))?
@@ -5075,12 +5232,43 @@ pub fn export_losses_notes_in(ds: &Dataset, ext: &str, name_field: Option<usize>
             notes.extend(losses.coordinates_note_in(&ds.fields, target, crs));
             notes
         }
-        "kml" | "kmz" => kml_empty_fields_note(ds, target)?.into_iter().collect(),
+        "kml" | "kmz" => kml_empty_fields_note(ds, target)?.into_iter().chain(kml_blank_names_note(ds, target)?).collect(),
         "gpx" => gpx_notes(ds, name_field, target),
         _ => Vec::new(),
     };
     notes.extend(TextLosses::of(&ds.features, &ds.fields, ds.geometry_type, ext, name_field).notes(&ds.fields, target));
     Ok(notes)
+}
+
+/// KML fields whose name is blank once trimmed, with values in the placemarks written: each is
+/// written as `<Data name="">`, which reading drops, so the column and its values are gone
+/// (#2415). A field with no value written is said by [`kml_empty_fields_note`].
+fn kml_blank_names_note(ds: &Dataset, target: &str) -> Result<Option<String>> {
+    let blank: Vec<usize> = ds.fields.iter().enumerate().filter(|(_, f)| f.name.trim().is_empty()).map(|(k, _)| k).collect();
+    if blank.is_empty() {
+        return Ok(None);
+    }
+    // One pass over the placemarks written, looking at Cancel as [`kml_empty_fields_note`] does.
+    let mut with_value = vec![false; blank.len()];
+    let mut values = 0usize;
+    for f in ds.features.iter().filter(|f| f.geometry.is_some()) {
+        crate::progress::check()?;
+        for (has, k) in with_value.iter_mut().zip(&blank) {
+            if f.attrs.get(*k).is_some_and(|v| !v.is_null()) {
+                *has = true;
+                values += 1;
+            }
+        }
+    }
+    let with_values = with_value.iter().filter(|has| **has).count();
+    Ok((values > 0).then(|| {
+        let target: String = target.chars().map(dbf_notice_char).collect();
+        let fields = if with_values == 1 { "1 field".to_string() } else { format!("{with_values} fields") };
+        let written = if values == 1 { "1 value".to_string() } else { format!("{values} values") };
+        format!(
+            "{target}: {fields} with a blank name, and {written} in them, won't read back: reading KML drops extended data without a name"
+        )
+    }))
 }
 
 /// KML writes ExtendedData only for non-null values of placemarks it writes. Report every
@@ -7331,6 +7519,74 @@ mod tests {
         assert!(text_notes(&clean, "shp").is_empty());
     }
 
+    /// Shapefile text with a NUL in it is said: reading the `.dbf` back keeps only the text before
+    /// it, and reads a value starting with one as null (#2415).
+    #[test]
+    fn shapefile_says_text_cut_at_a_nul() {
+        // The text before a NUL loses its trailing spaces as other text does ('ab '), and blank
+        // text before one (' ') reads as null, which the NUL's notice says.
+        let ds = text_layer(&["a", "b"], &[&[Some("ab\0cd"), Some("kept")], &[Some("\0x"), None], &[Some("ab \0cd"), Some(" \0y")]]);
+        assert_eq!(
+            text_notes(&ds, "shp"),
+            [
+                "t: 1 text value ends with spaces, which reading the file back drops, in 'a'",
+                "t: 4 text values hold a NUL character, and reading the file back keeps only the text before it, read as empty (null) when that is blank, in 'a', 'b'",
+            ]
+        );
+        // What the note says is what reading the file back does.
+        let (bytes, _) = write_bytes(&ds, "zip").unwrap();
+        let back = read_bytes("t.zip", &bytes).unwrap().0;
+        let column = |k: usize| back.features.iter().take(3).map(|f| f.attrs[k].clone()).collect::<Vec<_>>();
+        assert_eq!(column(0), [Value::Text("ab".into()), Value::Null, Value::Text("ab".into())]);
+        assert_eq!(column(1), [Value::Text("kept".into()), Value::Null, Value::Null]);
+        let clean = text_layer(&["a"], &[&[Some("abcd")], &[None]]);
+        assert!(text_notes(&clean, "shp").is_empty());
+    }
+
+    /// CSV text starting with an apostrophe before a formula's first character is said: reading
+    /// the file back takes the apostrophe for the formula guard and drops it (#2415). Text the
+    /// writer guards (`=y`) reads back as it was, and says nothing.
+    #[test]
+    fn csv_says_an_apostrophe_reading_takes_for_the_guard() {
+        let ds = text_layer(&["note", "code"], &[&[Some("'=x"), Some("a")], &[Some("'kept"), Some("'-5")], &[Some("=y"), Some("b")]]);
+        let said = "t: 2 text values start with an apostrophe before =, +, -, @, a tab or a line break, which reading the file back takes for the formula guard and drops, in 'note', 'code'";
+        assert_eq!(text_notes(&ds, "csv"), [said]);
+        assert_eq!(text_notes(&ds, "wkt"), [said]);
+        // What the note says is what reading the file back does.
+        let (bytes, _) = write_bytes(&ds, "csv").unwrap();
+        let back = read_bytes("t.csv", &bytes).unwrap().0;
+        let column = |n: &str| {
+            let i = back.field_index(n).unwrap();
+            back.features.iter().take(3).map(|f| f.attrs[i].to_string()).collect::<Vec<_>>()
+        };
+        assert_eq!(column("note"), ["=x", "'kept", "=y"]);
+        assert_eq!(column("code"), ["a", "-5", "b"]);
+        let clean = text_layer(&["note"], &[&[Some("'kept")], &[Some("=y")], &[Some("it's")]]);
+        assert!(text_notes(&clean, "csv").is_empty());
+    }
+
+    /// A KML field whose name is blank is said with its values: it's written as
+    /// `<Data name="">`, which reading drops, column and values (#2415). One without a value is
+    /// said by the note on fields with no values, not by this one.
+    #[test]
+    fn kml_says_fields_with_a_blank_name() {
+        let ds = text_layer(&["name", "", " ", "\t"], &[&[Some("a"), Some("x"), Some("y"), None], &[Some("b"), Some("z"), None, None]]);
+        let notes = export_losses_notes(&ds, "kml", name_field(&ds), "t").unwrap();
+        let blank: Vec<&String> = notes.iter().filter(|n| n.contains("blank name")).collect();
+        assert_eq!(
+            blank,
+            ["t: 2 fields with a blank name, and 3 values in them, won't read back: reading KML drops extended data without a name"],
+            "{notes:?}"
+        );
+        // What the note says is what reading the file back does.
+        let (bytes, _) = write_bytes(&ds, "kml").unwrap();
+        let back = &crate::kml::read("t.kml", &bytes).unwrap()[0].dataset;
+        assert!(back.fields.iter().all(|f| !f.name.trim().is_empty()), "{:?}", back.fields);
+        let clean = text_layer(&["name", "note", " "], &[&[Some("a"), Some("x"), None]]);
+        let notes = export_losses_notes(&clean, "kml", name_field(&clean), "t").unwrap();
+        assert!(!notes.iter().any(|n| n.contains("blank name")), "{notes:?}");
+    }
+
     #[test]
     fn kml_says_trimmed_and_blank_text() {
         let ds = text_layer(
@@ -7616,6 +7872,22 @@ mod tests {
             assert_eq!(sum, whole, "chunks of {size}");
         }
         assert_eq!(whole.notes(&wide.fields, "t"), Vec::<String>::new());
+        // The NUL and apostrophe counts add up too (#2415).
+        for (ext, layer, said) in [
+            ("csv", text_layer(&["note"], &[&[Some("'=x")], &[Some("y")], &[Some("'+z")]]), "2 text values start with an apostrophe"),
+            ("shp", text_layer(&["note"], &[&[Some("a\0b")], &[Some("y")], &[Some("ab \0c")]]), "2 text values hold a NUL"),
+        ] {
+            let whole = TextLosses::of(&layer.features, &layer.fields, layer.geometry_type, ext, None);
+            for size in 1..=layer.features.len() {
+                let mut sum = TextLosses::default();
+                for chunk in layer.features.chunks(size) {
+                    sum += TextLosses::of(chunk, &layer.fields, layer.geometry_type, ext, None);
+                }
+                assert_eq!(sum, whole, "{ext}: chunks of {size}");
+            }
+            let notes = whole.notes(&layer.fields, "t");
+            assert!(notes.iter().any(|n| n.contains(said)), "{ext}: {notes:?}");
+        }
     }
 
     /// GPX names fields with values before fields of nulls, so a field that lost data isn't

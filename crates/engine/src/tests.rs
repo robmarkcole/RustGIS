@@ -17,6 +17,8 @@ mod services_own;
 #[cfg(not(target_arch = "wasm32"))]
 #[path = "tests/sources_own.rs"]
 mod sources_own;
+#[path = "tests/unplaced_out.rs"]
+mod unplaced_out;
 
 #[cfg(not(target_arch = "wasm32"))]
 #[path = "tests/said_not_silent.rs"]
@@ -33158,6 +33160,56 @@ fn lidar_point_clouds() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// A layer read in place is counted by its source (#2678): `info.project` and `host.layers` give
+/// the source's total in `features`, as `layer.addData` did, and what is in memory in `loaded`.
+/// A source that can't say gives null, never 0.
+#[test]
+fn info_project_counts_a_layer_read_in_place_by_its_source() {
+    isolate_plugins();
+    let dir = std::env::temp_dir().join(format!("rustgis-count-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let pts: Vec<(f64, f64, f64, u8)> = (0..200).map(|i| (10.0 + f64::from(i) / 200.0, 50.5, 300.0, 2)).collect();
+    let path = dir.join("scan.las");
+    std::fs::write(&path, las_bytes(&pts)).unwrap();
+    let mut s = Session::new(Project::default());
+    let added = s.run("layer.addData", &json!({"path": path.display().to_string()})).unwrap();
+    assert_eq!((added["streamed"].as_bool(), added["features"].as_u64()), (Some(true), Some(200)), "{added}");
+    let info = s.run("info.project", &json!({"nameFilter": "scan"})).unwrap();
+    let scan = &info["layers"][0];
+    assert_eq!(
+        (scan["features"].as_u64(), scan["loaded"].as_u64(), scan["streamed"].as_bool()),
+        (Some(200), Some(0), Some(true)),
+        "{scan}"
+    );
+    plugin("eng-count", &[]);
+    let layers = forward(&mut s, "eng-count", "host.layers", json!({})).unwrap();
+    let scan = layers.as_array().unwrap().iter().find(|l| l["name"] == "scan").unwrap();
+    assert_eq!(
+        (scan["features"].as_u64(), scan["loaded"].as_u64(), scan["streamed"].as_bool()),
+        (Some(200), Some(0), Some(true)),
+        "{scan}"
+    );
+    // A layer held in memory: both numbers agree.
+    let mut w = world();
+    let info = w.run("info.project", &json!({"nameFilter": "Cities"})).unwrap();
+    let cities = &info["layers"][0];
+    assert!(cities["features"].as_u64().is_some_and(|n| n > 0), "{cities}");
+    assert_eq!(
+        (&cities["features"], &cities["loaded"], &cities["streamed"]),
+        (&cities["loaded"], &cities["loaded"], &json!(false)),
+        "{cities}"
+    );
+    // The file is gone when the project opens: the source can't say, so null, not 0.
+    let text = serde_json::to_string(&s.project).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    let mut t = Session::new(Project::default());
+    t.run("project.openText", &json!({"text": text})).unwrap();
+    let info = t.run("info.project", &json!({"nameFilter": "scan"})).unwrap();
+    let scan = &info["layers"][0];
+    assert!(scan["features"].is_null() && scan["streamed"] == true && scan["loaded"] == 0, "{scan}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// A preview of an oversized cloud must never become a successful whole-data result.
 #[test]
 fn lidar_sample_refuses_exports_and_statistics() {
@@ -44766,7 +44818,7 @@ fn postgis_dates_live() {
         let conn = postgis::connect(&url, false).unwrap();
         let t = postgis::find_table(&conn, &format!("public.{table}")).unwrap();
         let src = postgis::PostgisSource::open(conn, t, None, None).unwrap();
-        let b = src.read(&Request { extent: None, limit: 100 }).unwrap();
+        let b = src.read(&Request { extent: None, limit: 100, own: None }).unwrap();
         let note = rustgis_data::source::unread_dates_note(&src.info().fields, &b.unread_dates);
         assert_eq!(note.as_deref(), Some("2 values aren't dates and were read as empty, in 'd', 'ts'"));
         let f = b.features.iter().find(|f| f.id == 1).unwrap();
