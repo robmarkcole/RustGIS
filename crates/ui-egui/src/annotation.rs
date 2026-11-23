@@ -395,6 +395,7 @@ pub(crate) fn panel(app: &mut RustGisApp, ui: &mut egui::Ui) {
     }
     ui.small(tl!("Click an annotation to select it. Known circles and boxes show their editing handles."));
     if let Some(id) = active
+        && crate::boxedit::ready(app)
         && let Some([row]) = app.session.map().layer(id).map(|l| l.selection.as_slice())
         && app.session.box_spec(id, *row).is_none()
         && app.session.circle_spec(id, *row).is_none()
@@ -417,7 +418,12 @@ pub(crate) fn panel(app: &mut RustGisApp, ui: &mut egui::Ui) {
         let hidden = app.session.active_layer.and_then(|id| app.session.map().layer(id)).is_some_and(|l| {
             rustgis_engine::box_edit::check_tool(&app.session, l.id).is_ok() && !app.session.map().draws_at(l, app.session.scale())
         });
-        if hidden {
+        if !app.session.map().projection.is_globe() && app.session.map().camera.pitch != 0. {
+            ui.small(tl!("The map is tilted. Circle and box editing requires zero pitch."));
+            if ui.button(tl!("Reset map tilt")).clicked() {
+                let _ = app.run("map.setPitch", json!({"pitch":0}));
+            }
+        } else if hidden {
             ui.small(tl!("The polygon layer doesn't draw at this scale. Zoom in or out until it draws, then draw."));
         } else {
             ui.small(tl!("Drawing requires editing enabled, a loaded polygon layer and a flat Earth map with zero pitch."));

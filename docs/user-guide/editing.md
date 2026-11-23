@@ -227,6 +227,8 @@ must be restored or another field chosen before drawing with that default.
 Alternatively, right-click an annotation and choose **Change class** for a direct, undoable
 assignment from the same styled/recent classes. This changes only the clicked annotation and
 keeps the active class for new shapes. **Other class…** opens Annotate to enter another name.
+Class changes remain available on a tilted map. Circle/box geometry tools require zero pitch;
+use **Reset map tilt** in Annotate, or click the north arrow to reset both bearing and pitch.
 
 **Class colours…** opens the existing Symbology pane with **Unique Values** and the class field
 ready to apply. To include later values, reselect the same field in Symbology; this rebuilds its

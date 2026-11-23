@@ -78,8 +78,10 @@ pub(crate) fn pick(app: &mut RustGisApp, c: Coord, alt: bool) {
             | rustgis_engine::Tool::EditVertices
             | rustgis_engine::Tool::Circle
             | rustgis_engine::Tool::RotatedBox
-    ) || !crate::boxedit::ready(app)
-    {
+    ) || !app.session.active_layer.is_some_and(|id| {
+        rustgis_engine::box_edit::check_layer(&app.session, id).is_ok()
+            && app.session.map().layer(id).is_some_and(|l| app.session.map().draws_at(l, app.session.scale()))
+    }) {
         return;
     }
     let hits = crate::boxedit::hits(app, c);
@@ -152,7 +154,11 @@ pub(crate) fn open(app: &mut RustGisApp, p: &Value) -> Result<(), String> {
 pub(crate) fn menu(app: &mut RustGisApp, ui: &mut egui::Ui) {
     let Some(target) = app.conversion.menu.filter(|t| t.current(app)) else { return };
     let layer = target.layer;
-    if ui.button(tl!("Convert Polygon…")).clicked() {
+    if ui
+        .add_enabled(crate::boxedit::ready(app), egui::Button::new(tl!("Convert Polygon…")))
+        .on_disabled_hover_text(tl!("Shape conversion requires a flat Earth map with zero pitch."))
+        .clicked()
+    {
         let _ = app.run("ui.convertShape", json!({"layer":layer}));
         ui.close();
     }

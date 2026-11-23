@@ -194,6 +194,19 @@ fn choices(app: &RustGisApp) -> (std::collections::BTreeMap<String, Option<egui:
     (choices, more)
 }
 
+/// One full-width hit target for the label, colour swatch and trailing space.
+fn class_row(ui: &mut egui::Ui, name: &str, color: Option<egui::Color32>, selected: bool) -> egui::Response {
+    let mut label = egui::text::LayoutJob::default();
+    label.append(name, 22., egui::TextFormat::simple(egui::TextStyle::Button.resolve(ui.style()), egui::Color32::PLACEHOLDER));
+    let response = ui.add(egui::Button::selectable(selected, label).min_size(egui::vec2(ui.available_width(), 24.)));
+    if let Some(color) = color
+        && ui.is_rect_visible(response.rect)
+    {
+        ui.painter().circle_filled(crate::widgets::menu_icon_rect(ui, &response).center(), 5., color);
+    }
+    response
+}
+
 /// Called only for the right-click target validated by the shared polygon menu.
 pub(crate) fn menu(app: &mut RustGisApp, ui: &mut egui::Ui, layer: u32, row: usize) {
     sync(app);
@@ -214,19 +227,15 @@ pub(crate) fn menu(app: &mut RustGisApp, ui: &mut egui::Ui, layer: u32, row: usi
     });
     let (choices, more) = choices(app);
     ui.menu_button(tl!("Change class"), |ui| {
+        ui.set_max_width(220.);
         for (value, color) in &choices {
             if value.trim().is_empty() {
                 continue;
             }
-            ui.horizontal(|ui| {
-                if let Some(color) = color {
-                    ui.colored_label(*color, "●");
-                }
-                if ui.selectable_label(current.as_ref() == Some(value), value).clicked() {
-                    let _ = app.run("ui.annotationAssignClass", json!({"value":value}));
-                    ui.close();
-                }
-            });
+            if class_row(ui, value, *color, current.as_ref() == Some(value)).clicked() {
+                let _ = app.run("ui.annotationAssignClass", json!({"value":value}));
+                ui.close();
+            }
         }
         if more {
             ui.small(tl!("Showing the first 64 styled classes and recent choices."));
@@ -289,14 +298,14 @@ pub(crate) fn panel(app: &mut RustGisApp, ui: &mut egui::Ui) {
     let (choices, more) = choices(app);
     let mut value = app.annotation.classes.value.clone();
     egui::ComboBox::from_label(tl!("Active class")).selected_text(value.as_deref().unwrap_or(tl!("No class default"))).show_ui(ui, |ui| {
-        ui.selectable_value(&mut value, None, tl!("No class default"));
+        ui.set_max_width(220.);
+        if class_row(ui, tl!("No class default"), None, value.is_none()).clicked() {
+            value = None;
+        }
         for (name, color) in &choices {
-            ui.horizontal(|ui| {
-                if let Some(c) = color {
-                    ui.colored_label(*c, "●");
-                }
-                ui.selectable_value(&mut value, Some(name.clone()), name);
-            });
+            if class_row(ui, name, *color, value.as_ref() == Some(name)).clicked() {
+                value = Some(name.clone());
+            }
         }
     });
     if value != app.annotation.classes.value {
@@ -345,9 +354,13 @@ mod tests {
 
     #[test]
     fn right_click_changes_only_the_clicked_shape_class_and_preserves_the_drawing_default() {
-        use egui_kittest::kittest::Queryable;
+        use egui_kittest::kittest::{NodeT, Queryable};
         use rustgis_engine::{Tool, box_edit::Frame, data::Value as Cell, geom::Coord};
-        for (tool, row, center, value) in [(Tool::Circle, 0, [-100000., 0.], "truck"), (Tool::RotatedBox, 1, [100000., 0.], "car")] {
+        for (tool, row, center, value, pitch) in [
+            (Tool::Circle, 0, [-100000., 0.], "truck", 0.),
+            (Tool::RotatedBox, 1, [100000., 0.], "car", 0.),
+            (Tool::Select, 1, [100000., 0.], "car", 11.4),
+        ] {
             let mut session = Session::new(Project::default());
             session.active_layer = Some(session.map_mut().add_dataset(Dataset::new(
                 "Annotations",
@@ -371,6 +384,11 @@ mod tests {
             app.run("layer.symbology", json!({"type":"unique","field":"class"})).unwrap();
             if row == 0 {
                 app.run("ui.annotationClass", json!({"value":"car"})).unwrap();
+            }
+            if pitch != 0. {
+                app.run("ui.pane.annotation", json!({})).unwrap();
+                app.run("map.setBearing", json!({"bearing":17})).unwrap();
+                app.run("map.setPitch", json!({"pitch":pitch})).unwrap();
             }
             app.run("tool.set", json!({"tool":tool.code()})).unwrap();
             let layer = app.session.active_layer.unwrap();
@@ -407,10 +425,26 @@ mod tests {
                 vec![row],
                 "right-click targets the clicked object, not the old selection"
             );
+            if pitch != 0. {
+                assert!(h.get_by_label("Convert Polygon…").accesskit_node().is_disabled());
+            }
             let depth = h.state().session.undo_depth();
             h.get_by_label("Change class").click();
             h.run();
-            h.get_by_role_and_label(egui::accesskit::Role::Button, value).click();
+            let bounds = h.get_by_role_and_label(egui::accesskit::Role::Button, value).rect();
+            let menu_row = h.get_by_label("Other class…").rect();
+            let at = egui::pos2(if row == 0 { menu_row.left() + 10. } else { menu_row.right() - 3. }, bounds.center().y);
+            assert!(bounds.contains(at), "the class button covers both the swatch and the menu's trailing space");
+            h.event(egui::Event::PointerMoved(at));
+            for pressed in [true, false] {
+                h.event(egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                });
+                h.step();
+            }
             h.run();
             assert!(h.query_by_label("Change class").is_none(), "applying a class closes the context menu");
             let data = &h.state().session.map().layer(layer).unwrap().dataset;
@@ -420,13 +454,22 @@ mod tests {
             assert_eq!(data.features[row].geometry, before.features[row].geometry);
             assert_eq!(data.value(row, 1), before.value(row, 1));
             assert_eq!(h.state().session.circle_spec(layer, 0), Some(circle));
-            assert_eq!(h.state().session.box_spec(layer, 1), Some(bbox));
+            assert_eq!(h.state().session.box_spec(layer, 1), Some(bbox.clone()));
             assert_eq!(h.state().annotation.classes.value.as_deref(), if row == 0 { Some("car") } else { None });
             assert_eq!(h.state().session.undo_depth(), depth + 1);
             h.state_mut().run("edit.undo", json!({})).unwrap();
             assert_eq!(h.state().session.map().layer(layer).unwrap().dataset, before);
             h.state_mut().run("edit.redo", json!({})).unwrap();
             assert_eq!(h.state().session.map().layer(layer).unwrap().dataset.value(row, 0), &Cell::Text(value.into()));
+            if pitch != 0. {
+                assert!(!crate::boxedit::ready(h.state()));
+                h.get_by_label("Reset map tilt").click();
+                h.run();
+                assert_eq!(h.state().session.map().camera.pitch, 0.);
+                assert_eq!(h.state().session.map().camera.bearing, 17., "reset tilt keeps the chosen bearing");
+                assert!(crate::boxedit::ready(h.state()));
+                assert_eq!(h.state().session.box_spec(layer, 1), Some(bbox));
+            }
         }
     }
 
