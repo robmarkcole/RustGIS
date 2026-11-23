@@ -80,9 +80,18 @@ pub(crate) fn sync(app: &mut RustGisApp) {
     }
     crate::annotation_classes::sync(app);
 }
+/// Keep annotation navigation in the image plane, including when a shape tool is
+/// retained while another pane is open. Explicit camera commands remain available.
+pub(crate) fn planar_navigation(app: &RustGisApp) -> bool {
+    app.ui.right == Some(RightPane::Annotation) || matches!(app.session.tool, Tool::RotatedBox | Tool::Circle)
+}
+
 pub(crate) fn open(app: &mut RustGisApp) -> Result<(), String> {
     sync(app);
     app.ui.open_right(RightPane::Annotation);
+    if app.session.map().camera.pitch != 0.0 {
+        app.run("map.setPitch", json!({"pitch":0}))?;
+    }
     app.map.popup = None;
     if app.session.tool == Tool::Explore {
         app.run("tool.set", json!({"tool":"select"}))?;
@@ -429,7 +438,7 @@ pub(crate) fn panel(app: &mut RustGisApp, ui: &mut egui::Ui) {
             ui.small(tl!("Drawing requires editing enabled, a loaded polygon layer and a flat Earth map with zero pitch."));
         }
     }
-    ui.small(tl!("Space or middle-drag pans; releasing Space returns to the active drawing tool. Undo/Redo use the existing commands."));
+    ui.small(tl!("Space, middle-drag or right-drag pans; releasing Space returns to the active drawing tool. Map rotation and tilt gestures are disabled while annotating. Undo/Redo use the existing commands."));
     if matches!(app.session.tool, Tool::Circle | Tool::RotatedBox) {
         let details =
             egui::CollapsingHeader::new(tl!("Shape details")).id_salt("annotation_shape_details").default_open(false).show(ui, |ui| {

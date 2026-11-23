@@ -227,8 +227,12 @@ must be restored or another field chosen before drawing with that default.
 Alternatively, right-click an annotation and choose **Change class** for a direct, undoable
 assignment from the same styled/recent classes. This changes only the clicked annotation and
 keeps the active class for new shapes. **Other class…** opens Annotate to enter another name.
-Class changes remain available on a tilted map. Circle/box geometry tools require zero pitch;
-use **Reset map tilt** in Annotate, or click the north arrow to reset both bearing and pitch.
+Opening Annotate resets map tilt to zero without changing its bearing. While Annotate is open,
+or a circle/rotated-box tool is active, right-drag and Ctrl-drag in Explore pan instead of
+rotating/tilting; Shift+arrow keys also pan. Zoom remains available, and the box's rotation handle
+still rotates the object. Closing Annotate and leaving the shape tool restores normal map
+navigation. Explicit camera commands can still change tilt; in that case class changes remain
+available, and **Reset map tilt** restores geometry editing.
 
 **Class colours…** opens the existing Symbology pane with **Unique Values** and the class field
 ready to apply. To include later values, reselect the same field in Symbology; this rebuilds its
@@ -238,7 +242,7 @@ up to 64 styled values and the last 32 choices; other names can be entered direc
 are ordinary GeoJSON properties and survive export/import. Colours are layer styling, saved in
 projects/layer styles; they are not exported as a GeoJSON palette or custom annotation metadata.
 
-Space or middle-drag pans; releasing Space keeps the drawing tool. Use the selected object's
+Space, middle-drag or right-drag pans; releasing Space keeps the drawing tool. Use the selected object's
 existing handles, Undo/Redo, and **Export GeoJSON…**. **Shape details** is collapsed by default;
 expand it for numeric dimensions and additional editing controls. Map handles remain available
 while the section is hidden. Refused drawing gestures show an error notification even when
