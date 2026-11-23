@@ -621,7 +621,7 @@ mod tests {
         app.run("tool.set", json!({"tool":"circle"})).unwrap();
         drag(&mut app, &frame, [20., 20.], [60., 60.], true);
         app.run("ui.annotationClassColours", json!({})).unwrap();
-        assert_eq!(app.ui.symbology_pending.as_ref().unwrap().field, "class");
+        assert!(app.ui.symbology_pending.is_none(), "new classes already have matching Unique Values styling");
         assert_eq!(app.ui.right, Some(RightPane::Symbology));
         app.run("layer.symbology", json!({"type":"unique","field":"class"})).unwrap();
         app.run("layer.classStyle", json!({"value":"car","color":"#FF0000"})).unwrap();
@@ -629,6 +629,29 @@ mod tests {
         app.run("ui.annotationClassColours", json!({})).unwrap();
         assert!(app.ui.symbology_pending.is_none());
         assert_eq!(app.session.map().layer(layer).unwrap().renderer, renderer);
+        let before = app.session.map().layer(layer).unwrap().dataset.features.to_vec();
+        let depth = app.session.undo_depth();
+        app.run("ui.annotationClass", json!({"value":"box"})).unwrap();
+        assert_eq!(app.session.undo_depth(), depth + 1, "adding a new class creates one undoable colour rule");
+        let r = &app.session.map().layer(layer).unwrap().renderer;
+        let rustgis_engine::map::Renderer::Unique { classes, other, .. } = r else { panic!("Unique Values expected") };
+        let rustgis_engine::map::Renderer::Unique { classes: old, other: old_other, .. } = &renderer else { panic!() };
+        assert_eq!(classes[0], old[0]);
+        assert_eq!(other, old_other);
+        assert_eq!(classes[1].0, "box");
+        assert_ne!(classes[1].1.fill, classes[0].1.fill);
+        assert_eq!(
+            app.session.map().layer(layer).unwrap().dataset.features.to_vec(),
+            before,
+            "choosing a class does not relabel existing features"
+        );
+        assert!(r.legend().iter().any(|entry| entry.label == "box"));
+        app.run("ui.annotationClass", json!({"value":"box"})).unwrap();
+        assert_eq!(app.session.undo_depth(), depth + 1);
+        app.run("tool.set", json!({"tool":"rotatedBox"})).unwrap();
+        drag(&mut app, &frame, [70., 70.], [95., 95.], true);
+        assert_eq!(app.session.map().layer(layer).unwrap().dataset.value(1, 0).to_string(), "box");
+        assert!(app.session.box_spec(layer, 1).is_some());
     }
     #[test]
     fn annotation_classes_refuse_ambiguous_fields_and_multiple_selected_features_without_mutation() {
@@ -673,12 +696,16 @@ mod tests {
         h.get_by_label("Use class").click();
         h.run();
         assert_eq!(crate::annotation_classes::drawing_attributes(h.state()).unwrap(), json!({"class":"car"}));
-        assert_eq!(h.state().session.undo_depth(), depth, "class defaults are session-only");
+        assert_eq!(
+            h.state().session.undo_depth(),
+            depth + 1,
+            "the automatic colour rule is undoable; choosing the default changes no features"
+        );
         assert!(h.state().session.map().layer(layer).unwrap().dataset.features.is_empty());
         assert!(h.get_by_label("Assign to selected annotation").accesskit_node().is_disabled());
         h.get_by_label("Class colours…").click();
         h.run();
-        assert_eq!(h.state().ui.symbology_pending.as_ref().unwrap().field, "class");
+        assert!(h.state().ui.symbology_pending.is_none(), "the automatic class palette is already ready to customise");
     }
 
     // A minimal uncompressed TIFF with the original ModelTransformation, not a north-up

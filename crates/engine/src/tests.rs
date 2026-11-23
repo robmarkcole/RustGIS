@@ -10355,6 +10355,86 @@ fn symbology_classes_follow_the_definition_query() {
 }
 
 #[test]
+fn class_style_create_appends_without_recolouring_and_preserves_no_fill() {
+    use rustgis_data::{Dataset, Field, FieldType, GeometryType};
+    use rustgis_map::Renderer;
+    let mut s = Session::new(Project::default());
+    let id = s.map_mut().add_dataset(Dataset::new("Classes", GeometryType::Polygon, vec![Field::new("class", FieldType::Text)]));
+    s.active_layer = Some(id);
+    let create = |value: &str| json!({"field":"class","value":value,"create":true});
+    let initial = s.map().layer(id).unwrap().renderer.clone();
+    s.run("layer.classStyle", &create("car")).unwrap();
+    s.run("layer.classStyle", &json!({"value":"car","color":"#F3B82064","outline":"#102030","label":"Cars"})).unwrap();
+    let before = s.map().layer(id).unwrap().renderer.clone();
+    let depth = s.undo_depth();
+    s.run("layer.classStyle", &create("box")).unwrap();
+    assert_eq!(s.undo_depth(), depth + 1);
+    let after = s.map().layer(id).unwrap().renderer.clone();
+    let (
+        Renderer::Unique { classes: old, other: old_other, class_labels: old_labels, .. },
+        Renderer::Unique { classes, other, class_labels, .. },
+    ) = (&before, &after)
+    else {
+        panic!("Unique Values expected")
+    };
+    assert_eq!(classes.len(), 2);
+    assert_eq!(classes[0], old[0]);
+    assert_eq!(other, old_other);
+    assert_eq!(class_labels, old_labels);
+    assert_ne!(classes[0].1.fill.hex(), classes[1].1.fill.hex());
+    assert!(after.legend().iter().any(|entry| entry.label == "box"));
+    s.run("edit.undo", &json!({})).unwrap();
+    assert_eq!(s.map().layer(id).unwrap().renderer, before);
+    s.run("edit.redo", &json!({})).unwrap();
+    assert_eq!(s.map().layer(id).unwrap().renderer, after);
+    s.run("layer.noFill", &json!({})).unwrap();
+    s.run("layer.classStyle", &create("bird")).unwrap();
+    let Renderer::Unique { classes, .. } = &s.map().layer(id).unwrap().renderer else { panic!() };
+    assert!(classes.iter().all(|(_, symbol)| symbol.fill.a() == 0), "adding a class respects No Fill");
+    assert!(classes.iter().all(|(_, symbol)| symbol.stroke.a() > 0));
+    s.run("layer.restoreFill", &json!({})).unwrap();
+    let Renderer::Unique { classes, other, .. } = &s.map().layer(id).unwrap().renderer else { panic!() };
+    let Renderer::Unique { classes: old, other: old_other, .. } = after else { panic!() };
+    assert_eq!(&classes[..2], old.as_slice());
+    assert_eq!(other, &old_other);
+    assert_eq!(classes[2].1.fill.a(), other.fill.a());
+    let Renderer::Single(base) = initial else { panic!() };
+    assert_eq!(old_other, base, "Single Symbol keeps its symbol for other values");
+}
+
+#[test]
+fn class_style_create_validates_and_bounds_the_automatic_palette() {
+    use rustgis_data::{Dataset, Field, FieldType, GeometryType};
+    let mut s = Session::new(Project::default());
+    let id = s.map_mut().add_dataset(Dataset::new("Classes", GeometryType::Polygon, vec![Field::new("class", FieldType::Text)]));
+    s.active_layer = Some(id);
+    for bad in [
+        json!({"create":true,"value":"box"}),
+        json!({"create":true,"field":"absent","value":"box"}),
+        json!({"create":true,"field":"class","other":true}),
+        json!({"create":true,"field":"class","value":"  "}),
+        json!({"create":"yes","field":"class","value":"box"}),
+        json!({"create":true,"field":"class","value":"box","color":"bad"}),
+        json!({"value":"box","color":"#123456"}),
+    ] {
+        let before = serde_json::to_value(&s.project).unwrap();
+        let depth = s.undo_depth();
+        assert!(s.run("layer.classStyle", &bad).is_err(), "{bad}");
+        assert_eq!(serde_json::to_value(&s.project).unwrap(), before);
+        assert_eq!(s.undo_depth(), depth);
+    }
+    for i in 0..64 {
+        s.run("layer.classStyle", &json!({"create":true,"field":"class","value":format!("class{i}")})).unwrap();
+    }
+    let before = s.map().layer(id).unwrap().renderer.clone();
+    let rustgis_map::Renderer::Unique { classes, .. } = &before else { panic!() };
+    assert_eq!(classes.iter().map(|(_, symbol)| symbol.fill.hex()).collect::<std::collections::BTreeSet<_>>().len(), 64);
+    assert!(s.run("layer.classStyle", &json!({"create":true,"field":"class","value":"one too many"})).unwrap_err().contains("64"));
+    assert_eq!(s.map().layer(id).unwrap().renderer, before);
+    assert!(s.map().layer(id).unwrap().dataset.features.is_empty(), "class creation needs no feature scan");
+}
+
+#[test]
 fn layer_class_style_edits_one_class() {
     // #314: one class's colour and legend label, by command (the Symbology pane runs the same).
     let mut s = world();

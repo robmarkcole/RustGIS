@@ -841,11 +841,14 @@ mod tests {
         assert_eq!(app.session.circle_spec(layer, 1), Some(circle));
         app.run("ui.annotationClass", json!({"value":"car"})).unwrap();
         assert_eq!(crate::annotation_classes::drawing_attributes(&app).unwrap(), json!({"class":"car"}));
-        app.run("edit.undo", json!({})).unwrap();
+        app.run("edit.undo", json!({})).unwrap(); // The automatic class colour is its own step.
+        assert!(app.session.map().layer(layer).unwrap().dataset.field_index("class").is_some());
+        app.run("edit.undo", json!({})).unwrap(); // Then the background field creation.
         assert!(app.session.map().layer(layer).unwrap().dataset.field_index("class").is_none());
         assert!(crate::annotation_classes::drawing_attributes(&app).is_err());
         app.run("edit.redo", json!({})).unwrap();
         assert_eq!(crate::annotation_classes::drawing_attributes(&app).unwrap(), json!({"class":"car"}));
+        app.run("edit.redo", json!({})).unwrap(); // Restore the class colour as well.
         let p = json!({"layer":layer,"name":"other","type":"text"});
         let ahead = reads::read_ahead(&mut app.session, "edit.addField", &p).unwrap();
         let done = ahead.run(&Control::new()).unwrap();

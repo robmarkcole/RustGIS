@@ -101,13 +101,20 @@ pub(crate) fn select_field(app: &mut RustGisApp, p: &Value) -> Result<(), String
 }
 pub(crate) fn select_class(app: &mut RustGisApp, p: &Value) -> Result<(), String> {
     sync(app);
-    field(app)?;
+    let name = field(app)?.to_string();
     let value = match p.get("value") {
         Some(Value::Null) => None,
         Some(Value::String(value)) if !value.trim().is_empty() => Some(value.clone()),
         _ => return Err(tl!("Choose a non-empty class name, or null for no class default.").into()),
     };
     if let Some(value) = &value {
+        let styled = target(app).is_some_and(|l| {
+            matches!(&l.renderer, Renderer::Unique { field, classes, expression: None, .. }
+                if *field == name && classes.iter().any(|(existing, _)| existing == value))
+        });
+        if !styled {
+            app.run("layer.classStyle", json!({"field":name,"value":value,"create":true}))?;
+        }
         let recent = &mut app.annotation.classes.recent;
         recent.retain(|v| v != value);
         recent.insert(0, value.clone());
@@ -340,7 +347,7 @@ pub(crate) fn panel(app: &mut RustGisApp, ui: &mut egui::Ui) {
     if ui.button(tl!("Class colours…")).clicked() {
         let _ = app.run("ui.annotationClassColours", json!({}));
     }
-    ui.small(tl!("New shapes use the active class; no default keeps template values. Class colours opens Unique Values in Symbology; apply it to include new values. GeoJSON keeps class values, not these colours."));
+    ui.small(tl!("New shapes use the active class. New classes get a legend entry and an automatic colour; existing colours are kept. Class colours opens Symbology to customise them. GeoJSON keeps class values, not these colours."));
     ui.separator();
 }
 

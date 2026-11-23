@@ -234,10 +234,13 @@ still rotates the object. Closing Annotate and leaving the shape tool restores n
 navigation. Explicit camera commands can still change tilt; in that case class changes remain
 available, and **Reset map tilt** restores geometry editing.
 
-**Class colours…** opens the existing Symbology pane with **Unique Values** and the class field
-ready to apply. To include later values, reselect the same field in Symbology; this rebuilds its
-classes and colours, so configure colours after the class set is ready. Opening this pane for an
-already matching renderer preserves its colours. The Active class list offers
+Adding a new class immediately creates its own legend entry and chooses an automatic colour,
+preserving existing class colours, labels and outlines. A Single Symbol layer becomes Unique
+Values on the class field, keeping its old symbol for other values. Existing Unique Values must
+use that same field; for other renderers choose **Class colours…** first. Automatic palettes
+support up to 64 classes. Class creation is undoable separately from drawing a feature.
+**Class colours…** opens Symbology to customise colours without rebuilding existing categories.
+The Active class list offers
 up to 64 styled values and the last 32 choices; other names can be entered directly. Class values
 are ordinary GeoJSON properties and survive export/import. Colours are layer styling, saved in
 projects/layer styles; they are not exported as a GeoJSON palette or custom annotation metadata.

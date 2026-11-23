@@ -229,7 +229,7 @@ pub fn commands() -> Vec<C> {
         C::new("layer.classStyle", "Class Style", "Style › Drawing", class_style).roles(&[]).effects(crate::policy::Effects::NONE)
             .when(need_feature_layer)
             .params(
-                r##"{"layer"?, "value"?: text|number (a Unique Values class), "index"?: number (a Graduated Colors class, 0 = the lowest), "other"?: true (Unique Values' <all other values>), "color"?: "#RRGGBB" (preserves polygon translucency, minimum alpha 150)|"#RRGGBBAA" (sets alpha exactly), "outline"?: "#RRGGBB"|"#RRGGBBAA", "label"?: text (the legend label; "" goes back to the value or range)}"##,
+                r##"{"layer"?, "value"?: text|number (a Unique Values class), "create"?: bool (with field: append a missing value with an automatic colour, preserving existing classes; at most 64), "field"?: text (with create: a loaded field; Single Symbol becomes Unique Values, other renderers must already class this field), "index"?: number (a Graduated Colors class, 0 = the lowest), "other"?: true (Unique Values' <all other values>), "color"?: "#RRGGBB" (preserves polygon translucency, minimum alpha 150)|"#RRGGBBAA" (sets alpha exactly), "outline"?: "#RRGGBB"|"#RRGGBBAA", "label"?: text (the legend label; "" goes back to the value or range)}"##,
             ),
         C::new("layer.color", "Symbol Color", "Style › Drawing", |s, p| {
             let hex = s_req(p, "color")?;
@@ -7420,6 +7420,76 @@ fn class_ref(p: &Value) -> Result<Option<ClassRef>, String> {
     }))
 }
 
+/// Append one category without scanning features or regenerating existing symbols. Work is
+/// bounded by the 64-class automatic palette and 72 candidate colours, on the UI thread.
+fn ensure_unique_class(l: &mut rustgis_map::Layer, field: &str, value: &str) -> Result<(), String> {
+    use rustgis_map::symbology::MAX_UNIQUE;
+    if value.trim().is_empty() {
+        return Err("a new class needs a non-empty value".into());
+    }
+    let fi = l.dataset.field_index(field).ok_or_else(|| format!("no field named '{field}'"))?;
+    let field = l.dataset.fields.get(fi).map(|f| f.name.clone()).ok_or("no such field")?;
+    let g = l.geometry_type();
+    let single = match &l.renderer {
+        Renderer::Single(symbol) => Some(*symbol),
+        Renderer::Unique { field: existing, expression: None, classes, .. } if *existing == field => {
+            if classes.iter().any(|(v, _)| v == value) {
+                return Ok(());
+            }
+            if classes.len() >= MAX_UNIQUE {
+                return Err(format!("at most {MAX_UNIQUE} automatically coloured classes; edit the existing classes in Symbology"));
+            }
+            None
+        }
+        _ => return Err(format!("choose Unique Values on '{field}' in Class colours before adding a class")),
+    };
+    if let Some(other) = single {
+        l.renderer = Renderer::Unique {
+            field,
+            classes: Vec::new(),
+            other,
+            ramp: Ramp::Harbour,
+            class_labels: Default::default(),
+            other_label: None,
+            class_strokes: Default::default(),
+            other_strokes: Vec::new(),
+            class_fills: Default::default(),
+            other_fills: Vec::new(),
+            expression: None,
+        };
+    }
+    let Renderer::Unique { classes, other, .. } = &mut l.renderer else { return Err("no Unique Values renderer".into()) };
+    // Maximise the nearest RGB distance, ignoring opacity. Existing custom colours participate
+    // too, so an appended category does not reuse a manually chosen colour.
+    let distance = |a: Rgba, b: Rgba| {
+        let d = |a: u8, b: u8| (i32::from(a) - i32::from(b)).pow(2) as u32;
+        d(a.r(), b.r()) + d(a.g(), b.g()) + d(a.b(), b.b())
+    };
+    let colour = (0..8)
+        .map(|i| Ramp::Harbour.pick(i, 8))
+        .chain((0..64).map(|i| Ramp::Turbo.pick(i, 64)))
+        .max_by_key(|candidate| {
+            classes.iter().map(|(_, s)| s.fill).chain(std::iter::once(other.fill)).map(|used| distance(*candidate, used)).min().unwrap_or(0)
+        })
+        .ok_or("no class colours available")?;
+    let mut symbol = other.with_fill(colour.with_alpha(other.fill.a()), g);
+    if g == GeometryType::Polygon {
+        symbol.fill = colour.with_alpha(other.fill.a());
+        symbol.stroke = colour.shade(0.6).with_alpha(other.stroke.a());
+    }
+    let at = classes.len();
+    classes.push((value.into(), symbol));
+    // Symbols are stored as classes followed by 'other'. Keep No Fill's saved alpha vector
+    // aligned so Restore Fill still restores every pre-existing symbol exactly.
+    if let Some(hidden) = &mut l.hidden_fills
+        && hidden.alphas.len() == at + 1
+    {
+        let alpha = hidden.alphas.last().copied().unwrap_or(symbol.fill.a());
+        hidden.alphas.insert(at, alpha);
+    }
+    Ok(())
+}
+
 /// `layer.classStyle`: one class's colour, outline colour and legend label (#314).
 fn class_style(s: &mut Session, p: &Value) -> CmdResult {
     let class = class_ref(p)?.ok_or("name one class: value (Unique Values), index (Graduated Colors) or other: true")?;
@@ -7436,12 +7506,22 @@ fn class_style(s: &mut Session, p: &Value) -> CmdResult {
     }
     let preserve_fill_alpha = ps(p, "color").is_some_and(|hex| hex.trim().trim_start_matches('#').len() == 6);
     let style = ClassStyle { color: s.get_color(p, "color")?, outline: s.get_color(p, "outline")?, label, preserve_fill_alpha };
-    if style == ClassStyle::default() {
+    let create = match p.get("create") {
+        None => false,
+        Some(Value::Bool(create)) => *create,
+        Some(_) => return Err("create must be true or false".into()),
+    };
+    if style == ClassStyle::default() && !create {
         return Err("nothing to change: give a color, an outline or a label".into());
     }
     let id = s.layer_id(p)?;
     let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
     let g = l.geometry_type();
+    if create {
+        let ClassRef::Value(value) = &class else { return Err("create requires a class value".into()) };
+        let field = ps(p, "field").ok_or("create requires a field")?;
+        ensure_unique_class(l, field, value)?;
+    }
     let e = l.renderer.set_class_style(&class, &style, g)?;
     // A fill colour chosen while No Fill hides the fills is the one Restore Fill shows. The saved
     // opacities are only this class's while they still match the symbols, as Restore Fill needs.
