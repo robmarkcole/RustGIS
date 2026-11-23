@@ -83,6 +83,10 @@ pub(crate) fn sync(app: &mut RustGisApp) {
 pub(crate) fn open(app: &mut RustGisApp) -> Result<(), String> {
     sync(app);
     app.ui.open_right(RightPane::Annotation);
+    app.map.popup = None;
+    if app.session.tool == Tool::Explore {
+        app.run("tool.set", json!({"tool":"select"}))?;
+    }
     if !app.annotation.image_chosen
         && app.annotation.image.is_none()
         && let Some(id) = app.session.active_layer.filter(|id| app.session.map().layer(*id).is_some_and(|l| l.raster.is_some()))
@@ -242,6 +246,60 @@ pub(crate) fn select_layer(app: &mut RustGisApp, p: &Value) -> Result<(), String
     }
     app.run("layer.select", json!({"layer":id})).map(|_| ())
 }
+/// Annotation selection is scoped to its target layer. It selects ordinary polygons too,
+/// but only constructions already known to this session activate an exact-shape editor.
+pub(crate) fn click(app: &mut RustGisApp, c: rustgis_engine::geom::Coord, modifiers: egui::Modifiers) -> bool {
+    if app.ui.right != Some(RightPane::Annotation)
+        || !matches!(app.session.tool, Tool::Explore | Tool::Select)
+        || !app.session.active_layer.is_some_and(|id| polygon_layer(app, id))
+    {
+        return false;
+    }
+    app.map.popup = None;
+    if app.session.tool == Tool::Explore {
+        let _ = app.run("tool.set", json!({"tool":"select"}));
+    }
+    let hits = crate::boxedit::hits(app, c);
+    let current = app.session.active_layer.and_then(|id| {
+        let [row] = app.session.map().layer(id)?.selection.as_slice() else { return None };
+        Some((id, *row))
+    });
+    let index =
+        if modifiers.alt { current.and_then(|c| hits.iter().position(|h| *h == c)).map_or(0, |i| (i + 1) % hits.len().max(1)) } else { 0 };
+    if let Some(&(layer, row)) = hits.get(index) {
+        let mode = if modifiers.shift {
+            "add"
+        } else if modifiers.command {
+            "remove"
+        } else {
+            "new"
+        };
+        let _ = app.run("select.rows", json!({"layer":layer,"rows":[row],"mode":mode}));
+    } else if !modifiers.shift && !modifiers.command && app.session.map().selection_count() > 0 {
+        let _ = app.run("select.clear", json!({}));
+    }
+    if !modifiers.shift && !modifiers.command {
+        selected_tool(app);
+    }
+    true
+}
+pub(crate) fn selected_tool(app: &mut RustGisApp) {
+    if app.ui.right != Some(RightPane::Annotation) || !crate::boxedit::ready(app) {
+        return;
+    }
+    let Some(id) = app.session.active_layer else { return };
+    let Some([row]) = app.session.map().layer(id).map(|l| l.selection.as_slice()) else { return };
+    let tool = if app.session.box_spec(id, *row).is_some() {
+        Tool::RotatedBox
+    } else if app.session.circle_spec(id, *row).is_some() {
+        Tool::Circle
+    } else {
+        return;
+    };
+    if tool != app.session.tool {
+        let _ = app.run("tool.set", json!({"tool":tool.code()}));
+    }
+}
 pub(crate) fn grid_controls(app: &mut RustGisApp, ui: &mut egui::Ui) {
     sync(app);
     let mut image = app.annotation.image;
@@ -331,6 +389,20 @@ pub(crate) fn panel(app: &mut RustGisApp, ui: &mut egui::Ui) {
         let _ = app.run("edit.enable", json!({"on":enabled}));
     }
     crate::annotation_classes::panel(app, ui);
+    if ui.selectable_label(app.session.tool == Tool::Select, tl!("Select / Edit")).clicked() {
+        let _ = app.run("tool.set", json!({"tool":"select"}));
+        app.map.popup = None;
+    }
+    ui.small(tl!("Click an annotation to select it. Known circles and boxes show their editing handles."));
+    if let Some(id) = active
+        && let Some([row]) = app.session.map().layer(id).map(|l| l.selection.as_slice())
+        && app.session.box_spec(id, *row).is_none()
+        && app.session.circle_spec(id, *row).is_none()
+    {
+        ui.small(tl!(
+            "This is an ordinary polygon. To edit it as an exact shape, right-click it and choose Convert to…; otherwise use Edit Vertices."
+        ));
+    }
     let ready = crate::boxedit::ready(app) && drawing_frame(app).is_ok();
     ui.add_enabled_ui(ready, |ui| {
         ui.horizontal(|ui| {

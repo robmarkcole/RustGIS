@@ -212,6 +212,12 @@ Each new circle or rotated box captures that class when the drag starts;
 changing the default afterwards affects subsequent shapes. Other template defaults are kept.
 **No class default** leaves the class to the normal template/default rules.
 
+Opening Annotate from Explore starts in **Select / Edit** instead of opening feature-information popups.
+Click an annotation to select it; a circle or box constructed in this session automatically
+activates its editing handles. **Select / Edit** returns to selection without drawing new shapes.
+Reopened/imported polygons remain ordinary polygons: right-click and **Convert to…** to fit an
+exact circle or box, or use Edit Vertices. Selection never converts a polygon automatically.
+
 Select one annotation, choose the desired active class, then **Assign to selected annotation**.
 This edits only its class property, preserves its ID, geometry and constrained handles, and is
 undoable. Class defaults reset when changing target layer, project or map; a removed class field
