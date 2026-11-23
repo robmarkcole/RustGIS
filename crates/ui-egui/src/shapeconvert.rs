@@ -156,6 +156,7 @@ pub(crate) fn menu(app: &mut RustGisApp, ui: &mut egui::Ui) {
         let _ = app.run("ui.convertShape", json!({"layer":layer}));
         ui.close();
     }
+    crate::annotation_classes::menu(app, ui, target.layer, target.row);
 }
 pub(crate) fn landed(app: &mut RustGisApp, request: Option<u64>, result: crate::Landed) {
     if app.conversion.form.as_ref().is_none_or(|f| Some(f.request) != request || !f.pending) {

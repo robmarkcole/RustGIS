@@ -205,7 +205,9 @@ Choose **No image** to return explicitly to Web Mercator grid metres.
 EPSG coordinate system in a notice, while keeping the Annotate pane open.
 
 For multiclass annotation, choose an existing text **Class field**, or explicitly **Create class
-field** to add a text field named `class`. Choose an **Active class** or enter a new name and
+field** to add a text field named `class`. When choosing a target layer, a unique text field named
+`class` (ignoring case) is selected automatically. **No class field** remains an explicit opt-out
+while that target stays active; no class value is chosen automatically. Choose an **Active class** or enter a new name and
 click **Use class**. On desktop, creating the field runs in the background with progress and
 Cancel; wait for it before choosing a class. If cancelled, use **Retry class field creation**.
 Each new circle or rotated box captures that class when the drag starts;
@@ -222,6 +224,9 @@ Select one annotation, choose the desired active class, then **Assign to selecte
 This edits only its class property, preserves its ID, geometry and constrained handles, and is
 undoable. Class defaults reset when changing target layer, project or map; a removed class field
 must be restored or another field chosen before drawing with that default.
+Alternatively, right-click an annotation and choose **Change class** for a direct, undoable
+assignment from the same styled/recent classes. This changes only the clicked annotation and
+keeps the active class for new shapes. **Other class…** opens Annotate to enter another name.
 
 **Class colours…** opens the existing Symbology pane with **Unique Values** and the class field
 ready to apply. To include later values, reselect the same field in Symbology; this rebuilds its

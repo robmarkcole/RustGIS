@@ -38,11 +38,17 @@ pub(crate) fn sync(app: &mut RustGisApp) {
     let binding = binding(app);
     if app.annotation.classes.binding != binding {
         clear_refusal(app);
-        app.annotation.classes = State { binding, ..State::default() };
+        let field = target(app).and_then(|l| {
+            let mut matches = l.dataset.fields.iter().filter(|f| f.name.eq_ignore_ascii_case("class"));
+            let field = matches.next()?;
+            (field.ty == FieldType::Text && matches.next().is_none()).then(|| field.name.clone())
+        });
+        app.annotation.classes = State { binding, field, ..State::default() };
     } else if app.annotation.classes.refusal.is_some() && drawing_attributes(app).is_ok() {
         clear_refusal(app);
     }
 }
+
 pub(crate) fn refused(app: &mut RustGisApp, error: &str) {
     app.annotation.classes.refusal = Some(error.to_string());
 }
@@ -141,10 +147,14 @@ pub(crate) fn drawing_attributes(app: &RustGisApp) -> Result<Value, String> {
     attrs.insert(name.to_string(), json!(value));
     Ok(Value::Object(attrs))
 }
-pub(crate) fn assign(app: &mut RustGisApp) -> Result<(), String> {
+pub(crate) fn assign(app: &mut RustGisApp, p: &Value) -> Result<(), String> {
     sync(app);
     let name = field(app)?.to_string();
-    let value = app.annotation.classes.value.clone().ok_or_else(|| tl!("Choose an active class first.").to_string())?;
+    let value = match p.get("value") {
+        None => app.annotation.classes.value.clone().ok_or_else(|| tl!("Choose an active class first.").to_string())?,
+        Some(Value::String(value)) if !value.trim().is_empty() => value.clone(),
+        _ => return Err(tl!("Choose a non-empty class name.").into()),
+    };
     let l = target(app).ok_or_else(|| tl!("Choose a loaded editable polygon layer.").to_string())?;
     let [row] = l.selection.as_slice() else { return Err(tl!("Select exactly one annotation to change its class.").into()) };
     let fi = l.dataset.fields.iter().position(|f| f.name == name).ok_or_else(|| tl!("Choose a class field first.").to_string())?;
@@ -162,6 +172,71 @@ pub(crate) fn colours(app: &mut RustGisApp) -> Result<(), String> {
     app.ui.symbology_pending = if styled { None } else { Some(crate::PendingUniqueSymbology::new(&app.session, l, name)) };
     app.ui.open_right(RightPane::Symbology);
     Ok(())
+}
+
+fn choices(app: &RustGisApp) -> (std::collections::BTreeMap<String, Option<egui::Color32>>, bool) {
+    // Renderer classes and recent choices are bounded suggestions, never a per-frame row scan.
+    let mut choices = std::collections::BTreeMap::new();
+    let l = target(app);
+    let mut more = false;
+    if let Some(Renderer::Unique { field, classes, expression: None, .. }) = l.map(|l| &l.renderer)
+        && Some(field) == app.annotation.classes.field.as_ref()
+    {
+        more = classes.len() > 64;
+        for (name, symbol) in classes.iter().take(64) {
+            let c = symbol.fill;
+            choices.entry(name.clone()).or_insert(Some(egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), c.a())));
+        }
+    }
+    for name in &app.annotation.classes.recent {
+        choices.entry(name.clone()).or_insert(None);
+    }
+    (choices, more)
+}
+
+/// Called only for the right-click target validated by the shared polygon menu.
+pub(crate) fn menu(app: &mut RustGisApp, ui: &mut egui::Ui, layer: u32, row: usize) {
+    sync(app);
+    if app.session.active_layer != Some(layer) || target(app).is_none_or(|l| l.selection != [row]) {
+        return;
+    }
+    let name = match field(app) {
+        Ok(name) => name.to_string(),
+        Err(_) => {
+            ui.add_enabled(false, egui::Button::new(tl!("Change class")))
+                .on_disabled_hover_text(tl!("Choose a text class field in Annotate first."));
+            return;
+        }
+    };
+    let current = target(app).and_then(|l| {
+        let fi = l.dataset.fields.iter().position(|f| f.name == name)?;
+        l.dataset.features.row(row).map(|feature| feature.value(fi).to_string())
+    });
+    let (choices, more) = choices(app);
+    ui.menu_button(tl!("Change class"), |ui| {
+        for (value, color) in &choices {
+            if value.trim().is_empty() {
+                continue;
+            }
+            ui.horizontal(|ui| {
+                if let Some(color) = color {
+                    ui.colored_label(*color, "●");
+                }
+                if ui.selectable_label(current.as_ref() == Some(value), value).clicked() {
+                    let _ = app.run("ui.annotationAssignClass", json!({"value":value}));
+                    ui.close();
+                }
+            });
+        }
+        if more {
+            ui.small(tl!("Showing the first 64 styled classes and recent choices."));
+        }
+        ui.separator();
+        if ui.button(tl!("Other class…")).clicked() {
+            let _ = crate::annotation::open(app);
+            ui.close();
+        }
+    });
 }
 
 pub(crate) fn panel(app: &mut RustGisApp, ui: &mut egui::Ui) {
@@ -211,28 +286,14 @@ pub(crate) fn panel(app: &mut RustGisApp, ui: &mut egui::Ui) {
         ui.separator();
         return;
     }
-    // Renderer classes and recent choices are bounded suggestions, never a per-frame row scan.
-    let mut choices = std::collections::BTreeMap::new();
-    let l = target(app);
-    let mut more = false;
-    if let Some(Renderer::Unique { field, classes, expression: None, .. }) = l.map(|l| &l.renderer)
-        && Some(field) == app.annotation.classes.field.as_ref()
-    {
-        more = classes.len() > 64;
-        for (name, symbol) in classes.iter().take(64) {
-            choices.entry(name.clone()).or_insert(Some(symbol.fill));
-        }
-    }
-    for name in &app.annotation.classes.recent {
-        choices.entry(name.clone()).or_insert(None);
-    }
+    let (choices, more) = choices(app);
     let mut value = app.annotation.classes.value.clone();
     egui::ComboBox::from_label(tl!("Active class")).selected_text(value.as_deref().unwrap_or(tl!("No class default"))).show_ui(ui, |ui| {
         ui.selectable_value(&mut value, None, tl!("No class default"));
         for (name, color) in &choices {
             ui.horizontal(|ui| {
                 if let Some(c) = color {
-                    ui.colored_label(egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), c.a()), "●");
+                    ui.colored_label(*c, "●");
                 }
                 ui.selectable_value(&mut value, Some(name.clone()), name);
             });
@@ -272,4 +333,135 @@ pub(crate) fn panel(app: &mut RustGisApp, ui: &mut egui::Ui) {
     }
     ui.small(tl!("New shapes use the active class; no default keeps template values. Class colours opens Unique Values in Symbology; apply it to include new values. GeoJSON keeps class values, not these colours."));
     ui.separator();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustgis_engine::{
+        Project, Session,
+        data::{Dataset, Field},
+    };
+
+    #[test]
+    fn right_click_changes_only_the_clicked_shape_class_and_preserves_the_drawing_default() {
+        use egui_kittest::kittest::Queryable;
+        use rustgis_engine::{Tool, box_edit::Frame, data::Value as Cell, geom::Coord};
+        for (tool, row, center, value) in [(Tool::Circle, 0, [-100000., 0.], "truck"), (Tool::RotatedBox, 1, [100000., 0.], "car")] {
+            let mut session = Session::new(Project::default());
+            session.active_layer = Some(session.map_mut().add_dataset(Dataset::new(
+                "Annotations",
+                GeometryType::Polygon,
+                vec![Field::new("class", FieldType::Text), Field::new("notes", FieldType::Text)],
+            )));
+            session.map_mut().camera.res = 1000.;
+            session.map_mut().camera.center = Coord::new(0., 0.);
+            let mut app = RustGisApp::new(session);
+            app.run("edit.enable", json!({"on":true})).unwrap();
+            app.run(
+                "edit.addCircle",
+                json!({"circle":{"center":[-100000.,0.],"radius":20000.,"tolerance":100.},"attributes":{"class":"car","notes":"keep"}}),
+            )
+            .unwrap();
+            app.run(
+                "edit.addBox",
+                json!({"box":{"center":[100000.,0.],"width":40000.,"height":40000.,"angle":20.},"attributes":{"class":"truck"}}),
+            )
+            .unwrap();
+            app.run("layer.symbology", json!({"type":"unique","field":"class"})).unwrap();
+            if row == 0 {
+                app.run("ui.annotationClass", json!({"value":"car"})).unwrap();
+            }
+            app.run("tool.set", json!({"tool":tool.code()})).unwrap();
+            let layer = app.session.active_layer.unwrap();
+            app.run("select.rows", json!({"rows":[1-row]})).unwrap();
+            let before = app.session.map().layer(layer).unwrap().dataset.clone();
+            let circle = app.session.circle_spec(layer, 0).unwrap();
+            let bbox = app.session.box_spec(layer, 1).unwrap();
+            let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1000., 800.)).with_max_steps(1000).build_ui_state(
+                |ui, app: &mut RustGisApp| {
+                    let ctx = ui.ctx().clone();
+                    app.logic(&ctx);
+                    app.ui(ui);
+                },
+                app,
+            );
+            for _ in 0..6 {
+                h.step();
+            }
+            let rect = h.state().map.view_rect.unwrap().0;
+            let at = crate::mapview::lonlat_to_screen(h.state(), rect, Frame::default().to_lonlat(center).unwrap()).unwrap();
+            h.event(egui::Event::PointerMoved(at));
+            for pressed in [true, false] {
+                h.event(egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Secondary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                });
+                h.step();
+            }
+            h.run();
+            assert_eq!(
+                h.state().session.map().layer(layer).unwrap().selection,
+                vec![row],
+                "right-click targets the clicked object, not the old selection"
+            );
+            let depth = h.state().session.undo_depth();
+            h.get_by_label("Change class").click();
+            h.run();
+            h.get_by_role_and_label(egui::accesskit::Role::Button, value).click();
+            h.run();
+            assert!(h.query_by_label("Change class").is_none(), "applying a class closes the context menu");
+            let data = &h.state().session.map().layer(layer).unwrap().dataset;
+            assert_eq!(data.value(row, 0), &Cell::Text(value.into()));
+            assert_eq!(data.features[1 - row], before.features[1 - row]);
+            assert_eq!(data.features[row].id, before.features[row].id);
+            assert_eq!(data.features[row].geometry, before.features[row].geometry);
+            assert_eq!(data.value(row, 1), before.value(row, 1));
+            assert_eq!(h.state().session.circle_spec(layer, 0), Some(circle));
+            assert_eq!(h.state().session.box_spec(layer, 1), Some(bbox));
+            assert_eq!(h.state().annotation.classes.value.as_deref(), if row == 0 { Some("car") } else { None });
+            assert_eq!(h.state().session.undo_depth(), depth + 1);
+            h.state_mut().run("edit.undo", json!({})).unwrap();
+            assert_eq!(h.state().session.map().layer(layer).unwrap().dataset, before);
+            h.state_mut().run("edit.redo", json!({})).unwrap();
+            assert_eq!(h.state().session.map().layer(layer).unwrap().dataset.value(row, 0), &Cell::Text(value.into()));
+        }
+    }
+
+    #[test]
+    fn class_field_defaults_are_unambiguous_optional_and_never_assign_a_value() {
+        for (fields, expected) in [
+            (vec![Field::new("class", FieldType::Text)], Some("class")),
+            (vec![Field::new("Class", FieldType::Text)], Some("Class")),
+            (vec![Field::new("name", FieldType::Text)], None),
+            (vec![Field::new("class", FieldType::Integer)], None),
+            (vec![Field::new("class", FieldType::Text), Field::new("Class", FieldType::Text)], None),
+            (vec![Field::new("class", FieldType::Text), Field::new("Class", FieldType::Integer)], None),
+        ] {
+            let mut session = Session::new(Project::default());
+            session.active_layer = Some(session.map_mut().add_dataset(Dataset::new("Annotations", GeometryType::Polygon, fields)));
+            let mut app = RustGisApp::new(session);
+            let before = serde_json::to_value(&app.session.project).unwrap();
+            let depth = app.session.undo_depth();
+            sync(&mut app);
+            assert_eq!(app.annotation.classes.field.as_deref(), expected);
+            assert_eq!(drawing_attributes(&app).unwrap(), json!({}), "the field default never guesses a class value");
+            assert_eq!(serde_json::to_value(&app.session.project).unwrap(), before);
+            assert_eq!(app.session.undo_depth(), depth);
+            select_field(&mut app, &json!({"field":null})).unwrap();
+            for _ in 0..3 {
+                sync(&mut app);
+            }
+            assert!(app.annotation.classes.field.is_none(), "an explicit opt-out survives subsequent frames");
+            if expected.is_some() {
+                let layer = app.session.active_layer.unwrap();
+                let other = app.session.map_mut().add_dataset(Dataset::new("Other", GeometryType::Polygon, vec![]));
+                app.run("layer.select", json!({"layer":other})).unwrap();
+                app.run("layer.select", json!({"layer":layer})).unwrap();
+                assert_eq!(app.annotation.classes.field.as_deref(), expected, "a newly chosen target gets its own default");
+            }
+        }
+    }
 }

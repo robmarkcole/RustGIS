@@ -3641,7 +3641,7 @@ impl RustGisApp {
             "ui.annotationClassField" => annotation_classes::select_field(self, p)?,
             "ui.annotationClass" => annotation_classes::select_class(self, p)?,
             "ui.annotationCreateClassField" => annotation_classes::create_field(self)?,
-            "ui.annotationAssignClass" => annotation_classes::assign(self)?,
+            "ui.annotationAssignClass" => annotation_classes::assign(self, p)?,
             "ui.annotationClassColours" => annotation_classes::colours(self)?,
             "ui.pane.editing" => toggle_right(&mut self.ui, RightPane::Editing),
             "ui.pane.design" => toggle_right(&mut self.ui, RightPane::Design),
