@@ -15,7 +15,7 @@ Formats](data-formats.md).
 | FlatGeobuf (`.fgb`) | Yes | Yes (`share.exportLayer`) |
 | KML/KMZ (with their styles), GPX | Yes | Yes |
 | Spreadsheets (`.xlsx`, `.xls`, `.ods`), GeoRSS feeds, LandXML, encoded polylines | Yes | No |
-| GML, MapInfo MIF/MID, OpenStreetMap PBF, TopoJSON, CityJSON (footprints with heights), AutoCAD DXF (ASCII) | Yes | No |
+| GML, MapInfo MIF/MID, OpenStreetMap PBF, TopoJSON, CityJSON and CityGML (footprints with heights), AutoCAD DXF (ASCII) | Yes | No |
 | LiDAR point clouds: LAS, LAZ, COPC (an evenly spread sample) | Yes | No |
 | Geotagged photos (JPEG with EXIF GPS): points with their thumbnails | Yes | No |
 | Esri File Geodatabase (`.gdb` folder; 3D multipatches as footprints) | Yes (desktop) | No |
@@ -139,7 +139,9 @@ name, which stands for the first table of that name. An id given as a number is 
 a name. The Tools pane and Geocode Addresses send the id of the table picked; a tool's run keeps
 the table's name beside it (`input_name`). The **XY Table To Point** tool
 ([Geoprocessing](analysis.md), and a table's right-click menu) makes points of a table already in
-the project, from two fields of coordinates and their coordinate system. In a text field a single comma is the decimal separator
+the project, from two fields of coordinates and their coordinate system. The points keep the table's
+numbers, held in that system, which exports use by default; a row whose numbers have no place in
+longitude/latitude gets no point. In a text field a single comma is the decimal separator
 (`1,234` is 1.234); thousands separators are not read.
 
 **Use a polygon's published interior point.** To place TIGER interior points, run **XY Table
@@ -331,7 +333,8 @@ or the folder holding them in `RUSTGIS_GDAL_BIN`; GDAL 3.8 or later), the deskto
 the vector formats GDAL reads: DWG, MapInfo TAB, OpenStreetMap XML, File Geodatabases RustGIS
 can't read itself (compressed ones, or ones with raster fields)
 and more. RustGIS doesn't link to GDAL: each layer is converted once, by `ogr2ogr`, into a
-FlatGeobuf with a spatial index in WGS 84 (GDAL reprojects it), kept in the cache folder
+FlatGeobuf with a spatial index in the layer's own coordinate system (in WGS 84, with a notice,
+when RustGIS can't read that system), kept in the cache folder
 (`~/.cache/rustgis/gdal` on Linux, `~/Library/Caches/RustGIS/gdal` on macOS,
 `%LOCALAPPDATA%\RustGIS\cache\gdal` on Windows, or `RUSTGIS_GDAL_CACHE`). Adding the file again
 reuses the conversion and its layer listing until the file's path, size or modification time
@@ -523,6 +526,8 @@ back to it. In **Home › Add › Add Data › Database…**, give a PostgreSQL 
   A table whose geometries are of several types loads each type as its own layer (points on top), each up to that many.
   A **condition** (an SQL expression on its columns, such as `population > 10000`) loads only the
   rows it keeps. The layer is an ordinary layer in memory, so every editing tool works on it.
+  It keeps the table's own coordinates when RustGIS knows its SRID, and edits are written back
+  in that SRID; a row whose geometry isn't edited keeps it as the table holds it.
 
 - **Edit › Manage Edits › Save to PostGIS…** (`pg.saveEdits`), there while a layer is loaded for
   editing, shows how many of the layer's rows are new, changed and deleted, and writes them to its
@@ -569,7 +574,8 @@ On the desktop, **Home › Add › Add Data › Edit GeoPackage Table…** (`gpk
 feature table of an existing local `.gpkg` for editing. Choose its table with **List Tables**
 when the file has several. The table needs one `INTEGER PRIMARY KEY`. At most 100,000 rows
 are loaded; **Most rows** can lower that limit. Whole numbers may use comma-grouped thousands
-(for example, `1,000`); fractional values are rejected. RustGIS does not
+(for example, `1,000`); fractional values are rejected. The layer keeps the table's own
+coordinates (its `srs_id`), and edits are written back in them. RustGIS does not
 directly edit rows outside that load, including rows with unreadable geometry. File-owned
 triggers can change other rows.
 
@@ -1780,8 +1786,10 @@ rotation, pixel- or node-registered) reads no coordinates, and the transform win
 the store also holds. It is the variable's own, or that of the nearest group above it (up to 64
 levels up) that gives one, taken with that group's `spatial:shape`, which must be the variable's map's. Its map
 dimensions are those `spatial:dimensions` names. `proj:code`, `proj:wkt2` or `proj:epsg` give
-the coordinate system, after the variable's own attributes and its grid mapping, and before a
-`spatial_ref` or `crs` array beside it. A variable opened by its own address doesn't see its
+the coordinate system. The first of these that gives one is used: the variable's own attributes
+(its own `proj:` keys among them), then its grid mapping's, then the `proj:wkt2`, `proj:code` or
+`proj:epsg` of the nearest group above it that sets any of them (only when the variable sets none:
+a value that can't be read, on the variable or a group, isn't passed over for one further up), then a `spatial_ref` or `crs` array beside it. A variable opened by its own address doesn't see its
 groups' attributes: open the store's address with `"variable"` instead.
 A web store whose root lists no arrays (a Zarr 3 root `zarr.json` with no consolidated metadata,
 or a Zarr 2 `.zgroup` with no `.zmetadata`) needs `"variable"`: its array, the groups above it,

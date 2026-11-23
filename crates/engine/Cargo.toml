@@ -17,6 +17,8 @@ rustgis-render = { workspace = true }
 tiny-skia = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# The keys a project file has that this version doesn't read, to say what opening it left out.
+serde_ignored = "0.1"
 log = { workspace = true }
 web-time = { workspace = true }
 base64 = { workspace = true }
@@ -34,10 +36,15 @@ geolibre = ["dep:rustgis-geolibre"]
 pdf = ["rustgis-data/pdf"]
 # Existing in-tree Wasm fixtures for adapter tests; no guest or production interface change.
 testing = ["rustgis-plugins/testing"]
+# The check that a command declared as not mutating leaves the layers alone, in the integration
+# tests too (they link the library without `cfg(test)`; AGENTS.md). Never in a release.
+declaration-check = []
 # The JSON Schema of the project file (`cargo xtask schema`).
 schema = ["dep:schemars", "rustgis-data/schema", "rustgis-geom/schema"]
 
 [dev-dependencies]
+# The declaration check in the integration tests.
+rustgis-engine = { path = ".", features = ["declaration-check"] }
 # Reading back the PDFs layouts export (#2336).
 rustgis-data = { workspace = true, features = ["pdf"] }
 miniz_oxide = { workspace = true }
@@ -49,15 +56,16 @@ rustgis-analysis = { workspace = true, features = ["testing"] }
 tiny-skia = { workspace = true }
 # Parsing the addresses commands ask for in tests.
 url = { workspace = true }
-# Generated layers for the never-silent round trip (tests/never_silent_roundtrip.rs).
+# Generated layers for the never-silent round trip (tests/integration/never_silent_roundtrip.rs).
 proptest = { workspace = true }
 
-# Time slider animations as GIFs (exported by the desktop app only).
+# Random field-package identities; in the browser through its JavaScript crypto.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.4", features = ["wasm_js"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 getrandom = "0.4"
+# Time slider animations as GIFs (exported by the desktop app only).
 image = { workspace = true, features = ["gif"] }
 
 # The live PostGIS tests make their own tables, and change rows as someone else would.

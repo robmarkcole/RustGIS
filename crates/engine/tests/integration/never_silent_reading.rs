@@ -12,7 +12,7 @@
 //! their own test, `never_silent_roundtrip.rs`.
 //!
 //! The table includes text, CityJSON, CityGML, KMZ, GeoPackage, FlatGeobuf, GeoParquet, FileGDB,
-//! Shapefile, XLSX, ODS, XLS, XLSB and OSM PBF. More formats and loss kinds remain to add (ROADMAP.md); one loss
+//! Shapefile, XLSX, ODS, XLS, XLSB, OSM PBF and feature-service PBF. More formats and loss kinds remain to add (ROADMAP.md); one loss
 //! does not certify a reader.
 use rustgis_engine::data::loss::LossCode;
 use rustgis_engine::{Project, Session};
@@ -32,6 +32,53 @@ enum Expect {
 }
 use Expect::{Imported, Said, Silent};
 
+/// Independent dBASE III table: one text field and one date, with no encoding ambiguity.
+/// Only the date changes: a valid February day or a nonexistent one, read as Null.
+fn dbf_date(invalid: bool) -> Vec<u8> {
+    let mut bytes = vec![0u8; 97];
+    bytes[..12].copy_from_slice(&[3, 126, 11, 22, 1, 0, 0, 0, 97, 0, 13, 0]);
+    bytes[29] = 3; // Windows-1252 language driver; all text is ASCII.
+    for (at, name, kind, len) in [(32, "name", b'C', 4), (64, "day", b'D', 8)] {
+        bytes[at..at + name.len()].copy_from_slice(name.as_bytes());
+        bytes[at + 11] = kind;
+        bytes[at + 16] = len;
+    }
+    bytes[96] = 13;
+    bytes.extend_from_slice(b" kept");
+    bytes.extend_from_slice(if invalid { b"20260230" } else { b"20260228" });
+    bytes.push(26);
+    bytes
+}
+
+/// Checks the complete retained schema and row of the standalone date pair.
+fn check_dbf_date(ds: &rustgis_engine::data::Dataset, invalid: bool) -> std::io::Result<()> {
+    use rustgis_engine::data::{Field, FieldType, Value};
+    let date = if invalid { Value::Null } else { Value::parse_file("2026-02-28", FieldType::Date) };
+    if (!invalid && !matches!(&date, Value::Date(_)))
+        || ds.fields != [Field::new("name", FieldType::Text), Field::new("day", FieldType::Date)]
+        || ds.features.len() != 1
+        || ds.features[0].geometry.is_some()
+        || ds.features[0].attrs != [Value::Text("kept".into()), date]
+    {
+        return Err(std::io::Error::other(format!("standalone DBF date retained unexpected data: {ds:?}")));
+    }
+    Ok(())
+}
+
+/// The extra-cell pair preserves both named coordinates as integer attributes and point geometry.
+fn check_csv_extra(ds: &rustgis_engine::data::Dataset) -> std::io::Result<()> {
+    use rustgis_engine::data::{Field, FieldType, Geometry, Value};
+    use rustgis_engine::geom::Coord;
+    if ds.fields != [Field::new("lon", FieldType::Integer), Field::new("lat", FieldType::Integer)]
+        || ds.features.len() != 1
+        || ds.features[0].geometry != Some(Geometry::Point(Coord::new(1.0, 2.0)))
+        || ds.features[0].attrs != [Value::Int(1), Value::Int(2)]
+    {
+        return Err(std::io::Error::other(format!("CSV extra-cell pair retained unexpected data: {ds:?}")));
+    }
+    Ok(())
+}
+
 /// A clean file and the same file with a loss in it.
 struct Case {
     /// The reader and the loss, to name a failure.
@@ -43,10 +90,20 @@ struct Case {
     /// Files beside the clean and lossy inputs (binary indexes can differ).
     beside: [Vec<(&'static str, Vec<u8>)>; 2],
     expect: Expect,
+    /// Additional exact notices for this case's lossy input, in report order before its primary notice.
+    extra_notices: &'static [&'static str],
 }
 
 fn case(name: &'static str, file: &'static str, clean: impl AsRef<[u8]>, lossy: impl AsRef<[u8]>, expect: Expect) -> Case {
-    Case { name, file, clean: clean.as_ref().to_vec(), lossy: lossy.as_ref().to_vec(), beside: [Vec::new(), Vec::new()], expect }
+    Case {
+        name,
+        file,
+        clean: clean.as_ref().to_vec(),
+        lossy: lossy.as_ref().to_vec(),
+        beside: [Vec::new(), Vec::new()],
+        expect,
+        extra_notices: &[],
+    }
 }
 
 /// A GeoJSON feature collection of these geometries.
@@ -88,6 +145,11 @@ fn dxf(entities: &[&str]) -> String {
     let words: Vec<&str> =
         ["0 SECTION 2 ENTITIES"].iter().chain(entities).chain(&["0 ENDSEC 0 EOF"]).flat_map(|e| e.split_whitespace()).collect();
     words.join("\n") + "\n"
+}
+
+/// The middle vertex alone differs between the clean and lossy POLYLINE pair.
+fn dxf_polyline(middle: &str) -> String {
+    format!("0 POLYLINE 8 0 66 1 70 0 0 VERTEX 8 0 10 0 20 0 0 VERTEX 8 0 {middle} 0 VERTEX 8 0 10 2 20 2 0 SEQEND")
 }
 
 /// A MapInfo MIF file of these objects, with one integer column.
@@ -149,8 +211,10 @@ fn cases(fixture_dir: &std::path::Path) -> Vec<Case> {
             "<georss:where><gml:Polygon><gml:exterior><gml:LinearRing><gml:posList>0 0 0 4 4 4 0 0</gml:posList></gml:LinearRing></gml:exterior><gml:interior><gml:LinearRing><gml:posList>{hole}</gml:posList></gml:LinearRing></gml:interior></gml:Polygon></georss:where>"
         )
     };
-    let polyline =
-        |middle: &str| format!("0 POLYLINE 8 0 66 1 70 0 0 VERTEX 8 0 10 0 20 0 0 VERTEX 8 0 {middle} 0 VERTEX 8 0 10 2 20 2 0 SEQEND");
+    let track = |coords: &[&str]| {
+        let body: String = coords.iter().map(|c| format!("<gx:coord>{c}</gx:coord>")).collect();
+        format!(r#"<gx:Track xmlns:gx="http://www.google.com/kml/ext/2.2">{body}</gx:Track>"#)
+    };
     let parcel = r#"<Parcels><Parcel name="Lot"><CoordGeom><Line><Start>0 0</Start><End>0 10</End></Line><Line><Start>0 10</Start><End>10 10</End></Line><Line><Start>10 10</Start><End>0 0</End></Line></CoordGeom></Parcel></Parcels>"#;
     let cg_points = |second: &str| format!(r#"<CgPoints><CgPoint name="a">0 0</CgPoint><CgPoint name="b">{second}</CgPoint></CgPoints>"#);
 
@@ -208,14 +272,21 @@ fn cases(fixture_dir: &std::path::Path) -> Vec<Case> {
             "a.csv",
             "wkt,id\n\"GEOMETRYCOLLECTION(POINT(1 2))\",1\n",
             "wkt,id\n\"GEOMETRYCOLLECTION(POINT(1 2),POINT(3 4))\",1\n",
-            Silent("only the collection's first member is kept"),
+            Imported("1 WKT value in 'wkt' lost later non-empty geometry-collection members; only the first non-empty member is kept"),
         ),
         case(
             "CSV: cells past the header",
             "a.csv",
             "lon,lat\n1,2\n",
             "lon,lat\n1,2,lost\n",
-            Silent("a row's cells beyond the header's columns are left out"),
+            Imported("1 cell past the header's 2 columns was omitted in 1 row"),
+        ),
+        case(
+            "Standalone DBF: an invalid date",
+            "a.dbf",
+            dbf_date(false),
+            dbf_date(true),
+            Imported("a: 1 value isn't a date and was read as empty, in 'day'"),
         ),
         // KML.
         case(
@@ -237,15 +308,18 @@ fn cases(fixture_dir: &std::path::Path) -> Vec<Case> {
             "a.kml",
             kml(&["<LineString><coordinates>0,0 1,1 2,2</coordinates></LineString>"]),
             kml(&["<LineString><coordinates>0,0 x,1 2,2</coordinates></LineString>"]),
-            Silent("the coordinate is skipped and the line drawn without it"),
+            Imported("1 unreadable KML coordinate tuple was left out"),
         ),
-        case(
-            "KML: an unreadable hole",
-            "a.kml",
-            kml(&[&kml_polygon("1,1 2,1 2,2 1,1")]),
-            kml(&[&kml_polygon("1,1 x,y")]),
-            Silent("the hole is left out of the polygon"),
-        ),
+        Case {
+            extra_notices: &["a: 1 unreadable KML coordinate tuple was left out"],
+            ..case(
+                "KML: an unreadable hole",
+                "a.kml",
+                kml(&[&kml_polygon("1,1 2,1 2,2 1,1")]),
+                kml(&[&kml_polygon("1,1 x,y")]),
+                Imported("1 unreadable KML polygon hole was left out"),
+            )
+        },
         case(
             "KML: an unreadable part",
             "a.kml",
@@ -255,14 +329,39 @@ fn cases(fixture_dir: &std::path::Path) -> Vec<Case> {
             kml(&[
                 "<MultiGeometry><Point><coordinates>1,1</coordinates></Point><LineString><coordinates>0,0</coordinates></LineString></MultiGeometry>",
             ]),
-            Silent("a line of one point is left out of the placemark"),
+            Imported("1 KML line part with fewer than two usable coordinates was left out"),
         ),
         case(
             "KML: a point with more than one coordinate",
             "a.kml",
             kml(&["<Point><coordinates>1,1</coordinates></Point>"]),
             kml(&["<Point><coordinates>1,1 2,2</coordinates></Point>"]),
-            Silent("only the first coordinate is kept"),
+            Imported("1 excess KML Point coordinate tuple was left out"),
+        ),
+        case(
+            "KML: a polygon without a usable outer ring",
+            "a.kml",
+            kml(&[
+                "<MultiGeometry><Point><coordinates>1,2</coordinates></Point><Polygon><outerBoundaryIs><LinearRing><coordinates>0,0 4,0 4,4</coordinates></LinearRing></outerBoundaryIs></Polygon></MultiGeometry>",
+            ]),
+            kml(&[
+                "<MultiGeometry><Point><coordinates>1,2</coordinates></Point><Polygon><outerBoundaryIs><LinearRing><coordinates>0,0</coordinates></LinearRing></outerBoundaryIs></Polygon></MultiGeometry>",
+            ]),
+            Imported("1 KML polygon without a usable outer ring was left out"),
+        ),
+        case(
+            "KML: an unreadable gx:Track coordinate",
+            "a.kml",
+            kml(&[&track(&["0 0", "1 1", "2 2"])]),
+            kml(&[&track(&["0 0", "bad 1", "2 2"])]),
+            Imported("1 unreadable KML coordinate tuple was left out"),
+        ),
+        case(
+            "KML: a short gx:Track",
+            "a.kml",
+            kml(&[&format!("<MultiGeometry><Point><coordinates>1,2</coordinates></Point>{}</MultiGeometry>", track(&["0 0", "1 1"]))]),
+            kml(&[&format!("<MultiGeometry><Point><coordinates>1,2</coordinates></Point>{}</MultiGeometry>", track(&["0 0"]))]),
+            Imported("1 KML line part with fewer than two usable coordinates was left out"),
         ),
         // GPX.
         case(
@@ -270,7 +369,7 @@ fn cases(fixture_dir: &std::path::Path) -> Vec<Case> {
             "a.gpx",
             gpx(r#"<wpt lat="1" lon="1"/><wpt lat="2" lon="2"/>"#),
             gpx(r#"<wpt lat="1" lon="1"/><wpt lat="91" lon="2"/>"#),
-            Said("without usable coordinates"),
+            Said("without usable geometry"),
         ),
         case(
             "GPX: a track segment of one point",
@@ -279,7 +378,22 @@ fn cases(fixture_dir: &std::path::Path) -> Vec<Case> {
                 r#"<trk><trkseg><trkpt lat="1" lon="1"/><trkpt lat="2" lon="2"/></trkseg><trkseg><trkpt lat="3" lon="3"/><trkpt lat="4" lon="4"/></trkseg></trk>"#,
             ),
             gpx(r#"<trk><trkseg><trkpt lat="1" lon="1"/><trkpt lat="2" lon="2"/></trkseg><trkseg><trkpt lat="3" lon="3"/></trkseg></trk>"#),
-            Silent("the segment is left out of the track's line"),
+            Imported("1 GPX track segment with fewer than two usable points was left out of tracks; its point remains in track points"),
+        ),
+        // Feature-service PBF has a distinct sniffed parser from OSM PBF.
+        case(
+            "feature-service PBF: a height",
+            "a.feature.pbf",
+            include_bytes!("../../testdata/reading-losses/feature-xy.pbf"),
+            include_bytes!("../../testdata/reading-losses/feature-xyz.pbf"),
+            Imported("1 feature had Z or M values"),
+        ),
+        case(
+            "feature-service PBF: a measure",
+            "a.feature.pbf",
+            include_bytes!("../../testdata/reading-losses/feature-xy.pbf"),
+            include_bytes!("../../testdata/reading-losses/feature-xym.pbf"),
+            Imported("1 feature had Z or M values"),
         ),
         // OSM PBF: keep the outer polygon while one inner member is lost.
         case(
@@ -287,28 +401,28 @@ fn cases(fixture_dir: &std::path::Path) -> Vec<Case> {
             "a.osm.pbf",
             include_bytes!("../../testdata/reading-losses/hole-clean.osm.pbf"),
             include_bytes!("../../testdata/reading-losses/hole-missing-member.osm.pbf"),
-            Silent("the hole whose member way the file does not hold is left out"),
+            Imported("1 OSM relation member way was omitted because it is unavailable"),
         ),
         case(
             "OSM PBF: a missing inner node",
             "a.osm.pbf",
             include_bytes!("../../testdata/reading-losses/hole-clean.osm.pbf"),
             include_bytes!("../../testdata/reading-losses/hole-missing-node.osm.pbf"),
-            Silent("the hole whose member way refers to a missing node is left out"),
+            Imported("1 OSM relation ring was omitted because its node coordinates are unavailable"),
         ),
         case(
             "OSM PBF: an unclosed inner ring",
             "a.osm.pbf",
             include_bytes!("../../testdata/reading-losses/hole-clean.osm.pbf"),
             include_bytes!("../../testdata/reading-losses/hole-unclosed.osm.pbf"),
-            Silent("the inner member way that does not close is left out"),
+            Imported("1 OSM relation member way was omitted because it does not join into a closed ring of at least four coordinates"),
         ),
         case(
             "OSM PBF: an inner ring outside its outer",
             "a.osm.pbf",
             include_bytes!("../../testdata/reading-losses/hole-clean.osm.pbf"),
             include_bytes!("../../testdata/reading-losses/hole-outside.osm.pbf"),
-            Silent("the inner ring outside every outer ring is left out"),
+            Imported("1 OSM inner ring was omitted because no containing outer ring was found"),
         ),
         // GML.
         case(
@@ -340,7 +454,7 @@ fn cases(fixture_dir: &std::path::Path) -> Vec<Case> {
             "a.rss",
             georss(&["<georss:point>45 -71</georss:point>"]),
             georss(&["<georss:point>45 -71 46 -72</georss:point>"]),
-            Silent("only the first pair is kept"),
+            Imported("1 excess GeoRSS Point coordinate pair was left out"),
         ),
         // DXF.
         case(
@@ -355,14 +469,14 @@ fn cases(fixture_dir: &std::path::Path) -> Vec<Case> {
             "a.dxf",
             dxf(&["0 LINE 8 0 10 0 20 0 30 5 11 1 21 1 31 5"]),
             dxf(&["0 LINE 8 0 10 0 20 0 30 5 11 1 21 1 31 9"]),
-            Silent("one elevation per entity is kept, the first vertex's"),
+            Imported("1 feature lost varying Z coordinates; only the elevation attribute is kept"),
         ),
         case(
             "DXF: an unreadable polyline vertex",
             "a.dxf",
-            dxf(&[&polyline("10 1 20 1")]),
-            dxf(&[&polyline("10 1")]),
-            Silent("the vertex is skipped and the line drawn without it"),
+            dxf(&[&dxf_polyline("10 1 20 1")]),
+            dxf(&[&dxf_polyline("10 1")]),
+            Imported("1 unreadable POLYLINE vertex was left out of its line"),
         ),
         // LandXML.
         case(
@@ -377,7 +491,7 @@ fn cases(fixture_dir: &std::path::Path) -> Vec<Case> {
             "a.xml",
             landxml(&format!("{}{parcel}", cg_points("1 1"))),
             landxml(&format!(r#"{}<Parcels><Parcel name="Lot"/></Parcels>"#, cg_points("1 1"))),
-            Silent("the parcel is left out"),
+            Imported("1 LandXML parcel without CoordGeom was left out"),
         ),
         // Shapefile. 臺北101 as UTF-8, and in Big5, which isn't UTF-8.
         case(
@@ -402,14 +516,14 @@ fn cases(fixture_dir: &std::path::Path) -> Vec<Case> {
             "a.xlsx",
             include_bytes!("../../testdata/reading-losses/book-clean.xlsx"),
             include_bytes!("../../testdata/reading-losses/book-collection.xlsx"),
-            Silent("only the collection's first member is kept"),
+            Imported("1 WKT value in 'wkt' lost later non-empty geometry-collection members; only the first non-empty member is kept"),
         ),
         case(
             "XLSX: an error-valued attribute cell",
             "a.xlsx",
             include_bytes!("../../testdata/reading-losses/book-clean.xlsx"),
             include_bytes!("../../testdata/reading-losses/book-error.xlsx"),
-            Silent("the error-valued note cell is read as Null"),
+            Imported("1 spreadsheet error cell was read as empty, in 'note'"),
         ),
     ]);
 
@@ -426,7 +540,7 @@ fn cases(fixture_dir: &std::path::Path) -> Vec<Case> {
             "a.ods",
             include_bytes!("../../testdata/reading-losses/book-clean.ods"),
             include_bytes!("../../testdata/reading-losses/book-collection.ods"),
-            Silent("only the collection's first member is kept"),
+            Imported("1 WKT value in 'wkt' lost later non-empty geometry-collection members; only the first non-empty member is kept"),
         ),
     ]);
 
@@ -443,7 +557,7 @@ fn cases(fixture_dir: &std::path::Path) -> Vec<Case> {
             "a.xls",
             include_bytes!("../../testdata/reading-losses/book-clean.xls"),
             include_bytes!("../../testdata/reading-losses/book-collection.xls"),
-            Silent("only the collection's first member is kept"),
+            Imported("1 WKT value in 'wkt' lost later non-empty geometry-collection members; only the first non-empty member is kept"),
         ),
         case(
             "XLSB: a height in WKT",
@@ -464,7 +578,7 @@ fn cases(fixture_dir: &std::path::Path) -> Vec<Case> {
             "a.xlsb",
             include_bytes!("../../testdata/reading-losses/book-clean.xlsb"),
             include_bytes!("../../testdata/reading-losses/book-collection.xlsb"),
-            Silent("only the collection's first member is kept"),
+            Imported("1 WKT value in 'wkt' lost later non-empty geometry-collection members; only the first non-empty member is kept"),
         ),
     ]);
 
@@ -477,20 +591,26 @@ fn cases(fixture_dir: &std::path::Path) -> Vec<Case> {
         out.push(c);
     };
     mapinfo("MapInfo: an unreadable object", "Point 0 0\nPoint 1 1\n", "Point 0 0\nPoint 1 x\n", "1\n2\n", Said("couldn't be read"));
-    mapinfo("MapInfo: an arc", "Point 0 0\n", "Arc 0 0 2 2 0 90\n", "1\n", Silent("an arc or text object is kept without its geometry"));
+    mapinfo(
+        "MapInfo: an arc",
+        "Point 0 0\n",
+        "Arc 0 0 2 2 0 90\n",
+        "1\n",
+        Imported("1 MapInfo arc object was kept as a row without geometry"),
+    );
     mapinfo(
         "MapInfo: a line part of one point",
         "Pline Multiple 2\n2\n0 0\n1 1\n2\n5 5\n6 6\n",
         "Pline Multiple 2\n2\n0 0\n1 1\n1\n5 5\n",
         "1\n",
-        Silent("the part is left out of the line"),
+        Imported("1 MapInfo line part with fewer than two coordinates was omitted"),
     );
     mapinfo(
         "MapInfo: a ring of two points",
         "Region 2\n4\n0 0\n4 0\n4 4\n0 0\n4\n1 1\n2 1\n2 2\n1 1\n",
         "Region 2\n4\n0 0\n4 0\n4 4\n0 0\n2\n1 1\n2 2\n",
         "1\n",
-        Silent("the ring is left out of the polygon"),
+        Imported("1 MapInfo polygon ring with fewer than four coordinates after closure was omitted"),
     );
     // The archive path must report the same losses as the loose KML reader. Derive both
     // fixtures from each KML row so a new loss cannot be tested in only one container.
@@ -504,6 +624,7 @@ fn cases(fixture_dir: &std::path::Path) -> Vec<Case> {
             lossy: rustgis_engine::data::zip::write(&[("doc.kml".into(), c.lossy.clone())]).unwrap(),
             beside: [Vec::new(), Vec::new()],
             expect: c.expect,
+            extra_notices: c.extra_notices,
         })
         .collect::<Vec<_>>();
     out.extend(kmz);
@@ -670,6 +791,85 @@ fn check_workbook(ds: &rustgis_engine::data::Dataset, short_cells: bool) -> std:
     Ok(())
 }
 
+/// The height pair keeps the same XY and all ten DXF attributes; only the second Z is lost.
+fn check_dxf_height(ds: &rustgis_engine::data::Dataset) -> std::io::Result<()> {
+    use rustgis_engine::data::{Geometry, Value};
+    use rustgis_engine::geom::Coord;
+    let names: Vec<&str> = ds.fields.iter().map(|f| f.name.as_str()).collect();
+    if names != ["layer", "entity", "color", "linetype", "text", "height", "rotation", "block", "elevation", "paperspace"]
+        || ds.features.len() != 1
+        || ds.features[0].geometry != Some(Geometry::Line(vec![vec![Coord::new(0.0, 0.0), Coord::new(1.0, 1.0)]]))
+        || ds.features[0].attrs
+            != [
+                Value::Text("0".into()),
+                Value::Text("LINE".into()),
+                Value::Int(7),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Float(5.0),
+                Value::Bool(false),
+            ]
+    {
+        return Err(std::io::Error::other(format!("DXF height fixture retained unexpected data: {ds:?}")));
+    }
+    Ok(())
+}
+
+/// A damaged middle vertex leaves both endpoints, the drawing CRS and every attribute intact.
+fn check_dxf_vertex(ds: &rustgis_engine::data::Dataset, lossy: bool) -> std::io::Result<()> {
+    use rustgis_engine::data::raster::Crs;
+    use rustgis_engine::data::{Geometry, Value};
+    use rustgis_engine::geom::Coord;
+    let mut points = vec![Coord::new(0.0, 0.0)];
+    if !lossy {
+        points.push(Coord::new(1.0, 1.0));
+    }
+    points.push(Coord::new(2.0, 2.0));
+    let names: Vec<&str> = ds.fields.iter().map(|f| f.name.as_str()).collect();
+    if names != ["layer", "entity", "color", "linetype", "text", "height", "rotation", "block", "elevation", "paperspace"]
+        || ds.features.len() != 1
+        || ds.held_in != Crs::LonLat
+        || ds.zm_dropped
+        || ds.features[0].geometry != Some(Geometry::Line(vec![points]))
+        || ds.features[0].attrs
+            != [
+                Value::Text("0".into()),
+                Value::Text("POLYLINE".into()),
+                Value::Int(7),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Float(0.0),
+                Value::Bool(false),
+            ]
+    {
+        return Err(std::io::Error::other(format!("DXF vertex fixture retained unexpected data: {ds:?}")));
+    }
+    Ok(())
+}
+
+/// The PBF variants differ only in the discarded dimension; fractional XY and attributes survive.
+fn check_feature_pbf(ds: &rustgis_engine::data::Dataset, lossy: bool) -> std::io::Result<()> {
+    use rustgis_engine::data::{Field, FieldType, Geometry, GeometryType, Value};
+    use rustgis_engine::geom::Coord;
+    if ds.geometry_type != GeometryType::Point
+        || ds.fields != [Field::new("id", FieldType::Integer), Field::new("name", FieldType::Text)]
+        || ds.features.len() != 1
+        || ds.features[0].id != 1
+        || ds.features[0].geometry != Some(Geometry::Point(Coord::new(11.5, 17.5)))
+        || ds.features[0].attrs != [Value::Int(7), Value::Text("Place".into())]
+        || ds.zm_dropped != lossy
+    {
+        return Err(std::io::Error::other(format!("feature-service PBF retained unexpected data: {ds:?}")));
+    }
+    Ok(())
+}
+
 /// What `layer.addData` did with a file: the notices it gave and whether it added a layer or table,
 /// or why it refused the file.
 type SaidNotices = Vec<(String, Option<LossCode>)>;
@@ -710,6 +910,42 @@ fn read(dir: &std::path::Path, file: &str, content: &[u8], beside: &[(&str, Vec<
     } else {
         std::fs::write(&path, content)?;
     }
+    let collection = content == b"wkt,id\n\"GEOMETRYCOLLECTION(POINT(1 2),POINT(3 4))\",1\n"
+        || content == include_bytes!("../../testdata/reading-losses/book-collection.xlsx")
+        || content == include_bytes!("../../testdata/reading-losses/book-collection.ods")
+        || content == include_bytes!("../../testdata/reading-losses/book-collection.xls")
+        || content == include_bytes!("../../testdata/reading-losses/book-collection.xlsb");
+    let collection_note = "1 WKT value in 'wkt' lost later non-empty geometry-collection members; only the first non-empty member is kept";
+    let csv_collection = file.ends_with(".csv") && (collection || content == b"wkt,id\n\"GEOMETRYCOLLECTION(POINT(1 2))\",1\n");
+    if csv_collection {
+        let (native, report) = rustgis_engine::data::io::read_path(&path).map_err(std::io::Error::other)?;
+        if native.features.len() != 1
+            || native.features[0].geometry != Some(rustgis_engine::data::Geometry::Point(rustgis_engine::geom::Coord::new(1.0, 2.0)))
+            || native.features[0].attrs != [rustgis_engine::data::Value::Int(1)]
+            || report.skipped != 0
+            || report.messages != if collection { vec![collection_note] } else { vec![] }
+        {
+            return Err(std::io::Error::other(format!("CSV collection retained data or notice differs: {native:?}, {report:?}")));
+        }
+    }
+    let csv_extra = file == "a.csv" && (content == b"lon,lat\n1,2\n" || content == b"lon,lat\n1,2,lost\n");
+    let extra_note = "1 cell past the header's 2 columns was omitted in 1 row";
+    let extra_messages = if content == b"lon,lat\n1,2,lost\n" { vec![extra_note] } else { vec![] };
+    let dbf = file == "a.dbf";
+    let dbf_invalid = dbf && content == dbf_date(true);
+    let dbf_messages = if dbf_invalid { vec!["a: 1 value isn't a date and was read as empty, in 'day'"] } else { vec![] };
+    if csv_extra || dbf {
+        let (native, report) = rustgis_engine::data::io::read_path(&path).map_err(std::io::Error::other)?;
+        if csv_extra {
+            check_csv_extra(&native)?;
+        } else {
+            check_dbf_date(&native, dbf_invalid)?;
+        }
+        let expected = if csv_extra { &extra_messages } else { &dbf_messages };
+        if report.skipped != 0 || &report.messages != expected {
+            return Err(std::io::Error::other(format!("tabular native report: {report:?}")));
+        }
+    }
     if file.ends_with(".shp") {
         let (native, report) =
             rustgis_engine::data::io::read_path(&path).map_err(|e| std::io::Error::other(format!("native Shapefile fixture: {e}")))?;
@@ -730,12 +966,60 @@ fn read(dir: &std::path::Path, file: &str, content: &[u8], beside: &[(&str, Vec<
             || content == include_bytes!("../../testdata/reading-losses/book-z.ods")
             || content == include_bytes!("../../testdata/reading-losses/book-z.xls")
             || content == include_bytes!("../../testdata/reading-losses/book-z.xlsb");
+        let errors = content == include_bytes!("../../testdata/reading-losses/book-error.xlsx");
+        if collection && report.messages != [collection_note] {
+            return Err(std::io::Error::other(format!("native spreadsheet collection notice: {report:?}")));
+        }
+        if errors && report.messages != ["1 spreadsheet error cell was read as empty, in 'note'"] {
+            return Err(std::io::Error::other(format!("native spreadsheet error notice: {report:?}")));
+        }
         if report.skipped != 0
             || native.zm_dropped != height
-            || if height { report.messages.len() != 1 || !report.messages[0].contains("Z or M") } else { !report.messages.is_empty() }
+            || if height {
+                report.messages.len() != 1 || !report.messages[0].contains("Z or M")
+            } else {
+                !errors && !collection && !report.messages.is_empty()
+            }
         {
             return Err(std::io::Error::other(format!("native spreadsheet fixture has the wrong loss report: {report:?}")));
         }
+    }
+    let feature_pbf = file == "a.feature.pbf";
+    let pbf_lossy = content != include_bytes!("../../testdata/reading-losses/feature-xy.pbf");
+    let pbf_messages = if pbf_lossy { vec![rustgis_engine::data::zm_note(Some(1))] } else { vec![] };
+    if feature_pbf {
+        let (native, report) = rustgis_engine::data::esripbf::read(content, "a").map_err(std::io::Error::other)?;
+        check_feature_pbf(&native, pbf_lossy)?;
+        if report.skipped != 0 || report.messages != pbf_messages {
+            return Err(std::io::Error::other(format!("feature-service PBF has the wrong native report: {report:?}")));
+        }
+    }
+    let dxf_lossy = file == "a.dxf" && content == dxf(&["0 LINE 8 0 10 0 20 0 30 5 11 1 21 1 31 9"]).as_bytes();
+    let dxf_height = dxf_lossy || (file == "a.dxf" && content == dxf(&["0 LINE 8 0 10 0 20 0 30 5 11 1 21 1 31 5"]).as_bytes());
+    let mut dxf_messages = vec![
+        "a DXF drawing doesn't say its coordinate system (give \"crs\", such as EPSG:2263): coordinates are kept as they are".to_string(),
+    ];
+    let dxf_vertex_lossy = file == "a.dxf" && content == dxf(&[&dxf_polyline("10 1")]).as_bytes();
+    let dxf_vertex = dxf_vertex_lossy || (file == "a.dxf" && content == dxf(&[&dxf_polyline("10 1 20 1")]).as_bytes());
+    if dxf_vertex_lossy {
+        dxf_messages.push("1 unreadable POLYLINE vertex was left out of its line".into());
+    }
+    if dxf_vertex {
+        let native = rustgis_engine::data::dxf::read(file, content, &Default::default()).map_err(std::io::Error::other)?;
+        if native.len() != 1 || native[0].1.skipped != 0 || native[0].1.messages != dxf_messages {
+            return Err(std::io::Error::other(format!("DXF vertex native report: {native:?}")));
+        }
+        check_dxf_vertex(&native[0].0, dxf_vertex_lossy)?;
+    }
+    if dxf_lossy {
+        dxf_messages.push("1 feature lost varying Z coordinates; only the elevation attribute is kept".into());
+    }
+    if dxf_height {
+        let native = rustgis_engine::data::dxf::read(file, content, &Default::default()).map_err(std::io::Error::other)?;
+        if native.len() != 1 || native[0].1.skipped != 0 || native[0].1.messages != dxf_messages {
+            return Err(std::io::Error::other(format!("DXF height native report: {native:?}")));
+        }
+        check_dxf_height(&native[0].0)?;
     }
     let mut s = Session::new(Project::default());
     // Layers and standalone tables (what a file without geometry adds).
@@ -744,6 +1028,23 @@ fn read(dir: &std::path::Path, file: &str, content: &[u8], beside: &[(&str, Vec<
     let mark = s.notice_mark();
     if let Err(e) = s.run("layer.addData", &json!({"path": path})) {
         return Ok(Err(e));
+    }
+    if csv_extra || dbf {
+        let expected = if csv_extra { &extra_messages } else { &dbf_messages };
+        if s.notices_since(mark).iter().map(|n| n.text.as_str()).collect::<Vec<_>>() != *expected {
+            return Err(std::io::Error::other(format!("tabular command notices: {:?}", s.notices_since(mark))));
+        }
+        if csv_extra {
+            if s.map().layers.len() != 1 || !s.project.tables.is_empty() {
+                return Err(std::io::Error::other("CSV extra-cell pair didn't add exactly one layer"));
+            }
+            check_csv_extra(&s.map().layers[0].dataset)?;
+        } else {
+            if !s.map().layers.is_empty() || s.project.tables.len() != 1 {
+                return Err(std::io::Error::other("DBF date pair didn't add exactly one standalone table"));
+            }
+            check_dbf_date(&s.project.tables[0].dataset, dbf_invalid)?;
+        }
     }
     if file.ends_with(".shp") {
         if s.map().layers.len() != 1 {
@@ -763,6 +1064,57 @@ fn read(dir: &std::path::Path, file: &str, content: &[u8], beside: &[(&str, Vec<
             && !s.notices_since(mark).is_empty()
         {
             return Err(std::io::Error::other("clean spreadsheet fixture gave a notice"));
+        }
+    }
+    if collection || csv_collection {
+        let notices = s.notices_since(mark);
+        if notices.iter().map(|n| n.text.as_str()).collect::<Vec<_>>() != if collection { vec![collection_note] } else { vec![] } {
+            return Err(std::io::Error::other(format!("collection command notice: {notices:?}")));
+        }
+        if csv_collection {
+            if s.map().layers.len() != 1 || !s.project.tables.is_empty() {
+                return Err(std::io::Error::other("CSV collection didn't add exactly one layer"));
+            }
+            use rustgis_engine::data::{Geometry, Value};
+            use rustgis_engine::geom::Coord;
+            let ds = &s.map().layers[0].dataset;
+            if ds.features.len() != 1
+                || ds.features[0].geometry != Some(Geometry::Point(Coord::new(1.0, 2.0)))
+                || ds.features[0].attrs != [Value::Int(1)]
+            {
+                return Err(std::io::Error::other("CSV command lost retained point or ID"));
+            }
+        }
+    }
+    if feature_pbf {
+        if s.map().layers.len() != 1 || !s.project.tables.is_empty() {
+            return Err(std::io::Error::other("feature-service PBF didn't add exactly one layer"));
+        }
+        check_feature_pbf(&s.map().layers[0].dataset, pbf_lossy)?;
+        let notices = s.notices_since(mark);
+        // Require the exact loss count and subject, and no additional notice.
+        if notices.iter().map(|n| n.text.clone()).collect::<Vec<_>>() != pbf_messages {
+            return Err(std::io::Error::other(format!("feature-service PBF has the wrong command notices: {notices:?}")));
+        }
+    }
+    if dxf_vertex {
+        if s.map().layers.len() != 1 || !s.project.tables.is_empty() {
+            return Err(std::io::Error::other("DXF vertex fixture didn't add exactly one layer"));
+        }
+        check_dxf_vertex(&s.map().layers[0].dataset, dxf_vertex_lossy)?;
+        let said: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+        if said != dxf_messages {
+            return Err(std::io::Error::other(format!("DXF vertex command notices: {said:?}")));
+        }
+    }
+    if dxf_height {
+        if s.map().layers.len() != 1 || !s.project.tables.is_empty() {
+            return Err(std::io::Error::other("DXF height fixture didn't add exactly one layer"));
+        }
+        check_dxf_height(&s.map().layers[0].dataset)?;
+        let said: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+        if said != dxf_messages {
+            return Err(std::io::Error::other(format!("DXF height command notices: {said:?}")));
         }
     }
     let said = s.notices_since(mark).iter().map(|n| (n.text.clone(), n.loss())).collect();
@@ -836,4 +1188,65 @@ fn a_reading_that_loses_something_says_so() {
     }
     let _ = std::fs::remove_dir_all(&root);
     assert!(failures.is_empty(), "{} of the cases failed:\n{}", failures.len(), failures.join("\n"));
+}
+
+/// The pinned XML losses keep their native data and deliver exactly those notices at command ingress.
+#[test]
+fn xml_losses_keep_data_and_reach_command() {
+    use rustgis_engine::data::{Dataset, ReadReport, georss, gpx, kml, landxml};
+    let root = std::env::temp_dir().join(format!("rustgis-xml-loss-reading-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let mut checked = 0;
+    for c in cases(&root.join("fixtures")) {
+        let Imported(words) = c.expect else { continue };
+        if !["KML:", "GPX:", "GeoRSS:", "LandXML:"].iter().any(|prefix| c.name.starts_with(prefix)) {
+            continue;
+        }
+        checked += 1;
+        for (lossy, bytes) in [(false, &c.clean), (true, &c.lossy)] {
+            let native: Vec<(Dataset, ReadReport)> = match c.file {
+                "a.kml" | "a.kmz" => kml::read(c.file, bytes).unwrap().into_iter().map(|l| (l.dataset, l.report)).collect(),
+                "a.gpx" => gpx::read(c.file, bytes).unwrap(),
+                "a.rss" => georss::read(c.file, bytes).unwrap(),
+                "a.xml" => landxml::read(c.file, bytes, None).unwrap(),
+                other => panic!("unexpected XML fixture {other}"),
+            };
+            let messages: Vec<String> = native.iter().flat_map(|(_, r)| r.messages.texts().map(str::to_string)).collect();
+            let expected = if c.file.ends_with("kml") || c.file.ends_with("kmz") || c.file.ends_with("gpx") {
+                format!("a: {words}")
+            } else {
+                words.to_string()
+            };
+            let mut expected_messages = Vec::new();
+            if c.file == "a.xml" {
+                expected_messages.push(
+                    "the file doesn't say its coordinate system (give \"crs\", such as EPSG:2263): coordinates are kept as they are"
+                        .to_string(),
+                );
+            }
+            if lossy {
+                expected_messages.extend(c.extra_notices.iter().map(|m| (*m).to_string()));
+                expected_messages.push(expected);
+            }
+            assert_eq!(messages, expected_messages, "{} native notices", c.name);
+            let path = root.join(c.file);
+            std::fs::write(&path, bytes).unwrap();
+            let mut session = Session::new(Project::default());
+            let mark = session.notice_mark();
+            session.run("layer.addData", &json!({"path": path})).unwrap();
+            assert_eq!(session.map().layers.len(), native.len(), "{} layer count", c.name);
+            for (ds, _) in &native {
+                let mut matches = session.map().layers.iter().filter(|layer| layer.dataset.name == ds.name);
+                let layer = matches.next().unwrap_or_else(|| panic!("{} missing dataset {}", c.name, ds.name));
+                assert!(matches.next().is_none(), "{} repeated dataset {}", c.name, ds.name);
+                assert_eq!(layer.dataset.fields, ds.fields, "{} fields", c.name);
+                assert_eq!(layer.dataset.features, ds.features, "{} retained data", c.name);
+                assert_eq!(layer.dataset.held_in, ds.held_in, "{} held CRS", c.name);
+            }
+            let said: Vec<_> = session.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+            assert_eq!(said, messages, "{} command notices", c.name);
+        }
+    }
+    assert_eq!(checked, 17, "ten logical cases, seventeen rows with the KMZ twins");
+    let _ = std::fs::remove_dir_all(root);
 }

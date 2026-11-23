@@ -2070,8 +2070,10 @@ pub fn assemble(store: &Store, plan: &Plan, chunks: &HashMap<String, Vec<u8>>, n
     // Unread proj: values stay visible beside the system used, or in the error below.
     let found = crs_of(store, a);
     let unread = if found.is_none() { unread_proj(a) } else { None };
+    let mut crs_assumed = false;
     let (crs, crs_notes): (Option<Crs>, Vec<String>) = if lonlat {
         let assumed = lonlat_assumption(found.as_ref().map(|(c, _)| *c), crs);
+        crs_assumed = assumed.is_some();
         let (actual, note) = found.unwrap_or((Crs::LonLat, None));
         (Some(if actual.is_geographic() { actual } else { Crs::LonLat }), note.into_iter().chain(assumed).collect())
     } else {
@@ -2117,6 +2119,7 @@ pub fn assemble(store: &Store, plan: &Plan, chunks: &HashMap<String, Vec<u8>>, n
     if rounded > 0 {
         r.rounded = vec![rounded];
     }
+    r.crs_assumed = crs_assumed;
     r.lost.extend(crs_notes);
     r.lost.extend(unread);
     // A transform the coordinates stood in for is said, not dropped without a word.
@@ -2324,7 +2327,8 @@ fn grid_axes(store: &Store, a: &Array, chunks: &HashMap<String, Vec<u8>>) -> Res
 
 /// The chunk keys of `variable`'s map coordinates, for [`window_of`]: each is read whole (its
 /// first [`MAX_CHUNKS`] chunks, as any coordinate), so longer ones than [`MAX_COORDS`] can't place
-/// a box (a window is given in cells instead). None for a grid its `spatial:transform` places.
+/// a box (a window is given in cells instead). Empty for a grid its `spatial:transform` places
+/// (a box is placed by arithmetic).
 pub fn window_keys(store: &Store, variable: &str) -> Result<Vec<String>> {
     let a = store.array(variable).ok_or_else(|| bad(format!("no variable named {variable}")))?;
     // A grid placed by its spatial:transform places a box by arithmetic, however long its axes.
@@ -2879,9 +2883,11 @@ pub fn read_parts(dir: &std::path::Path, parts: &[Part], chunks: &mut HashMap<St
             Ok(f) => f,
             // Never written: only a file that isn't there. Any other failure is said.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(bad(format!("{}: {}: {e}", dir.display(), part.key))),
         };
-        let len = f.metadata()?.len();
+        // A failure names the store and the shard, as the check below does.
+        let failed = |e: std::io::Error| bad(format!("{}: {}: {e}", dir.display(), part.key));
+        let len = f.metadata().map_err(failed)?.len();
         let (first, n) = match part.span {
             Span::Bytes(a, b) => (a, b - a + 1),
             Span::Tail(n) => (len.saturating_sub(n), n.min(len)),
@@ -2890,9 +2896,9 @@ pub fn read_parts(dir: &std::path::Path, parts: &[Part], chunks: &mut HashMap<St
         if first.saturating_add(n) > len || n > MAX_CHUNK_FILE || *total > MAX_READ {
             return Err(bad(format!("{}: {} is cut, or the chunks to read are too large", dir.display(), part.key)));
         }
-        f.seek(SeekFrom::Start(first))?;
+        f.seek(SeekFrom::Start(first)).map_err(failed)?;
         let mut buf = Vec::new();
-        f.take(n).read_to_end(&mut buf)?;
+        f.take(n).read_to_end(&mut buf).map_err(failed)?;
         chunks.insert(part.id.clone(), buf);
     }
     Ok(())
@@ -4658,7 +4664,9 @@ mod tests {
         let shard = dir.join("v/c/0/0/0");
         std::fs::remove_file(&shard).unwrap();
         std::fs::create_dir(&shard).unwrap();
-        assert!(read_dir(&dir, &sel(0, w0).label(), None).is_err());
+        let e = read_dir(&dir, &sel(0, w0).label(), None).unwrap_err().to_string();
+        // The message names the store and the shard.
+        assert!(e.contains(&dir.display().to_string()) && e.contains("v/c/0/0/0"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
         // A window over more than MAX_CHUNKS of the shards' chunks reads its shards whole, as a
         // window did before, rather than being refused: 260 × 260 cells of 2 × 2 chunks in shards

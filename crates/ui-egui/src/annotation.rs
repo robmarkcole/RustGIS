@@ -273,8 +273,11 @@ pub(crate) fn click(app: &mut RustGisApp, c: rustgis_engine::geom::Coord, modifi
         let [row] = app.session.map().layer(id)?.selection.as_slice() else { return None };
         Some((id, *row))
     });
-    let index =
-        if modifiers.alt { current.and_then(|c| hits.iter().position(|h| *h == c)).map_or(0, |i| (i + 1) % hits.len().max(1)) } else { 0 };
+    let index = if modifiers.alt {
+        current.and_then(|selected| hits.iter().position(|hit| *hit == selected)).map_or(0, |i| (i + 1) % hits.len().max(1))
+    } else {
+        0
+    };
     if let Some(&(layer, row)) = hits.get(index) {
         let mode = if modifiers.shift {
             "add"

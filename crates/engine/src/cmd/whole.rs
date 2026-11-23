@@ -31,7 +31,7 @@ pub(crate) struct Unread {
     rows: usize,
     dates: Option<String>,
     rounded: Option<String>,
-    messages: Vec<String>,
+    messages: rustgis_data::loss::Notes,
 }
 
 impl Whole {
@@ -56,20 +56,17 @@ impl Whole {
         Whole { name: l.name.clone(), rows }
     }
 
-    /// Every feature in longitude/latitude, whatever system the layer holds its coordinates in
-    /// (its work reads places there), with the fields the layer lists (so a field's index in the
-    /// layer is its index here), and the rows of its source that couldn't be read. A source read
-    /// a chunk at a time looks at Cancel between chunks; one read at once (a GeoJSON file, a
-    /// database table) is a single step that doesn't, as for Load All Features.
+    /// Every feature in the system the layer holds its coordinates in ([`Dataset::coord_crs`]: its
+    /// work tests places there, none of them converted), with the fields the layer lists (so a
+    /// field's index in the layer is its index here), and the rows of its source that couldn't be
+    /// read. A source read a chunk at a time looks at Cancel between chunks; one read at once (a
+    /// GeoJSON file, a database table) is a single step that doesn't, as for Load All Features.
     pub(crate) fn read(self) -> Result<(Dataset, Unread), String> {
         let Whole { name, rows } = self;
-        let (mut ds, unread) = match rows {
+        let (ds, unread) = match rows {
             Rows::Held(ds) => (ds, Unreadable::default()),
             Rows::Source(l) => l.load_all_counted().map_err(|e| format!("{name}: {e}"))?,
         };
-        if ds.coord_crs() != rustgis_data::raster::Crs::LonLat {
-            ds = ds.in_lonlat()?.into_owned();
-        }
         Ok((ds, Unread::of(name, unread)))
     }
 }
@@ -93,15 +90,17 @@ impl Unread {
             s.notify(format!("{}: {rounded}", self.layer), false);
         }
         for message in &self.messages {
-            s.notify(message.clone(), false);
+            s.say(message.clone());
         }
     }
 
     /// What [`Unread::say`] says, as lines: for a tool's messages.
-    pub(crate) fn lines(&self) -> Vec<String> {
+    pub(crate) fn lines(&self) -> rustgis_data::loss::Notes {
         let rows = (self.rows > 0).then(|| unread_notice(&self.layer, self.rows));
         let dates = [&self.dates, &self.rounded].into_iter().flatten().map(|n| format!("{}: {n}", self.layer));
-        rows.into_iter().chain(dates).chain(self.messages.iter().cloned()).collect()
+        let mut lines: rustgis_data::loss::Notes = rows.into_iter().chain(dates).collect();
+        lines.extend(self.messages.iter().cloned());
+        lines
     }
 
     /// `error`, with the rows left out when there were any: they may be why it failed.
@@ -168,7 +167,7 @@ pub(crate) fn load_into(l: &mut Layer) -> Result<Unread, String> {
 }
 
 /// The notice for `unread` rows of `layer`'s source that couldn't be read.
-pub(crate) fn unread_notice(layer: &str, unread: usize) -> String {
+pub fn unread_notice(layer: &str, unread: usize) -> String {
     match unread {
         1 => format!("{layer}: 1 row couldn't be read and was left out"),
         n => format!("{layer}: {n} rows couldn't be read and were left out"),
@@ -237,13 +236,13 @@ mod tests {
             "sites".into(),
             Unreadable {
                 dates: Some("1 value isn't a date and was read as empty, in 'day'".into()),
-                messages: vec!["source: conversion left out 2 source features".into()],
+                messages: ["source: conversion left out 2 source features"].into_iter().collect(),
                 ..Default::default()
             },
         );
         let mut session = Session::new(crate::Project::new("notices"));
         unread.say(&mut session);
-        assert_eq!(session.notices.iter().map(|n| &n.text).collect::<Vec<_>>(), unread.lines().iter().collect::<Vec<_>>());
+        assert_eq!(session.notices.iter().map(|n| n.text.as_str()).collect::<Vec<_>>(), unread.lines().texts().collect::<Vec<_>>());
         assert_eq!(session.notices.len(), 2);
         assert_eq!(unread.lines().iter().filter(|n| n.contains("conversion left out 2")).count(), 1);
         assert!(Unread::of("clean".into(), Unreadable::default()).lines().is_empty());

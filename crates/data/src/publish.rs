@@ -10,8 +10,11 @@
 //!    written as the file holds them, not as an older read held them.
 //! 2. The file as it was read, written again the same way, holds what the file holds: the same
 //!    shapes (no Z or M values dropped, none left out), the same columns and the same values,
-//!    compared as the bytes the `.dbf` holds, not as read (text a read trims, a code page's
-//!    characters). Whatever a read and write of the file loses shows here, before the edits.
+//!    compared as the `.dbf` holds them, not as read: the column descriptors byte for byte, and
+//!    text cells too but for the padding after them (text a read trims, a code page's
+//!    characters); numbers by value (`003.50` is `3.5`, `-0` is `0`), logicals by meaning (`Y`,
+//!    `1` and `T` are one true, `N`, `0` and `F` one false) and a zero date as a blank one.
+//!    Whatever a read and write of the file loses shows here, before the edits.
 //! 3. The layer, written, reads back as the layer: every value and shape the edits made fits.
 //!
 //! A shape that wasn't edited is written with the coordinates the file holds, not converted to
@@ -48,6 +51,9 @@ pub struct Published {
     pub read: Dataset,
     /// Digest of `read`, computed before placement so cancellation cannot interrupt completion.
     pub rows: u64,
+    /// Its [`crate::sync::native_digest`] when it is held in a system of its own
+    /// ([`crate::sync::Synced::native`]).
+    pub native: Option<u64>,
     pub features: usize,
     pub notes: Vec<String>,
 }
@@ -251,12 +257,12 @@ pub fn shapefile(ds: &Dataset, path: &Path, synced: &Synced) -> Result<Published
     // 1. It reads as the layer was read: in the layer's system, and in the file's own
     // coordinates (the system taken for longitude/latitude, which converts nothing).
     let (as_read, _) = crate::io::read_shapefile_parts(original.parts(), &name, ds.crs)?;
-    if crate::sync::rows_digest(&as_read)? != synced.rows {
+    if synced.digest_of(&as_read)? != synced.digest() {
         // Define Projection changes the layer's CRS, which is part of its digest. The
         // unedited file must still reproduce the saved baseline in its own CRS. Keep the
         // current-CRS read above for imports with an override and native-coordinate reuse.
         let (baseline, _) = crate::io::read_shapefile_parts(original.parts(), &name, None)?;
-        if crate::sync::rows_digest(&baseline)? != synced.rows {
+        if synced.digest_of(&baseline)? != synced.digest() {
             return Err(refused(
                 path,
                 "it reads otherwise now than at the saved sync point, even in the file's own coordinate system; the import CRS may differ or RustGIS may read it more fully now: restore the original import CRS or add the file again with the intended CRS",
@@ -392,7 +398,7 @@ pub fn shapefile(ds: &Dataset, path: &Path, synced: &Synced) -> Result<Published
     if let Some((cpg, bytes)) = &original.cpg {
         targets.push((cpg.clone(), bytes.clone()));
     }
-    let rows = crate::sync::rows_digest(&read_back)?;
+    let (rows, native) = crate::sync::digests(&read_back)?;
     // The record of the files as they will be, made before any is placed: once they are, the
     // publish has happened, whatever comes after.
     let files = FileSync::of_written(path, &targets)?;
@@ -411,8 +417,9 @@ pub fn shapefile(ds: &Dataset, path: &Path, synced: &Synced) -> Result<Published
         crate::io::unstage(&staged);
         return Err(e);
     }
-    crate::io::place_shapefile(path, &staged)?;
-    Ok(Published { files, read: read_back, rows, features: ds.features.len(), notes })
+    let kept = crate::io::place_shapefile(path, &staged)?;
+    notes.extend(crate::io::kept_backups_note(path, &kept));
+    Ok(Published { files, read: read_back, rows, native, features: ds.features.len(), notes })
 }
 
 /// `ds` in the file's coordinate system `crs` (`None`: longitude/latitude), from the system it
@@ -428,7 +435,7 @@ fn in_file<'a>(ds: &'a Dataset, crs: Option<Crs>, as_held: Option<(&Dataset, &Da
             crate::progress::check()?;
             if f.geometry.is_none() && r.geometry.is_some() {
                 return Err(DataError::Format(format!(
-                    "source shape {} couldn't be converted to longitude/latitude, so its native geometry can't be matched safely; check the source projection and add the file again; nothing was written",
+                    "source shape {} couldn't be converted from the source projection when it was read, so its native geometry can't be matched safely; check the source projection and add the file again; nothing was written",
                     i + 1
                 )));
             }
@@ -860,7 +867,7 @@ mod tests {
     fn read(path: &Path) -> (Dataset, Synced) {
         let (read, files) = FileSync::around(path, || crate::io::read_path(path).unwrap()).unwrap();
         let rows = crate::sync::rows_digest(&read.0).unwrap();
-        (read.0, Synced { files: files.unwrap(), rows })
+        (read.0, Synced { files: files.unwrap(), rows, native: None })
     }
 
     /// An edit is written back: the file reads as the layer, keeps its columns and `.prj`, and
@@ -1204,7 +1211,7 @@ mod tests {
         ds.features = rows.into();
         let published = shapefile(&ds, &path, &sync).unwrap();
         assert_eq!(published.read.features.iter().next().unwrap().attrs[0], Value::Null);
-        let synced = Synced { files: published.files, rows: crate::sync::rows_digest(&published.read).unwrap() };
+        let synced = Synced { files: published.files, rows: crate::sync::rows_digest(&published.read).unwrap(), native: None };
         let mut ds = published.read;
         let mut rows: Vec<_> = ds.features.iter().cloned().collect();
         rows[1].attrs[0] = Value::Text("Jonas".into());
@@ -1285,7 +1292,7 @@ mod tests {
         ds.features = rows.clone().into();
         let published = shapefile(&ds, &path, &sync).unwrap();
         // The record of what was published, as the layer takes it.
-        let synced = Synced { files: published.files, rows: crate::sync::rows_digest(&published.read).unwrap() };
+        let synced = Synced { files: published.files, rows: crate::sync::rows_digest(&published.read).unwrap(), native: None };
         let dbf = std::fs::read(path.with_extension("dbf")).unwrap();
         assert!(dbf.windows(5).any(|w| w == b"Mu\xf1oz"), "written in Windows-1252");
         assert_eq!(std::fs::read(path.with_extension("cpg")).unwrap(), b"1252");
@@ -1431,7 +1438,7 @@ mod tests {
         assert_eq!(published.read.fields[1].ty, FieldType::Double);
         assert_eq!(published.read.features.first().unwrap().attrs[1], Value::Float(100.0));
         assert!(published.notes.is_empty(), "{:?}", published.notes);
-        let again = shapefile(&published.read, &path, &Synced { files: published.files, rows: published.rows }).unwrap();
+        let again = shapefile(&published.read, &path, &Synced { files: published.files, rows: published.rows, native: None }).unwrap();
         assert!(again.notes.is_empty(), "{:?}", again.notes);
     }
 
@@ -1547,7 +1554,7 @@ mod tests {
         rows[0].id = id;
         rows[0].attrs[0] = Value::Text("Smyth".into());
         ds.features = rows.into();
-        let sync = Synced { files: published.files, rows: published.rows };
+        let sync = Synced { files: published.files, rows: published.rows, native: None };
         let before = std::fs::read(&path).unwrap();
         shapefile(&ds, &path, &sync).unwrap();
         assert!(same_shapes(&before, &std::fs::read(&path).unwrap(), 0.0).is_none());

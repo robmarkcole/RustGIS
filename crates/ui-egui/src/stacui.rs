@@ -629,12 +629,9 @@ fn poll_walk(app: &mut RustGisApp, ctx: &egui::Context) {
     }
     let st = &mut app.ui.stac;
     let n = walk.items().len().to_string();
+    // Refused and skipped links have their own notices above: the stops they don't say come first.
     st.info = Some(if walk.complete() {
         i18n::fmt("Showing {n} items", &[("n", &n)])
-    } else if walk.refused() > 0 {
-        i18n::fmt("Showing {n} items ({f} catalog links were refused)", &[("n", &n), ("f", &walk.refused().to_string())])
-    } else if walk.skipped() > 0 {
-        i18n::fmt("Showing {n} items ({s} catalog links were skipped)", &[("n", &n), ("s", &walk.skipped().to_string())])
     } else if walk.reads >= catalog::MAX_READS {
         i18n::fmt(
             "Showing {n} items (stopped after reading {r} documents: pick a catalog further down)",
@@ -644,6 +641,10 @@ fn poll_walk(app: &mut RustGisApp, ctx: &egui::Context) {
         i18n::fmt("Showing {n} items ({f} documents couldn't be read)", &[("n", &n), ("f", &walk.failed.to_string())])
     } else if walk.cut && walk.items().len() < 50 {
         i18n::fmt("Showing {n} items (some catalogs were too deep or too large to read: pick a catalog further down)", &[("n", &n)])
+    } else if walk.refused() > 0 {
+        i18n::fmt("Showing {n} items ({f} catalog links were refused)", &[("n", &n), ("f", &walk.refused().to_string())])
+    } else if walk.skipped() > 0 {
+        i18n::fmt("Showing {n} items ({s} catalog links were skipped)", &[("n", &n), ("s", &walk.skipped().to_string())])
     } else {
         i18n::fmt("Showing {n} items (more match: narrow the search)", &[("n", &n)])
     });
@@ -1573,7 +1574,7 @@ fn add_selected(app: &mut RustGisApp) {
     match rustgis_engine::cmd::stac_area::selected_geometries(&app.session, &json!({})) {
         Ok((geometries, notes)) => {
             let what = tl!("the selected features").to_string();
-            start_loading(app, what, move || rustgis_engine::cmd::stac_area::merge_loaded(&geometries, notes));
+            start_loading(app, what, move || rustgis_engine::cmd::stac_area::merge_loaded(&geometries, notes.into()));
         }
         Err(e) => app.ui.stac.error = Some(e),
     }
@@ -1625,7 +1626,11 @@ fn land(app: &mut RustGisApp, answer: Result<Loaded, String>) {
     match answer {
         Ok(loaded) => {
             for n in loaded.notices {
-                app.session.warn(n);
+                // An ordinary note warns; a loss says its code too.
+                match n.loss {
+                    Some(_) => app.session.say(n),
+                    None => app.session.warn(n.text),
+                }
             }
             push_part(app, loaded.geometry);
         }
@@ -2903,8 +2908,10 @@ mod tests {
         assert!(app.ui.stac.error.is_some() && app.ui.stac.loading.is_none());
         app.ui.stac.error = None;
         // A mixed answer lands its notices, then its part.
-        let answer =
-            rustgis_engine::cmd::stac_area::merge_loaded(&[rectangle([0.0, 0.0, 1.0, 1.0]), Geometry::Point(at(5.0, 5.0))], Vec::new());
+        let answer = rustgis_engine::cmd::stac_area::merge_loaded(
+            &[rectangle([0.0, 0.0, 1.0, 1.0]), Geometry::Point(at(5.0, 5.0))],
+            Default::default(),
+        );
         let before = app.session.notice_mark();
         land(&mut app, answer);
         assert_eq!(app.ui.stac.parts.len(), 1);

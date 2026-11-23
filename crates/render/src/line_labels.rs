@@ -52,6 +52,41 @@ pub(super) fn spread_gap(advances: &[f32], gap: f32, room: f32, stretch: f32) ->
     (wide - gap > 0.01).then_some(wide)
 }
 
+/// A class's `stretch` on a curved label that isn't fitted (#2262: along a line, a polygon's
+/// centre line or a guide line): its letters are spaced so it covers `share` of the line it
+/// follows, the spacing held within `lo`..=`hi` (letter spacing's range, in the advances' units).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Stretch {
+    pub share: f32,
+    pub lo: f32,
+    pub hi: f32,
+}
+
+impl Stretch {
+    /// The letter spacing at which `advances` covers `share` of `room`, or as near as the range
+    /// lets it; `None` for fewer than two characters or a room or share that isn't a positive
+    /// number (the label keeps its own spacing).
+    pub(super) fn gap(&self, advances: &[f32], room: f32) -> Option<f32> {
+        let target = self.share * room;
+        if advances.len() < 2 || !(target.is_finite() && target > 0.0 && self.lo <= self.hi) {
+            return None;
+        }
+        let (mut lo, mut hi) = (self.lo, self.hi);
+        if curved_len(advances, hi) <= target {
+            return Some(hi);
+        }
+        if curved_len(advances, lo) >= target {
+            return Some(lo);
+        }
+        // `curved_len` never shrinks as the spacing grows.
+        for _ in 0..40 {
+            let g = (lo + hi) / 2.0;
+            if curved_len(advances, g) < target { lo = g } else { hi = g }
+        }
+        Some(hi)
+    }
+}
+
 /// A line in screen points, with how far along it each vertex is.
 #[derive(Debug)]
 struct Path {
@@ -799,21 +834,23 @@ mod tests {
         assert!(glyphs.iter().all(|g| g.1.abs() < 1e-3 && g.2.abs() < 1e-4), "{glyphs:?}");
     }
 
-    /// A bend of nearly half a turn under a label whose start-to-end direction is steep: none of
-    /// its characters stand upside down, though each is within a right angle of that direction.
+    /// A bend of nearly half a turn under a label whose start-to-end direction is steep: one whose
+    /// characters would stand upside down is refused; one that is placed has none upside down.
     #[test]
-    fn curved_text_round_a_half_turn_never_stands_upside_down() {
+    fn curved_text_past_the_turn_bound_is_refused() {
         // Its course turns from -0.5 to 2.9 radians, so the text's ends are -0.3 and 2.7 and its
-        // start-to-end direction about 1.2.
+        // start-to-end direction about 1.2: its far characters turn past the bound, so it is
+        // left out. A shorter text round the middle of the turn is placed, every character
+        // within the bound.
         let arc: Vec<(f32, f32)> = (0..=340)
             .map(|i| {
                 let t = -0.5 + i as f32 / 100.0;
                 (200.0 + 58.0 * t.sin(), 200.0 - 58.0 * t.cos())
             })
             .collect();
-        if let Some((_, glyphs)) = curved(&arc, &[7.0; 25], 0.0, 0.0, None) {
-            assert!(glyphs.iter().all(|g| g.2.abs() <= std::f32::consts::FRAC_PI_2 + MAX_TURN), "upside down: {glyphs:?}");
-        }
+        assert!(curved(&arc, &[7.0; 25], 0.0, 0.0, None).is_none());
+        let (_, glyphs) = curved(&arc, &[7.0; 8], 0.0, 0.0, None).expect("a short text round the turn is placed");
+        assert!(glyphs.iter().all(|g| g.2.abs() <= std::f32::consts::FRAC_PI_2 + MAX_TURN), "upside down: {glyphs:?}");
     }
 
     /// A hairpin tighter than the text, sharper than [`MAX_TURN`] over a text's height: still left out.
@@ -961,6 +998,23 @@ mod tests {
         let tight = [1.0, 10.0, 1.0];
         let wide = spread_gap(&tight, -5.0, 36.0, 0.6).unwrap();
         assert!((curved_len(&tight, wide) - 0.6 * 36.0).abs() < 0.01, "{wide}");
+    }
+
+    /// `stretch` without `fit` (#2262): the text covers that share of its line, within letter
+    /// spacing's range, wider or tighter than its own; none for one character.
+    #[test]
+    fn a_stretched_label_covers_its_share_of_the_line_within_the_spacing_range() {
+        let advances = [10.0; 5];
+        let s = |share: f32| Stretch { share, lo: -6.65, hi: 66.5 };
+        for (share, room) in [(0.7, 400.0), (0.5, 120.0), (0.9, 60.0)] {
+            let gap = s(share).gap(&advances, room).unwrap();
+            assert!((curved_len(&advances, gap) - share * room).abs() < 0.01, "{share} of {room}: {gap}");
+        }
+        // Past the range: held at its ends.
+        assert_eq!(s(1.0).gap(&advances, 10_000.0), Some(66.5));
+        assert_eq!(s(0.1).gap(&advances, 100.0), Some(-6.65));
+        assert_eq!(s(0.7).gap(&[10.0], 400.0), None);
+        assert_eq!(s(0.7).gap(&advances, f32::NAN), None);
     }
 
     /// The repeats clear of a spread label (#2265): as [`repeats`] beyond it, the nearer ones

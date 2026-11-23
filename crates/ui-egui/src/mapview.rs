@@ -340,8 +340,9 @@ pub struct MapView {
     pictures: crate::popupmedia::Pictures,
     /// The tile layers' credits, from the last render.
     attribution: Vec<String>,
-    /// Tile layer errors, and why layers were drawn without their cast shadows (in the map or
-    /// the Layout view), already reported.
+    /// Tile layer errors (by kind, see [`say_tile_error`]), why layers were drawn without their
+    /// cast shadows (in the map or the Layout view), and what frames approximated, already
+    /// reported.
     pub(crate) tile_errors: std::collections::HashSet<String>,
     /// When the map last rendered (seconds).
     last_render: f64,
@@ -442,7 +443,7 @@ impl Default for MapView {
             kept_lonlat: None,
             menu_lonlat: None,
             menu_text: None,
-            coord_format: crate::CoordReadout::Decimal,
+            coord_format: crate::CoordReadout::default(),
             render_ms: 0,
             notices_seen: 0,
             toasts: Vec::new(),
@@ -512,7 +513,11 @@ impl MapView {
             self.attribution.clear();
             self.tile_errors.clear();
             self.drape = Default::default();
+            // With their relays: what the old project's frames approximated on workers isn't the
+            // new one's.
             self.tilt_drape = Default::default();
+            self.tilt_settle.relay = Default::default();
+            self.motion_frame.relay = Default::default();
             self.filling = false;
         }
         self.project = Some(opened);
@@ -576,6 +581,11 @@ impl MapView {
     /// The camera the last full render was drawn with (diagnostics and tests).
     pub fn full_frame_camera(&self) -> Camera {
         self.tex_camera
+    }
+
+    /// The camera the GPU scene on screen is drawn for now (diagnostics and tests).
+    pub fn scene_camera(&self) -> Option<Camera> {
+        self.gpu_frame.as_ref().map(|f| f.camera())
     }
 
     /// Whether the map shown is a GPU scene that moves with the camera (vector meshes and raster
@@ -974,7 +984,7 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     // pictures drawn on the CPU (tiles, rasters…). Vector scenes re-project in the vertex
     // shader; image scenes shift and scale as cached pictures while navigating.
     // A decline holds at its revision and zoom level (what it shows depends on both).
-    let rev = (app.session.revision, (cam.res.max(1e-9).log2().round()) as i32);
+    let rev = declined_at(app.session.revision, &cam);
     let turned_view = View { width: w, height: h, pixels_per_point: ppp as f64, camera: cam, sky: true };
     let gpu_ok = app.map.gpu_enabled
         && app.map.render_state.is_some()
@@ -1121,7 +1131,22 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         // A frame the worker couldn't draw (it panicked, or the system refused its thread) is
         // drawn on the UI thread, as before: a refused thread costs smoothness, not the frame.
         && !app.map.tilt_settle.failed(key);
-    let settling = (tilted || globe_view || tiled_flat || flat_settle) && !moving && app.ws.playing.is_none() && !hold;
+    // A turned or tilted map on the GPU re-projects its scene as the camera moves, but only so far
+    // (`SceneBuffers::fits`): turned or tilted half a degree, zoomed by 0.7 or 1.4 or panned a quarter
+    // of the view, it needs a scene of its own. Made on the UI thread, each one stopped the window
+    // for as long as tessellating every layer took, again and again through a turn, a tilt or a
+    // quick zoom. So, like a flat map's frames (#1750), it is made off the UI thread, while it
+    // moves and once it rests, and the scene on screen follows the camera meanwhile (ground it
+    // left out shows the map's background until the new one lands). The browser has one thread.
+    let turned_off = cfg!(not(target_arch = "wasm32"))
+        && !app.map.inline_frames
+        && gpu_ok
+        && !globe_view
+        && (cam.bearing != 0.0 || cam.pitch != 0.0)
+        && app.map.gpu_frame.as_ref().is_some_and(|f| !f.has_images && f.follows(&cam))
+        && app.map.key.is_some_and(|k| k.rev == key.rev && k.size == key.size && k.sources == key.sources && (k.cam != key.cam || k.draft))
+        && !app.map.tilt_settle.failed(key);
+    let settling = (tilted || globe_view || tiled_flat || flat_settle || turned_off) && !moving && app.ws.playing.is_none() && !hold;
     let mut tilt_draped = tilt_draped;
     // A frame finishing during a new gesture is obsolete. Drain it now so it neither holds
     // the worker slot nor keeps screenshot/idle waiters waiting for a frame we will not show;
@@ -1177,6 +1202,11 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 app.map.motion_cost = full_cost(done.ms as f64, &done.view, (w, h), ppp);
                 match r {
                     rustgis_engine::render::RenderOutput::Cpu(r) => {
+                        // A turned or tilted view the GPU declined stays on the CPU, as when it is
+                        // drawn here, until the map or its data change.
+                        if !globe_view && (done.view.camera.bearing != 0.0 || done.view.camera.pitch != 0.0) && gpu_ok {
+                            app.map.gpu_turn_declined = Some(declined_at(k.rev, &done.view.camera));
+                        }
                         app.map.gpu_frame = None;
                         show_frame(app, ui.ctx(), r, &done.view, (w, h), k, time, globe_view);
                         // Over terrain the settled frame's mesh is finer than the drape's
@@ -1208,9 +1238,18 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             let upload = gpu_upload(app, gpu_ok);
             app.map.tilt_settle.start_prepared(ui.ctx(), key, app.session.map().clone(), view, backend, upload);
             // A worker the system refused wakes no frame: the next draws it here.
-            if flat_settle && app.map.tilt_settle.failed(key) {
+            if (flat_settle || turned_off) && app.map.tilt_settle.failed(key) {
                 ui.ctx().request_repaint();
             }
+        }
+        // A turned or tilted scene follows a camera that jumped (a zoom box, a bookmark) while
+        // the worker makes the scene for it, as it does while the map moves.
+        if turned_off
+            && app.map.key != Some(key)
+            && let (Some(gf), Some(rs)) = (&app.map.gpu_frame, &app.map.render_state)
+            && gf.camera() != cam
+        {
+            gf.set_camera(&rs.queue, &cam);
         }
         let shown = (app.map.texture.is_some() || app.map.gpu_frame.is_some())
             && app.map.key.is_some_and(|k| same_view(Key { draft: false, ..k }, key));
@@ -1224,7 +1263,7 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             } else if app.map.preview_attempt != Some(key)
                 && !reprojects
                 // The last frame, shifted, stands in while the worker draws; if it couldn't, a preview.
-                && !(flat_settle && app.map.tilt_settle.busy())
+                && !((flat_settle || turned_off) && app.map.tilt_settle.busy())
                 && !(keep_frame && app.map.tilt_settle.busy())
             {
                 // A kept frame waits for the exact one; if that couldn't be drawn, a preview.
@@ -1259,7 +1298,10 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     // as it lands, while the map still moves: the camera has moved on since, so it is shifted and
     // scaled like the frame it replaces. Once the map rests or changes it is stopped and dropped:
     // the exact frame follows.
-    if flat_settle && interacting && !app.map.motion_dropped {
+    // A worker's frame that came back on the CPU because the GPU declined its turned or tilted
+    // view: the frame shown now is that one, and the next decides again whether to try the GPU.
+    let mut declined_now = false;
+    if (flat_settle || turned_off) && interacting && !app.map.motion_dropped {
         if let Some((k, done)) = app.map.motion_frame.take() {
             app.session.map_mut().adopt_caches(&done.map);
             if k.rev == key.rev
@@ -1272,6 +1314,11 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 app.map.motion_cost = full_cost(done.ms as f64, &done.view, (w, h), ppp);
                 match r {
                     rustgis_engine::render::RenderOutput::Cpu(r) => {
+                        if gpu_ok && (done.view.camera.bearing != 0.0 || done.view.camera.pitch != 0.0) {
+                            app.map.gpu_turn_declined = Some(declined_at(k.rev, &done.view.camera));
+                            declined_now = true;
+                            ui.ctx().request_repaint();
+                        }
                         app.map.gpu_frame = None;
                         show_frame(app, ui.ctx(), r, &done.view, (w, h), k, time, false);
                     }
@@ -1393,14 +1440,13 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     let mut motion_off = false;
     if stale
         && !fast_engaged
-        && flat_settle
+        && ((flat_settle && !turning) || turned_off)
         && interacting
-        && !turning
         && !hold
         && !app.map.motion_dropped
         && (motion.is_some() || gpu_vector)
         // The scene on screen follows the camera while its successor is drawn.
-        && (!gpu_vector || (cam_only && app.map.gpu_frame.as_ref().is_some_and(|f| !f.has_images && f.fits(&cam))))
+        && (!gpu_vector || (cam_only && app.map.gpu_frame.as_ref().is_some_and(|f| !f.has_images && f.follows(&cam))))
     {
         let job = Key { draft: motion.is_some(), ..key };
         if !app.map.motion_frame.busy() {
@@ -1420,6 +1466,7 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     if stale
         && !fast_engaged
         && !motion_off
+        && !declined_now
         && !settling
         && !hold
         && !draped
@@ -1539,6 +1586,19 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     // vector-only scenes re-project in their shaders. Both draw inside egui's wgpu pass. The GPU
     // backend only serves flat maps, so the globe's drape never meets it.
     // Not under the tilted map's drape: a flat GPU frame from before the tilt would cover it.
+    // A scene that re-projects is drawn for the view's camera. One that followed a camera jump
+    // (a zoom box, a bookmark) while the worker made the scene for it stayed at that camera when
+    // the view came back to the one it was made for before that scene landed: then nothing above
+    // is out of date, and nothing else moves it back.
+    if app.map.key == Some(key)
+        && !tilt_draped
+        && let (Some(gf), Some(rs)) = (&app.map.gpu_frame, &app.map.render_state)
+        && !gf.has_images
+        && gf.follows(&cam)
+        && gf.camera() != cam
+    {
+        gf.set_camera(&rs.queue, &cam);
+    }
     if let (Some(gf), Some(gr)) = (app.map.gpu_frame.as_ref().filter(|_| !tilt_draped), &app.map.gpu_renderer) {
         // A scene with pictures (or drawn for another size, a pane being dragged) is shown as a
         // picture of itself, shifted and scaled until it is drawn again.
@@ -1549,9 +1609,7 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         let (live_frame, live_pending) = match gf.live_frame(if picture { app.map.tex_camera } else { cam }) {
             Some((mut f, pending, declined)) => {
                 for error in f.tile_errors.drain(..) {
-                    if app.map.tile_errors.insert(error.clone()) {
-                        app.session.notify(error, true);
-                    }
+                    say_tile_error(&mut app.map.tile_errors, &mut app.session, error);
                 }
                 // A layer no longer drawn live (its style turned out to draw more than raster
                 // tiles): the map is drawn again, as tiles arriving would draw it.
@@ -1687,6 +1745,12 @@ fn reads_in_place(m: &rustgis_engine::map::Map) -> bool {
     m.layers.iter().any(|l| l.raster.as_ref().is_some_and(|r| r.in_place))
 }
 
+/// What a turned or tilted view the GPU declined is held at (`gpu_turn_declined`): the map's
+/// revision and the camera's zoom level, what the decline depends on.
+fn declined_at(revision: u64, cam: &Camera) -> (u64, i32) {
+    (revision, (cam.res.max(1e-9).log2().round()) as i32)
+}
+
 /// The GPU scene buffers a worker uploaded for its frame (see [`gpu_upload`]), if it did.
 fn uploaded(prepared: Option<crate::tilt_settle::Prepared>) -> Option<crate::mapgpu::SceneBuffers> {
     prepared.and_then(|p| p.downcast::<crate::mapgpu::SceneBuffers>().ok()).map(|b| *b)
@@ -1766,10 +1830,9 @@ fn show_gpu_frame(
     app.map.attribution = scene.attribution;
     app.map.last_render = time;
     for e in scene.tile_errors {
-        if app.map.tile_errors.insert(e.clone()) {
-            app.session.notify(e, true);
-        }
+        say_tile_error(&mut app.map.tile_errors, &mut app.session, e);
     }
+    say_approximations(app);
     app.map.tex_camera = cam;
     app.map.tex_size = (view.width, view.height);
     app.map.key = Some(key);
@@ -1828,13 +1891,91 @@ fn show_frame(
     app.map.attribution = r.attribution;
     app.map.last_render = time;
     for e in r.tile_errors {
-        if app.map.tile_errors.insert(e.clone()) {
-            app.session.notify(e, true);
-        }
+        say_tile_error(&mut app.map.tile_errors, &mut app.session, e);
     }
+    say_approximations(app);
     app.map.tex_camera = cam;
     app.map.tex_size = (view.width, view.height);
     app.map.key = Some(key);
+}
+
+/// Says a tile layer's error ("{layer}: {why}", its kinds joined by "; ") once a project for each
+/// layer and kind of error, each kind a notice of its own: the count of tiles in the view a kind
+/// may carry ("12 tiles left out: …") changes with every pan or zoom, so it is said under its kind
+/// ([`tile_error_kind`]), with the count it had then, rather than again for each new count.
+/// Another kind of error, or another layer's, is said all the same. `said` is the map view's
+/// [`MapView::tile_errors`].
+pub(crate) fn say_tile_error(said: &mut std::collections::HashSet<String>, session: &mut rustgis_engine::Session, error: String) {
+    let (layer, why) = error.split_once(": ").map_or(("", error.as_str()), |(l, w)| (l, w));
+    for kind in why.split("; ") {
+        let notice = if layer.is_empty() { kind.to_string() } else { format!("{layer}: {kind}") };
+        // The layer's name as it is: only the reason loses its counts.
+        if said.insert(format!("{layer}\0{}", tile_error_kind(kind))) {
+            session.notify(notice, true);
+        }
+    }
+}
+
+/// Tile error reason `e` without its counts of tiles ("12 tiles left out", "3 tiles are partial",
+/// "2 warped tile components left out" each become `#`) or what follows the host in the
+/// addresses it names (each tile's differs, by its z/x/y): what it says beside them, the layer,
+/// the server and the reason, is its kind.
+fn tile_error_kind(e: &str) -> String {
+    let unaddressed = without_urls(e);
+    let mut out = String::with_capacity(unaddressed.len());
+    let mut rest = unaddressed.as_str();
+    while let Some(i) = rest.find(|c: char| c.is_ascii_digit()) {
+        let (head, tail) = rest.split_at(i);
+        out.push_str(head);
+        let n = tail.find(|c: char| !c.is_ascii_digit()).unwrap_or(tail.len());
+        let (digits, after) = tail.split_at(n);
+        let starts_word = !out.ends_with(|c: char| c.is_alphanumeric() || c == '.' || c == ',');
+        if starts_word && (after.starts_with(" tiles ") || after.starts_with(" warped tile")) {
+            out.push('#');
+        } else {
+            out.push_str(digits);
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `e` with the rest of each web address in it after its host (`http://` or `https://`, any case,
+/// up to the next space or its end) replaced by `/…`: the path and query, which name the tile,
+/// go; the server stays, so another server's failure is a kind of its own.
+fn without_urls(e: &str) -> String {
+    // ASCII lower case keeps each byte where it is, so positions in it are positions in `e`.
+    let lower = e.to_ascii_lowercase();
+    let mut out = String::with_capacity(e.len());
+    let mut at = 0;
+    while let Some(i) = lower[at..].find("http://").into_iter().chain(lower[at..].find("https://")).min().map(|i| at + i) {
+        out.push_str(&e[at..i]);
+        let end = e[i..].find(char::is_whitespace).map_or(e.len(), |n| i + n);
+        let url = &e[i..end];
+        let host_from = url.find("://").map_or(0, |n| n + 3);
+        let host_end = url[host_from..].find(['/', '?', '#']).map_or(url.len(), |n| host_from + n);
+        out.push_str(&url[..host_end]);
+        if host_end < url.len() {
+            out.push_str("/…");
+        }
+        at = end;
+    }
+    out.push_str(&e[at..]);
+    out
+}
+
+/// Says, once a project each, what the map view's frames drew otherwise than their layers ask
+/// (a dashed line drawn solid, a fill left off a block diagram's walls, see
+/// [`rustgis_engine::render::take_approximations`]), each kind with the count it had when first
+/// seen: read after each frame it shows, with what its workers' frames handed over.
+fn say_approximations(app: &mut RustGisApp) {
+    let relays = [&app.map.tilt_settle.relay, &app.map.motion_frame.relay, &app.map.tilt_drape.relay];
+    for (kind, e) in rustgis_engine::render::take_approximations(&relays) {
+        if app.map.tile_errors.insert(format!("approximated\0{kind}")) {
+            app.session.warn(e);
+        }
+    }
 }
 
 /// How much wider and taller than the view a frame drawn mid-motion to fill a gap is, so the
@@ -2300,6 +2441,10 @@ pub(crate) fn text_graphic_at(app: &RustGisApp, ctx: &egui::Context, rect: Rect,
         let to_lonlat = l.dataset.lonlat_conversion().ok()?;
         (0..l.dataset.features.len()).rev().filter(|r| drawn.get(*r) == Some(&true)).find_map(|row| {
             let g = l.dataset.features.get(row)?.geometry.as_ref()?;
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "View Clipping's draw distance: picks only what the renderer draws, by its test (`within_view_distance`)"
+            )]
             if let Some((centre, d)) = clip {
                 // No extent (an empty geometry, or one whose conversion isn't a number): nothing
                 // of it is drawn, and clamping to its extent would panic.
@@ -3772,10 +3917,12 @@ fn overlays(app: &mut RustGisApp, ui: &mut Ui, p: &egui::Painter, rect: Rect, t:
             // On the map's body: the Earth measures on the WGS 84 ellipsoid, so the panel agrees
             // with the geoprocessing tools (#939); another body measures on its sphere and scales.
             let body = app.session.map().body();
+            #[expect(clippy::disallowed_methods, reason = "another body measures on its sphere, scaled by `Body`")]
             let measure_length = |pts: &[Coord]| {
                 if body.is_earth() { wgs84_length_m(pts) } else { body.length(geodesic_length_m(pts)) }
             };
             // Perimeter and area in the map body's measurement model.
+            #[expect(clippy::disallowed_methods, reason = "another body measures on its sphere, scaled by `Body`")]
             let measure_ring = |ring: &[Coord]| {
                 if body.is_earth() {
                     wgs84_ring_perimeter_area_m2(ring)
@@ -4456,7 +4603,7 @@ fn select_shown(app: &mut RustGisApp) {
     if let Some((id, row)) = found {
         rustgis_engine::cmd::select::set(&mut app.session, id, vec![row], rustgis_engine::cmd::select::Mode::New);
     } else {
-        app.session.map_mut().clear_selection();
+        rustgis_engine::cmd::select::clear(&mut app.session);
     }
     app.session.revision = app.session.revision.wrapping_add(1);
 }
@@ -4953,6 +5100,77 @@ mod tile_redraw_tests {
         }
     }
 
+    /// A tile layer's error whose count of tiles changes as the view moves is said once for the
+    /// layer and kind; another kind or another layer's is said all the same (#2639).
+    #[test]
+    fn tile_errors_are_said_once_a_layer_and_kind_whatever_their_counts() {
+        use super::{say_tile_error, tile_error_kind};
+        assert_eq!(tile_error_kind("Tiles: 12 tiles left out: refused"), "Tiles: # tiles left out: refused");
+        assert_eq!(tile_error_kind("Tiles: 3 tiles are partial (first: HTTP 404)"), "Tiles: # tiles are partial (first: HTTP 404)");
+        assert_eq!(tile_error_kind("Layer 12: 2 warped tile components left out: x"), "Layer 12: # warped tile components left out: x");
+        assert_eq!(tile_error_kind("Tiles: missing source"), "Tiles: missing source");
+        // An address names its tile (z/x/y): two tiles' are one kind (#2657).
+        let a = tile_error_kind("1 tiles left out: https://b.s3.example/t/3/4/5.png?X-Sig=1 answered with a redirect");
+        let b = tile_error_kind("7 tiles left out: https://b.s3.example/t/9/8/7.png?X-Sig=2 answered with a redirect");
+        assert_eq!(a, b);
+        assert_eq!(a, "# tiles left out: https://b.s3.example/… answered with a redirect");
+        // Another server is another kind.
+        assert_ne!(a, tile_error_kind("1 tiles left out: https://a.s3.example/t/3/4/5.png answered with a redirect"));
+        // Two addresses, one at the end, any case.
+        assert_eq!(
+            tile_error_kind("from HTTPS://x.example/1/2/3.png to http://y.example/4/5/6.png?k=1"),
+            "from HTTPS://x.example/… to http://y.example/…"
+        );
+        assert_eq!(tile_error_kind("refused by https://x.example"), "refused by https://x.example");
+        let mut app = crate::RustGisApp::with_sample();
+        let said = |app: &crate::RustGisApp, mark| app.session.notices_since(mark).iter().map(|n| n.text.clone()).collect::<Vec<_>>();
+        let mark = app.session.notice_mark();
+        for n in [12, 7, 30, 12] {
+            say_tile_error(&mut app.map.tile_errors, &mut app.session, format!("Tiles: {n} tiles left out: refused"));
+        }
+        assert_eq!(said(&app, mark), ["Tiles: 12 tiles left out: refused"]);
+        // A new reason, and another layer's, are new.
+        say_tile_error(&mut app.map.tile_errors, &mut app.session, "Tiles: 4 tiles left out: HTTP 500".into());
+        say_tile_error(&mut app.map.tile_errors, &mut app.session, "Roads: 4 tiles left out: refused".into());
+        assert_eq!(said(&app, mark).len(), 3, "{:?}", said(&app, mark));
+        // A layer's kinds joined in one error are each said once, under the layer.
+        let mark = app.session.notice_mark();
+        say_tile_error(&mut app.map.tile_errors, &mut app.session, "Tiles: 9 tiles left out: refused; sprite left out".into());
+        assert_eq!(said(&app, mark), ["Tiles: sprite left out"]);
+        // Layers whose names hold what a count looks like stay apart.
+        let mark = app.session.notice_mark();
+        say_tile_error(&mut app.map.tile_errors, &mut app.session, "2024 tiles west: missing source".into());
+        say_tile_error(&mut app.map.tile_errors, &mut app.session, "2025 tiles west: missing source".into());
+        assert_eq!(said(&app, mark).len(), 2);
+    }
+
+    /// What the map view's frames approximated is said once a project each (#2639).
+    #[test]
+    fn approximations_are_said_once_a_project() {
+        let mut app = crate::RustGisApp::with_sample();
+        rustgis_engine::render::take_approximations(&[]);
+        let mark = app.session.notice_mark();
+        super::say_approximations(&mut app);
+        assert!(!app.session.notices_since(mark).iter().any(|n| n.text.starts_with("road: ")), "nothing approximated, nothing said");
+        use rustgis_engine::data::{Dataset, Geometry, GeometryType};
+        use rustgis_engine::geom::Coord;
+        use rustgis_engine::map::{Basemap, Camera, LineStroke, Map, symbology::Dash};
+        let mut m = Map::new("Map");
+        m.basemap = Basemap::Blank;
+        let mut d = Dataset::new("road", GeometryType::Polyline, vec![]);
+        d.push(Some(Geometry::Line(vec![vec![Coord::new(-1.0, 0.0), Coord::new(1.0, 0.0)]])), vec![]);
+        let id = m.add_dataset(d);
+        m.layer_mut(id).unwrap().line_strokes = vec![LineStroke { dash: Dash::new(&[0.2, 0.2]), width: Some(4.0), ..Default::default() }];
+        let camera = Camera { center: rustgis_engine::geom::lonlat_to_merc(Coord::new(0.0, 0.0)), res: 1500.0, bearing: 0.0, pitch: 0.0 };
+        let view = rustgis_engine::render::View { width: 200.0, height: 200.0, pixels_per_point: 1.0, camera, sky: false };
+        for _ in 0..2 {
+            rustgis_engine::render::render(&mut m, &view).unwrap();
+            super::say_approximations(&mut app);
+        }
+        let said: Vec<_> = app.session.notices_since(mark).iter().map(|n| n.text.clone()).filter(|t| t.starts_with("road: ")).collect();
+        assert!(said.len() == 1 && said[0].starts_with("road: 1 dashed line(s) drawn solid"), "{said:?}");
+    }
+
     #[test]
     fn tiles_arriving_are_held_briefly_after_a_frame() {
         // Shown a moment ago: the new tiles wait; a while ago, they are drawn.
@@ -5441,6 +5659,58 @@ mod tests {
             pp.info["results"].as_array().unwrap().iter().map(|r| r["tileLayer"].as_str().or(r["layer"].as_str()).unwrap()).collect();
         assert_eq!((shown, pp.index), (vec!["Over", "Countries"], 0));
         assert!(app.session.map().layer_by_name("Countries").unwrap().selection.is_empty());
+    }
+
+    /// Browsing to a service result clears vector selection without an Undo step. A Similar
+    /// read prepared before that actual pop-up gesture must not replace the user's clear.
+    #[test]
+    fn popup_clear_preserves_selection_intent_against_pending_similar() {
+        use egui_kittest::kittest::Queryable;
+        use rustgis_engine::analysis::control::Control;
+        use rustgis_engine::cmd::reads::{read_ahead, read_land};
+        use rustgis_engine::data::{Dataset, Field, FieldType, Geometry, GeometryType, Value as Cell};
+        let mut s = rustgis_engine::Session::new(rustgis_engine::Project::default());
+        let mut data = Dataset::new("values", GeometryType::Point, vec![Field::new("n", FieldType::Integer)]);
+        for n in [0, 2, 10] {
+            data.push(Some(Geometry::Point(Coord::new(n as f64, 0.0))), vec![Cell::Int(n)]);
+        }
+        let id = rustgis_engine::cmd::layer::add_dataset(&mut s, data);
+        let fid = s.map().layer(id).unwrap().dataset.features[0].id;
+        let url = "https://wms.example.org/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=over&STYLES=&CRS=EPSG:3857&BBOX={bbox-epsg-3857}&WIDTH=256&HEIGHT=256&FORMAT=image%2Fpng";
+        s.run("map.addTiles", &json!({"url":url,"name":"Remote","overlay":true})).unwrap();
+        s.run("select.rows", &json!({"layer":id,"rows":[0]})).unwrap();
+        let pending = read_ahead(&mut s, "data.similar", &json!({"layer":id,"row":0,"fields":["n"],"count":1})).unwrap();
+        let depth = s.undo_depth();
+        let first = json!({"layerId":id,"fid":fid,"layer":"values","attributes":{"name":"Reference"}});
+        let mut info = first.clone();
+        info["results"] = json!([first,{"tileLayer":"Remote","attributes":{"name":"Remote feature"}}]);
+        let pp = Popup::new(info, Coord::new(0.0, 0.0), s.project.active_map, s.opened);
+        let mut app = RustGisApp::new(s);
+        app.map.popup = Some(pp);
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1000.0, 700.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                let rect = ui.max_rect();
+                popup(app, ui, rect);
+            },
+            app,
+        );
+        h.run();
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "›").click();
+        h.run();
+        assert_eq!(h.state().map.popup.as_ref().unwrap().index, 1);
+        assert!(h.state().session.map().layer(id).unwrap().selection.is_empty());
+        assert_eq!(h.state().session.undo_depth(), depth, "pop-up browsing creates no Undo step");
+        let mark = h.state().session.notice_mark();
+        let answer = read_land(&mut h.state_mut().session, pending.run(&Control::stoppable()).unwrap()).unwrap();
+        assert_eq!(answer["similar"][0]["row"], 1);
+        assert!(h.state().session.map().layer(id).unwrap().selection.is_empty(), "the pending read must preserve the pop-up clear");
+        assert!(h.state().session.notices_since(mark).iter().any(|n| n.text.contains("without replacing the current selection")));
     }
 
     /// A WMS layer's answer comes in the drawing order (#808): drawn over Countries, its feature

@@ -3,19 +3,43 @@
 //! the overlap a feature has with a polygon, and the rules that roll the values of several matches
 //! up into one.
 //!
-//! Distances are on the WGS 84 ellipsoid, as buffers' are. The nearest points of two features are
-//! found in an azimuthal equidistant plane, centred first between the features and then between
-//! the points found, and measured along the geodesic between them.
+//! In a run in longitude/latitude, distances are on the WGS 84 ellipsoid, as buffers' are. The
+//! nearest points of two features are found in an azimuthal equidistant plane, centred first
+//! between the features and then between the points found, and measured along the geodesic between
+//! them. In a run in a projected system's own plane ([`crate::convert::Plane::Own`], #2032 C2e-3),
+//! they are found there and measured straight, in the system's unit times its length.
 
 use rustgis_data::{Coord, Dataset, FieldType, Geometry, Value};
-use rustgis_geom::{Aeqd, Extent, WGS84_MIN_RADIUS_M, geodesic_interpolate, geodesic_length_m, geodesic_ring_area_m2, wgs84_distance_m};
+use rustgis_geom::{Aeqd, Extent, WGS84_MIN_RADIUS_M, geodesic_interpolate, wgs84_distance_m, wgs84_ring_perimeter_area_m2, wgs84_step_m};
 use serde_json::Value as Json;
 
 /// Whether a coordinate is a place on the Earth in lon/lat: finite, with a latitude of ±90° at most
 /// and a longitude within 540° of the meridian (a shape across the antimeridian goes past 180°).
 /// Distances leave other coordinates out, as places they can't measure from.
 fn on_earth(c: &Coord) -> bool {
-    c.is_finite() && c.x.abs() <= 540.0 && c.y.abs() <= 90.0
+    c.is_finite() && (crate::convert::plane() == crate::convert::Plane::Own || (c.x.abs() <= 540.0 && c.y.abs() <= 90.0))
+}
+
+/// The plane nearest points are found in: an azimuthal equidistant one, or a projected system's
+/// own as it is.
+enum Flat {
+    Aeqd(Aeqd),
+    Own,
+}
+
+impl Flat {
+    fn forward(&self, c: Coord) -> Coord {
+        match self {
+            Flat::Aeqd(p) => p.forward(c),
+            Flat::Own => c,
+        }
+    }
+    fn inverse(&self, c: Coord) -> Coord {
+        match self {
+            Flat::Aeqd(p) => p.inverse(c),
+            Flat::Own => c,
+        }
+    }
 }
 
 /// The first coordinate of a geometry that is a place on the Earth.
@@ -29,7 +53,8 @@ pub fn first_coord(g: &Geometry) -> Option<Coord> {
     first
 }
 
-/// The ground distance (metres) between two features that don't intersect: between their nearest
+/// The distance (metres) between two features that don't intersect, on the ground (flat in a
+/// projected system's own plane, see the module's docs): between their nearest
 /// points, edges and vertices alike. `None` for a geometry without a finite coordinate.
 ///
 /// The nearest pair is found in a plane centred between the features' first vertices, then again
@@ -37,7 +62,10 @@ pub fn first_coord(g: &Geometry) -> Option<Coord> {
 /// the features are.
 pub fn distance_m(a: &Geometry, b: &Geometry) -> Option<f64> {
     let (p, q) = nearest_points(a, b)?;
-    let d = wgs84_distance_m(p, q);
+    let d = match crate::convert::own_unit_m() {
+        Some(unit) => (p.x - q.x).hypot(p.y - q.y) * unit,
+        None => wgs84_distance_m(p, q),
+    };
     d.is_finite().then_some(d)
 }
 
@@ -46,13 +74,16 @@ pub fn distance_m(a: &Geometry, b: &Geometry) -> Option<f64> {
 pub fn nearest_points(a: &Geometry, b: &Geometry) -> Option<(Coord, Coord)> {
     // The features' first vertices are a pair of their points: the search starts from them.
     let (fa, fb) = (first_coord(a)?, first_coord(b)?);
-    let (p, q) = nearest_pair(a, b, &Aeqd::new(geodesic_interpolate(fa, fb, 0.5)), Some((fa, fb)))?;
-    Some(nearest_pair(a, b, &Aeqd::new(geodesic_interpolate(p, q, 0.5)), Some((p, q))).unwrap_or((p, q)))
+    if crate::convert::plane() == crate::convert::Plane::Own {
+        return nearest_pair(a, b, &Flat::Own, Some((fa, fb)));
+    }
+    let (p, q) = nearest_pair(a, b, &Flat::Aeqd(Aeqd::new(geodesic_interpolate(fa, fb, 0.5))), Some((fa, fb)))?;
+    Some(nearest_pair(a, b, &Flat::Aeqd(Aeqd::new(geodesic_interpolate(p, q, 0.5))), Some((p, q))).unwrap_or((p, q)))
 }
 
 /// The nearest points of two geometries (lon/lat) as found in `plane`: a point of `a`, one of `b`.
 /// `seed`, a pair already found, starts the search, so pairs no nearer than it are skipped.
-fn nearest_pair(a: &Geometry, b: &Geometry, plane: &Aeqd, seed: Option<(Coord, Coord)>) -> Option<(Coord, Coord)> {
+fn nearest_pair(a: &Geometry, b: &Geometry, plane: &Flat, seed: Option<(Coord, Coord)>) -> Option<(Coord, Coord)> {
     let boxed = |segs: Vec<(Coord, Coord)>| -> Vec<((Coord, Coord), [f64; 4])> {
         segs.into_iter().map(|(s, e)| ((s, e), [s.x.min(e.x), s.y.min(e.y), s.x.max(e.x), s.y.max(e.y)])).collect()
     };
@@ -94,7 +125,7 @@ fn nearest_pair(a: &Geometry, b: &Geometry, plane: &Aeqd, seed: Option<(Coord, C
 }
 
 /// A geometry's edges in the plane; a point is an edge of no length.
-fn segments(g: &Geometry, plane: &Aeqd) -> Vec<(Coord, Coord)> {
+fn segments(g: &Geometry, plane: &Flat) -> Vec<(Coord, Coord)> {
     let mut out = Vec::new();
     let mut path = |pts: &[Coord], closed: bool| {
         // A coordinate left out ends a run: no edge joins the runs on either side of it, and a
@@ -159,6 +190,11 @@ pub fn may_be_within(a: &Extent, b: &Extent, metres: f64) -> bool {
     if a.is_empty() || b.is_empty() {
         return false;
     }
+    // In a projected system's own plane, extents there: their gap measured straight.
+    if let Some(d) = crate::convert::own_length(metres) {
+        let gap = (b.min_x - a.max_x).max(a.min_x - b.max_x).max(0.0).hypot((b.min_y - a.max_y).max(a.min_y - b.max_y).max(0.0));
+        return gap <= d.max(0.0) * (1.0 + 1e-9) + 1e-9;
+    }
     let (dlat, dlon) = spread(a.min_y.abs().max(a.max_y.abs()), metres);
     let lat_gap = (b.min_y - a.max_y).max(a.min_y - b.max_y).max(0.0);
     if lat_gap > dlat {
@@ -174,6 +210,11 @@ pub fn search_box(ext: &Extent, metres: f64) -> Option<Extent> {
     if ext.is_empty() || !metres.is_finite() {
         return None;
     }
+    // In a projected system's own plane, the extent there widened by the distance in its unit.
+    if let Some(d) = crate::convert::own_length(metres) {
+        let d = d.max(0.0) * (1.0 + 1e-9) + 1e-9;
+        return Some(Extent::new(ext.min_x - d, ext.min_y - d, ext.max_x + d, ext.max_y + d));
+    }
     let (dlat, dlon) = spread(ext.min_y.abs().max(ext.max_y.abs()), metres);
     let dlon = dlon?;
     let (x0, x1) = (ext.min_x - dlon, ext.max_x + dlon);
@@ -188,20 +229,34 @@ fn lon_gap(a: &Extent, b: &Extent) -> f64 {
     [-360.0, 0.0, 360.0].iter().map(|k| (b.min_x + k - a.max_x).max(a.min_x - (b.max_x + k)).max(0.0)).fold(f64::INFINITY, f64::min)
 }
 
-/// The ground area (square metres) of a lon/lat polygon geometry, holes taken out.
+/// The ground area (square metres) of a lon/lat polygon geometry on the WGS 84 ellipsoid, holes
+/// taken out, as the Measure tool gives it. NaN for a ring whose winding is ambiguous.
 pub fn area_m2(g: &Geometry) -> f64 {
     let Geometry::Polygon(polys) = g else { return 0.0 };
     polys
         .iter()
         .flat_map(|rings| rings.iter().enumerate())
-        .map(|(i, r)| if i == 0 { geodesic_ring_area_m2(r) } else { -geodesic_ring_area_m2(r) })
+        .map(|(i, r)| {
+            let (_, area) = wgs84_ring_perimeter_area_m2(r);
+            if i == 0 { area } else { -area }
+        })
         .sum()
 }
 
-/// The ground length (metres) of a lon/lat line geometry.
+/// The ground length (metres) of a lon/lat line geometry on the WGS 84 ellipsoid, each step
+/// measured with [`wgs84_step_m`]: within a millionth of
+/// [`wgs84_length_m`](rustgis_geom::wgs84_length_m), without a geodesic solve for each of a dense
+/// line's many short steps.
 pub fn length_m(g: &Geometry) -> f64 {
     let Geometry::Line(parts) = g else { return 0.0 };
-    parts.iter().map(|p| geodesic_length_m(p)).sum()
+    parts
+        .iter()
+        .flat_map(|p| p.windows(2))
+        .map(|w| match w {
+            [a, b] => wgs84_step_m(*a, *b),
+            _ => 0.0,
+        })
+        .sum()
 }
 
 /// How the values of a join field's matches become one value in a one-to-one join.
@@ -449,11 +504,12 @@ pub fn parse_merge(join: &Dataset, v: Option<&Json>) -> Result<Vec<Merge>, Strin
 mod tests {
     use super::*;
 
-    use rustgis_geom::haversine_m;
+    use rustgis_geom::{haversine_m, wgs84_length_m};
 
     /// The ground distance from `p` to a line, by sampling each edge finely along its great circle.
     /// Only the samples within 1.2% of the nearest on the sphere are measured on the ellipsoid,
     /// whose distances are within 0.6% of the sphere's.
+    #[expect(clippy::disallowed_methods, reason = "the test ranks samples on the sphere and measures the nearest on the ellipsoid")]
     fn brute(p: Coord, line: &[Coord]) -> f64 {
         let samples: Vec<(Coord, f64)> = line
             .windows(2)
@@ -465,6 +521,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::disallowed_methods, reason = "the test tells the ellipsoid's distance from the sphere's")]
     fn distances_are_on_the_wgs84_ellipsoid() {
         // 0.0904369° north of the equator is 10,000 m on WGS 84 (GeographicLib) but 10,056 m on the
         // mean sphere: within 10 km in the measure, and not ruled out before it (#888).
@@ -475,6 +532,71 @@ mod tests {
         let (ea, eb) = (Extent::new(a.x, a.y, a.x, a.y), Extent::new(b.x, b.y, b.x, b.y));
         assert!(may_be_within(&ea, &eb, 10_000.0));
         assert!(search_box(&ea, 10_000.0).is_some_and(|e| e.max_y >= b.y));
+    }
+
+    /// Spatial Join's Largest overlap ranks overlaps by their area or length on the WGS 84
+    /// ellipsoid, as the Measure tool measures them. A 1° square on the equator, listed first, and a
+    /// band at 60°N that the ellipsoid makes 0.5% larger but the sphere 0.5% smaller: the band
+    /// wins. Likewise for a line along a meridian through a 1° zone and a shorter one at 60°N.
+    #[test]
+    #[expect(clippy::disallowed_methods, reason = "the test sets the sphere's ranking against the ellipsoid's")]
+    fn largest_overlap_ranks_overlaps_on_the_ellipsoid() {
+        use crate::{Inputs, Output};
+        use rustgis_data::{Field, GeometryType};
+        use rustgis_geom::{geodesic_length_m, geodesic_ring_area_m2};
+        use std::collections::HashMap;
+        struct Layers(HashMap<String, Dataset>);
+        impl Inputs for Layers {
+            fn dataset(&self, layer: &str) -> Option<&Dataset> {
+                self.0.get(layer)
+            }
+            fn selection(&self, _: &str) -> &[usize] {
+                &[]
+            }
+        }
+        let ring = |x0: f64, x1: f64, y0: f64, y1: f64| {
+            vec![Coord::new(x0, y0), Coord::new(x1, y0), Coord::new(x1, y1), Coord::new(x0, y1), Coord::new(x0, y0)]
+        };
+        let zones = |band_top: f64| {
+            let mut ds = Dataset::new("zones", GeometryType::Polygon, vec![Field::new("zone", FieldType::Text)]);
+            for (name, r) in [("equator", ring(0.0, 1.0, 0.0, 1.0)), ("north", ring(0.0, 1.0, 60.0, band_top))] {
+                ds.push(Some(Geometry::Polygon(vec![vec![r]])), vec![Value::Text(name.into())]);
+            }
+            ds
+        };
+        let joined = |target: Dataset, zones: Dataset| {
+            let layers = Layers(HashMap::from([("t".to_string(), target), ("zones".to_string(), zones)]));
+            let r = crate::run("spatialJoin", &layers, &serde_json::json!({"target": "t", "join": "zones", "match": "Largest overlap"}));
+            let Ok(crate::ToolResult { output: Output::Layer(ds), .. }) = r else { panic!("a layer") };
+            ds.field_index("join_zone").map(|i| ds.value(0, i).clone())
+        };
+        let north = Some(Value::Text("north".into()));
+
+        let (square, band) = (ring(0.0, 1.0, 0.0, 1.0), ring(0.0, 1.0, 60.0, 62.054));
+        let area = |r: &Vec<Coord>| wgs84_ring_perimeter_area_m2(r).1;
+        assert!(area(&band) > area(&square) * 1.004 && geodesic_ring_area_m2(&band) < geodesic_ring_area_m2(&square) * 0.996);
+        let mut parcel = Dataset::new("t", GeometryType::Polygon, vec![]);
+        parcel.push(Some(Geometry::Polygon(vec![vec![ring(0.0, 1.0, -1.0, 63.0)]])), vec![]);
+        assert_eq!(joined(parcel, zones(62.054)), north);
+
+        let (near_equator, near_pole) = ([Coord::new(0.5, 0.0), Coord::new(0.5, 1.0)], [Coord::new(0.5, 60.0), Coord::new(0.5, 60.995)]);
+        assert!(wgs84_length_m(&near_pole) > wgs84_length_m(&near_equator) * 1.002);
+        assert!(geodesic_length_m(&near_pole) < geodesic_length_m(&near_equator) * 0.996);
+        let mut road = Dataset::new("t", GeometryType::Polyline, vec![]);
+        road.push(Some(Geometry::Line(vec![vec![Coord::new(0.5, -1.0), Coord::new(0.5, 63.0)]])), vec![]);
+        assert_eq!(joined(road, zones(60.995)), north);
+
+        // A dense road, its steps short enough to be measured without a solve: the same zone wins,
+        // and each overlap's length is within a millionth of the solve's.
+        let dense: Vec<Coord> = (0..=6_400).map(|i| Coord::new(0.5, -1.0 + f64::from(i) * 0.01)).collect();
+        for part in [&dense[100..=200], &dense[6_100..=6_199]] {
+            let exact = wgs84_length_m(part);
+            let stepped = length_m(&Geometry::Line(vec![part.to_vec()]));
+            assert!((stepped / exact - 1.0).abs() < 1e-6, "{stepped} m, {exact} m on the ellipsoid");
+        }
+        let mut road = Dataset::new("t", GeometryType::Polyline, vec![]);
+        road.push(Some(Geometry::Line(vec![dense])), vec![]);
+        assert_eq!(joined(road, zones(60.995)), north);
     }
 
     #[test]

@@ -257,7 +257,9 @@ static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 static SIGNED_OUT: AtomicU64 = AtomicU64::new(0);
 
 /// Source revisions are locked before any retained cache. Publication and reload share this
-/// lock; callbacks and I/O must always run after releasing it.
+/// lock. [`if_archive_current`] runs its `f` while holding it (`land`, `keep` and
+/// `remember_info` run there), so such a callback must not do I/O or call back into code that
+/// takes this lock; any other I/O runs after releasing it.
 fn archive_epochs() -> &'static Mutex<HashMap<String, u64>> {
     static E: std::sync::LazyLock<Mutex<HashMap<String, u64>>> = std::sync::LazyLock::new(Mutex::default);
     &E
@@ -1749,6 +1751,36 @@ pub fn download_detailed(url: &str, max: usize, done: DoneDetailed) {
     download_detailed_within(url, max, DOWNLOAD_TIMEOUT, &[], done);
 }
 
+/// Like [`download_detailed`], preserving the final post-redirect [`crate::address::Origin`] and
+/// observed network reach alongside the bytes: for a service's document, whose links reach only as
+/// far as it did.
+pub fn download_detailed_with_origin(url: &str, max: usize, done: DoneFetchedDetailed) {
+    download_fetched_reaching(url, max, DOWNLOAD_TIMEOUT, &[], Reaching::Any, done);
+}
+
+/// Like [`download_within`], preserving the final post-redirect [`crate::address::Origin`] and
+/// observed network reach alongside the bytes.
+pub fn download_within_with_origin(url: &str, max: usize, timeout: std::time::Duration, done: FetchedDone) {
+    download_fetched_reaching(url, max, timeout, &[], Reaching::Any, Box::new(move |r| done(r.map_err(|f| f.message))));
+}
+
+/// Like [`download_limited`], connecting no wider than `ceiling` and giving up after `timeout`
+/// natively (the usual download's when none), preserving the final post-redirect
+/// [`crate::address::Origin`] and observed network reach alongside the bytes: a paged read's
+/// next page is held to where the page before it was read, without recording its address
+/// ([`restrict_to_public`]).
+pub fn download_limited_reaching_with_origin(
+    url: &str,
+    max: usize,
+    timeout: Option<std::time::Duration>,
+    ceiling: crate::address::Reach,
+    done: FetchedDone,
+) {
+    let reaching = if ceiling == crate::address::Reach::Public { Reaching::Public } else { Reaching::Any };
+    let timeout = timeout.unwrap_or(DOWNLOAD_TIMEOUT);
+    download_fetched_reaching(url, max, timeout, &[], reaching, Box::new(move |r| done(r.map_err(|f| f.message))));
+}
+
 /// Like [`download`], preserving the final post-redirect [`crate::address::Origin`] and observed
 /// network reach alongside the downloaded bytes.
 pub fn download_with_origin(url: &str, done: FetchedDone) {
@@ -1797,7 +1829,8 @@ enum Reaching {
     Public,
 }
 
-type DoneFetchedDetailed = Box<dyn FnOnce(Result<Fetched, Failure>) + Send>;
+/// Called once with a download's bytes and where they came from, or what is known of its failure.
+pub type DoneFetchedDetailed = Box<dyn FnOnce(Result<Fetched, Failure>) + Send>;
 
 /// Like [`download_detailed`], giving up after `timeout` natively; a status in `omit` isn't
 /// recorded as a failure.
@@ -2483,6 +2516,57 @@ mod native {
     use crate::address::{Origin, Reach};
     use crate::failure::{Failure, Reason};
 
+    /// Runs `work` on a thread of its own, handing it `done`. When the system refuses a thread,
+    /// `done` hears `refused` (given why) instead, so the caller is answered either way.
+    fn answer_on_own_thread<T: 'static>(
+        done: Box<dyn FnOnce(T) + Send>,
+        refused: impl FnOnce(String) -> T,
+        work: impl FnOnce(Box<dyn FnOnce(T) + Send>) + Send + 'static,
+    ) {
+        let spawn = |work| std::thread::Builder::new().name("rustgis-request".into()).spawn(work).map(drop);
+        answer_on_own_thread_with(spawn, done, refused, work);
+    }
+
+    /// [`answer_on_own_thread`], its thread started by `spawn`, which a test can make refuse.
+    fn answer_on_own_thread_with<T: 'static>(
+        spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+        done: Box<dyn FnOnce(T) + Send>,
+        refused: impl FnOnce(String) -> T,
+        work: impl FnOnce(Box<dyn FnOnce(T) + Send>) + Send + 'static,
+    ) {
+        let held = std::sync::Arc::new(Mutex::new(Some(done)));
+        let given = held.clone();
+        let spawned = spawn(Box::new(move || {
+            let done = given.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Some(done) = done {
+                work(done);
+            }
+        }));
+        if let Err(e) = spawned {
+            let done = held.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Some(done) = done {
+                done(refused(format!("the system refused a thread for the request ({e})")));
+            }
+        }
+    }
+
+    /// A thread the system refuses for a request answers its `done` with the refusal, the request
+    /// unsent.
+    #[cfg(test)]
+    #[test]
+    fn a_refused_thread_answers_the_request_with_the_refusal() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let heard: std::sync::Arc<Mutex<Option<Result<(), String>>>> = std::sync::Arc::default();
+        let (h, sent) = (heard.clone(), std::sync::Arc::new(AtomicBool::new(false)));
+        let s = sent.clone();
+        let done: Box<dyn FnOnce(Result<(), String>) + Send> = Box::new(move |r| *h.lock().unwrap() = Some(r));
+        let refuse = |_| Err(std::io::Error::other("no threads left"));
+        answer_on_own_thread_with(refuse, done, Err, move |_| s.store(true, Ordering::Relaxed));
+        let heard = heard.lock().unwrap().take();
+        assert!(heard.is_some_and(|r| r.is_err_and(|e| e.contains("no threads left"))));
+        assert!(!sent.load(Ordering::Relaxed));
+    }
+
     /// Fetches under way at once, over all servers: two servers at their cap.
     const WORKERS: usize = 2 * PER_HOST;
     /// Fetches under way at once from one server.
@@ -2997,7 +3081,12 @@ mod native {
         }
         let capture = Capture::current();
         let still = super::current_still();
-        std::thread::spawn(move || {
+        // Refused a thread: the file is read without asking, as past the limit.
+        let refused = |_| {
+            HEADS.fetch_sub(1, Relaxed);
+            Ok(super::Head::default())
+        };
+        answer_on_own_thread(done, refused, move |done| {
             super::with_optional_still(still, || {
                 let _scope = capture.enter();
                 let r = super::check_current()
@@ -3108,7 +3197,7 @@ mod native {
     pub(super) fn post_fetched(url: String, body: String, ceiling: Reach, done: FetchedDone) {
         let capture = Capture::current();
         let still = super::current_still();
-        std::thread::spawn(move || {
+        answer_on_own_thread(done, Err, move |done| {
             super::with_optional_still(still, || {
                 let _scope = capture.enter();
                 let timeout = std::time::Duration::from_secs(60);
@@ -3201,17 +3290,21 @@ mod native {
         let capture = Capture::current();
         let still = super::current_still();
         let progress = super::current_progress();
-        std::thread::spawn(move || {
-            super::with_optional_still(still, || {
-                super::with_progress(progress, || {
-                    let _scope = capture.enter();
-                    let r = super::check_current()
-                        .map_err(Failure::from)
-                        .and_then(|_| get_fetched_omitting(&download_agent(timeout), &url, omit));
-                    done(r);
+        answer_on_own_thread(
+            done,
+            |why| Err(Failure::from(why)),
+            move |done| {
+                super::with_optional_still(still, || {
+                    super::with_progress(progress, || {
+                        let _scope = capture.enter();
+                        let r = super::check_current()
+                            .map_err(Failure::from)
+                            .and_then(|_| get_fetched_omitting(&download_agent(timeout), &url, omit));
+                        done(r);
+                    })
                 })
-            })
-        });
+            },
+        );
     }
 
     /// Like [`download_fetched_within`], connecting only to internet addresses ([`public_agent`]).
@@ -3229,20 +3322,24 @@ mod native {
         let capture = Capture::current();
         let still = super::current_still();
         let progress = super::current_progress();
-        std::thread::spawn(move || {
-            super::with_optional_still(still, || {
-                super::with_progress(progress, || {
-                    let _scope = capture.enter();
-                    let r = super::check_current().map_err(Failure::from).and_then(|_| {
-                        fetch_answer(&public_agent(timeout), &url, Reach::Public, true, omit).map(|mut f| {
-                            f.origin = f.origin.narrow_reach(Reach::Public);
-                            f
-                        })
-                    });
-                    done(r);
+        answer_on_own_thread(
+            done,
+            |why| Err(Failure::from(why)),
+            move |done| {
+                super::with_optional_still(still, || {
+                    super::with_progress(progress, || {
+                        let _scope = capture.enter();
+                        let r = super::check_current().map_err(Failure::from).and_then(|_| {
+                            fetch_answer(&public_agent(timeout), &url, Reach::Public, true, omit).map(|mut f| {
+                                f.origin = f.origin.narrow_reach(Reach::Public);
+                                f
+                            })
+                        });
+                        done(r);
+                    })
                 })
-            })
-        });
+            },
+        );
     }
 
     /// Dispatches each queued read through the pool matching its inherited IP ceiling.
@@ -3405,6 +3502,14 @@ mod native {
     pub(super) fn content_range_total(header: &str) -> Option<u64> {
         let (_, len) = header.rsplit_once('/')?;
         len.trim().parse::<u64>().ok().filter(|len| *len > 0)
+    }
+
+    /// The octets a `Content-Range` header says an answer holds (`bytes 200-299/1000`: 200 and
+    /// 299); none when it can't be read.
+    pub(super) fn content_range_span(header: &str) -> Option<(u64, u64)> {
+        let span = header.trim().strip_prefix("bytes")?.trim_start().split('/').next()?;
+        let (a, b) = span.split_once('-')?;
+        Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
     }
 
     /// The sign-ins' tokens a hop to `at` carries, as (header, value, whether a refusal must be
@@ -3653,6 +3758,15 @@ mod native {
             {
                 return Err(rustgis_data::diagnostics::message_with_address(url, super::NO_RANGES).into());
             }
+            // A range answered (206) with other octets than asked for: never read as the range. An
+            // answer may end sooner (the file's end), never start elsewhere or run past the range.
+            if let Some((a, b)) = range.filter(|_| !whole)
+                && let Some((from, to)) = resp.headers().get("content-range").and_then(|v| v.to_str().ok()).and_then(content_range_span)
+                && (from != a || to > b)
+            {
+                let why = format!("the server answered octets {from}-{to}, not the {a}-{b} asked for");
+                return Err(rustgis_data::diagnostics::message_with_address(url, &why).into());
+            }
             let mut buf = Vec::new();
             if !resp.status().is_success() {
                 return Err(format!("HTTP {}", resp.status().as_u16()).into());
@@ -3744,6 +3858,7 @@ mod native {
     }
 }
 
+#[expect(clippy::disallowed_methods, reason = "a thread the system refuses fails the test, as it should")]
 #[cfg(test)]
 mod tests {
     #[test]

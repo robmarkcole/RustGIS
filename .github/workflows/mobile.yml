@@ -350,7 +350,9 @@ jobs:
 
   ios-build:
     name: iOS app
-    runs-on: macos-latest
+    # App Store Connect requires the iOS 27 SDK from April 2027 (ITMS-90725); macos-latest's
+    # newest Xcode is 26.x, the xcode-27 image has Xcode 27. Back to macos-latest once it does.
+    runs-on: xcode-27
     timeout-minutes: 90
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -387,7 +389,10 @@ jobs:
           newest="$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1 || true)"
           [ -n "$newest" ] || { echo "::error::No Xcode on the runner."; exit 1; }
           sudo xcode-select -s "$newest/Contents/Developer"
-          echo "::notice::$(xcodebuild -version | head -1), iOS SDK $(xcrun --sdk iphoneos --show-sdk-version)"
+          sdk="$(xcrun --sdk iphoneos --show-sdk-version)"
+          echo "::notice::$(xcodebuild -version | head -1), iOS SDK $sdk"
+          # App Store Connect requires the iOS 27 SDK from April 2027 (ITMS-90725).
+          [ "${sdk%%.*}" -ge 27 ] || { echo "::error::$(basename "$newest") has the iOS $sdk SDK; App Store uploads need iOS 27 or later."; exit 1; }
 
       # The whole bundle, unsigned: any failure on the way fails the step.
       - name: Build the app
@@ -411,7 +416,7 @@ jobs:
     name: Sign the iOS app
     if: github.event_name != 'pull_request'
     needs: ios-build
-    runs-on: macos-latest
+    runs-on: xcode-27
     timeout-minutes: 30
     environment: mobile-release
     steps:
@@ -529,7 +534,7 @@ jobs:
     name: Upload the iOS app to TestFlight
     if: github.event_name == 'release' || inputs.testflight
     needs: [ios-build, ios-sign]
-    runs-on: macos-latest
+    runs-on: xcode-27
     timeout-minutes: 30
     environment: mobile-release
     steps:

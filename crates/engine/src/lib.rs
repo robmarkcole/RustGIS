@@ -43,6 +43,7 @@ pub mod schema;
 pub mod service_logins;
 pub mod service_tokens;
 pub mod sources;
+pub mod surface;
 #[cfg(test)]
 mod tests;
 mod undo_memory;
@@ -109,6 +110,9 @@ pub struct CommandSpec {
     /// Pure executor-owned resolution for commands whose inputs exceed the common layer selector.
     pub(crate) transition: Option<fn(&cmd::InputContext<'_>, &Value) -> Result<Option<cmd::Selection>, String>>,
     pub(crate) inputs: Option<fn(&cmd::InputContext<'_>, &Value) -> Result<cmd::Inputs, String>>,
+    /// As a step of another command, it is atomic: it runs in a [`Session::savepoint`], undone
+    /// whole when it fails, since a plugin may handle the error and go on.
+    pub(crate) atomic: bool,
 }
 
 fn always(_: &Session) -> Option<&'static str> {
@@ -147,7 +151,13 @@ impl CommandSpec {
             roles: None,
             inputs: None,
             transition: None,
+            atomic: false,
         }
+    }
+    /// See [`CommandSpec::atomic`].
+    pub(crate) const fn atomic(mut self) -> Self {
+        self.atomic = true;
+        self
     }
     /// Declares the effects reviewed for this command; omitted declarations fail closed.
     pub const fn effects(mut self, effects: policy::Effects) -> Self {
@@ -393,6 +403,13 @@ fn clip(s: &str, n: usize) -> String {
 /// The most layer names a notice lists (the rest counted), each cut to 80 characters: the notice
 /// stays well within what a notice keeps.
 const NAMES_SAID: usize = 5;
+
+/// The first ten of `v` for a notice, separated by `; `, then how many more.
+pub(crate) fn listed(v: &[String]) -> String {
+    let more = v.len().saturating_sub(10);
+    let shown = v.iter().take(10).cloned().collect::<Vec<_>>().join("; ");
+    if more > 0 { format!("{shown}; and {more} more") } else { shown }
+}
 
 /// Layer names for a notice: the first [`NAMES_SAID`], each clipped, and how many more.
 fn names_said(names: &[String]) -> String {
@@ -753,18 +770,21 @@ pub(crate) struct StepTally {
     pub(crate) edited: bool,
 }
 
-/// What a command that doesn't mutate can move of what undo restores: the history state
-/// (`edit.undo`), the project replaced (`project.new`), its file (`project.saveAs`), and the
-/// unsaved mark a write that changed layers leaves (Publish to Source). Measured before and after
-/// a shared step ([`Session::shared_step`]), not inferred from what the command may reach. The
-/// project's contents change only by commands that mutate, except its history log, where an
-/// export records itself as a log entry, not an edit, as when it runs by itself.
+/// What a step can move of what undo restores without saying so: the history state
+/// (`edit.undo`), the project replaced (`project.new`), its file (`project.saveAs`), the unsaved
+/// mark a write that changed layers leaves (Publish to Source), and which layers each map has,
+/// in what order, with the id its next layer takes. Measured before and after a shared step
+/// ([`Session::shared_step`]), not inferred from what the command may reach. The project's other
+/// contents (a layer's name, look or features) change only by commands that mutate, except its
+/// history log, where an export records itself as a log entry, not an edit, as when it runs by
+/// itself.
 #[derive(PartialEq, Eq)]
 struct Restored {
     state: u64,
     opened: u64,
     files: ProjectFiles,
     unsaved_marks: u64,
+    layers: Vec<rustgis_map::LayerMark>,
 }
 
 pub struct Session {
@@ -829,6 +849,16 @@ pub struct Session {
     pub registry: Registry,
     /// Bumped on every change so views can cache.
     pub revision: u64,
+    /// The latest external selection admission, including changes on other layers. Mutations
+    /// conservatively record intent too; an older replay cannot advance it past newer intent.
+    pub(crate) selection_intent: u64,
+    /// External selection intent and Similar requests share one admission sequence.
+    pub(crate) selection_sequence: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// A prepared script/model's admission and its inner Similar request sequence.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) selection_admission: Option<(u64, std::sync::Arc<std::sync::atomic::AtomicU64>)>,
+    /// The last Similar request that applied selection here, independently of external intent.
+    pub(crate) similar_selected: (u64, u64),
     /// Bumped each time another project replaces this one (new, open, sample, template), however
     /// the command came (the app, an agent, a script): the interface drops what it kept for the
     /// old one.
@@ -867,7 +897,9 @@ pub struct Session {
     /// Counted losses await the outermost guard's cleanup, including failed nested commands.
     /// Runtime-only: never in Project, undo or PutAside, so replacement cannot erase them.
     loss_notices: Vec<LossNotice>,
-    loss_notice_overflow: u32,
+    /// Occurrences past [`MAX_LOSS_NOTICE_KINDS`], by cause (`None` for unclassified advisories),
+    /// so a strict run still sees the code: at most one entry per code.
+    loss_notice_overflow: Vec<(Option<rustgis_data::loss::LossCode>, u32)>,
     /// Whether this session has said that native HTTPS trusts the bundled CA roots (#1591).
     bundled_roots_said: bool,
     /// Troubleshooting history, independent of the active pane, project files and undo.
@@ -875,6 +907,9 @@ pub struct Session {
     /// Notices given in this session, including ones no longer kept (see [`Session::notices_since`]),
     /// less those a failed command withdrew.
     notices_given: u64,
+    /// Loss notices given in this session by code, including ones no longer kept, less those a
+    /// failed command withdrew (see [`Session::losses_given`]).
+    losses_given: Vec<(rustgis_data::loss::LossCode, u64)>,
     /// Whether the outermost command now running has said that a zoom couldn't reach its place;
     /// `None` between commands. Its inner steps would each say it (a zoom refused by each layer an
     /// add frames): it is said once in a command, however many notices come after.
@@ -943,6 +978,11 @@ pub struct Session {
     /// A task is executing: its steps may not start another task, even through scripts.
     /// Kept across project replacement until the active call returns; never part of undo.
     pub(crate) task_running: bool,
+    /// A command declared as not mutating changed the layers (AGENTS.md): raised when the top-level
+    /// command returns ([`Session::command_epilogue`], every entry), past any step's catch (a
+    /// task's), so the tests fail on it.
+    #[cfg(any(test, feature = "declaration-check"))]
+    pub(crate) declaration_broken: Option<String>,
     /// Models made in this session (lower-cased names); the steps of others may not touch files.
     trusted_models: policy::Trust,
     /// What the last model run did, node by node (`model::RunReport`), kept even when the run
@@ -1323,6 +1363,16 @@ pub(crate) fn edits_features(id: &str) -> bool {
 }
 
 impl Session {
+    /// Attributes replayed selection effects to their initiating script/model. Ordinary
+    /// synchronous actions take a fresh admission, so later user intent wins over queued work.
+    pub(crate) fn selection_epoch(&self) -> u64 {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some((epoch, _)) = &self.selection_admission {
+            return *epoch;
+        }
+        self.selection_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed).wrapping_add(1)
+    }
+
     /// Marks this thread as the desktop window owner for column statistics and shape fitting. Adapters with a
     /// window use the prepared read queue; headless adapters leave this disabled.
     #[cfg(not(target_arch = "wasm32"))]
@@ -1330,6 +1380,29 @@ impl Session {
         self.statistics_window_thread = enabled.then(|| std::thread::current().id());
     }
 
+    /// Keeps the ids new features are given above those field packages hold, in every layer they
+    /// apply to ([`Project::keep_field_floors`]). Run when a project is opened, after every command
+    /// wherever it runs (`invoke`: run, landed from a copy or a read, or a line of a script or task),
+    /// after an export lands, and after Undo and Redo: a floor lives with a layer's rows, which a
+    /// reload, a renewal or a restored snapshot replaces.
+    pub(crate) fn keep_field_floors(&mut self) {
+        self.project.keep_field_floors();
+    }
+
+    /// Whether the open field package's rows are waiting to be kept on this device
+    /// (`offline.keepRows`), as opening a package from home asks.
+    pub fn field_rows_waiting(&self) -> bool {
+        self.project.given.is_some()
+    }
+
+    /// Lets go of the open field package's rows waiting to be kept, when they can't be: the rows
+    /// they share with the project are then no longer held for them.
+    pub fn forget_field_rows(&mut self) {
+        self.project.given = None;
+    }
+
+    /// Starts an independent session with fresh runtime selection intent and request order.
+    /// Prepared script copies explicitly share request order with their originating session.
     pub fn new(mut project: Project) -> Self {
         // The engine's tests never add Shapefile indexes to the user's cache (#1230).
         #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -1369,6 +1442,11 @@ impl Session {
             layout_arrangements: serde_json::Map::new(),
             registry: Registry { commands: cmd::all() },
             revision: 1,
+            selection_intent: 0,
+            selection_sequence: Default::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            selection_admission: None,
+            similar_selected: (0, 0),
             opened: 0,
             exchange: None,
             tool: Tool::Explore,
@@ -1382,10 +1460,11 @@ impl Session {
             on_window_thread: false,
             notices: Vec::new(),
             loss_notices: Vec::new(),
-            loss_notice_overflow: 0,
+            loss_notice_overflow: Vec::new(),
             bundled_roots_said: false,
             diagnostics: rustgis_data::diagnostics::History::default(),
             notices_given: 0,
+            losses_given: Vec::new(),
             beyond_said: None,
             crs_notes_said: Vec::new(),
             grid_pairs: Vec::new(),
@@ -1414,6 +1493,8 @@ impl Session {
             browse_response: None,
             trusted_tasks: Default::default(),
             task_running: false,
+            #[cfg(any(test, feature = "declaration-check"))]
+            declaration_broken: None,
             trusted_models: Default::default(),
             model_run: None,
             project_starts: 0,
@@ -1513,6 +1594,8 @@ impl Session {
         for text in label_notices {
             session.notify_text(text, false);
         }
+        // A project opened: its layers keep new ids above those field packages hold.
+        session.keep_field_floors();
         session
     }
 
@@ -1579,7 +1662,7 @@ impl Session {
     }
 
     /// Hands over a PDF download's bytes with its page drawn off the frame
-    /// ([`cmd::raster::read_download_page`]), for `layer.addDownload {"id"}` as
+    /// ([`cmd::raster::read_download_shared_page`]), for `layer.addDownload {"id"}` as
     /// [`Session::download_landed`] does.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn download_landed_page(&mut self, id: u64, bytes: Vec<u8>, page: rustgis_data::raster::Raster) -> bool {
@@ -1880,8 +1963,15 @@ impl Session {
             self.merge = None;
             self.beyond_said = None;
         }
+        // Taken on every top-level return, a panic's too, so it never reaches the next command.
+        #[cfg(any(test, feature = "declaration-check"))]
+        let broken = outermost.then(|| self.declaration_broken.take()).flatten();
         match result {
-            Ok(result) => result,
+            Ok(result) => {
+                #[cfg(any(test, feature = "declaration-check"))]
+                assert!(broken.is_none(), "{}", broken.unwrap_or_default());
+                result
+            }
             Err(payload) => std::panic::resume_unwind(payload),
         }
     }
@@ -2203,35 +2293,36 @@ impl Session {
         self.guarded_inner(label, true, false, f)
     }
 
-    /// Runs `run`, the command `spec`, as a step of the command running now, in its transaction
-    /// (a script's line, a task's step, a plugin's call): it takes no undo step of its own, and
-    /// what it did goes into [`Session::shared_steps`]. Whether it left a request or changed
-    /// nothing ([`Session::request_only`]) is its own, never the enclosing command's. It edited
-    /// when it mutated and didn't say it changed nothing, or when [`Restored`] moved: a failed
-    /// step that kept a record (a failure note, a source file written) moved the history state.
+    /// Runs `run`, the command `spec`, as a step of the command running now (a script's line, a
+    /// task's step, a plugin's call), in its transaction or, for an [atomic](CommandSpec::atomic)
+    /// command, in a [`Session::savepoint`] of it. It takes no undo step of its own, and what it
+    /// did goes into [`Session::shared_steps`].
+    /// Whether it left a request or changed nothing ([`Session::request_only`]) is its own, never
+    /// the enclosing command's. It edited when it mutates and didn't say it changed nothing, or
+    /// when [`Restored`] moved. A failed step that mutates counts too unless a savepoint undid it:
+    /// telling what it changed would cost a copy of each layer it touched.
     pub(crate) fn shared_step(&mut self, spec: &CommandSpec, run: impl FnOnce(&mut Session) -> CmdResult) -> CmdResult {
         let outer = std::mem::take(&mut self.request_only);
-        let before = self.restored();
-        #[cfg(debug_assertions)]
-        let layers = (!spec.mutates).then(|| self.project.maps.iter().map(Map::layer_mark).collect::<Vec<_>>());
-        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(self)));
+        // Once the account holds an edit, nothing a step does changes it: no need to measure.
+        let before = (!self.shared_steps.edited).then(|| self.restored());
+        let step = |s: &mut Session| if spec.atomic { s.savepoint(spec.label, run) } else { run(s) };
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| step(self)));
         let unchanged = std::mem::replace(&mut self.request_only, outer);
-        let moved = self.restored() != before;
-        // A command that doesn't mutate leaves the layers alone, or the measure above misses it.
-        #[cfg(debug_assertions)]
-        debug_assert!(
-            moved || res.is_err() || layers.is_none_or(|layers| self.project.maps.iter().map(Map::layer_mark).eq(layers)),
-            "{} doesn't mutate but changed the layers",
-            spec.id
-        );
-        // A failed step counts too: in a shared transaction nothing undoes what it did part way.
+        let moved = before.is_some_and(|before| self.restored() != before);
+        let kept = !spec.atomic || matches!(res, Ok(Ok(_)));
         self.shared_steps.requested |= unchanged;
-        self.shared_steps.edited |= moved || (spec.mutates && !unchanged);
+        self.shared_steps.edited |= moved || (spec.mutates && kept && !unchanged);
         res.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
     }
 
     fn restored(&self) -> Restored {
-        Restored { state: self.state, opened: self.opened, files: self.project_files(), unsaved_marks: self.unsaved_marks }
+        Restored {
+            state: self.state,
+            opened: self.opened,
+            files: self.project_files(),
+            unsaved_marks: self.unsaved_marks,
+            layers: self.project.maps.iter().map(Map::layer_mark).collect(),
+        }
     }
 
     fn project_files(&self) -> ProjectFiles {
@@ -2393,7 +2484,12 @@ impl Session {
                 if withdrawn.iter().any(|n| !n.error && !n.written && n.text == BEYOND_PROJECTION) && self.beyond_said == Some(true) {
                     self.beyond_said = Some(false);
                 }
-                let kept: Vec<Notice> = withdrawn.into_iter().filter(|n| n.error || n.written).collect();
+                let (kept, gone): (Vec<Notice>, Vec<Notice>) = withdrawn.into_iter().partition(|n| n.error || n.written);
+                for code in gone.iter().filter_map(Notice::loss) {
+                    if let Some(given) = self.losses_given.iter_mut().find(|(c, _)| *c == code) {
+                        given.1 = given.1.saturating_sub(1);
+                    }
+                }
                 self.notices_given -= (new - kept.len()) as u64;
                 self.notices.extend(kept);
                 let mut recorded_failure = false;
@@ -2657,7 +2753,7 @@ impl Session {
         // Streamed vector windows land after project opening too. Check each installed read
         // once, keeping the same counted notice channel as retained resident expressions.
         let mut landed = Vec::new();
-        let mut dates = Vec::new();
+        let mut dates: Vec<rustgis_data::loss::Note> = Vec::new();
         let mut not_utf8 = Vec::new();
         let mut source_errors = Vec::new();
         let mut source_error_count = 0;
@@ -2681,32 +2777,32 @@ impl Session {
                 // Values in date fields that weren't dates, once for a layer read in place.
                 let (unread, rounded) = layer.source.as_mut().map(|source| source.take_unread_dates()).unwrap_or_default();
                 if let Some(note) = unread {
-                    dates.push(format!(
+                    dates.push(rustgis_data::loss::Note::plain(format!(
                         "{}: some values in its date fields aren't dates and show as empty (Load All Features counts them all); so far, {note}",
                         layer.name
-                    ));
+                    )));
                 }
                 if let Some(note) = rounded {
-                    dates.push(format!(
+                    dates.push(rustgis_data::loss::Note::plain(format!(
                         "{}: some date-times in it have digits past the microsecond and are rounded (Load All Features counts them all); so far, {note}",
                         layer.name
-                    ));
+                    )));
                 }
                 if let Some(note) = layer.source.as_mut().and_then(|source| source.take_null_text()) {
-                    dates.push(format!(
+                    dates.push(rustgis_data::loss::Note::plain(format!(
                         "{}: some text values written as Null in it show as empty (Load All Features counts them all); so far, {note}",
                         layer.name
-                    ));
+                    )));
                 }
                 if let Some(note) = layer.source.as_mut().and_then(|source| source.take_not_utf8()) {
                     not_utf8.push(notice_text::NoticeText::format(
-                        "{name}: some text values in it aren't valid UTF-8 (Load All Features counts them all); so far, {note}",
+                        "{name}: so far, {note} (Load All Features counts them all)",
                         [("name", layer.name.clone().into()), ("note", note.into())],
                     ));
                 }
                 // What else the map's reads of it lost or assumed, each kind once for its opening.
                 for note in layer.source.as_mut().map(|source| source.take_read_notes()).unwrap_or_default() {
-                    dates.push(format!("{}: {note}", layer.name));
+                    dates.push(note.prefixed(&layer.name));
                 }
                 if layer.source.as_mut().is_some_and(|source| source.take_display_window()) {
                     landed.push(&*layer);
@@ -2717,7 +2813,7 @@ impl Session {
             self.notify(message, false);
         }
         for note in dates {
-            self.notify(note, false);
+            self.say(note);
         }
         for note in not_utf8 {
             self.notify_text(note, false);
@@ -2839,9 +2935,8 @@ impl Session {
     /// Says once a session that native HTTPS trusts the bundled Mozilla roots, as a Linux or BSD
     /// system with no CA certificates and no `SSL_CERT_FILE` or `SSL_CERT_DIR` makes it
     /// ([`rustgis_data::http::bundled_roots`]): the trust source was assumed, not the system's.
-    /// Checked after each command and each frame, as the clients are first made when a request is.
-    /// Says, once a session, that native HTTPS fell back to the bundled CA roots, if it did. Run
-    /// with [`Session::notice_landed_rasters`]; a reader of the notices that runs no command (the
+    /// Checked after each command and each frame (with [`Session::notice_landed_rasters`]), as the
+    /// clients are first made when a request is; a reader of the notices that runs no command (the
     /// Python package) calls it first, as a client made on a background thread chooses the trust.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn notice_trust(&mut self) {
@@ -2943,9 +3038,9 @@ impl Session {
     /// A notice about a file or database write that has committed, not a pending delivery or
     /// an in-memory edit. It follows the ordinary redaction, bounds and diagnostics path, but
     /// survives a later enclosing command's rollback.
-    pub(crate) fn notify_written(&mut self, text: impl Into<String>, error: bool) {
+    pub(crate) fn notify_written(&mut self, text: impl Into<String>) {
         let mark = self.notice_mark();
-        self.notify(text, error);
+        self.notify(text, false);
         self.retain_written_notices(mark);
     }
 
@@ -3229,11 +3324,6 @@ impl Session {
         }
         // Layers gone are forgotten, so the map stays as small as the project.
         self.unplaced_checked.retain(|id, _| seen.contains(id));
-        let listed = |v: &[String]| {
-            let more = v.len().saturating_sub(10);
-            let shown = v.iter().take(10).cloned().collect::<Vec<_>>().join("; ");
-            if more > 0 { format!("{shown}; and {more} more") } else { shown }
-        };
         if features > 0 {
             let text = format!(
                 "{features} feature(s) have a place that can't be given in longitude/latitude: the map and the globe draw them without it, and labels' lines, block diagrams and terrain water leave them out ({})",
@@ -3255,6 +3345,23 @@ impl Session {
     pub(crate) fn notify_text(&mut self, text: notice_text::NoticeText, error: bool) {
         use rustgis_data::diagnostics::Severity;
         self.publish_text(text, if error { Severity::Error } else { Severity::Info }, None);
+    }
+
+    /// Says what a reader, a source, a write or a tool said: a note that reports a loss as that
+    /// loss, with its code ([`Session::notify_loss`]), any other as an ordinary notice.
+    pub fn say(&mut self, note: rustgis_data::loss::Note) {
+        match note.loss {
+            Some(code) => self.notify_loss(code, note.text.into()),
+            None => self.notify(note.text, false),
+        }
+    }
+
+    /// [`Session::say`] for what a committed external write said, which restoring a project
+    /// cannot undo ([`Session::notify_written`]).
+    pub(crate) fn say_written(&mut self, note: rustgis_data::loss::Note) {
+        let mark = self.notice_mark();
+        self.say(note);
+        self.retain_written_notices(mark);
     }
 
     /// Reports loss from an in-memory result, with text for translated interfaces.
@@ -3333,8 +3440,10 @@ impl Session {
             loss.text = text(loss.count);
         } else if self.loss_notices.len() < MAX_LOSS_NOTICE_KINDS {
             self.loss_notices.push(LossNotice { code, template, count, text: text(count), source: self.diagnostic_source });
+        } else if let Some(over) = self.loss_notice_overflow.iter_mut().find(|(c, _)| *c == code) {
+            over.1 = over.1.saturating_add(count);
         } else {
-            self.loss_notice_overflow = self.loss_notice_overflow.saturating_add(count);
+            self.loss_notice_overflow.push((code, count));
         }
     }
 
@@ -3343,10 +3452,14 @@ impl Session {
         for loss in std::mem::take(&mut self.loss_notices) {
             self.publish_counted(loss.text, loss.code, loss.source);
         }
-        let overflow = std::mem::take(&mut self.loss_notice_overflow);
-        if overflow > 0 {
-            // The overflow count may combine several causes and unclassified advisories.
-            self.warn(format!("{overflow} further counted notice occurrence(s) could not be described"));
+        for (code, n) in std::mem::take(&mut self.loss_notice_overflow) {
+            match code {
+                Some(code) => {
+                    let text = Self::redacted(&format!("{n} further {} occurrence(s) could not be described", code.spec().id));
+                    self.publish_counted(text, Some(code), self.diagnostic_source);
+                }
+                None => self.warn(format!("{n} further counted notice occurrence(s) could not be described")),
+            }
         }
     }
 
@@ -3400,6 +3513,12 @@ impl Session {
             loss,
         });
         self.notices_given += 1;
+        if let Some(code) = loss {
+            match self.losses_given.iter_mut().find(|(c, _)| *c == code) {
+                Some(given) => given.1 = given.1.saturating_add(1),
+                None => self.losses_given.push((code, 1)),
+            }
+        }
         if self.notices.len() > 200 {
             self.notices.remove(0);
         }
@@ -3413,6 +3532,16 @@ impl Session {
     /// A mark to pass to [`Session::notices_since`].
     pub fn notice_mark(&self) -> u64 {
         self.notices_given
+    }
+
+    /// How many loss notices this session has given for each code, including those the notice
+    /// queue no longer keeps: compare two of these to learn what a run lost, however much it said.
+    /// A failed command's losses are taken back with its changes, except counted losses
+    /// ([`Session::notify_counted`]), which outlive its rollback, and one whose notice the queue
+    /// had already let go: which of those described a committed write isn't kept, so it stays
+    /// counted, erring towards a loss.
+    pub fn losses_given(&self) -> &[(rustgis_data::loss::LossCode, u64)] {
+        &self.losses_given
     }
 
     /// The notices given since `mark` was taken (those still kept): what a command said beside its
@@ -3550,6 +3679,8 @@ impl Session {
             std::mem::swap(&mut self.opened_package, &mut files.opened_package);
         }
         self.project.keep_table_ids(&cur);
+        self.project.keep_field_ids(&cur);
+        self.keep_field_floors();
         self.reopen_layout(open, saved);
         self.keep_time_position(&cur);
         self.keep_tile_pick(&cur);
@@ -3590,6 +3721,8 @@ impl Session {
             std::mem::swap(&mut self.opened_package, &mut files.opened_package);
         }
         self.project.keep_table_ids(&cur);
+        self.project.keep_field_ids(&cur);
+        self.keep_field_floors();
         self.reopen_layout(open, saved);
         self.keep_time_position(&cur);
         self.keep_tile_pick(&cur);

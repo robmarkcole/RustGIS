@@ -1,4 +1,5 @@
 //! Runs frames of the whole UI (no GPU) through every tab, pane, dialog and theme.
+#![expect(clippy::disallowed_methods, reason = "a thread the system refuses fails the test, as it should")]
 
 use egui_kittest::kittest::Queryable;
 use rustgis_ui_egui::RustGisApp;
@@ -1331,12 +1332,25 @@ fn browse_lists_thousands_of_plugins_quickly() {
     h.state_mut().plugins.open = false;
 }
 
-/// Switching to a CJK language keeps drawing the previous one for the frame its fonts are
-/// installed in (`set_fonts` takes effect a frame late), so no frame shows missing-glyph boxes.
+/// A pending CJK font download keeps the previous readable language; switching to a covered
+/// alphabetic language remains immediate.
 #[test]
 fn language_switch_waits_for_its_font() {
+    if std::env::var_os("RUSTGIS_LANGUAGE_SWITCH_TEST").is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "language_switch_waits_for_its_font", "--nocapture"])
+            .env("RUSTGIS_LANGUAGE_SWITCH_TEST", "1")
+            .env("RUSTGIS_BUILTIN_FONTS", "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        return;
+    }
+
     let mut h = harness();
-    // A machine without a CJK face draws Chinese as boxes, whenever it switches.
+    // Keep downloads deterministic: a host with no installed CJK face stays pending.
+    h.state_mut().services.fetch_font = Some(Box::new(|_| {}));
     h.ctx.set_missing_glyph_policy(egui::MissingGlyphPolicy::Tofu);
     h.state_mut().run("ui.language", json!({"code": "en"})).unwrap();
     for _ in 0..4 {
@@ -1348,7 +1362,7 @@ fn language_switch_waits_for_its_font() {
     h.step();
     assert_eq!(h.state().lang().code(), "en", "fonts installed this frame aren't active yet");
     h.step();
-    assert_eq!(h.state().lang().code(), "zh");
+    assert_eq!(h.state().lang().code(), "en", "a deterministic pending download keeps readable English");
     // Back to an alphabetic language: nothing to wait for.
     h.state_mut().run("ui.language", json!({"code": "de"})).unwrap();
     h.step();
@@ -3521,6 +3535,8 @@ fn save_project_dialog_needs_downloads() {
 #[test]
 fn map_context_menu_copies_the_clicked_coordinates() {
     let mut h = harness();
+    // In decimal degrees (the default reads in the map's own coordinates).
+    h.state_mut().run("ui.coordinateFormat", json!({"format": "decimal"})).unwrap();
     for _ in 0..4 {
         h.step();
     }
@@ -4120,6 +4136,8 @@ fn plugin_picks_take_a_place_on_the_map() {
     rp::load(rp::Package::from_zip(&rp::testing::pick_package("ui-pick")).unwrap(), "test").unwrap();
     let _unload = Unload("ui-pick");
     let mut h = harness();
+    // The status bar in decimal degrees, as the pane shows the place.
+    h.state_mut().run("ui.coordinateFormat", json!({"format": "decimal"})).unwrap();
     h.state_mut().run("ui.pane.plugin", json!({"id": "ui-pick"})).unwrap();
     h.run_steps(3);
     let place = |h: &egui_kittest::Harness<'_, RustGisApp>, id: &str| h.state().session.plugin_panels["ui-pick"].values[id].clone();

@@ -29,22 +29,78 @@ pub(crate) fn header_feature_count(path: &Path) -> Result<u64> {
     Ok(reader.header().features_count())
 }
 
+/// The system a FlatGeobuf header says, read as a GeoPackage row's is ([`super::declared_reproject`]).
+fn header_reproject(header_crs: Option<flatgeobuf::Crs<'_>>, notes: &mut Vec<String>) -> Result<Reproject> {
+    // The header's system is read as a GeoPackage row's is ([`super::declared_reproject`]): by
+    // its EPSG code, or by its WKT when the WKT gives another shift to WGS 84 or there is no
+    // EPSG code (#1855). The code is an EPSG one only when the organization is EPSG (or not
+    // given, which means EPSG); 0 is none.
+    let organization = header_crs.and_then(|c| c.org());
+    let epsg_org = organization.is_none_or(|o| o.eq_ignore_ascii_case("epsg"));
+    let code = header_crs.map(|c| i64::from(c.code())).filter(|c| *c != 0);
+    let declared = super::DeclaredCrs {
+        what: "its coordinate system",
+        organization,
+        code,
+        epsg: code.and_then(|c| u32::try_from(c).ok()).filter(|_| epsg_org),
+        wkt1: super::defined(header_crs.and_then(|c| c.wkt())),
+        wkt2: None,
+    };
+    Ok(match super::declared_reproject(declared, notes) {
+        Some(reproject) => reproject?,
+        // Nothing to read it by: longitude/latitude, said when another organization's code
+        // names the system, or a negative code, which can't be an EPSG one.
+        None => {
+            if !epsg_org && let Some(org) = organization {
+                notes.push(format!("its coordinate system is defined by {org}, not EPSG; read as longitude/latitude"));
+            } else if let Some(code) = code {
+                notes.push(format!("its coordinate system's code {code} isn't an EPSG code; read as longitude/latitude"));
+            }
+            Reproject::from_crs(Crs::LonLat, notes)
+        }
+    })
+}
+
+/// The system RustGIS reads a FlatGeobuf in, from its header alone (no feature is read): the
+/// outer error when the header can't be read, the inner one when the system it says is refused
+/// (another body's that can't be placed).
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn header_coord_crs(path: &Path) -> Result<Result<Crs>> {
+    let reader = open_reader(BufReader::new(std::fs::File::open(path)?))?;
+    Ok(header_reproject(reader.header().crs(), &mut Vec::new()).map(|r| r.crs()))
+}
+
+/// Whether a FlatGeobuf's header says WGS 84 longitude/latitude or no system: EPSG:4326 (or no
+/// organization with 4326), OGC CRS84, or a definition read as longitude/latitude.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn header_says_wgs84(path: &Path) -> bool {
+    let Ok(reader) = std::fs::File::open(path).map_err(DataError::from).and_then(|f| open_reader(BufReader::new(f))) else { return false };
+    let Some(crs) = reader.header().crs() else { return true };
+    let org = crs.org().unwrap_or("EPSG");
+    (org.eq_ignore_ascii_case("epsg") && crs.code() == 4326)
+        || (org.eq_ignore_ascii_case("ogc") && crs.code_string().is_some_and(|c| c.eq_ignore_ascii_case("CRS84")))
+        || crs.wkt().is_some_and(|w| crate::raster::wkt::read_wkt(w).is_ok_and(|(c, _)| c == Crs::LonLat))
+}
+
 /// A file or an upload, read and seeked.
 trait ReadSeek: Read + Seek {}
 impl<T: Read + Seek> ReadSeek for T {}
 
 #[derive(Clone, Debug)]
 enum Input {
-    Path(PathBuf, Option<PathBuf>),
+    /// A file, and for a conversion its original's fingerprints as they were when it was
+    /// opened ([`crate::provenance::snapshot`]).
+    Path(PathBuf, Option<Arc<Vec<crate::provenance::Fingerprint>>>),
     Bytes(super::Shared),
     /// A file by its web address.
     Remote(Arc<Remote>),
 }
 
-/// Opens the physical conversion while attributing reads to the original local input.
-fn open_input_file(path: &Path, original: Option<&Path>) -> std::io::Result<std::fs::File> {
+/// Opens the physical conversion while attributing reads to the original local input, as it was
+/// when the conversion was opened: a later change to the original isn't what this conversion holds.
+fn open_input_file(path: &Path, original: Option<&[crate::provenance::Fingerprint]>) -> std::io::Result<std::fs::File> {
     if let Some(original) = original {
-        crate::provenance::path(original);
+        crate::provenance::record(original.iter().cloned());
         std::fs::File::open(path)
     } else {
         crate::provenance::open(path)
@@ -90,7 +146,7 @@ impl FgbOpen {
                     date_columns.len()
                 )),
                 Input::Path(path, original) => {
-                    src.classify_dates(BufReader::new(open_input_file(path, original.as_deref())?), &date_columns)?
+                    src.classify_dates(BufReader::new(open_input_file(path, original.as_deref().map(Vec::as_slice))?), &date_columns)?
                 }
                 Input::Bytes(bytes) => src.classify_dates(Cursor::new(bytes.clone()), &date_columns)?,
             }
@@ -112,11 +168,9 @@ impl FgbSource {
     /// Reads a GDAL conversion's header, retaining its source identity for later worker reads.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn prepare_converted_path(path: &Path, name: &str, original: &Path) -> Result<FgbOpen> {
-        Self::prepare(
-            BufReader::new(open_input_file(path, Some(original))?),
-            Input::Path(path.to_path_buf(), Some(original.to_path_buf())),
-            name,
-        )
+        let ((), seen) = crate::provenance::snapshot(|| crate::provenance::path(original));
+        let seen = Arc::new(seen);
+        Self::prepare(BufReader::new(open_input_file(path, Some(&seen))?), Input::Path(path.to_path_buf(), Some(seen)), name)
     }
 
     /// Opens a GDAL conversion without treating its cache or workspace file as a user input.
@@ -141,14 +195,6 @@ impl FgbSource {
     pub fn open_path(path: &Path, name: &str) -> Result<Self> {
         let f = BufReader::new(crate::provenance::open(path)?);
         Self::new(f, Input::Path(path.to_path_buf(), None), name)
-    }
-
-    /// Opens a private conversion, keeping its files alive for every shared reader.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn open_owned_path(path: &Path, name: &str, workspace: Arc<super::gdal::ReloadWorkspace>) -> Result<Self> {
-        let mut source = Self::open_path(path, name)?;
-        source._workspace = Some(workspace);
-        Ok(source)
     }
 
     pub fn open_bytes(bytes: Vec<u8>, name: &str) -> Result<Self> {
@@ -182,35 +228,7 @@ impl FgbSource {
         let reader = open_reader(r)?;
         let h = reader.header();
         let mut notes = Vec::new();
-        // The header's system is read as a GeoPackage row's is ([`super::declared_reproject`]): by
-        // its EPSG code, or by its WKT when the WKT gives another shift to WGS 84 or there is no
-        // EPSG code (#1855). The code is an EPSG one only when the organization is EPSG (or not
-        // given, which means EPSG); 0 is none.
-        let header_crs = h.crs();
-        let organization = header_crs.and_then(|c| c.org());
-        let epsg_org = organization.is_none_or(|o| o.eq_ignore_ascii_case("epsg"));
-        let code = header_crs.map(|c| i64::from(c.code())).filter(|c| *c != 0);
-        let declared = super::DeclaredCrs {
-            what: "its coordinate system",
-            organization,
-            code,
-            epsg: code.and_then(|c| u32::try_from(c).ok()).filter(|_| epsg_org),
-            wkt1: super::defined(header_crs.and_then(|c| c.wkt())),
-            wkt2: None,
-        };
-        let reproject = match super::declared_reproject(declared, &mut notes) {
-            Some(reproject) => reproject?,
-            // Nothing to read it by: longitude/latitude, said when another organization's code
-            // names the system, or a negative code, which can't be an EPSG one.
-            None => {
-                if !epsg_org && let Some(org) = organization {
-                    notes.push(format!("its coordinate system is defined by {org}, not EPSG; read as longitude/latitude"));
-                } else if let Some(code) = code {
-                    notes.push(format!("its coordinate system's code {code} isn't an EPSG code; read as longitude/latitude"));
-                }
-                Reproject::from_crs(Crs::LonLat, &mut notes)
-            }
-        };
+        let reproject = header_reproject(h.crs(), &mut notes)?;
         let mut date_columns = Vec::new();
         let mut fields = Vec::new();
         let mut slots = Vec::new();
@@ -259,7 +277,7 @@ impl FgbSource {
             crs: reproject.info_crs(),
             // The crate's index search assumes the default node size; other files are scanned.
             indexed: h.index_node_size() == flatgeobuf::packed_r_tree::PackedRTree::DEFAULT_NODE_SIZE && count > 0,
-            notes,
+            notes: notes.into(),
             zm_dropped: false,
         };
         info.note_columns(
@@ -490,7 +508,7 @@ impl FgbSource {
         };
         let r: Option<Box<dyn ReadSeek>> = match &self.input {
             Input::Path(p, original) => {
-                open_input_file(p, original.as_deref()).ok().map(|f| Box::new(BufReader::new(f)) as Box<dyn ReadSeek>)
+                open_input_file(p, original.as_deref().map(Vec::as_slice)).ok().map(|f| Box::new(BufReader::new(f)) as Box<dyn ReadSeek>)
             }
             Input::Bytes(b) => Some(Box::new(Cursor::new(b.clone()))),
             Input::Remote(f) => Some(Box::new(remote::Reader::new(f.clone()))),
@@ -815,7 +833,9 @@ impl FeatureSource for FgbSource {
 
     fn read(&self, req: &Request) -> Result<Batch> {
         match &self.input {
-            Input::Path(p, original) => self.read_with(&|| Ok(BufReader::new(open_input_file(p, original.as_deref())?)), req, false),
+            Input::Path(p, original) => {
+                self.read_with(&|| Ok(BufReader::new(open_input_file(p, original.as_deref().map(Vec::as_slice))?)), req, false)
+            }
             Input::Bytes(b) => self.read_with(&|| Ok(Cursor::new(b.clone())), req, false),
             Input::Remote(f) => self.read_remote(f, req),
         }
@@ -839,7 +859,7 @@ impl FeatureSource for FgbSource {
         let mut chunks = super::chunk_memory::Chunker::new(bytes, visit)?;
         match &self.input {
             Input::Path(p, original) => {
-                self.visit_with(&|| Ok(BufReader::new(open_input_file(p, original.as_deref())?)), extent, &mut chunks)
+                self.visit_with(&|| Ok(BufReader::new(open_input_file(p, original.as_deref().map(Vec::as_slice))?)), extent, &mut chunks)
             }
             Input::Bytes(b) => self.visit_with(&|| Ok(Cursor::new(b.clone())), extent, &mut chunks),
             Input::Remote(_) => Err(DataError::Unsupported("a whole FlatGeobuf by its web address read a chunk at a time".into())),

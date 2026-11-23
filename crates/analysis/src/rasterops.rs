@@ -411,6 +411,10 @@ pub fn weighted_overlay(criteria: &[(Vec<f32>, f64)]) -> Result<Vec<f32>, String
 }
 
 /// Metres between two longitude/latitude points.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the elevation profile's distances stay on the sphere for now: a solve per path vertex costs about 20 times as much on the ellipsoid, and the profile commands run on the command thread"
+)]
 fn dist_m(a: Coord, b: Coord) -> f64 {
     rustgis_geom::haversine_m(a, b)
 }
@@ -1012,61 +1016,175 @@ pub fn classify_min_distance(r: &Raster, bands: &[usize], means: &[(f32, Vec<f64
 /// means are the same on every machine.
 pub fn zonal_means(r: &Raster, bands: &[usize], rings: &[Vec<Coord>]) -> Result<Option<(Vec<f64>, usize)>, crate::control::Cancelled> {
     crate::control::begin(r.height as usize);
-    means_under(r, bands, rings, |rows| {
+    means_under(r, &ZoneIn::LonLat, bands, &[rings], |rows| {
         crate::control::check()?;
         crate::control::advance(rows);
         Ok(())
     })
 }
 
-/// [`zonal_means`], `each_rows(n)` asked as the raster's rows go by, `n` at a time (each row
-/// once, all of them): an error stops it.
+/// [`zonal_means`] of a polygon's `parts` (each its rings, a pixel in two parts counted once) in
+/// `from`: longitude/latitude, or the system its layer holds its coordinates in. A cell's centre is
+/// converted into that system to be tested (none of it when it is the raster's own), by the direct
+/// operation between two datums. Each part's rows count toward the progress.
+pub fn zonal_means_in(r: &Raster, from: Crs, bands: &[usize], parts: &[Vec<Vec<Coord>>]) -> Result<Option<(Vec<f64>, usize)>, String> {
+    let zone = ZoneIn::new(r, from)?;
+    crate::control::begin(parts.len().saturating_mul(r.height as usize));
+    let parts: Vec<&[Vec<Coord>]> = parts.iter().map(Vec::as_slice).collect();
+    Ok(means_under(r, &zone, bands, &parts, |rows| {
+        crate::control::check()?;
+        crate::control::advance(rows);
+        Ok(())
+    })?)
+}
+
+/// The system a zone's rings are in, and how a raster's cells and the zone meet there: in
+/// longitude/latitude through the raster's transformer, or in a layer's own system
+/// ([`crate::tools::ToGrid`] both ways). A cell's centre goes into the zone's system as a point
+/// ([`crate::tools::ToGrid::place`]): a cell centre the zone's system can't hold is outside the
+/// zone, so it isn't counted. The zone's extent goes onto the raster's grid as a polygon's vertices do
+/// ([`crate::tools::ToGrid::vertex`]), Web Mercator taking a latitude past 85.05° as 85.05°, as
+/// it takes a place in longitude/latitude, so a zone reaching past it is still read within its
+/// window.
+pub(crate) enum ZoneIn {
+    LonLat,
+    Own { to_zone: Box<crate::tools::ToGrid>, to_grid: Box<crate::tools::ToGrid> },
+}
+
+impl ZoneIn {
+    pub(crate) fn new(r: &Raster, from: Crs) -> Result<Self, String> {
+        Ok(if from == Crs::LonLat {
+            Self::LonLat
+        } else {
+            Self::Own {
+                to_zone: Box::new(crate::tools::ToGrid::new(r.crs, from)?),
+                to_grid: Box::new(crate::tools::ToGrid::new(from, r.crs)?),
+            }
+        })
+    }
+
+    /// Whether the zone's box `e` holds a pole its system holds, in a system other than the
+    /// raster's: the outline bounds nothing there (on a Web Mercator raster it lands south of the
+    /// cells near the pole), so the whole raster is read.
+    pub(crate) fn holds_a_pole(&self, e: &Extent) -> bool {
+        matches!(self, Self::Own { to_zone, .. } if to_zone.poles().iter().any(|p| e.contains(*p)))
+    }
+
+    /// The columns and rows of `r` whose cell centres can fall in the zone's box `e`: the whole
+    /// raster when the box holds a pole ([`ZoneIn::holds_a_pole`]), else [`zone_window`], with its
+    /// interior samples for a zone in a system of its own.
+    pub(crate) fn window(&self, r: &Raster, e: &Extent) -> (Range<u32>, Range<u32>) {
+        match self {
+            _ if self.holds_a_pole(e) => (0..r.width, 0..r.height),
+            Self::Own { .. } => zone_window(r, e, true, |c| self.grid(r, c)),
+            Self::LonLat => zone_window(r, e, false, |c| self.grid(r, c)),
+        }
+    }
+
+    /// A place in the raster's system in the zone's.
+    pub(crate) fn zone(&self, r: &Raster, w: Coord) -> Option<Coord> {
+        match self {
+            Self::LonLat => r.transformer().to_lonlat(w),
+            Self::Own { to_zone, .. } => to_zone.place(w),
+        }
+    }
+
+    /// A place in the zone's system in the raster's.
+    pub(crate) fn grid(&self, r: &Raster, c: Coord) -> Option<Coord> {
+        match self {
+            Self::LonLat => r.transformer().from_lonlat(c),
+            Self::Own { to_grid, .. } => to_grid.vertex(c),
+        }
+    }
+}
+
+/// [`polygon_mask_with_failures`] for polygons in `from`: longitude/latitude, or the system their
+/// layer holds its coordinates in, converted into the raster's (none of it when that is the
+/// raster's own), by the direct operation between two datums.
+pub fn polygon_mask_in(
+    r: &Raster,
+    from: Crs,
+    polygons: &[Vec<Vec<Coord>>],
+    failed_parts: &mut Vec<usize>,
+) -> Result<Option<(Range<u32>, Range<u32>, Vec<bool>)>, String> {
+    if from == Crs::LonLat {
+        return polygon_mask_with_failures(r, polygons, failed_parts);
+    }
+    let to = crate::tools::ToGrid::new(from, r.crs)?;
+    polygon_mask_on(ToWorld::Own(&to), &r.transform, (r.width, r.height), polygons, failed_parts)
+}
+
+/// [`zonal_means`] over a zone's `parts` (each its rings), `each_rows(n)` asked as the raster's
+/// rows go by, `n` at a time (each row once per part, all of them): an error stops it.
 ///
-/// A cell counts when its centre, in longitude/latitude, lies in the zone (inside the outer ring
-/// and in no hole). Only the cells in the zone's window are tested ([`zone_window`]), not every
-/// cell of the raster, in the same row-major order, so the sums are those of testing them all.
+/// A cell counts when its centre, in the zone's system (`zone`), lies in a part (inside its outer
+/// ring and in none of its holes), once however many parts hold it. Each part's cells are tested in
+/// its window ([`zone_window`]), not every cell of the raster, in the same row-major order, so for
+/// one part the sums are those of testing them all.
 fn means_under(
     r: &Raster,
+    zone: &ZoneIn,
     bands: &[usize],
-    rings: &[Vec<Coord>],
+    parts: &[&[Vec<Coord>]],
     mut each_rows: impl FnMut(usize) -> Result<(), crate::control::Cancelled>,
 ) -> Result<Option<(Vec<f64>, usize)>, crate::control::Cancelled> {
-    let mut e = Extent::EMPTY;
-    for c in rings.iter().flatten() {
-        e.expand(*c);
-    }
+    let boxes: Vec<Extent> = parts
+        .iter()
+        .map(|rings| {
+            rings.iter().flatten().fold(Extent::EMPTY, |mut e, c| {
+                e.expand(*c);
+                e
+            })
+        })
+        .collect();
+    let in_part = |k: usize, ll: Coord| boxes[k].contains(ll) && rustgis_data::geometry::polygon_contains(parts[k], ll);
+    // The earlier parts a cell of a part may also lie in are found by their boxes: a part whose box
+    // meets no earlier one's tests none of them.
+    let index = (parts.len() > 1).then(|| crate::tools::ExtentIndex::new(boxes.iter().copied()));
     let mut sums = vec![0.0; bands.len()];
     let mut n = 0usize;
-    let (cols, rows) = zone_window(r, &e);
-    each_rows((r.height - (rows.end - rows.start)) as usize)?;
-    for row in rows {
-        each_rows(1)?;
-        for col in cols.clone() {
-            let w = r.transform.to_world(f64::from(col) + 0.5, f64::from(row) + 0.5);
-            let Some(ll) = r.transformer().to_lonlat(w) else { continue };
-            if !e.contains(ll) || !rustgis_data::geometry::polygon_contains(rings, ll) {
-                continue;
-            }
-            let vals: Option<Vec<f64>> = bands.iter().map(|b| r.value(*b, i64::from(col), i64::from(row)).map(f64::from)).collect();
-            if let Some(v) = vals {
-                sums.iter_mut().zip(&v).for_each(|(s, x)| *s += x);
-                n += 1;
+    for (k, e) in boxes.iter().enumerate() {
+        let earlier = index.as_ref().filter(|ix| ix.any_candidate(e, |j| j < k && boxes[j].intersects(e)));
+        let (cols, rows) = zone.window(r, e);
+        each_rows((r.height - (rows.end - rows.start)) as usize)?;
+        for row in rows {
+            each_rows(1)?;
+            for col in cols.clone() {
+                let w = r.transform.to_world(f64::from(col) + 0.5, f64::from(row) + 0.5);
+                let Some(ll) = zone.zone(r, w) else { continue };
+                // Counted for the first part that holds it, so parts that overlap count it once.
+                if !in_part(k, ll)
+                    || earlier.is_some_and(|ix| ix.any_candidate(&Extent::new(ll.x, ll.y, ll.x, ll.y), |j| j < k && in_part(j, ll)))
+                {
+                    continue;
+                }
+                let vals: Option<Vec<f64>> = bands.iter().map(|b| r.value(*b, i64::from(col), i64::from(row)).map(f64::from)).collect();
+                if let Some(v) = vals {
+                    sums.iter_mut().zip(&v).for_each(|(s, x)| *s += x);
+                    n += 1;
+                }
             }
         }
     }
     Ok((n > 0).then(|| (sums.into_iter().map(|s| s / n as f64).collect(), n)))
 }
 
-/// The columns and rows of `r` whose cell centres can fall in the longitude/latitude extent `e`:
-/// its outline placed on the raster's grid, with two cells to spare. Each side is sampled, and
-/// each stretch between samples near the raster is halved until its ends are at most a cell
-/// apart, so a side that curves on the grid (a parallel on a polar raster) bows only a fraction
-/// of a cell between them, whatever the zone's size. A stretch whose ends are farther from the
-/// raster than the distance between them isn't halved: that takes the side not to fold back
-/// within one stretch (a sixty-fourth of the side at first), which a projection's smooth image of
-/// a parallel or meridian doesn't. The whole raster when a point can't be placed; none when `e` is
-/// empty.
-fn zone_window(r: &Raster, e: &Extent) -> (Range<u32>, Range<u32>) {
+/// The columns and rows of `r` whose cell centres can fall in the extent `e`, in the zone's system
+/// (`to_grid` places it in the raster's): its outline placed on the raster's grid, with two cells
+/// to spare. Each side is sampled, and each stretch between samples near the raster is halved until
+/// its ends are at most a cell apart, so a side that curves on the grid (a parallel on a polar
+/// raster) bows only a fraction of a cell between them, whatever the zone's size. A stretch whose
+/// ends are farther from the raster than the distance between them isn't halved: that takes the
+/// side not to fold back within one stretch (a sixty-fourth of the side at first), which a
+/// projection's smooth image of a parallel or meridian doesn't. The whole raster when a point can't
+/// be placed; none when `e` is empty.
+///
+/// With `interior` (a zone held in a system other than longitude/latitude), places inside `e` are
+/// placed too, a sixteenth of it apart: when one can't be, or lands outside the outline's window,
+/// the zone's box holds a place the raster's grid can't take in one piece, and the whole raster is
+/// read. (A box holding a pole, whose outline lands south of a Web Mercator raster's cells near
+/// it, is read whole before this: `means_under`.)
+fn zone_window(r: &Raster, e: &Extent, interior: bool, to_grid: impl Fn(Coord) -> Option<Coord>) -> (Range<u32>, Range<u32>) {
     if e.is_empty() {
         return (0..0, 0..0);
     }
@@ -1076,7 +1194,7 @@ fn zone_window(r: &Raster, e: &Extent) -> (Range<u32>, Range<u32>) {
     let whole = (0..r.width, 0..r.height);
     let (w, h) = (f64::from(r.width), f64::from(r.height));
     let place = |ll: Coord| {
-        let (col, row) = r.transform.to_pixel(r.transformer().from_lonlat(ll)?);
+        let (col, row) = r.transform.to_pixel(to_grid(ll)?);
         (col.is_finite() && row.is_finite()).then_some((col, row))
     };
     let sides: [(Coord, Coord); 4] = [
@@ -1113,11 +1231,23 @@ fn zone_window(r: &Raster, e: &Extent) -> (Range<u32>, Range<u32>) {
             stretches.push((tm, pm, t1, p1, depth + 1));
         }
     }
+    let (c0, r0, c1, r1) = (c0.floor() - 2.0, r0.floor() - 2.0, c1.ceil() + 2.0, r1.ceil() + 2.0);
+    if interior {
+        const INSIDE: u32 = 16;
+        for i in 1..INSIDE {
+            for j in 1..INSIDE {
+                let (u, v) = (f64::from(i) / f64::from(INSIDE), f64::from(j) / f64::from(INSIDE));
+                let Some((col, row)) = place(Coord::new(e.min_x + u * (e.max_x - e.min_x), e.min_y + v * (e.max_y - e.min_y))) else {
+                    return whole;
+                };
+                if !(c0..=c1).contains(&col) || !(r0..=r1).contains(&row) {
+                    return whole;
+                }
+            }
+        }
+    }
     let clamp = |v: f64, n: u32| v.clamp(0.0, f64::from(n)) as u32;
-    (
-        (clamp(c0.floor() - 2.0, r.width)..clamp(c1.ceil() + 2.0, r.width)),
-        (clamp(r0.floor() - 2.0, r.height)..clamp(r1.ceil() + 2.0, r.height)),
-    )
+    ((clamp(c0, r.width)..clamp(c1, r.width)), (clamp(r0, r.height)..clamp(r1, r.height)))
 }
 
 /// Each class's mean of `bands` over the pixels under its training polygons (lon/lat rings, each
@@ -1125,6 +1255,19 @@ fn zone_window(r: &Raster, e: &Extent) -> (Range<u32>, Range<u32>) {
 /// under its polygons left out. Each polygon's rows count toward the run's progress, and a
 /// cancelled run stops (#1291).
 pub fn class_means(r: &Raster, bands: &[usize], polygons: &[(String, Vec<Vec<Coord>>)]) -> Result<Vec<(String, Vec<f64>, usize)>, String> {
+    class_means_in(r, Crs::LonLat, bands, polygons)
+}
+
+/// [`class_means`] of training polygons whose rings are in `from`: longitude/latitude, or the
+/// system their layer holds its coordinates in, a cell's centre tested there ([`ZoneIn`]: none of
+/// it converted when that is the raster's own).
+pub fn class_means_in(
+    r: &Raster,
+    from: Crs,
+    bands: &[usize],
+    polygons: &[(String, Vec<Vec<Coord>>)],
+) -> Result<Vec<(String, Vec<f64>, usize)>, String> {
+    let zone = ZoneIn::new(r, from)?;
     crate::control::begin(polygons.len().saturating_mul(r.height as usize));
     let mut classes: Vec<(String, Vec<f64>, usize)> = Vec::new();
     for (key, rings) in polygons {
@@ -1133,7 +1276,7 @@ pub fn class_means(r: &Raster, bands: &[usize], polygons: &[(String, Vec<Vec<Coo
             crate::control::advance(rows);
             Ok(())
         };
-        let Some((m, n)) = means_under(r, bands, rings, counted)? else { continue };
+        let Some((m, n)) = means_under(r, &zone, bands, &[rings.as_slice()], counted)? else { continue };
         match classes.iter_mut().find(|c| c.0 == *key) {
             Some(c) => {
                 let total = c.2 + n;
@@ -1289,7 +1432,16 @@ pub fn transform_polygon_to_lonlat(rings: &[Vec<Coord>], tr: Option<&Transformer
     Ok(out_rings)
 }
 
+/// The polygon parts of a (multi-)polygon feature, checked and taken apart into rings, in the
+/// system they are in: [`transform_feature_polygons_to_lonlat`] with no transformer. It doesn't
+/// look at Cancel: a caller looping over features does, between them.
+pub fn validated_polygon_parts(polys: &[Vec<Vec<Coord>>]) -> Result<Vec<Vec<Vec<Coord>>>, PolygonTransformError> {
+    transform_feature_polygons_to_lonlat(polys, None)
+}
+
 /// Transforms and validates all polygon parts of a (multi-)polygon feature to WGS 84 lon/lat coordinates.
+/// With no transformer (`tr` `None`), it only checks the parts and takes them apart into rings,
+/// in whatever system they are in.
 pub fn transform_feature_polygons_to_lonlat(
     polys: &[Vec<Vec<Coord>>],
     tr: Option<&Transformer>,
@@ -1389,8 +1541,26 @@ pub fn parse_bands_str(s: &str, total_bands: usize) -> Result<Vec<usize>, String
     Ok(out)
 }
 
+/// How polygons' places reach a grid's coordinate system: from longitude/latitude through its
+/// transformer, or from a run's own system ([`crate::tools::ToGrid`]: as they are when the grid is
+/// in it too).
+#[derive(Clone, Copy)]
+pub(crate) enum ToWorld<'a> {
+    LonLat(&'a Transformer),
+    Own(&'a crate::tools::ToGrid),
+}
+
+impl ToWorld<'_> {
+    fn world(&self, c: Coord) -> Option<Coord> {
+        match self {
+            Self::LonLat(tr) => tr.from_lonlat(c),
+            Self::Own(to) => to.vertex(c),
+        }
+    }
+}
+
 /// Projects a complete ring to the raster grid without dropping failed vertices.
-fn project_ring(tr: &Transformer, t: &GeoTransform, ring: &[Coord]) -> Option<Vec<(f64, f64)>> {
+fn project_ring(tr: ToWorld<'_>, t: &GeoTransform, ring: &[Coord]) -> Option<Vec<(f64, f64)>> {
     if ring.len() < 3 {
         return None;
     }
@@ -1399,7 +1569,7 @@ fn project_ring(tr: &Transformer, t: &GeoTransform, ring: &[Coord]) -> Option<Ve
             if !c.is_finite() {
                 return None;
             }
-            let pt = t.to_pixel(tr.from_lonlat(c)?);
+            let pt = t.to_pixel(tr.world(c)?);
             (pt.0.is_finite() && pt.1.is_finite()).then_some(pt)
         })
         .collect()
@@ -1424,13 +1594,13 @@ pub fn polygon_mask_with_failures(
     polygons: &[Vec<Vec<Coord>>],
     failed_parts: &mut Vec<usize>,
 ) -> Result<Option<(Range<u32>, Range<u32>, Vec<bool>)>, String> {
-    polygon_mask_on(r.transformer(), &r.transform, (r.width, r.height), polygons, failed_parts)
+    polygon_mask_on(ToWorld::LonLat(r.transformer()), &r.transform, (r.width, r.height), polygons, failed_parts)
 }
 
 /// [`polygon_mask_with_failures`] on a grid of `size` (columns, rows) cells placed by `t` in the
 /// coordinate system of `tr`, with no raster on it yet.
 pub(crate) fn polygon_mask_on(
-    tr: &Transformer,
+    tr: ToWorld<'_>,
     t: &GeoTransform,
     size: (u32, u32),
     polygons: &[Vec<Vec<Coord>>],
@@ -1465,8 +1635,8 @@ pub(crate) fn polygon_mask_on(
     Ok(Some((cols, rows, trimmed)))
 }
 
-/// Polygons (each an exterior ring and its holes, in longitude/latitude) projected to a grid's
-/// pixels, with the window of the grid around them.
+/// Polygons (each an exterior ring and its holes, their places reaching the grid's system by a
+/// [`ToWorld`]) projected to a grid's pixels, with the window of the grid around them.
 pub(crate) struct Placed {
     parts: Vec<Vec<Vec<(f64, f64)>>>,
     width: u32,
@@ -1487,7 +1657,7 @@ impl Placed {
     /// `None` when no polygon can be placed or none reaches the grid of `size` (columns, rows).
     /// The zero-based indices of the rejected parts are appended to `failed_parts`.
     pub(crate) fn new(
-        tr: &Transformer,
+        tr: ToWorld<'_>,
         t: &GeoTransform,
         size: (u32, u32),
         polygons: &[Vec<Vec<Coord>>],
@@ -1683,6 +1853,17 @@ pub(crate) fn zonal_statistics_with_failures(
     polygons: &[Vec<Vec<Coord>>],
     failed_parts: &mut Vec<usize>,
 ) -> Result<Vec<ZoneStats>, String> {
+    zonal_statistics_from(r, ToWorld::LonLat(r.transformer()), bands, polygons, failed_parts)
+}
+
+/// [`zonal_statistics_with_failures`] for polygons whose places reach the raster's system by `to`.
+pub(crate) fn zonal_statistics_from(
+    r: &Raster,
+    to: ToWorld<'_>,
+    bands: &[usize],
+    polygons: &[Vec<Vec<Coord>>],
+    failed_parts: &mut Vec<usize>,
+) -> Result<Vec<ZoneStats>, String> {
     r.require_coordinates()?;
     for &b in bands {
         if b >= r.band_count() {
@@ -1693,7 +1874,7 @@ pub(crate) fn zonal_statistics_with_failures(
         return Ok(Vec::new());
     }
 
-    let Some((cols, rows, mask)) = polygon_mask_with_failures(r, polygons, failed_parts)? else {
+    let Some((cols, rows, mask)) = polygon_mask_on(to, &r.transform, (r.width, r.height), polygons, failed_parts)? else {
         return Ok(vec![ZoneStats::default(); bands.len()]);
     };
 
@@ -2586,9 +2767,11 @@ mod tests {
                 }
                 polygons.push(rings);
             }
-            let found = polygon_mask_on(&tr, &t, (width, height), &polygons, &mut Vec::new()).unwrap();
-            let parts: Vec<Vec<Vec<(f64, f64)>>> =
-                polygons.iter().map(|rings| rings.iter().map(|ring| project_ring(&tr, &t, ring).unwrap()).collect()).collect();
+            let found = polygon_mask_on(ToWorld::LonLat(&tr), &t, (width, height), &polygons, &mut Vec::new()).unwrap();
+            let parts: Vec<Vec<Vec<(f64, f64)>>> = polygons
+                .iter()
+                .map(|rings| rings.iter().map(|ring| project_ring(ToWorld::LonLat(&tr), &t, ring).unwrap()).collect())
+                .collect();
             let want = plain(&parts, width, height);
             let mut got = vec![false; want.len()];
             if let Some((cols, rows, mask)) = found {
@@ -2987,14 +3170,14 @@ mod tests {
 
         // Multipart features
         let multi_valid = vec![vec![ext.clone(), hole1.clone()], vec![sq(20.0, 20.0, 30.0, 30.0)]];
-        let multi_res = transform_feature_polygons_to_lonlat(&multi_valid, None).unwrap();
+        let multi_res = validated_polygon_parts(&multi_valid).unwrap();
         assert_eq!(multi_res.len(), 2);
         assert_eq!(multi_res[0].len(), 2);
         assert_eq!(multi_res[1].len(), 1);
 
         // Multipart with failing part
         let multi_bad = vec![vec![ext.clone()], vec![vec![Coord::new(1.0, 1.0)]]];
-        assert!(transform_feature_polygons_to_lonlat(&multi_bad, None).is_err());
+        assert!(validated_polygon_parts(&multi_bad).is_err());
     }
 
     #[test]
@@ -3035,5 +3218,41 @@ mod tests {
         assert!(parse_bands_str("1,,2", total).is_err(), "empty item between commas is invalid");
         assert!(parse_bands_str(",", total).is_err(), "standalone comma is invalid");
         assert!(parse_bands_str(";", total).is_err(), "standalone semicolon is invalid");
+    }
+
+    /// A polar zone held in its own system on a Web Mercator raster near the pole: the zone's
+    /// outline lands south of the raster, its inside on it. Every cell whose centre is in the zone
+    /// counts, as a scan of them all finds.
+    #[test]
+    fn a_polar_zone_counts_the_cells_inside_it_beyond_its_outline() {
+        let merc = Crs::WebMercator.transformer().unwrap_or_else(|e| panic!("{e}"));
+        let (Some(sw), Some(ne)) = (merc.from_lonlat(Coord::new(-10.0, 84.0)), merc.from_lonlat(Coord::new(10.0, 85.0))) else {
+            panic!("the corners are in Web Mercator")
+        };
+        let cell = 5_000.0;
+        let (w, h) = (((ne.x - sw.x) / cell).ceil() as u32, ((ne.y - sw.y) / cell).ceil() as u32);
+        let gt = GeoTransform { origin_x: sw.x, origin_y: ne.y, pixel_width: cell, pixel_height: -cell };
+        let r = Raster::new("polar", w, h, vec![vec![1.0; (w * h) as usize]], gt, Crs::WebMercator, None, ColorHint::Gray, "Float32")
+            .unwrap_or_else(|e| panic!("{e}"));
+        // NSIDC Sea Ice Polar Stereographic North: squares of 1,000 km each way about the pole,
+        // their sides near 77°N to 81°N.
+        let polar = Crs::Epsg(3413);
+        // Centred on the pole, and off it.
+        let to_polar = polar.transformer().unwrap_or_else(|e| panic!("{e}"));
+        // The last reaches far north and east: no sample inside it lands near the pole.
+        for (x0, x1, y0, y1) in [(-1e6, 1e6, -1e6, 1e6), (-0.9e6, 1.1e6, -1.05e6, 0.95e6), (-1e6, 31e6, -1e6, 31e6)] {
+            let ring = vec![Coord::new(x0, y0), Coord::new(x1, y0), Coord::new(x1, y1), Coord::new(x0, y1), Coord::new(x0, y0)];
+            let mut inside = 0;
+            for row in 0..h {
+                for col in 0..w {
+                    let c = r.transform.to_world(f64::from(col) + 0.5, f64::from(row) + 0.5);
+                    let p = merc.to_lonlat(c).and_then(|ll| to_polar.from_lonlat(ll)).unwrap_or_else(|| panic!("{c:?} is in EPSG:3413"));
+                    inside += usize::from(p.x > x0 && p.x < x1 && p.y > y0 && p.y < y1);
+                }
+            }
+            assert!(inside > 1000, "{inside} cells are in the zone");
+            let got = zonal_means_in(&r, polar, &[0], &[vec![ring]]).unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(got, Some((vec![1.0], inside)), "{x0} {x1} {y0} {y1}");
+        }
     }
 }

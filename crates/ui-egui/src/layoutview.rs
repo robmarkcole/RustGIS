@@ -6,7 +6,7 @@
 
 use egui::{Align2, Color32, CornerRadius, CursorIcon, Pos2, Rect, Sense, Stroke, Ui, pos2, vec2};
 use rustgis_engine::map::layout::{
-    Arrange, ArrowStyle, Background, ChartOrder, CoordFormat, Element, ElementKind, Grid, GridKind, GridStyle, INK, LEGEND_TEXT_SIZE,
+    Arrange, ArrowStyle, Background, ChartOrder, CoordFormat, Element, ElementKind, Grid, GridKind, GridStyle, INK, LAYOUT_TEXT_SIZE,
     Layout, LineHead, MAX_BACKGROUND_PADDING, MAX_BACKGROUND_RADIUS, MAX_BACKGROUND_WIDTH, MAX_CHART_BARS, MAX_CHART_DECIMALS,
     MAX_COLORBAR_TICKS, MAX_FRAME_SCALE, MAX_GRID_WIDTH, MAX_LEGEND_COLUMNS, MAX_SCALE_DIVISIONS, MAX_TICK_MM, MIN_FRAME_SCALE,
     Orientation, PT_PER_MM, ScaleBarStyle, ScaleUnits, TextAlign, TickSide, chart_stack_refusal, frame_camera, line_angle, line_length,
@@ -61,8 +61,12 @@ const FRAMES_REDRAW_S: f64 = 0.25;
 /// Says, once each, why frames drawn for a page or a preview drew layers without their cast
 /// shadows (see [`rustgis_engine::render::shadows_said`]), as the map view says them.
 pub(crate) fn say_frame_shadows(app: &mut RustGisApp, said: &rustgis_engine::render::ShadowsSaid) {
-    for e in &said.notices {
-        if app.map.tile_errors.insert(e.clone()) {
+    // Keyed by kind, as the map view keys its own (`say_approximations`): an approximation's text
+    // carries a count that changes as the page is drawn again, and the map view and a page say
+    // each kind once between them.
+    for (i, e) in said.notices.iter().enumerate() {
+        let key = said.keys.get(i).cloned().unwrap_or_else(|| e.clone());
+        if app.map.tile_errors.insert(key) {
             app.session.warn(e.clone());
         }
     }
@@ -1398,7 +1402,6 @@ fn text_field(
     None
 }
 
-/// A map frame's grid options; `set` sends the changed ones (`false` removes the grid).
 /// An outline in a map frame's properties (its extent indicator, its border): the command key its
 /// changes go under, its width's drag id, and its colour and width (points) within `range`.
 struct Outline {
@@ -1445,6 +1448,7 @@ fn outline_rows(
     });
 }
 
+/// A map frame's grid options; `set` sends the changed ones (`false` removes the grid).
 fn grid_properties(app: &mut RustGisApp, ui: &mut Ui, grid: Option<&Grid>, id: u32, set: &dyn Fn(&mut RustGisApp, Value)) {
     let mut on = grid.is_some();
     if ui.checkbox(&mut on, tl!("Show grid")).changed() {
@@ -1569,6 +1573,10 @@ fn grid_properties(app: &mut RustGisApp, ui: &mut Ui, grid: Option<&Grid>, id: u
         ui.end_row();
         if !g.labels {
             return;
+        }
+        // Its labels' points; their room from the edge and MGRS squares' names follow (#2581).
+        if let Some(pt) = text_size_row(ui, tl!("Label size"), key("labelSize"), g.label_size) {
+            set(app, json!({"labelSize": pt}));
         }
         if measured {
             let input_label = ui.label(tl!("MGRS labels"));
@@ -1843,23 +1851,9 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                         }
                         ui.end_row();
                         // Its names' and labels' points; the title, rows and swatches follow (#2581).
-                        let input_label = ui.label(tl!("Text size"));
-                        let mut pt = *text_size;
-                        let drag = Dragged::lend(ui, drag_key("textSize"), &mut pt);
-                        let r = ui
-                            .add(
-                                egui::DragValue::new(&mut pt)
-                                    .update_while_editing(false)
-                                    .range(LEGEND_TEXT_SIZE)
-                                    .speed(0.1)
-                                    .max_decimals(1)
-                                    .suffix(" pt"),
-                            )
-                            .labelled_by(input_label.id);
-                        if drag.settled(ui, &r, &mut pt) && (pt - text_size).abs() > 1e-6 {
+                        if let Some(pt) = text_size_row(ui, tl!("Text size"), drag_key("textSize"), *text_size) {
                             update(app, json!({"textSize": pt}));
                         }
-                        ui.end_row();
                     }
                     ElementKind::Colorbar { frame, layer, title, orientation, ticks, tick_side, reverse, .. } => {
                         let input_label = ui.label(tl!("Title"));
@@ -2010,7 +2004,7 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                             ui.end_row();
                         }
                     }
-                    ElementKind::ScaleBar { units, divisions, style, color, fill, .. } => {
+                    ElementKind::ScaleBar { units, divisions, style, color, fill, text_size, .. } => {
                         let input_label = ui.label(tl!("Style"));
                         egui::ComboBox::from_id_salt(("scale_style", id))
                             .selected_text(tl!(style.label()))
@@ -2047,6 +2041,10 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                             update(app, json!({"divisions": n}));
                         }
                         ui.end_row();
+                        // Its labels' points; their room follows, the bar keeping its size (#2581).
+                        if let Some(pt) = text_size_row(ui, tl!("Text size"), drag_key("textSize"), *text_size) {
+                            update(app, json!({"textSize": pt}));
+                        }
                         // The fill is the alternating bar's light divisions: the other styles draw none.
                         let colors = [("Color", "color", *color), ("Fill", "fill", *fill)];
                         let shown = if *style == ScaleBarStyle::Alternating { 2 } else { 1 };
@@ -2715,6 +2713,20 @@ fn first_ink(background: Option<&Background>) -> rustgis_engine::map::Rgba {
     if crate::theme::contrast(shown, Color32::WHITE) > crate::theme::contrast(shown, crate::theme::c32(INK)) { white } else { INK }
 }
 
+/// A row of a layout element's text size in points, within [`LAYOUT_TEXT_SIZE`], labelled `label`
+/// (#2581): the size it settles on when it differs from `current`.
+fn text_size_row(ui: &mut egui::Ui, label: impl Into<egui::WidgetText>, key: egui::Id, current: f64) -> Option<f64> {
+    let input_label = ui.label(label);
+    let mut pt = current;
+    let drag = Dragged::lend(ui, key, &mut pt);
+    let r = ui
+        .add(egui::DragValue::new(&mut pt).update_while_editing(false).range(LAYOUT_TEXT_SIZE).speed(0.1).max_decimals(1).suffix(" pt"))
+        .labelled_by(input_label.id);
+    let settled = drag.settled(ui, &r, &mut pt) && (pt - current).abs() > 1e-6;
+    ui.end_row();
+    settled.then_some(pt)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2725,6 +2737,23 @@ mod tests {
     use egui::{Event, Key, Modifiers, PointerButton, Pos2, Rect, vec2};
     use serde_json::json;
     use std::{cell::Cell, rc::Rc};
+
+    /// A page or preview says each kind of approximation once, as the map view does, though its
+    /// count changes as the page is drawn again (#2657).
+    #[test]
+    fn frame_approximations_are_said_once_a_kind() {
+        let mut app = RustGisApp::with_sample();
+        let mark = app.session.notice_mark();
+        let said = |n: u32| rustgis_engine::render::ShadowsSaid {
+            notices: vec![format!("Roads: {n} dashed line(s) drawn solid")],
+            keys: vec!["approximated\0Roads\0dashes".to_string()],
+            to_come: false,
+        };
+        super::say_frame_shadows(&mut app, &said(5));
+        super::say_frame_shadows(&mut app, &said(7));
+        let n = app.session.notices_since(mark).iter().filter(|n| n.text.starts_with("Roads: ")).count();
+        assert_eq!(n, 1);
+    }
 
     /// Ink starts white only over a dark background, so turning it on never hides the text (#2257).
     #[test]
@@ -3661,8 +3690,15 @@ mod tests {
     fn the_format_pane_tells_the_box_from_the_200_line_limit() {
         use crate::layoutview::lines_left_out_label;
         use rustgis_engine::render::layout::TextLoss;
-        let loss =
-            |left_out, below_box, past_limit| TextLoss { id: 1, name: "Note".into(), left_out, at_least: false, below_box, past_limit };
+        let loss = |left_out, below_box, past_limit| TextLoss {
+            id: 1,
+            name: "Note".into(),
+            left_out,
+            at_least: false,
+            below_box,
+            past_limit,
+            off_page: false,
+        };
         assert_eq!(lines_left_out_label(&loss(0, false, false)), None);
         assert_eq!(lines_left_out_label(&loss(3, true, false)).as_deref(), Some("3 lines don't fit the box"));
         assert_eq!(lines_left_out_label(&loss(50, false, true)).as_deref(), Some("50 lines aren't drawn: a text draws 200 at most"));

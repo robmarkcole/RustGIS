@@ -668,7 +668,7 @@ fn a_nan_shape_outside_an_area_its_system_cant_bound_is_counted_as_of_the_layer(
         let r = Reproject::from_crs(crs, &mut Vec::new());
         assert!(r.extent_from_lonlat(&view).is_none(), "the view's edge is refused");
         const SAID: &str = "have a coordinate that isn't a number under a bounding box that is one";
-        let said = |notes: &[String]| notes.iter().filter(|n| n.contains(SAID)).cloned().collect::<Vec<_>>();
+        let said = |notes: &[crate::loss::Note]| notes.iter().filter(|n| n.contains(SAID)).map(|n| n.text.clone()).collect::<Vec<_>>();
         let reads = |src: &dyn FeatureSource| {
             let read = src.read(&Request { extent: Some(view), ..Request::all() }).unwrap();
             let mut kept = 0;
@@ -722,7 +722,7 @@ fn a_nan_shape_under_a_finite_box_is_said_when_left_out() {
             p
         };
         const SAID: &str = "have a coordinate that isn't a number under a bounding box that is one";
-        let said = |notes: &[String]| notes.iter().filter(|n| n.contains(SAID)).cloned().collect::<Vec<_>>();
+        let said = |notes: &[crate::loss::Note]| notes.iter().filter(|n| n.contains(SAID)).map(|n| n.text.clone()).collect::<Vec<_>>();
         let chunk_notes = |src: &dyn FeatureSource, extent| {
             let batch = src.visit_chunks(extent, 1 << 20, &mut |_| Ok(())).unwrap();
             (batch.skipped, said(&batch.notes))
@@ -803,4 +803,117 @@ fn a_nan_shape_under_a_finite_box_is_said_when_left_out() {
         assert_eq!(chunk_notes(src.as_ref(), None), (1, Vec::new()));
     });
     std::fs::remove_dir_all(fixture).unwrap();
+}
+/// A streamed Shapefile leaves a record marked deleted out with its shape, as a whole read does,
+/// and counts it; a clean one says nothing of it.
+#[test]
+fn a_streamed_shapefile_counts_its_deleted_records() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("pts.shp");
+    let mut ds = Dataset::new("pts", GeometryType::Point, vec![crate::Field::new("name", crate::FieldType::Text)]);
+    for (k, name) in ["a", "b", "c"].iter().enumerate() {
+        ds.push(Some(Geometry::Point(Coord::new(k as f64, k as f64))), vec![crate::Value::Text((*name).into())]);
+    }
+    write_shapefile(&ds, &path);
+    let said = |r: &crate::ReadReport| r.messages.iter().filter(|m| m.contains("marked deleted")).cloned().collect::<Vec<_>>();
+    cache::with_index_dir(tmp.path().join("cache"), || {
+        let (clean, report) = crate::source::materialize(&ShpSource::open_path(&path, "pts").unwrap()).unwrap();
+        assert_eq!(clean.features.len(), 3);
+        assert!(said(&report).is_empty(), "{:?}", report.messages);
+        let dbf_path = path.with_extension("dbf");
+        let mut dbf = std::fs::read(&dbf_path).unwrap();
+        let header = usize::from(u16::from_le_bytes([dbf[8], dbf[9]]));
+        let len = usize::from(u16::from_le_bytes([dbf[10], dbf[11]]));
+        dbf[header + len] = b'*';
+        std::fs::write(&dbf_path, &dbf).unwrap();
+        let (ds, report) = crate::source::materialize(&ShpSource::open_path(&path, "pts").unwrap()).unwrap();
+        let names: Vec<_> = ds.features.iter().map(|f| f.attrs[0].clone()).collect();
+        assert_eq!(names, [crate::Value::Text("a".into()), crate::Value::Text("c".into())]);
+        assert_eq!(said(&report), ["pts: 1 dBASE record marked deleted was left out, with its shape"]);
+    });
+}
+
+/// Reads by area take each record's stored box on trust, so they find every shape only once a
+/// whole read has seen each box hold its shape (#1065): a clean file of polygons or of points after
+/// that read, and never a file whose stored box misses its shape (a stale one, left over from an
+/// edit), by however little, which reads by area leave out.
+#[test]
+fn reads_by_area_find_every_shape_once_a_whole_read_has_seen_the_boxes_hold() {
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = tmp.path().to_path_buf();
+    let square = |x: f64| {
+        Geometry::Polygon(vec![vec![vec![Coord::new(x, 0.0), Coord::new(x + 1.0, 0.0), Coord::new(x + 1.0, 1.0), Coord::new(x, 0.0)]]])
+    };
+    let mut polygons = Dataset::new("squares", GeometryType::Polygon, vec![]);
+    for x in [0.0, 2.0, 4.0] {
+        polygons.push(Some(square(x)), vec![]);
+    }
+    let clean = folder.join("clean.shp");
+    write_shapefile(&polygons, &clean);
+    // The first record's stored box (at 112, four little-endian f64s) moved to 40..41: in order, but
+    // away from its square.
+    let stale = folder.join("stale.shp");
+    write_shapefile(&polygons, &stale);
+    let mut b = std::fs::read(&stale).unwrap();
+    for (k, v) in [40.0f64, 40.0, 41.0, 41.0].iter().enumerate() {
+        b[112 + 8 * k..120 + 8 * k].copy_from_slice(&v.to_le_bytes());
+    }
+    std::fs::write(&stale, b).unwrap();
+    // One whose stored box misses its square by a millionth of a degree: its west side at 1e-6.
+    let short = folder.join("short.shp");
+    write_shapefile(&polygons, &short);
+    let mut b = std::fs::read(&short).unwrap();
+    b[112..120].copy_from_slice(&1e-6f64.to_le_bytes());
+    std::fs::write(&short, b).unwrap();
+    let mut points = Dataset::new("pts", GeometryType::Point, vec![]);
+    points.push(Some(Geometry::Point(Coord::new(1.0, 1.0))), vec![]);
+    let pts = folder.join("pts.shp");
+    write_shapefile(&points, &pts);
+    cache::with_index_dir(folder.join("cache"), || {
+        let whole = |s: &ShpSource| s.visit_chunks(None, usize::MAX, &mut |_| Ok(())).unwrap();
+        let s = ShpSource::open_path(&clean, "clean").unwrap();
+        assert!(!s.finds_all_by_area(), "not before a whole read has looked");
+        assert!(whole(&s).complete);
+        assert!(s.finds_all_by_area(), "every box holds its square");
+        let s = ShpSource::open_path(&stale, "stale").unwrap();
+        whole(&s);
+        assert!(!s.finds_all_by_area(), "a stored box misses its square");
+        let s = ShpSource::open_path(&short, "short").unwrap();
+        whole(&s);
+        assert!(!s.finds_all_by_area(), "a stored box misses its square by a millionth of a degree");
+        // Points are looked at too: a record's own type is read, whatever the header says.
+        let s = ShpSource::open_path(&pts, "pts").unwrap();
+        assert!(!s.finds_all_by_area(), "not before a whole read has looked");
+        whole(&s);
+        assert!(s.finds_all_by_area(), "each point is its own box");
+    });
+}
+
+/// A Shapefile says whether it is as it was opened (#1065): yes until it is written again (on Unix
+/// at the same size and time too), and a read's error once it is gone.
+#[test]
+fn a_shapefile_says_whether_it_is_as_it_was_opened() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("pts.shp");
+    let mut ds = Dataset::new("pts", GeometryType::Point, vec![]);
+    ds.push(Some(Geometry::Point(Coord::new(1.0, 1.0))), vec![]);
+    write_shapefile(&ds, &path);
+    cache::with_index_dir(tmp.path().join("cache"), || {
+        let s = ShpSource::open_path(&path, "pts").unwrap();
+        assert!(s.same_as_opened().unwrap(), "as opened");
+        // The same size, its time set back: the change time still moves.
+        let dbf = path.with_extension("dbf");
+        let modified = std::fs::metadata(&dbf).unwrap().modified().unwrap();
+        let bytes = std::fs::read(&dbf).unwrap();
+        std::fs::write(&dbf, &bytes).unwrap();
+        std::fs::File::options().write(true).open(&dbf).unwrap().set_modified(modified).unwrap();
+        #[cfg(unix)]
+        assert!(!s.same_as_opened().unwrap(), "written again at the same size and time");
+        let s = ShpSource::open_path(&path, "pts").unwrap();
+        ds.push(Some(Geometry::Point(Coord::new(2.0, 2.0))), vec![]);
+        write_shapefile(&ds, &path);
+        assert!(!s.same_as_opened().unwrap(), "written again");
+        std::fs::remove_file(&path).unwrap();
+        assert!(s.same_as_opened().is_err(), "gone");
+    });
 }

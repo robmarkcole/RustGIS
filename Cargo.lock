@@ -688,6 +688,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
+name = "bigdecimal"
+version = "0.4.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8fa3f3d8cbf4dffcfe4991de61d012bef509a409ecbe9dd41049bfe32b4d4653"
+dependencies = [
+ "autocfg",
+ "libm",
+ "num-bigint 0.4.8",
+ "num-integer",
+ "num-traits",
+]
+
+[[package]]
 name = "bit-set"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1349,6 +1362,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
+name = "data-url"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
+
+[[package]]
 name = "dbase"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2004,6 +2023,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "float-cmp"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "98de4bbd547a563b716d8dfa9aad1cb19bfab00f4fa09a6a4ed21dbcf44ce9c4"
+
+[[package]]
+name = "float_eq"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "28a80e3145d8ad11ba0995949bbcf48b9df2be62772b3d351ef017dff6ecb853"
+
+[[package]]
 name = "float_next_after"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2458,6 +2489,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "h3o"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e09e90732a210d62fb37ce0452cac2b999aeff4ebd1998b53cf45290175b39b5"
+dependencies = [
+ "ahash",
+ "either",
+ "float_eq",
+ "geo",
+ "geo-traits",
+ "h3o-bit",
+ "libm",
+ "ordered-float",
+]
+
+[[package]]
+name = "h3o-bit"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3b42eb4efef1f96510ae1a33b2682562a677d504641e9903a77bf5c666b9013e"
+
+[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2908,6 +2961,12 @@ dependencies = [
  "byteorder-lite",
  "quick-error",
 ]
+
+[[package]]
+name = "imagesize"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65b27460c2c92b037f3f94c538ed9a3342f3fdf923606781629ccb35f82d042a"
 
 [[package]]
 name = "indexmap"
@@ -4389,6 +4448,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "pico-args"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5be167a7af36ee22fe3115051bc51f6e6c7054c9348e28deb4f49bd6f705a315"
+
+[[package]]
 name = "pin-project"
 version = "1.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4950,6 +5015,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
+name = "resvg"
+version = "0.50.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77bb4b284cf8a5c8ae721594af53387fb755d2196fddb32b2acfb4fa9251fa0c"
+dependencies = [
+ "bytemuck",
+ "log",
+ "pico-args",
+ "rgb",
+ "svgtypes",
+ "tiny-skia 0.12.0",
+ "usvg",
+]
+
+[[package]]
 name = "rfd"
 version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4975,6 +5055,15 @@ dependencies = [
  "wayland-protocols",
  "web-sys",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "rgb"
+version = "0.8.53"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47b34b781b31e5d73e9fbc8689c70551fd1ade9a19e3e28cfec8580a79290cc4"
+dependencies = [
+ "bytemuck",
 ]
 
 [[package]]
@@ -5064,7 +5153,7 @@ dependencies = [
 
 [[package]]
 name = "rustgis"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "eframe",
  "egui",
@@ -5085,21 +5174,23 @@ dependencies = [
 
 [[package]]
 name = "rustgis-analysis"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "a5",
  "geo",
+ "h3o",
  "log",
  "proptest",
  "rustgis-data",
  "rustgis-geom",
+ "s2",
  "serde",
  "serde_json",
 ]
 
 [[package]]
 name = "rustgis-assistant"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "base64 0.23.1",
  "getrandom 0.4.3",
@@ -5118,7 +5209,7 @@ dependencies = [
 
 [[package]]
 name = "rustgis-cli"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "rustgis-assistant",
  "rustgis-engine",
@@ -5128,7 +5219,7 @@ dependencies = [
 
 [[package]]
 name = "rustgis-data"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5185,7 +5276,7 @@ dependencies = [
 
 [[package]]
 name = "rustgis-engine"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "base64 0.23.1",
  "getrandom 0.4.3",
@@ -5198,6 +5289,7 @@ dependencies = [
  "rusqlite",
  "rustgis-analysis",
  "rustgis-data",
+ "rustgis-engine",
  "rustgis-geolibre",
  "rustgis-geom",
  "rustgis-map",
@@ -5206,6 +5298,7 @@ dependencies = [
  "rustls",
  "schemars",
  "serde",
+ "serde_ignored",
  "serde_json",
  "sys-locale",
  "tiny-skia 0.12.0",
@@ -5215,7 +5308,7 @@ dependencies = [
 
 [[package]]
 name = "rustgis-geolibre"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "flate2",
  "log",
@@ -5225,13 +5318,14 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "tar",
+ "tiff",
  "ureq",
  "zip",
 ]
 
 [[package]]
 name = "rustgis-geom"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "geographiclib-rs",
  "proptest",
@@ -5241,7 +5335,7 @@ dependencies = [
 
 [[package]]
 name = "rustgis-keychain"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "apple-native-keyring-store",
  "keyring-core",
@@ -5252,7 +5346,7 @@ dependencies = [
 
 [[package]]
 name = "rustgis-map"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "base64 0.23.1",
  "roxmltree",
@@ -5266,7 +5360,7 @@ dependencies = [
 
 [[package]]
 name = "rustgis-mobile"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "android_logger",
  "block2 0.6.2",
@@ -5290,7 +5384,7 @@ dependencies = [
 
 [[package]]
 name = "rustgis-plugins"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "base64 0.23.1",
  "log",
@@ -5309,7 +5403,7 @@ dependencies = [
 
 [[package]]
 name = "rustgis-python"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "pyo3",
  "pyo3-build-config",
@@ -5320,22 +5414,25 @@ dependencies = [
 
 [[package]]
 name = "rustgis-render"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "ab_glyph",
  "base64 0.23.1",
  "bytemuck",
  "epaint_default_fonts",
  "image",
+ "kurbo",
  "log",
  "lyon",
  "miniz_oxide 0.9.1",
+ "resvg",
  "rustgis-data",
  "rustgis-geom",
  "rustgis-map",
  "rustgis-tiles",
  "serde_json",
  "subsetter",
+ "svgtypes",
  "tempfile",
  "tiny-skia 0.12.0",
  "ttf-parser",
@@ -5345,7 +5442,7 @@ dependencies = [
 
 [[package]]
 name = "rustgis-tiles"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "base64 0.23.1",
  "brotli 9.0.0",
@@ -5368,7 +5465,7 @@ dependencies = [
 
 [[package]]
 name = "rustgis-ui-egui"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "base64 0.23.1",
  "bytemuck",
@@ -5395,7 +5492,7 @@ dependencies = [
 
 [[package]]
 name = "rustgis-ui-touch"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "egui",
  "rustgis-ui-egui",
@@ -5405,7 +5502,7 @@ dependencies = [
 
 [[package]]
 name = "rustgis-web"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "eframe",
  "egui",
@@ -5552,6 +5649,16 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
+
+[[package]]
+name = "s2"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "081105773b1c0ff138641d8d27206aa1ea08fe604736a17f5af7d3c49f1500d7"
+dependencies = [
+ "bigdecimal",
+ "libm",
+]
 
 [[package]]
 name = "same-file"
@@ -5750,6 +5857,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_ignored"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "115dffd5f3853e06e746965a20dcbae6ee747ae30b543d91b0e089668bb07798"
+dependencies = [
+ "serde",
+ "serde_core",
+]
+
+[[package]]
 name = "serde_json"
 version = "1.0.154"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5868,6 +5985,15 @@ name = "simdutf8"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
+
+[[package]]
+name = "simplecss"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7a9c6883ca9c3c7c90e888de77b7a5c849c779d25d74a1269b0218b14e8b136c"
+dependencies = [
+ "log",
+]
 
 [[package]]
 name = "siphasher"
@@ -6071,6 +6197,9 @@ name = "strict-num"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6637bab7722d379c8b41ba849228d680cc12d0a45ba1fa2b48f2a30577a06731"
+dependencies = [
+ "float-cmp",
+]
 
 [[package]]
 name = "string-interner"
@@ -6107,6 +6236,16 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+
+[[package]]
+name = "svgtypes"
+version = "0.16.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f12b12995e3638c70618c1facb1ce65302f6a6f706b675f07c58a5d7391120e"
+dependencies = [
+ "kurbo",
+ "siphasher",
+]
 
 [[package]]
 name = "syn"
@@ -6752,6 +6891,25 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
+]
+
+[[package]]
+name = "usvg"
+version = "0.50.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bdb896f04730b97805bbc3191fc57e4bf03face0f14577dd42e783c4d8c98802"
+dependencies = [
+ "data-url",
+ "imagesize",
+ "kurbo",
+ "log",
+ "pico-args",
+ "roxmltree",
+ "simplecss",
+ "siphasher",
+ "strict-num",
+ "svgtypes",
+ "tiny-skia-path 0.12.0",
 ]
 
 [[package]]
@@ -8004,7 +8162,7 @@ checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 
 [[package]]
 name = "xtask"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "serde_json",
 ]

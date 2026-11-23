@@ -160,7 +160,7 @@ pub struct Unreadable {
     pub rounded: Option<String>,
     /// Other reader diagnostics, already qualified by their source. Date diagnostics stay in
     /// their typed fields above so consumers can describe what an export did to them once.
-    pub messages: Vec<String>,
+    pub messages: rustgis_data::loss::Notes,
     /// `messages` contains the source's Z/M loss diagnostic. An export can keep that more
     /// specific report instead of also emitting its generic already-dropped-Z/M warning.
     pub zm_noted: bool,
@@ -690,10 +690,10 @@ impl Layer {
         // A failed read leaves nothing drawn for it (its error shows in Layers), not the
         // previous view's features.
         match src.poll(block) {
-            source::Polled::Done(_, batch) => {
-                src.saw_unread_dates(&batch.unread_dates, &batch.rounded_dates);
-                src.saw_null_text(&batch.null_text);
-                src.saw_not_utf8(&batch.not_utf8);
+            source::Polled::Done(window, batch) => {
+                src.saw_unread_dates(&window.extent, &batch.unread_dates, &batch.rounded_dates);
+                src.saw_null_text(&window.extent, &batch.null_text);
+                src.saw_not_utf8(&window.extent, &batch.not_utf8);
                 src.saw_read_notes(&batch.notes);
                 self.install(batch.features)
             }
@@ -704,10 +704,10 @@ impl Layer {
         if let Some(e) = src.wanted(view) {
             src.start(e, block);
             match src.poll(block) {
-                source::Polled::Done(_, batch) => {
-                    src.saw_unread_dates(&batch.unread_dates, &batch.rounded_dates);
-                    src.saw_null_text(&batch.null_text);
-                    src.saw_not_utf8(&batch.not_utf8);
+                source::Polled::Done(window, batch) => {
+                    src.saw_unread_dates(&window.extent, &batch.unread_dates, &batch.rounded_dates);
+                    src.saw_null_text(&window.extent, &batch.null_text);
+                    src.saw_not_utf8(&window.extent, &batch.not_utf8);
                     src.saw_read_notes(&batch.notes);
                     self.install(batch.features)
                 }
@@ -902,11 +902,11 @@ impl Layer {
         if let Some(info) = copy.info() {
             ds.zm_dropped |= info.zm_dropped;
             for note in &info.notes {
-                let message = format!("{}: {note}", info.name);
+                let message = note.clone().prefixed(&info.name);
                 if !report.messages.contains(&message) {
                     report.messages.push(message);
                 }
-                zm_noted |= info.zm_dropped && reader_noted_zm(note);
+                zm_noted |= info.zm_dropped && reader_noted_zm(&note.text);
             }
         }
         ds.name = self.dataset.name.clone();
@@ -1527,6 +1527,18 @@ impl Layer {
             self.display = self.display.take().filter(|d| self.display_levels.iter().any(|kept| std::sync::Arc::ptr_eq(d, kept)));
         }
         fits
+    }
+
+    /// Takes the rows of `kept`, a chunk of a streamed layer drawn before (a copy of this layer
+    /// with other rows), and the geometry drawing made of them: projected, and thinned for
+    /// display. Sharing them costs a pointer; this layer keeps its own look. What drawing makes
+    /// that `kept` lacks is made from the rows as usual.
+    pub fn draw_rows_of(&mut self, kept: &Layer) {
+        self.clear_cache();
+        self.dataset.features = kept.dataset.features.clone();
+        self.dataset.held_in = kept.dataset.held_in;
+        self.geometry_rev = kept.geometry_rev;
+        self.adopt_cache(kept);
     }
 
     /// Whether the projected geometry cache is filled for a projection, from the layer's current
@@ -3091,6 +3103,14 @@ impl Map {
         }
         for l in self.layers.iter_mut().filter(|l| l.is_streamed() && l.visible && l.in_scale_range(scale) && !held.contains(&l.id)) {
             pending |= l.sync_source_with(view, block, env);
+        }
+        // A view kept for its frames fits in what its share leaves beside the rows it holds now,
+        // hidden or not: a share shrunk by another streamed layer, or a larger view installed,
+        // lets it go.
+        for l in &self.layers {
+            if let Some(src) = &l.source {
+                src.trim_kept_view(bytes.saturating_sub(l.view_cache_bytes()));
+            }
         }
         pending
     }

@@ -15,6 +15,10 @@ pub struct Pick {
     pub points: Vec<rustgis_engine::geom::Coord>,
 }
 
+/// The systems a layer holds its coordinates in and was read in, and the project's.
+type LayerSystems =
+    (rustgis_engine::data::raster::Crs, Option<rustgis_engine::data::raster::Crs>, Option<rustgis_engine::data::raster::Crs>);
+
 /// The Workflows pane's inputs and results.
 #[derive(Default)]
 pub struct Workflow {
@@ -35,6 +39,11 @@ pub struct Workflow {
     pub pick: Option<Pick>,
     pub result: Option<Value>,
     pub error: Option<String>,
+    /// Only this request may replace the Similar section's pending result.
+    #[cfg(not(target_arch = "wasm32"))]
+    similar_request: Option<SimilarRequest>,
+    #[cfg(not(target_arch = "wasm32"))]
+    similar_next: u64,
     pub script: String,
     pub script_out: Vec<(String, bool)>,
     /// The Script pane's last run, shown above its results.
@@ -59,14 +68,18 @@ pub struct Workflow {
     pub spectral: crate::spectralui::Spectral,
     pub selected_only: Option<bool>,
     /// The projected coordinate system the Geostatistical Wizard's surface is made in; empty: the
-    /// environment's, else the projected one the layer was read in, else degrees.
+    /// environment's, else the projected one the layer holds its coordinates in, else the one it
+    /// was read in, else degrees.
     pub crs: String,
     /// The system the Wizard's surface was last to be made in (its own, else the environment's):
     /// when it changes, the cell size typed for it is cleared.
     pub wizard_system: String,
-    /// The system the Wizard's layer was read in, and the one its surface is made in from it
-    /// ([`rustgis_engine::analysis::layer_raster_crs`]), kept so it is worked out once.
-    pub layer_system: Option<(rustgis_engine::data::raster::Crs, Option<rustgis_engine::data::raster::Crs>)>,
+    /// The systems the Wizard's layer holds its coordinates in and was read in, and the project's,
+    /// and the one its surface is made in from them (the held one when projected,
+    /// [`rustgis_engine::analysis::works_in`], else the read-in one,
+    /// [`rustgis_engine::analysis::layer_raster_crs`], else the project's for a layer in degrees),
+    /// kept so it is worked out once.
+    pub layer_system: Option<(LayerSystems, Option<rustgis_engine::data::raster::Crs>)>,
     /// The coordinate system typed for a new ortho or reality workspace; empty: the images'
     /// projected system, else degrees.
     pub workspace_crs: String,
@@ -84,11 +97,71 @@ pub struct Workflow {
     pub job: Option<Job>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+struct SimilarRequest {
+    id: u64,
+    opened: u64,
+    map: u64,
+    layer: String,
+    instance: Option<u64>,
+}
+
+/// A pane/input change relinquishes ownership of a pending ranking. The read still completes
+/// through its ordinary command, but cannot overwrite another section or a newer request.
+pub(crate) fn forget_similar(workflow: &mut Workflow) {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        workflow.similar_request = None;
+    }
+    #[cfg(target_arch = "wasm32")]
+    let _ = workflow;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn start_similar(app: &mut RustGisApp) {
+    app.workflow.similar_next = app.workflow.similar_next.wrapping_add(1);
+    let id = app.workflow.similar_next;
+    app.workflow.similar_request = Some(SimilarRequest {
+        id,
+        opened: app.session.opened,
+        map: app.session.map().instance_id(),
+        layer: app.workflow.layer.clone(),
+        instance: app.session.map().layer_by_name(&app.workflow.layer).map(|l| l.instance_id()),
+    });
+    (app.workflow.result, app.workflow.error) = (None, None);
+    let params = json!({"layer": app.workflow.layer, "count": 10});
+    // Success here is only an admission receipt. Completion owns success and every failure.
+    let _ = crate::readjob::run_workflow_similar(app, params, id);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+/// Delivers only to the still-current pane request; the admission receipt never becomes output.
+pub(crate) fn similar_ran(app: &mut RustGisApp, request: u64, landed: crate::Landed) {
+    if !app.workflow.similar_request.as_ref().is_some_and(|r| r.id == request) {
+        return;
+    }
+    let Some(asked) = app.workflow.similar_request.take() else { return };
+    if app.workflow.section != "similar"
+        || app.workflow.layer != asked.layer
+        || app.session.opened != asked.opened
+        || app.session.map().instance_id() != asked.map
+        || app.session.map().layer_by_name(&asked.layer).map(|l| l.instance_id()) != asked.instance
+    {
+        return;
+    }
+    match landed {
+        crate::Landed::Ran(r) => show(app, r),
+        crate::Landed::NotRun(why) => show(app, Err(why)),
+    }
+}
+
 /// A workflow running on a thread of its own, so the window goes on while it works (#1291 step 3).
 #[cfg(not(target_arch = "wasm32"))]
 pub struct Job {
     /// What it is called, for its progress line.
     name: &'static str,
+    /// Only this section owns the pane output; data and error notices still land elsewhere.
+    section: &'static str,
     /// Stops it, and counts its progress.
     control: std::sync::Arc<rustgis_engine::analysis::control::Control>,
     kind: JobKind,
@@ -283,6 +356,20 @@ fn show(app: &mut RustGisApp, r: Result<Value, String>) {
     app.map.invalidate();
 }
 
+/// A background workflow changes only its own section's output. Its applied data redraws the
+/// map either way, and failures remain visible as notices after the user changes sections.
+#[cfg(not(target_arch = "wasm32"))]
+fn show_job(app: &mut RustGisApp, section: &'static str, r: Result<Value, String>) {
+    if app.workflow.section == section {
+        show(app, r);
+    } else {
+        if let Err(error) = r {
+            app.session.notify(error, true);
+        }
+        app.map.invalidate();
+    }
+}
+
 /// The workflows that run on a thread of their own on the desktop, as their command and name:
 /// Zonal Statistics, and those that make a raster
 /// ([`rustgis_engine::cmd::workflows::runs_in_background`]). Their work grows with the raster and
@@ -292,6 +379,27 @@ fn background(id: &str) -> Option<(&'static str, &'static str)> {
     match id {
         "gp.zonalStats" => Some(("gp.zonalStats", "Zonal Statistics")),
         _ => rustgis_engine::cmd::workflows::runs_in_background(id),
+    }
+}
+
+/// Starts a command that makes a raster (`workflows::runs_in_background`) asked for outside the
+/// pane through the app's dispatch (Command Search): on a thread of its own, the Workflows pane
+/// opened to show its progress and Cancel, as from a section; its layer is added when it lands, a
+/// failure then said in the status bar. The answer says it started; one that can't start (another
+/// is under way) is an error.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn start_from_dispatch(app: &mut RustGisApp, command: &'static str, name: &'static str, p: Value) -> Result<Value, String> {
+    // Its result is shown in the section the pane shows as it starts (the first, when it never
+    // opened), as a run from that section's would be.
+    settle_section(app);
+    start(app, command, name, p);
+    match &app.workflow.job {
+        Some(job) if job.name == name && app.workflow.error.is_none() => {
+            // Opened, not toggled: a pane already open stays so; one that didn't start doesn't open it.
+            app.ui.open_right(crate::RightPane::Workflows);
+            Ok(json!({"started": name}))
+        }
+        _ => Err(app.workflow.error.clone().unwrap_or_else(|| crate::i18n::fmt("{tool} didn't start", &[("tool", tl_raw!(name))]))),
     }
 }
 
@@ -326,7 +434,7 @@ fn start(app: &mut RustGisApp, command: &'static str, name: &'static str, p: Val
     };
     match kind {
         Ok(kind) => {
-            app.workflow.job = Some(Job { name, control, kind });
+            app.workflow.job = Some(Job { name, section: app.workflow.section, control, kind });
             (app.workflow.result, app.workflow.error) = (None, None);
         }
         Err(e) => show(app, Err(e)),
@@ -346,7 +454,8 @@ fn fill<T>(slot: &crate::Slot<T>, v: T) {
 
 /// A workflow that has finished on its thread, applied (so it's in the History and can be undone):
 /// called every frame, whatever pane is in view, so a run lands though the pane closed. `true`
-/// while one is still running.
+/// while one is still running. Pane output stays in its originating section; failures still
+/// reach session notices after a section change.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn land_job(app: &mut RustGisApp) -> bool {
     use rustgis_engine::cmd::{gp, workflows};
@@ -357,8 +466,9 @@ pub fn land_job(app: &mut RustGisApp) -> bool {
             if !gp::tool_waiting(&app.session, *id) {
                 job.control.cancel();
                 let name = job.name;
+                let section = job.section;
                 app.workflow.job = None;
-                dropped(app, name);
+                dropped(app, section, name);
                 return false;
             }
             filled(slot)
@@ -368,8 +478,9 @@ pub fn land_job(app: &mut RustGisApp) -> bool {
             if !workflows::raster_waiting(&app.session, *id) {
                 job.control.cancel();
                 let name = job.name;
+                let section = job.section;
                 app.workflow.job = None;
-                dropped(app, name);
+                dropped(app, section, name);
                 return false;
             }
             filled(slot)
@@ -379,25 +490,38 @@ pub fn land_job(app: &mut RustGisApp) -> bool {
         return true;
     }
     let Some(job) = app.workflow.job.take() else { return false };
+    // Cancelled once its work was done, before it landed (in the frame between): dropped, so
+    // nothing is added, and a file it wrote beside its destination is removed.
+    let cancelled = || Err(crate::i18n::fmt("{tool} was cancelled", &[("tool", tl_raw!(job.name))]));
     match job.kind {
+        JobKind::Tool { id, slot } if job.control.is_cancelled() => {
+            drop(take(&slot));
+            gp::tool_abandon(&mut app.session, id);
+            show_job(app, job.section, cancelled());
+        }
+        JobKind::Raster { id, slot, .. } if job.control.is_cancelled() => {
+            drop(take(&slot));
+            workflows::raster_abandon(&mut app.session, id);
+            show_job(app, job.section, cancelled());
+        }
         JobKind::Tool { id, slot } => {
             let Some(done) = take(&slot) else { return false };
             let r = gp::tool_complete(&mut app.session, id, done).and_then(|_| app.finish_gp(id));
-            show(app, r);
+            show_job(app, job.section, r);
         }
         JobKind::Raster { id, command, params, slot } => match take(&slot) {
             // Added by its command, as if it had run here.
             Some(Ok(made)) => match workflows::raster_land(&mut app.session, id, made) {
                 Ok(true) => {
                     let result = app.finish_raster(command, id, &params);
-                    show(app, result);
+                    show_job(app, job.section, result);
                 }
-                Ok(false) => dropped(app, job.name),
-                Err(e) => show(app, Err(e)),
+                Ok(false) => dropped(app, job.section, job.name),
+                Err(e) => show_job(app, job.section, Err(e)),
             },
             Some(Err(e)) => {
                 workflows::raster_abandon(&mut app.session, id);
-                show(app, Err(e));
+                show_job(app, job.section, Err(e));
             }
             None => {}
         },
@@ -417,9 +541,9 @@ fn take<T>(slot: &crate::Slot<T>) -> Option<T> {
 
 /// Says that a workflow's run was dropped: its project closed while it ran.
 #[cfg(not(target_arch = "wasm32"))]
-fn dropped(app: &mut RustGisApp, name: &'static str) {
-    app.workflow.error = Some(crate::i18n::fmt("{tool} was stopped: its project was closed while it ran.", &[("tool", tl_raw!(name))]));
-    app.workflow.result = None;
+fn dropped(app: &mut RustGisApp, section: &'static str, name: &'static str) {
+    let error = crate::i18n::fmt("{tool} was stopped: its project was closed while it ran.", &[("tool", tl_raw!(name))]);
+    show_job(app, section, Err(error));
 }
 
 /// A workflow under way: its name, progress and Cancel.
@@ -543,23 +667,32 @@ fn picked(app: &mut RustGisApp, purpose: &str) -> Option<Vec<rustgis_engine::geo
     if done { app.workflow.pick.take().map(|p| p.points) } else { None }
 }
 
-/// Draws the active workflow form; raster functions share their step parameters with the
-/// Function Editor so Apply and Add Step honor the same choices.
-pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
-    // A section whose extension was turned off while it was open: back to the first.
+/// The section the pane shows: none yet (the pane never opened), or one whose extension was turned
+/// off while it was open, is the first.
+fn settle_section(app: &mut RustGisApp) {
     if app.workflow.section.is_empty() || !section_shown(&app.session, app.workflow.section) {
         // Its map pick ends with it (a pick started elsewhere, with no section open, stays).
         if !app.workflow.section.is_empty() {
             app.workflow.pick = None;
         }
+        forget_similar(&mut app.workflow);
         app.workflow.section = "rasterFunctions";
     }
+}
+
+/// Draws the active workflow form; raster functions share their step parameters with the
+/// Function Editor so Apply and Add Step honor the same choices.
+pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
+    settle_section(app);
     egui::ComboBox::from_id_salt("wf_section")
         .selected_text(tl!(SECTIONS.iter().find(|s| s.0 == app.workflow.section).map_or("", |s| s.1)))
         .width(ui.available_width() - 8.0)
         .show_ui(ui, |ui| {
             for (id, title) in SECTIONS.iter().filter(|s| section_shown(&app.session, s.0)) {
-                if ui.selectable_label(app.workflow.section == *id, tl!(*title)).clicked() {
+                if ui.selectable_label(app.workflow.section == *id, tl!(*title)).clicked()
+                    && (app.workflow.section != "similar" || *id != "similar")
+                {
+                    forget_similar(&mut app.workflow);
                     app.workflow.section = id;
                     app.workflow.result = None;
                     app.workflow.error = None;
@@ -599,7 +732,12 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         _ => &features,
     };
     if !inputs.contains(&w.layer) {
-        w.layer = inputs.first().cloned().unwrap_or_default();
+        let layer = inputs.first().cloned().unwrap_or_default();
+        if w.section == "similar" && w.layer != layer {
+            forget_similar(w);
+            (w.result, w.error) = (None, None);
+        }
+        w.layer = layer;
     }
     if (w.section == "zonalStats" || w.section == "process") && !polygons.contains(&w.layer2) {
         w.layer2 = polygons.first().cloned().unwrap_or_default();
@@ -815,15 +953,23 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             heading(ui, "Interpolate a surface from points (IDW)");
             combo(ui, "wf_i", "Layer", &mut app.workflow.layer, &points);
             combo(ui, "wf_if", "Field", &mut app.workflow.field, &numeric);
-            // Empty: the environment's system, else the projected one the layer was read in, else
-            // degrees; the hint shows which.
-            let read_in = app.session.map().layer_by_name(&app.workflow.layer).and_then(|l| l.dataset.crs);
-            // The run's choice; kept for the layer's system, so a projection isn't built every frame.
-            let layer_crs = match (read_in, app.workflow.layer_system) {
+            // Empty: the environment's system, else the projected one the layer holds its
+            // coordinates in, else the one it was read in, else the project's, else degrees; the
+            // hint shows which.
+            let project = app.session.project.coordinate_system;
+            let systems = app.session.map().layer_by_name(&app.workflow.layer).map(|l| (l.dataset.coord_crs(), l.dataset.crs, project));
+            // The run's choice; kept for the layer's systems, so a projection isn't built every
+            // frame.
+            let layer_crs = match (systems, app.workflow.layer_system) {
                 (Some(c), Some((seen, chosen))) if seen == c => chosen,
-                (Some(c), _) => {
-                    let chosen = rustgis_engine::analysis::layer_raster_crs(Some(c)).and_then(Result::ok);
-                    app.workflow.layer_system = Some((c, chosen));
+                (Some((held, read_in, project)), _) => {
+                    use rustgis_engine::analysis::layer_raster_crs;
+                    let from = if rustgis_engine::analysis::works_in(held) { Some(held) } else { read_in };
+                    let chosen = match layer_raster_crs(from) {
+                        Some(c) => c.ok(),
+                        None => layer_raster_crs(project).and_then(Result::ok),
+                    };
+                    app.workflow.layer_system = Some(((held, read_in, project), chosen));
                     chosen
                 }
                 (None, _) => None,
@@ -922,9 +1068,24 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         }
         "similar" => {
             heading(ui, "Features most like the selected one");
+            let before = app.workflow.layer.clone();
             combo(ui, "wf_e", "Layer", &mut app.workflow.layer, &features);
+            if app.workflow.layer != before {
+                forget_similar(&mut app.workflow);
+                (app.workflow.result, app.workflow.error) = (None, None);
+            }
             if ui.button(tl!("Find Similar")).clicked() {
+                #[cfg(not(target_arch = "wasm32"))]
+                start_similar(app);
+                #[cfg(target_arch = "wasm32")]
                 run(app, "data.similar", json!({"layer": app.workflow.layer, "count": 10}));
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            if app.workflow.similar_request.is_some() {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(tl!("Running…"));
+                });
             }
         }
         "interop" => {
@@ -1698,12 +1859,13 @@ fn trend(app: &mut RustGisApp, ui: &mut Ui, rasters: &[String]) {
 
 /// A trend that has finished, its layers added through `cube.trend` (so it's in the History):
 /// called every frame, whatever pane is in view, so a run lands though the Workflows pane
-/// closed. `true` while one is still running.
+/// closed. Output stays with the Trend section; failures elsewhere become notices.
+/// `true` while one is still running.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn land_trend(app: &mut RustGisApp) -> bool {
     use std::sync::atomic::Ordering;
     let Some(r) = &app.workflow.trend.running else { return false };
-    let Some(res) = r.result.lock().ok().and_then(|mut g| g.take()) else { return true };
+    let Some(res) = r.result.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() else { return true };
     let mut p = r.params.clone();
     // A run the user cancelled stops quietly: no error for it.
     let cancelled = r.cancel.load(Ordering::Relaxed);
@@ -1715,14 +1877,15 @@ pub fn land_trend(app: &mut RustGisApp) -> bool {
         Ok(_) if cancelled => {}
         // Another project opened meanwhile: nothing added, and said.
         Ok(_) if !current => {
-            app.workflow.error = Some(tl!("The trend finished after another project was opened, so it wasn't added").to_string());
+            show_job(app, "trend", Err(tl!("The trend finished after another project was opened, so it wasn't added").to_string()));
         }
         Ok((rasters, dates)) => {
             p["ran"] = json!(rustgis_engine::cmd::cube::land(&mut app.session, rasters, dates));
-            run(app, "cube.trend", p);
+            let result = app.run("cube.trend", p);
+            show_job(app, "trend", result);
         }
         Err(_) if cancelled => {}
-        Err(e) => app.workflow.error = Some(e),
+        Err(e) => show_job(app, "trend", Err(e)),
     }
     false
 }
@@ -2838,6 +3001,147 @@ mod tests {
             _ => None,
         });
         assert_eq!(copied, Some(pretty(&long)), "Copy keeps the long line whole");
+    }
+
+    /// Ready Trend completions land through the real app frame without replacing another
+    /// section's output; Trend still receives its own result/error and Cancel stays quiet.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn trend_completion_preserves_other_workflow_output() {
+        for section in ["similar", "trend"] {
+            for outcome in ["failure", "project changed", "success", "cancelled"] {
+                let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+                let id = app.session.download_started();
+                if outcome == "project changed" {
+                    app.session.run("project.new", &Value::Null).unwrap();
+                }
+                app.run("ui.pane.workflows", json!({"section":section})).unwrap();
+                let kept = json!({"similar": [{"row":1,"distance":0.5}]});
+                app.workflow.result = Some(kept.clone());
+                let result = match outcome {
+                    "project changed" | "success" => Ok((Vec::new(), 0)),
+                    _ => Err("trend test failure".into()),
+                };
+                app.workflow.trend.running = Some(Trending {
+                    total: 1,
+                    id,
+                    params: Value::Null,
+                    cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(outcome == "cancelled")),
+                    done: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+                    result: std::sync::Arc::new(std::sync::Mutex::new(Some(result))),
+                });
+                let mark = app.session.notice_mark();
+                let mut fonts = false;
+                let mut h = egui_kittest::Harness::builder().with_size(vec2(1400.0, 900.0)).build_ui_state(
+                    move |ui, app: &mut RustGisApp| {
+                        if !fonts {
+                            crate::theme::install_fonts(ui.ctx(), &[], None);
+                            fonts = true;
+                            return;
+                        }
+                        app.logic(ui.ctx());
+                        app.ui(ui);
+                    },
+                    app,
+                );
+                for _ in 0..4 {
+                    h.step();
+                }
+                assert!(h.state().workflow.trend.running.is_none(), "the real frame consumed the worker completion");
+                let notices = h.state().session.notices_since(mark);
+                if outcome == "cancelled" || (section == "similar" && outcome == "success") {
+                    assert!(h.state().workflow.error.is_none());
+                    assert_eq!(h.state().workflow.result, Some(kept));
+                    assert!(notices.is_empty());
+                } else if outcome == "success" {
+                    assert!(h.state().workflow.error.is_none());
+                    assert_eq!(h.state().workflow.result, Some(json!({"layers":[],"dates":0})));
+                    assert!(notices.is_empty());
+                } else {
+                    let needle = if outcome == "project changed" { "after another project" } else { "trend test failure" };
+                    if section == "similar" {
+                        assert!(h.state().workflow.error.is_none(), "Trend's error belongs outside the Similar pane");
+                        assert_eq!(h.state().workflow.result, Some(kept));
+                        assert_eq!(notices.len(), 1);
+                        assert!(notices[0].error && notices[0].text.contains(needle));
+                    } else {
+                        assert!(h.state().workflow.error.as_deref().is_some_and(|e| e.contains(needle)));
+                        assert!(h.state().workflow.result.is_none());
+                        assert!(notices.is_empty());
+                    }
+                }
+            }
+        }
+    }
+
+    /// A command that makes a raster, asked for through the app's dispatch (Command Search) rather
+    /// than a section, runs on a thread of its own too: Polygons to Raster from a
+    /// text field answers that it started, the pane shows it running, and its layer and class table
+    /// land with it.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_raster_command_from_the_dispatch_runs_on_a_thread() {
+        let mut app = RustGisApp::with_sample();
+        // As the app runs, a frame at a time.
+        app.reads_off_frame = true;
+        let (layers, tables) = (app.session.map().layers.len(), app.session.project.tables.len());
+        // One that can't start doesn't open the pane.
+        assert!(app.run("raster.rasterize", json!({"layer": "Countries", "field": "name"})).unwrap_err().contains("cellSize is required"));
+        assert!(!app.ui.right_open.contains(&crate::RightPane::Workflows));
+        let p = json!({"layer": "Countries", "field": "name", "cellSize": 5});
+        let started = app.run("raster.rasterize", p.clone()).unwrap();
+        assert_eq!(started, json!({"started": "Polygons to Raster"}));
+        assert!(app.workflow.job.is_some(), "{:?}", app.workflow.error);
+        assert!(app.ui.right_open.contains(&crate::RightPane::Workflows));
+        // Its result goes to the section the pane shows (the first: it had never opened).
+        assert_eq!(app.workflow.section, "rasterFunctions");
+        assert_eq!(app.workflow.job.as_ref().map(|j| j.section), Some("rasterFunctions"));
+        // A second, while it runs, is refused and says why.
+        let again = app.run("raster.rasterize", p).unwrap_err();
+        assert!(again.contains("is still running"), "{again}");
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while land_job(&mut app) {
+            assert!(std::time::Instant::now() < end, "the run never landed");
+            std::thread::sleep(std::time::Duration::from_millis(5)); // test-wait: polling for the workflow to land, as above
+        }
+        assert!(app.workflow.job.is_none() && app.workflow.error.is_none(), "{:?}", app.workflow.error);
+        assert!(app.workflow.result.as_ref().is_some_and(|r| r["classTable"].is_string()), "{:?}", app.workflow.result);
+        assert_eq!(app.session.map().layers.len(), layers + 1);
+        assert_eq!(app.session.project.tables.len(), tables + 1);
+    }
+
+    /// A Cancel that comes once the work is done, before the job lands, still holds: nothing is
+    /// added, and the GeoTIFF it wrote beside its destination is removed, the destination left as
+    /// it was.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_cancel_after_the_work_is_done_drops_what_it_made() {
+        let dir = std::env::temp_dir().join(format!("rustgis-late-cancel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("burned.tif");
+        std::fs::write(&path, b"before").unwrap();
+        let mut app = RustGisApp::with_sample();
+        app.reads_off_frame = true;
+        let layers = app.session.map().layers.len();
+        let p = json!({"layer": "Countries", "field": "name", "cellSize": 5, "path": path.to_string_lossy()});
+        app.run("raster.rasterize", p).unwrap();
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !matches!(&app.workflow.job, Some(Job { kind: JobKind::Raster { slot, .. }, .. }) if filled(slot)) {
+            assert!(std::time::Instant::now() < end, "the run never finished");
+            std::thread::sleep(std::time::Duration::from_millis(5)); // test-wait: polling for the worker to fill its slot
+        }
+        // It made its raster (and wrote its file beside the destination): looked at, not taken.
+        let Some(Job { kind: JobKind::Raster { slot, .. }, control, .. }) = &app.workflow.job else { panic!("no raster job") };
+        assert!(matches!(&*slot.lock().unwrap(), Some(Ok(_))), "the run failed");
+        control.cancel();
+        assert!(!land_job(&mut app));
+        assert!(app.workflow.job.is_none());
+        assert!(app.workflow.error.as_deref().is_some_and(|e| e.contains("was cancelled")), "{:?}", app.workflow.error);
+        assert_eq!(app.session.map().layers.len(), layers);
+        assert_eq!(std::fs::read(&path).unwrap(), b"before");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "a staged file was left");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// Interpolate runs on a thread of its own from the pane (#1291 step 3): the pane goes on while

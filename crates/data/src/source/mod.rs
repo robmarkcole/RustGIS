@@ -173,7 +173,7 @@ pub struct SourceInfo {
     pub indexed: bool,
     /// Things worth telling whoever adds the source (an unknown coordinate system read as
     /// longitude/latitude, tables left out).
-    pub notes: Vec<String>,
+    pub notes: crate::loss::Notes,
     /// The source has Z or M values, which reading drops (see [`Dataset::zm_dropped`]).
     pub zm_dropped: bool,
 }
@@ -257,9 +257,10 @@ pub struct Batch {
     pub null_text: Vec<usize>,
     /// What else the read lost or assumed, one note per kind with its count (values that don't fit
     /// their field, rings without area): said as they are.
-    pub notes: Vec<String>,
-    /// Text values of a Shapefile read as UTF-8 that aren't UTF-8, so hold U+FFFD in place of
-    /// those bytes, counted for each field by its position. Said by [`not_utf8_note`].
+    pub notes: crate::loss::Notes,
+    /// Text values of a Shapefile that aren't valid in the encoding they were read in
+    /// ([`FeatureSource::text_encoding`]), so hold U+FFFD in place of those bytes, counted for each
+    /// field by its position. Said by [`not_utf8_note`].
     pub not_utf8: Vec<usize>,
 }
 
@@ -274,7 +275,7 @@ pub(crate) fn null_text_at(counts: &mut Vec<usize>, k: usize) {
     unread_dates_by(counts, k, 1);
 }
 
-/// Counts one more text value that isn't UTF-8 in the field at `k` ([`Batch::not_utf8`]).
+/// Counts one more text value that isn't valid in its encoding in the field at `k` ([`Batch::not_utf8`]).
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn not_utf8_at(counts: &mut Vec<usize>, k: usize) {
     unread_dates_by(counts, k, 1);
@@ -336,23 +337,23 @@ pub fn null_text_note(fields: &[crate::Field], counts: &[usize]) -> Option<Strin
     Some(format!("{what} read as empty, in {}", crate::io::named_fields(fields, counts)))
 }
 
-/// What a read says of a `.dbf`'s text values read as UTF-8 that aren't UTF-8
-/// ([`Batch::not_utf8`]): how many, in which fields (the first five named), and why they were read
-/// as UTF-8. `None` when there were none.
-pub fn not_utf8_note(fields: &[crate::Field], counts: &[usize]) -> Option<String> {
+/// What a read says of a `.dbf`'s text values that aren't valid in the `encoding` they were read in
+/// ([`Batch::not_utf8`], [`FeatureSource::text_encoding`]): how many, in which fields (the first five
+/// named), and why they were read in it. `None` when there were none.
+pub fn not_utf8_note(fields: &[crate::Field], counts: &[usize], encoding: &str) -> Option<String> {
     let total: usize = counts.iter().sum();
     if total == 0 {
         return None;
     }
     let what = if total == 1 {
-        "1 text value isn't valid UTF-8 and was".to_string()
+        format!("1 text value isn't valid {encoding} and was")
     } else {
-        format!("{total} text values aren't valid UTF-8 and were")
+        format!("{total} text values aren't valid {encoding} and were")
     };
     Some(format!(
         "{what} read with U+FFFD in place of the bytes that can't be read, in {}; {}",
         crate::io::named_fields(fields, counts),
-        crate::dbf::NO_OTHER_ENCODING
+        crate::dbf::cause(encoding)
     ))
 }
 
@@ -381,6 +382,19 @@ pub trait FeatureSource: Send + Sync {
     fn visits_chunks(&self) -> bool {
         self.streams_chunks()
     }
+    /// Whether a read by area ([`FeatureSource::visit_chunks`] with an extent) gives every
+    /// feature of a whole read whose shape meets the area: false where some can't be placed by
+    /// area (a Shapefile's records without a usable box, left out of reads by area), and for a
+    /// source that doesn't say.
+    fn finds_all_by_area(&self) -> bool {
+        false
+    }
+    /// Whether the source is as it was when opened, judged cheaply (its files' sizes and
+    /// modification times), for what was read from it and kept beside it: `Ok(false)` when it
+    /// changed or the source can't say, and the error a read would give when it can't be read.
+    fn same_as_opened(&self) -> Result<bool> {
+        Ok(false)
+    }
     /// Whether a complete bounded traversal for a geographic extent is available. This also
     /// covers readers whose view and whole-export paths still use their existing sample or
     /// whole-read contracts.
@@ -408,6 +422,11 @@ pub trait FeatureSource: Send + Sync {
     /// extent is in longitude/latitude whatever this is.
     fn coord_crs(&self) -> crate::raster::Crs {
         crate::raster::Crs::LonLat
+    }
+    /// The encoding the source's text values are read in, for the notice of those that aren't
+    /// valid in it ([`not_utf8_note`]).
+    fn text_encoding(&self) -> &'static str {
+        "UTF-8"
     }
     /// Whether features were left out of every read because the coordinate system the source
     /// declares can't place them, so that defining its projection again can't bring them back.
@@ -670,6 +689,10 @@ impl FeatureSource for Fetching {
         self.0.lost_to_crs()
     }
 
+    fn text_encoding(&self) -> &'static str {
+        self.0.text_encoding()
+    }
+
     fn skipped_at_open(&self) -> usize {
         self.0.skipped_at_open()
     }
@@ -713,18 +736,17 @@ fn materialize_within(src: &dyn FeatureSource, budget: u64) -> Result<(Dataset, 
     let unread_dates = unread_dates_note(&info.fields, &unread_dates);
     let mut report = ReadReport {
         skipped: skipped + src.skipped_at_open(),
-        messages: info.notes.iter().map(|n| format!("{}: {n}", info.name)).collect(),
+        messages: info.notes.clone().prefixed(&info.name),
         synced: None,
         unread_dates: unread_dates.clone(),
         rounded_dates: rounded.clone(),
         extrusion: None,
-        losses: Vec::new(),
     };
     let null_text = null_text_note(&info.fields, &null_text);
-    let not_utf8 = not_utf8_note(&info.fields, &not_utf8);
-    report.messages.extend(
-        unread_dates.into_iter().chain(rounded).chain(null_text).chain(notes).chain(not_utf8).map(|n| format!("{}: {n}", info.name)),
-    );
+    let not_utf8 = not_utf8_note(&info.fields, &not_utf8, src.text_encoding());
+    report.messages.extend(unread_dates.into_iter().chain(rounded).chain(null_text).map(|n| format!("{}: {n}", info.name)));
+    report.messages.extend(notes.prefixed(&info.name));
+    report.messages.extend(not_utf8.into_iter().map(|n| format!("{}: {n}", info.name)));
     if ds.geometry_type == GeometryType::None
         && let Some(g) = ds.features.iter().find_map(|f| f.geometry.as_ref())
     {
@@ -835,8 +857,8 @@ pub(crate) struct Reproject {
 }
 
 impl Reproject {
-    /// For a reader that converts only EPSG codes: a coordinate system declared without one, by
-    /// `authority` and `code` or by a `wkt` definition, when it is another body's
+    /// For [`declared_reproject`]: a coordinate system declared by `authority` and `code` or by a
+    /// `wkt` definition, when it is another body's
     /// ([`crate::raster::planetary::declared`]). `None` when it isn't.
     /// - Its longitude/latitude are read as they are, with a note. The layer keeps the system when
     ///   the definition gives it.

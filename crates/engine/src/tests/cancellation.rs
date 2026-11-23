@@ -15,6 +15,13 @@ pub(super) fn long_commands(boundaries: bool) {
     let _ = std::fs::remove_dir_all(&dir.0);
     std::fs::create_dir_all(&dir.0).unwrap();
     let out = |f: &str| dir.0.join(f).display().to_string();
+    // The reads made ahead that run here, checked at the end against every one there is
+    // (`reads::IN_BACKGROUND` and the table edits).
+    let covered = std::cell::RefCell::new(std::collections::BTreeSet::new());
+    let read = |fixture: &Session, command: &'static str, p: &Value| {
+        covered.borrow_mut().insert(command);
+        exercise(fixture, command, p, Kind::Read, &dir.0, boundaries);
+    };
     let mut s = world();
     if boundaries {
         // A few sample rows and simple shapes exercise the same commands without a world-sized
@@ -79,6 +86,7 @@ pub(super) fn long_commands(boundaries: bool) {
         ("raster.index", json!({"layer": dem, "index": "ndvi", "nir": 1, "red": 1})),
         ("raster.process", json!({"layer": dem, "operation": "resample", "factor": 4})),
         ("imagery.mosaic", json!({"name": "Valley"})),
+        ("raster.rasterize", json!({"layer": "Squares", "field": "name", "cellSize": 0.0005, "path": out("burned.tif")})),
         (
             "dl.classify",
             json!({"layer": "scene", "training": "training", "classField": "class", "bands": [1, 2], "epochs": if boundaries { 2 } else { 30 }, "model": "landcover"}),
@@ -142,8 +150,9 @@ pub(super) fn long_commands(boundaries: bool) {
     s.run("layer.addDataText", &json!({"fileName": "ranks.csv", "text": "name,score\na,1\nb,3\n"})).unwrap();
     let registered = crate::cmd::exports::IN_BACKGROUND.iter().map(|(c, ..)| *c).collect::<std::collections::BTreeSet<_>>();
     assert_eq!(listed(&exports), registered, "add a new background export here");
-    // Reuse the same origin and generation on every retry. The open area includes a real
-    // streamed layer to exercise cancellation during its source traversal as well as the write.
+    // Reuse the same origin and generation on every retry (each package's own identity is new, and
+    // `comparable` blanks it). The open area includes a real streamed layer to exercise
+    // cancellation during its source traversal as well as the write.
     let mut field = session(&s);
     field.run("layer.addData", &json!({"path": out("towns.shp"), "name": "Streamed towns", "stream": true})).unwrap();
     field.run("offline.package", &json!({"path": out("seed.rgisfield"), "name": "Crew", "extent": [9, 44, 11, 46]})).unwrap();
@@ -161,19 +170,33 @@ pub(super) fn long_commands(boundaries: bool) {
         }
     }
 
+    // Opening a field package from home keeps the rows it gave on a read of its own
+    // (`offline.keepRows`); each run starts with none kept.
+    let seed = std::fs::read(out("seed.rgisfield")).unwrap();
+    let unpacked = dir.0.join("field package");
+    let (text, _) = crate::cmd::field::unpack_into(&seed, &unpacked).unwrap();
+    let phone = Session::new(crate::cmd::field::project_in(&text, &unpacked).unwrap());
+    read(&phone, "offline.keepRows", &json!({}));
+
     // The Add Service dialog replays supplied metadata off the desktop frame too.
     let params = json!({"url":"https://maps.example.org/dataset","type":"ogcapi","text":"{\"collections\":[]}"});
     for command in ["service.layers", "service.add"] {
+        // An add names its layer: a call without one is refused before any discovery starts.
+        let mut params = params.clone();
+        if command == "service.add" {
+            params["layer"] = json!("map");
+        }
         // Adding a service needs a real collection and remote features to succeed. An empty
         // listing is useful only for the original first-check cancellation test.
         if !boundaries || command == "service.layers" {
-            exercise(&s, command, &params, Kind::Read, &dir.0, boundaries);
+            read(&s, command, &params);
         }
     }
     // Shape fitting uses the same cancellable read queue, without modifying its source. Its
     // fixture is an editing session of its own, which the boundary sweep's sessions don't carry,
     // so it keeps first-check coverage.
     if !boundaries {
+        covered.borrow_mut().insert("edit.previewShapeConversion");
         let mut shapes = Session::new(Project::default());
         let id = shapes.map_mut().add_dataset(rustgis_data::Dataset::new("Conversion", rustgis_data::GeometryType::Polygon, vec![]));
         shapes.active_layer = Some(id);
@@ -190,14 +213,14 @@ pub(super) fn long_commands(boundaries: bool) {
     // records indexed, the GeoJSON file's features found, Cancel looked at as they go (#2446).
     for file in ["in-place.shp", "in-place.geojson"] {
         s.run("share.exportLayer", &json!({"layer": "Cities", "path": out(file)})).unwrap();
-        exercise(&s, "layer.addData", &json!({"path": out(file), "stream": true}), Kind::Read, &dir.0, boundaries);
+        read(&s, "layer.addData", &json!({"path": out(file), "stream": true}));
     }
     // Past the first few thousand features, the GeoJSON scan looks at Cancel again.
     let many: Vec<Value> = (0..4097)
         .map(|i| json!({"type": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [10.0 + f64::from(i) * 1e-4, 45.0]}}))
         .collect();
     std::fs::write(out("many.geojson"), json!({"type": "FeatureCollection", "features": many}).to_string()).unwrap();
-    exercise(&s, "layer.addData", &json!({"path": out("many.geojson"), "stream": true}), Kind::Read, &dir.0, boundaries);
+    read(&s, "layer.addData", &json!({"path": out("many.geojson"), "stream": true}));
     // Creating a class column also visits every feature, on the same field-edit worker.
     {
         let mut classes = Session::new(Project::default());
@@ -208,16 +231,27 @@ pub(super) fn long_commands(boundaries: bool) {
         }
         let layer = classes.map_mut().add_dataset(data);
         classes.active_layer = Some(layer);
-        exercise(&classes, "edit.addField", &json!({"layer":layer,"name":"class","type":"text"}), Kind::Read, &dir.0, boundaries);
+        read(&classes, "edit.addField", &json!({"layer":layer,"name":"class","type":"text"}));
     }
     // Original TIFF headers share the read queue and both cancellation sweeps.
-    exercise(&s, "raster.imageGrid", &json!({"layer": dem}), Kind::Read, &dir.0, boundaries);
+    read(&s, "raster.imageGrid", &json!({"layer": dem}));
     // A PDF's page is read on the same queue: the file, then its drawing, Cancel looked at between
     // (#2336).
     s.run("layout.new", &json!({"page": "a4", "template": "map"})).unwrap();
     s.run("layout.export", &json!({"path": out("page.pdf"), "dpi": 36, "allPages": false})).unwrap();
-    exercise(&s, "layer.addData", &json!({"path": out("page.pdf")}), Kind::Read, &dir.0, boundaries);
-    exercise(&s, "table.statistics", &json!({"layer": "Cities", "field": "pop_max"}), Kind::Read, &dir.0, boundaries);
+    read(&s, "layer.addData", &json!({"path": out("page.pdf")}));
+    read(&s, "table.statistics", &json!({"layer": "Cities", "field": "pop_max"}));
+    read(&s, "data.similar", &json!({"layer": "Cities", "row": 0, "fields": ["pop_max"], "count": 2}));
+    // The topology worker evaluates the primary query before its geometric check.
+    {
+        let id = s.map().layer_by_name("Cities").unwrap().id;
+        let query = s.map_mut().layer_mut(id).unwrap().definition_query.replace("pop_max >= 0".into());
+        let rules = s.map().editing.topology.clone();
+        s.run("topology.rules", &json!({"add":{"rule":"mustNotSelfIntersect","layer":"Cities"}})).unwrap();
+        read(&s, "topology.validate", &json!({}));
+        s.map_mut().layer_mut(id).unwrap().definition_query = query;
+        s.map_mut().editing.topology = rules;
+    }
     // A Zarr point series is read on a thread of its own by the Time Series pane (#2282). It isn't
     // one of the queues above (it has no read-ahead), so it is run here: a local store, swept at
     // each of its checks in the boundary mode. It changes nothing in the project.
@@ -253,7 +287,15 @@ pub(super) fn long_commands(boundaries: bool) {
     }
     // Automatic size bounds scan the numeric field on that queue too.
     s.run("layer.symbology", &json!({"layer": "Cities", "type": "unique", "field": "name"})).unwrap();
-    exercise(&s, "layer.sizeBy", &json!({"layer": "Cities", "field": "pop_max"}), Kind::Read, &dir.0, boundaries);
+    read(&s, "layer.sizeBy", &json!({"layer": "Cities", "field": "pop_max"}));
+    // A QGIS style's raster image marker: the image is read on that queue, Cancel looked at before it
+    // (the style file's one read and its XML's one parse don't look; #2620).
+    image::RgbImage::from_pixel(4, 4, image::Rgb([200, 30, 30])).save(out("pin.png")).unwrap();
+    let marker = r#"<qgis version="4.2.3"><renderer-v2 type="singleSymbol"><symbols><symbol type="marker" name="0" alpha="1">
+        <layer class="RasterMarker" enabled="1"><Option type="Map"><Option name="imageFile" value="pin.png"/></Option></layer>
+        </symbol></symbols></renderer-v2></qgis>"#;
+    std::fs::write(out("pin.qml"), marker).unwrap();
+    read(&s, "style.importQgis", &json!({"layer": "Cities", "path": out("pin.qml")}));
 
     s.run("layer.addDataText", &json!({"fileName": "calc.csv", "text": "n,day\n1,01/02/2024\n2,02/03/2024\n"})).unwrap();
     s.run("edit.enable", &json!({"on": true})).unwrap();
@@ -267,9 +309,9 @@ pub(super) fn long_commands(boundaries: bool) {
     ];
     assert_eq!(listed(&edits), crate::cmd::edit::TABLE_EDITS.iter().map(|(id, ..)| *id).collect(), "add a new table worker here");
     for (command, p) in edits {
-        exercise(&s, command, &p, Kind::Read, &dir.0, boundaries);
+        read(&s, command, &p);
         let script = json!({"script": format!("{command} {p}")});
-        exercise(&s, "script.run", &script, Kind::Read, &dir.0, boundaries);
+        read(&s, "script.run", &script);
     }
     s.run(
         "layer.addDataText",
@@ -279,7 +321,7 @@ pub(super) fn long_commands(boundaries: bool) {
     )
     .unwrap();
     let params = json!({"layer":"dated", "field":"day", "type":"date", "format":"%m/%d/%Y"});
-    exercise(&s, "edit.convertField", &params, Kind::Read, &dir.0, boundaries);
+    read(&s, "edit.convertField", &params);
 
     // Replacement validation can now scan temporal fields as well as probing geometry.
     let mut dates = rustgis_data::Dataset::new(
@@ -294,7 +336,7 @@ pub(super) fn long_commands(boundaries: bool) {
     let replacement = out("cancel-repair-source.fgb");
     std::fs::write(&replacement, rustgis_data::source::fgb::write(&dates).unwrap()).unwrap();
     let id = s.run("layer.addData", &json!({"path": replacement, "stream": true})).unwrap()["layer"].as_u64().unwrap();
-    exercise(&s, "layer.repairSource", &json!({"layer": id, "path": replacement}), Kind::Read, &dir.0, boundaries);
+    read(&s, "layer.repairSource", &json!({"layer": id, "path": replacement}));
     std::fs::remove_file(replacement).unwrap();
 
     // The tools whose work grows past a second or two on real data: buffers, overlays, joins,
@@ -324,9 +366,66 @@ pub(super) fn long_commands(boundaries: bool) {
         ("tabulateIntersection", json!({"zones": "Countries", "classes": "Squares", "includeEmptyZones": true})),
         ("serviceArea", json!({"network": "Rivers", "facilities": "Cities", "breaks": "50", "snapDistance": 100000})),
         ("odCostMatrix", json!({"network": "Rivers", "origins": "Cities", "destinations": "Cities", "count": 1, "snapDistance": 100000})),
+        ("a5Grid", json!({"system": "S2", "resolution": 4, "area": "Input Layer", "input": "Countries"})),
+        ("a5Grid", json!({"system": "Hexagon", "resolution": 3, "area": "Input Layer", "input": "Countries"})),
+        ("a5Aggregate", json!({"system": "H3", "input": "Cities", "resolution": 3})),
+        ("a5Grid", json!({"system": "H3", "resolution": 3, "area": "Input Layer", "input": "Countries"})),
     ];
     for (tool, params) in &tools {
         exercise(&s, tool, params, Kind::Tool, &dir.0, boundaries);
+    }
+
+    // A layer read in place, loaded whole, converted to annotation and reloaded; one read whole
+    // from its file, compared with it.
+    s.run("layer.addData", &json!({"path": out("towns.shp"), "name": "towns in place", "stream": true})).unwrap();
+    read(&s, "layer.loadAll", &json!({"layer": "towns in place"}));
+    read(&s, "labels.convert", &json!({"layer": "towns in place"}));
+    read(&s, "layer.reloadData", &json!({"layer": "towns in place"}));
+    read(&s, "source.syncState", &json!({"layer": "towns"}));
+    let graph = json!({"nodes": [
+        {"id": "squares", "kind": "input", "layer": "Squares"},
+        {"id": "ring", "kind": "tool", "tool": "buffer", "params": {"distance": 100}},
+        {"id": "output", "kind": "output", "name": "Rings"}
+    ], "edges": [
+        {"from": "squares", "fromPort": "out", "to": "ring", "toPort": "input"},
+        {"from": "ring", "fromPort": "out", "to": "output", "toPort": "in"}
+    ]});
+    read(&s, "model.run", &json!({"graph": graph}));
+    // A tile archive reloaded from its file, and repaired to a copy of it.
+    {
+        use crate::render::rustgis_tiles::pmtiles;
+        let archive = pmtiles::NewArchive {
+            tile_type: pmtiles::TileType::Png,
+            gzipped_tiles: false,
+            bounds: [-180.0, -85.0, 180.0, 85.0],
+            metadata: json!({}),
+        };
+        let mut tile = tiny_skia::Pixmap::new(1, 1).unwrap();
+        tile.fill(tiny_skia::Color::from_rgba8(10, 20, 30, 255));
+        let bytes = pmtiles::write(vec![(0, 0, 0, tile.encode_png().unwrap())], &archive).unwrap();
+        std::fs::write(out("archive.pmtiles"), &bytes).unwrap();
+        std::fs::write(out("moved.pmtiles"), &bytes).unwrap();
+    }
+    s.run("map.addTiles", &json!({"url": out("archive.pmtiles"), "overlay": true})).unwrap();
+    read(&s, "map.reloadTiles", &json!({"index": 0}));
+    read(&s, "map.repairTiles", &json!({"index": 0, "path": out("moved.pmtiles")}));
+
+    // Reads made ahead that aren't run here, and why.
+    let exempt: [(&str, &str); 0] = [];
+    let covered = covered.into_inner();
+    for (command, why) in exempt {
+        assert!(!covered.contains(command), "{command} is run here: take it out of the exemptions ({why})");
+    }
+    let registered = crate::cmd::reads::IN_BACKGROUND
+        .iter()
+        .map(|(c, _)| *c)
+        .chain(crate::cmd::edit::TABLE_EDITS.iter().map(|(c, ..)| *c))
+        .collect::<std::collections::BTreeSet<_>>();
+    let known = covered.iter().copied().chain(exempt.iter().map(|(c, _)| *c)).collect::<std::collections::BTreeSet<_>>();
+    // The boundary sweep leaves out the reads that keep first-check coverage only, so the first-check
+    // run is the one that must reach every read.
+    if !boundaries {
+        assert_eq!(known, registered, "a command read ahead (reads::IN_BACKGROUND) is run here, or exempted with the reason it isn't");
     }
 }
 
@@ -385,7 +484,7 @@ impl Kind {
 /// bits retain NaNs and signed zero. Include streamed rows omitted by project serialization;
 /// normalize GP record timestamps/durations and geometry cache generations, which naturally
 /// differ on a successful retry or Undo/Redo. All features, pixels and layer settings remain.
-fn contents(project: &Project) -> Value {
+pub(super) fn contents(project: &Project) -> Value {
     let pixels: Vec<_> = project
         .maps
         .iter()
@@ -463,6 +562,35 @@ fn files(dir: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf
     out
 }
 
+/// `files` with each field package's own identity blanked: every package is given a new one, so
+/// two complete runs write the same package but for it.
+fn comparable(
+    mut files: std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>>,
+) -> std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>> {
+    for (path, bytes) in &mut files {
+        let Some(zip) = bytes.as_ref().filter(|_| path.extension().is_some_and(|e| e == "rgisfield")) else { continue };
+        let Ok(entries) = rustgis_data::zip::read(zip) else { continue };
+        let mut out = Vec::new();
+        for (name, data) in entries {
+            let data = match serde_json::from_slice::<Value>(&data) {
+                // The entry naming the identity of a package going out.
+                Ok(_) if name == crate::cmd::field_changes::GIVEN => Vec::new(),
+                Ok(mut project) if name.ends_with(".rgis") => {
+                    if let Some(origin) = project.get_mut("field_origin").and_then(Value::as_object_mut) {
+                        origin.remove("package");
+                    }
+                    project.to_string().into_bytes()
+                }
+                _ => data,
+            };
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(&data);
+        }
+        *bytes = Some(out);
+    }
+    files
+}
+
 /// Restores only this test's private directory between independent runs; never before a retry.
 fn restore(dir: &std::path::Path, before: &std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>>) {
     std::fs::remove_dir_all(dir).unwrap();
@@ -483,8 +611,19 @@ fn restore(dir: &std::path::Path, before: &std::collections::BTreeMap<std::path:
 /// (`exports::written_under`); they must match a normal run's complete files and session.
 fn exercise(fixture: &Session, command: &str, p: &Value, kind: Kind, dir: &std::path::Path, boundaries: bool) {
     const MAX_CHECKS: u64 = 256;
+    // A keep finds the rows it kept on an earlier run and stops at its first check: each run starts
+    // with none kept, so the sweep reaches the write loop, and what a run leaves there is compared.
+    let bases = (command == "offline.keepRows").then(crate::cmd::field_changes::test_bases::root).flatten();
+    let fresh_bases = || {
+        if let Some(root) = &bases {
+            let _ = std::fs::remove_dir_all(root);
+        }
+    };
     let files = || {
         let mut found = files(dir);
+        if let Some(root) = bases.as_ref().filter(|r| r.exists()) {
+            found.extend(files(root).into_iter().map(|(path, bytes)| (std::path::Path::new("field bases").join(path), bytes)));
+        }
         if command == "source.publish"
             && let Some(lock) = found.remove(std::path::Path::new(".towns.shp.rustgis-lock"))
         {
@@ -494,15 +633,19 @@ fn exercise(fixture: &Session, command: &str, p: &Value, kind: Kind, dir: &std::
         }
         found
     };
+    fresh_bases();
     let before_files = files();
     let mut normal = session(fixture);
     let expected = if boundaries {
         let count = Control::cancelled_at_look(u64::MAX);
         kind.run(&mut normal, command, p, &count).unwrap_or_else(|e| panic!("{command} {p}: normal run: {e}"));
         assert!(count.looked() > 0, "{command} {p}: never looks at Cancel");
+        // Kept from scratch, a keep looks between rows, not only once.
+        assert!(bases.is_none() || count.looked() > 2, "{command} {p}: looked {} times; it kept nothing", count.looked());
         assert!(count.looked() < MAX_CHECKS, "{command} {p}: {} checks; shrink the fixture to fit the cap", count.looked());
-        let result = (contents(&normal.project), files());
+        let result = (contents(&normal.project), comparable(files()));
         restore(dir, &before_files);
+        fresh_bases();
         Some(result)
     } else {
         None
@@ -524,18 +667,23 @@ fn exercise(fixture: &Session, command: &str, p: &Value, kind: Kind, dir: &std::
             if !boundaries {
                 return;
             }
+            if bases.is_some() {
+                // A cancelled keep lets the rows go by design, so the package keeps them when it is
+                // opened again: the retry opens it again.
+                s.project.given.clone_from(&fixture.project.given);
+            }
             kind.run(&mut s, command, p, &Control::new()).unwrap_or_else(|e| panic!("{what}: retry: {e}"));
         } else {
             assert!(boundaries, "{what}: ran on after Cancel");
         }
         let (expected, complete_files) = expected.as_ref().unwrap();
         assert!(&contents(&s.project) == expected, "{what}: completion differs from normal run");
-        assert!(&files() == complete_files, "{what}: completion left incomplete files");
+        assert!(&comparable(files()) == complete_files, "{what}: completion left incomplete files");
         if result.is_ok() && control.is_cancelled() {
             // A committed export is already complete, and a subsequent invocation still works.
             kind.run(&mut s, command, p, &Control::new()).unwrap_or_else(|e| panic!("{what}: retry after commit: {e}"));
             assert!(&contents(&s.project) == expected, "{what}: retry after commit changed completion");
-            assert!(&files() == complete_files, "{what}: retry after commit left incomplete files");
+            assert!(&comparable(files()) == complete_files, "{what}: retry after commit left incomplete files");
         }
         // Retry directly on the cancelled session before doing anything that could reset it.
         // Then exercise Undo/Redo: an added step restores the pre-command map. A publication's
@@ -547,8 +695,12 @@ fn exercise(fixture: &Session, command: &str, p: &Value, kind: Kind, dir: &std::
         }
         assert!(s.undo(), "{what}: lost Undo");
         if added_step {
-            // Table ids are never reused: undo keeps the counter (see the standalone-table removal regression).
+            // Table ids are never reused: undo keeps the counter, which only grows
+            // (`table_remove_takes_a_standalone_table_out_of_the_project` in tests.rs). Checked so,
+            // then set back, so only the counter is excused.
             let mut undone = contents(&s.project);
+            let id = |v: &Value| v["project"]["next_table_id"].as_u64();
+            assert!(id(&undone) >= id(&before), "{what}: undo lowered next_table_id");
             undone["project"]["next_table_id"] = before["project"]["next_table_id"].clone();
             assert!(undone == before, "{what}: undo didn't restore the map");
             assert!(!s.dirty(), "{what}: undo didn't return to the saved state");
@@ -556,6 +708,7 @@ fn exercise(fixture: &Session, command: &str, p: &Value, kind: Kind, dir: &std::
         assert!(s.redo(), "{what}: lost Redo");
         assert!(contents(&s.project) == completed, "{what}: redo didn't restore completion");
         restore(dir, &before_files);
+        fresh_bases();
         if !control.is_cancelled() {
             return;
         }
@@ -588,4 +741,64 @@ fn tiny_raster(scene: bool) -> String {
     )
     .unwrap();
     base64::engine::general_purpose::STANDARD.encode(geotiff::write(&raster, 0).unwrap())
+}
+
+/// A public synchronous command is a transaction even when Cancel arrives after several rows.
+#[test]
+fn synchronous_add_field_mid_loop_cancel_restores_rows_fields_and_history() {
+    use rustgis_data::{Dataset, Field, FieldType, GeometryType, Value as Cell, progress};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+    struct CancelAfter(AtomicU64);
+    impl progress::Probe for CancelAfter {
+        fn cancelled(&self) -> bool {
+            self.0.load(Ordering::Relaxed) >= 5
+        }
+        fn begin(&self, _: u64) {
+            self.0.store(0, Ordering::Relaxed);
+        }
+        fn advance(&self, n: u64) {
+            self.0.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+    for table in [false, true] {
+        let mut ds = Dataset::new("Rows", GeometryType::Polygon, vec![Field::new("name", FieldType::Text)]);
+        for i in 0..20 {
+            ds.push(None, vec![Cell::Text(format!("row{i}"))]);
+        }
+        let before = ds.clone();
+        let mut s = Session::new(Project::default());
+        let (id, p) = if table {
+            let id = s.project.add_table(ds);
+            (id, json!({"table":id,"name":"class","type":"text"}))
+        } else {
+            let id = s.map_mut().add_dataset(ds);
+            s.active_layer = Some(id);
+            (id, json!({"layer":id,"name":"class","type":"text"}))
+        };
+        let mut seed = p.clone();
+        seed["name"] = json!("temporary");
+        s.run("edit.addField", &seed).unwrap();
+        s.run("edit.undo", &json!({})).unwrap();
+        let depth = s.undo_depth();
+        let redo = s.redo_labels().collect::<Vec<_>>();
+        assert!(!redo.is_empty());
+        let probe = Arc::new(CancelAfter(AtomicU64::new(0)));
+        let guard = progress::install(Some(probe.clone()));
+        let error = s.run("edit.addField", &p).unwrap_err();
+        drop(guard);
+        assert!(error.contains("cancelled"), "{error}");
+        assert_eq!(probe.0.load(Ordering::Relaxed), 5, "cancellation happened after several row writes");
+        let after = if table { &s.project.table(id).unwrap().dataset } else { &s.map().layer(id).unwrap().dataset };
+        assert_eq!(after.fields, before.fields);
+        assert_eq!(after.features.to_vec(), before.features.to_vec());
+        assert_eq!(s.undo_depth(), depth);
+        assert_eq!(s.redo_labels().collect::<Vec<_>>(), redo);
+        s.run("edit.addField", &p).unwrap();
+        let after = if table { &s.project.table(id).unwrap().dataset } else { &s.map().layer(id).unwrap().dataset };
+        assert_eq!(after.fields.len(), 2);
+        assert!(after.features.rows().all(|row| row.values().len() == 2 && row.value(1).is_null()));
+    }
 }

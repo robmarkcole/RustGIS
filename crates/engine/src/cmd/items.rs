@@ -100,7 +100,7 @@ pub fn commands() -> Vec<C> {
                 s.notify(format!("New Style: the style takes the first {MAX_STYLE_NAME} characters of the layer's name"), false);
             }
             if left_out > 0 {
-                s.notify(format!("Style {name} from {layer}: {left_out} fill(s) No Fill hid couldn't be put back in it, as their classes have fills of their own now, are gone or their opacity wasn't kept; it draws them as the layer does now"), false);
+                s.notify(format!("Style {name} from {layer}: {left_out} fill(s) No Fill hid couldn't be put back in it, as their classes have fills of their own now, are gone or their opacity wasn't kept; the style is saved without them"), false);
             }
             Ok(json!({"style": name}))
         }).roles(&[]).effects(crate::policy::Effects::NONE)
@@ -312,7 +312,9 @@ pub fn commands() -> Vec<C> {
             }
             let kept = name.chars().count() - if i > 1 { format!(" {i}").chars().count() } else { 0 };
             if kept < base.chars().count() {
-                s.notify(format!("New Task: a task has that name already, so the name given is cut to {kept} characters to fit \" {i}\""), false);
+                // `task.import` adds its task through this command, and is named as itself.
+                let title = if b(p, "imported").unwrap_or(false) { "Import Task" } else { "New Task" };
+                s.notify(format!("{title}: a task has that name already, so the name given is cut to {kept} characters to fit \" {i}\""), false);
             }
             s.project.tasks.push(Task { name: name.clone(), description, steps });
             Ok(json!({"task": name}))
@@ -324,8 +326,8 @@ pub fn commands() -> Vec<C> {
                 return Err(format!("'{}' can't be a task step", step.command));
             }
             let t = task_mut(s, p)?;
-            if t.steps.len() >= 200 {
-                return Err("a task has at most 200 steps".into());
+            if t.steps.len() >= MAX_TASK_STEPS {
+                return Err(format!("a task has at most {MAX_TASK_STEPS} steps"));
             }
             t.steps.push(step);
             Ok(json!({"steps": t.steps.len()}))
@@ -580,7 +582,8 @@ fn import_maps(s: &mut Session, p: &Value) -> CmdResult {
     }
     // Repair what was read (rasters reopen, cameras clamp); the sources that read S3 wait for
     // the saved connection that is to read them.
-    for notice in s.project.normalize_text() {
+    let when = if s.project.maps.len().saturating_sub(first_map) == 1 { "while importing the map" } else { "while importing the maps" };
+    for notice in s.project.normalize_after(when) {
         s.notify_text(notice, false);
     }
     super::connections::restore_active(s);
@@ -937,7 +940,15 @@ fn layer_template(s: &mut Session, p: &Value) -> CmdResult {
         o => return Err(format!("unknown layer template '{o}'")),
     };
     let name = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).unwrap_or(title);
-    let id = super::layer::add_dataset(s, Dataset::new(name, gt, fields));
+    let mut ds = Dataset::new(name, gt, fields);
+    // Held in the project's coordinate system, when it has one (#2032 C3a).
+    // One that doesn't convert to longitude/latitude, which the map draws through, is said.
+    if let Some(crs) = s.project.coordinate_system
+        && let Err(e) = ds.hold_as(crs, Some(crs))
+    {
+        s.notify(format!("Layer '{name}' is held in longitude/latitude, not the project's coordinate system: {e}"), false);
+    }
+    let id = super::layer::add_dataset(s, ds);
     if let Some(l) = s.map_mut().layer_mut(id) {
         l.labels.default.field = "name".into();
     }
@@ -1135,7 +1146,7 @@ fn export_3d(s: &mut Session, p: &Value) -> CmdResult {
             s.notify(note, false);
         }
         s.retain_written_notices(written);
-        s.notify_written(format!("Exported {path}"), false);
+        s.notify_written(format!("Exported {path}"));
         return Ok(json!({
             "path": path, "bytes": bytes.len(), "triangles": report.triangles,
             "skippedDegenerate": report.degenerate, "linesDropped": report.lines, "capsFanned": report.fanned,
@@ -1147,7 +1158,7 @@ fn export_3d(s: &mut Session, p: &Value) -> CmdResult {
         s.notify(note, false);
     }
     s.retain_written_notices(written);
-    s.notify_written(format!("Exported {path}"), false);
+    s.notify_written(format!("Exported {path}"));
     Ok(json!({"path": path, "bytes": obj.len()}))
 }
 
@@ -1688,14 +1699,14 @@ pub const ITEMS: &[(&str, &str, &str)] = &[
 pub fn item_bytes(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Vec<u8>), String> {
     let (name, bytes, notes) = item_output(s, kind, p)?;
     for note in notes {
-        s.notify(note, false);
+        s.say(note);
     }
     Ok((name, bytes))
 }
 
 /// Builds an item and returns construction-loss notes for publication only after delivery.
-pub fn item_output(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Vec<u8>, Vec<String>), String> {
-    let mut construction_notes = match kind {
+pub fn item_output(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Vec<u8>, rustgis_data::loss::Notes), String> {
+    let mut construction_notes: rustgis_data::loss::Notes = (match kind {
         "map" => {
             let m = saved_map(s, p)?;
             s.constructions.output_notes(m.layers.iter().map(|l| (m.instance_id(), l)))?
@@ -1712,7 +1723,8 @@ pub fn item_output(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Ve
         "mapPackage" | "fieldPackage" => s.constructions.output_notes(s.map().layers.iter().map(|l| (s.map().instance_id(), l)))?,
         "gpPackage" => s.constructions.output_notes(gp_result_layers(s).into_iter().map(|(m, l)| (m.instance_id(), l)))?,
         _ => Vec::new(),
-    };
+    })
+    .into();
     let (name, bytes) = match kind {
         "map" => {
             let map = saved_map(s, p)?;
@@ -1788,14 +1800,14 @@ pub fn item_output(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Ve
             let id = s.layer_id(p)?;
             let name = s.map().layer(id).map(|l| l.name.clone()).unwrap_or_default();
             let (text, notes) = obj_text(s, p)?;
-            construction_notes = notes;
+            construction_notes = notes.into();
             (name, text.into_bytes())
         }
         "stl" => {
             let id = s.layer_id(p)?;
             let name = s.map().layer(id).map(|l| l.name.clone()).unwrap_or_default();
             let (bytes, _, notes) = stl_bytes(s, p)?;
-            construction_notes = notes;
+            construction_notes = notes.into();
             (name, bytes)
         }
         "report" | "reportTemplate" => {
@@ -1826,7 +1838,7 @@ pub fn item_output(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Ve
         }
         k if super::sharing::KINDS.iter().any(|x| x.0 == k) => {
             let (name, bytes, _, notes) = super::sharing::share_output(s, k, p)?;
-            construction_notes = notes;
+            construction_notes = notes.into();
             super::sharing::note_label_classes(s, k, p);
             super::sharing::note_export(s, k, p, &name);
             (name, bytes)
@@ -1844,7 +1856,7 @@ pub(crate) fn save_item(s: &mut Session, kind: &str, p: &Value) -> CmdResult {
     let (_, bytes, notes) = item_output(s, kind, p)?;
     rustgis_data::io::write_atomic(Path::new(&path), &bytes).map_err(|e| format!("{path}: {e}"))?;
     for note in notes {
-        s.notify(note, false);
+        s.say(note);
     }
     s.retain_written_notices(written);
     Ok(json!({"path": path, "bytes": bytes.len()}))

@@ -1809,9 +1809,11 @@ fn tile_row(app: &mut RustGisApp, ui: &mut Ui, i: usize, moves: [bool; 2], reord
             ui.close();
         }
         // Its raster tiles over the view, as a GeoTIFF placed on the ground.
-        // Not a vector archive (one whose source layers its header names).
+        // Not a vector archive (one whose source layers its header names), and not in the web
+        // app (which downloads), which has no thread to fetch the tiles on.
         if matches!(tile.kind, TileKind::Raster | TileKind::PmTiles | TileKind::MbTiles)
             && sources.is_none()
+            && app.services.download.is_none()
             && ui.button(tl!("Export Raster…")).clicked()
         {
             action = Some(("ui.exportRaster", json!({"tiles": i})));
@@ -1950,8 +1952,9 @@ fn disk_note(app: &RustGisApp, layer: Option<&Layer>, tile: Option<usize>) -> Op
 
 /// The note after a layer's name, its details and tint, as [`disk_note`] gives them. A layer read
 /// whole from a Shapefile or GeoJSON file it publishes to (`source.publish`) also says whether it
-/// holds edits the file lacks (`syncmark`), and its file's changes point to Publish to Source,
-/// which refuses to overwrite them, rather than Reload Data, which can't read it again.
+/// holds edits the file lacks (`syncmark`). A change on disk with no edits points to adding the
+/// file again (and Source File State), not Reload Data, which can't read it again; with edits,
+/// Publish to Source refuses to overwrite the change and Export Features keeps them.
 pub(crate) fn layer_note(app: &mut RustGisApp, l: &Layer, ctx: &egui::Context) -> Option<(String, String, Option<bool>)> {
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -3251,8 +3254,8 @@ fn layer_list(form: &mut GpForm, ui: &mut Ui, param: &'static str, cur: &str, of
 /// Whether a layer parameter's picker offers no layer (`—`), to leave it out again once one is
 /// picked: when it is optional and names no layer as its default. One that does would run with
 /// that layer when left empty (its default is filled in then), so `—` would show one layer and
-/// run with another (#1517). A built-in tool's `layer` picker offers none (A5 Grid's follows the
-/// active layer).
+/// run with another (#1517). A built-in tool's `layer` picker offers none (Generate Tessellation's
+/// follows the active layer).
 fn no_layer_offered(p: &rustgis_engine::analysis::ParamSpec) -> bool {
     !p.required && serde_json::from_str::<String>(p.default).map_or(true, |n| n.is_empty())
 }
@@ -3260,8 +3263,8 @@ fn no_layer_offered(p: &rustgis_engine::analysis::ParamSpec) -> bool {
 impl GpForm {
     /// Opens a tool, pre-filling layer parameters from the active layer. An external tool's
     /// optional input stays empty until it's picked: it changes what the tool does, as a weight
-    /// or a mask would (#1517). A built-in tool's is filled as before; the form shows A5 Grid's,
-    /// the only one, when its options ask for it (`applies`).
+    /// or a mask would (#1517). A built-in tool's is filled as before; the form shows Generate
+    /// Tessellation's, the only one, when its options ask for it (`applies`).
     pub fn open(&mut self, tool: Option<&'static str>, s: &Session) {
         self.tool = tool;
         self.values.clear();
@@ -3377,7 +3380,7 @@ fn geolibre_card(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         return;
     }
     // An install that just finished: use the runner, and remember it.
-    let finished = app.gp.install.as_ref().and_then(|st| st.lock().ok().and_then(|mut s| s.result.take()));
+    let finished = app.gp.install.as_ref().and_then(|st| st.lock().unwrap_or_else(std::sync::PoisonError::into_inner).result.take());
     if let Some(result) = finished {
         app.gp.install = None;
         match result.and_then(|path| app.run("gp.setGeolibre", json!({"path": path})).map(|_| path)) {
@@ -3406,7 +3409,9 @@ fn geolibre_card(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             ui.label(egui::RichText::new(e).size(11.0).color(t.red));
         }
     }
-    let download = status["download"].as_str().unwrap_or("https://github.com/opengeos/geolibre-rust/releases/latest").to_string();
+    // The pinned release's page, as `gp::geolibre_status` gives it; none, no link (never the latest
+    // release, which may be one this version can't run).
+    let download = status["download"].as_str().map(str::to_string);
     ui.add_space(6.0);
     egui::Frame::NONE.stroke(Stroke::new(1.0, t.border)).corner_radius(CornerRadius::same(6)).inner_margin(egui::Margin::same(10)).show(
         ui,
@@ -3458,8 +3463,16 @@ fn geolibre_card(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                     }
                     ui.add_space(2.0);
                     ui.horizontal_wrapped(|ui| {
-                        ui.label(egui::RichText::new(tl!("Or")).size(11.0).color(t.text_dim));
-                        ui.add(egui::Hyperlink::from_label_and_url(tl!("Download the GeoLibre runner"), download).open_in_new_tab(true));
+                        // "Or" only when something follows it: the browser has no download link
+                        // and no Locate….
+                        if download.is_some() || cfg!(not(target_arch = "wasm32")) {
+                            ui.label(egui::RichText::new(tl!("Or")).size(11.0).color(t.text_dim));
+                        }
+                        if let Some(download) = &download {
+                            ui.add(
+                                egui::Hyperlink::from_label_and_url(tl!("Download the GeoLibre runner"), download).open_in_new_tab(true),
+                            );
+                        }
                         #[cfg(not(target_arch = "wasm32"))]
                         if ui.small_button(tl!("Locate…")).clicked()
                             && let Some(path) =
@@ -3559,7 +3572,7 @@ fn geolibre_language(app: &mut RustGisApp, ui: &mut Ui) {
     // One download at a time, whatever the language now: a second one would take the first's
     // place, and the first's result (or failure) would never be shown.
     if let Some((_, slot)) = &app.gp.language_download {
-        let done = slot.lock().ok().and_then(|mut r| r.take());
+        let done = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
         match done {
             // A pack that names none of these tools (made for another runner version) would leave
             // them in English under Remove translations, without a word.
@@ -5830,11 +5843,13 @@ pub(crate) fn stroke_image(layer: u32, class: Option<&ClassRef>, strokes: &[Line
 }
 
 /// A marker as an editor sends it back: an image that can't be drawn (one a file gave that wasn't
-/// kept, or that doesn't decode) becomes the circle it is drawn as, which the command takes where
-/// it refuses the image. Whether it was replaced.
+/// kept, that doesn't decode or that has too many pixels) becomes the circle it is drawn as, which
+/// the command takes where it refuses the image. One drawn as a circle only for what the run has
+/// spent is sent as it is, to draw after a restart. Whether it was replaced.
 pub(crate) fn drawn_marker(m: Marker) -> (Marker, bool) {
+    let lost = |p| rustgis_engine::render::picture_marker_kept_refusal(p).is_some();
     match m {
-        Marker::Picture(p) if !rustgis_engine::render::picture_marker_draws(p) => (Marker::Circle, true),
+        Marker::Picture(p) if lost(p) => (Marker::Circle, true),
         m => (m, false),
     }
 }
@@ -7802,9 +7817,23 @@ pub(crate) fn layout_menu(app: &mut RustGisApp, ui: &mut Ui, n: &str) {
     }
 }
 
+#[expect(clippy::disallowed_methods, reason = "a thread the system refuses fails the test, as it should")]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An editor sends back an image that draws as it is, and one refused for itself (not an
+    /// image) as the circle it is drawn as, counted. The rule is render's
+    /// `picture_marker_kept_refusal`, whose tests cover one refused only until a restart.
+    #[test]
+    fn an_editor_sends_an_image_that_cant_draw_as_its_circle() {
+        let png =
+            "iVBORw0KGgoAAAANSUhEUgAAABgAAAAMCAYAAAB4MH11AAAAIElEQVR4nGO4ICPznxQsE3OBJMwwasGoBaMWjFpAGAMALk9r//PjorkAAAAASUVORK5CYII=";
+        let fine = Marker::Picture(rustgis_engine::map::Picture::new(png));
+        assert_eq!(drawn_marker(fine), (fine, false));
+        let broken = Marker::Picture(rustgis_engine::map::Picture::new("bm90IGFuIGltYWdl"));
+        assert_eq!(drawn_marker(broken), (Marker::Circle, true));
+    }
 
     /// A point layer given an image by `layer.marker` shows it in its patch (the Layers row and the
     /// symbol editor's swatch), and a stroke's image marker shows on the stroke editor's line, not

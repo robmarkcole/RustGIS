@@ -25,7 +25,9 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
     under them. When the legend sits at the right of the map (its right edge in the frame's
     right tenth), starting between 45 % and 70 % of the frame's width, the right column starts
     where the legend does, unless its texts would then need a taller box. Text sizes follow the
-    sheet's short side: an A3's are 1.41 times an A4's, an A0's four times. Given its size alone
+    sheet's short side: an A3's are 1.41 times an A4's, an A0's four times. So do the legend's
+    text size, the scale bar's and the graticule's (9, 8 and 8 points on A4) and the strips the
+    graticule's labels take inside the frame. Given its size alone
     (`"a4"`, the default, or any other: `"letter"`, `"a0"`…), a sheet is turned to
     portrait or landscape, whichever the map comes out larger on: the area's extent east to west
     against north to south, on the map's projection, with the room the style leaves the map. The
@@ -224,8 +226,11 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   and **Line width**, and its labels: decimal degrees (`112.5°W`, as many decimals as the
   interval needs) or degrees, minutes and seconds (`112°30′W`), with a hemisphere letter or a
   sign (`-112.5°`), on any of the four edges (longitudes along the top and bottom, latitudes along
-  the left and right; the bottom and left to start with), and the side labels horizontal or
-  running along the edge. From a command:
+  the left and right; the bottom and left to start with), the side labels horizontal or
+  running along the edge, and their **Label size** (`"labelSize"`, 4 to 100 points, 8 by default;
+  their room from the frame's edge and a measured grid's MGRS square names follow in proportion,
+  labels that would then touch, or that reach further in than the frame is across, are left out,
+  and `null` gives the default back). From a command:
   `layout.addElement={"kind":"grid","step":0.5,"style":"ticks","format":"dms","edges":["top","bottom","left","right"],"labelOrientation":"vertical"}`
   (given again, it changes only the options it names), or `layout.update` with
   `"grid": {…}` (`false` removes the grid). On a map on the globe the lines are drawn on the
@@ -270,9 +275,17 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   and **Outline** colours (`"style":"compass","fill":"#B91C1C"`). A scale bar's pick its
   **Style** (alternating bar, stepped line or single line), its **Units** (metres or kilometres
   to suit the scale, or kilometres, metres, miles or feet), its **Divisions** (1 to 10), each
-  labelled where there is room, its **Color** (the lines, the dark divisions and the labels) and
-  its **Fill** (the alternating bar's light divisions)
-  (`"style":"line","units":"miles","divisions":2,"color":"#1F4E79"`). A legend's
+  labelled where there is room, its **Color** (the lines, the dark divisions and the labels), its
+  **Fill** (the alternating bar's light divisions) and its **Text size** (`"textSize"`, 4 to 100
+  points, 8 by default; the room over the bar and between the labels follows, the bar keeps its
+  length and height and moves down, and right, in its box to make room for larger labels, which
+  reach no further past its top and left than the default size's, and `null` gives the default
+  back) (`"style":"line","units":"miles","divisions":2,"color":"#1F4E79","textSize":12`). A box too
+  small for its labels and bar (too short, which draws the bar below it, too narrow for its last
+  label, or so narrow that a larger last label runs into the first), or a label that runs off the
+  page, is said when its place, size, text size, units or divisions change or its frame is drawn
+  at another scale, and an export reports it as cut off, as it does a text. A locked scale bar
+  refuses a new text size, `null` included. A legend's
   parts:
   - **What a legend lists**: what its frame draws: only layers with a feature at the frame's
     scale (through their definition query, display filters and scale range) and, for Unique
@@ -377,8 +390,8 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   tables. Its properties pick the **Layer** (unless one is picked, the top visible raster with a
   colour scale, not drawn by classes: a legend lists a land cover's classes, and a colorbar
   added over a map with only such rasters draws an empty placeholder and says so), the
-  **Title** (the units, such as `Elevation (m)`; the layer's name to start with; one wider than the colorbar
-  wraps at spaces onto more lines, the bar under them), the
+  **Title** (the units, such as `Elevation (m)`; the layer's name to start with; a title wider than the colorbar
+  wraps at spaces onto more lines, with the bar under them), the
   **Orientation**, which side the **Labels** go on, how many **Ticks** a gradient labels (2 to
   21, the ends included) and **Reverse** (high values first). An RGB raster or a hillshade
   without a tint has no colour scale and shows a placeholder, as does a picked layer that was

@@ -118,16 +118,20 @@ fn prepare_env(app: &mut RustGisApp, id: &str) {
     }
     let job = Arc::new(Mutex::new(EnvJob::default()));
     app.plugins.envs.insert(id.to_string(), job.clone());
-    let id = id.to_string();
-    std::thread::spawn(move || {
+    let (id, work) = (id.to_string(), job.clone());
+    let spawned = std::thread::Builder::new().name("rustgis-plugin-env".into()).spawn(move || {
         let set = |f: &mut dyn FnMut(&mut EnvJob)| {
-            if let Ok(mut j) = job.lock() {
+            if let Ok(mut j) = work.lock() {
                 f(&mut j);
             }
         };
         let r = rp::pyenv::prepare(&id, &mut |line| set(&mut |j| j.now = line.to_string()));
         set(&mut |j| j.done = Some(r.clone().map(|p| p.display().to_string())));
     });
+    if let Err(e) = spawned {
+        let why = crate::i18n::fmt("The system refused a thread to do this on ({error}); try again", &[("error", &e.to_string())]);
+        job.lock().unwrap_or_else(|e| e.into_inner()).done = Some(Err(why));
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -257,7 +261,7 @@ pub(crate) fn fetch(app: &RustGisApp, url: &str, limit: usize, ctx: Option<egui:
     #[cfg(not(target_arch = "wasm32"))]
     {
         let (url, out) = (url.to_string(), slot.clone());
-        std::thread::spawn(move || {
+        crate::work_off_frame("rustgis-plugin-registry", &slot, move || {
             let r = rp::registry::fetch(&url, limit);
             if let Ok(mut s) = out.lock() {
                 *s = Some(r);
@@ -278,7 +282,7 @@ pub(crate) fn fetch(app: &RustGisApp, url: &str, limit: usize, ctx: Option<egui:
 }
 
 pub(crate) fn take(slot: &Download) -> Option<Result<Vec<u8>, String>> {
-    slot.lock().ok().and_then(|mut s| s.take())
+    slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
 }
 
 /// Whether the web app keeps installed plugins in its preferences (the desktop keeps them in
@@ -723,11 +727,12 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
                         ));
                         Vec::new()
                     });
-                    for name in pulled {
-                        app.session.notify(
-                            crate::i18n::fmt("{name} was withdrawn from the plugin registry and has been turned off.", &[("name", &name)]),
-                            true,
-                        );
+                    // One warning for them all, with a count: the withdrawal was applied as asked.
+                    if !pulled.is_empty() {
+                        app.session.warn(crate::i18n::fmt(
+                            "{n} plugin(s) were withdrawn from the plugin registry and turned off: {names}",
+                            &[("n", &pulled.len().to_string()), ("names", &pulled.join(", "))],
+                        ));
                     }
                 }
                 // Another registry may have no blocklist (it blocks nothing); the hosted one always

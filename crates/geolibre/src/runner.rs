@@ -16,7 +16,7 @@ use serde_json::Value;
 /// `apps/rustgis-web/src/geolibre.rs`): move both forward together, with the user guide's link
 /// (`docs/user-guide/analysis.md`), by a pull request, after checking the new runner against
 /// [`SUPPORTED_FROM`]..[`SUPPORTED_BEFORE`].
-pub const RELEASE: &str = "1.8.0";
+pub const RELEASE: &str = "1.8.3";
 
 /// The oldest runner version RustGIS works with: the first 1.x release, which already answers
 /// `version`, `manifests` and `<tool> --k=v` as RustGIS asks them.
@@ -169,8 +169,8 @@ fn output_until(mut c: Command, stop: &dyn Fn() -> Option<String>) -> Result<Out
     let mut child = spawn_when_free(&mut c, stop)?;
     // Drain both pipes on threads while the process runs: a full pipe (large manifests, or
     // many warnings) would otherwise block it until the time limit.
-    fn drain(mut pipe: impl std::io::Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
-        std::thread::spawn(move || {
+    fn drain(mut pipe: impl std::io::Read + Send + 'static) -> std::io::Result<std::thread::JoinHandle<Vec<u8>>> {
+        std::thread::Builder::new().spawn(move || {
             let mut buf = Vec::new();
             let _ = pipe.read_to_end(&mut buf);
             buf
@@ -182,7 +182,15 @@ fn output_until(mut c: Command, stop: &dyn Fn() -> Option<String>) -> Result<Out
         let _ = child.wait();
         return Err("the program's output couldn't be read".into());
     };
-    let (out_reader, err_reader) = (drain(out), drain(err));
+    let (out_reader, err_reader) = match (drain(out), drain(err)) {
+        (Ok(out), Ok(err)) => (out, err),
+        // No thread to read its output with: never leave the process running.
+        (Err(e), _) | (_, Err(e)) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("the system refused a thread to read the program's output on ({e})"));
+        }
+    };
     let status = loop {
         let why = match child.try_wait() {
             Ok(Some(status)) => break status,

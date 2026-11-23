@@ -45,9 +45,26 @@ impl ReloadWorkspace {
         self.dir.path()
     }
 
-    /// Whether a saved conversion belongs to a disposable workspace rather than a durable cache.
+    /// Whether a saved conversion belongs to a disposable workspace rather than a durable cache:
+    /// in a folder named as a workspace that holds its owner lock, marked as one. A user's cache
+    /// folder that only has such a name (`RUSTGIS_GDAL_CACHE=/data/reload-2024`) isn't one. A lock
+    /// that is there but can't be opened or read is held by a live owner (Windows refuses reads of
+    /// a locked range); one shorter than the marker isn't a workspace's.
     pub fn contains_file(path: &Path) -> bool {
-        path.parent().and_then(Path::file_name).is_some_and(|name| name.to_string_lossy().starts_with(RELOAD_PREFIX))
+        use std::io::Read;
+        let Some(parent) = path.parent() else { return false };
+        if !parent.file_name().is_some_and(|name| name.to_string_lossy().starts_with(RELOAD_PREFIX)) {
+            return false;
+        }
+        let mut lock = match std::fs::File::open(parent.join("owner.lock")) {
+            Ok(lock) => lock,
+            Err(e) => return e.kind() != std::io::ErrorKind::NotFound,
+        };
+        let mut marker = [0; RELOAD_OWNER_MARKER.len()];
+        match lock.read_exact(&mut marker) {
+            Ok(()) => marker.as_slice() == RELOAD_OWNER_MARKER,
+            Err(e) => e.kind() != std::io::ErrorKind::UnexpectedEof,
+        }
     }
 }
 
@@ -163,7 +180,7 @@ fn run(
         }
     }
     let drain = |p: Option<Box<dyn Read + Send>>| {
-        std::thread::spawn(move || {
+        std::thread::Builder::new().spawn(move || {
             let mut buf = Vec::new();
             if let Some(mut p) = p {
                 let _ = p.read_to_end(&mut buf);
@@ -173,6 +190,15 @@ fn run(
     };
     let out = drain(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
     let err = drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    // No thread to read its output with: the program is stopped, as without one to write with.
+    let (out, err) = match (out, err) {
+        (Ok(out), Ok(err)) => (out, err),
+        (Err(e), _) | (_, Err(e)) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
+    };
     let start = std::time::Instant::now();
     let status = loop {
         if let Some((dir, max)) = workspace
@@ -329,6 +355,21 @@ mod tests {
             .unwrap();
     }
 
+    /// A durable cache folder that is only named as a workspace keeps its conversions; a real
+    /// workspace's are disposable.
+    #[test]
+    fn only_a_real_workspace_contains_its_files() {
+        let cache = tempfile::tempdir().unwrap();
+        let durable = cache.path().join("reload-2024");
+        std::fs::create_dir_all(&durable).unwrap();
+        assert!(!ReloadWorkspace::contains_file(&durable.join("layer.fgb")));
+        std::fs::write(durable.join("owner.lock"), b"something else").unwrap();
+        assert!(!ReloadWorkspace::contains_file(&durable.join("layer.fgb")));
+        let workspace = reload_workspace(cache.path()).unwrap();
+        assert!(ReloadWorkspace::contains_file(&workspace.path().join("layer.fgb")));
+        assert!(!ReloadWorkspace::contains_file(&cache.path().join("layer.fgb")));
+    }
+
     #[test]
     fn reload_collection_preserves_a_new_unlocked_owner_lock_then_reclaims_it_after_grace() {
         let cache = tempfile::tempdir().unwrap();
@@ -454,6 +495,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[expect(clippy::disallowed_methods, reason = "a thread the system refuses fails the test, as it should")]
     fn timeout_returns_while_a_grandchild_holds_the_pipes() {
         use std::time::{Duration, Instant};
         for budgeted in [false, true] {

@@ -126,6 +126,11 @@ pub struct Grid {
     /// zone: the one named, else the map's own when it is one, else the zone at the frame's centre.
     #[serde(default, skip_serializing_if = "is_false")]
     pub mgrs: bool,
+    /// The size of its labels, in points, within [`LAYOUT_TEXT_SIZE`] (#2581): their room from
+    /// the frame's edge and MGRS squares' names follow in proportion. [`GRID_LABEL_PT`] unless
+    /// set, and left out then, so layouts saved before keep their bytes.
+    #[serde(default = "grid_label_pt", skip_serializing_if = "is_grid_label_pt")]
+    pub label_size: f64,
 }
 
 /// What a grid's lines are.
@@ -219,6 +224,7 @@ impl Default for Grid {
             crs: None,
             short: false,
             mgrs: false,
+            label_size: GRID_LABEL_PT,
         }
     }
 }
@@ -845,13 +851,26 @@ fn is_one_column(columns: &usize) -> bool {
 /// A legend's text size until it is set (#2581), in points: its layers' names and classes'
 /// labels, as legends have always drawn them.
 pub const LEGEND_TEXT_PT: f64 = 9.0;
-/// The sizes a legend's text takes, in points.
-pub const LEGEND_TEXT_SIZE: std::ops::RangeInclusive<f64> = 4.0..=100.0;
+/// A scale bar's labels' size until it is set (#2581), in points, as scale bars have always
+/// drawn them.
+pub const SCALE_BAR_TEXT_PT: f64 = 8.0;
+/// A grid's labels' size until it is set (#2581), in points, as grids have always drawn them.
+pub const GRID_LABEL_PT: f64 = 8.0;
+/// The sizes a legend's, a scale bar's or a grid's text takes, in points (#2581).
+pub const LAYOUT_TEXT_SIZE: std::ops::RangeInclusive<f64> = 4.0..=100.0;
 
-/// A legend's text size kept within [`LEGEND_TEXT_SIZE`], [`LEGEND_TEXT_PT`] when it is no number:
-/// what a layout opened and the drawing take, so they agree (a command refuses one out of range).
-pub fn legend_text_in_range(pt: f64) -> f64 {
-    finite_or(pt, LEGEND_TEXT_PT).clamp(*LEGEND_TEXT_SIZE.start(), *LEGEND_TEXT_SIZE.end())
+/// A legend's, scale bar's or grid's text size kept within [`LAYOUT_TEXT_SIZE`], its `default`
+/// when it is no number: what a layout opened and the drawing take, so they agree (a command
+/// refuses one out of range).
+pub fn layout_text_in_range(pt: f64, default: f64) -> f64 {
+    finite_or(pt, default).clamp(*LAYOUT_TEXT_SIZE.start(), *LAYOUT_TEXT_SIZE.end())
+}
+
+/// How many times its `default` a text of `pt` points is drawn, `pt` brought into range as
+/// [`layout_text_in_range`] does: what a legend's rows, a scale bar's or a grid's labels and
+/// their room are scaled by (#2581).
+pub fn layout_text_scale(pt: f64, default: f64) -> f64 {
+    layout_text_in_range(pt, default) / default
 }
 
 fn legend_text_pt() -> f64 {
@@ -860,6 +879,22 @@ fn legend_text_pt() -> f64 {
 
 fn is_legend_text_pt(size: &f64) -> bool {
     *size == LEGEND_TEXT_PT
+}
+
+fn scale_bar_text_pt() -> f64 {
+    SCALE_BAR_TEXT_PT
+}
+
+fn is_scale_bar_text_pt(size: &f64) -> bool {
+    *size == SCALE_BAR_TEXT_PT
+}
+
+fn grid_label_pt() -> f64 {
+    GRID_LABEL_PT
+}
+
+fn is_grid_label_pt(size: &f64) -> bool {
+    *size == GRID_LABEL_PT
 }
 
 /// The dark grey a scale bar draws in by default, and a legend, colorbar, table or chart without
@@ -975,6 +1010,12 @@ pub enum ElementKind {
         /// The alternating bar's light divisions.
         #[serde(default = "white")]
         fill: Rgba,
+        /// The size of its labels, in points, within [`LAYOUT_TEXT_SIZE`] (#2581): the room over
+        /// the bar and between labels follows in proportion, the bar keeping its size.
+        /// [`SCALE_BAR_TEXT_PT`] unless set, and left out then, so layouts saved before keep their
+        /// bytes.
+        #[serde(default = "scale_bar_text_pt", skip_serializing_if = "is_scale_bar_text_pt")]
+        text_size: f64,
     },
     Legend {
         frame: u32,
@@ -1010,7 +1051,7 @@ pub enum ElementKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         color: Option<Rgba>,
         /// The size of its layers' names and its classes' labels, in points, within
-        /// [`LEGEND_TEXT_SIZE`] (#2581): its title, rows, swatches and gaps follow in proportion,
+        /// [`LAYOUT_TEXT_SIZE`] (#2581): its title, rows, swatches and gaps follow in proportion,
         /// a point symbol keeping the size the map draws it at. [`LEGEND_TEXT_PT`] unless set,
         /// and left out then, so layouts saved before keep their bytes.
         #[serde(default = "legend_text_pt", skip_serializing_if = "is_legend_text_pt")]
@@ -1395,6 +1436,7 @@ impl ElementKind {
             style: ScaleBarStyle::default(),
             color: ink(),
             fill: white(),
+            text_size: SCALE_BAR_TEXT_PT,
         }
     }
 
@@ -1444,11 +1486,11 @@ impl ElementKind {
 
     /// Whether `key` given as null changes an element of this kind, giving it back its default:
     /// an ink's `color`, a chart's `title` (the title it is given) and `barColor`, and a legend's
-    /// `textSize` (#2581).
+    /// or scale bar's `textSize` (#2581).
     pub fn null_resets(&self, key: &str) -> bool {
         (self.takes_ink() && key == "color")
             || (matches!(self, ElementKind::Chart { .. }) && matches!(key, "title" | "barColor"))
-            || (matches!(self, ElementKind::Legend { .. }) && key == "textSize")
+            || (matches!(self, ElementKind::Legend { .. } | ElementKind::ScaleBar { .. }) && key == "textSize")
     }
 
     /// Its ink, when it [takes one](ElementKind::takes_ink) and has one; `None` draws in [`INK`].
@@ -1473,9 +1515,15 @@ impl ElementKind {
         }
     }
 
-    /// Whether it is a legend whose text isn't the default size (#2581).
-    pub fn has_custom_legend_text(&self) -> bool {
-        matches!(self, ElementKind::Legend { text_size, .. } if !is_legend_text_pt(text_size))
+    /// Whether it is a legend whose text, a scale bar whose labels or a map frame whose grid's
+    /// labels aren't their default size (#2581).
+    pub fn has_custom_text_size(&self) -> bool {
+        match self {
+            ElementKind::Legend { text_size, .. } => !is_legend_text_pt(text_size),
+            ElementKind::ScaleBar { text_size, .. } => !is_scale_bar_text_pt(text_size),
+            ElementKind::MapFrame { grid: Some(g), .. } => !is_grid_label_pt(&g.label_size),
+            _ => false,
+        }
     }
 
     /// Whether it is a map frame whose border isn't the default one (#2557).
@@ -2479,7 +2527,9 @@ impl Layout {
                         *center = Coord::new(0.0, 0.0);
                     }
                     center.x = center.x.clamp(-540.0, 540.0);
-                    center.y = center.y.clamp(-85.0, 85.0);
+                    // A pole is a centre like any other on a polar map: the map's projection
+                    // decides where the frame is drawn ([`frame_camera`], #2684).
+                    center.y = center.y.clamp(-90.0, 90.0);
                     if let FrameShape::Polygon(p) = shape {
                         let points = p.len();
                         p.retain(|(u, v)| u.is_finite() && v.is_finite());
@@ -2513,10 +2563,11 @@ impl Layout {
                             }
                         }
                         g.width = finite_or(g.width, grid_width()).clamp(0.0, MAX_GRID_WIDTH);
+                        g.label_size = layout_text_in_range(g.label_size, GRID_LABEL_PT);
                     }
                 }
                 ElementKind::Legend { exclude, columns, labels, text_size, .. } => {
-                    *text_size = legend_text_in_range(*text_size);
+                    *text_size = layout_text_in_range(*text_size, LEGEND_TEXT_PT);
                     // Names stay whole: a layer's own name isn't cut, and a cut one would no
                     // longer match it.
                     cut |= exclude.len() > MAX_LEGEND_EXCLUDED;
@@ -2549,7 +2600,10 @@ impl Layout {
                     text.truncate(end);
                 }
                 ElementKind::Table { rows, .. } => *rows = (*rows).clamp(1, 500),
-                ElementKind::ScaleBar { divisions, .. } => *divisions = (*divisions).clamp(1, MAX_SCALE_DIVISIONS),
+                ElementKind::ScaleBar { divisions, text_size, .. } => {
+                    *divisions = (*divisions).clamp(1, MAX_SCALE_DIVISIONS);
+                    *text_size = layout_text_in_range(*text_size, SCALE_BAR_TEXT_PT);
+                }
                 ElementKind::Rectangle { width, .. } | ElementKind::Ellipse { width, .. } => {
                     *width = finite_or(*width, 1.0).clamp(0.0, 50.0)
                 }
@@ -2696,13 +2750,28 @@ fn is_zero(v: &f64) -> bool {
 /// turned or tilted.
 pub fn frame_camera(map: &Map, center: Coord, scale: f64, bearing: f64, pitch: f64) -> Camera {
     let mut cam = Camera { bearing: crate::camera::normalize_bearing(bearing), pitch: crate::camera::normalize_pitch(pitch), ..map.camera };
-    if let Some(c) = map.to_map(center) {
+    // The centre where the map's projection places it: a pole itself on a polar map. Where it
+    // can't (a pole on Web Mercator, at infinity), 85° of latitude, as frames always were (#2684).
+    // A longitude past a view's reach (±270° on Web Mercator) is the same meridian a turn of the
+    // globe nearer: the frame shows the same place, not one moved to the view's edge (#2711).
+    let center = if center.x.abs() > 270.0 { Coord::new((center.x + 180.0).rem_euclid(360.0) - 180.0, center.y) } else { center };
+    let at = if frame_center_placed(map, center) { center } else { Coord::new(center.x, center.y.clamp(-85.0, 85.0)) };
+    if let Some(c) = map.to_map(at) {
         cam.center = c;
     }
     let per = map.ground_per_unit(cam.center).max(1e-9);
     cam.res = scale * PAPER_M_PER_PT / per;
     cam.clamp();
     cam
+}
+
+/// Whether a frame centred on `center` (lon/lat) is drawn centred there on `map`: its projection
+/// places the point, and reads it back at the same latitude. A pole on Web Mercator isn't: its
+/// projection takes a pole to its edge at 85.05°, which reads back as that ([`frame_camera`]
+/// draws the frame at 85° instead); on a polar map it is (#2684). The longitude isn't compared:
+/// it may run past ±180°, and at a pole every longitude is the same point.
+pub fn frame_center_placed(map: &Map, center: Coord) -> bool {
+    map.to_map(center).and_then(|m| map.to_lonlat(m)).is_some_and(|back| (back.y - center.y).abs() < 1e-4)
 }
 
 /// The scale that fits a lon/lat extent into a frame `w_mm`×`h_mm` with a margin, and its centre.
@@ -3597,15 +3666,58 @@ mod tests {
         };
         let old: Layout = serde_json::from_str(&page(r#"{"frame":1,"title":"L"}"#)).unwrap();
         assert_eq!(size(&old), LEGEND_TEXT_PT);
-        assert!(!old.elements[1].kind.has_custom_legend_text());
+        assert!(!old.elements[1].kind.has_custom_text_size());
         assert!(!serde_json::to_string(&old).unwrap().contains("text_size"), "the default isn't written");
         let mut big: Layout = serde_json::from_str(&page(r#"{"frame":1,"title":"L","text_size":1e9}"#)).unwrap();
         assert_eq!(big.clamp().elements_adjusted, 1);
-        assert_eq!(size(&big), *LEGEND_TEXT_SIZE.end());
-        assert!(big.elements[1].kind.has_custom_legend_text());
+        assert_eq!(size(&big), *LAYOUT_TEXT_SIZE.end());
+        assert!(big.elements[1].kind.has_custom_text_size());
         let saved = serde_json::to_string(&big).unwrap();
         assert!(saved.contains(r#""text_size":100.0"#), "{saved}");
         assert_eq!(serde_json::from_str::<Layout>(&saved).unwrap(), big);
+    }
+
+    #[test]
+    fn scale_bar_and_grid_label_sizes_default_and_are_kept_in_range() {
+        let page = |grid: &str, bar: &str| {
+            format!(
+                r#"{{"name":"x","width":297,"height":210,"elements":[
+                {{"id":1,"name":"f","x":0,"y":0,"w":100,"h":100,"kind":{{"MapFrame":{{"map":"M","center":{{"x":0,"y":0}},"scale":1e6,"grid":{grid}}}}}}},
+                {{"id":2,"name":"s","x":0,"y":0,"w":50,"h":10,"kind":{{"ScaleBar":{bar}}}}}]}}"#
+            )
+        };
+        let sizes = |l: &Layout| match (&l.elements[0].kind, &l.elements[1].kind) {
+            (ElementKind::MapFrame { grid: Some(g), .. }, ElementKind::ScaleBar { text_size, .. }) => (g.label_size, *text_size),
+            _ => panic!("a frame with a grid and a scale bar expected"),
+        };
+        let old: Layout = serde_json::from_str(&page(r#"{"step":10,"color":[0,0,0,255]}"#, r#"{"frame":1}"#)).unwrap();
+        assert_eq!(sizes(&old), (GRID_LABEL_PT, SCALE_BAR_TEXT_PT));
+        assert!(old.elements.iter().all(|e| !e.kind.has_custom_text_size()));
+        let text = serde_json::to_string(&old).unwrap();
+        assert!(!text.contains("text_size") && !text.contains("label_size"), "the defaults aren't written: {text}");
+        assert_eq!(ElementKind::scale_bar(1), old.elements[1].kind, "a new bar is the default one");
+        // Out of range, or not a number a reader can draw at, each is brought in and counted.
+        for (bad, (grid, bar)) in [("1e9", (100.0, 100.0)), ("-3", (4.0, 4.0)), ("0.5", (4.0, 4.0))] {
+            let mut l: Layout = serde_json::from_str(&page(
+                &format!(r#"{{"step":10,"color":[0,0,0,255],"label_size":{bad}}}"#),
+                &format!(r#"{{"frame":1,"text_size":{bad}}}"#),
+            ))
+            .unwrap();
+            assert_eq!(l.clamp().elements_adjusted, 2, "{bad}");
+            assert_eq!(sizes(&l), (grid, bar), "{bad}");
+            assert!(l.elements.iter().all(|e| e.kind.has_custom_text_size()), "{bad}");
+            assert!(l.clamp().is_empty(), "{bad}: a repaired layout needs nothing more");
+        }
+        let mut sized: Layout =
+            serde_json::from_str(&page(r#"{"step":10,"color":[0,0,0,255],"label_size":14}"#, r#"{"frame":1,"text_size":16}"#)).unwrap();
+        assert!(sized.clamp().is_empty(), "sizes in range are left as they are");
+        assert_eq!(sizes(&sized), (14.0, 16.0));
+        let saved = serde_json::to_string(&sized).unwrap();
+        assert!(saved.contains(r#""label_size":14.0"#) && saved.contains(r#""text_size":16.0"#), "{saved}");
+        assert_eq!(serde_json::from_str::<Layout>(&saved).unwrap(), sized);
+        // A non-finite size, as a program may hand it, falls back to the default.
+        assert_eq!(layout_text_in_range(f64::NAN, SCALE_BAR_TEXT_PT), SCALE_BAR_TEXT_PT);
+        assert_eq!(layout_text_in_range(f64::INFINITY, GRID_LABEL_PT), GRID_LABEL_PT);
     }
 
     #[test]
@@ -3703,6 +3815,45 @@ mod tests {
         assert_eq!(ScaleUnits::Auto.resolve(0.05), (0.01, "cm"));
         assert_eq!(ScaleUnits::Auto.resolve(0.005), (0.001, "mm"));
         assert_eq!(ScaleUnits::Meters.resolve(0.005), (1.0, "m"), "a chosen unit stays");
+    }
+
+    /// A frame centred on a pole keeps that centre, and is drawn centred there on a polar map;
+    /// Web Mercator, whose poles are at infinity, draws it at 85° as frames always were, and
+    /// [`frame_center_placed`] tells it can't place it (#2684).
+    #[test]
+    fn a_frame_centred_on_a_pole_is_drawn_there_on_a_polar_map() {
+        let mut l = Layout::new("Polo", 150.0, 150.0);
+        let frame: ElementKind =
+            serde_json::from_value(serde_json::json!({"MapFrame":{"map":"Mapa", "center":{"x":0,"y":-90}, "scale":60000000.0}})).unwrap();
+        let id = l.add("Mapa", (5.0, 5.0, 140.0, 140.0), frame);
+        l.clamp();
+        let center = |l: &Layout| match l.element(id).map(|e| &e.kind) {
+            Some(ElementKind::MapFrame { center, .. }) => *center,
+            _ => panic!("no frame"),
+        };
+        assert_eq!(center(&l).y, -90.0, "the pole kept");
+        // On a south polar stereographic map, the pole is the frame's centre.
+        let mut polar = Map::new("Mapa");
+        polar.set_projection(crate::Projection::from_code("EPSG:3031").unwrap());
+        let south = Coord::new(0.0, -90.0);
+        assert!(frame_center_placed(&polar, south));
+        let cam = frame_camera(&polar, south, 60_000_000.0, 0.0, 0.0);
+        let pole = polar.to_map(south).unwrap();
+        assert!((cam.center.x - pole.x).abs() < 1e-3 && (cam.center.y - pole.y).abs() < 1e-3, "{:?} {pole:?}", cam.center);
+        // On Web Mercator it can't be: drawn at 85° S.
+        let merc = Map::new("Mapa");
+        assert!(!frame_center_placed(&merc, south) && frame_center_placed(&merc, Coord::new(0.0, -85.0)));
+        // A longitude past ±180° (the sanitizer keeps up to ±540°) is placed: only the latitude counts.
+        assert!(frame_center_placed(&merc, Coord::new(300.0, 40.0)) && frame_center_placed(&merc, Coord::new(-500.0, -60.0)));
+        // And drawn there: the same meridian a turn of the globe nearer, not the view's edge at 270°.
+        for (lon, lat) in [(300.0, 40.0), (-500.0, -60.0)] {
+            let at = merc.to_lonlat(frame_camera(&merc, Coord::new(lon, lat), 60_000_000.0, 0.0, 0.0).center).unwrap();
+            let turns = (at.x - lon).rem_euclid(360.0);
+            assert!((turns < 1e-6 || turns > 360.0 - 1e-6) && (at.y - lat).abs() < 1e-6, "({lon}, {lat}) drawn at {at:?}");
+        }
+        let cam = frame_camera(&merc, south, 60_000_000.0, 0.0, 0.0);
+        let at = merc.to_lonlat(cam.center).unwrap();
+        assert!((at.y + 85.0).abs() < 1e-6, "{at:?}");
     }
 
     #[test]

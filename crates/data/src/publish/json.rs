@@ -8,7 +8,8 @@ use std::path::Path;
 
 /// Publishes a whole-read GeoJSON layer. Checks source bytes and the original read's digest,
 /// then proves that both the original and the edits survive a round trip. Foreign members,
-/// legacy CRS declarations, duplicate keys and noncanonical number text are refused. A file
+/// duplicate keys and noncanonical number text are refused. A legacy `crs` member is kept, and
+/// the layer is written back in the system it declares, which the layer must still be held in. A file
 /// with feature ids permits value/geometry edits, but not row changes: the reader doesn't keep
 /// those external ids as layer ids. Parsing, JSON equality and serialization are single steps
 /// that finish before Cancel is seen;
@@ -24,9 +25,6 @@ pub fn geojson(ds: &Dataset, path: &Path, synced: &Synced) -> Result<Published> 
         if changed.is_empty() { Ok(()) } else { Err(refused(path, format!("{} changed since the layer was read", changed.join(", ")))) }
     };
     unchanged()?;
-    if ds.crs.is_some_and(|c| c != crate::raster::Crs::LonLat) {
-        return Err(refused(path, "publishing GeoJSON requires a layer read in longitude/latitude"));
-    }
     let bytes = super::read_part(path, crate::io::file_size_error)?.ok_or_else(|| refused(path, "the source file is missing"))?;
     let text = std::str::from_utf8(&bytes).map_err(|e| refused(path, format!("its text isn't UTF-8: {e}")))?;
     // Parse with serde's depth limit before the raw duplicate-key traversal below.
@@ -34,13 +32,45 @@ pub fn geojson(ds: &Dataset, path: &Path, synced: &Synced) -> Result<Published> 
     let valid = unique_keys(text).and_then(|()| canonical_numbers(text));
     crate::progress::check()?;
     valid.map_err(|e| refused(path, e))?;
-    if original.get("crs").is_some() {
-        return Err(refused(path, "it has a legacy crs member, which a rewrite wouldn't keep"));
-    }
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let (mut as_read, _) = crate::io::read_geojson(text, &name)?;
+    let (mut as_read, report) = crate::io::read_geojson(text, &name)?;
+    // What the read skipped or said can't be rewritten: refused with what it said, rather than
+    // taken for rows the layer added, removed or reordered.
+    if report.skipped > 0 || !report.messages.is_empty() {
+        let mut said: Vec<&str> = report.messages.texts().collect();
+        let skipped = format!("{} features couldn't be read", report.skipped);
+        if said.is_empty() {
+            said.push(&skipped);
+        }
+        return Err(refused(path, format!("reading it isn't lossless ({}), so a rewrite wouldn't keep the file", said.join("; "))));
+    }
+    // Written back in the system the file declares (its legacy `crs` member, else
+    // longitude/latitude), so what the kept member says stays true.
+    let declared = as_read.coord_crs();
+    if ds.coord_crs() != declared {
+        // A layer of a project saved before RustGIS kept a file's own coordinates holds them in
+        // longitude/latitude.
+        return Err(refused(
+            path,
+            format!(
+                "the file's coordinates are in {}, and the layer holds them in {}; add the file again to publish to it, or export a copy",
+                declared.label(),
+                ds.coord_crs().label()
+            ),
+        ));
+    }
+    if ds.crs.unwrap_or(crate::raster::Crs::LonLat) != declared {
+        return Err(refused(
+            path,
+            format!(
+                "the file's coordinates are in {}, and the layer's coordinate system was defined as {} since; export a copy instead",
+                declared.label(),
+                ds.crs.unwrap_or(ds.coord_crs()).label()
+            ),
+        ));
+    }
     as_read.crs = ds.crs;
-    if crate::sync::rows_digest(&as_read)? != synced.rows {
+    if synced.digest_of(&as_read)? != synced.digest() {
         return Err(refused(path, "it reads otherwise now than when the layer was read; add the file again to compare it"));
     }
     {
@@ -77,7 +107,7 @@ pub fn geojson(ds: &Dataset, path: &Path, synced: &Synced) -> Result<Published> 
             removed.iter().take(5).map(|n| n.chars().take(80).collect::<String>()).collect::<Vec<_>>().join(", ")
         )]
     };
-    let rows = crate::sync::rows_digest(&read)?;
+    let (rows, native) = crate::sync::digests(&read)?;
     let targets = vec![(path.to_path_buf(), written)];
     let files = FileSync::of_written(path, &targets)?;
     let staged = crate::io::stage_shapefile(&targets)?;
@@ -94,7 +124,7 @@ pub fn geojson(ds: &Dataset, path: &Path, synced: &Synced) -> Result<Published> 
     })();
     crate::io::unstage(&staged);
     placed?;
-    Ok(Published { files, read, rows, features: ds.features.len(), notes })
+    Ok(Published { files, read, rows, native, features: ds.features.len(), notes })
 }
 
 /// Builds only the members RustGIS understands. Comparing the original with its rebuild catches
@@ -200,6 +230,12 @@ fn document(ds: &Dataset, original: &Json) -> std::result::Result<Json, String> 
         }
         _ => return Err("a bare geometry can't hold attributes or a different number of rows; export a collection instead".into()),
     };
+    // A legacy `crs` member says the system the coordinates are in, which they're written in.
+    if let (Some(crs), Some(object)) = (original.get("crs"), out.as_object_mut())
+        && matches!(kind, "FeatureCollection" | "Feature")
+    {
+        object.insert("crs".into(), crs.clone());
+    }
     keep_numbers(&mut out, original)?;
     Ok(out)
 }
@@ -267,26 +303,53 @@ fn keep_numbers(out: &mut Json, original: &Json) -> std::result::Result<(), Stri
 }
 
 /// Names the first member or array position a rebuild would change, without printing its
-/// value. Parsed JSON is depth-limited by serde; each key in this diagnostic is bounded.
+/// value: a member whose JSON type changes says from what to what, an array whose length changes
+/// says so. Parsed JSON is depth-limited by serde; each key in this diagnostic is bounded.
 fn difference(a: &Json, b: &Json) -> Option<String> {
+    let (path, what) = differs(a, b)?;
+    let path = if path.is_empty() { "the document".to_string() } else { path.join(".") };
+    Some(match what {
+        Some(what) => format!("{path}, whose {what}"),
+        None => path,
+    })
+}
+
+/// [`difference`]: the path to the first change, and what changes there beside the value.
+fn differs(a: &Json, b: &Json) -> Option<(Vec<String>, Option<String>)> {
     if a == b {
         return None;
     }
+    let kind = |v: &Json| match v {
+        Json::Null => "null",
+        Json::Bool(_) => "true or false",
+        Json::Number(_) => "number",
+        Json::String(_) => "text",
+        Json::Array(_) => "array",
+        Json::Object(_) => "object",
+    };
+    let within = |key: String, rest: Option<(Vec<String>, Option<String>)>| {
+        rest.map(|(mut path, what)| {
+            path.insert(0, key);
+            (path, what)
+        })
+    };
     match (a, b) {
         (Json::Object(a), Json::Object(b)) => {
             for (key, value) in a {
                 let shown: String = key.chars().take(80).collect();
-                let Some(other) = b.get(key) else { return Some(shown) };
-                if let Some(rest) = difference(value, other) {
-                    return Some(format!("{shown}.{rest}"));
+                let Some(other) = b.get(key) else { return Some((vec![shown], None)) };
+                if let Some(found) = within(shown, differs(value, other)) {
+                    return Some(found);
                 }
             }
-            b.keys().find(|k| !a.contains_key(*k)).map(|k| k.chars().take(80).collect())
+            b.keys().find(|k| !a.contains_key(*k)).map(|k| (vec![k.chars().take(80).collect()], None))
         }
         (Json::Array(a), Json::Array(b)) if a.len() == b.len() => {
-            a.iter().zip(b).enumerate().find_map(|(i, (a, b))| difference(a, b).map(|p| format!("[{i}].{p}")))
+            a.iter().zip(b).enumerate().find_map(|(i, (a, b))| within(format!("[{i}]"), differs(a, b)))
         }
-        _ => Some("value or size".into()),
+        (Json::Array(_), Json::Array(_)) => Some((Vec::new(), Some("length changes".into()))),
+        _ if kind(a) != kind(b) => Some((Vec::new(), Some(format!("type changes ({} to {})", kind(a), kind(b))))),
+        _ => Some((Vec::new(), None)),
     }
 }
 
@@ -319,8 +382,10 @@ fn canonical_numbers(text: &str) -> std::result::Result<(), String> {
             }
             let raw = text.get(start..i).ok_or("a number's text isn't valid")?;
             let number: serde_json::Number = serde_json::from_str(raw).map_err(|e| e.to_string())?;
-            if number.to_string() != raw {
-                return Err(format!("a number at byte {} would be spelled differently by a rewrite", start + 1));
+            let spelled = number.to_string();
+            if spelled != raw {
+                let clip = |t: &str| if t.len() > 40 { format!("{}…", t.chars().take(40).collect::<String>()) } else { t.to_string() };
+                return Err(format!("a number at byte {} ({}) would be spelled {} by a rewrite", start + 1, clip(raw), clip(&spelled)));
             }
             continue;
         }
@@ -381,7 +446,7 @@ mod tests {
         let path = dir.path().join("parcels.geojson");
         std::fs::write(&path, text).unwrap();
         let ds = crate::io::read_path(&path).unwrap().0;
-        let sync = Synced { files: FileSync::read(&path).unwrap(), rows: crate::sync::rows_digest(&ds).unwrap() };
+        let sync = Synced::record(FileSync::read(&path).unwrap(), &ds).unwrap();
         (dir, path, ds, sync)
     }
 
@@ -417,7 +482,7 @@ mod tests {
         assert_eq!(serde_json::from_str::<Json>(&text).unwrap(), serde_json::from_str::<Json>(&SOURCE.replace("Smith", "Jones")).unwrap());
         assert!(text.contains("[1,2]"));
         assert!(out.files.changed(&path).unwrap().is_empty());
-        let sync = Synced { files: out.files, rows: out.rows };
+        let sync = Synced { files: out.files, rows: out.rows, native: None };
         rename_owner(&mut ds, "Taylor");
         geojson(&ds, &path, &sync).unwrap();
     }
@@ -471,6 +536,41 @@ mod tests {
         }
     }
 
+    /// A file with a legacy `crs` member keeps it, and is written back in its system: an edited
+    /// point lands where it was put, in the file's own coordinates.
+    #[test]
+    fn a_legacy_crs_member_is_kept_and_the_layer_written_back_in_it() {
+        let lv95 = r#"{"type":"FeatureCollection","crs":{"type":"name","properties":{"name":"urn:ogc:def:crs:EPSG::2056"}},"features":[{"type":"Feature","properties":{"owner":"Smith"},"geometry":{"type":"Point","coordinates":[2600000,1200000]}}]}"#;
+        let (_dir, path, mut ds, sync) = loaded(lv95);
+        let system = crate::raster::Crs::from_epsg(2056).unwrap();
+        assert_eq!(ds.coord_crs(), system);
+        rename_owner(&mut ds, "Jones");
+        let mut rows: Vec<_> = ds.features.iter().cloned().collect();
+        rows.first_mut().unwrap().geometry = Some(crate::Geometry::Point(rustgis_geom::Coord::new(2_600_010.5, 1_200_020.0)));
+        ds.features = rows.into();
+        let out = geojson(&ds, &path, &sync).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let want = lv95.replace("Smith", "Jones").replace("[2600000,1200000]", "[2600010.5,1200020.0]");
+        assert_eq!(serde_json::from_str::<Json>(&text).unwrap(), serde_json::from_str::<Json>(&want).unwrap());
+        assert_eq!(out.read.coord_crs(), system);
+        // And again from what it wrote.
+        let sync = Synced { files: out.files, rows: out.rows, native: out.native };
+        rename_owner(&mut ds, "Taylor");
+        geojson(&ds, &path, &sync).unwrap();
+        // A `crs` of null says nothing and is kept as it is.
+        let null = SOURCE.replace("\"features\":[", "\"crs\":null,\"features\":[");
+        let (_dir, path, mut ds, sync) = loaded(&null);
+        rename_owner(&mut ds, "Jones");
+        geojson(&ds, &path, &sync).unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("\"crs\":null"));
+        // A layer whose system was defined again isn't written into a file that says the old one.
+        let (_dir, path, ds, sync) = loaded(lv95);
+        let redefined = crate::io::define_projection(&ds, crate::raster::Crs::from_epsg(21781).unwrap()).unwrap();
+        let e = geojson(&redefined, &path, &sync).err().unwrap().to_string();
+        assert!(e.contains("EPSG:2056") && e.contains("EPSG:21781") && e.contains("nothing was written"), "{e}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), lv95);
+    }
+
     #[test]
     fn a_changed_source_is_left_untouched() {
         let (_dir, path, mut ds, sync) = loaded(SOURCE);
@@ -490,7 +590,6 @@ mod tests {
             SOURCE.replace("\"features\":[", "\"bbox\":[0,0,9,9],\"features\":["),
             SOURCE.replace("[1,2]", "[1.00,2]"),
             SOURCE.replace("\"owner\":\"Smith\"", "\"owner\":\"Lost\",\"owner\":\"Smith\""),
-            SOURCE.replace("\"features\":[", "\"crs\":null,\"features\":["),
             SOURCE.replace("\"owner\":\"Smith\"", "\"owner\":{\"name\":\"Smith\"}"),
         ] {
             let (_dir, path, ds, sync) = loaded(&text);
@@ -498,6 +597,30 @@ mod tests {
             assert!(error.contains("nothing was written"), "{error}");
             assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
         }
+    }
+
+    /// The refusals say why: a member whose type a rewrite changes says from what to what, number
+    /// text names the writer's spelling, and a file the reader can't read whole says what it said
+    /// rather than blaming rows the layer changed.
+    #[test]
+    fn refusals_give_the_reason() {
+        let mixed = r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"age":4},"geometry":{"type":"Point","coordinates":[1,2]}},{"type":"Feature","properties":{"age":"old"},"geometry":{"type":"Point","coordinates":[1,2]}}]}"#;
+        let (_dir, path, ds, sync) = loaded(mixed);
+        let error = geojson(&ds, &path, &sync).err().unwrap().to_string();
+        assert!(error.contains("would change features.[0].properties.age, whose type changes (number to text);"), "{error}");
+        assert!(!error.contains("value or size"), "{error}");
+
+        let small = SOURCE.replace("[1,2]", "[1,0.000004]");
+        let (_dir, path, ds, sync) = loaded(&small);
+        let error = geojson(&ds, &path, &sync).err().unwrap().to_string();
+        assert!(error.contains("(0.000004) would be spelled 4e-6 by a rewrite"), "{error}");
+
+        let unreadable = SOURCE
+            .replace("]}", r#",{"type":"Feature","properties":{"owner":"Gone"},"geometry":{"type":"Point","coordinates":"nowhere"}}]}"#);
+        let (_dir, path, ds, sync) = loaded(&unreadable);
+        let error = geojson(&ds, &path, &sync).err().unwrap().to_string();
+        assert!(error.contains("reading it isn't lossless") && !error.contains("reordered"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), unreadable);
     }
 
     #[test]
@@ -560,7 +683,7 @@ mod tests {
         assert!(published.notes.first().unwrap().contains("1 properties left out"));
         assert!(published.notes.first().unwrap().contains("owner"));
         let written = std::fs::read_to_string(&path).unwrap();
-        let sync = Synced { files: published.files, rows: published.rows };
+        let sync = Synced { files: published.files, rows: published.rows, native: None };
         ds.features = Vec::new().into();
         assert!(geojson(&ds, &path, &sync).err().unwrap().to_string().contains("empty collection has no schema"));
         assert_eq!(std::fs::read_to_string(path).unwrap(), written);
@@ -606,7 +729,7 @@ mod tests {
         let out = geojson(&ds, &path, &sync).unwrap();
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(written.contains("parcel-17"));
-        let sync = Synced { files: out.files, rows: out.rows };
+        let sync = Synced { files: out.files, rows: out.rows, native: None };
         ds.features = Vec::new().into();
         let error = geojson(&ds, &path, &sync).err().unwrap().to_string();
         assert!(error.contains("feature ids"), "{error}");

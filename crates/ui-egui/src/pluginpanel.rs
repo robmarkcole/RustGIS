@@ -1015,18 +1015,19 @@ fn tabs(app: &mut RustGisApp, ui: &mut Ui, pid: &str, item: &PanelItemDecl, stat
         });
     });
     ui.add_space(2.0);
-    let _ = t;
     if let Some(n) = pick {
         send(app, pid, item, json!(n));
     }
 }
 
-/// The weekday of a date, 0 for Monday.
+/// The weekday of a date, 0 for Monday. A month outside 1 to 12 (callers pass only those) gives
+/// some weekday rather than failing.
 fn weekday(y: i32, m: u32, d: u32) -> u32 {
     // Sakamoto's method, which counts from Sunday.
-    const T: [i32; 12] = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
-    let y = if m < 3 { y - 1 } else { y };
-    let sunday = (y + y / 4 - y / 100 + y / 400 + T[(m - 1) as usize] + d as i32).rem_euclid(7) as u32;
+    const T: [i64; 12] = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
+    let y = i64::from(y) - i64::from(m < 3);
+    let offset = m.checked_sub(1).and_then(|i| T.get(i as usize)).copied().unwrap_or(0);
+    let sunday = (y + y / 4 - y / 100 + y / 400 + offset + i64::from(d)).rem_euclid(7) as u32;
     (sunday + 6) % 7
 }
 
@@ -1227,6 +1228,7 @@ fn range(app: &mut RustGisApp, ui: &mut Ui, pid: &str, item: &PanelItemDecl, sta
     }
 }
 
+#[expect(clippy::disallowed_methods, reason = "a thread the system refuses fails the test, as it should")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1297,6 +1299,10 @@ mod tests {
         assert_eq!(weekday(2023, 4, 1), 5);
         assert_eq!(weekday(2024, 2, 29), 3);
         assert_eq!(weekday(2000, 1, 1), 5);
+        // A month outside 1 to 12, or a far year or day, gives a weekday rather than failing.
+        for (y, m, d) in [(2024, 0, 1), (2024, 13, 1), (i32::MAX, 2, u32::MAX), (i32::MIN, 0, 0)] {
+            assert!(weekday(y, m, d) < 7);
+        }
         assert_eq!(month_step(2023, 1, -1), (2022, 12));
         assert_eq!(month_step(2023, 12, 1), (2024, 1));
         assert_eq!(month_step(9999, 12, 1), (9999, 12), "kept within years 1 to 9999");
@@ -2182,7 +2188,8 @@ mod tests {
         assert_eq!(taken.len(), 1);
         let id = app.session.download_started_for(&taken[0]).unwrap();
         let landed = crate::serviceui::Landed { id, url: url.to_string(), params: taken[0].params().clone(), origin: None };
-        crate::serviceui::go_on(&mut app, landed, 0, rustgis_engine::data::ogc::Step::Failed("its second page failed".into()));
+        let local = rustgis_engine::render::rustgis_tiles::address::Reach::Local;
+        crate::serviceui::go_on(&mut app, landed, 0, local, rustgis_engine::data::ogc::Step::Failed("its second page failed".into()));
         let ran = app.session.poll_plugin_retries();
         assert_eq!(ran.len(), 1, "{ran:?}");
         assert!(ran[0].1.as_ref().is_err_and(|e| e.contains("its second page failed")), "{ran:?}");

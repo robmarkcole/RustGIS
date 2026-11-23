@@ -108,6 +108,7 @@ pub type Then = fn(&mut RustGisApp, Landed);
 enum Completion {
     Command(Then),
     ShapeConversion(Option<u64>),
+    WorkflowSimilar(u64),
     ImageGrid(u64),
 }
 impl Completion {
@@ -115,6 +116,7 @@ impl Completion {
         match self {
             Self::Command(then) => then(app, result),
             Self::ShapeConversion(request) => crate::shapeconvert::landed(app, request, result),
+            Self::WorkflowSimilar(request) => crate::analysispane::similar_ran(app, request, result),
             Self::ImageGrid(request) => crate::annotation::landed(app, request, result),
         }
     }
@@ -155,6 +157,11 @@ pub fn run_then(app: &mut RustGisApp, command: &'static str, p: Value, then: Opt
 pub(crate) fn run_shape_conversion(app: &mut RustGisApp, p: Value) -> Result<Value, String> {
     let request = p.get("request").and_then(Value::as_u64);
     run_presented(app, "edit.previewShapeConversion", p, Some(Completion::ShapeConversion(request)), None, None)
+}
+
+/// Gives the final ranking to the pane request that asked for it, rather than its queue receipt.
+pub(crate) fn run_workflow_similar(app: &mut RustGisApp, p: Value, request: u64) -> Result<Value, String> {
+    run_presented(app, "data.similar", p, Some(Completion::WorkflowSimilar(request)), None, None)
 }
 
 /// Original grid lookup shares the read queue and carries its request through every outcome.
@@ -212,9 +219,11 @@ fn run_presented(
             | "labels.convert"
             | "source.syncState"
             | "table.statistics"
+            | "data.similar"
             | "raster.imageGrid"
             | "edit.previewShapeConversion"
             | "layer.sizeBy"
+            | "style.importQgis"
     ) || (matches!(command, "edit.convertField" | "edit.addField") && p.get("table").is_none_or(Value::is_null)))
     .then(|| app.session.layer_id(&p).ok().and_then(|id| app.session.map().layer(id)).map(|l| (l.instance_id(), l.name.clone())))
     .flatten();
@@ -253,7 +262,6 @@ fn run_presented(
         return Ok(json!({"reading": instance}));
     }
     let archive = matches!(command, "map.reloadTiles" | "map.repairTiles").then(|| reads::archive_target(&app.session, &p)).flatten();
-    let mut p = p;
     if let Some((i, _)) = &archive
         && let Some(params) = p.as_object_mut()
     {
@@ -317,7 +325,7 @@ pub fn admitted(app: &mut RustGisApp, ahead: reads::ReadAhead, relay: rustgis_as
     };
     let params = params.clone();
     let archive = matches!(command, "map.reloadTiles" | "map.repairTiles").then(|| reads::archive_target(&app.session, &params)).flatten();
-    let layer = matches!(command, "table.statistics" | "layer.sizeBy")
+    let layer = matches!(command, "table.statistics" | "data.similar" | "layer.sizeBy")
         .then(|| app.session.layer_id(&params).ok().and_then(|id| app.session.map().layer(id)).map(|l| (l.instance_id(), l.name.clone())))
         .flatten();
     let what =
@@ -404,17 +412,27 @@ fn leave(app: &mut RustGisApp, left: &mut Vec<(String, Gone)>, asked: &Asked, wh
     left.push((what, why));
 }
 
-/// What a command asked for is called in a notice: a script, or an unnamed model, by the
-/// command's name.
+/// What a command asked for is called in a notice: a script, an unnamed model or anything else
+/// that gives no name, by the command's name.
 fn called<'a>(command: &str, what: &'a str) -> &'a str {
     match (what.is_empty(), command) {
         (false, _) => what,
         (true, "script.run") => tl_raw!("Run Script"),
+        (true, "model.run") => tl_raw!("Run Model"),
         (true, "topology.validate") => tl_raw!("Error Inspector"),
         (true, "table.statistics") => tl_raw!("Column Statistics"),
+        (true, "data.similar") => tl_raw!("Find Similar"),
         (true, "layer.sizeBy") => tl_raw!("Size by Field"),
+        (true, "style.importQgis") => tl_raw!("Import QGIS Style"),
         (true, "service.add") => tl_raw!("Add Service Layer"),
-        (true, _) => tl_raw!("Run Model"),
+        (true, "service.layers") => tl_raw!("List Service Layers"),
+        (true, "edit.previewShapeConversion") => tl_raw!("Preview Shape Conversion"),
+        (true, "raster.imageGrid") => tl_raw!("Original Image Grid"),
+        (true, "source.syncState") => tl_raw!("Source File State"),
+        (true, "map.reloadTiles") => tl_raw!("Reload Tile Archive"),
+        (true, "map.repairTiles") => tl_raw!("Repair Tile Archive"),
+        (true, "offline.keepRows") => tl_raw!("Keep Field Package Rows"),
+        (true, _) => tl_raw!("A background read"),
     }
 }
 
@@ -541,6 +559,8 @@ fn start(app: &mut RustGisApp, mut asked: Asked, p: Value) -> Result<Value, Stri
                 | "edit.previewShapeConversion"
                 | "raster.imageGrid"
                 | "layer.sizeBy"
+                | "data.similar"
+                | "topology.validate"
         ) || rustgis_engine::cmd::edit::table_edit_in_background(asked.command).is_some()
         {
             let why = crate::i18n::fmt("The background worker could not start ({error}). Retry the command.", &[("error", &e.to_string())]);
@@ -552,9 +572,6 @@ fn start(app: &mut RustGisApp, mut asked: Asked, p: Value) -> Result<Value, Stri
         if reload {
             crate::diskwatch::reading(app, asked.command, &p);
         }
-        // Here, where its Cancel can't be clicked, the topology check takes the work limit of a
-        // run that can't be cancelled; it has none on its thread.
-        let control = if asked.command == "topology.validate" { Control::new() } else { control };
         let read = held
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -797,6 +814,17 @@ mod tests {
             assert!(std::time::Instant::now() < end, "the reads never landed");
             std::thread::sleep(std::time::Duration::from_millis(5)); // test-wait: legacy polling for background read completion
         }
+    }
+
+    #[test]
+    fn a_read_without_a_name_is_called_by_its_own_command() {
+        assert_eq!(called("model.run", "Flood"), "Flood");
+        assert_eq!(called("model.run", ""), "Run Model");
+        assert_eq!(called("service.layers", ""), "List Service Layers");
+        for command in ["edit.previewShapeConversion", "raster.imageGrid", "source.syncState", "map.reloadTiles", "map.repairTiles"] {
+            assert_ne!(called(command, ""), "Run Model", "{command}");
+        }
+        assert_eq!(called("layer.loadAll", ""), "A background read");
     }
 
     #[test]
@@ -1378,6 +1406,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A file added on a thread gives the project its coordinate system when the project takes
+    /// it from the first layer added: the read lands through the same seam as a command.
+    #[test]
+    fn a_file_added_on_a_thread_gives_the_project_its_system() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bern.shp");
+        let mut w = rustgis_engine::Session::new(rustgis_engine::Project::default());
+        w.run("project.coordinateSystem", &json!({"crs": "EPSG:2056"})).unwrap();
+        w.run("layer.template", &json!({"template": "points", "name": "Bern"})).unwrap();
+        w.map_mut().editing.settings.enabled = true;
+        w.run("edit.addFeature", &json!({"layer": "Bern", "geometry": {"type": "Point", "coordinates": [7.43863, 46.95108]}})).unwrap();
+        w.run("share.exportLayer", &json!({"layer": "Bern", "path": path})).unwrap();
+        let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        app.reads_off_frame = true;
+        app.run("project.coordinateSystem", json!({"fromFirstLayer": true})).unwrap();
+        assert_eq!(crate::layerchooser::add_file(&mut app, &path.display().to_string()).unwrap()["started"], "Add Data");
+        landed(&mut app, 60);
+        assert_eq!(app.session.map().layers.len(), 1);
+        assert_eq!(app.session.project.coordinate_system, Some(rustgis_engine::data::raster::Crs::Epsg(2056)));
+        app.run("edit.undo", Value::Null).unwrap();
+        assert_eq!(app.session.project.coordinate_system, None, "Undo takes it back with the layer");
+    }
+
     /// Scripted Delimited Text picks join the same background queue as ordinary file picks.
     #[test]
     fn scripted_delimited_picks_run_in_background() {
@@ -1727,6 +1778,52 @@ mod tests {
         assert_eq!(step.params["layer"], json!("towns"));
     }
 
+    /// Import QGIS Style reads its file and its raster image markers' images on a thread first
+    /// (#2620): the layer is styled when they have been read, with the notes the command gives.
+    #[test]
+    fn a_qgis_style_is_read_on_a_thread_before_it_lands() {
+        use rustgis_engine::data::{Coord, Dataset, Geometry, GeometryType};
+        let dir = tempfile::tempdir().unwrap();
+        let picture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../map/testdata/qgis/generated/data/picture.png");
+        let path = dir.path().join("pin.qml");
+        std::fs::write(
+            &path,
+            format!(
+                r#"<qgis version="4.2.3"><renderer-v2 type="singleSymbol"><symbols><symbol type="marker" name="0" alpha="1">
+                <layer class="RasterMarker" enabled="1"><Option type="Map"><Option name="imageFile" value="{}"/><Option name="size" value="6"/>
+                </Option></layer></symbol></symbols></renderer-v2></qgis>"#,
+                picture.display()
+            ),
+        )
+        .unwrap();
+        let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        let mut ds = Dataset::new("towns", GeometryType::Point, vec![]);
+        ds.push(Some(Geometry::Point(Coord::new(0.0, 0.0))), vec![]);
+        let id = rustgis_engine::cmd::layer::add_dataset(&mut app.session, ds);
+        app.reads_off_frame = true;
+        let params = json!({"layer": id, "path": path});
+        assert_eq!(app.run_by_user("style.importQgis", params).unwrap()["started"], "Import QGIS Style");
+        assert!(
+            matches!(app.session.map().layer(id).unwrap().symbol(0).marker, rustgis_engine::map::Marker::Circle),
+            "styled only once it has been read"
+        );
+        landed(&mut app, 60);
+        assert!(matches!(app.session.map().layer(id).unwrap().symbol(0).marker, rustgis_engine::map::Marker::Picture(_)));
+        app.run("edit.undo", Value::Null).unwrap();
+        assert!(matches!(app.session.map().layer(id).unwrap().symbol(0).marker, rustgis_engine::map::Marker::Circle));
+        // A clean style says nothing; one whose image isn't a PNG, JPEG or SVG says so once, on landing.
+        let said = |app: &RustGisApp| app.session.notices.iter().filter(|n| n.text.contains("isn't a PNG, JPEG or SVG")).count();
+        assert_eq!(said(&app), 0);
+        std::fs::write(dir.path().join("pin.gif"), b"GIF89a").unwrap();
+        let gif = dir.path().join("gif.qml");
+        let text = std::fs::read_to_string(&path).unwrap().replace(&picture.display().to_string(), "pin.gif");
+        std::fs::write(&gif, text).unwrap();
+        app.run_by_user("style.importQgis", json!({"layer": id, "path": gif})).unwrap();
+        assert_eq!(said(&app), 0, "said on landing, not before");
+        landed(&mut app, 60);
+        assert_eq!(said(&app), 1);
+    }
+
     /// Task steps cannot bypass the worker through direct or scripted table writes.
     #[test]
     fn a_task_refuses_table_writes_before_scanning_rows() {
@@ -2035,6 +2132,259 @@ mod tests {
         assert_eq!(answer["result"]["isError"], false, "{answer}");
         assert!(answer["result"]["content"][0]["text"].as_str().unwrap().contains("\"sum\":6"), "{answer}");
         relay.stop();
+    }
+
+    /// The real pane button owns the final ranking, not the read queue's admission receipt.
+    #[test]
+    fn similar_pane_receives_success_failure_and_cancellation() {
+        use egui_kittest::kittest::Queryable;
+        use rustgis_engine::data::{Dataset, Field, FieldType, Geometry, GeometryType, Value as V};
+        for outcome in ["success", "error", "cancel", "spawn", "newer", "layer", "workflow", "reopen", "closed", "error_layer"] {
+            let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+            let mut ds = Dataset::new("numbers", GeometryType::Point, vec![Field::new("n", FieldType::Integer)]);
+            for n in [0, 2, 10] {
+                ds.push(
+                    Some(Geometry::Point(rustgis_engine::geom::Coord::new(n as f64, n as f64))),
+                    vec![if n == 0 && matches!(outcome, "error" | "error_layer") { V::Null } else { V::Int(n) }],
+                );
+            }
+            let id = rustgis_engine::cmd::layer::add_dataset(&mut app.session, ds.clone());
+            ds.name = "other".into();
+            rustgis_engine::cmd::layer::add_dataset(&mut app.session, ds);
+            app.session.map_mut().layer_mut(id).unwrap().selection = vec![0];
+            app.reads_off_frame = true;
+            app.reads.fail_spawn = outcome == "spawn";
+            if outcome == "workflow" {
+                crate::analysispane::run_elsewhere(
+                    &mut app,
+                    "interpolate",
+                    "analysis.interpolate",
+                    json!({"layer":"numbers","field":"n","cellSize":2}),
+                );
+                assert!(app.workflow.job.is_some(), "the raster workflow is pending before Similar starts");
+            }
+            app.run("ui.pane.workflows", json!({"section":"similar"})).unwrap();
+            app.workflow.layer = "numbers".into();
+            // Pause only the frame's completion pass until the button and queue ownership have
+            // been inspected; draw the owning pane first, then use the real app frame's
+            // completion hook below.
+            let allow_landing = std::rc::Rc::new(std::cell::Cell::new(false));
+            let allow = allow_landing.clone();
+            let mut fonts = false;
+            let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1400.0, 900.0)).with_max_steps(1000).build_ui_state(
+                move |ui, app: &mut RustGisApp| {
+                    if !fonts {
+                        crate::theme::install_fonts(ui.ctx(), &[], None);
+                        fonts = true;
+                        return;
+                    }
+                    if allow.get() {
+                        app.logic(ui.ctx());
+                        app.ui(ui);
+                    } else {
+                        crate::analysispane::workflows(app, ui, &Tokens::light());
+                    }
+                },
+                app,
+            );
+            if outcome == "workflow" {
+                // This deliberately held background job shows a spinner until we land it.
+                for _ in 0..4 {
+                    h.step();
+                }
+            } else {
+                h.run();
+            }
+            h.get_by_role_and_label(egui::accesskit::Role::Button, "Find Similar").click();
+            for _ in 0..4 {
+                h.step();
+            }
+            assert_eq!(showing(h.state()), outcome != "spawn", "{outcome}: worker admission");
+            assert!(h.state().workflow.result.is_none(), "a receipt is not a ranking");
+            if outcome == "reopen" {
+                h.state_mut().run("ui.pane.workflows", json!({"section":"similar"})).unwrap();
+            } else if outcome == "closed" {
+                h.state_mut().run("ui.pane.workflows", json!({})).unwrap();
+                assert_ne!(h.state().ui.right, Some(crate::RightPane::Workflows));
+            }
+            match outcome {
+                "workflow" => {
+                    let end = std::time::Instant::now() + Duration::from_secs(60);
+                    while crate::analysispane::land_job(h.state_mut()) {
+                        assert!(std::time::Instant::now() < end, "the raster workflow never landed");
+                        std::thread::sleep(Duration::from_millis(5)); // test-wait: the real raster completion lands while Similar remains pending
+                    }
+                    assert!(h.state().session.map().layers.iter().any(|l| l.is_raster()));
+                    assert!(h.state().workflow.result.is_none(), "another section cannot show its result in the Similar pane");
+                }
+                "cancel" => h.state().reads.cancel_for_tests(),
+                "layer" | "error_layer" => {
+                    h.state_mut().workflow.layer = "other".into();
+                    h.state_mut().workflow.result = Some(json!({"kept":"other layer"}));
+                }
+                "newer" => {
+                    // The older completion cannot erase the newer pending state or show its
+                    // ranking. Keep the worker slots deterministic without timing the scan.
+                    let end = std::time::Instant::now() + Duration::from_secs(60);
+                    while !h.state().reads.read_finished_for_tests() {
+                        assert!(std::time::Instant::now() < end);
+                        std::thread::sleep(Duration::from_millis(5)); // test-wait: completion slot before testing queued pane ownership
+                    }
+                    h.get_by_role_and_label(egui::accesskit::Role::Button, "Find Similar").click();
+                    for _ in 0..4 {
+                        h.step();
+                    }
+                    assert_eq!(h.state().reads.waiting.len(), 1);
+                    land(h.state_mut());
+                    assert!(h.state().workflow.result.is_none(), "older ranking cannot replace the newer pending request");
+                    h.state().reads.cancel_for_tests();
+                }
+                _ => {}
+            }
+            allow_landing.set(true);
+            let end = std::time::Instant::now() + Duration::from_secs(60);
+            while showing(h.state()) || !h.state().reads.waiting.is_empty() {
+                assert!(std::time::Instant::now() < end, "{outcome}: pane read never landed");
+                h.step();
+                std::thread::sleep(Duration::from_millis(5)); // test-wait: worker completion delivered by the real app frame
+            }
+            if outcome == "closed" {
+                assert!(h.state().workflow.result.is_some(), "closing the pane keeps its completed ranking for reopening");
+                h.state_mut().run("ui.pane.workflows", json!({"section":"similar"})).unwrap();
+                h.step();
+            }
+            // Completion used the full app frame above. Inspect the actual pane alone so its
+            // diagnostic cannot be confused with the same text in another app surface.
+            allow_landing.set(false);
+            h.step();
+            h.run();
+            match outcome {
+                "success" | "workflow" | "reopen" | "closed" => {
+                    let answer = h.state().workflow.result.as_ref().expect("the pane shows the completed ranking");
+                    assert_eq!(answer["similar"].as_array().unwrap().len(), 2);
+                    assert!(answer["similar"][0]["distance"].is_number());
+                    assert!(h.query_by_label_contains("distance").is_some(), "the ranking is drawn in the pane");
+                    assert!(h.state().workflow.error.is_none());
+                    if outcome == "success" {
+                        let answer = h.state().workflow.result.clone();
+                        h.step();
+                        assert_eq!(h.state().workflow.result, answer, "an unchanged layer keeps its ranking");
+                        h.state_mut().run("layer.remove", json!({"layer":id})).unwrap();
+                        h.step();
+                        assert_eq!(h.state().workflow.layer, "other");
+                        assert!(h.state().workflow.result.is_none() && h.state().workflow.error.is_none());
+                        assert!(h.query_by_label_contains("distance").is_none(), "a fallback layer cannot show the removed layer's rows");
+                    }
+                }
+                "error" => {
+                    assert!(h.state().workflow.result.is_none());
+                    assert!(h.state().workflow.error.as_deref().is_some_and(|e| e.contains("reference row")));
+                    assert!(
+                        h.query_by_role_and_label(egui::accesskit::Role::Label, h.state().workflow.error.as_deref().unwrap()).is_some()
+                    );
+                }
+                "spawn" => {
+                    assert!(h.state().workflow.result.is_none());
+                    assert!(h.state().workflow.error.as_deref().is_some_and(|e| e.contains("background worker could not start")));
+                    assert!(
+                        h.query_by_role_and_label(egui::accesskit::Role::Label, h.state().workflow.error.as_deref().unwrap()).is_some()
+                    );
+                }
+                "cancel" | "newer" => {
+                    assert!(h.state().workflow.result.is_none());
+                    assert!(h.state().workflow.error.as_deref().is_some_and(|e| e.contains("cancelled")));
+                    assert!(
+                        h.query_by_role_and_label(egui::accesskit::Role::Label, h.state().workflow.error.as_deref().unwrap()).is_some()
+                    );
+                }
+                "layer" | "error_layer" => {
+                    if outcome == "error_layer" {
+                        assert_eq!(h.state().session.notices.iter().filter(|n| n.error && n.text.contains("reference row")).count(), 1);
+                    }
+                    assert_eq!(h.state().workflow.result, Some(json!({"kept":"other layer"})));
+                    assert!(h.state().workflow.error.is_none());
+                }
+                _ => panic!("unexpected Similar pane scenario"),
+            }
+        }
+    }
+
+    /// UI and direct relay Similar requests defer selection until the worker lands; a failed
+    /// worker spawn must refuse rather than compute synchronously on the window thread.
+    #[test]
+    fn similarity_uses_the_read_queue_for_ui_and_relay() {
+        use rustgis_engine::data::{Dataset, Field, FieldType, GeometryType, Value as V};
+        use std::io::{BufRead, BufReader};
+        for relay_call in [false, true] {
+            let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+            let mut ds = Dataset::new("numbers", GeometryType::Point, vec![Field::new("n", FieldType::Integer)]);
+            for n in [0, 2, 10] {
+                ds.push(None, vec![V::Int(n)]);
+            }
+            let id = rustgis_engine::cmd::layer::add_dataset(&mut app.session, ds);
+            let l = app.session.map_mut().layer_mut(id).unwrap();
+            l.selection = vec![0];
+            l.definition_query = Some("n >= 2".into());
+            app.reads_off_frame = true;
+            let p = json!({"layer":id,"fields":["n"],"count":2});
+            let relay = if relay_call {
+                let (relay, grant, client, ahead) = paused_relay(&mut app, relay_command(1, "data.similar", p.clone()));
+                admitted(&mut app, ahead, relay.clone());
+                Some((relay, grant, client))
+            } else {
+                assert_eq!(app.run("data.similar", p.clone()).unwrap()["started"], "Find Similar");
+                None
+            };
+            assert_eq!(app.session.map().layer(id).unwrap().selection, vec![0]);
+            landed(&mut app, 60);
+            assert_eq!(app.session.map().layer(id).unwrap().selection, vec![1, 2]);
+            if let Some((relay, _grant, client)) = relay {
+                let mut text = String::new();
+                BufReader::new(client).read_line(&mut text).unwrap();
+                let answer: Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(answer["result"]["isError"], false, "{answer}");
+                assert!(answer["result"]["content"][0]["text"].as_str().unwrap().contains("similar"));
+                relay.stop();
+            }
+            app.reads.fail_spawn = true;
+            let before = app.session.map().layer(id).unwrap().selection.clone();
+            assert!(app.run("data.similar", p).unwrap_err().contains("background worker could not start"));
+            assert_eq!(app.session.map().layer(id).unwrap().selection, before);
+        }
+    }
+
+    /// Topology's worker is used by both UI and scoped relay paths, with no inline spawn fallback.
+    #[test]
+    fn topology_uses_the_read_queue_for_ui_and_relay() {
+        use std::io::{BufRead, BufReader};
+        for relay_call in [false, true] {
+            let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+            let mut ds = rustgis_engine::data::Dataset::new("points", rustgis_engine::data::GeometryType::Point, vec![]);
+            ds.push(Some(rustgis_engine::data::Geometry::Point(rustgis_engine::geom::Coord::new(1.0, 2.0))), vec![]);
+            rustgis_engine::cmd::layer::add_dataset(&mut app.session, ds);
+            app.run("topology.rules", json!({"add":{"rule":"mustNotSelfIntersect","layer":"points"}})).unwrap();
+            app.reads_off_frame = true;
+            let p = json!({});
+            let relay = if relay_call {
+                let (relay, grant, client, ahead) = paused_relay(&mut app, relay_command(1, "topology.validate", p.clone()));
+                admitted(&mut app, ahead, relay.clone());
+                Some((relay, grant, client))
+            } else {
+                assert_eq!(app.run("topology.validate", p.clone()).unwrap()["started"], "Error Inspector");
+                None
+            };
+            landed(&mut app, 60);
+            if let Some((relay, _grant, client)) = relay {
+                let mut text = String::new();
+                BufReader::new(client).read_line(&mut text).unwrap();
+                let answer: Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(answer["result"]["isError"], false, "{answer}");
+                assert!(answer["result"]["content"][0]["text"].as_str().unwrap().contains("errors"));
+                relay.stop();
+            }
+            app.reads.fail_spawn = true;
+            assert!(app.run("topology.validate", p).unwrap_err().contains("background worker could not start"));
+        }
     }
 
     /// Statistics… counts the column on a thread of its own and keeps the answer for its window

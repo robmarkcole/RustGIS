@@ -14,7 +14,8 @@ use crate::{CmdResult, Session};
 /// was exported, unless `then` says it).
 pub struct Wrote {
     pub(crate) answer: Value,
-    pub(crate) notes: Vec<String>,
+    /// What it says once written, each loss with its code.
+    pub(crate) notes: rustgis_data::loss::Notes,
     /// Drawing diagnostics available before the session finalizer, with their original severity.
     pub(crate) diagnostics: Vec<(rustgis_data::diagnostics::Severity, String)>,
     /// Source failures to report if delivery cannot update their live layers.
@@ -35,7 +36,12 @@ pub struct Wrote {
 
 impl Wrote {
     fn completion_notes(&self) -> Vec<String> {
-        self.notes.iter().chain(self.diagnostics.iter().map(|(_, text)| text)).chain(&self.refused_notes).cloned().collect()
+        self.notes
+            .texts()
+            .chain(self.diagnostics.iter().map(|(_, text)| text.as_str()))
+            .chain(self.refused_notes.iter().map(String::as_str))
+            .map(str::to_string)
+            .collect()
     }
 }
 
@@ -135,9 +141,9 @@ fn said(s: &mut Session, wrote: Wrote) -> CmdResult {
     }
     for note in notes {
         if written_path.is_some() {
-            s.notify_written(note, false);
+            s.say_written(note);
         } else {
-            s.notify(note, false);
+            s.say(note);
         }
     }
     if let Some(then) = then {
@@ -179,18 +185,13 @@ pub(crate) fn drawn(
         }
     }
     if written.is_ok() {
-        let listed = |v: &[String]| {
-            let more = v.len().saturating_sub(10);
-            let shown = v.iter().take(10).cloned().collect::<Vec<_>>().join("; ");
-            if more > 0 { format!("{shown}; and {more} more") } else { shown }
-        };
         let warn = rustgis_data::diagnostics::Severity::Warning;
         if unplaced > 0 {
             notices.push((
                 warn,
                 format!(
                     "{path}: {unplaced} feature(s) have a place that can't be given in longitude/latitude, drawn without it ({})",
-                    listed(&partly)
+                    crate::listed(&partly)
                 ),
             ));
         }
@@ -200,7 +201,7 @@ pub(crate) fn drawn(
                 format!(
                     "{path}: {} layer(s) aren't drawn, as their system can't be given in longitude/latitude: {}",
                     undrawn.len(),
-                    listed(&undrawn)
+                    crate::listed(&undrawn)
                 ),
             ));
         }
@@ -261,12 +262,12 @@ pub(crate) fn drawn(
         // already reported above retain their screen markers, so this cannot duplicate them.
         s.notice_landed_pixels();
         written?;
-        s.notify_written(format!("Exported {path}"), false);
+        s.notify_written(format!("Exported {path}"));
         Ok(())
     });
     Ok(Wrote {
         answer,
-        notes: Vec::new(),
+        notes: Default::default(),
         diagnostics: notices,
         refused_notes,
         written_path,
@@ -410,6 +411,15 @@ pub(crate) fn export_start_raw(s: &mut Session, op: crate::policy::Authorized<cr
 /// its answer: the troubleshooting history files what it says (its failure too) under that
 /// command, and the session's log has its entry, as when it runs here.
 pub fn export_land(s: &mut Session, started: Started, done: Result<Wrote, String>) -> CmdResult {
+    let landed = export_land_floored(s, started, done);
+    // A landed export (a field package's) may record ids packages hold: kept as any command's are.
+    s.keep_field_floors();
+    landed
+}
+
+/// [`export_land`], before field packages' id floors are kept.
+#[cfg(not(target_arch = "wasm32"))]
+fn export_land_floored(s: &mut Session, started: Started, done: Result<Wrote, String>) -> CmdResult {
     let _inputs = s.log.on().then(rustgis_data::provenance::Capture::start);
     rustgis_data::provenance::record(started.inputs.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned());
     let Started { command, params, at, start, owner, project, .. } = started;
@@ -465,7 +475,7 @@ mod tests {
                 answer: serde_json::json!({"path": "x"}),
                 diagnostics: Vec::new(),
                 refused_notes: Vec::new(),
-                notes: vec!["Exported x".into()],
+                notes: ["Exported x"].into_iter().collect(),
                 written_path: Some("x".into()),
                 then: None,
                 #[cfg(not(target_arch = "wasm32"))]

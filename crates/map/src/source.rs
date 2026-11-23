@@ -19,6 +19,8 @@ use rustgis_geom::Extent;
 use serde::{Deserialize, Serialize};
 
 mod render_lod;
+mod render_view;
+pub use render_view::KEPT_VIEW_BYTES;
 mod window;
 pub(crate) use window::Query;
 
@@ -138,32 +140,37 @@ pub struct SourceLayer {
     conversion_fallback: Option<String>,
     /// Losses from a conversion actually performed while opening, consumed once by its caller.
     #[serde(skip)]
-    conversion_notes_unsaid: Vec<String>,
+    conversion_notes_unsaid: rustgis_data::loss::Notes,
     /// Values in date fields a view read found weren't dates ([`Batch::unread_dates`]), until
     /// said by [`SourceLayer::take_unread_dates`]; once said, later reads aren't counted again.
+    /// Kept for each window read ([`Tally`]): a window read again replaces its counts.
     #[serde(skip)]
-    unread_dates: Option<Vec<usize>>,
+    unread_dates: Tally,
     /// Date-times a view read rounded to the microsecond ([`Batch::rounded_dates`]), likewise.
     #[serde(skip)]
-    rounded_dates: Option<Vec<usize>>,
+    rounded_dates: Tally,
     #[serde(skip)]
     unread_dates_said: bool,
     #[serde(skip)]
     rounded_dates_said: bool,
     /// Text values `<Null>` a view read read as null ([`Batch::null_text`]), likewise.
     #[serde(skip)]
-    null_text: Option<Vec<usize>>,
+    null_text: Tally,
     #[serde(skip)]
     null_text_said: bool,
     /// Text values a view read found weren't UTF-8 ([`Batch::not_utf8`]), likewise.
     #[serde(skip)]
-    not_utf8: Option<Vec<usize>>,
+    not_utf8: Tally,
+    /// The encoding `not_utf8` counts were read in, taken when they were kept: the source may be
+    /// opened again before they are said.
+    #[serde(skip)]
+    not_utf8_in: Option<&'static str>,
     #[serde(skip)]
     not_utf8_said: bool,
     /// What else view reads lost or assumed ([`Batch::notes`]), until said by
     /// [`SourceLayer::take_read_notes`].
     #[serde(skip)]
-    read_notes: Vec<String>,
+    read_notes: rustgis_data::loss::Notes,
     /// The kinds of note view reads of this opening have given ([`note_kind`]): each is said once,
     /// with the count of the read that first gave it, not again on each redraw.
     #[serde(skip)]
@@ -173,6 +180,9 @@ pub struct SourceLayer {
     /// Whole-source thinning decisions shared by render snapshots, independent of view rows.
     #[serde(skip)]
     render_lod: Arc<Mutex<render_lod::Decisions>>,
+    /// The last view's rows and drawn geometry, shared by render snapshots ([`render_view`]).
+    #[serde(skip)]
+    render_view: Arc<Mutex<render_view::KeptView>>,
     #[serde(skip)]
     pending: Option<Arc<Pending>>,
     /// Projection used for this disposable window's geometry cache.
@@ -765,6 +775,54 @@ pub(crate) fn another_frame() {
     }
 }
 
+/// How many windows a [`Tally`] keeps apart.
+const WINDOWS_COUNTED: usize = 64;
+
+/// What view reads found, counted for each field by its position, kept for each window read: a
+/// window read again replaces its counts instead of adding to them.
+#[derive(Clone, Default)]
+struct Tally {
+    windows: Vec<(Extent, Vec<usize>)>,
+    /// Counts of windows past [`WINDOWS_COUNTED`], added up as they come.
+    // ponytail: past 64 windows between two notice passes a window read again adds up as before;
+    // keep rows' identity in `Batch` to count exactly.
+    rest: Vec<usize>,
+}
+
+impl Tally {
+    fn saw(&mut self, window: &Extent, counts: &[usize]) {
+        let at = self.windows.iter().position(|(w, _)| w == window);
+        if counts.iter().all(|n| *n == 0) {
+            if let Some(at) = at {
+                self.windows.remove(at);
+            }
+        } else if let Some((_, kept)) = at.and_then(|at| self.windows.get_mut(at)) {
+            *kept = counts.to_vec();
+        } else if self.windows.len() < WINDOWS_COUNTED {
+            self.windows.push((*window, counts.to_vec()));
+        } else {
+            rustgis_data::source::add_unread_dates(&mut self.rest, counts);
+        }
+    }
+
+    /// Nothing is pending.
+    fn is_empty(&self) -> bool {
+        self.windows.is_empty() && self.rest.iter().all(|n| *n == 0)
+    }
+
+    /// The counts of every window added up, or `None` when nothing is pending.
+    fn total(&self) -> Option<Vec<usize>> {
+        if self.is_empty() {
+            return None;
+        }
+        let mut all = self.rest.clone();
+        for (_, counts) in &self.windows {
+            rustgis_data::source::add_unread_dates(&mut all, counts);
+        }
+        Some(all)
+    }
+}
+
 /// What [`SourceLayer::poll`] found.
 pub enum Polled {
     /// Nothing new.
@@ -786,12 +844,15 @@ impl SourceLayer {
     /// [`SourceLayer::take_unread_dates`] says it. Once said, later reads aren't counted: they
     /// read the same features again, and the notice says Load All Features counts them all.
     /// Each kind is counted until its own notice is said, so saying one doesn't silence the other.
-    pub fn saw_unread_dates(&mut self, unread: &[usize], rounded: &[usize]) {
-        if !self.unread_dates_said && unread.iter().any(|n| *n > 0) {
-            rustgis_data::source::add_unread_dates(self.unread_dates.get_or_insert_with(Vec::new), unread);
+    /// `window` is the extent the batch was read for: reading it again replaces its counts, so the
+    /// same rows aren't counted twice. Two different windows that overlap still count the rows
+    /// they share twice; the notice says "so far" and Load All Features counts them all.
+    pub fn saw_unread_dates(&mut self, window: &Extent, unread: &[usize], rounded: &[usize]) {
+        if !self.unread_dates_said {
+            self.unread_dates.saw(window, unread);
         }
-        if !self.rounded_dates_said && rounded.iter().any(|n| *n > 0) {
-            rustgis_data::source::add_unread_dates(self.rounded_dates.get_or_insert_with(Vec::new), rounded);
+        if !self.rounded_dates_said {
+            self.rounded_dates.saw(window, rounded);
         }
     }
 
@@ -800,7 +861,7 @@ impl SourceLayer {
     /// ([`rustgis_data::source::rounded_dates_note`]), once for the source.
     pub fn take_unread_dates(&mut self) -> (Option<String>, Option<String>) {
         let Some(fields) = self.info().map(|i| i.fields.clone()) else { return (None, None) };
-        let (unread, rounded) = (self.unread_dates.take(), self.rounded_dates.take());
+        let (unread, rounded) = (std::mem::take(&mut self.unread_dates).total(), std::mem::take(&mut self.rounded_dates).total());
         if unread.is_none() && rounded.is_none() {
             return (None, None);
         }
@@ -814,9 +875,9 @@ impl SourceLayer {
 
     /// Keeps what view reads found of text values `<Null>` read as null, until
     /// [`SourceLayer::take_null_text`] says it, as [`SourceLayer::saw_unread_dates`] does for dates.
-    pub fn saw_null_text(&mut self, counts: &[usize]) {
-        if !self.null_text_said && counts.iter().any(|n| *n > 0) {
-            rustgis_data::source::add_unread_dates(self.null_text.get_or_insert_with(Vec::new), counts);
+    pub fn saw_null_text(&mut self, window: &Extent, counts: &[usize]) {
+        if !self.null_text_said {
+            self.null_text.saw(window, counts);
         }
     }
 
@@ -824,16 +885,22 @@ impl SourceLayer {
     /// ([`rustgis_data::source::null_text_note`]), once for the source.
     pub fn take_null_text(&mut self) -> Option<String> {
         let fields = self.info().map(|i| i.fields.clone())?;
-        let counts = self.null_text.take()?;
+        let counts = std::mem::take(&mut self.null_text).total()?;
         self.null_text_said = true;
         rustgis_data::source::null_text_note(&fields, &counts)
     }
 
     /// Keeps what view reads found of text values that aren't UTF-8, until
     /// [`SourceLayer::take_not_utf8`] says it, as [`SourceLayer::saw_unread_dates`] does for dates.
-    pub fn saw_not_utf8(&mut self, counts: &[usize]) {
-        if !self.not_utf8_said && counts.iter().any(|n| *n > 0) {
-            rustgis_data::source::add_unread_dates(self.not_utf8.get_or_insert_with(Vec::new), counts);
+    pub fn saw_not_utf8(&mut self, window: &Extent, counts: &[usize]) {
+        if !self.not_utf8_said {
+            let encoding = self.handle.as_ref().map_or("UTF-8", |h| h.text_encoding());
+            // Counts of another encoding are of another opening's text: they aren't added to these.
+            if self.not_utf8_in != Some(encoding) {
+                self.not_utf8 = Tally::default();
+            }
+            self.not_utf8_in = Some(encoding);
+            self.not_utf8.saw(window, counts);
         }
     }
 
@@ -841,11 +908,13 @@ impl SourceLayer {
     /// ([`rustgis_data::source::not_utf8_note`]), once for the source.
     pub fn take_not_utf8(&mut self) -> Option<String> {
         // Checked first: this runs every frame for each layer with a source, and most have nothing pending.
-        self.not_utf8.as_ref()?;
+        if self.not_utf8.is_empty() {
+            return None;
+        }
         let fields = self.info().map(|i| i.fields.clone())?;
-        let counts = self.not_utf8.take()?;
+        let counts = std::mem::take(&mut self.not_utf8).total()?;
         self.not_utf8_said = true;
-        rustgis_data::source::not_utf8_note(&fields, &counts)
+        rustgis_data::source::not_utf8_note(&fields, &counts, self.not_utf8_in.take().unwrap_or("UTF-8"))
     }
 
     /// Keeps what view reads said they lost or assumed ([`Batch::notes`]) until
@@ -854,9 +923,14 @@ impl SourceLayer {
     /// their counts ([`note_kind`]: a number starting the note or a clause, before a space); notes
     /// that differ in any other number or word are kinds of their own. Past [`READ_NOTE_KINDS`]
     /// kinds, one last note says there are more.
-    pub fn saw_read_notes(&mut self, notes: &[String]) {
-        for note in notes.iter().filter(|n| !n.trim().is_empty()) {
-            let kind = note_kind(note);
+    pub fn saw_read_notes(&mut self, notes: &[rustgis_data::loss::Note]) {
+        for note in notes.iter().filter(|n| !n.text.trim().is_empty()) {
+            // A kind is its wording without its counts, and its loss code: a coded note isn't
+            // folded into a plain one that reads the same.
+            let kind = match note.loss {
+                Some(code) => format!("{}\u{1f}{}", note_kind(&note.text), code.spec().id),
+                None => note_kind(&note.text),
+            };
             if self.read_note_kinds.contains(&kind) {
                 continue;
             }
@@ -877,7 +951,7 @@ impl SourceLayer {
 
     /// What view reads said they lost or assumed ([`Batch::notes`]) and haven't said yet, each
     /// kind once for the opening ([`SourceLayer::saw_read_notes`]).
-    pub fn take_read_notes(&mut self) -> Vec<String> {
+    pub fn take_read_notes(&mut self) -> rustgis_data::loss::Notes {
         std::mem::take(&mut self.read_notes)
     }
 
@@ -961,7 +1035,7 @@ impl SourceLayer {
         }
         let mut new =
             SourceLayer { shapefile_crs: self.shapefile_crs, limit: self.limit, byte_budget: self.byte_budget, ..Default::default() };
-        let mut conversion_notes = Vec::new();
+        let mut conversion_notes = rustgis_data::loss::Notes::new();
         let declared_empty;
         let conversion_zm_dropped;
         if let Some(g) = &self.gdal {
@@ -1013,6 +1087,9 @@ impl SourceLayer {
                     conversion_notes.push(format!("DuckDB: {} rows of another geometry type were left out", out.other_family));
                 }
                 let part = out.parts.first().ok_or_else(|| format!("{path}: the table returns no {}", d.family.label()))?;
+                if part.zm_dropped > 0 {
+                    conversion_notes.push(rustgis_data::zm_note(Some(part.zm_dropped)));
+                }
                 declared_empty = part.count == 0;
                 new.path = Some(part.path.display().to_string());
                 let handle = rustgis_data::source::parquet::ParquetSource::open_converted_path(
@@ -1023,7 +1100,7 @@ impl SourceLayer {
                 )
                 .map_err(|e| format!("{path}: {e}"))?;
                 new.handle = Some(Arc::new(handle));
-                conversion_zm_dropped = false;
+                conversion_zm_dropped = part.zm_dropped > 0;
                 new.duckdb = Some(d);
             }
         } else {
@@ -1129,6 +1206,44 @@ impl SourceLayer {
         // cache. Recover the guard so later frames can cache successful decisions again.
         let mut cache = self.render_lod.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         cache.get_or_try_insert(handle, projection, level, calculate)
+    }
+
+    /// The chunks a frame drew from the source's last view, with their projected and display
+    /// geometry, when that view was read for a longitude/latitude box holding `near`, drawn for
+    /// `key` (the projection and datum grids, as the renderer names them) and holding at most
+    /// `room` bytes (#1065). They hold rows only: the drawing takes the layer's look from the
+    /// layer, its rows and geometry from them ([`crate::Layer::draw_rows_of`]).
+    pub fn kept_view(&self, key: &str, near: &Extent, room: usize) -> Option<Arc<Vec<crate::Layer>>> {
+        let handle = self.handle.as_ref()?;
+        self.render_view.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(handle, key, near, room)
+    }
+
+    /// Whether a frame at resolution `res` (map units a pixel) should read a view wider than it
+    /// draws, to keep it for the frames after: not after a view as coarse or coarser was too large
+    /// to keep.
+    pub fn view_worth_keeping(&self, key: &str, res: f64) -> bool {
+        let Some(handle) = &self.handle else { return false };
+        self.render_view.lock().unwrap_or_else(std::sync::PoisonError::into_inner).worth_keeping(handle, key, res)
+    }
+
+    /// Keeps the chunks a frame at resolution `res` drew from a view read for `read`, with the
+    /// bytes they hold, in place of the last view kept; `None` says they came to more than may be
+    /// kept.
+    pub fn keep_view(&self, key: &str, read: Extent, res: f64, chunks: Option<(Vec<crate::Layer>, usize)>) {
+        let Some(handle) = &self.handle else { return };
+        self.render_view.lock().unwrap_or_else(std::sync::PoisonError::into_inner).put(handle, key, read, res, chunks);
+    }
+
+    /// Lets the kept view go when it holds more than `room` bytes.
+    pub fn trim_kept_view(&self, room: usize) {
+        self.render_view.lock().unwrap_or_else(std::sync::PoisonError::into_inner).trim(room);
+    }
+
+    /// Puts the kept chunks drawn again, with the geometry drawing made of them, in place of
+    /// `drawn`, the ones [`SourceLayer::kept_view`] gave, while those are still what is kept.
+    pub fn refresh_kept_view(&self, key: &str, drawn: &Arc<Vec<crate::Layer>>, chunks: Vec<crate::Layer>, bytes: usize) {
+        let Some(handle) = &self.handle else { return };
+        self.render_view.lock().unwrap_or_else(std::sync::PoisonError::into_inner).refresh(handle, key, drawn, chunks, bytes);
     }
 
     /// Retained interaction bytes assigned by the map, or the standalone default.
@@ -1582,7 +1697,7 @@ impl SourceLayer {
     }
 
     /// Takes diagnostics only from a fresh conversion performed by [`Self::open`].
-    pub fn take_conversion_notes(&mut self) -> Vec<String> {
+    pub fn take_conversion_notes(&mut self) -> rustgis_data::loss::Notes {
         std::mem::take(&mut self.conversion_notes_unsaid)
     }
 
@@ -1640,13 +1755,14 @@ impl SourceLayer {
         self.clear_error();
         self.login = false;
         // A new opening may hold other values: what was said of the last one doesn't hold.
-        self.unread_dates = None;
-        self.rounded_dates = None;
+        self.unread_dates = Tally::default();
+        self.rounded_dates = Tally::default();
         self.unread_dates_said = false;
         self.rounded_dates_said = false;
-        self.null_text = None;
+        self.null_text = Tally::default();
         self.null_text_said = false;
-        self.not_utf8 = None;
+        self.not_utf8 = Tally::default();
+        self.not_utf8_in = None;
         self.not_utf8_said = false;
         self.forget_read_notes();
         self.reset();
@@ -1661,6 +1777,7 @@ impl SourceLayer {
     pub fn detach_read(&mut self) {
         self.pending = None;
         self.render_lod = Default::default();
+        self.render_view = Default::default();
     }
 
     /// Whether `other` (a copy of this one) reads the same source the same way: the same file and
@@ -1684,6 +1801,7 @@ impl SourceLayer {
     /// Forgets the window, so the next view reads again (after the source changes).
     pub fn reset(&mut self) {
         self.render_lod = Default::default();
+        self.render_view = Default::default();
         self.reset_window();
     }
 
@@ -1948,6 +2066,7 @@ impl SourceLayer {
             handle: _,
             window: _,
             render_lod: _,
+            render_view: _,
             pending: _,
             projection: _,
             ready_cache: _,
@@ -1978,6 +2097,7 @@ impl SourceLayer {
             null_text: _,
             null_text_said: _,
             not_utf8: _,
+            not_utf8_in: _,
             not_utf8_said: _,
             read_notes: _,
             read_note_kinds: _,
@@ -2052,7 +2172,7 @@ mod tests {
         let handle = rustgis_data::source::open_shared("converted.fgb", bytes.clone(), None).unwrap();
         let mut source = super::SourceLayer::from_bytes("converted.fgb", bytes, None, handle);
         let mut info = source.info().unwrap().clone();
-        info.notes.push("conversion left out 2 source features".into());
+        info.notes.push("conversion left out 2 source features");
         info.zm_dropped = true;
         source.conversion_info = Some(info);
         let mut layer = crate::Layer::new(1, Dataset::new("layer", GeometryType::Point, Vec::new()));
@@ -2120,15 +2240,54 @@ mod tests {
             source.wait_open(std::time::Duration::from_secs(5));
             assert!(source.is_open(), "{:?}", source.error);
             let (first, second): (&[usize], &[usize]) = if unread_first { (&[1], &[]) } else { (&[], &[1]) };
-            source.saw_unread_dates(first, second);
+            let window = rustgis_geom::Extent::new(0.0, 0.0, 1.0, 1.0);
+            source.saw_unread_dates(&window, first, second);
             let said = source.take_unread_dates();
             assert_eq!((said.0.is_some(), said.1.is_some()), (unread_first, !unread_first));
             // The other kind, found by a later read, is still said; the said kind isn't again.
-            source.saw_unread_dates(&[2], &[2]);
+            source.saw_unread_dates(&window, &[2], &[2]);
             let said = source.take_unread_dates();
             assert_eq!((said.0.is_some(), said.1.is_some()), (!unread_first, unread_first), "unread first: {unread_first}");
             assert_eq!(source.take_unread_dates(), (None, None));
         }
+    }
+
+    /// A window read again replaces its counts; another window adds to them; a clean re-read
+    /// clears its own; past the windows kept apart, counts add up and nothing panics.
+    #[test]
+    fn a_window_read_again_replaces_its_counts() {
+        use super::{Tally, WINDOWS_COUNTED};
+        use rustgis_geom::Extent;
+        let (a, b) = (Extent::new(0.0, 0.0, 1.0, 1.0), Extent::new(2.0, 0.0, 3.0, 1.0));
+        let mut tally = Tally::default();
+        assert_eq!(tally.total(), None);
+        tally.saw(&a, &[0, 3]);
+        tally.saw(&a, &[0, 3]);
+        assert_eq!(tally.total(), Some(vec![0, 3]));
+        tally.saw(&b, &[1]);
+        assert_eq!(tally.total(), Some(vec![1, 3]));
+        tally.saw(&a, &[]);
+        assert_eq!(tally.total(), Some(vec![1]));
+        tally.saw(&b, &[0]);
+        assert_eq!(tally.total(), None);
+        let nan = Extent::new(f64::NAN, 0.0, 1.0, 1.0);
+        for _ in 0..2 * WINDOWS_COUNTED {
+            tally.saw(&nan, &[1]);
+        }
+        assert_eq!(tally.total(), Some(vec![2 * WINDOWS_COUNTED]));
+        assert!(tally.windows.len() <= WINDOWS_COUNTED);
+        // The same through the layer: a text kind said once, a re-read of its window not counted again.
+        let mut source = super::SourceLayer::default();
+        source.saw_not_utf8(&a, &[1]);
+        source.saw_not_utf8(&a, &[1]);
+        source.saw_null_text(&a, &[2]);
+        source.saw_null_text(&a, &[2]);
+        assert_eq!(std::mem::take(&mut source.not_utf8).total(), Some(vec![1]));
+        assert_eq!(std::mem::take(&mut source.null_text).total(), Some(vec![2]));
+        source.saw_unread_dates(&a, &[1], &[1]);
+        source.saw_unread_dates(&a, &[1], &[1]);
+        assert_eq!(std::mem::take(&mut source.unread_dates).total(), Some(vec![1]));
+        assert_eq!(std::mem::take(&mut source.rounded_dates).total(), Some(vec![1]));
     }
 
     /// A view read's notes are said once for each kind, whatever count a later read of another
@@ -2137,16 +2296,18 @@ mod tests {
     #[test]
     fn view_read_notes_are_said_once_for_each_kind() {
         let mut source = super::SourceLayer::default();
-        let note = |n: usize| format!("{n} of the shapes read (a sample of the layer, which may hold more) have a NaN");
-        source.saw_read_notes(&[note(3), String::new(), " ".into()]);
+        let note = |n: usize| {
+            rustgis_data::loss::Note::plain(format!("{n} of the shapes read (a sample of the layer, which may hold more) have a NaN"))
+        };
+        source.saw_read_notes(&[note(3), "".into(), " ".into()]);
         source.saw_read_notes(&[note(5)]);
         assert_eq!(source.take_read_notes(), [note(3)]);
         source.saw_read_notes(&[note(12), "7 values cut".into()]);
         assert_eq!(source.take_read_notes(), ["7 values cut"]);
         assert!(source.take_read_notes().is_empty());
         // A source with endless kinds of note says the first ones, then one note that there are more.
-        let many: Vec<String> = (0..2 * super::READ_NOTE_KINDS)
-            .map(|k| format!("kind {}: 1", char::from(b'a' + (k % 26) as u8).to_string().repeat(k / 26 + 1)))
+        let many: Vec<rustgis_data::loss::Note> = (0..2 * super::READ_NOTE_KINDS)
+            .map(|k| format!("kind {}: 1", char::from(b'a' + (k % 26) as u8).to_string().repeat(k / 26 + 1)).into())
             .collect();
         source.saw_read_notes(&many);
         source.saw_read_notes(&many);
@@ -2156,6 +2317,18 @@ mod tests {
         source.forget_read_notes();
         source.saw_read_notes(&[note(4)]);
         assert_eq!(source.take_read_notes(), [note(4)]);
+    }
+
+    /// A note that reports a loss isn't folded into a plain one that reads the same: its code
+    /// is said too, once.
+    #[test]
+    fn a_coded_read_note_is_its_own_kind() {
+        use rustgis_data::loss::{LossCode, Note};
+        let mut source = super::SourceLayer::default();
+        let plain = Note::plain("2 rings left out");
+        let coded = Note::loss(LossCode::DroppedRing, "3 rings left out");
+        source.saw_read_notes(&[plain.clone(), coded.clone(), coded.clone()]);
+        assert_eq!(source.take_read_notes(), [plain, coded]);
     }
 
     /// Only counts make two notes one kind: notes differing in another number stay apart.
@@ -2176,6 +2349,7 @@ mod tests {
             "EPSG:4326: 3 shape(s) left out".into(),
             "EPSG:3857: 3 shape(s) left out".into(),
         ];
+        let notes = notes.map(rustgis_data::loss::Note::plain);
         source.saw_read_notes(&notes);
         let said = source.take_read_notes();
         let expected = [&notes[0], &notes[2], &notes[4], &notes[5], &notes[6], &notes[7], &notes[8], &notes[9]];
@@ -2250,7 +2424,7 @@ mod tests {
     #[test]
     fn opening_conversion_notes_are_runtime_only_and_taken_once() {
         let note = "GDAL: 2 features of another geometry type were left out";
-        let mut source = super::SourceLayer { conversion_notes_unsaid: vec![note.into()], ..Default::default() };
+        let mut source = super::SourceLayer { conversion_notes_unsaid: [note].into_iter().collect(), ..Default::default() };
         let saved = serde_json::to_value(&source).unwrap();
         assert!(saved.get("conversion_notes_unsaid").is_none());
         let mut restored: super::SourceLayer = serde_json::from_value(saved).unwrap();

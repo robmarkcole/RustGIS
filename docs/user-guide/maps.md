@@ -103,10 +103,15 @@ base. `"extent": [xmin, ymin, xmax, ymax]` gives another box, in the map's units
 metres, at least 10 a side, not all within ±180 by ±90; needed over elevation tiles, which have no extent of their own; a box
 in degrees, off the world or off the DEM is refused, and the result gives the box cut to as
 numbers, or `"layer"` while the DEM's data isn't read); `"depth"` puts the base
-that many metres below the lowest ground in the box (ground with no height, drawn at 0, counts as 0; default half the box's relief, at least
+that many metres below the lowest ground in the box (ground with no height, drawn at 0, counts as 0, and a notice says how much of the box has none; default half the box's relief, at least
 100 m; both are stretched by the exaggeration), and `"walls": "#RRGGBB"` colours the walls
 (default `#C8B89A`, a sandy brown). The walls are lit by the way they face the light, as extruded
-walls are, darker toward their foot, and outlined. Left out, the block stays as it was;
+walls are, darker toward their foot, and outlined. Left out, the block stays as it was, and
+a `"block"` object changes only the keys it gives: keys left out stay as they were, and `null` puts one back to its
+default (`"extent": null` the DEM's extent, `"depth": null` half the relief, `"walls": null` `#C8B89A` with no layer,
+`"water": null` or `false` no water in the walls, `"shape": null` a box, `"radius": null` the circle's largest);
+the block's `"water"` is given whole (`{depth, field}`) each time: `{"water": {"depth": 5}}` replaces a water that had a field.
+Without a block, the keys left out take the defaults, and `"block": true` keeps a block as it is, or draws one with them;
 `"block": false` takes it off. It shows in the settled view and in exported maps (over elevation tiles, the walls once the
 box's tiles are read); while the map
 moves the ground is drawn whole, and labels, markers and extruded features outside the box still
@@ -126,11 +131,13 @@ perspective, as a geologic block diagram shows its rock units: a hatch's angle i
 horizontal (0° gives bedding lines), and a pattern is as big on the wall as on the ground at the
 view's centre (a reference scale grows it as it does on the ground). A pattern too fine to draw
 on a wall shows as its colour mixed over the fill. Gradient and shapeburst fills aren't drawn on
-walls. The layer may be hidden, so the walls can show geology while the ground shows soils. It
+walls, and a notice says how many of the layer's polygons along them show without theirs. The layer may be hidden, so the walls can show geology while the ground shows soils. It
 must be a polygon layer that holds all its
 features (not one read a view at a time), with a name of its own; it follows the layer's renames,
 and when it is removed, or a project opens without it, the walls are `color` (said) until a
 polygon layer of that name comes back. A plain `"walls": "#RRGGBB"` takes the layer off.
+`{"walls": {"layer": "Geology"}}` keeps the walls' colour, `{"walls": {"color": "#806040"}}` keeps the layer, and
+`{"walls": {"layer": null}}` takes the layer off and keeps the colour.
 
 `"shape": "circle"` cuts a round block: the largest circle inside the box (the DEM's extent or
 `"extent"`), centred in it, or a smaller one with `"radius"` (map units; one larger than the
@@ -138,7 +145,7 @@ box's circle takes the box's). It reads the same at any bearing, which suits a f
 turns or an orbit. Only the ground inside the circle is drawn and sets the base, and the wall
 runs round its near half, with everything a box's walls have: colour, a walls layer's units and
 their patterns (which run on round the wall), light and fog. `"shape": "box"` (the default)
-takes it back to the box.
+takes it back to the box. A block kept from before stays round when another key changes, its radius too.
 
 `"shape": {"layer": "Bacias", "where": "nome = 'Rio Doce'"}` cuts the block to a study area: the
 polygons of a polygon layer that the expression picks (written as a definition query, among the
@@ -151,7 +158,7 @@ than 45°. A `"where"` that picks no polygon is refused. Holes are not cut: the 
 them is drawn, and a notice says how many. Several polygons each stand as their own block on the
 same base (dissolve touching ones first for one outline). The outline follows the polygons to about a third of the
 finest mesh cell (a ring narrower than that is left out, and said), and is read again when the
-layer is edited.
+layer is edited. A box kept from before is dropped when the block is cut to polygons.
 
 With water on the terrain (below), `"block": {"water": {"depth": 12}}` shows it in the walls'
 section: where the block's edge (a round block's circle too) runs inside a water polygon (the first in the layer's rows where
@@ -168,8 +175,7 @@ from about the shore band's width in (a few pixels at the view's centre), so the
 basin, not a cliff. A water body with no depth, or no level, shows none, and setting the block or
 the water says how many of those its definition query keeps have no value in the field. These depths
 are schematic unless they come from a field: say so in the figure's caption. `"water": false` in the
-block takes the water out of the walls (give the block whole again: a `"block"` object sets all of
-it, its extent, depth and walls too); while it is there, taking the terrain's water off, or giving
+block takes the water out of the walls (the rest of the block stays as it was); while it is there, taking the terrain's water off, or giving
 it a layer without the depth field, is refused. Deleting the depth field keeps the water's own
 `depth` for all the water, or takes the water out of the walls when there is none, and says so.
 
@@ -309,11 +315,12 @@ and **View In Google Earth** open the place in your browser at about the same zo
 The status bar shows the pointer's coordinates while it is over the map, and keeps the last
 position (dimmed) when it leaves, so you can move to the status bar and click it. It reads `—`
 until the pointer has been over the map, and again after you switch to another map or open another
-project. Click the coordinates to step through four formats; the choice is remembered and also
+project. Click the coordinates to step through five formats; the choice is remembered and also
 sets the right-click menu's first row. The same place in each:
 
 | Format | Example | Notes |
 | --- | --- | --- |
+| Map coordinates | `1703188 mE  6420339 mN` | the default: easting and northing in the map's coordinate system, named beside them in the status bar (here Web Mercator), in its unit (`m`, `ft` for international feet, `ftUS` for US survey feet, no unit for another); whole units at a unit a pixel or more, up to three decimals as you zoom in |
 | Decimal degrees | `15.3000° E  49.8500° N` | four decimal places |
 | DMS | `15°18′00.0″ E  49°51′00.0″ N` | degrees, minutes and seconds |
 | UTM | `33north 521567 5521996` | zone and hemisphere (`33south …` south of the equator), easting and northing in metres, rounded to the metre |
@@ -331,10 +338,17 @@ reference, which has no zone number: a letter for the half (Y for western longit
 eastern ones in the north, A and B in the south, with the 0° and 180° meridians in Z and B),
 the 100 km square and the digits, truncated, `Z AC 77146 62481`. 84° N itself is UPS, 80° S
 itself is UTM. On the map of another body than the Earth the readout shows *No UTM here*
-(or *No MGRS here*) rather than a wrong reference, and degrees still read. Scripts set the format with
-`ui.coordinateFormat={"format":"utm"}` (`decimal`, `dms`, `utm` or `mgrs`); without `format`
-it steps to the next one. A saved format this version doesn't know, say from a newer RustGIS,
-reads as decimal degrees with a notice, and stays saved until you pick a format.
+(or *No MGRS here*) rather than a wrong reference, and degrees still read. Map coordinates read in
+degrees on the globe and on another body's map, since the map's projection is computed on the
+Earth's figure; where the map's projection doesn't reach or folds over (the far side of a polar
+or oblique projection), they read *No map coordinates here*, and the right-click menu's row copies
+latitude and longitude instead. A projection can reach well beyond a national grid's area of use:
+London on a map in LV95 still reads eastings and northings. In map coordinates the right-click
+menu's row copies the system's name after them, `2600173 mE  1200272 mN  EPSG:2056`, so the copy
+says which system it is in. Scripts set the format with `ui.coordinateFormat={"format":"utm"}` (`map`, `decimal`,
+`dms`, `utm` or `mgrs`); without `format` it steps to the next one. A saved format this version
+doesn't know, say from a newer RustGIS, reads in map coordinates with a notice, and stays saved
+until you pick a format.
 
 `map.convertPosition` gives a place in all of these forms at once, without moving the map, for
 scripts, Python and the AI Assistant. It takes the place as `map.goToXY` does: `lon` and `lat`
@@ -819,8 +833,8 @@ World, Sphere and Africa Sinusoidal (`ESRI:54008`, `53008`, `102011`) can be the
 
 ### Finding a coordinate system
 
-The coordinate system boxes of the Coordinate System dialog, Define Projection, the Shapefile, DXF
-and CSV imports, the measured grid, **Settings › Start-up › Projection** and the analysis
+The coordinate system boxes of the Coordinate System dialog, Project Properties, Define Projection,
+the Shapefile, DXF and CSV imports, the measured grid, **Settings › Start-up › Projection** and the analysis
 environment search as you type. A box finds a system by its code (`3035`, `EPSG:3035`,
 `esri:102033`), by words of its name (`lv95`, `utm 32n wgs`), by its projection method (`albers`,
 `oblique mercator`) or by its area of use (`switzerland`), and lists the matches under the box: the
@@ -841,6 +855,44 @@ or ↓ chose a row. A box for the map, the measured grid or the analysis environ
 systems only. Text the list doesn't hold, such as WKT or a PROJ string, is used as typed. A system
 is remembered once it is applied or its import starts; **Clear** beside **Recently used** in the
 Coordinate System dialog forgets them all.
+
+### The project's coordinate system
+
+A project can have a coordinate system of its own, set in **Project Properties** (the project
+page's **Project Properties…** button, or `project.coordinateSystem` from the command line, Python
+or the Assistant). New maps are drawn in it, starting where the active map is looking, and new
+empty layers from **Layer Templates** hold their coordinates in it, so features drawn in them are
+stored in its units. Maps and layers already in the project keep their own systems. A system in
+degrees, or one without an EPSG or ESRI code, can't be a map's projection: new maps then stay in
+Web Mercator, and RustGIS says why. A project without one works as before.
+
+Tools follow it too. A tool that works in longitude/latitude (on a layer in degrees, or one that
+always does) gives its new layers in the project's system, converted, and with it as their own, so
+they export in it; one with a place the system can't hold (beyond 85.05° in Web Mercator, say)
+stays in longitude/latitude, and the tool says so. A tool that works in its first layer's own
+projected system keeps its output there. Shortest Route, Simulation and Convert Labels to
+Annotation do the same with the layer they make from another. IDW, Kriging, Kernel Density and
+the Geostatistical Wizard make a raster from a layer in degrees, or with no system, in the
+project's when it is projected,
+and say so (`crs: "EPSG:4326"` still makes it in degrees). An export of a layer with no system of
+its own (one drawn in longitude/latitude, say) is written in the project's system where the format
+can hold one (GeoPackage, Shapefile, FlatGeobuf, GeoParquet), and says so. A geocentric project system holds no map
+coordinates, so outputs and exports stay in longitude/latitude in it.
+
+**While it has none, take it from the first layer added** gives the project the system of the next
+layer added from data (**Home › Add**: a file, a URL, a service, a database; or a map imported, an
+offline map opened, layers pasted) that says what system
+it is in (a raster's, or a file's such as a GeoPackage's or a Shapefile's `.prj`), and says so; Undo
+takes it back with the layer. A tool's output gives none. A layer that names no system, taken for
+longitude/latitude, gives none, nor does a raster read as WGS 84 because its coordinates look like
+degrees; one that names WGS 84 or another system in degrees gives that, and new maps then stay in
+Web Mercator. A raster read in place gives its system once its pixels have arrived, at the next
+change to the project. The setting and the option are saved with the project;
+an older RustGIS refuses a project that has them (it needs `project-crs`) rather than saving it
+again without them.
+
+In the **Coordinate System** dialog, **Use the project's** and **Use the first layer's** pick the
+project's system or that of the map's first layer with one, and Apply draws the map in it.
 
 ## Globe
 

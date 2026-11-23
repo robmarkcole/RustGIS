@@ -1,5 +1,103 @@
 {
   "$defs": {
+    "AreaConflict": {
+      "description": "A feature a sync or a Bring Back of an offline area changed in one place and found changed in\nthe other too, with the version that lost (#2468).",
+      "properties": {
+        "at": {
+          "description": "When it was found, in seconds since 1970, as [`OfflineArea::synced`].",
+          "format": "double",
+          "type": "number"
+        },
+        "feature": {
+          "description": "The feature, by its id in the map.",
+          "format": "uint64",
+          "maximum": 18446744073709551615,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "geometry": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Geometry"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "kind": {
+          "$ref": "#/$defs/ConflictKind"
+        },
+        "layer": {
+          "description": "The layer, by id, in the area's map, and its name then.",
+          "format": "uint32",
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "layer_name": {
+          "type": "string"
+        },
+        "package": {
+          "description": "The field package that brought it ([`FieldOrigin::package`]); empty for a sync, or for a\npackage made before packages had one.",
+          "type": "string"
+        },
+        "shape": {
+          "description": "Whether the shape lost too: then [`AreaConflict::geometry`] is the shape that lost, in\nlongitude/latitude (`None`: it had none).",
+          "type": "boolean"
+        },
+        "values": {
+          "description": "The values that lost, by field name.",
+          "items": {
+            "maxItems": 2,
+            "minItems": 2,
+            "prefixItems": [
+              {
+                "type": "string"
+              },
+              {
+                "$ref": "#/$defs/Value"
+              }
+            ],
+            "type": "array"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "at",
+        "layer",
+        "layer_name",
+        "feature",
+        "kind"
+      ],
+      "type": "object"
+    },
+    "ConflictKind": {
+      "description": "What happened to a feature changed in both places, and so which version an\n[`AreaConflict`] keeps.",
+      "oneOf": [
+        {
+          "const": "replaced",
+          "description": "Edited in both places: the field's version went in, and the values the map had lost.",
+          "type": "string"
+        },
+        {
+          "const": "deleted",
+          "description": "Deleted in the field after a change in the map: deleted, and the map's feature lost.",
+          "type": "string"
+        },
+        {
+          "const": "kept",
+          "description": "Deleted in the field after a change in the map: kept, and only the deletion lost.",
+          "type": "string"
+        },
+        {
+          "const": "dropped",
+          "description": "Edited in the field but deleted in the map meanwhile: left deleted, and the field's edits\nlost.",
+          "type": "string"
+        }
+      ]
+    },
     "Coord": {
       "description": "A 2-D coordinate.",
       "properties": {
@@ -175,7 +273,24 @@
           "type": "string"
         },
         "generation": {
-          "description": "The area's [`OfflineArea::generation`] when the package was made. Bring Back accepts the\npackage only while the area still has it. Empty for a package made before packages carried\none.",
+          "description": "The area's [`OfflineArea::generation`] when the package was made. Bring Back accepts a\npackage without a list of its changes only while the area still has it. Empty for a package\nmade before packages carried one.",
+          "type": "string"
+        },
+        "ids": {
+          "additionalProperties": false,
+          "description": "The highest feature id each of the package's layers had when it was made, by layer id: a\nfeature added in the field is given an id above it, even after the features with the\nhighest ids are deleted, so it is never taken for one the package gave.",
+          "patternProperties": {
+            "^\\d+$": {
+              "format": "uint64",
+              "maximum": 9223372036854775806,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "package": {
+          "description": "This package's own identity, new for each package made: Bring Back refuses a package whose\nidentity its area has brought back already ([`OfflineArea::returned`]), and the phone finds\nthe copy of the rows it was given by it. Empty for a package made before packages had one.",
           "type": "string"
         },
         "project": {
@@ -617,6 +732,13 @@
     "OfflineArea": {
       "description": "A map's data clipped to an extent, to take into the field.",
       "properties": {
+        "conflicts": {
+          "description": "The versions that lost when a sync or a Bring Back of the area found a feature changed both\nhere and in the field, oldest first: kept so they can be looked at again after the notice\nis gone (Data › Offline › Conflicts), until they are dismissed.",
+          "items": {
+            "$ref": "#/$defs/AreaConflict"
+          },
+          "type": "array"
+        },
         "created": {
           "format": "double",
           "type": "number"
@@ -629,12 +751,25 @@
           "$ref": "#/$defs/Extent"
         },
         "generation": {
-          "description": "Which state of the area its field packages were made from: given when a package is first\nmade of the area, and replaced at every sync or Bring Back. A package comes back only while\nthe area still has the one it was made with, so a second copy of a package, or a second\nreturn, can't undo or repeat what the first brought home. Empty until a package is made.",
+          "description": "Which state of the area its field packages were made from: given when a package is first\nmade of the area, and replaced at every sync or Bring Back. A package without a list of its\nchanges, compared with the area as last synced, comes back only while the area still has the\none it was made with, so it can't undo or repeat what came home since. Empty until a package\nis made.",
           "type": "string"
         },
         "id": {
           "description": "Persistent identity, independent of the editable display name.",
           "type": "string"
+        },
+        "ids": {
+          "additionalProperties": false,
+          "description": "The highest feature id each layer of its map had in any field package made of the area, by\nlayer id: a feature added to the map here is given an id above it, so a package still out\nnever takes one added since for a feature it was given.",
+          "patternProperties": {
+            "^\\d+$": {
+              "format": "uint64",
+              "maximum": 9223372036854775806,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "type": "object"
         },
         "map": {
           "description": "The map it came from (by name).",
@@ -642,6 +777,13 @@
         },
         "name": {
           "type": "string"
+        },
+        "returned": {
+          "description": "The identities ([`FieldOrigin::package`]) of the field packages of this area already\nbrought back: each comes back once, so its changes can't be applied twice.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         },
         "synced": {
           "default": 0.0,
@@ -929,6 +1071,21 @@
       "minimum": 0,
       "type": "integer"
     },
+    "coordinate_system": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Crs"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The project's coordinate system (#2032 C3a): new maps are drawn in it, when a map can be,\nand new empty layers hold their coordinates in it. Maps and layers already in the project\nkeep theirs. `None`: new maps in Web Mercator and new layers in longitude/latitude, as\nbefore there was one. Saved with [`PROJECT_CRS`], which an older reader refuses rather\nthan saving the project again without it."
+    },
+    "crs_from_first_layer": {
+      "description": "While the project has no coordinate system, the first layer added with one of its own\ngives it its system ([`Project::coordinate_system`]). Off by default.",
+      "type": "boolean"
+    },
     "data_stores": {
       "default": [],
       "items": {
@@ -1085,6 +1242,7 @@
           "terrain-water",
           "terrain-water-shore",
           "terrain-block-water",
+          "terrain-block-walls-layer",
           "shaded-relief-effects",
           "normalized-legend-urls",
           "field-origin",
@@ -1106,14 +1264,18 @@
           "layout-chart-classes",
           "layout-chart-stack",
           "field-generation",
+          "field-package",
+          "field-conflicts",
           "offline-map-area-id",
           "crs-wkt",
           "zarr-window",
           "blank-paper",
           "layout-frame-border",
           "native-coordinates",
-          "layout-legend-text",
-          "label-guide"
+          "layout-text-size",
+          "label-guide",
+          "project-crs",
+          "dggs-system"
         ],
         "type": "string"
       },
@@ -1184,6 +1346,7 @@
     "terrain-water",
     "terrain-water-shore",
     "terrain-block-water",
+    "terrain-block-walls-layer",
     "shaded-relief-effects",
     "normalized-legend-urls",
     "field-origin",
@@ -1205,14 +1368,18 @@
     "layout-chart-classes",
     "layout-chart-stack",
     "field-generation",
+    "field-package",
+    "field-conflicts",
     "offline-map-area-id",
     "crs-wkt",
     "zarr-window",
     "blank-paper",
     "layout-frame-border",
     "native-coordinates",
-    "layout-legend-text",
-    "label-guide"
+    "layout-text-size",
+    "label-guide",
+    "project-crs",
+    "dggs-system"
   ],
   "x-rustgis-reads-format": 2,
   "x-rustgis-writes-format": 2

@@ -19,6 +19,8 @@ pub fn commands() -> Vec<C> {
         C::new("project.save", "Save Project", "Project", save).inputs(save_inputs).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).key("Mod+S").view().params(r#"{"path"?: string}"#),
         C::new("project.saveAs", "Save Project As", "Project", save_as).inputs(save_as_inputs).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).key("Mod+Shift+S").view().params(r#"{"path": string}"#),
         C::new("project.rename", "Rename Project", "Project", rename).roles(&[]).effects(crate::policy::Effects::NONE).params(r#"{"name": string}"#),
+        C::new("project.coordinateSystem", "Project Coordinate System", "Project", coordinate_system).roles(&[]).effects(crate::policy::Effects::NONE)
+            .params(r#"{"crs"?: the system new maps are drawn in and new empty layers are held in: EPSG:<code>, ESRI:<code>, WKT or a PROJ string ("" or null: none, as a project starts; omitted: kept), "fromFirstLayer"?: bool (while the project has none, the first layer added with a coordinate system gives it; omitted: kept)}"#),
         C::new("edit.undo", "Undo", "Quick Access Toolbar", |s, _| if s.undo() { Ok(Value::Null) } else { Err("nothing to undo".into()) }).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::History))
             .key("Mod+Z")
             .view()
@@ -123,7 +125,7 @@ fn export_log(s: &mut Session, p: &Value) -> CmdResult {
     rustgis_data::io::write_atomic_with(&path, |w| s.log.write(w, format == "csv")).map_err(|e| format!("{}: {e}", path.display()))?;
     // Entries dropped past the log's limits aren't in the file: said.
     let dropped = s.log.dropped_said().map(|d| format!("; not in it: {d}")).unwrap_or_default();
-    s.notify_written(format!("Exported the session log ({n} entries) to {}{dropped}", path.display()), false);
+    s.notify_written(format!("Exported the session log ({n} entries) to {}{dropped}", path.display()));
     Ok(json!({"path": path.display().to_string(), "entries": n, "format": format}))
 }
 
@@ -235,8 +237,10 @@ impl ConversionLoss {
 /// known, and saved-conversion fallbacks once with the layer count and first failure. Ordinary
 /// source notes are not opening conversion diagnostics.
 pub(crate) fn say_conversion_fallbacks(s: &mut Session) {
+    use rustgis_data::loss::LossCode;
     let mut fallback: Option<(usize, String, String)> = None;
-    let mut losses = std::collections::BTreeMap::<(String, String), ConversionLoss>::new();
+    // By provider and kind, and by the loss code the notes carry, which the summary keeps.
+    let mut losses = std::collections::BTreeMap::<(String, String, Option<&'static str>), (ConversionLoss, Option<LossCode>)>::new();
     for l in s.project.maps.iter_mut().flat_map(|m| &mut m.layers) {
         let Some(source) = l.source.as_mut() else { continue };
         if let Some(note) = source.take_conversion_fallback() {
@@ -247,6 +251,8 @@ pub(crate) fn say_conversion_fallbacks(s: &mut Session) {
         }
         let mut seen = std::collections::BTreeSet::new();
         for note in source.take_conversion_notes() {
+            let code = note.loss;
+            let note = note.text;
             // Source layer names and feature counts vary within a loss kind. Count affected
             // layers once each and total leading feature/row counts across those layers.
             let kind = [
@@ -262,9 +268,9 @@ pub(crate) fn say_conversion_fallbacks(s: &mut Session) {
             // An unlisted GDAL warning, without its per-layer occurrence count.
             .unwrap_or_else(|| note.rsplit_once(" (").filter(|(_, tail)| tail.ends_with("occurrence(s))")).map_or(&note, |(base, _)| base));
             let provider = note.split_once(": ").map_or("", |(provider, _)| provider);
-            let key = (provider.to_owned(), kind.to_owned());
+            let key = (provider.to_owned(), kind.to_owned(), code.map(|c| c.spec().id));
             if seen.insert(key.clone()) {
-                losses.entry(key).and_modify(|loss| loss.add(&note)).or_insert_with(|| ConversionLoss::new(&l.name, note));
+                losses.entry(key).and_modify(|(loss, _)| loss.add(&note)).or_insert_with(|| (ConversionLoss::new(&l.name, note), code));
             }
         }
     }
@@ -276,8 +282,8 @@ pub(crate) fn say_conversion_fallbacks(s: &mut Session) {
         };
         s.notify(text, false);
     }
-    for loss in losses.into_values() {
-        s.notify(loss.notice(), false);
+    for (loss, code) in losses.into_values() {
+        s.say(rustgis_data::loss::Note { text: loss.notice(), loss: code });
     }
 }
 
@@ -292,7 +298,7 @@ pub(super) fn off_dem(extent: Option<[f64; 4]>, dem: Option<&(String, Option<[f6
             let d = (*footprint)?;
             (e[2] <= d[0] || e[0] >= d[2] || e[3] <= d[1] || e[1] >= d[3]).then(|| {
                 format!(
-                    "block's extent doesn't overlap '{n}' (its corners are [{:.0}, {:.0}, {:.0}, {:.0}] in Web Mercator metres)",
+                    "the block's box doesn't overlap '{n}', whose footprint spans [{:.0}, {:.0}, {:.0}, {:.0}] in Web Mercator metres",
                     d[0], d[1], d[2], d[3]
                 )
             })
@@ -441,7 +447,9 @@ fn reset(s: &mut Session, p: Project) {
     if !uncut.is_empty() {
         s.notify(
             format!(
-                "{}: the layer a block diagram is cut to is missing, isn't a polygon layer, is read a view at a time, shares its name with another layer or picks no polygon with an area, so no block is drawn",
+                "{} block diagram{} cut to a layer that is missing, isn't a polygon layer, holds its features only a view at a time, shares its name with another layer or picks no polygon with an area, so no block is drawn: {}",
+                uncut.len(),
+                if uncut.len() == 1 { "" } else { "s" },
                 uncut.join(", ")
             ),
             false,
@@ -451,12 +459,12 @@ fn reset(s: &mut Session, p: Project) {
     match plain.as_slice() {
         [] => {}
         [one] => s.notify(
-            format!("{one}: the block diagram's walls layer is missing, not a polygon layer, read a view at a time or of a name another layer shares, so its walls are one colour"),
+            format!("{one}: the block diagram's walls layer is missing, isn't a polygon layer, holds its features only a view at a time, or shares its name with another layer, so its walls are one colour"),
             false,
         ),
         _ => s.notify(
             format!(
-                "{} block diagrams have a walls layer missing, not a polygon layer, read a view at a time or of a name another layer shares, so their walls are one colour: {}",
+                "{} block diagrams have a walls layer that is missing, isn't a polygon layer, holds its features only a view at a time, or shares its name with another layer, so their walls are one colour: {}",
                 plain.len(),
                 plain.join(", ")
             ),
@@ -676,6 +684,18 @@ fn open(s: &mut Session, p: &Value) -> CmdResult {
         }
     };
     reset(s, proj);
+    // The rows a package from home gave are kept on this device. The app keeps them on a thread of
+    // its own (it runs `offline.keepRows` next); a script or the command line keeps them here.
+    #[cfg(not(target_arch = "wasm32"))]
+    let window = s.statistics_window_thread == Some(std::thread::current().id());
+    #[cfg(target_arch = "wasm32")]
+    let window = true;
+    if s.project.given.is_some()
+        && !window
+        && let Err(e) = super::field_changes::keep_rows(s, &Value::Null)
+    {
+        s.warn(e);
+    }
     let legacy_field = is_package && legacy_field_package(&s.project);
     unlink_partial_copies(s, is_field || legacy_field);
     // A package opens as a new, unsaved project (saving writes a plain project file).
@@ -762,6 +782,9 @@ fn write(s: &mut Session, path: PathBuf) -> CmdResult {
         let ext = path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
         return Err(if ext == crate::project::PACKAGE_EXTENSION {
             "a project saves to a .rgis file; Package Project (project.package) writes a .rgispkg package".into()
+        } else if ext.is_empty() || ext == crate::project::EXTENSION {
+            // `foo.` and `a.rgis.` end in a bare dot; `atlas.rgis/` names a folder.
+            "a project saves to a .rgis file".into()
         } else {
             format!("a project saves to a .rgis file, not a .{ext} one")
         });
@@ -772,7 +795,7 @@ fn write(s: &mut Session, path: PathBuf) -> CmdResult {
     s.mark_saved();
     s.edit_counts.clear();
     let written = s.notice_mark();
-    s.notify_written(format!("Saved {}", path.display()), false);
+    s.notify_written(format!("Saved {}", path.display()));
     crate::durable::notify(s, &report);
     for note in construction_notes {
         s.notify(note, false);
@@ -819,6 +842,155 @@ fn rename(s: &mut Session, p: &Value) -> CmdResult {
     Ok(Value::Null)
 }
 
+/// Sets the project's coordinate system and whether the first layer added gives it one. Maps
+/// and layers already in the project keep their own systems: it is what new ones start in.
+fn coordinate_system(s: &mut Session, p: &Value) -> CmdResult {
+    let given = p.get("crs");
+    let from_first = p.get("fromFirstLayer").filter(|v| !v.is_null());
+    if given.is_none() && from_first.is_none() {
+        return Err("give crs, fromFirstLayer or both".into());
+    }
+    let crs = match given {
+        None => s.project.coordinate_system,
+        Some(Value::Null) => None,
+        Some(Value::String(t)) if t.trim().is_empty() => None,
+        Some(Value::String(t)) => {
+            Some(rustgis_data::raster::Crs::parse(super::within("crs", "a coordinate system", t, 64 * 1024)?.as_str())?)
+        }
+        Some(_) => return Err("crs is a coordinate system's code, WKT or PROJ string, or null".into()),
+    };
+    let from_first = match from_first {
+        None => s.project.crs_from_first_layer,
+        Some(v) => v.as_bool().ok_or("fromFirstLayer is true or false")?,
+    };
+    s.project.coordinate_system = crs;
+    s.project.crs_from_first_layer = from_first;
+    // A system chosen, or the option off: rasters waiting for their pixels were added before it,
+    // and give none later (cleared again, or the option on again).
+    if crs.is_some() || !from_first {
+        s.project.first_layer.settle();
+    }
+    Ok(project_crs_json(&s.project))
+}
+
+/// Text `crs` reads back as the same system: an EPSG or ESRI code, else a custom system's WKT when
+/// it was given one (its PROJ definition alone can leave out what places points, such as angles in
+/// grads), else its PROJ definition.
+pub fn crs_text(crs: rustgis_data::raster::Crs) -> String {
+    let label = crs.label();
+    if label.starts_with("ESRI:") { label } else { crs.definition_text() }
+}
+
+/// The project's coordinate system as commands give it: text that `crs` reads back as the same
+/// system ([`crs_text`]), its name, whether a map can be drawn in it, and whether the first layer
+/// added gives it one.
+pub(crate) fn project_crs_json(project: &crate::project::Project) -> Value {
+    let crs = project.coordinate_system;
+    json!({
+        "crs": crs.map(crs_text),
+        "label": crs.map(|c| c.label()),
+        "mapsCanUse": crs.map(|c| super::navigate::map_projection_for(c).is_ok()),
+        "fromFirstLayer": project.crs_from_first_layer,
+    })
+}
+
+/// Commands that add data from outside the project without being under Home › Add.
+const ADDS_DATA: &[&str] = &["map.import", "layer.paste", "offline.open"];
+
+/// The layers in the project before a step that adds data (a command of Home › Add: a file, a
+/// URL, a service, a database; or [`ADDS_DATA`]), when the project is to take its coordinate
+/// system from the first layer added ([`Project::crs_from_first_layer`]) and has none yet; else
+/// `None`, and nothing is looked at. A tool's output isn't a layer added: a raster made from one
+/// whose system was assumed would name WGS 84 as if it had been given. Undo and Redo change
+/// nothing (they are views of history), and a project opened or started brings its own setting.
+/// A raster added with its pixels still to come (read in place, or from a server) says no system
+/// until they land: [`take_first_layer_system`] keeps it waiting, and any later step that changes
+/// the project, not only one adding data, looks at those waiting.
+///
+/// [`Project::crs_from_first_layer`]: crate::project::Project::crs_from_first_layer
+pub(crate) fn first_layer_watch(s: &Session, spec: &crate::CommandSpec) -> Option<FirstLayerWatch> {
+    let p = &s.project;
+    if !spec.mutates || !p.crs_from_first_layer || p.coordinate_system.is_some() {
+        return None;
+    }
+    let adds_data = spec.location.starts_with("Home › Add") || ADDS_DATA.contains(&spec.id);
+    if !adds_data && p.first_layer.pending.is_empty() {
+        return None;
+    }
+    let waiting = &p.first_layer.pending;
+    let before =
+        p.maps.iter().flat_map(|m| m.layers.iter()).map(rustgis_map::Layer::instance_id).filter(|id| !waiting.contains(id)).collect();
+    Some(FirstLayerWatch { opened: s.opened, before, adds_data })
+}
+
+/// What [`first_layer_watch`] saw before a step, for [`take_first_layer_system`] after it.
+pub(crate) struct FirstLayerWatch {
+    opened: u64,
+    before: std::collections::HashSet<u64>,
+    /// The step adds data: the layers it added are looked at, besides the rasters waiting.
+    adds_data: bool,
+}
+
+/// The coordinate system a layer says it is in: a raster's, or the one a feature layer was read
+/// in. `None` for a layer whose file named none: a feature layer taken for longitude/latitude, a
+/// raster read as WGS 84 because its coordinates look like degrees, a scan not yet placed.
+pub fn layer_system(l: &rustgis_map::Layer) -> Option<rustgis_data::raster::Crs> {
+    match &l.raster {
+        Some(r) => r.data.as_ref().filter(|d| d.georeferenced && !d.crs_assumed).map(|d| d.crs),
+        None => l.dataset.crs,
+    }
+}
+
+/// After a step: the project takes the coordinate system of the first layer it added that has
+/// one, in the maps' order, and says so ([`first_layer_watch`]). Each layer is looked at once, by
+/// the innermost step that added it, so a step around it (a script and its lines) doesn't take it
+/// again; rasters whose pixels are still to come wait. What was looked at is kept with the project
+/// ([`crate::project::FirstLayerSeen`]), so Undo and a rolled-back command restore it.
+pub(crate) fn take_first_layer_system(s: &mut Session, FirstLayerWatch { opened, before, adds_data }: &FirstLayerWatch) {
+    if s.opened != *opened || !s.project.crs_from_first_layer || s.project.coordinate_system.is_some() {
+        return;
+    }
+    let p = &mut s.project;
+    let (mut found, mut waiting) = (None, Vec::new());
+    for l in p.maps.iter().flat_map(|m| m.layers.iter()) {
+        let id = l.instance_id();
+        let candidate = if *adds_data { !before.contains(&id) } else { p.first_layer.pending.contains(&id) };
+        if !candidate || p.first_layer.considered.contains(&id) {
+            continue;
+        }
+        if l.raster.as_ref().is_some_and(|r| r.data.is_none()) {
+            waiting.push(id);
+            continue;
+        }
+        p.first_layer.considered.insert(id);
+        if found.is_none() {
+            found = layer_system(l).map(|crs| (crs, l.name.clone()));
+        }
+    }
+    // Waiting: those still to come, and only layers still in the project (Undo restores the list
+    // with a layer it brings back).
+    let present: std::collections::HashSet<u64> =
+        p.maps.iter().flat_map(|m| m.layers.iter()).map(rustgis_map::Layer::instance_id).collect();
+    let considered = &p.first_layer.considered;
+    p.first_layer.pending.retain(|id| present.contains(id) && !considered.contains(id));
+    for id in waiting {
+        if !p.first_layer.pending.contains(&id) {
+            p.first_layer.pending.push(id);
+        }
+    }
+    if let Some((crs, name)) = found {
+        p.coordinate_system = Some(crs);
+        p.first_layer.settle();
+        s.notify(
+            format!(
+                "The project's coordinate system is now {}, from layer '{name}': new maps are drawn in it and new layers held in it",
+                crs.label()
+            ),
+            false,
+        );
+    }
+}
+
 /// Picks the map tool: a Create tool needs a layer of its kind selected, and the tools that
 /// change features (Edit Vertices, Cut Polygon, Reshape) need editing on.
 fn set_tool(s: &mut Session, p: &Value) -> CmdResult {
@@ -852,6 +1024,14 @@ fn set_tool(s: &mut Session, p: &Value) -> CmdResult {
 fn parse_tool(p: &Value) -> Result<Tool, String> {
     let name = ps(p, "tool").ok_or("tool is required")?;
     Tool::from_code(name).ok_or_else(|| format!("unknown tool '{name}'"))
+}
+
+/// A transparency (or any `f32` setting) for JSON, rounded to 4 decimals: widened as it is, 33.3
+/// would read 33.299999237060547 to the Assistant and plugins.
+pub(crate) fn percent(v: f32) -> Value {
+    let wide = f64::from(v);
+    let rounded = (wide * 10_000.0).round() / 10_000.0;
+    json!(if rounded.is_finite() { rounded } else { wide })
 }
 
 /// A longitude/latitude extent as `[west, south, east, north]`, or null when there is none.
@@ -910,7 +1090,7 @@ fn info(s: &mut Session, p: &Value) -> CmdResult {
             };
             if let Some(o) = v.as_object_mut() {
                 o.insert("group".into(), json!(m.group_of(l.id).map(|g| g.name.as_str())));
-                o.insert("transparency".into(), json!(l.transparency));
+                o.insert("transparency".into(), json!(percent(l.transparency)));
                 o.insert("source".into(), json!(source(l)));
                 o.insert("extent".into(), bbox(l.extent()));
                 if !fields {
@@ -942,6 +1122,7 @@ fn info(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({
         "name": s.project.name,
         "path": s.path.as_ref().map(|p| p.display().to_string()),
+        "coordinateSystem": project_crs_json(&s.project),
         "unsaved": s.dirty(),
         "maps": s.project.maps.iter().map(|m| m.name.clone()).collect::<Vec<_>>(),
         "activeMap": m.name,
@@ -955,7 +1136,7 @@ fn info(s: &mut Session, p: &Value) -> CmdResult {
         "activeLayer": active,
         "layers": layers,
         "groups": m.groups.iter().map(|g| json!({
-            "id": g.id, "name": g.name, "visible": g.visible, "transparency": g.transparency,
+            "id": g.id, "name": g.name, "visible": g.visible, "transparency": percent(g.transparency),
             "minScale": g.min_scale, "maxScale": g.max_scale, "layers": g.children, "parent": g.parent,
         })).collect::<Vec<_>>(),
         // Web tile layers (XYZ, WMS, vector tiles, styles, archives), each drawn over the map layer

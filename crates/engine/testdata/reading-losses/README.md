@@ -57,8 +57,8 @@ exercise coordinate-system assumptions.
 | --- | --- | --- | --- |
 | `book-clean.xlsx` | `POINT(1 2)` | absent | None; no command notice |
 | `book-z.xlsx` | `POINT Z(1 2 3)` | absent | Imports with a Z/M-loss notice |
-| `book-collection.xlsx` | `GEOMETRYCOLLECTION(POINT(1 2),POINT(3 4))` | absent | Silent: only the first member remains |
-| `book-error.xlsx` | `POINT(1 2)` | error cell (`t="e"`, value `#DIV/0!`) | Silent: the error becomes Null |
+| `book-collection.xlsx` | `GEOMETRYCOLLECTION(POINT(1 2),POINT(3 4))` | absent | Imported: one WKT value loses later non-empty members; the first remains |
+| `book-error.xlsx` | `POINT(1 2)` | error cell (`t="e"`, value `#DIV/0!`) | Imports with a counted notice naming `note`; the error becomes Null |
 
 The clean workbook is shared by all three pairs. All four must retain exactly one point
 at (1, 2), integer `id=7` and text `note=Null`, through both `sheets::read` and
@@ -82,7 +82,7 @@ numeric `id=7` and an empty note cell. The WKT is ordinary string content:
 | --- | --- | --- |
 | `book-clean.ods` | `POINT(1 2)` | None; no native or command notice |
 | `book-z.ods` | `POINT Z(1 2 3)` | Imports with a Z/M-loss notice |
-| `book-collection.ods` | `GEOMETRYCOLLECTION(POINT(1 2),POINT(3 4))` | Silent: only the first member remains |
+| `book-collection.ods` | `GEOMETRYCOLLECTION(POINT(1 2),POINT(3 4))` | Imported: one WKT value loses later non-empty members; the first remains |
 
 The clean workbook serves both pairs. The same retained-data assertions as XLSX require
 exactly one point at (1, 2), integer `id=7` and text `note=Null` through the native
@@ -125,7 +125,7 @@ command imports must retain exactly the point with no attribute fields/values or
 | --- | --- | --- |
 | `book-clean` | `POINT(1 2)` | None; no native or command notice |
 | `book-z` | `POINT Z(1 2 3)` | Imports with a Z/M-loss notice |
-| `book-collection` | `GEOMETRYCOLLECTION(POINT(1 2),POINT(3 4))` | Silent: only the first member remains |
+| `book-collection` | `GEOMETRYCOLLECTION(POINT(1 2),POINT(3 4))` | Imported: one WKT value loses later non-empty members; the first remains |
 | `book-short.xlsb` (paired with `book-clean.xlsb`) | `POINT(1 2)` | Silent: all attribute fields and values are lost |
 
 The height/member pairs must retain exactly one point at (1, 2), integer `id=7`,
@@ -133,6 +133,51 @@ text `note=Null` and both field names/types, through `sheets::read` and `layer.a
 Native checks require zero skipped rows, the expected height flag and exactly one
 Z/M message for the height variant (none otherwise). Valid lossy fixtures must import.
 Dates, error cells, other sheets and broader type/encoding fidelity are not certified.
+
+## Feature-service PBF
+
+Three tiny, independently encoded feature-service query answers, written offline with
+Python's standard-library `struct` and Protocol Buffers wire encoding, following
+[FeatureCollection.proto](https://github.com/Esri/arcgis-pbf/blob/master/proto/FeatureCollection/FeatureCollection.proto).
+No service data, exporter or third-party code is included. These exercise the sniffed
+feature-service reader, distinct from the OSM PBF reader despite the shared extension.
+
+All declare WKID 4326, point geometry, lower-left origin, XY scale 0.5 and translation
+(10, 20). One point's quantized XY (3, -5) becomes (11.5, 17.5); its attributes are
+OID `id=7` and string `name=Place`. `feature-xy.pbf` (100 bytes) is clean.
+`feature-xyz.pbf` and `feature-xym.pbf` (121 bytes each) add respectively `hasZ` or
+`hasM`, a third coordinate 37, and that component's unit scale/zero translation.
+The clean file serves both pairs. This tests separate dimension flags, not renamed files.
+
+The corpus checks exact geometry, feature ID, field names/types and attributes through
+`esripbf::read` and `layer.addData`, with no skipped features. The native and command
+messages must be exactly the one-feature Z/M drop message for XYZ/XYM and absent for XY.
+Other geometry and attribute losses and network paging are outside these fixtures.
+
+## XML partial-geometry notices
+
+The inline KML/KMZ pairs import with counted notices for unreadable coordinate tuples,
+unreadable polygon holes, polygons without usable outer rings, short line parts and excess
+Point coordinates. The tuple and short-part notices also cover `gx:Track`. GPX reports short
+segments omitted from track lines while retaining their usable points in the track-points
+layer. GeoRSS reports excess Point coordinate pairs; LandXML reports parcels without
+`CoordGeom`. Clean counterparts give none of these notices. Native regressions assert retained
+coordinates and attributes, and the command corpus compares retained data and exact native
+notices through `layer.addData`. Ten logical cases have seventeen rows with the KMZ twins; they do
+not establish completeness for these formats or cover the gaps below.
+
+## Standalone DBF
+
+The harness independently encodes two dBASE III tables directly from the header and
+field-descriptor layout: one record, character `name` (4 bytes) and date `day` (8 bytes).
+Both keep ASCII `name=kept`; the date is `20260228` or the nonexistent `20260230`.
+The language driver is explicitly Windows-1252 and all text is ASCII, so the pair
+exercises invalid-date reporting, without an encoding assumption or decoding loss.
+No exporter or external program is used. Both imports must succeed as one standalone
+table with exactly the declared fields, one row and no geometry. Native `io::read_path`
+and `layer.addData` retain the clean date as a date and read only the invalid one as Null,
+with exactly the existing one-value notice naming `day`. This is not coverage of other
+dBASE types, names or encoding losses.
 
 ## Coverage boundaries
 
@@ -149,7 +194,7 @@ but not covered here, not necessarily a known bug. CRS assumptions remain separa
 | TopoJSON | Z, missing arcs, bad quantized positions, nested members | M, other parts, attributes |
 | Delimited text (CSV/TSV/TXT/DAT, gzip wrapper) | CSV WKT Z, bad WKT/XY, later WKT members, extra cells | M, holes/curves, types/names/encoding, wrapper parity |
 | Shapefile | Point Z/M, line Z/ZM | Other shapes/parts, attributes; DBF encoding tracked in #2325 |
-| Standalone DBF | None | Names/types/encoding; geometry and Z/M inapplicable |
+| Standalone DBF | Invalid date read as Null | Other types/names/encoding; geometry and Z/M inapplicable |
 | KML/KMZ | Z, missing geometry, bad coordinate/hole/part, excess point coordinates | Other parts, attributes |
 | GPX | Bad waypoint, short track segment | Elevation attributes, other parts, attributes |
 | GeoRSS (RSS/Atom/GeoRSS, sniffed XML) | Unreadable place/hole, excess coordinate pairs | GML dimensions, other members, attributes |
@@ -159,7 +204,7 @@ but not covered here, not necessarily a known bug. CRS assumptions remain separa
 | DXF | Varying line Z, unreadable entity/vertex | Other entities/curves/parts, attributes |
 | MapInfo MIF/MID | Unreadable object, arc, short part/ring | Other geometry and attribute conversion |
 | OSM PBF | Missing member/node, unclosed/outside inner ring | Other relations, attributes; native coordinates are XY |
-| Feature-service PBF (distinct sniffed PBF parser) | None | Dimensions, geometry members, attributes |
+| Feature-service PBF (distinct sniffed PBF parser) | Point Z and M, separately | Other geometries/dimensions, geometry members, attributes |
 | GeoPackage / FlatGeobuf / GeoParquet / FileGDB (distinct readers) | Z in each | M, members/parts/curves where supported, attributes |
 | LAS/LAZ | None in this paired corpus | Sampling, dimensions/attributes; geometry members/holes inapplicable |
 | XLSX | WKT Z/members, error-valued attribute | M, other geometry, dates/formulas/names/encoding |

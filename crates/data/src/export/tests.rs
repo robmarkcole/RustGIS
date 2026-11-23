@@ -67,7 +67,7 @@ impl Runs {
             count: Some(ds.features.len() as u64),
             crs: "EPSG:4326".into(),
             indexed: false,
-            notes: Vec::new(),
+            notes: Default::default(),
             zm_dropped: false,
         };
         Runs {
@@ -100,7 +100,7 @@ impl FeatureSource for Runs {
             unread_dates: Vec::new(),
             rounded_dates: Vec::new(),
             null_text: Vec::new(),
-            notes: Vec::new(),
+            notes: Default::default(),
             not_utf8: Vec::new(),
         })
     }
@@ -207,7 +207,7 @@ fn a_streamed_export_writes_what_a_whole_export_writes() {
         layer.crs = whole.crs;
         let format = src.info().format;
         for ext in STREAMED {
-            let systems: &[Crs] = if PROJECTED_FORMATS.contains(&ext) { &[Crs::LonLat, Crs::WebMercator] } else { &[Crs::LonLat] };
+            let systems: &[Crs] = if crate::io::holds_a_system(ext) { &[Crs::LonLat, Crs::WebMercator] } else { &[Crs::LonLat] };
             for &crs in systems {
                 let (a, b) =
                     (d.join(format!("{format}-streamed-{}.{ext}", crs.epsg())), d.join(format!("{format}-whole-{}.{ext}", crs.epsg())));
@@ -241,11 +241,12 @@ fn a_streamed_export_writes_what_a_whole_export_writes() {
                     rounded_dates: Vec::new(),
                     null_text: Vec::new(),
                     not_utf8: Vec::new(),
+                    not_utf8_in: "UTF-8",
                     utc_dates,
                     fine_dates: if ext == "gpkg" { crate::io::fine_dates(whole.features.iter(), &whole.fields) } else { Vec::new() },
                     written_values: if ext == "fgb" { crate::io::written_values(whole.features.iter(), &whole.fields) } else { Vec::new() },
                     date_messages: Vec::new(),
-                    read_notes: Vec::new(),
+                    read_notes: Default::default(),
                 };
                 assert_eq!(streamed, expected, "{what}");
                 let (a, b) = (read_back(&a), read_back(&b));
@@ -374,9 +375,11 @@ fn a_layer_without_a_declared_type_takes_its_first_geometrys() {
         points.push_next(Some(Geometry::Point(Coord::new(i as f64, 2.0))), vec![Value::Int(i)]);
     }
     let layer = Dataset::new("points", GeometryType::None, points.fields.clone());
-    write_chunks_in(&Runs::new(&points, 2), &layer, &d.join("points.csv"), Crs::LonLat, 1).unwrap();
+    let e = write_chunks_in(&Runs::new(&points, 2), &layer, &d.join("points.csv"), Crs::LonLat, 1).unwrap();
     let text = std::fs::read_to_string(d.join("points.csv")).unwrap();
     assert!(text.starts_with("longitude,latitude,n"), "{text}");
+    // The export says so, for the notice of the system its columns are in (`share.exportLayer`).
+    assert!(e.csv.points);
 }
 
 /// Rows a source couldn't read are counted, so an export can say how many it left out; a clean
@@ -423,9 +426,15 @@ fn streamed_exports_refuse_what_they_cant_write() {
     let ds = squares();
     let layer = Dataset::new(ds.name.clone(), ds.geometry_type, ds.fields.clone());
     let src = Runs::new(&ds, 10);
-    for (name, crs) in
-        [("out.shp", Crs::LonLat), ("out.kml", Crs::LonLat), ("out.geojson", Crs::WebMercator), ("out.parquet", Crs::WebMercator)]
-    {
+    // GeoParquet says a system by its EPSG code only: one without is refused.
+    let gnomonic = Crs::parse("+proj=gnom +lat_0=51 +lon_0=9 +datum=WGS84 +units=m +no_defs").unwrap();
+    for (name, crs) in [
+        ("out.shp", Crs::LonLat),
+        ("out.kml", Crs::LonLat),
+        ("out.geojson", Crs::WebMercator),
+        ("out.kml", Crs::WebMercator),
+        ("out.parquet", gnomonic),
+    ] {
         assert!(write_source_in(&src, &layer, &d.join(name), crs).is_err(), "{name}");
     }
     let whole_only = Runs { chunks: false, ..Runs::new(&ds, 10) };

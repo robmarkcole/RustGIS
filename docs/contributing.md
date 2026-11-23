@@ -34,7 +34,29 @@ naming, wording, a refactor, an extra test for code that works) can be left for 
 quality pass**: before each release, maintainers gather these from the merged pull requests and fix
 them together. Reply on the comment that it's left for the release quality pass (agents end the
 reply with `<!-- quality-sweep -->`), so it can be found. Bugs, crashes, silent data loss and
-breaks of the rules in AGENTS.md are fixed in the pull request.
+breaks of the rules in AGENTS.md are fixed in the pull request, even when the problem predates it,
+the input that triggers it is rare, the fix needs a wider change or earlier code does the same. A
+defect too large for the pull request gets an issue, filed and linked from the reply, instead of
+the marker.
+
+The Claude review ends each inline comment with its category (`Category: bug`, security,
+performance, quality or agents-md). CI's **Review deferrals** check, which runs on each push and again in the
+merge queue, fails when a reply leaves a bug, security or AGENTS.md finding for the release quality
+pass. A maintainer can override it for one finding by ending a reply in its thread with
+`<!-- deferral-approved -->` and running the check again. The override isn't a reason: it records
+that a maintainer accepts the finding for the release quality pass, or judges it misclassified. A maintainer here is the repository's owner, a member of its organization or a
+collaborator, and the pull request's author may be that maintainer. Comments from
+other reviewers carry no category, so the check lets them through: those reviewers answer the
+reply themselves.
+
+The limits in `xtask/row-uses.txt` and `xtask/memory-limits.txt` only go down. CI's **Limits only go
+down** check, which runs on each push and again in the merge queue, fails when a pull request raises
+or removes one against the base commit; a new memory scenario is fine. A maintainer
+approves a deliberate raise (or a removed scenario) by commenting on the pull request, or reviewing
+it, with the line the failure prints for it on a line of its own, such as
+`<!-- ratchet-raise-approved: xtask/row-uses.txt count=790 -->` (a maintainer as for the deferral
+override above), and the check is run again. The line names the limit and its value, so a later
+push that raises it further needs a new approval.
 
 Changes to saved or generated output must classify each new owning field: address, executable
 parameters, generated text or user data. Use the shared durable-output transaction and keep
@@ -85,7 +107,8 @@ Other workspace tasks:
 | Task | Purpose |
 | --- | --- |
 | `cargo xtask changed [--list] [base]` | Run the `cargo xtask ci` checks on only the packages your branch changes and those that depend on them: a quicker check while you work. A file outside every package that no package includes, such as `Cargo.lock`, checks the whole workspace. `--list` prints the packages without checking them |
-| `cargo xtask layers` | Check crate dependency direction and keep UI dependencies out of lower layers |
+| `cargo xtask layers` | Check crate dependency direction (target-specific dependencies included) and keep UI dependencies out of lower layers; a new crate under `crates/` needs a layer in `LAYERS` |
+| `cargo xtask attribution` | Check that every image and font file has a row in `ATTRIBUTION.md` (its path, a directory above it or a pattern in backticks; a bare name covers a file at the repository root) |
 | `cargo xtask notices` | Regenerate the shipped `THIRD-PARTY-LICENSES.txt` files after changing dependencies, or after adding code or data from another project to `INCLUDED` in `xtask/src/notices.rs` (with its licence text in `third-party/`); requires `cargo-about` |
 | `cargo xtask notices --check` | Check the notices without writing them; stale notices warn in CI but block releases |
 | `cargo xtask web-pwa <dir>` | Generate the service worker in a Trunk build output directory, such as `dist/web` |
@@ -305,7 +328,7 @@ test similarly generates its KML, KMZ, CSV and GeoJSON inputs. These run automat
 `cargo test --workspace --locked` and `cargo xtask ci`, without a separate setup step or a
 public service. Extend these generators when adding cases.
 
-`crates/engine/tests/workflows.rs` runs everyday jobs from start to finish: join, overlay,
+`crates/engine/tests/integration/workflows.rs` runs everyday jobs from start to finish: join, overlay,
 summarise, map, save, reopen and export, and the same saved job twice. Its real-data case,
 Shelby County's census tracts checked against the areas the Census Bureau publishes, is
 `#[ignore]`d: the nightly build downloads the public-domain files, pinned by checksum, and runs it
@@ -332,11 +355,13 @@ them all the same way:
 
 - An integration test (`crates/<crate>/tests/`) seeds its runner from `PROPERTY_SEED` (1 if
   unset) and runs `PROPERTY_CASES` cases, with a default that takes a few seconds, and no
-  failure file. A failure panics with `PROPERTY_SEED=<seed>` and the smallest input found.
+  failure file. A value set that isn't a whole number fails rather than running the defaults.
+  A failure panics with `PROPERTY_SEED=<seed>` and the smallest input found.
 - Pull requests run the fixed seed with `cargo test`. The nightly runs each property test on a
   new seed with more cases; add a new one to its step in `nightly.yml`.
 - What the rule allows (a format's limits, a tolerance) is a list in the test, each entry with
-  its reason.
+  its reason. A rule about notices is tested both ways: lossy input gives the notice of that
+  kind, clean input gives none.
 
 To run a failing seed again, or deeper:
 `PROPERTY_SEED=7 PROPERTY_CASES=2000 cargo test -p rustgis-engine --test integration never_silent_roundtrip::`.

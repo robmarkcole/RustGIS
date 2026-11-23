@@ -77,6 +77,7 @@ pub const CAPABILITIES: &[&str] = &[
     "terrain-water",
     "terrain-water-shore",
     "terrain-block-water",
+    "terrain-block-walls-layer",
     "shaded-relief-effects",
     "normalized-legend-urls",
     "field-origin",
@@ -98,18 +99,29 @@ pub const CAPABILITIES: &[&str] = &[
     "layout-chart-classes",
     "layout-chart-stack",
     "field-generation",
+    "field-package",
+    FIELD_CONFLICTS,
     "offline-map-area-id",
     "crs-wkt",
     "zarr-window",
     "blank-paper",
     "layout-frame-border",
     NATIVE_COORDINATES,
-    "layout-legend-text",
+    "layout-text-size",
     "label-guide",
+    PROJECT_CRS,
+    "dggs-system",
 ];
+/// An offline area keeping the versions that lost a sync or a Bring Back
+/// (`OfflineArea::conflicts`, #2468): an older reader would save it again without them.
+pub(crate) const FIELD_CONFLICTS: &str = "field-conflicts";
 /// A layer or table saved in a coordinate system of its own, not longitude/latitude
 /// (`Dataset::held_in`, #2032 C2d): an older reader would read its coordinates as degrees.
 pub(crate) const NATIVE_COORDINATES: &str = "native-coordinates";
+/// A project with a coordinate system of its own, or taking one from its first layer
+/// (`Project::coordinate_system`, `Project::crs_from_first_layer`, #2032 C3a): an older reader
+/// would save it again without them.
+pub(crate) const PROJECT_CRS: &str = "project-crs";
 /// Independent marker sizes alongside classified point colours (`Layer::size_by`).
 pub(crate) const SIZE_BY_CAPABILITY: &str = "classified-point-size";
 /// The most entries a document's `requires` may list: past it the document is refused without
@@ -385,6 +397,11 @@ pub(crate) fn public_login_params(value: &serde_json::Value) -> Option<serde_jso
 #[serde(remote = "Self")]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Project {
+    /// Which layers have been looked at for the project's coordinate system, and which wait for
+    /// their pixels (`crate::cmd::project::take_first_layer_system`): never saved, and kept with
+    /// the project so that Undo and a rolled-back command restore it with the layers.
+    #[serde(skip)]
+    pub(crate) first_layer: FirstLayerSeen,
     /// Read-time adjustments (labels, diagrams, layouts), consumed by the session and never saved.
     #[serde(skip)]
     pub(crate) read_notices: Vec<(ReadPart, NoticeText)>,
@@ -398,6 +415,11 @@ pub struct Project {
     /// The home and area this field copy belongs to, retained through ordinary saves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub field_origin: Option<FieldOrigin>,
+    /// The rows a field package from home gave, taken as it opened and not yet kept on this device
+    /// (`offline.keepRows`). Never saved.
+    #[serde(skip)]
+    #[cfg_attr(feature = "schema", schemars(skip))]
+    pub(crate) given: Option<std::sync::Arc<crate::cmd::field_changes::GivenRows>>,
     #[cfg_attr(feature = "schema", schemars(with = "Vec<crate::schema::Open>"))]
     pub maps: Vec<Map>,
     pub active_map: usize,
@@ -470,6 +492,33 @@ pub struct Project {
     #[serde(default)]
     #[cfg_attr(feature = "schema", schemars(with = "Vec<crate::schema::Open>"))]
     pub data_stores: Vec<crate::cmd::sharing::DataStore>,
+    /// The project's coordinate system (#2032 C3a): new maps are drawn in it, when a map can be,
+    /// and new empty layers hold their coordinates in it. Maps and layers already in the project
+    /// keep theirs. `None`: new maps in Web Mercator and new layers in longitude/latitude, as
+    /// before there was one. Saved with [`PROJECT_CRS`], which an older reader refuses rather
+    /// than saving the project again without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinate_system: Option<rustgis_data::raster::Crs>,
+    /// While the project has no coordinate system, the first layer added with one of its own
+    /// gives it its system ([`Project::coordinate_system`]). Off by default.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub crs_from_first_layer: bool,
+}
+
+/// The layers a project taking its system from the first layer added has looked at, by instance
+/// id: those looked at (each once, by the innermost step that added it), and rasters added whose
+/// pixels were still to come.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FirstLayerSeen {
+    pub(crate) considered: std::collections::HashSet<u64>,
+    pub(crate) pending: Vec<u64>,
+}
+
+impl FirstLayerSeen {
+    /// The project has a system, or doesn't take one: the rasters waiting count as looked at.
+    pub(crate) fn settle(&mut self) {
+        self.considered.extend(self.pending.drain(..));
+    }
 }
 
 /// A standalone table: a dataset without geometry, under an id that stays with it. Names can
@@ -623,17 +672,77 @@ pub struct Job {
 pub struct FieldOrigin {
     pub project: String,
     pub area: String,
-    /// The area's [`OfflineArea::generation`] when the package was made. Bring Back accepts the
-    /// package only while the area still has it. Empty for a package made before packages carried
-    /// one.
+    /// The area's [`OfflineArea::generation`] when the package was made. Bring Back accepts a
+    /// package without a list of its changes only while the area still has it. Empty for a package
+    /// made before packages carried one.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub generation: String,
+    /// This package's own identity, new for each package made: Bring Back refuses a package whose
+    /// identity its area has brought back already ([`OfflineArea::returned`]), and the phone finds
+    /// the copy of the rows it was given by it. Empty for a package made before packages had one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub package: String,
+    /// The highest feature id each of the package's layers had when it was made, by layer id: a
+    /// feature added in the field is given an id above it, even after the features with the
+    /// highest ids are deleted, so it is never taken for one the package gave.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    #[cfg_attr(feature = "schema", schemars(with = "std::collections::BTreeMap<u32, crate::schema::IdFloor>"))]
+    pub ids: std::collections::BTreeMap<u32, u64>,
+}
+
+impl Project {
+    /// Keeps the ids new features are given above those field packages hold: in a field project,
+    /// those its package gave ([`FieldOrigin::ids`]); at home, those an offline area's packages gave
+    /// ([`OfflineArea::ids`]), in both maps a feature can be added to for the area, its source map
+    /// (by [`OfflineArea::map`]) and its offline map when open (by its area id, or the offline title
+    /// a map saved before maps carried one has). The session runs it after every command, Undo and
+    /// Redo, and when a project is opened ([`crate::Session::keep_field_floors`]), so a layer whose
+    /// rows were replaced (reloaded, renewed, restored) still keeps them.
+    pub(crate) fn keep_field_floors(&mut self) {
+        if let (Some(origin), Some(map)) = (self.field_origin.clone(), self.maps.first_mut()) {
+            origin.keep_ids(map);
+        }
+        for area in &self.offline_areas {
+            let offline = format!("{}{}", area.name, crate::cmd::field::OFFLINE);
+            let is_area_map = |m: &Map| {
+                m.name.eq_ignore_ascii_case(&area.map)
+                    || (!area.id.is_empty() && m.offline_area_id.as_deref() == Some(area.id.as_str()))
+                    || (m.offline_area_id.is_none() && m.name.eq_ignore_ascii_case(&offline))
+            };
+            for map in self.maps.iter_mut().filter(|m| is_area_map(m)) {
+                for (layer, id) in &area.ids {
+                    if let Some(l) = map.layers.iter_mut().find(|l| l.id == *layer && !l.is_raster()) {
+                        l.dataset.features.keep_ids_above(*id);
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl FieldOrigin {
+    /// Keeps the ids new features of `map`'s layers are given above those the package gave
+    /// ([`FieldOrigin::ids`]).
+    pub(crate) fn keep_ids(&self, map: &mut Map) {
+        for (layer, id) in &self.ids {
+            if let Some(l) = map.layers.iter_mut().find(|l| l.id == *layer && !l.is_raster()) {
+                l.dataset.features.keep_ids_above(*id);
+            }
+        }
+    }
 }
 
 pub(crate) fn field_id() -> Result<String, String> {
     let mut bits = [0u8; 16];
     getrandom::fill(&mut bits).map_err(|e| format!("cannot make a field-package identity: {e}"))?;
     Ok(bits.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// Whether the highest ids a field package's layers had ([`FieldOrigin::ids`], [`OfflineArea::ids`])
+/// can be: below the largest id a GeoPackage or PostGIS feature can have (`i64::MAX`), so the next
+/// new feature's id is one either can hold. One at or above it is hostile, and refused.
+pub(crate) fn valid_id_floors(ids: &std::collections::BTreeMap<u32, u64>) -> bool {
+    ids.values().all(|id| *id < i64::MAX.unsigned_abs())
 }
 
 pub(crate) fn valid_field_id(id: &str) -> bool {
@@ -655,14 +764,77 @@ pub struct OfflineArea {
     #[serde(default)]
     pub synced: f64,
     /// Which state of the area its field packages were made from: given when a package is first
-    /// made of the area, and replaced at every sync or Bring Back. A package comes back only while
-    /// the area still has the one it was made with, so a second copy of a package, or a second
-    /// return, can't undo or repeat what the first brought home. Empty until a package is made.
+    /// made of the area, and replaced at every sync or Bring Back. A package without a list of its
+    /// changes, compared with the area as last synced, comes back only while the area still has the
+    /// one it was made with, so it can't undo or repeat what came home since. Empty until a package
+    /// is made.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub generation: String,
+    /// The identities ([`FieldOrigin::package`]) of the field packages of this area already
+    /// brought back: each comes back once, so its changes can't be applied twice.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub returned: Vec<String>,
+    /// The highest feature id each layer of its map had in any field package made of the area, by
+    /// layer id: a feature added to the map here is given an id above it, so a package still out
+    /// never takes one added since for a feature it was given.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    #[cfg_attr(feature = "schema", schemars(with = "std::collections::BTreeMap<u32, crate::schema::IdFloor>"))]
+    pub ids: std::collections::BTreeMap<u32, u64>,
+    /// The versions that lost when a sync or a Bring Back of the area found a feature changed both
+    /// here and in the field, oldest first: kept so they can be looked at again after the notice
+    /// is gone (Data › Offline › Conflicts), until they are dismissed.
+    // Each shared, so neither an Undo step's copy of the project nor a change to the list (one
+    // added or dismissed) copies a conflict's values and shape: only the pointers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts: Vec<std::sync::Arc<AreaConflict>>,
     /// The snapshot: the map's feature layers holding the features meeting the extent.
     #[cfg_attr(feature = "schema", schemars(with = "crate::schema::Open"))]
     pub data: Map,
+}
+
+/// A feature a sync or a Bring Back of an offline area changed in one place and found changed in
+/// the other too, with the version that lost (#2468).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AreaConflict {
+    /// When it was found, in seconds since 1970, as [`OfflineArea::synced`].
+    pub at: f64,
+    /// The field package that brought it ([`FieldOrigin::package`]); empty for a sync, or for a
+    /// package made before packages had one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub package: String,
+    /// The layer, by id, in the area's map, and its name then.
+    pub layer: u32,
+    pub layer_name: String,
+    /// The feature, by its id in the map.
+    pub feature: u64,
+    pub kind: ConflictKind,
+    /// The values that lost, by field name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<(String, rustgis_data::Value)>,
+    /// Whether the shape lost too: then [`AreaConflict::geometry`] is the shape that lost, in
+    /// longitude/latitude (`None`: it had none).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shape: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geometry: Option<rustgis_data::Geometry>,
+}
+
+/// What happened to a feature changed in both places, and so which version an
+/// [`AreaConflict`] keeps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum ConflictKind {
+    /// Edited in both places: the field's version went in, and the values the map had lost.
+    Replaced,
+    /// Deleted in the field after a change in the map: deleted, and the map's feature lost.
+    Deleted,
+    /// Deleted in the field after a change in the map: kept, and only the deletion lost.
+    Kept,
+    /// Edited in the field but deleted in the map meanwhile: left deleted, and the field's edits
+    /// lost.
+    Dropped,
 }
 
 /// Settings every geoprocessing run honours.
@@ -1125,11 +1297,13 @@ impl Project {
 
     pub fn new(name: impl Into<String>) -> Self {
         Project {
+            first_layer: FirstLayerSeen::default(),
             read_notices: Vec::new(),
             format: FORMAT,
             name: name.into(),
             origin_id: String::new(),
             field_origin: None,
+            given: None,
             maps: vec![Map::new("Map")],
             active_map: 0,
             tables: Vec::new(),
@@ -1153,6 +1327,8 @@ impl Project {
             dl_models: Vec::new(),
             shared: Vec::new(),
             data_stores: Vec::new(),
+            coordinate_system: None,
+            crs_from_first_layer: false,
         }
     }
 
@@ -1254,6 +1430,30 @@ impl Project {
         self.next_table_id = self.next_table_id.max(other.next_table_id);
     }
 
+    /// Keeps the ids field packages hold, recorded in another state of the project, in this one,
+    /// which takes its place (undo, redo): each offline area's ([`OfflineArea::ids`], by area id)
+    /// and the field project's own ([`FieldOrigin::ids`], for the same package) only go up. A
+    /// package sent goes on holding its ids whatever is undone at home.
+    pub(crate) fn keep_field_ids(&mut self, other: &Project) {
+        let up = |into: &mut std::collections::BTreeMap<u32, u64>, from: &std::collections::BTreeMap<u32, u64>| {
+            for (layer, id) in from {
+                let held = into.entry(*layer).or_insert(0);
+                *held = (*held).max(*id);
+            }
+        };
+        for area in self.offline_areas.iter_mut().filter(|a| !a.id.is_empty()) {
+            if let Some(was) = other.offline_areas.iter().find(|o| o.id == area.id) {
+                up(&mut area.ids, &was.ids);
+            }
+        }
+        if let (Some(origin), Some(was)) = (self.field_origin.as_mut(), other.field_origin.as_ref())
+            && !origin.package.is_empty()
+            && origin.package == was.package
+        {
+            up(&mut origin.ids, &was.ids);
+        }
+    }
+
     /// Adds a standalone table, and returns the id it got.
     pub fn add_table(&mut self, dataset: Dataset) -> u32 {
         let id = self.new_table_id();
@@ -1302,7 +1502,13 @@ impl Project {
 
     /// The same repairs with deferred translation for session-owned interface notices.
     pub(crate) fn normalize_text(&mut self) -> Vec<NoticeText> {
-        self.repair(false).into_iter().map(|(_, n)| n).collect()
+        self.normalize_after("while checking the project")
+    }
+
+    /// [`Project::normalize_text`] after something was added to the project, its notices saying
+    /// `when` the repairs were made ("while importing the map").
+    pub(crate) fn normalize_after(&mut self, when: &'static str) -> Vec<NoticeText> {
+        self.repair(false, when).into_iter().map(|(_, n)| n).collect()
     }
 
     /// [`Project::normalize`] for a project read from its file, which also opens its plain COG
@@ -1312,12 +1518,13 @@ impl Project {
     /// as it is. Returns a notice for each kind of change that removed, cut or renamed
     /// something, with the part of the project it is about.
     pub(crate) fn normalize_opened(&mut self) -> Vec<(ReadPart, NoticeText)> {
-        self.repair(true)
+        self.repair(true, "while opening the project")
     }
 
     /// Reports removed or shortened content, renamed items and repaired group display settings
-    /// with their affected part. Table ids absent from older formats are filled in for compatibility.
-    fn repair(&mut self, opened: bool) -> Vec<(ReadPart, NoticeText)> {
+    /// with their affected part, each saying `when` it was made. Table ids absent from older
+    /// formats are filled in for compatibility.
+    fn repair(&mut self, opened: bool, when: &'static str) -> Vec<(ReadPart, NoticeText)> {
         if self.maps.is_empty() {
             self.maps.push(Map::new("Map"));
         }
@@ -1350,7 +1557,6 @@ impl Project {
                 repairs.push((l.name.clone(), r));
             }
         }
-        let when = if opened { "while opening the project" } else { "while checking the project" };
         let mut notices: Vec<(ReadPart, NoticeText)> =
             layout_notices(&self.name, when, layouts_dropped, &repairs).into_iter().map(|n| (ReadPart::Layouts, n.into())).collect();
         let mut done = Repaired::default();
@@ -1717,14 +1923,20 @@ impl Project {
     /// peer input stays unnormalized until its slot census has rejected ambiguous identities.
     fn read_json(text: &str, restore: bool, dir: Option<&Path>, normalize: bool, map_limit: Option<usize>) -> Result<Project, String> {
         check_format(text, "project")?;
-        let mut p: Project = serde_json::from_str(text).map_err(|e| {
+        let refused = |e: serde_json::Error| {
             let msg = e.to_string();
             if msg.contains("unknown variant") {
                 format!("this project may have been saved by a newer RustGIS: {msg}. Update RustGIS to open it.")
             } else {
                 format!("not a RustGIS project: {msg}")
             }
-        })?;
+        };
+        // Keys this version doesn't read (a hand-edited file, or one another program wrote) are
+        // left out, as before, and now said: counted, a few named (#2639).
+        let mut unknown = UnknownKeys::default();
+        let mut de = serde_json::Deserializer::from_str(text);
+        let mut p: Project = serde_ignored::deserialize(&mut de, |path| unknown.add(&path.to_string())).map_err(refused)?;
+        de.end().map_err(refused)?;
         let mut area_ids = std::collections::HashSet::new();
         let mut offline_map_ids = std::collections::HashSet::new();
         if (!p.origin_id.is_empty() && !valid_field_id(&p.origin_id))
@@ -1732,10 +1944,14 @@ impl Project {
                 !valid_field_id(&origin.project)
                     || !valid_field_id(&origin.area)
                     || (!origin.generation.is_empty() && !valid_field_id(&origin.generation))
+                    || (!origin.package.is_empty() && !valid_field_id(&origin.package))
+                    || !valid_id_floors(&origin.ids)
             })
             || p.offline_areas.iter().any(|area| {
                 (!area.id.is_empty() && (!valid_field_id(&area.id) || !area_ids.insert(area.id.as_str())))
                     || (!area.generation.is_empty() && !valid_field_id(&area.generation))
+                    || area.returned.iter().any(|id| !valid_field_id(id))
+                    || !valid_id_floors(&area.ids)
             })
             || p.maps.iter().any(|map| map.offline_area_id.as_deref().is_some_and(|id| !valid_field_id(id) || !offline_map_ids.insert(id)))
         {
@@ -1761,7 +1977,12 @@ impl Project {
         if let Some(limit) = map_limit {
             p.maps.truncate(limit);
         }
-        let repair_notices = if normalize { p.normalize_opened() } else { Vec::new() };
+        // Maps imported from a project are read as it opens, and said as imported.
+        let repair_notices = match (normalize, map_limit) {
+            (false, _) => Vec::new(),
+            (true, None) => p.normalize_opened(),
+            (true, Some(_)) => p.repair(true, "while importing the maps"),
+        };
         p.read_notices =
             label_losses::notices_for_maps(text, &p, map_limit.is_some())?.into_iter().map(|(part, text)| (part, text.into())).collect();
         p.read_notices.extend(repair_notices);
@@ -1826,6 +2047,7 @@ impl Project {
                 NoticeText::format("{n} map(s) beyond the import limit left out", [("n", excluded_maps.to_string().into())]),
             ));
         }
+        p.read_notices.extend(unknown.notices(map_limit));
         Ok(p)
     }
 
@@ -1927,24 +2149,64 @@ fn empty_map() -> &'static Map {
 pub const MAX_ITEMS: usize = 1000;
 
 /// What a read made of the image markers of `layers` and saved `styles` (by name): those not
-/// kept, which saving loses, and those that aren't a PNG or JPEG image that decodes (each image
-/// decoded once); both are drawn as circles.
+/// kept, which saving loses, and those the renderer draws as circles, by why (not a PNG, JPEG
+/// or SVG that decodes, past `render::MARKER_PIXELS`, an SVG with too much to draw or with
+/// filters, text, images, animation or links to other files, or past what the run has left of
+/// `render::RUN_MARKER_PIXELS`; each image checked once); both are drawn as circles. Checking
+/// decodes each new image, on the UI thread: at most what the run decodes, once.
 pub(crate) fn picture_notices<'a>(
     layers: impl IntoIterator<Item = &'a rustgis_map::Layer>,
     styles: impl IntoIterator<Item = (&'a str, &'a rustgis_map::Renderer)>,
 ) -> Vec<NoticeText> {
+    picture_notices_by(layers, styles, &|p| rustgis_render::picture_marker_kept_check(p).err())
+}
+
+/// [`picture_notices`], each kept image's refusal given by `check` (the renderer's; a test's own,
+/// to say what a run past its budget says without spending the process's).
+pub(crate) fn picture_notices_by<'a>(
+    layers: impl IntoIterator<Item = &'a rustgis_map::Layer>,
+    styles: impl IntoIterator<Item = (&'a str, &'a rustgis_map::Renderer)>,
+    check: &dyn Fn(rustgis_map::Picture) -> Option<rustgis_render::MarkerRefusal>,
+) -> Vec<NoticeText> {
     use rustgis_map::Picture;
     use rustgis_map::symbology::{MAX_PICTURE_BYTES, MAX_PICTURES, MAX_PICTURES_BYTES};
+    use rustgis_render::MarkerRefusal;
     let seen = std::cell::RefCell::new(std::collections::HashMap::new());
-    let unreadable =
-        |p: Picture| !p.is_default() && !*seen.borrow_mut().entry(p).or_insert_with(|| rustgis_render::picture_marker_draws(p));
-    let (mut dropped, mut bad) = (Vec::new(), Vec::new());
+    let refused = |p: Picture| {
+        if p.is_default() {
+            return None;
+        }
+        *seen.borrow_mut().entry(p).or_insert_with(|| check(p))
+    };
+    // The names with an image refused so, by each refusal in `WHY`, in the order their notices go.
+    const WHY: [MarkerRefusal; 5] = [
+        MarkerRefusal::NotAnImage,
+        MarkerRefusal::TooManyPixels,
+        MarkerRefusal::TooMuchToDraw,
+        MarkerRefusal::SvgUndrawn,
+        MarkerRefusal::PastRunPixels,
+    ];
+    let (mut dropped, mut bad) = (Vec::new(), WHY.map(|_| Vec::<&str>::new()));
     let mut note = |name: &'a str, any: &dyn Fn(&dyn Fn(Picture) -> bool) -> bool| {
         if any(&Picture::is_dropped) {
             dropped.push(name);
         }
-        if any(&unreadable) {
-            bad.push(name);
+        // One walk of the symbols (answering no to see them all), noting each refusal met.
+        let met = std::cell::Cell::new([false; WHY.len()]);
+        any(&|p| {
+            if let Some(why) = refused(p)
+                && let Some(i) = WHY.iter().position(|w| *w == why)
+            {
+                let mut seen = met.get();
+                seen[i] = true;
+                met.set(seen);
+            }
+            false
+        });
+        for (names, met) in bad.iter_mut().zip(met.get()) {
+            if met {
+                names.push(name);
+            }
         }
     };
     for l in layers {
@@ -1965,10 +2227,39 @@ pub(crate) fn picture_notices<'a>(
             ],
         ));
     }
-    if !bad.is_empty() {
+    let [not_images, too_large, too_much, filtered, past_run] = &bad;
+    if !not_images.is_empty() {
         notices.push(NoticeText::format(
-            "Image markers in {names} aren't PNG or JPEG images and are drawn as circles",
-            [("names", picture_names(&bad))],
+            "Image markers in {names} aren't PNG, JPEG or SVG images and are drawn as circles",
+            [("names", picture_names(not_images))],
+        ));
+    }
+    if !too_large.is_empty() {
+        notices.push(NoticeText::format(
+            "Image markers in {names} have more pixels than {side} × {side} and are drawn as circles",
+            [("names", picture_names(too_large)), ("side", rustgis_render::MARKER_PIXELS_SIDE.to_string().into())],
+        ));
+    }
+    if !too_much.is_empty() {
+        notices.push(NoticeText::format(
+            "Image markers in {names} are SVGs with more to draw than a {side} × {side} image and are drawn as circles",
+            [("names", picture_names(too_much)), ("side", rustgis_render::MARKER_PIXELS_SIDE.to_string().into())],
+        ));
+    }
+    if !filtered.is_empty() {
+        notices.push(NoticeText::format(
+            "Image markers in {names} are SVGs with filters, text, images, animation or links to other files, which RustGIS doesn't draw in marker images, and are drawn as circles",
+            [("names", picture_names(filtered))],
+        ));
+    }
+    if !past_run.is_empty() {
+        notices.push(NoticeText::format(
+            "Image markers in {names} are past what RustGIS decodes of marker images until it restarts ({mpx} megapixels, {mib} MiB) and are drawn as circles",
+            [
+                ("names", picture_names(past_run)),
+                ("mpx", (rustgis_render::RUN_MARKER_PIXELS / 1_000_000).to_string().into()),
+                ("mib", (rustgis_render::RUN_MARKER_BYTES >> 20).to_string().into()),
+            ],
         ));
     }
     notices
@@ -1985,7 +2276,7 @@ fn picture_names(names: &[&str]) -> NoticeText {
 }
 
 /// The part of a project a read notice is about, so an import says only what it takes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum ReadPart {
     AreaExpressions,
     Labels,
@@ -1997,6 +2288,79 @@ pub(crate) enum ReadPart {
     Maps,
     /// The project's other lists: reports, presentations, notebooks, models, ramps and the like.
     Items,
+}
+
+/// The most keys an unknown-keys notice names for each part; the rest are counted.
+const MAX_UNKNOWN_NAMED: usize = 3;
+
+/// The keys a project file has that this version doesn't read, by the part of the project each
+/// is in: counted, and the first few kept by their place in the file (`maps.0.layers.2.glow`).
+#[derive(Default)]
+struct UnknownKeys {
+    /// (part, map index for a key inside a map, place in the file), the first few of each part and
+    /// map.
+    named: Vec<(ReadPart, Option<usize>, String)>,
+    /// How many keys each part (and each map) has.
+    counted: std::collections::HashMap<(ReadPart, Option<usize>), usize>,
+}
+
+impl UnknownKeys {
+    /// Notes the key at `place` (serde_ignored's path, segments joined by dots).
+    fn add(&mut self, place: &str) {
+        // The header's `requires`, which `check_format` reads.
+        if place == "requires" {
+            return;
+        }
+        let mut parts = place.split('.');
+        let (part, map) = match parts.next() {
+            Some("maps") => (ReadPart::Maps, parts.next().and_then(|i| i.parse().ok())),
+            Some("layouts") => (ReadPart::Layouts, None),
+            _ => (ReadPart::Items, None),
+        };
+        // The first few of each part and map, so an import that leaves some maps out still names
+        // those of the maps it takes.
+        let seen = self.counted.entry((part, map)).or_default();
+        if *seen < MAX_UNKNOWN_NAMED {
+            // A key from the file is shown on one line of plain text: controls and directional
+            // marks flattened, as field names are.
+            let shown: String = place.chars().map(rustgis_data::io::dbf_notice_char).collect();
+            self.named.push((part, map, crate::project::short_name(&shown)));
+        }
+        *seen += 1;
+    }
+
+    /// One notice for each part with keys left out, leaving out keys in maps past `map_limit`
+    /// (an import that doesn't take those maps says nothing of them).
+    fn notices(self, map_limit: Option<usize>) -> Vec<(ReadPart, NoticeText)> {
+        let kept = |map: &Option<usize>| map_limit.is_none_or(|limit| map.is_none_or(|i| i < limit));
+        [ReadPart::Maps, ReadPart::Layouts, ReadPart::Items]
+            .into_iter()
+            .filter_map(|part| {
+                let n: usize = self.counted.iter().filter(|((p, m), _)| *p == part && kept(m)).map(|(_, n)| n).sum();
+                if n == 0 {
+                    return None;
+                }
+                let named: Vec<&str> = self
+                    .named
+                    .iter()
+                    .filter(|(p, m, _)| *p == part && kept(m))
+                    .map(|(.., place)| place.as_str())
+                    .take(MAX_UNKNOWN_NAMED)
+                    .collect();
+                let mut which = named.join(", ");
+                if n > named.len() {
+                    which = format!("{which} and {} more", n - named.len());
+                }
+                Some((
+                    part,
+                    NoticeText::format(
+                        "{n} key(s) this version doesn't read were left out (from a newer RustGIS, another program or a hand edit): {which}",
+                        [("n", n.to_string().into()), ("which", which.into())],
+                    ),
+                ))
+            })
+            .collect()
+    }
 }
 
 /// Every part: a whole project opened.
@@ -2013,7 +2377,6 @@ pub(crate) const ALL_PARTS: [ReadPart; 7] = [
 /// The most layouts a project keeps (`layout.*` commands refuse to make more).
 pub(crate) const MAX_LAYOUTS: usize = 200;
 
-/// The layouts named in a notice, the first few of them.
 /// A name cut to 100 characters for a notice, so a long one can't crowd out the count (a
 /// notice too long is withheld whole).
 pub(crate) fn short_name(name: &str) -> String {
@@ -2023,6 +2386,7 @@ pub(crate) fn short_name(name: &str) -> String {
     }
 }
 
+/// The layouts named in a notice, the first few of them.
 fn layout_names(
     repairs: &[(String, rustgis_map::layout::LayoutRepairs)],
     of: impl Fn(&rustgis_map::layout::LayoutRepairs) -> usize,
@@ -2396,11 +2760,13 @@ impl Durable for Project {
     /// Offers classified whole fields once, before any live mutation.
     fn prepare(&self, p: &mut Prepare<'_>) {
         let Self {
+            first_layer: _,
             read_notices: _,
             format: _,
             name: _,
             origin_id: _,
             field_origin: _,
+            given: _,
             maps,
             active_map: _,
             tables,
@@ -2424,13 +2790,17 @@ impl Durable for Project {
             dl_models: _,
             shared: _,
             data_stores: _,
+            coordinate_system: _,
+            crs_from_first_layer: _,
         } = self;
         for (i, v) in maps.iter().enumerate() {
             p.child(Owner::Map(i), v);
         }
         for (i, v) in offline_areas.iter().enumerate() {
-            let OfflineArea { id: _, name: _, map: _, extent: _, created: _, synced: _, generation: _, data } = v;
+            let OfflineArea { id: _, name, map: _, extent: _, created: _, synced: _, generation: _, returned: _, ids: _, conflicts, data } =
+                v;
             p.child(Owner::Area(i), data);
+            p.count_conflicts(name, conflicts);
         }
         for (i, v) in tables.iter().enumerate() {
             p.child(Owner::Table(i), v);

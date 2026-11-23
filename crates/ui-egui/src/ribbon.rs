@@ -1065,6 +1065,28 @@ fn offline_group(app: &mut RustGisApp, ui: &mut Ui) {
                     }
                 });
             }
+            // The versions that lost when an area's edits came back, kept until dismissed (#2468).
+            let held: Vec<(String, usize)> =
+                app.session.project.offline_areas.iter().map(|a| (a.name.clone(), a.conflicts.len())).collect();
+            small_menu(
+                ui,
+                app,
+                "merge",
+                "Conflicts",
+                "Look at the versions that lost when an offline area's edits came back.",
+                move |ui, app| {
+                    if held.is_empty() {
+                        ui.label(egui::RichText::new(tl!("No offline areas")).weak());
+                    }
+                    for (n, count) in &held {
+                        let label = crate::i18n::fmt("{area} ({count})", &[("area", n), ("count", &count.to_string())]);
+                        if ui.button(label).clicked() {
+                            let _ = app.run("ui.dialog", json!({"name": "offlineConflicts", "area": n}));
+                            ui.close();
+                        }
+                    }
+                },
+            );
         });
     });
 }
@@ -1895,7 +1917,7 @@ fn graticule_menu(ui: &mut Ui, app: &mut RustGisApp) {
         }
     }
     ui.separator();
-    // Under the layers, filled ones hide the lines; over them, only the labels are on top.
+    // Under the layers, filled ones hide the lines; over them, the lines show on every layer.
     let mut on_top = app.session.map().graticule_on_top;
     if ui
         .checkbox(&mut on_top, tl!("Draw on top of layers"))
@@ -1995,7 +2017,7 @@ fn view_tab(app: &mut RustGisApp, ui: &mut Ui) {
             app,
             "graticule",
             "Graticule",
-            "Show or hide the graticule over the basemap: latitudes and longitudes, a measured grid, the UTM zones or the MGRS grid.",
+            "Show or hide the graticule over the basemap, or over the layers when drawn on top: latitudes and longitudes, a measured grid, the UTM zones or the MGRS grid.",
             "map.graticule",
             Value::Null,
             g,
@@ -2607,7 +2629,7 @@ fn data_source_group(app: &mut RustGisApp, ui: &mut Ui) {
         );
         #[cfg(not(target_arch = "wasm32"))]
         if active_layer(app).is_some_and(crate::reloaddata::supported) {
-            big(ui, app, "redo", "Reload\nData", crate::reloaddata::HELP, "ui.reloadData", Value::Null, false, false);
+            big(ui, app, "reload", "Reload\nData", crate::reloaddata::HELP, "ui.reloadData", Value::Null, false, false);
         }
     });
 }
@@ -4999,7 +5021,7 @@ fn drawing_group(app: &mut RustGisApp, ui: &mut Ui, layer: &rustgis_engine::map:
                 small(
                     ui,
                     app,
-                    if hidden { "symbology" } else { "no_fill" },
+                    if hidden { "restore_fill" } else { "no_fill" },
                     if hidden { "Restore Fill" } else { "No Fill" },
                     if hidden {
                         "Restore polygon fills hidden by No Fill, keeping their colors and outlines."

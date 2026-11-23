@@ -726,6 +726,11 @@ pub struct Raster {
     /// `false` for a scan (a TIFF with no GeoTIFF tags, a PNG, a JPEG): `transform` is then only
     /// a stand-in until the picture is placed or georeferenced, and says nothing about the ground.
     pub georeferenced: bool,
+    /// Whether `crs` is WGS 84 assumed for a file that doesn't say its system, its coordinates
+    /// looking like degrees (an ASCII grid without a `.prj`, a GeoTIFF without one), or says only
+    /// that it is in degrees (a GeoTIFF's geographic model with no EPSG code, its datum unread):
+    /// it names no system to give (a project taking its system from the first layer added).
+    pub crs_assumed: bool,
     /// What reading it left out or cut (a colour table, names), one line a kind with a count,
     /// for whoever adds it to the map to say (AGENTS.md, Never silent). Empty when nothing was
     /// left out.
@@ -922,6 +927,7 @@ impl Raster {
             step: 1,
             posts: false,
             georeferenced: true,
+            crs_assumed: false,
             lost: Vec::new(),
             rounded: Vec::new(),
             rounded_some: Vec::new(),
@@ -1049,7 +1055,7 @@ impl Raster {
         if self.georeferenced {
             Ok(())
         } else {
-            Err(format!("{} has no coordinates: georeference it first (raster.georeference)", self.name))
+            Err(format!("{} has no coordinates: georeference it first (raster.georeference, with the Imagery extension on)", self.name))
         }
     }
 
@@ -1261,7 +1267,12 @@ impl Raster {
 
     /// The pixel under a longitude/latitude point.
     pub fn pixel_at(&self, lonlat: Coord) -> Option<(i64, i64)> {
-        let (c, r) = self.transform.to_pixel(self.transformer.from_lonlat(lonlat)?);
+        self.pixel_at_world(self.transformer.from_lonlat(lonlat)?)
+    }
+
+    /// The pixel under a place in the raster's own system.
+    pub fn pixel_at_world(&self, w: Coord) -> Option<(i64, i64)> {
+        let (c, r) = self.transform.to_pixel(w);
         let (c, r) = (self.wrap_col(c).floor(), r.floor());
         (c >= 0.0 && r >= 0.0 && c < self.width as f64 && r < self.height as f64).then_some((c as i64, r as i64))
     }
@@ -1544,6 +1555,7 @@ pub fn read_converted(path: &Path, c: &gdal::Converted) -> Result<Raster> {
     // assumed as if it had been the file's own): said with the raster's other losses, whichever way
     // it is read, as a reload says them again.
     if c.assumed_lonlat {
+        r.crs_assumed = true;
         r.lost.push(format!("{} (give \"crs\" if not)", assumed_wgs84_note("it doesn't say its coordinate system")));
     }
     if !c.others.is_empty() {
@@ -1833,6 +1845,17 @@ pub fn read_bytes_page(file_name: &str, bytes: &[u8], page: Option<&str>, place:
         let _ = (page, place);
         Err(DataError::Unsupported(PDF_ELSEWHERE.into()))
     }
+}
+
+/// Reads an owned upload or embedded raster without copying PDF bytes for the decoder.
+/// Other formats borrow the same buffer, as [`read_bytes_page`] does.
+pub fn read_shared_page(file_name: &str, bytes: std::sync::Arc<Vec<u8>>, page: Option<&str>, place: bool) -> Result<Raster> {
+    #[cfg(feature = "pdf")]
+    if is_pdf_name(file_name) {
+        let name = Path::new(file_name).file_stem().and_then(|s| s.to_str()).unwrap_or("raster");
+        return pdf::read_shared(name, bytes, page, place);
+    }
+    read_bytes_page(file_name, &bytes, page, place)
 }
 
 /// Reads a raster from a file's name and bytes (a browser upload); a PDF's first page.

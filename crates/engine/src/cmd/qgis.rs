@@ -4,7 +4,7 @@
 //! (`rustgis_map::qgis::Report`).
 
 use rustgis_geom::{Coord, Extent};
-use rustgis_map::qgis::{self, NoteKind, Report, Source};
+use rustgis_map::qgis::{self, NoteKind, Report, Source, listed};
 use serde_json::{Value, json};
 
 use super::{need_layer, ps};
@@ -64,12 +64,18 @@ const MARKER_READ_BYTES: usize = if cfg!(test) { 1 << 10 } else { rustgis_map::s
 
 /// The importer's reader of raster image markers' images ([`qgis::ReadImage`]): [`marker_image`]
 /// within [`MARKER_READ_BYTES`] for the import. On the import's thread, as the rest of it is
-/// (`import_project` and `import_style` say why): each read is one file of at most 1.5 MiB, only
-/// a regular file is opened (a pipe or a device would wait for a writer), and the bound caps them
-/// all.
+/// (`import_project` says why; `import_style` reads on a thread of its own in the desktop app,
+/// [`style_ahead`]): each read is one file of at most 1.5 MiB, only a regular file is opened (a
+/// pipe or a device would wait for a writer), and the bound caps them all. Each looks at Cancel.
 fn marker_images() -> impl FnMut(&str) -> Result<(String, f32), &'static str> {
     let mut read = 0;
     move |source| {
+        // Under a Cancel (a style read on a thread of its own, a project imported by a script or model)
+        // a Cancel stops the images here; the import notes each as skipped, so its caller looks at
+        // Cancel again once the parse is done and gives the cancelled error. With none, nothing is asked.
+        if rustgis_data::progress::check().is_err() {
+            return Err("cancelled");
+        }
         if read >= MARKER_READ_BYTES {
             return Err("past the bytes of images an import reads");
         }
@@ -81,22 +87,23 @@ fn marker_images() -> impl FnMut(&str) -> Result<(String, f32), &'static str> {
 /// within what a picture marker keeps (`symbology::MAX_PICTURE_BYTES` of base64, 2 MiB), checked
 /// as `layer.marker` checks an image; with its height over its width. Its base64's length is added
 /// to `read`, or for a file that doesn't read (past the limit, or failing part way) what was read
-/// of it, so the import's bound overshoots by one file at most. Checking it decodes it, at most
-/// 20,000 pixels a side within 512 MiB, as `layer.marker` does.
+/// of it, so the import's bound overshoots by one file at most. Checking it decodes it, within
+/// `render::MARKER_PIXELS` and what the run has left of `render::RUN_MARKER_PIXELS`, as
+/// `layer.marker` does.
 fn marker_image(source: &str, read: &mut usize) -> Result<(String, f32), &'static str> {
     use base64::Engine;
-    use rustgis_map::symbology::MAX_PICTURE_BYTES;
+    use rustgis_map::symbology::MAX_PICTURE_BYTES as MARKER_PICTURE_BYTES;
     const TOO_LARGE: &str = "whose image is past 2 MiB of base64";
-    const NOT_AN_IMAGE: &str = "whose image isn't a PNG or JPEG RustGIS reads";
+    const NOT_AN_IMAGE: &str = rustgis_render::MarkerRefusal::NotAnImage.whose();
     let b64 = match source.strip_prefix("base64:") {
         // Past the limit, refused before it is copied, and charged as a file past it is.
-        Some(b64) if b64.trim().len() > MAX_PICTURE_BYTES => {
-            *read += MAX_PICTURE_BYTES;
+        Some(b64) if b64.trim().len() > MARKER_PICTURE_BYTES => {
+            *read += MARKER_PICTURE_BYTES;
             return Err(TOO_LARGE);
         }
         Some(b64) => b64.trim().to_string(),
         // Base64 is 4 characters for 3 bytes.
-        None => match super::graphics::read_picture_file(source, MAX_PICTURE_BYTES / 4 * 3) {
+        None => match super::graphics::read_picture_file(source, MARKER_PICTURE_BYTES / 4 * 3) {
             Ok(bytes) if bytes.is_empty() => return Err(NOT_AN_IMAGE),
             Ok(bytes) => base64::engine::general_purpose::STANDARD.encode(bytes),
             Err(e) => {
@@ -116,18 +123,12 @@ fn marker_image(source: &str, read: &mut usize) -> Result<(String, f32), &'stati
     if b64.is_empty() {
         return Err("with no image");
     }
-    if b64.len() > MAX_PICTURE_BYTES {
+    if b64.len() > MARKER_PICTURE_BYTES {
         return Err(TOO_LARGE);
     }
-    // As `layer.marker` checks one: one kept already decodes into the drawing's cache.
-    let readable = match rustgis_map::Picture::kept(&b64) {
-        Some(kept) => rustgis_render::picture_marker_draws(kept),
-        None => rustgis_render::picture_marker_readable(&b64),
-    };
-    match rustgis_render::picture_size(&b64) {
-        Some((w, h)) if readable && w > 0 && h > 0 => Ok((b64, h as f32 / w as f32)),
-        _ => Err(NOT_AN_IMAGE),
-    }
+    // As `layer.marker` checks one, decoded once for the run, where drawing it finds it.
+    let aspect = rustgis_render::picture_marker_check(&b64).map_err(rustgis_render::MarkerRefusal::whose)?;
+    Ok((b64, aspect))
 }
 
 /// The most bytes of a QGIS file read (a `.qgz` can carry data files beside its project).
@@ -165,6 +166,9 @@ fn import_project(s: &mut Session, p: &Value) -> CmdResult {
     let dir = ps(p, "dir").filter(|d| !d.trim().is_empty()).map(str::to_string).or_else(|| file_dir(p));
     let mut report = Report::default();
     let project = qgis::read_project(&text, dir.as_deref().unwrap_or_default(), &mut marker_images(), &mut report)?;
+    // A script or model runs this under its Cancel: one that came during the images was noted as a
+    // skipped image, and no layer is added for a cancelled run.
+    rustgis_data::progress::check().map_err(|e| e.to_string())?;
     // A map of its own, named as the project.
     let name = if project.title.is_empty() { "QGIS project" } else { project.title.as_str() };
     s.run_part("map.new", &json!({"name": name}))?;
@@ -1689,13 +1693,6 @@ fn add_relations(s: &mut Session, project: &qgis::Project, came_in: &[CameIn], r
             destination_key,
         });
     }
-    let listed = |names: &[&str]| {
-        let mut text = names.iter().take(8).copied().collect::<Vec<_>>().join(", ");
-        if names.len() > 8 {
-            text.push_str(", …");
-        }
-        format!("{}: {text}", names.len())
-    };
     if !missing.is_empty() {
         report.skipped("", format!("its relations between layers that didn't come in or haven't the fields ({})", listed(&missing)));
     }
@@ -1864,13 +1861,6 @@ fn add_bookmarks(s: &mut Session, project: &qgis::Project, report: &mut Report) 
         m.bookmarks.push(rustgis_map::Bookmark::new(name, m.camera));
     }
     m.camera = view;
-    let listed = |names: &[&str]| {
-        let mut text = names.iter().take(8).copied().collect::<Vec<_>>().join(", ");
-        if names.len() > 8 {
-            text.push_str(", …");
-        }
-        format!("{}: {text}", names.len())
-    };
     if !none.is_empty() {
         report.skipped("", format!("its bookmarks with no coordinate system, in a project without one ({})", listed(&none)));
     }
@@ -2010,20 +2000,60 @@ fn notify_report(s: &mut Session, report: &Report) {
     }
 }
 
-/// Imports a QGIS style onto a layer. On the thread that runs it: the style import isn't among
-/// the commands whose reads the app makes on a thread first ([`super::reads`]), as it wasn't
-/// before it read marker images. Reading the style and its images there, with Cancel, is its own
-/// change. Its work is bounded by the style: one file of at most [`MAX_FILE`] bytes, its XML
+/// A QGIS style file read and parsed: the style and what it couldn't carry over.
+type StyleRead = Result<(qgis::Style, Report), String>;
+
+/// Reads and parses the style file `p` names (or gives) for the layer called `layer`: its raster
+/// image markers' relative files start from the style file's folder.
+fn read_style_file(p: &Value, layer: &str) -> StyleRead {
+    let text = qgis_text(p)?;
+    rustgis_data::progress::check().map_err(|e| e.to_string())?;
+    let mut report = Report::default();
+    let style = qgis::read_style(&text, layer, &file_dir(p).unwrap_or_default(), &mut marker_images(), &mut report)?;
+    // A Cancel that came during the images was noted as a skipped image: the read is cancelled.
+    rustgis_data::progress::check().map_err(|e| e.to_string())?;
+    Ok((style, report))
+}
+
+/// A style read ahead: for the layer it was read for, as it was called then.
+struct StyleAhead {
+    layer: String,
+    read: StyleRead,
+}
+
+/// The key a style read ahead is taken by (see [`super::reads`]).
+fn ahead_key(id: u32) -> String {
+    format!("style.importQgis:{id}")
+}
+
+/// The read `style.importQgis` makes before it runs in the desktop app: on a thread of its own, with
+/// Cancel. A request that is wrong gives nothing, or its error: the command says why. It holds a
+/// copy of the command's own `text` or `data` (at most [`MAX_XML`] bytes or their base64) while it
+/// reads, none of the layer's.
+pub(crate) fn style_ahead(s: &Session, p: &Value) -> Option<super::reads::ReadWork> {
+    let id = s.layer_id(p).ok()?;
+    let layer = s.map().layer(id)?.name.clone();
+    let p = p.clone();
+    Some(super::reads::ahead("Import QGIS Style", ahead_key(id), move || StyleAhead { read: read_style_file(&p, &layer), layer }))
+}
+
+/// Imports a QGIS style onto a layer. Its reads are made before it runs where the app can make
+/// them on a thread of its own ([`super::reads`]: the desktop app, with Cancel, no progress count;
+/// the style is applied only when they are done, so a cancelled import leaves the layer as it was);
+/// run anywhere else (the command line, a script, the browser) it reads here, on the thread that
+/// runs it. Its work is bounded by the style: one file of at most [`MAX_FILE`] bytes, its XML
 /// parsed within [`MAX_XML`], and its raster image markers' images within [`MARKER_READ_BYTES`],
 /// each file read once and decoded once to check it (see [`marker_images`] and [`marker_image`]).
+/// Cancel is looked at before each image: the file's one read and the XML's one parse don't.
 fn import_style(s: &mut Session, p: &Value) -> CmdResult {
-    let text = qgis_text(p)?;
     let id = s.layer_id(p)?;
     let name = s.map().layer(id).map(|l| l.name.clone()).ok_or("no such layer")?;
-    let mut report = Report::default();
-    // Its raster image markers' relative files start from the style file's folder.
-    let dir = file_dir(p).unwrap_or_default();
-    let style = qgis::read_style(&text, &name, &dir, &mut marker_images(), &mut report)?;
+    // The name is the only layer input `read_style` uses, so a style read for another name is read again by the user.
+    let (style, mut report) = match super::reads::take::<StyleAhead>(s, &ahead_key(id)) {
+        Some(a) if a.layer == name => a.read?,
+        Some(_) => return Err("the layer was renamed while its style was read: import it again".into()),
+        None => read_style_file(p, &name)?,
+    };
     let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
     if l.raster.is_some() {
         // A style that doesn't fit leaves the raster as it was, its opacity and scale range too.

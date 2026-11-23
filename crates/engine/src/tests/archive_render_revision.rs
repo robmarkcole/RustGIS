@@ -1,3 +1,4 @@
+#![expect(clippy::disallowed_methods, reason = "a thread the system refuses fails the test, as it should")]
 use crate::{data, map, render};
 use data::source::{Batch, FeatureSource, Request, SourceInfo};
 use data::{Dataset, Feature, Geometry, GeometryType};
@@ -113,7 +114,7 @@ fn paused_map(path: &std::path::Path, kind: TileKind) -> (Map, render::View, mps
         count: Some(1),
         crs: "EPSG:4326".into(),
         indexed: true,
-        notes: Vec::new(),
+        notes: Default::default(),
         zm_dropped: false,
     };
     let id = map.add_dataset(ds.clone());

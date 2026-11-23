@@ -1,4 +1,5 @@
 //! Committed files and their losses remain visible after a workflow rolls its project back.
+#![expect(clippy::disallowed_methods, reason = "a thread the system refuses fails the test, as it should")]
 
 use rustgis_data::{Dataset, Field, FieldType, Geometry, GeometryType, Value as Cell};
 use serde_json::{Value, json};
@@ -351,7 +352,7 @@ fn write_notices_keep_the_ordinary_queue_bounded_and_marks_consistent() {
             s.notify("rolled-back edit", false);
             s.guarded("Inner", true, |s| {
                 for i in 0..250 {
-                    s.notify_written(format!("committed {i}"), false);
+                    s.notify_written(format!("committed {i}"));
                 }
                 Err("inner failed".into())
             })?;

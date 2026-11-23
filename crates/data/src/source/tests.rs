@@ -395,8 +395,9 @@ fn geopackage_provenance_excludes_temporary_copies() {
     write_gpkg(&path, true);
     let captured = crate::provenance::Capture::start();
     let bytes = crate::provenance::read(&path).unwrap();
-    assert!(gpkg::unsupported_table_counts_bytes(&bytes).unwrap().is_empty());
-    let source = open_bytes("upload.gpkg", bytes, None).unwrap();
+    let upload = gpkg::GpkgUpload::new(&bytes).unwrap();
+    assert!(upload.unsupported_table_counts().unwrap().is_empty());
+    let source = upload.open(None).unwrap();
     assert!(!source.read(&Request { extent: None, limit: 1 }).unwrap().features.is_empty());
     assert_eq!(captured.inputs().len(), 1);
     assert_eq!(captured.inputs()[0].path, path.display().to_string());
@@ -465,6 +466,47 @@ fn geopackage_provenance_keeps_a_linked_path() {
     let paths = inputs(&alias);
     assert!(paths.contains(&alias.display().to_string()), "{paths:?}");
     assert!(paths.contains(&format!("{}-wal", resolved.display())), "{paths:?}");
+}
+
+/// A retained conversion read after its original changed names the original as it was when the
+/// conversion was opened, not as it is now; a DuckDB database's write-ahead log with it (#2639).
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_conversion_names_its_original_as_it_was_when_opened() {
+    use crate::provenance::{Capture, Fingerprint};
+    let folder = tempfile::tempdir().unwrap();
+    let original = folder.path().join("drawing.dwg");
+    std::fs::write(&original, b"first").unwrap();
+    let converted = folder.path().join("cache.fgb");
+    write_fgb(&converted);
+    let source = super::fgb::FgbSource::open_converted_path(&converted, "grid", &original, None).unwrap();
+    let inputs = || {
+        let captured = Capture::start();
+        assert!(!source.read(&Request { extent: None, limit: 1 }).unwrap().features.is_empty());
+        captured.inputs()
+    };
+    let before = inputs();
+    assert!(before.len() == 1 && before[0].size == Some(5) && before[0].path == original.display().to_string(), "{before:?}");
+    std::fs::write(&original, b"changed since").unwrap();
+    assert_eq!(inputs(), before, "the conversion holds the original as it was");
+    // GeoParquet from a DuckDB database: the database and its log as they were.
+    let db = folder.path().join("places.duckdb");
+    std::fs::write(&db, b"db").unwrap();
+    std::fs::write(folder.path().join("places.duckdb.wal"), b"wal").unwrap();
+    let parquet = folder.path().join("cache.parquet");
+    write_parquet(&parquet, true);
+    let source = super::parquet::ParquetSource::open_converted_path(&parquet, "grid", Some(&db), None).unwrap();
+    let inputs = || {
+        let captured = Capture::start();
+        assert!(!source.read(&Request { extent: None, limit: 1 }).unwrap().features.is_empty());
+        captured.inputs()
+    };
+    let before: Vec<Fingerprint> = inputs();
+    assert_eq!(before.len(), 2, "{before:?}");
+    assert!(before.iter().any(|i| i.path.ends_with("places.duckdb.wal") && i.size == Some(3)), "{before:?}");
+    assert!(!before.iter().any(|i| i.path.ends_with("cache.parquet")), "{before:?}");
+    std::fs::write(folder.path().join("places.duckdb.wal"), b"more changes").unwrap();
+    assert_eq!(inputs(), before);
 }
 
 /// 30 × 20 points over the world, named and numbered.
@@ -554,7 +596,7 @@ fn write_fgb(path: &Path) {
 }
 
 /// A GeoPackage of the points in Web Mercator, with an R-tree index (or without).
-fn write_gpkg(path: &Path, rtree: bool) {
+pub(super) fn write_gpkg(path: &Path, rtree: bool) {
     let _ = std::fs::remove_file(path);
     let c = rusqlite::Connection::open(path).unwrap();
     c.execute_batch(
@@ -692,7 +734,7 @@ fn materialize_refuses_oversized_and_incomplete_sources() {
             count: Some(MAX_LIMIT as u64 + 1),
             crs: "EPSG:4326".into(),
             indexed: false,
-            notes: vec![],
+            notes: Default::default(),
             zm_dropped: false,
         },
         batch: None,
@@ -769,7 +811,7 @@ fn geoparquet_planetary_systems_are_said_or_refused() {
     let p = d.join("mars.parquet");
     write_parquet_typed(&p, false, &mars("GeographicCRS", 49900, "east"));
     let src = open_path(&p, None).unwrap();
-    assert_eq!(src.info().notes.iter().filter(|m| body(m)).count(), 1, "{:?}", src.info().notes);
+    assert_eq!(src.info().notes.iter().filter(|m| body(&m.text)).count(), 1, "{:?}", src.info().notes);
     assert!(!src.info().notes.iter().any(|m| m.contains("no EPSG code")), "{:?}", src.info().notes);
     let (ds, _) = materialize(src.as_ref()).unwrap();
     assert_eq!(
@@ -799,7 +841,7 @@ fn geoparquet_planetary_systems_are_said_or_refused() {
     // Earth one.
     write_parquet_typed(&p, false, &no_id(mars("GeographicCRS", 49900, "east")));
     let notes = open_path(&p, None).unwrap().info().notes.clone();
-    let said: Vec<&String> = notes.iter().filter(|m| body(m)).collect();
+    let said: Vec<&crate::loss::Note> = notes.iter().filter(|m| body(&m.text)).collect();
     assert_eq!(said.len(), 1, "{notes:?}");
     assert!(said[0].contains("as only its ellipsoid says") && !said[0].contains("code"), "{said:?}");
     write_parquet_typed(&p, false, r#"["Point"],"crs":{"type":"GeographicCRS","name":"WGS 84","id":{"authority":"EPSG","code":4326}}"#);
@@ -846,7 +888,7 @@ fn geoparquet_planetary_systems_are_said_or_refused() {
         ] {
             write_parquet_typed(&p, false, &axes(kind, id, &cs));
             let src = open_path(&p, None).unwrap_or_else(|e| panic!("{kind} {cs} {id}: {e}"));
-            assert_eq!(src.info().notes.iter().filter(|m| body(m)).count(), 1, "{kind} {cs} {id}: {:?}", src.info().notes);
+            assert_eq!(src.info().notes.iter().filter(|m| body(&m.text)).count(), 1, "{kind} {cs} {id}: {:?}", src.info().notes);
             let (ds, _) = materialize(src.as_ref()).unwrap();
             assert_eq!(ds.features.len(), points().len());
         }
@@ -855,7 +897,7 @@ fn geoparquet_planetary_systems_are_said_or_refused() {
     for cs in [lonlat(r#""radian""#, r#""radian""#), xyz.to_string()] {
         write_parquet_typed(&p, false, &axes("GeographicCRS", "", &cs).replace("3396190", "6378137"));
         let notes = open_path(&p, None).unwrap().info().notes.clone();
-        assert!(!notes.iter().any(body), "{notes:?}");
+        assert!(!notes.iter().any(|m| body(&m.text)), "{notes:?}");
     }
 }
 
@@ -1156,7 +1198,10 @@ fn custom_srs_reads(path: &Path) -> Vec<(Option<Geometry>, Vec<String>)> {
         .into_iter()
         .map(|src| {
             let batch = src.read(&Request::all()).unwrap();
-            (lonlat_of(src, batch.features.first().and_then(|f| f.geometry.clone())), src.info().notes.clone())
+            (
+                lonlat_of(src, batch.features.first().and_then(|f| f.geometry.clone())),
+                src.info().notes.texts().map(str::to_string).collect(),
+            )
         })
         .collect()
 }
@@ -1379,7 +1424,10 @@ fn fgb_reads(path: &Path) -> Vec<(Option<Geometry>, Vec<String>)> {
         .into_iter()
         .map(|src| {
             let batch = src.read(&Request::all()).unwrap();
-            (lonlat_of(src.as_ref(), batch.features.first().and_then(|f| f.geometry.clone())), src.info().notes.clone())
+            (
+                lonlat_of(src.as_ref(), batch.features.first().and_then(|f| f.geometry.clone())),
+                src.info().notes.texts().map(str::to_string).collect(),
+            )
         })
         .collect()
 }
@@ -2629,7 +2677,7 @@ fn geojson_in_place_rejects_partial_collections_with_a_notice() {
         let (ds, streamed_report) = materialize(&src).unwrap();
         assert_eq!(ds.features, whole.features);
         assert_eq!(streamed_report.skipped, report.skipped);
-        assert_eq!(streamed_report.messages, report.messages.iter().map(|m| format!("x: {m}")).collect::<Vec<_>>());
+        assert_eq!(streamed_report.messages, report.messages.clone().prefixed("x"));
     }
     std::fs::remove_file(p).unwrap();
 }
@@ -2711,7 +2759,7 @@ fn geojson_paths(file: &str, text: &str) -> (Dataset, Vec<String>, String) {
         assert_eq!(inplace.crs_incomplete, whole.crs_incomplete, "{file}");
         assert_eq!(inplace.geometry_type, whole.geometry_type, "{file}");
         assert_eq!(report.skipped, in_report.skipped, "{file}");
-        let strip = |m: &Vec<String>| m.iter().map(|m| m.trim_start_matches("x: ").to_string()).collect::<Vec<_>>();
+        let strip = |m: &crate::loss::Notes| m.iter().map(|m| m.text.trim_start_matches("x: ").to_string()).collect::<Vec<_>>();
         assert_eq!(strip(&report.messages), strip(&in_report.messages), "{file}");
         // The extent a source says is that of the features it reads (those that convert).
         assert_eq!(src.info().extent, whole.lonlat_extent(), "{file}");
@@ -2722,7 +2770,7 @@ fn geojson_paths(file: &str, text: &str) -> (Dataset, Vec<String>, String) {
     let src = geojson::GeoJsonSource::open_with(&p, "x", crate::io::BYTES_FLOOR).unwrap();
     // In longitude/latitude, for the tests to say where its features are: it holds them in its
     // declared system, as the file does.
-    (whole.in_lonlat().unwrap().into_owned(), report.messages, src.info().crs.clone())
+    (whole.in_lonlat().unwrap().into_owned(), report.messages.texts().map(str::to_string).collect(), src.info().crs.clone())
 }
 
 fn in_arnhem(e: &Extent) -> bool {
@@ -3084,6 +3132,147 @@ fn exports_are_written_in_the_system_the_layer_was_read_in() {
     assert!(crate::io::write_path_in(&ds, &d.join("squares.geojson"), Crs::from_epsg(25832).unwrap()).is_err());
 }
 
+#[test]
+fn a_geoparquet_export_keeps_a_system_with_an_epsg_code() {
+    let d = dir().join("export-parquet-crs");
+    std::fs::create_dir_all(&d).unwrap();
+    let ds = utm_squares(25832);
+    let utm = Crs::from_epsg(25832).unwrap();
+    for ext in ["parquet", "geoparquet"] {
+        assert_eq!(crate::io::default_export_crs(&ds, ext), utm, "{ext}");
+        assert_eq!(crate::io::default_export_note(&ds, &format!("a.{ext}")), None, "{ext}");
+        let p = d.join(format!("utm.{ext}"));
+        crate::io::write_path_in(&ds, &p, utm).unwrap();
+        // Read back in the same system, at the same coordinates, by its EPSG code.
+        let (back, _) = materialize(open_path(&p, None).unwrap().as_ref()).unwrap();
+        assert_eq!(back.crs, Some(utm), "{ext}");
+        assert_eq!(back.coord_crs(), utm, "{ext}");
+        let coords = |ds: &Dataset| {
+            let mut v = Vec::new();
+            for f in &ds.features {
+                f.geometry.as_ref().unwrap().for_each_coord(|c| v.push((c.x, c.y)));
+            }
+            v
+        };
+        assert_eq!(coords(&back), coords(&ds), "{ext}");
+        // The written bytes are the whole-file and the in-memory writer alike.
+        let (bytes, _) = crate::io::write_bytes_in(&ds, ext, utm).unwrap();
+        let (mem, _) = crate::io::read_bytes(&format!("m.{ext}"), &bytes).unwrap();
+        assert_eq!(mem.crs, Some(utm), "{ext}");
+    }
+    // Longitude/latitude writes the file as before: no `crs` on the geometry column.
+    let lonlat = crate::io::project(&ds, Crs::LonLat).unwrap();
+    let mut plain = lonlat.clone();
+    plain.crs = None;
+    let (a, _) = crate::io::write_bytes_in(&plain, "parquet", Crs::LonLat).unwrap();
+    assert_eq!(a, crate::source::parquet::write(&plain).unwrap());
+    let geo = |bytes: &[u8]| {
+        use ::parquet::file::reader::FileReader;
+        let r = ::parquet::file::reader::SerializedFileReader::new(bytes::Bytes::copy_from_slice(bytes)).unwrap();
+        let kv = r.metadata().file_metadata().key_value_metadata().unwrap().clone();
+        let geo = kv.into_iter().find(|k| k.key == "geo").unwrap().value.unwrap();
+        serde_json::from_str::<serde_json::Value>(&geo).unwrap()
+    };
+    assert!(geo(&a)["columns"]["geometry"].get("crs").is_none());
+    let (b, _) = crate::io::write_bytes_in(&ds, "parquet", utm).unwrap();
+    assert_eq!(geo(&b)["columns"]["geometry"]["crs"]["id"]["code"], 25832);
+    // A system without an EPSG code: written in WGS 84 by default (said), refused when asked for.
+    let wkt =
+        crate::raster::wkt::to_wkt(utm).unwrap().replace(",AUTHORITY[\"EPSG\",\"25832\"]", "").replace("ETRS89 / UTM zone 32N", "My grid");
+    let custom = crate::raster::wkt::crs_from_wkt(&wkt).unwrap();
+    let mut own = ds.clone();
+    own.crs = Some(custom);
+    assert_eq!(crate::io::default_export_crs(&own, "parquet"), Crs::LonLat);
+    let note = crate::io::default_export_note(&own, "a.parquet").unwrap();
+    assert!(note.contains("has no EPSG code,") && note.contains("WGS 84"), "{note}");
+    let e = crate::io::write_path_in(&own, &d.join("custom.parquet"), custom).unwrap_err().to_string();
+    assert!(e.contains("no EPSG code"), "{e}");
+}
+
+#[test]
+fn a_csv_export_takes_x_and_y_in_a_system_asked_for() {
+    use crate::{Field, FieldType, Value};
+    let d = dir().join("export-csv-crs");
+    std::fs::create_dir_all(&d).unwrap();
+    let lv95 = Crs::from_epsg(2056).unwrap();
+    let mut ds = Dataset::new("pts", GeometryType::Point, vec![Field::new("name", FieldType::Text)]);
+    ds.push(Some(Geometry::Point(Coord::new(2_600_000.5, 1_200_000.25))), vec![Value::Text("Bern".into())]);
+    ds.crs = Some(lv95);
+    ds.held_in = lv95;
+    // By default it stays longitude/latitude, as before.
+    assert_eq!(crate::io::default_export_crs(&ds, "csv"), Crs::LonLat);
+    assert!(crate::io::holds_a_system("CSV") && !crate::io::holds_a_system("geojson"));
+    let lonlat = String::from_utf8(crate::io::write_bytes(&ds, "csv").unwrap().0).unwrap();
+    assert!(lonlat.starts_with("longitude,latitude,name\n7.43"), "{lonlat}");
+    assert_eq!(crate::io::csv_system_note("a.csv", ds.geometry_type, Crs::LonLat), None);
+    // Asked for, its own coordinates go in x and y, exactly.
+    let p = d.join("pts.csv");
+    crate::io::write_path_in(&ds, &p, lv95).unwrap();
+    let text = std::fs::read_to_string(&p).unwrap();
+    assert_eq!(text, "x,y,name\n2600000.5,1200000.25,Bern\n");
+    let (bytes, _) = crate::io::write_bytes_in(&ds, "csv", lv95).unwrap();
+    assert_eq!(String::from_utf8(bytes).unwrap(), text);
+    // Read back with the system given, at the same place.
+    let opts = crate::io::CsvOptions { crs: Some(lv95), ..Default::default() };
+    let (back, _) = crate::io::read_csv_with(&text, "pts", &opts).unwrap();
+    let mut at = Vec::new();
+    back.features[0].geometry.as_ref().unwrap().for_each_coord(|c| at.push((c.x, c.y)));
+    let mut want = Vec::new();
+    ds.features[0].geometry.as_ref().unwrap().for_each_coord(|c| want.push((c.x, c.y)));
+    let back_lonlat = crate::io::project(&back, Crs::LonLat).unwrap();
+    let ds_lonlat = crate::io::project(&ds, Crs::LonLat).unwrap();
+    let pt = |ds: &Dataset| match ds.features[0].geometry {
+        Some(Geometry::Point(c)) => c,
+        _ => panic!(),
+    };
+    assert!((pt(&back_lonlat).x - pt(&ds_lonlat).x).abs() < 1e-9 && (pt(&back_lonlat).y - pt(&ds_lonlat).y).abs() < 1e-9);
+    // The file can't say its system, so that is said.
+    let note = crate::io::csv_system_note("pts.csv", ds.geometry_type, lv95).unwrap();
+    assert!(note.contains("EPSG:2056") && note.contains("can't say"), "{note}");
+    assert_eq!(crate::io::csv_system_note("pts.gpkg", ds.geometry_type, lv95), None);
+    // Fields named x and y push the columns to easting and northing; every name taken is said.
+    let mut xy = Dataset::new("xy", GeometryType::Point, vec![Field::new("X", FieldType::Integer), Field::new("y", FieldType::Integer)]);
+    xy.push(Some(Geometry::Point(Coord::new(2_600_000.0, 1_200_000.0))), vec![Value::Int(1), Value::Int(2)]);
+    xy.crs = Some(lv95);
+    xy.held_in = lv95;
+    let text = crate::io::to_csv_in(&xy, lv95).unwrap();
+    assert!(text.starts_with("easting,northing,X,y\n"), "{text}");
+    assert!(crate::io::export_losses_notes_in(&xy, "csv", None, "xy.csv", lv95).unwrap().is_empty());
+    let mut every = xy.clone();
+    every.fields.push(Field::new("easting", FieldType::Integer));
+    every.fields.push(Field::new("northing", FieldType::Integer));
+    for f in &mut every.features {
+        f.attrs.extend([Value::Int(3), Value::Int(4)]);
+    }
+    assert!(crate::io::to_csv_in(&every, lv95).unwrap().starts_with("x_1,y_1,"));
+    let notes = crate::io::export_losses_notes_in(&every, "csv", None, "xy.csv", lv95).unwrap();
+    assert!(notes.iter().any(|n| n.contains("'x', 'easting', 'y' and 'northing'") && n.contains("'x_1' and 'y_1'")), "{notes:?}");
+    // Each axis on its own: 'x' and 'easting' taken move only the x column, and only those two
+    // names are said.
+    let mut one =
+        Dataset::new("one", GeometryType::Point, vec![Field::new("x", FieldType::Integer), Field::new("easting", FieldType::Integer)]);
+    one.push(Some(Geometry::Point(Coord::new(2_600_000.0, 1_200_000.0))), vec![Value::Int(1), Value::Int(2)]);
+    one.crs = Some(lv95);
+    one.held_in = lv95;
+    assert!(crate::io::to_csv_in(&one, lv95).unwrap().starts_with("x_1,y,x,easting\n"));
+    let notes = crate::io::export_losses_notes_in(&one, "csv", None, "one.csv", lv95).unwrap();
+    assert!(
+        notes.iter().any(|n| n.contains("the names 'x' and 'easting', so") && n.contains("'x_1' and 'y'") && !n.contains("northing")),
+        "{notes:?}"
+    );
+    // Into a geographic system other than WGS 84: longitude and latitude columns, and no note
+    // of unusable positions, which are counted on the coordinates written.
+    // Fields named x and y are a pair reading could take instead, which a note names when rows
+    // lack a usable longitude/latitude: counted on LV95's metres, every row would.
+    let etrs89 = Crs::from_epsg(4258).unwrap();
+    let (bytes, _) = crate::io::write_bytes_in(&ds, "csv", etrs89).unwrap();
+    assert!(String::from_utf8(bytes).unwrap().starts_with("longitude,latitude,name\n7.43"));
+    assert!(crate::io::export_losses_notes_in(&ds, "csv", None, "pts.csv", etrs89).unwrap().is_empty());
+    assert_eq!(xy.coord_crs(), lv95);
+    let notes = crate::io::export_losses_notes_in(&xy, "csv", None, "xy.csv", etrs89).unwrap();
+    assert!(notes.is_empty(), "{notes:?}");
+}
+
 /// A catalog index as AlphaEarth's is (a `bbox` struct, a nested `assets.data.href`), and patch
 /// embeddings as Earth Index's are (a fixed-size list of floats a point), in row groups of 50.
 fn write_index_and_vectors() -> Vec<u8> {
@@ -3423,7 +3612,7 @@ fn geopackage_flatgeobuf_and_geoparquet_visit_what_a_whole_read_gives() {
 #[test]
 fn declared_z_and_m_are_said_and_counted() {
     let d = tempfile::tempdir().unwrap();
-    let says = |info: &SourceInfo| info.zm_dropped && info.notes.contains(&crate::zm_note(Some(600)));
+    let says = |info: &SourceInfo| info.zm_dropped && info.notes.says(&crate::zm_note(Some(600)));
     let quiet = |info: &SourceInfo| !info.zm_dropped && !info.notes.iter().any(|n| n.contains("Z or M"));
 
     let gpkg = d.path().join("grid.gpkg");
@@ -3436,7 +3625,7 @@ fn declared_z_and_m_are_said_and_counted() {
     assert!(says(&info), "{:?}", info.notes);
     // The web reader doesn't scan for the count, and says so without one.
     let info = mem(&gpkg).info().clone();
-    assert!(info.zm_dropped && info.notes.contains(&crate::zm_note(None)), "{:?}", info.notes);
+    assert!(info.zm_dropped && info.notes.says(&crate::zm_note(None)), "{:?}", info.notes);
 
     let parquet = d.path().join("grid.parquet");
     write_parquet_typed(&parquet, false, r#"["Point"]"#);
@@ -3447,7 +3636,7 @@ fn declared_z_and_m_are_said_and_counted() {
     // Some types with Z, some without: said, without a count.
     write_parquet_typed(&parquet, false, r#"["Point", "Point Z"]"#);
     let info = open_path(&parquet, None).unwrap().info().clone();
-    assert!(info.zm_dropped && info.notes.contains(&crate::zm_note(None)), "{:?}", info.notes);
+    assert!(info.zm_dropped && info.notes.says(&crate::zm_note(None)), "{:?}", info.notes);
 }
 
 /// A GeoParquet whose columns RustGIS has no field type for (a decimal too wide for a 64-bit
@@ -3683,10 +3872,7 @@ fn geopackage_dates_are_written_and_read_as_dates() {
         // The moment is kept, at UTC.
         let utc = vec![day("2026-03-05"), at("2026-03-05T12:30:00Z")];
         assert_eq!(read, [utc, rows[1].to_vec(), null.clone(), null.clone(), null.clone(), vec![day("2026-01-01"), Value::Null]]);
-        assert!(
-            report.messages.contains(&"permits: 2 values aren't dates and were read as empty, in 'issued', 'seen'".to_string()),
-            "{report:?}"
-        );
+        assert!(report.messages.says("permits: 2 values aren't dates and were read as empty, in 'issued', 'seen'"), "{report:?}");
     }
     // The export says the text it wrote in a date field that isn't a date, and a date-time with a
     // time in one, which reads back empty too.
@@ -3747,7 +3933,7 @@ fn geopackage_export_adds_and_replaces_tables_and_keeps_the_others() {
     }
     let to = |mode, name: Option<&str>| GpkgTable { mode, name: name.map(String::from) };
     let written = write_path_to(&permits, &path, Crs::LonLat, &to(GpkgMode::AddTable, None)).unwrap();
-    assert_eq!(written, (0, Some(GpkgWritten { table: "permits".into(), replaced: false, dependents: vec![] })));
+    assert_eq!(written, (0, Some(GpkgWritten { table: "permits".into(), replaced: false, dependents: vec![] }), Vec::new()));
     rusqlite::Connection::open(&path).unwrap().execute_batch("INSERT INTO gpkg_ogr_contents VALUES ('permits', 3)").unwrap();
     assert_eq!(gpkg_tables(&path), ["owners", "parcels", "permits"]);
     // The file's own trigger on its contents didn't run.
@@ -4051,7 +4237,14 @@ fn native_file_dates_preserve_zone_policy_and_fractional_seconds() {
     let path = temp.path().join("stream.parquet");
     let summary = crate::export::write_source_in(source.as_ref(), &ds, &path, Crs::LonLat).unwrap();
     assert_eq!(summary.written, 2);
-    assert_eq!(summary.date_messages.len(), 2);
+    // Without a label of their own: the export adds its path once.
+    assert_eq!(
+        summary.date_messages,
+        [
+            "2 date-times were written in UTC without their original offsets, in 'instant'",
+            "2 date-times were written as ISO text because their column mixes zoned and unzoned values, in 'mixed'"
+        ]
+    );
     let (streamed, _) = crate::io::read_path(&path).unwrap();
     assert_eq!(streamed.fields, back.fields);
     ds.features[0].attrs[0] = Value::Text("2026-02-30".into());

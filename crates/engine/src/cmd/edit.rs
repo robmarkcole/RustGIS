@@ -18,7 +18,7 @@ pub fn commands() -> Vec<C> {
             .roles(&[crate::ParamRole {key:"frame",role:crate::Role::Opaque}]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).view()
             .when(crate::cmd::design::need_editable).params(r#"{"layer"?:name|id,"row":number,"featureId"?:number,"kind":"circle|rotatedBox","request"?:number (preview correlation only),"image"?:GeoTIFF layer name|id,"frame"?:construction grid as edit.addBox.box.frame (otherwise Web Mercator)}"#),
         C::new("edit.applyShapeConversion", "Apply Shape Conversion", "Edit › Features", crate::shape_conversion::apply).inputs(crate::shape_conversion::apply_inputs)
-            .roles(&[crate::ParamRole {key:"preview",role:crate::Role::Opaque}]).effects(crate::policy::Effects::NONE)
+            .roles(&[crate::ParamRole {key:"preview",role:crate::Role::Opaque}]).effects(crate::policy::Effects::NONE).atomic()
             .when(crate::shape_conversion::need_editing).params(r#"{"preview":result of edit.previewShapeConversion,"confirm":true}"#),
         C::new("edit.calculateGeometry", "Calculate Geometry", "Attribute Table", crate::geometry_calc::run).roles(&[]).effects(crate::policy::Effects::NONE)
             .when(super::design::need_editable)
@@ -29,7 +29,7 @@ pub fn commands() -> Vec<C> {
         C::new("edit.delete", "Delete", "Edit › Features", delete).roles(&[]).effects(crate::policy::Effects::NONE).key("Delete").when(super::design::need_editable_selection),
         C::new("edit.setValue", "Edit Attribute", "Attribute Table", set_value).roles(&[]).effects(crate::policy::Effects::NONE)
             .when(super::design::need_editable_or_table)
-            .params(r#"{"layer"?, "table"?: name|id (a standalone table, instead of a layer), "row": number, "field": string, "value": any}"#),
+            .params(r#"{"layer"?, "table"?: name|id (a standalone table, instead of a layer), "row": number, "field": string, "value": any, "classStyle"?: bool (a layer text field: ensure the applied class has a Unique Values colour rule, in the same undoable transaction)}"#),
         C::new("edit.addField", "Add Field", "Data › Data Design › Fields", add_field).roles(&[]).effects(crate::policy::Effects::NONE)
             .when(need_layer_or_table)
             .params(r#"{"layer"?, "table"?: name|id (a standalone table, instead of a layer), "name": string, "type": "long"|"double"|"text"|"boolean"|"date"|"datetime"}"#),
@@ -349,7 +349,8 @@ pub(crate) fn validate(g: &Geometry) -> Result<(), String> {
 /// `v` as a value of a `ty` field. A date-time into a date field is the day it shows. A number goes into a number field as it is, not through the
 /// text it shows (which rounds a decimal to six places); a decimal, or text written as one, into a
 /// whole-number field loses its fraction (toward zero); a whole number past 2^53 into a decimal
-/// field is the nearest decimal. Not a number is null. Other values go through their text (a
+/// field is the nearest decimal. Not a number, and an infinity in a whole-number field, are null.
+/// Other values go through their text (a
 /// decimal into a text field as it's shown, to six places), and what the field can't hold is
 /// null. A number past the 64-bit range is held at the range's end, as it was; [`coerce_cut`], for
 /// callers that say what was cut, makes it null instead.
@@ -370,8 +371,11 @@ pub(crate) enum Cut {
     Fraction,
     /// All of it: a number past the 64-bit range is null.
     Range,
-    /// All of it: not a number (NaN) is null.
+    /// All of it: not a number (NaN), or a word read as one, is null.
     NotANumber,
+    /// All of it: an infinity, given as a number or as text ("inf"), is null in a field that
+    /// holds only finite numbers.
+    NotFinite,
     /// A date-time's time of day or zone: a date field keeps its day.
     Time,
 }
@@ -382,6 +386,7 @@ pub(crate) struct Cuts {
     fractions: usize,
     past: usize,
     not_numbers: usize,
+    not_finite: usize,
     times: usize,
 }
 
@@ -392,6 +397,7 @@ impl Cuts {
             Cut::Fraction => self.fractions += 1,
             Cut::Range => self.past += 1,
             Cut::NotANumber => self.not_numbers += 1,
+            Cut::NotFinite => self.not_finite += 1,
             Cut::Time => self.times += 1,
         }
     }
@@ -419,6 +425,10 @@ impl Cuts {
         if self.not_numbers > 0 {
             let are = if self.not_numbers == 1 { "isn't a number" } else { "aren't numbers" };
             out.push((LossCode::DroppedValue, format!("{by}: '{field}' is null for {} that {are}", results(self.not_numbers))));
+        }
+        if self.not_finite > 0 {
+            let are = if self.not_finite == 1 { "isn't a finite number" } else { "aren't finite numbers" };
+            out.push((LossCode::DroppedValue, format!("{by}: '{field}' is null for {} that {are}", results(self.not_finite))));
         }
         if self.times > 0 {
             let their = if self.times == 1 { "its" } else { "their" };
@@ -537,7 +547,7 @@ impl WriteLosses {
 /// in a whole-number field.
 pub(crate) fn coerce_cut(v: Value, ty: FieldType) -> (Value, Cut) {
     if ty == FieldType::Double && non_finite_input(&v, ty) {
-        return (Value::Null, Cut::NotANumber);
+        return (Value::Null, if infinite(&v) { Cut::NotFinite } else { Cut::NotANumber });
     }
     let (v, cut, _) = convert(v, ty);
     (v, cut)
@@ -554,11 +564,21 @@ pub(crate) fn non_finite_input(value: &Value, ty: FieldType) -> bool {
         }
 }
 
+/// Whether a number, or a number written as text, is an infinity (not NaN).
+fn infinite(value: &Value) -> bool {
+    match value {
+        Value::Float(f) => f.is_infinite(),
+        Value::Text(text) => text.trim().parse::<f64>().is_ok_and(f64::is_infinite),
+        _ => false,
+    }
+}
+
 /// [`coerce_cut`], and for a number past the range the decimal it was read as.
 fn convert(v: Value, ty: FieldType) -> (Value, Cut, Option<f64>) {
     match (v, ty) {
         (Value::Null, _) => (Value::Null, Cut::None, None),
         (Value::Int(i), FieldType::Integer) => (Value::Int(i), Cut::None, None),
+        (Value::Float(f), FieldType::Integer) if f.is_infinite() => (Value::Null, Cut::NotFinite, None),
         (Value::Float(f), FieldType::Integer) => whole(f),
         (Value::Float(f), FieldType::Double) => (Value::Float(f), Cut::None, None),
         (Value::Int(i), FieldType::Double) => (Value::Float(i as f64), Cut::None, None),
@@ -577,6 +597,7 @@ fn convert(v: Value, ty: FieldType) -> (Value, Cut, Option<f64>) {
                 // A word the decimal reader takes ("inf", "NaN") isn't a number written as text:
                 // null, and said so, as not a number.
                 (None, Ok(f)) if f.is_finite() || t.bytes().any(|b| b.is_ascii_digit()) => whole(f),
+                (None, Ok(f)) if f.is_infinite() => (Value::Null, Cut::NotFinite, None),
                 (None, Ok(_)) => (Value::Null, Cut::NotANumber, None),
                 _ => (Value::parse(&t, ty), Cut::None, None),
             },
@@ -669,6 +690,14 @@ fn numeric_loss(input: &Value, v: &Value, ty: FieldType) -> Option<&'static str>
 /// standalone table, as its field holds it ([`typed`]), saying what that lost. A table's first
 /// copy of shared rows runs on the desktop table worker ([`table_ahead`]).
 fn set_value(s: &mut Session, p: &Json) -> CmdResult {
+    let class_style = match p.get("classStyle") {
+        None => false,
+        Some(Json::Bool(on)) => *on,
+        Some(_) => return Err("classStyle must be true or false".into()),
+    };
+    if class_style && matches!(target(s, p)?, Target::Table(_)) {
+        return Err("automatic class styling requires a layer, not a standalone table".into());
+    }
     if let Some(result) = land_table_edit(s, p, "edit.setValue") {
         return result;
     }
@@ -702,6 +731,9 @@ fn set_value(s: &mut Session, p: &Json) -> CmdResult {
     let ty = l.dataset.fields.get(fi).map(|f| f.ty).ok_or("no field")?;
     let field = l.dataset.fields.get(fi).map(|f| f.name.clone()).ok_or("no field")?;
     let layer = l.dataset.name.clone();
+    if class_style && ty != FieldType::Text {
+        return Err("automatic class styling requires a text field".into());
+    }
     let v = typed(raw, ty)?;
     // Keep the existing finite coercion, but say when it discards information.
     let loss = numeric_loss(&input, &v, ty);
@@ -712,6 +744,13 @@ fn set_value(s: &mut Session, p: &Json) -> CmdResult {
     let cell = f.attrs.get_mut(fi).ok_or("no such row")?;
     *cell = v;
     super::design::apply(s, id, vec![super::design::Change { before: Some(before), row: Some(row) }])?;
+    if class_style {
+        let l = s.map_mut().layer_mut(id).ok_or("no layer")?;
+        let Value::Text(value) = l.dataset.value(row, fi) else { return Err("a class needs a non-empty text value".into()) };
+        let value = value.clone();
+        // The command transaction rolls back both the cell and styling if either refuses.
+        super::layer::ensure_unique_class(l, &field, &value)?;
+    }
     if let Some(key) = loss {
         notify_loss(s, key, &layer, field, row);
     }
@@ -742,10 +781,9 @@ fn typed(raw: Json, ty: FieldType) -> Result<Value, String> {
     })
 }
 
-/// Adds an empty field of a type: long, double, text, boolean, date or datetime. Table rows
-/// are filled on the desktop worker ([`table_ahead`]), with progress and Cancel.
-/// Fills a new column on the desktop field-edit worker, with Cancel between rows.
-/// The shared row storage's first copy cannot be interrupted.
+/// Adds an empty field of a type: long, double, text, boolean, date or datetime. Layer and
+/// table rows are filled on the desktop field-edit worker ([`table_ahead`]), with progress
+/// and Cancel between rows. The shared row storage's first copy cannot be interrupted.
 fn add_field(s: &mut Session, p: &Json) -> CmdResult {
     let landed = match target(s, p)? {
         Target::Layer(_) => land_layer_schema(s, p, "edit.addField"),
@@ -1304,7 +1342,7 @@ pub(crate) fn script_table(
     use super::gp::{Ahead, RanAhead};
     if prepared {
         let next = match &mut s.tools_ahead {
-            Some(Ahead::Taking(ran)) => ran.pop_front(),
+            Some(Ahead::Taking(ran, _)) => ran.pop_front(),
             _ => None,
         };
         let Some(RanAhead::Table(next)) = next else {
@@ -1832,7 +1870,8 @@ mod tests {
     fn coerce_takes_not_a_number_as_null() {
         assert_eq!(coerce_cut(Value::Float(f64::NAN), FieldType::Integer), (Value::Null, Cut::NotANumber));
         assert_eq!(coerce(Value::Float(f64::NAN), FieldType::Integer), Value::Null);
-        assert_eq!(coerce_cut(Value::Float(f64::INFINITY), FieldType::Integer), (Value::Null, Cut::Range));
+        assert_eq!(coerce_cut(Value::Float(f64::INFINITY), FieldType::Integer), (Value::Null, Cut::NotFinite));
+        assert_eq!(coerce(Value::Float(f64::INFINITY), FieldType::Integer), Value::Null);
         assert_eq!(coerce(Value::Float(-1e30), FieldType::Integer), Value::Int(i64::MIN));
         assert_eq!(coerce(Value::Float(0.1 + 0.2), FieldType::Double), Value::Float(0.1 + 0.2));
         // Text past the range, whole or decimal: null where it's said, at the range's end elsewhere.
@@ -1858,6 +1897,16 @@ mod tests {
         cuts = Cuts::default();
         cuts.add(Cut::NotANumber);
         assert_eq!(cuts.notices("Rule", "n"), ["Rule: 'n' is null for 1 result that isn't a number"]);
+        // An infinity is said as not finite, not as not a number; NaN stays not a number.
+        assert_eq!(coerce_cut(Value::Float(f64::INFINITY), FieldType::Double), (Value::Null, Cut::NotFinite));
+        assert_eq!(coerce_cut(text("-inf"), FieldType::Double), (Value::Null, Cut::NotFinite));
+        assert_eq!(coerce_cut(text("inf"), FieldType::Integer), (Value::Null, Cut::NotFinite));
+        assert_eq!(coerce_cut(Value::Float(f64::NAN), FieldType::Double), (Value::Null, Cut::NotANumber));
+        assert_eq!(coerce_cut(text("NaN"), FieldType::Integer), (Value::Null, Cut::NotANumber));
+        cuts = Cuts::default();
+        cuts.add(Cut::NotFinite);
+        cuts.add(Cut::NotFinite);
+        assert_eq!(cuts.notices("Calculate Field", "d"), ["Calculate Field: 'd' is null for 2 results that aren't finite numbers"]);
     }
 
     /// Every form the earlier calculator read gives the same stored values through the

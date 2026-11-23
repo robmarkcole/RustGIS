@@ -631,6 +631,12 @@ pub fn read_download_page(name: &str, bytes: &[u8], page: Option<&str>, place: b
     raster::read_bytes_page(name, bytes, page, place).map_err(|e| format!("{name}: {e}"))
 }
 
+/// Reads a download whose retry/landing state already shares its bytes, without copying a PDF.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn read_download_shared_page(name: &str, bytes: std::sync::Arc<Vec<u8>>, page: Option<&str>, place: bool) -> Result<Raster, String> {
+    raster::read_shared_page(name, bytes, page, place).map_err(|e| format!("{name}: {e}"))
+}
+
 /// The raster at `path` (a PDF's `page`), read whole; for a `scan`, as the file holds it, without
 /// the world file beside it (#2075).
 pub(crate) fn read_raster_as(path: &str, page: Option<&str>, scan: bool) -> Result<Raster, String> {
@@ -698,7 +704,9 @@ fn add_jpeg2000_bytes(s: &mut Session, p: &Value, name: &str, bytes: Vec<u8>, zo
     let c = raster::gdal::convert_jpeg2000(bytes, crs, MAX_UPLOAD_BYTES as u64).map_err(|e| format!("{name}: {e}"))?;
     let stem = Path::new(name).file_stem().and_then(|s| s.to_str()).unwrap_or("raster");
     let file_name = format!("{stem}.tif");
-    let r = raster::read_bytes(&file_name, &c.tif).map_err(|e| format!("{name}: {e}"))?;
+    let mut r = raster::read_bytes(&file_name, &c.tif).map_err(|e| format!("{name}: {e}"))?;
+    // The GeoTIFF GDAL made names the WGS 84 it assumed, as if the file had.
+    r.crs_assumed |= c.assumed_lonlat;
     if c.assumed_lonlat {
         s.notify(format!("{name} doesn't say its coordinate system; its coordinates look like longitude/latitude, so it's read as WGS 84 (give \"crs\" if not)"), false);
     }
@@ -733,17 +741,43 @@ fn add_bytes<const LIMIT: usize>(s: &mut Session, p: &Value) -> CmdResult {
     add_named_bytes(s, p, name, bytes, b(p, "zoom"))
 }
 
+/// The system a WCS coverage was asked for in, for an answer that doesn't say its own:
+/// `"coverageCrs"` (`service.coverage`'s, `EPSG:<code>`), else the one its GetCoverage address
+/// `url` names ([`coverage_request_system`](rustgis_data::ogc::coverage_request_system)).
+pub(crate) fn coverage_system(p: &Value, url: &str) -> Option<rustgis_data::raster::Crs> {
+    // Only `EPSG:<code>`: `Crs::parse` takes WKT and PROJ text too, and keeps a system for them.
+    let given = ps(p, "coverageCrs")
+        .and_then(|c| c.strip_prefix("EPSG:")?.parse::<u32>().ok())
+        .and_then(rustgis_data::raster::Crs::from_epsg)
+        .filter(|c| !c.is_geographic());
+    given.or_else(|| rustgis_data::ogc::coverage_request_system(url))
+}
+
 /// Adds a file's contents (an upload, a download) as its name's extension says. A PDF's page is
 /// drawn here, on the caller's thread, unless it was drawn already ([`add_named_bytes_read`]): the
 /// desktop app's downloads land with theirs drawn off the frame ([`download_page`]) and its file
 /// drops are read by path on the read queue, so a caller here is the command line, Python or a
 /// script, with no window to hold.
 pub(crate) fn add_named_bytes(s: &mut Session, p: &Value, name: String, bytes: Vec<u8>, zoom: Option<bool>) -> CmdResult {
-    add_named_bytes_read(s, p, name, bytes, zoom, None)
+    add_named_bytes_read(s, p, name, bytes, zoom, None, None)
+}
+
+/// [`add_named_bytes`] of a WCS coverage's answer asked for in `asked`, its own system: a GeoTIFF
+/// that doesn't say its system is read in it (#2032).
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn add_coverage_bytes(
+    s: &mut Session,
+    p: &Value,
+    name: String,
+    bytes: Vec<u8>,
+    asked: Option<rustgis_data::raster::Crs>,
+) -> CmdResult {
+    add_named_bytes_read(s, p, name, bytes, None, None, asked)
 }
 
 /// [`add_named_bytes`], with a PDF's page drawn already off the frame (a download's,
-/// [`read_download_page`]) instead of here.
+/// [`read_download_shared_page`]) instead of here, and a WCS coverage's own system it was asked
+/// for in (`asked`, for an answer that doesn't say it).
 pub(crate) fn add_named_bytes_read(
     s: &mut Session,
     p: &Value,
@@ -751,6 +785,7 @@ pub(crate) fn add_named_bytes_read(
     bytes: Vec<u8>,
     zoom: Option<bool>,
     drawn: Option<Raster>,
+    asked: Option<rustgis_data::raster::Crs>,
 ) -> CmdResult {
     // A geotagged photo (an upload, a drop): a point in the photo layer, so several uploads
     // gather in one.
@@ -767,18 +802,28 @@ pub(crate) fn add_named_bytes_read(
         return Err(JPEG2000_WEB_LIMITATION.into());
     }
     if raster::is_raster_name(&name) {
+        let bytes = std::sync::Arc::new(bytes);
         // A PDF's page, kept so the project reads the same page from its copy again.
         let page = pdf_page(&name, p)?;
         let mut r = match drawn {
             Some(r) => r,
-            None => raster::read_bytes_page(&name, &bytes, page.as_deref(), !scan).map_err(|e| format!("{name}: {e}"))?,
+            // A WCS coverage asked for in its own system (#2032): an answer that doesn't say its
+            // system is read in that one; one that says it is read as any GeoTIFF.
+            None => match asked.filter(|_| !scan && [".tif", ".tiff"].iter().any(|x| name.to_ascii_lowercase().ends_with(x))) {
+                Some(asked) => {
+                    let stem = std::path::Path::new(&name).file_stem().and_then(|s| s.to_str()).unwrap_or("raster");
+                    rustgis_data::raster::geotiff::read_asked_in(std::io::Cursor::new(bytes.as_slice()), stem, asked)
+                        .map_err(|e| format!("{name}: {e}"))?
+                }
+                None => raster::read_shared_page(&name, bytes.clone(), page.as_deref(), !scan).map_err(|e| format!("{name}: {e}"))?,
+            },
         };
         r.lost.extend(raster::elevation_ignores(&name, ps(p, "layer"), ps(p, "crs")));
         if scan {
             r = r.into_scan().map_err(|e| format!("{name}: {e}"))?;
         }
         let title = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).map(str::to_string).unwrap_or_else(|| r.name.clone());
-        let mut rl = RasterLayer::from_bytes(r, name, bytes);
+        let mut rl = RasterLayer::from_shared(r, name, bytes);
         rl.subdataset = page;
         return add_raster_after(s, &title, rl, zoom);
     }
@@ -795,7 +840,7 @@ pub(crate) fn add_named_bytes_read(
     if rustgis_data::sheets::is_sheet_name(&name) {
         return super::layer::add_sheet(s, p, &name, &bytes, zoom);
     }
-    // Files of several layers: zipped Shapefiles, KML/KMZ, GPX, GeoRSS, LandXML, CityJSON.
+    // Files of several layers: zipped Shapefiles, KML/KMZ, GPX, GeoRSS, LandXML, CityJSON, CityGML.
     if rustgis_data::io::is_multi_layer_name(&name) {
         return super::layer::add_layers(s, p, &name, &bytes, zoom, false);
     }
@@ -1158,7 +1203,13 @@ pub(super) fn write_geotiff(r: &Raster, bi: usize, cog: bool, path: &str) -> Res
 }
 
 /// Builds the band instruction before combining the note with any caller-supplied path or name.
-fn write_geotiff_with_guidance(r: &Raster, bi: usize, cog: bool, path: &str, band_hint: &str) -> Result<super::exports::Wrote, String> {
+pub(super) fn write_geotiff_with_guidance(
+    r: &Raster,
+    bi: usize,
+    cog: bool,
+    path: &str,
+    band_hint: &str,
+) -> Result<super::exports::Wrote, String> {
     let cog = if cog {
         // Tiles go to the file as they are made: the whole file is never held in memory.
         Some(raster::cogwrite::write_file(r, bi, Path::new(path)).map_err(|e| format!("{path}: {e}"))?)
@@ -1167,6 +1218,29 @@ fn write_geotiff_with_guidance(r: &Raster, bi: usize, cog: bool, path: &str, ban
         rustgis_data::io::write_atomic(Path::new(path), &bytes).map_err(|e| format!("{path}: {e}"))?;
         None
     };
+    wrote_geotiff(r, bi, path, cog, band_hint)
+}
+
+/// [`write_geotiff_with_guidance`]'s Cloud Optimized GeoTIFF, written beside `path` and put in
+/// its place when the returned file is committed (as a background run's raster is added).
+pub(super) fn write_cog_staged(
+    r: &Raster,
+    bi: usize,
+    path: &str,
+    band_hint: &str,
+) -> Result<(super::exports::Wrote, rustgis_data::io::StagedWrite), String> {
+    let (cog, staged) = raster::cogwrite::write_staged(r, bi, Path::new(path)).map_err(|e| format!("{path}: {e}"))?;
+    Ok((wrote_geotiff(r, bi, path, Some(cog), band_hint)?, staged))
+}
+
+/// What writing `r`'s band `bi` to `path` says.
+fn wrote_geotiff(
+    r: &Raster,
+    bi: usize,
+    path: &str,
+    cog: Option<raster::cogwrite::CogInfo>,
+    band_hint: &str,
+) -> Result<super::exports::Wrote, String> {
     let note = geotiff_note(r, bi, cog.is_some(), band_hint)?;
     let mut v = match r.overview {
         Some((fw, fh)) => json!({"path": path, "width": r.width, "height": r.height, "overviewOf": [fw, fh]}),
@@ -1179,7 +1253,7 @@ fn write_geotiff_with_guidance(r: &Raster, bi: usize, cog: bool, path: &str, ban
         answer: v,
         diagnostics: Vec::new(),
         refused_notes: Vec::new(),
-        notes: vec![format!("Exported {path}{note}")],
+        notes: [format!("Exported {path}{note}")].into_iter().collect(),
         written_path: Some(path.to_string()),
         then: None,
         #[cfg(not(target_arch = "wasm32"))]
@@ -1194,7 +1268,7 @@ pub(super) fn write_and_report(s: &mut Session, r: &Raster, bi: usize, cog: bool
     let wrote =
         write_geotiff_with_guidance(r, bi, cog, path, "export the resulting layer with share.exportRaster and give \"band\" for another")?;
     for note in wrote.notes {
-        s.notify_written(note, false);
+        s.say_written(note);
     }
     Ok(wrote.answer)
 }

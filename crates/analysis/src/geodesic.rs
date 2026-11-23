@@ -22,6 +22,10 @@
 //! Between vertices, those edges cut at most 0.031% of the distance inside the circle in the
 //! projection plane. A short corner can have a step approaching 5.625° when the backend rounds
 //! its segment count down, cutting at most 0.125% inside, on top of the projection error.
+//!
+//! In a run in a projected system's own plane ([`crate::convert::Plane::Own`], #2032 C2e-3), a
+//! feature is buffered there as it is, the distance measured flat in the system's unit
+//! ([`crate::convert::own_length`]), as distances are in a projected system.
 
 use geo::{
     BooleanOps, Buffer, Contains, Coord as GC, CoordsIter, LineString, MultiLineString, MultiPolygon, Orient, Point, Polygon,
@@ -318,6 +322,10 @@ impl Plane {
     /// from the same edge straight in the analysis plane ([`lonlat_to_plane`]: Web Mercator within
     /// ±85.05°, straight in lon/lat beyond) by more than `tolerance` meters at its quarter points
     /// or midpoint.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a tolerance for splitting an edge, not a measurement: ellipsoid distances are within 0.6% of the sphere's"
+    )]
     fn strays(&self, a: GC<f64>, b: GC<f64>, la: Coord, lb: Coord, tolerance: f64) -> bool {
         let at = |t: f64| self.0.inverse(Coord::new(a.x + t * (b.x - a.x), a.y + t * (b.y - a.y)));
         // `b` on `a`'s side of the antimeridian, so the straight edge is the short one.
@@ -431,12 +439,18 @@ fn point(c: Coord, metres: f64) -> MultiPolygon<f64> {
     if !c.is_finite() {
         return MultiPolygon::new(vec![]);
     }
+    if let Some(d) = crate::convert::own_length(metres) {
+        return Point::new(c.x, c.y).buffer_with_style(buffer_style(d));
+    }
     let plane = Plane::new(c, c.x);
     plane.back(&Point::new(0.0, 0.0).buffer_with_style(buffer_style(metres)), metres)
 }
 
 /// A line's buffer: in one projection centred on it when it fits, else in stretches.
 fn lines(parts: &[Vec<Coord>], metres: f64) -> MultiPolygon<f64> {
+    if let Some(d) = crate::convert::own_length(metres) {
+        return MultiLineString::new(parts.iter().map(|p| crate::convert::ring(p)).collect()).buffer_with_style(buffer_style(d));
+    }
     let all: Vec<Coord> = parts.iter().flatten().copied().collect();
     let Some(centre) = spherical_centre(&all) else { return MultiPolygon::new(vec![]) };
     if fits(&all, centre) {
@@ -451,7 +465,6 @@ fn lines(parts: &[Vec<Coord>], metres: f64) -> MultiPolygon<f64> {
 /// outline's buffer (in stretches) added or, inward, taken away.
 fn polygons(polys: &[Vec<Vec<Coord>>], metres: f64) -> MultiPolygon<f64> {
     let all: Vec<Coord> = polys.iter().flatten().flatten().copied().collect();
-    let Some(centre) = spherical_centre(&all) else { return MultiPolygon::new(vec![]) };
     let shape = |ring: &dyn Fn(&[Coord]) -> LineString<f64>| {
         MultiPolygon::new(
             polys
@@ -464,6 +477,10 @@ fn polygons(polys: &[Vec<Vec<Coord>>], metres: f64) -> MultiPolygon<f64> {
                 .collect(),
         )
     };
+    if let Some(d) = crate::convert::own_length(metres) {
+        return shape(&|r| crate::convert::ring(r)).buffer_with_style(buffer_style(d));
+    }
+    let Some(centre) = spherical_centre(&all) else { return MultiPolygon::new(vec![]) };
     if fits(&all, centre) {
         let plane = Plane::new(centre, all.first().map_or(centre.x, |c| c.x));
         return plane.back(&shape(&|r| plane.line(r)).buffer_with_style(buffer_style(metres)), metres);
@@ -482,6 +499,7 @@ fn finite(parts: &[Vec<Coord>]) -> Vec<Vec<Coord>> {
     parts.iter().map(|p| p.iter().copied().filter(|c| c.is_finite()).collect::<Vec<_>>()).filter(|p| !p.is_empty()).collect()
 }
 
+#[expect(clippy::disallowed_methods, reason = "sizes the pieces a buffer is cut into, not a measurement")]
 fn fits(pts: &[Coord], centre: Coord) -> bool {
     pts.iter().all(|c| haversine_m(centre, *c) <= ONE_PIECE_M)
 }
@@ -491,6 +509,7 @@ fn stretched(parts: &[Vec<Coord>], metres: f64) -> Vec<MultiPolygon<f64>> {
     let mut out = Vec::new();
     for part in parts {
         let d = densify(part);
+        #[expect(clippy::disallowed_methods, reason = "sizes the pieces a buffer is cut into, not a measurement")]
         let near = |a: usize, b: usize| d.get(a).zip(d.get(b)).is_some_and(|(a, b)| haversine_m(*a, *b) <= STRETCH_M);
         let mut start = 0;
         loop {
@@ -515,6 +534,7 @@ fn stretched(parts: &[Vec<Coord>], metres: f64) -> Vec<MultiPolygon<f64>> {
 
 /// A line with every edge split along its geodesic on WGS 84 into pieces of at most [`DENSIFY_M`], or
 /// longer ones for a line so long it would gain more than [`MAX_ADDED`] vertices.
+#[expect(clippy::disallowed_methods, reason = "the densify step: it sets how many vertices an edge gains, not a measurement")]
 fn densify(pts: &[Coord]) -> Vec<Coord> {
     let step = DENSIFY_M.max(rustgis_geom::geodesic_length_m(pts) / MAX_ADDED);
     let mut out: Vec<Coord> = pts.first().copied().into_iter().collect();

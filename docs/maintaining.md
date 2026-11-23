@@ -68,6 +68,10 @@ same files. New and changed code follows these rules; not every existing reader 
   doesn't save it again without what it couldn't read.
 - A format's version goes up only when a file uses something an older reader would lose or
   misread.
+- A key a project file has that this version doesn't read (a hand edit, another program) is left
+  out on open and said: one notice per part of the project, with a count and the first few
+  places. Keys inside a setting read leniently or flattened into another (a layer's labels) aren't
+  seen, so they go unsaid (#2639).
 - Where a change allows it, reading a new version ships at least one release before anything
   writes it.
 - A project, map or layer file, a model or a web tool lists in `requires` each capability it needs
@@ -108,6 +112,7 @@ diagram cut to a circle or to polygons), `terrain-block-polygon` (one cut to pol
 `terrain-water`,
 `terrain-water-shore` (a terrain water's shore band other than the default),
 `terrain-block-water` (water in a block diagram's walls),
+`terrain-block-walls-layer` (the layer a block diagram's walls are coloured by),
 `shaded-relief-effects` (cast shadows, sky visibility, fill light or rock colour),
 `shaded-relief-light` (a Shaded Relief's ambient or balanced light),
 `blank-paper` (a blank basemap's paper colour) and
@@ -133,6 +138,10 @@ Omitted units and explicit `km2` require nothing extra; omitted zone fields need
 capability because older tools refuse them.
 The same containers require `tabulate-intersection-empty-zones` when
 `includeEmptyZones` is on, so older readers refuse the file instead of omitting the zero rows.
+The same containers require `dggs-system` when Generate Tessellation or Aggregate Points to Grid
+(`a5Grid`, `a5Aggregate`) is given a `system` other than A5: those were A5's tools, and an older
+reader would make A5 cells, warning only that it ignored the key. A blank `system`, `A5` or none
+needs nothing.
 
 Projects with a background on a layout element, or a saved task step, script, notebook command
 cell or history entry that gives one (`layout.addElement` or `layout.update` with a
@@ -213,12 +222,15 @@ too, since an older reader warns that it ignores the key; `"border": null` only 
 back and needs nothing. A saved `layout.import` whose `text` has such a frame requires it as well.
 Layout files are not covered, as for backgrounds (#2277).
 
-Projects with a legend whose text isn't the default 9 points (`text_size` on a legend) require
-`layout-legend-text`, so an older reader refuses them instead of drawing the legend at 9 points
-and saving it again without its size (#2581). A saved `layout.addElement` for a legend or
-`layout.update` that gives `textSize` another size requires it too; `null` or 9 only give the
-default and need nothing. A saved `layout.import` whose `text` has such a legend requires it as
-well. Layout files are not covered, as for backgrounds (#2277).
+Projects with a legend, a scale bar or a grid whose text isn't its default size (`text_size` on
+a legend, 9 points by default, or on a scale bar, 8; `label_size` on a frame's grid, 8) require
+`layout-text-size`, so an older reader refuses them instead of drawing that text at the default
+and saving it again without its size (#2581). A saved `layout.addElement` that gives a legend or
+a scale bar `textSize`, or a grid `labelSize`, of another size requires it too, and so does a
+`layout.update` with `"grid": {"labelSize": …}` of another size; `null` or the default need
+nothing. A saved `layout.update` isn't told which element it changes, so any `textSize` but
+`null` requires it there. A saved `layout.import` whose `text` has such an element requires it
+as well. Layout files are not covered, as for backgrounds (#2277).
 
 Projects, map files and layer files with a layer or table held in a coordinate system of its own
 (`Dataset::held_in`: a file's system, kept since #2580) save its features in that system, exactly,

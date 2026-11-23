@@ -6,7 +6,7 @@
 
 use std::{borrow::Cow, path::Path};
 
-use crate::io::{CsvWriter, GeoJsonWriter, GpkgTable, GpkgWritten, PROJECTED_FORMATS, check_projected, project_each, write_atomic_with};
+use crate::io::{CsvWriter, GeoJsonWriter, GpkgTable, GpkgWritten, check_projected, project_each, write_atomic_with};
 use crate::raster::Crs;
 use crate::rows::Query;
 use crate::source::FeatureSource;
@@ -58,9 +58,11 @@ pub struct Exported {
     /// Per field of the layer, text values `<Null>` the source read as null
     /// ([`crate::source::Batch::null_text`], said by [`crate::source::null_text_note`]).
     pub null_text: Vec<usize>,
-    /// Per field of the layer, text values the source read as UTF-8 that aren't UTF-8
+    /// Per field of the layer, text values that aren't valid in the encoding the source read them in
     /// ([`crate::source::Batch::not_utf8`], said by [`crate::source::not_utf8_note`]).
     pub not_utf8: Vec<usize>,
+    /// The encoding `not_utf8` is of ([`crate::source::FeatureSource::text_encoding`]).
+    pub not_utf8_in: &'static str,
     /// Per field of the layer, date-times a GeoPackage holds in UTC rather than at their own
     /// offset ([`crate::io::offset_dates`]; empty for the other formats).
     pub utc_dates: Vec<usize>,
@@ -74,7 +76,7 @@ pub struct Exported {
     pub date_messages: Vec<String>,
     /// What reading the source lost or assumed besides the counts above
     /// ([`crate::source::Batch::notes`]), said as they are.
-    pub read_notes: Vec<String>,
+    pub read_notes: crate::loss::Notes,
 }
 
 /// The rows a definition query excluded, or why the stored query could not be applied.
@@ -103,18 +105,8 @@ pub fn write_source_in(src: &dyn FeatureSource, layer: &Dataset, path: &Path, cr
 }
 
 /// As [`write_source_in`], a GeoPackage's table placed as `gpkg` says (see
-/// [`crate::io::write_path_to`]): also returns the table written.
-pub fn write_source_to(
-    src: &dyn FeatureSource,
-    layer: &Dataset,
-    path: &Path,
-    crs: Crs,
-    gpkg: &GpkgTable,
-) -> Result<(Exported, Option<GpkgWritten>)> {
-    write_chunks_to(src, layer, path, crs, gpkg, CHUNK_BYTES, None)
-}
-
-/// As [`write_source_to`], applying the layer's query before projecting or serializing each chunk.
+/// [`crate::io::write_path_to`]), applying the layer's query before projecting or serializing each
+/// chunk: also returns the table written.
 pub fn write_source_filtered(
     src: &dyn FeatureSource,
     layer: &Dataset,
@@ -134,7 +126,7 @@ fn write_chunks_in(src: &dyn FeatureSource, layer: &Dataset, path: &Path, crs: C
     write_chunks_to(src, layer, path, crs, &GpkgTable::default(), bytes, None).map(|(e, _)| e)
 }
 
-/// [`write_source_to`], `bytes` of features a chunk.
+/// [`write_source_filtered`], `bytes` of features a chunk.
 fn write_chunks_to(
     src: &dyn FeatureSource,
     layer: &Dataset,
@@ -233,7 +225,7 @@ fn write_chunks_as(
         return Err(DataError::Unsupported("a source that can't be read a chunk at a time".into()));
     }
     if crs != Crs::LonLat {
-        if !PROJECTED_FORMATS.contains(&ext) {
+        if !crate::io::holds_a_system(ext) {
             return Err(DataError::Unsupported(format!(".{ext} in {} (it holds longitude/latitude only)", crs.label())));
         }
         check_projected(ext, crs)?;
@@ -259,7 +251,7 @@ fn write_chunks_as(
     let mut unread_dates = Vec::new();
     let mut rounded_dates = Vec::new();
     let mut null_text = Vec::new();
-    let mut read_notes = Vec::new();
+    let mut read_notes = crate::loss::Notes::new();
     let mut not_utf8 = Vec::new();
     let mut utc_dates = Vec::new();
     let mut fine_dates = Vec::new();
@@ -352,7 +344,7 @@ fn write_chunks_as(
             Ok::<_, DataError>(0)
         })?,
         "csv" => write_atomic_with(path, |out| {
-            let mut w = CsvWriter::new(out, &layer.fields, geometry_type)?;
+            let mut w = CsvWriter::new(out, &layer.fields, geometry_type, crs)?;
             feed(&mut |features| w.write(features))?;
             w.finish()?;
             Ok::<_, DataError>(0)
@@ -361,7 +353,7 @@ fn write_chunks_as(
             crate::source::fgb::write_features(&layer.name, geometry_type, &layer.fields, crs, out, &mut feed)
         })?,
         _ => write_atomic_with(path, |out| {
-            let (_, counts, messages) = crate::source::parquet::write_features(geometry_type, &layer.fields, out, &mut feed)?;
+            let (_, counts, messages) = crate::source::parquet::write_features(geometry_type, &layer.fields, crs, out, &mut feed)?;
             unfit = counts;
             date_messages = messages;
             Ok::<_, DataError>(0)
@@ -383,6 +375,7 @@ fn write_chunks_as(
             rounded_dates,
             null_text,
             not_utf8,
+            not_utf8_in: src.text_encoding(),
             utc_dates,
             fine_dates,
             written_values,

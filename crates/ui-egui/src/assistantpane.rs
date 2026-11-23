@@ -278,14 +278,21 @@ type SignInRead = (Option<chatgpt::Binding>, Slot<SignInResult>);
 fn read_sign_in(app: &mut RustGisApp, checking: Option<chatgpt::Binding>, ctx: &egui::Context) {
     let slot: Slot<SignInResult> = Slot::default();
     let (out, ctx) = (slot.clone(), ctx.clone());
-    std::thread::spawn(move || {
+    let spawned = std::thread::Builder::new().name("rustgis-chatgpt-sign-in".into()).spawn(move || {
         let c = chatgpt::load_any_report();
         if let Ok(mut s) = out.lock() {
             *s = Some(c);
         }
         ctx.request_repaint();
     });
-    app.assistant.sign_in_read = Some((checking, slot));
+    match spawned {
+        Ok(_) => app.assistant.sign_in_read = Some((checking, slot)),
+        // Not read is not signed out: the sign-in stays as it is, and the refusal is said.
+        Err(e) => sign_in_store_error(
+            app,
+            crate::i18n::fmt("the system refused a thread to read them on ({error})", &[("error", &e.to_string())]).into(),
+        ),
+    }
 }
 
 /// Keeps account-store refusal visible without emitting the same failure on every poll.
@@ -318,7 +325,7 @@ fn saved_accounts(app: &mut RustGisApp) -> Vec<chatgpt::Credentials> {
 #[cfg(not(target_arch = "wasm32"))]
 fn poll_sign_in(app: &mut RustGisApp, ctx: &egui::Context) {
     let Some((checking, slot)) = app.assistant.sign_in_read.as_ref() else { return };
-    let Some(read) = slot.lock().ok().and_then(|mut s| s.take()) else { return };
+    let Some(read) = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() else { return };
     let checking = checking.clone();
     app.assistant.sign_in_read = None;
     let Some(cfg) = app.assistant.agent.as_ref().map(|a| a.config.clone()).filter(Config::login) else { return };
@@ -463,7 +470,7 @@ fn dispatch(app: &mut RustGisApp, req: HttpRequest, login: Option<chatgpt::Bindi
     #[cfg(not(target_arch = "wasm32"))]
     {
         let (out, ctx) = (slot.clone(), ctx.clone());
-        std::thread::spawn(move || {
+        crate::work_off_frame("rustgis-assistant-request", &slot, move || {
             let repaint = ctx.clone();
             let mut on_chunk = |piece: &[u8]| {
                 if let Some(Ok(mut buf)) = chunks.as_ref().map(|c| c.lock()) {
@@ -561,7 +568,7 @@ fn sync_sign_in(app: &mut RustGisApp, ctx: &egui::Context) {
 }
 
 fn take(slot: &Reply) -> Option<Result<HttpResponse, rustgis_assistant::Error>> {
-    slot.lock().ok().and_then(|mut s| s.take())
+    slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
 }
 
 /// Ends the agent threads on this computer (with every process they started), and the relay if
@@ -720,7 +727,7 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
         }
     }
     #[cfg(not(target_arch = "wasm32"))]
-    if let Some(r) = app.assistant.signout.as_ref().and_then(|s| s.lock().ok().and_then(|mut s| s.take())) {
+    if let Some(r) = app.assistant.signout.as_ref().and_then(|s| s.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()) {
         app.assistant.signout = None;
         if r.is_err() {
             app.assistant.login_error = Some(
@@ -1253,7 +1260,7 @@ fn revoke_later(app: &mut RustGisApp, revocation: Option<chatgpt::Revocation>, c
     let Some(r) = revocation else { return };
     let slot: Slot<Result<(), rustgis_assistant::Error>> = Slot::default();
     let (out, ctx) = (slot.clone(), ctx.clone());
-    std::thread::spawn(move || {
+    crate::work_off_frame("rustgis-chatgpt-revoke", &slot, move || {
         let result = chatgpt::revoke(&r);
         if let Ok(mut s) = out.lock() {
             *s = Some(result);

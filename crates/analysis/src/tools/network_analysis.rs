@@ -80,6 +80,14 @@ fn network<'a>(inp: &'a dyn Inputs, p: &Json, tool: &str) -> Result<Network<'a>,
         }
     }
     let graph = Graph::of(ds, &rows, cost_field)?;
+    if graph.overflowing() > 0 {
+        let field = cost_field.and_then(|fi| ds.fields.get(fi)).map_or("", |f| f.name.as_str());
+        notes.push(format!(
+            "{tool}: {} line(s) of '{}' cost so much in {field} that a segment's cost is past the largest number, and are closed",
+            graph.overflowing(),
+            ds.name
+        ));
+    }
     if graph.skipped_segments() > 0 {
         notes.push(format!(
             "{tool}: {} segment(s) of '{}' with invalid coordinates were left out of the network",
@@ -88,7 +96,9 @@ fn network<'a>(inp: &'a dyn Inputs, p: &Json, tool: &str) -> Result<Network<'a>,
         ));
     }
     if graph.segments() == 0 {
-        return Err(format!("'{}' has no lines to search", ds.name));
+        // What left no lines is said with it: the notes would be lost with the run.
+        let why = if notes.is_empty() { String::new() } else { format!(" ({})", notes.join("; ")) };
+        return Err(format!("'{}' has no lines to search{why}", ds.name));
     }
     Ok(Network { ds, graph, unit_m, snap_m, notes })
 }
@@ -111,6 +121,10 @@ fn place(inp: &dyn Inputs, p: &Json, key: &str, net: &mut Network<'_>, tool: &st
         Far,
     }
     let (graph, snap_m) = (&net.graph, net.snap_m);
+    // The graph is in longitude/latitude: each point is given there from the system its layer
+    // holds it in (the one the run works in, [`Inputs::work_crs`]); one that can't be has no
+    // usable point.
+    let to = ds.lonlat_conversion()?;
     crate::control::begin(rows.len());
     let got = crate::parallel::try_map(
         &rows,
@@ -127,9 +141,7 @@ fn place(inp: &dyn Inputs, p: &Json, key: &str, net: &mut Network<'_>, tool: &st
                 },
                 _ => return Ok(Got::NoPoint),
             };
-            if !at.is_finite() || at.y.abs() > 90.0 {
-                return Ok(Got::NoPoint);
-            }
+            let Some(at) = to.point(at).filter(|c| c.is_finite() && c.y.abs() <= 90.0) else { return Ok(Got::NoPoint) };
             Ok::<_, String>(graph.place(at, snap_m)?.map_or(Got::Far, |placed| Got::Placed(f.id, placed)))
         },
     )?;
@@ -293,12 +305,31 @@ pub(super) fn service_area(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Str
 
     let ds = net.ds;
     let mut out = copy_schema(ds, out_name(p, format!("{}_ServiceArea", ds.name)), GeometryType::Polyline);
-    out.crs = ds.crs;
     for (name, ty) in [("facility_fid", FieldType::Integer), ("from_break", FieldType::Double), ("to_break", FieldType::Double)] {
         let name = unique_field(&out, name);
         out.fields.push(Field::new(name, ty));
     }
     let mut reached = HashSet::new();
+    // Made in longitude/latitude, on the graph; each line held as the network is, in the system
+    // the run works in, as it is added (the output is never made twice).
+    let to_own = Crs::LonLat.to(ds.coord_crs())?;
+    let held = |lines: Vec<Vec<Coord>>| -> Result<Vec<Vec<Coord>>, String> {
+        if to_own.is_identity() {
+            return Ok(lines);
+        }
+        lines
+            .into_iter()
+            .map(|part| {
+                part.into_iter()
+                    .map(|c| {
+                        to_own.point(c).filter(|c| c.is_finite()).ok_or_else(|| {
+                            format!("{TOOL}: a place it reached can't be held in {}, the system of '{}'", ds.coord_crs().label(), ds.name)
+                        })
+                    })
+                    .collect()
+            })
+            .collect()
+    };
     for ((row, band, facility), lines) in parts {
         crate::control::check()?;
         let Some(f) = ds.features.get(row) else { continue };
@@ -307,8 +338,10 @@ pub(super) fn service_area(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Str
         let fid = facilities.get(facility).map_or(Value::Null, |(id, _)| Value::Int(id.cast_signed()));
         let from = if band == 0 { 0.0 } else { breaks.get(band - 1).copied().unwrap_or(0.0) };
         attrs.extend([fid, Value::Float(from), Value::Float(breaks.get(band).copied().unwrap_or(0.0))]);
-        out.push(Some(Geometry::Line(lines)), attrs);
+        out.push(Some(Geometry::Line(held(lines)?)), attrs);
     }
+    out.held_in = ds.coord_crs();
+    out.crs = ds.crs;
     let units = if s(p, "units").is_empty() { "Kilometers" } else { s(p, "units") };
     let mut messages = vec![format!(
         "{TOOL}: {} line part(s) reached from {} of {} facilities, in {units}",
@@ -699,6 +732,26 @@ mod tests {
             "{:?}",
             r.messages
         );
+        assert!(!r.messages.iter().any(|m| m.contains("past the largest number")), "{:?}", r.messages);
+        // A cost so large its segments' costs overflow closes the line too, counted apart.
+        let mut huge = roads();
+        huge.features[3].attrs[0] = Value::Float(1e306);
+        let inputs = map(vec![huge, points("shops", &[Some(c(0.005, 0.0))])]);
+        let r = service_area(&inputs, &json!({"network": "roads", "facilities": "shops", "breaks": "5", "costField": "cost"})).unwrap();
+        assert!(
+            r.messages.iter().any(|m| m
+                .contains("1 line(s) of 'roads' cost so much in cost that a segment's cost is past the largest number, and are closed")),
+            "{:?}",
+            r.messages
+        );
+        // Every line closed so: the refusal says why.
+        let mut all = roads();
+        for f in all.features.iter_mut() {
+            f.attrs[0] = Value::Float(1e306);
+        }
+        let inputs = map(vec![all, points("shops", &[Some(c(0.005, 0.0))])]);
+        let e = service_area(&inputs, &json!({"network": "roads", "facilities": "shops", "breaks": "5", "costField": "cost"})).unwrap_err();
+        assert!(e.contains("has no lines to search") && e.contains("4 line(s) of 'roads' cost so much"), "{e}");
     }
 
     /// A point just across ±180° from a line is moved onto it, about 110 m away, not left out as

@@ -154,7 +154,7 @@ isn't itself an entry in the log, as a saved file is). **Clear Log** empties it 
   entry, even when the next command answers it. New entries also carry
   `rustgis_version`, the version that executed the command, and `inputs`, the local files actually
   opened by its readers (including sidecars and a script's child commands). SQLite journal/WAL
-  companions present at read time are included too. Each fingerprint has
+  companions and a DuckDB database's `.wal` present at read time are included too. Each fingerprint has
   an absolute `path`, `size` in bytes, `modified_ns` (nanoseconds since 1970 UTC, as text), and
   `sha256` when cheaply available. RustGIS reuses existing digests or hashes buffers already in
   memory up to 8 MiB; it never rereads a large input just for the log. Streamed, random-access
@@ -167,11 +167,16 @@ isn't itself an entry in the log, as a saved file is). **Clear Log** empties it 
   also stops fingerprint collection on background jobs started while it is off. The log captures local reads RustGIS makes; it cannot enumerate files
   opened internally by another program or include metadata the browser's upload did not supply.
   GDAL conversions name the original local file, including cache hits; DuckDB conversions name
-  the explicitly supplied local database, when there is one. Conversion caches and
-  temporary GeoPackage copies and reloads of files just exported are excluded. ER Mapper headers
-  include plainly named `DataFile` companions beside the header when cheaply identifiable;
-  observing them never adds a validation requirement to conversion. Files inside a database folder
-  opened by another program are not enumerated.
+  the explicitly supplied local database, when there is one. A later read of a conversion names
+  the original as it was when the conversion was opened, not as it is by then. Conversion caches
+  and temporary GeoPackage copies and reloads of files just exported are excluded. ER Mapper
+  headers include their `DataFile` beside the header, or, when they name none, GDAL's default
+  (the header's name without `.ers`) when it is there; observing them never adds a validation
+  requirement to conversion. A folder another program opens (a File Geodatabase read through GDAL)
+  lists the files inside it, up to 1,000 files 8 folders deep and 10,000 files and folders looked at. Where a list can't be complete (a
+  larger folder, a header that couldn't be read, a data file elsewhere or missing, a linked ER Mapper
+  dataset), a fingerprint of that path carries `incomplete`, saying why, and has no size, time or
+  digest; these marks are kept when an entry's list is cut to 100.
   Older exported entries lack these optional fields, so their version and inputs are unknown.
 - **For the session only:** the log is kept in memory, across the projects opened or made in the
   session, until RustGIS closes or the log is cleared. A saved project, its recovery copy, a
@@ -332,7 +337,7 @@ Each layer keeps its look:
   lines as strokes of markers or hash marks, at their places (intervals, vertices, the ends, the
   middle), turned with the line, their markers' offsets and angles kept; font markers as
   characters of their font, on points and along lines; raster image markers as
-  [image markers](cartography.md#symbology) of their PNG or JPEG (embedded in the file, or a file
+  [image markers](cartography.md#symbology) of their PNG, JPEG or SVG (embedded in the file, or a file
   of their own, relative to the project's folder or, in a style, to the style's), on points
   (anchored where QGIS anchors them) and along lines; a marker symbol of several layers, or one
   shifted, turned or anchored off its centre, as a point's marks; a marker angle taken from a
@@ -418,8 +423,9 @@ holding `NULL`, which QGIS takes as unknown and RustGIS skips. What RustGIS does
 near as it can, or left out, and said: the import's notes list, layer by layer, what was
 approximated (vector tile styles, text matched ignoring letter case, a memory layer's fields of kinds RustGIS hasn't as text, gradient and shapeburst fills' offsets left out and colour ramps other than gradients drawn from their first colour to their last, SVG, raster and random fills and dense brushes as a tint of their colour, SVG markers as circles,
 raster image markers whose image RustGIS can't use as circles (one at a web address, which it
-doesn't fetch, or kept inside a `.qgz`; a file that doesn't open or isn't a PNG or JPEG; one past
-2 MiB of base64 or the images it keeps), those of a fixed aspect ratio in their image's own,
+doesn't fetch, or kept inside a `.qgz`; a file that doesn't open or isn't a PNG, JPEG or SVG; one past
+2 MiB of base64, 2048 × 2048 pixels or as much to draw, an SVG with filters, text, images, animation or links to other files, the images it keeps or the pixels or memory of marker images it decodes
+until it restarts), those of a fixed aspect ratio in their image's own,
 see-through ones opaque and those anchored off their centre along lines centred,
 dashed polygon outlines solid, label halos with sharp corners drawn round and blended ones drawn
 over the map, label backgrounds of other shapes drawn as rectangles, label distances from lines
@@ -441,6 +447,8 @@ A QGIS layer style (`.qml`) styles the selected layer the same way, a feature la
 "…/roads.qml"}`). A raster style that reads a band the raster hasn't is noted and leaves the
 raster as it was. On a raster still loading (a remote file), the bands can't be checked yet: the
 style is applied, noted as unchecked, and a band the file hasn't is drawn from its last band.
+In the desktop app the style file and its raster image markers' image files are read in the
+background, with Cancel: the layer is styled once they are read, and a cancelled import leaves it as it was.
 
 RustGIS works out a map's scale with the OGC's 0.28 mm screen pixel, QGIS at 96 pixels to the
 inch, so the same view is a larger scale in QGIS; scales from QGIS (reference scales, visibility
@@ -635,7 +643,8 @@ duplication and nudging have their own [layout shortcuts](layouts.md#layouts).
   Sync sends changed, new and deleted features back and refreshes it. A feature changed in the
   map since the last sync and also edited or deleted offline takes the offline version, with a
   warning naming it (Undo reverts the whole sync, restoring the map's version); an offline edit
-  to a feature since deleted from the map is dropped, with a warning too. **Package for the Field**
+  to a feature since deleted from the map is dropped, with a warning too. **Conflicts** keeps the
+  version that lost each time, by area, until it is dismissed. **Package for the Field**
   and **Bring Back** carry an area to a phone and its edits back (see [Field Work](field-work.md)).
   **Feature Cache** prepares
   every layer's geometry for the current projection (Fill, Empty, Cancel, Auto Cache).

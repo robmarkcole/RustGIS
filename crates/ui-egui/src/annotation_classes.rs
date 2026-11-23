@@ -4,6 +4,30 @@ use rustgis_engine::data::{FieldType, GeometryType};
 use rustgis_engine::map::{Layer, Renderer};
 use serde_json::{Value, json};
 
+const MAX_CLASS_NAME_CHARS: usize = 256;
+
+/// Normalise all entry points before storing a default, style or per-feature value.
+fn class_name(value: &str) -> Result<String, String> {
+    let name = value.trim();
+    if name.is_empty() {
+        return Err(tl!("Choose a non-empty class name.").into());
+    }
+    if name.chars().take(MAX_CLASS_NAME_CHARS + 1).count() > MAX_CLASS_NAME_CHARS {
+        return Err(tl!("Class names may contain at most 256 characters.").into());
+    }
+    if rustgis_engine::data::Value::is_null_marker(name) {
+        return Err(tl!("<Null> is reserved for missing values. Choose another class name.").into());
+    }
+    Ok(name.to_string())
+}
+
+fn styled(app: &RustGisApp, name: &str, value: &str) -> bool {
+    target(app).is_some_and(|l| {
+        matches!(&l.renderer, Renderer::Unique { field, classes, expression: None, .. }
+            if field == name && classes.iter().any(|(existing, _)| existing == value))
+    })
+}
+
 type Binding = (u64, u64, u32, u64, u64);
 #[derive(Default)]
 pub(crate) struct State {
@@ -104,15 +128,11 @@ pub(crate) fn select_class(app: &mut RustGisApp, p: &Value) -> Result<(), String
     let name = field(app)?.to_string();
     let value = match p.get("value") {
         Some(Value::Null) => None,
-        Some(Value::String(value)) if !value.trim().is_empty() => Some(value.clone()),
+        Some(Value::String(value)) => Some(class_name(value)?),
         _ => return Err(tl!("Choose a non-empty class name, or null for no class default.").into()),
     };
     if let Some(value) = &value {
-        let styled = target(app).is_some_and(|l| {
-            matches!(&l.renderer, Renderer::Unique { field, classes, expression: None, .. }
-                if *field == name && classes.iter().any(|(existing, _)| existing == value))
-        });
-        if !styled {
+        if !styled(app, &name, value) {
             app.run("layer.classStyle", json!({"field":name,"value":value,"create":true}))?;
         }
         let recent = &mut app.annotation.classes.recent;
@@ -159,17 +179,17 @@ pub(crate) fn assign(app: &mut RustGisApp, p: &Value) -> Result<(), String> {
     let name = field(app)?.to_string();
     let value = match p.get("value") {
         None => app.annotation.classes.value.clone().ok_or_else(|| tl!("Choose an active class first.").to_string())?,
-        Some(Value::String(value)) if !value.trim().is_empty() => value.clone(),
+        Some(Value::String(value)) => class_name(value)?,
         _ => return Err(tl!("Choose a non-empty class name.").into()),
     };
     let l = target(app).ok_or_else(|| tl!("Choose a loaded editable polygon layer.").to_string())?;
     let [row] = l.selection.as_slice() else { return Err(tl!("Select exactly one annotation to change its class.").into()) };
     let fi = l.dataset.fields.iter().position(|f| f.name == name).ok_or_else(|| tl!("Choose a class field first.").to_string())?;
     let feature = l.dataset.features.row(*row).ok_or_else(|| tl!("The selected annotation is no longer available.").to_string())?;
-    if feature.value(fi) == &rustgis_engine::data::Value::Text(value.clone()) {
+    if feature.value(fi) == &rustgis_engine::data::Value::Text(value.clone()) && styled(app, &name, &value) {
         return Ok(());
     }
-    app.run("edit.setValue", json!({"layer":l.id,"row":row,"field":name,"value":value})).map(|_| ())
+    app.run("edit.setValue", json!({"layer":l.id,"row":row,"field":name,"value":value,"classStyle":true})).map(|_| ())
 }
 pub(crate) fn colours(app: &mut RustGisApp) -> Result<(), String> {
     sync(app);
@@ -294,7 +314,7 @@ pub(crate) fn panel(app: &mut RustGisApp, ui: &mut egui::Ui) {
         return;
     }
     if let Err(error) = field(app) {
-        ui.colored_label(egui::Color32::RED, error);
+        ui.colored_label(crate::theme::Tokens::get(ui.ctx()).red, error);
         if can_create && app.annotation.classes.field.as_deref() == Some("class") && ui.button(tl!("Retry class field creation")).clicked()
         {
             let _ = app.run("ui.annotationCreateClassField", json!({}));
@@ -363,10 +383,12 @@ mod tests {
     fn right_click_changes_only_the_clicked_shape_class_and_preserves_the_drawing_default() {
         use egui_kittest::kittest::Queryable;
         use rustgis_engine::{Tool, box_edit::Frame, data::Value as Cell, geom::Coord};
-        for (tool, row, center, value, pitch) in [
-            (Tool::Circle, 0, [-100000., 0.], "truck", 0.),
-            (Tool::RotatedBox, 1, [100000., 0.], "car", 0.),
-            (Tool::Select, 1, [100000., 0.], "car", 11.4),
+        for (tool, row, center, value, pitch, reset) in [
+            (Tool::Circle, 0, [-100000., 0.], "truck", 0., false),
+            (Tool::RotatedBox, 1, [100000., 0.], "car", 0., false),
+            (Tool::Select, 1, [100000., 0.], "car", 11.4, false),
+            (Tool::Circle, 0, [-100000., 0.], "truck", 0., true),
+            (Tool::Explore, 1, [100000., 0.], "car", 0., false),
         ] {
             let mut session = Session::new(Project::default());
             session.active_layer = Some(session.map_mut().add_dataset(Dataset::new(
@@ -392,6 +414,11 @@ mod tests {
             if row == 0 {
                 app.run("ui.annotationClass", json!({"value":"car"})).unwrap();
             }
+            if reset {
+                app.run("ui.annotationClass", json!({"value":"truck"})).unwrap();
+                app.run("ui.annotationClass", json!({"value":"car"})).unwrap();
+                app.run("layer.symbology", json!({"type":"single"})).unwrap();
+            }
             if pitch != 0. {
                 app.run("ui.pane.annotation", json!({})).unwrap();
                 app.run("map.setBearing", json!({"bearing":17})).unwrap();
@@ -401,6 +428,7 @@ mod tests {
             let layer = app.session.active_layer.unwrap();
             app.run("select.rows", json!({"rows":[1-row]})).unwrap();
             let before = app.session.map().layer(layer).unwrap().dataset.clone();
+            let before_renderer = app.session.map().layer(layer).unwrap().renderer.clone();
             let circle = app.session.circle_spec(layer, 0).unwrap();
             let bbox = app.session.box_spec(layer, 1).unwrap();
             let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1000., 800.)).with_max_steps(1000).build_ui_state(
@@ -432,10 +460,12 @@ mod tests {
                 vec![row],
                 "right-click targets the clicked object, not the old selection"
             );
-            assert!(
-                h.query_by_label("Convert to Shape…").is_none(),
-                "known annotation shapes keep editing and class actions, without refitting"
-            );
+            if tool != Tool::Explore {
+                assert!(h.query_by_label("Convert to Shape…").is_none(), "known annotation shapes keep their editing actions");
+            }
+            if tool == Tool::Explore {
+                assert_ne!(h.state().ui.right, Some(RightPane::Annotation), "ordinary polygon editing also offers Change class");
+            }
             let depth = h.state().session.undo_depth();
             h.get_by_label("Change class").click();
             h.run();
@@ -465,10 +495,16 @@ mod tests {
             assert_eq!(h.state().session.box_spec(layer, 1), Some(bbox.clone()));
             assert_eq!(h.state().annotation.classes.value.as_deref(), if row == 0 { Some("car") } else { None });
             assert_eq!(h.state().session.undo_depth(), depth + 1);
+            let after_renderer = h.state().session.map().layer(layer).unwrap().renderer.clone();
+            if reset {
+                assert!(after_renderer.legend().iter().any(|entry| entry.label == value), "a recent value restores its colour rule");
+            }
             h.state_mut().run("edit.undo", json!({})).unwrap();
+            assert_eq!(h.state().session.map().layer(layer).unwrap().renderer, before_renderer);
             assert_eq!(h.state().session.map().layer(layer).unwrap().dataset, before);
             h.state_mut().run("edit.redo", json!({})).unwrap();
             assert_eq!(h.state().session.map().layer(layer).unwrap().dataset.value(row, 0), &Cell::Text(value.into()));
+            assert_eq!(h.state().session.map().layer(layer).unwrap().renderer, after_renderer);
             if pitch != 0. {
                 assert!(!crate::boxedit::ready(h.state()));
                 h.get_by_label("Reset map tilt").click();
@@ -479,6 +515,41 @@ mod tests {
                 assert_eq!(h.state().session.box_spec(layer, 1), Some(bbox));
             }
         }
+    }
+
+    #[test]
+    fn class_names_are_normalised_bounded_and_never_coerced_to_missing_values() {
+        use rustgis_engine::data::Value as Cell;
+        let mut data = Dataset::new("Classes", GeometryType::Polygon, vec![Field::new("class", FieldType::Text)]);
+        data.push(None, vec![Cell::Text("seed".into())]);
+        let mut session = Session::new(Project::default());
+        let id = session.map_mut().add_dataset(data);
+        session.active_layer = Some(id);
+        let mut app = RustGisApp::new(session);
+        app.run("edit.enable", json!({"on":true})).unwrap();
+        app.run("select.rows", json!({"rows":[0]})).unwrap();
+        app.run("ui.annotationClass", json!({"value":"  car  "})).unwrap();
+        assert_eq!(app.annotation.classes.value.as_deref(), Some("car"));
+        assert!(app.session.map().layer(id).unwrap().renderer.legend().iter().any(|entry| entry.label == "car"));
+        app.run("ui.annotationAssignClass", json!({"value":"  truck  "})).unwrap();
+        assert_eq!(app.session.map().layer(id).unwrap().dataset.value(0, 0), &Cell::Text("truck".into()));
+        assert_eq!(app.annotation.classes.value.as_deref(), Some("car"));
+        for invalid in ["<null>".into(), "  <NuLl>  ".into(), "".into(), "  ".into(), "a".repeat(257), "类".repeat(257)] {
+            for command in ["ui.annotationClass", "ui.annotationAssignClass"] {
+                let before = serde_json::to_value(&app.session.project).unwrap();
+                let depth = app.session.undo_depth();
+                let notices = app.session.notice_mark();
+                assert!(app.run(command, json!({"value":invalid})).is_err());
+                assert_eq!(serde_json::to_value(&app.session.project).unwrap(), before);
+                assert_eq!(app.session.undo_depth(), depth);
+                assert_eq!(app.annotation.classes.value.as_deref(), Some("car"));
+                assert!(app.session.notices_since(notices).iter().any(|notice| notice.error), "command refusals already notify the user");
+            }
+        }
+        let maximum = "类".repeat(256);
+        app.run("ui.annotationClass", json!({"value":maximum})).unwrap();
+        app.run("ui.annotationAssignClass", json!({})).unwrap();
+        assert_eq!(app.session.map().layer(id).unwrap().dataset.value(0, 0), &Cell::Text(maximum));
     }
 
     #[test]

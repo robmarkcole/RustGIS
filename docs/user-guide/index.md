@@ -99,10 +99,10 @@ This guide walks through RustGIS by task. Each page covers one part of the app:
   and closes it when it is. **Pane Sets** keep the tabs open.
 - **Status bar**: the scale (type one, or pick from the list), the zoom level, bearing and pitch
   (click them to face north and look straight down again), the pointer's coordinates (click them
-  to step through decimal degrees, DMS, UTM and MGRS; see [Coordinate readouts](maps.md#coordinate-readouts)),
+  to step through map coordinates (the map's own system, the default), decimal degrees, DMS, UTM and MGRS; see [Coordinate readouts](maps.md#coordinate-readouts)),
   the coordinate system (click it to change the
   projection), the selection count (with a button to clear it), the latest notice (click to open
-  **Diagnostics**), a **Diagnostics** button, the last draw time, the frame rate and a **GPU**/**CPU**
+  **Messages**), a **Messages** button, the last draw time, the frame rate and a **GPU**/**CPU**
   renderer switch. While agents control the desktop app, it also shows the MCP relay or file bridge.
 
 **Command Search** (++ctrl+k++, or the box at the top right) finds commands and geoprocessing
@@ -465,7 +465,9 @@ should putting one back fail too, the message names the temporary file that hold
 Shapefile, so it can be renamed back by hand. Sidecars RustGIS doesn't write, such as `.shp.xml`
 metadata, are left alone. The spatial indexes that would no longer match (`.qix`, `.sbn`, `.sbx`)
 are removed where they can be; one that can't be (held open by another program) is left, and
-should be deleted before that program uses the file.
+should be deleted before that program uses the file. Once the new parts have landed, the hidden
+copies of the old ones are removed too; a copy that can't be removed is left beside the
+Shapefile, and the publish names it so it can be deleted.
 
 This rollback needs RustGIS to keep running. Replacing several Shapefile parts is not atomic:
 a process crash or power loss between renames can leave a mixed or incomplete set. Keep an
@@ -488,12 +490,16 @@ For `.geojson`, publish also checks that the source is unchanged, that it still 
 at the last sync, and that both the original and the edited layer survive a read/write. It keeps
 the document's kind (FeatureCollection, Feature or bare geometry), a collection's name, and
 feature ids. Ordinary integer coordinate text stays integer text when the value is unchanged.
-Whitespace and member order may change.
+Whitespace and member order may change. A legacy `crs` member is kept, and the layer is written
+back in the system it names (Swiss LV95 coordinates stay LV95); a layer whose coordinate system
+was defined again since is refused.
 
-Publish refuses a rewrite that would change foreign members, a legacy `crs` member, Z values,
+Publish refuses a rewrite that would change foreign members, Z values,
 a geometry the reader simplifies, nested properties it reads as text, duplicate object keys,
-or number text the writer would spell differently (such as `1.00` or `1E3`). The message says
-why; the original file stays unchanged. A file with feature ids requires the same internal row
+number text the writer would spell differently (such as `1.00`, `1E3`, or a decimal below
+0.00001 such as `0.000004`, which it writes `4e-6`), a property that mixes numbers and text
+(read as a text column, its numbers would be written as text), or a file that doesn't read whole
+(a feature the reader skips). The message says why; the original file stays unchanged. A file with feature ids requires the same internal row
 ids in the same order: adding, deleting or reordering rows is refused when their external ids
 couldn't be preserved, and the same holds for a layer without fields whose features mix absent,
 null and object `properties`. Absent or null `properties` are kept only in a layer without fields:

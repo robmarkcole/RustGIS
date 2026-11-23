@@ -106,6 +106,7 @@ pub(crate) fn for_each_row<T: Send, S>(
         return Ok(());
     }
     let run = control::current();
+    let plane = crate::convert::run_plane();
     let still = rustgis_data::source::remote::current_still();
     let rows = std::sync::Mutex::new(rows.enumerate());
     let failed = AtomicBool::new(false);
@@ -113,6 +114,7 @@ pub(crate) fn for_each_row<T: Send, S>(
         rustgis_data::source::remote::with_optional_still(still.clone(), || {
             let _stop = StopOnPanic(&failed);
             let _run = control::install(run.clone());
+            let _plane = crate::convert::install(plane);
             let mut s = scratch();
             let mut taken = Vec::with_capacity(BATCH);
             while !failed.load(Ordering::Relaxed) && !control::cancelled() {
@@ -209,6 +211,7 @@ fn try_map_by<T: Sync, S, R: Send, E: Send + From<Cancelled>>(
             .collect();
     }
     let run = control::current();
+    let plane = crate::convert::run_plane();
     let still = rustgis_data::source::remote::current_still();
     let next = AtomicUsize::new(0);
     let failed = AtomicBool::new(false);
@@ -216,6 +219,7 @@ fn try_map_by<T: Sync, S, R: Send, E: Send + From<Cancelled>>(
         rustgis_data::source::remote::with_optional_still(still.clone(), || {
             let _stop = StopOnPanic(&failed);
             let _run = control::install(run.clone());
+            let _plane = crate::convert::install(plane);
             let mut s = scratch();
             let mut made = Vec::new();
             while !failed.load(Ordering::Relaxed) {
@@ -498,6 +502,28 @@ mod tests {
         });
         assert!(r.is_err(), "no worker ran an item");
         assert!(ran.load(std::sync::atomic::Ordering::Relaxed) < items.len() / 2, "{}", ran.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// The threads a run starts work in its plane (#2032 C2e-2): a run in a projected system's own
+    /// plane isn't worked on in the analysis plane on the threads it hands rows or items to.
+    #[test]
+    fn the_threads_work_in_the_runs_plane() {
+        use crate::convert::{Plane, RunPlane, install, run_plane};
+        // A plane in US survey feet with x west and y south (`+axis=wsu`): its unit and axes go to
+        // the threads with it, into their scratch set-up too (#2032 C2e-3).
+        let run = RunPlane { plane: Plane::Own, unit_m: 0.304_800_609_601_219, axes: [(-1.0, 0.0), (0.0, -1.0)] };
+        let _own = install(run);
+        let items: Vec<u32> = (0..5_000).collect();
+        let set_up = std::sync::Mutex::new(Vec::new());
+        let planes = try_map_on(&items, 4, || set_up.lock().unwrap().push(run_plane()), |_, _, _| Ok::<_, Cancelled>(run_plane())).unwrap();
+        assert!(planes.iter().all(|p| *p == run));
+        let seen = std::sync::Mutex::new(Vec::new());
+        let mut rows = vec![0u8; 5_000];
+        for_each_row(rows.chunks_mut(1), 4, || set_up.lock().unwrap().push(run_plane()), |_, _, _| seen.lock().unwrap().push(run_plane()))
+            .unwrap();
+        assert!(seen.lock().unwrap().iter().all(|p| *p == run));
+        let set_up = set_up.into_inner().unwrap();
+        assert!(!set_up.is_empty() && set_up.iter().all(|p| *p == run), "{set_up:?}");
     }
 
     #[test]

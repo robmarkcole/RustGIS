@@ -62,9 +62,23 @@ pub(crate) fn publish_work(s: &Session, p: &Value) -> Result<super::exports::Wor
         let (synced, path, dataset, instance, name) =
             (synced.clone(), path.to_string(), l.dataset.clone(), l.instance_id(), l.name.clone());
         Ok(Box::new(move || {
-            let rows = rustgis_data::sync::rows_digest(&dataset).map_err(|e| e.to_string())?;
+            // The digests the record needs, before anything is written, so Cancel can't leave a
+            // written file without its record. A layer held in its own system is hashed as held
+            // (no conversion), and in longitude/latitude too only when its record is of that kind
+            // (an older release's kept no native one), in the same pass. A record of a kind not
+            // hashed here (a held layer read back in longitude/latitude) differs, so the layer
+            // takes what was read back: refreshed, never out of step.
+            let err = |e: rustgis_data::DataError| e.to_string();
+            let (lonlat_rows, native_rows) = if synced.native.is_none() || dataset.coord_crs() == rustgis_data::raster::Crs::LonLat {
+                let (rows, native) = rustgis_data::sync::digests(&dataset).map_err(err)?;
+                (Some(rows), native)
+            } else {
+                (None, Some(rustgis_data::sync::native_digest(&dataset).map_err(err)?))
+            };
+            let of_kind = |native: bool| if native { native_rows } else { lonlat_rows };
+            let rows = of_kind(synced.native.is_some());
             let features = dataset.features.len();
-            if rows == synced.rows {
+            if rows == Some(synced.digest()) {
                 let changed = synced.files.changed(std::path::Path::new(&path)).map_err(|e| e.to_string())?;
                 if !changed.is_empty() {
                     return Err(format!(
@@ -76,7 +90,7 @@ pub(crate) fn publish_work(s: &Session, p: &Value) -> Result<super::exports::Wor
                     answer: serde_json::json!({"layer": id, "path": path, "published": false, "features": features}),
                     diagnostics: Vec::new(),
                     refused_notes: Vec::new(),
-                    notes: vec![format!("{name} has no edits its file lacks, so {path} wasn't written")],
+                    notes: [format!("{name} has no edits its file lacks, so {path} wasn't written")].into_iter().collect(),
                     written_path: None,
                     then: None,
                     owner: None,
@@ -105,12 +119,15 @@ pub(crate) fn publish_work(s: &Session, p: &Value) -> Result<super::exports::Wor
                 }
             }
             held.crs = published.read.crs;
+            // In the system the file is read in, which a layer a project saved before RustGIS
+            // kept a file's own coordinates (held in longitude/latitude) takes with them.
+            held.held_in = published.read.coord_crs();
             // Already hashed before the files were placed: Cancel must not leave a successful
             // write without its sync record. Feature ids do not contribute to the digest.
-            let read = published.rows;
-            // Unchanged when the file reads as the layer is.
-            let held = (read != rows).then_some(held);
-            let new = rustgis_data::sync::Synced { files: published.files, rows: read };
+            let new = rustgis_data::sync::Synced { files: published.files, rows: published.rows, native: published.native };
+            // Unchanged when the file reads as the layer is: compared by the digest of the kind
+            // the new record keeps, hashed above.
+            let held = (of_kind(new.native.is_some()) != Some(new.digest())).then_some(held);
             let (said, written_path) = (path.clone(), Some(path.clone()));
             let then: Then = Box::new(move |s: &mut Session, _: &mut Value| {
                 let mark = s.notice_mark();
@@ -128,10 +145,12 @@ pub(crate) fn publish_work(s: &Session, p: &Value) -> Result<super::exports::Wor
                             && l.dataset.features.shares(&dataset.features)
                             && l.dataset.fields == dataset.fields
                             && l.dataset.crs == dataset.crs
+                            && l.dataset.held_in == dataset.held_in
                         {
                             l.dataset.features = held.features;
                             l.dataset.fields = held.fields;
                             l.dataset.crs = held.crs;
+                            l.dataset.held_in = held.held_in;
                             l.touch_geometry();
                             s.revision = s.revision.wrapping_add(1);
                         }
@@ -139,7 +158,7 @@ pub(crate) fn publish_work(s: &Session, p: &Value) -> Result<super::exports::Wor
                     }
                     _ => s.warn(format!("{said} was written, but {name} changed while it was: add the file again to compare them")),
                 }
-                s.notify_written(format!("Published {name} to {said}"), false);
+                s.notify_written(format!("Published {name} to {said}"));
                 s.retain_written_notices(mark);
                 Ok(())
             });
@@ -147,7 +166,7 @@ pub(crate) fn publish_work(s: &Session, p: &Value) -> Result<super::exports::Wor
                 answer: serde_json::json!({"layer": id, "path": path, "published": true, "features": published.features}),
                 diagnostics: Vec::new(),
                 refused_notes: Vec::new(),
-                notes: published.notes,
+                notes: published.notes.into(),
                 written_path,
                 then: Some(then),
                 owner: None,
@@ -197,7 +216,7 @@ pub(crate) fn sync_ahead(s: &Session, p: &Value) -> Option<super::reads::ReadWor
     let (synced, path, dataset) = (l.synced.clone()?, l.dataset.source.clone().filter(|p| local_file(p))?, l.dataset.clone());
     Some(super::reads::ahead("Source File State", ahead_key(id), move || {
         let changed = synced.files.changed(std::path::Path::new(&path)).map_err(|e| e.to_string());
-        let rows = rustgis_data::sync::rows_digest(&dataset).map_err(|e| e.to_string());
+        let rows = synced.digest_of(&dataset).map_err(|e| e.to_string());
         Checked { synced, path, dataset, rows, changed }
     }))
 }
@@ -227,7 +246,7 @@ fn sync_state(s: &mut Session, p: &Value) -> CmdResult {
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let (was, files, path) = (synced.rows, synced.files.clone(), path.to_string());
+        let (was, synced, path) = (synced.digest(), synced.clone(), path.to_string());
         let ahead = super::reads::take::<Checked>(s, &ahead_key(id));
         let l = s.map().layer(id).ok_or("the layer no longer exists")?;
         let (rows, changed) = match ahead {
@@ -235,8 +254,8 @@ fn sync_state(s: &mut Session, p: &Value) -> CmdResult {
             // Checking again here would hold the window: the check made on its thread is dropped.
             Some(_) => return Err("the layer or its file's record changed while it was checked: check again".into()),
             None => (
-                rustgis_data::sync::rows_digest(&l.dataset).map_err(|e| e.to_string())?,
-                files.changed(std::path::Path::new(&path)).map_err(|e| e.to_string())?,
+                synced.digest_of(&l.dataset).map_err(|e| e.to_string())?,
+                synced.files.changed(std::path::Path::new(&path)).map_err(|e| e.to_string())?,
             ),
         };
         let edited = rows != was;
@@ -253,9 +272,14 @@ fn sync_state(s: &mut Session, p: &Value) -> CmdResult {
 /// Whether `path` names a file on this computer a record is made for: a Shapefile or `.geojson`
 /// file, not an address, a database or a network share (`\\host\share`, `//host/share`,
 /// `/\host\share`, `\\?\UNC\host\share`). Windows' long form of a local path (`\\?\C:\…`) is one
-/// on this computer. The desktop's Layers pane marks the same layers this publishes.
+/// on this computer. A `file://` address isn't one: the record's file is opened by the path as
+/// written, so the path checked here is the one opened. The desktop's Layers pane marks the same
+/// layers this publishes.
 pub fn local_file(path: &str) -> bool {
-    let b = rustgis_map::paths::local_path(path).as_bytes();
+    if rustgis_map::paths::local_path(path) != path {
+        return false;
+    }
+    let b = path.as_bytes();
     let sep = |i: usize| b.get(i).is_some_and(|c| matches!(c, b'/' | b'\\'));
     // Windows takes any two leading separators, of either kind, for a network share, unless they
     // begin the long form of a path on a drive.

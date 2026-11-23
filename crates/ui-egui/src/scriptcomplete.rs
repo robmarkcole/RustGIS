@@ -862,7 +862,8 @@ fn step_value(script: &str, at: usize, session: &rustgis_engine::Session) -> Opt
 /// What a `gp.run` line's tool takes for the value being typed in its `"params"` (#788), by the
 /// kind of the tool's parameter of that key, as the tool's form offers it (`takes_layer`,
 /// `takes_field`): the layers of its kind, then the tables for one that takes any layer; the
-/// fields it takes of the layer or table the tool's first layer parameter names (before or after
+/// fields it takes of the layer or table named by the parameter whose fields it lists (the
+/// input `fieldlists::input` gives for its kind, else `panes::layer_for_param`, before or after
 /// it); or its choices. None for another kind: a number, a bool, a path, a text, several layers in
 /// one string.
 fn tool_value(script: &str, at: usize, session: &rustgis_engine::Session) -> Option<Offer> {
@@ -1193,6 +1194,14 @@ pub struct Help {
     pub location: String,
 }
 
+impl Help {
+    /// What the help says, for a screen reader: the command's name and what it does (the
+    /// signature and parameters left out, as code to read).
+    fn spoken(&self) -> String {
+        crate::completion::spoken(&self.label, Some(&self.about))
+    }
+}
+
 /// The help for command `id`, as Command Search names and places it (translated); None for an id
 /// no command has.
 pub fn help(session: &rustgis_engine::Session, id: &str) -> Option<Help> {
@@ -1310,6 +1319,26 @@ fn draw_help(ui: &mut Ui, help: &Help, width: f32) {
     });
 }
 
+/// Each layer's rows, by their allocation, as an offer's key: an expression's values and the note
+/// of what they were read from (`exprcomplete::ValuesRead`) come from them, and a streamed layer's
+/// read for the view replaces them with no command, so with no revision (`Layer::install`). As the
+/// expression box keys its own offer (`exprcomplete::expr_edit_lines`). Held weakly, never as an address
+/// hashed: rows freed and new ones at their address would pass for the same.
+#[derive(Clone)]
+struct Rows(Vec<std::sync::Weak<Vec<rustgis_engine::data::Feature>>>);
+
+impl Rows {
+    fn of(session: &rustgis_engine::Session) -> Self {
+        Self(session.map().layers.iter().map(|l| l.dataset.features.allocation_key()).collect())
+    }
+}
+
+impl PartialEq for Rows {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.len() == other.0.len() && self.0.iter().zip(&other.0).all(|(a, b)| a.ptr_eq(b))
+    }
+}
+
 /// The list's state between frames, kept in one place.
 #[derive(Clone, Default)]
 struct State {
@@ -1323,8 +1352,9 @@ struct State {
     /// The hash is taken each frame the box has focus: the length alone misses a script replaced by
     /// one as long, and a change made by code comes with no input event to wait for. It reads the
     /// text once, as egui's own layout already does each frame (the layouter's cache key, the
-    /// galley cache), so it adds a constant, not a new order of cost. And whether it was asked for.
-    worked: Option<Worked<(u64, u64, Option<u32>, bool), Option<Offer>>>,
+    /// galley cache), so it adds a constant, not a new order of cost. And whether it was asked for,
+    /// and the layers' rows (`Rows`).
+    worked: Option<Worked<(u64, u64, Option<u32>, bool, Rows), Option<Offer>>>,
     /// Where Ctrl+Space asked for the list: it shows there with nothing typed.
     asked: Asked,
     /// The help by the cursor (`hint`).
@@ -1449,7 +1479,7 @@ pub fn show(
     let work = |at: Option<usize>| {
         let text = egui::util::hash(script);
         let here = asked.here(text, at);
-        let with = (rustgis_engine::plugins::revision(), session.revision, session.active_layer, here);
+        let with = (rustgis_engine::plugins::revision(), session.revision, session.active_layer, here, Rows::of(session));
         Worked::get(worked, at, text, &with).unwrap_or_else(|| {
             let offer = at.and_then(|at| offer_at(script, at, &script_ids_cached(ui, session), session, here));
             *worked = Some(Worked { at, text, with, value: offer.clone() });
@@ -1487,9 +1517,34 @@ pub fn show(
             }
         }
     };
-    let clicked = state.list.show(ui, box_id.with("complete_list"), out, visible, work, icon, draw);
+    // What the help says, for a screen reader (`List::show`): the same sources as `draw`.
+    let describe = |offer: &Offer, item: &str| match &offer.of {
+        Some(Of::ToolIds) => rustgis_engine::analysis::tool(item).map(|t| tool_help(t).spoken()),
+        None | Some(Of::CommandIds) => help(session, item).map(|h| h.spoken()),
+        Some(Of::Expression(e)) => {
+            let ds = e.data.as_ref().and_then(|of| data_of(session, of));
+            crate::exprcomplete::describe_item(&e.offer, item, ds)
+        }
+        Some(of) => item_help(session, of, item).map(|(text, about)| crate::completion::spoken(&text, about.as_deref())),
+    };
+    let said = |offer: &Offer| rows_key(session, offer);
+    let clicked = state.list.show(ui, box_id.with("complete_list"), out, visible, work, icon, said, describe, draw);
     store(ui, box_id, state);
     clicked
+}
+
+/// A key of what the rows of `offer` say is read from (`List::show`'s `said`): the project, as the
+/// offer's own key has it (`show`'s `with`: plugins, the session's revision, the active layer), and
+/// for a list of layers each one's count of features, which a streamed layer's read for the view
+/// changes with no command, so with no revision.
+fn rows_key(session: &rustgis_engine::Session, offer: &Offer) -> u64 {
+    let mut key = egui::util::hash((rustgis_engine::plugins::revision(), session.revision, session.active_layer));
+    if matches!(offer.of, Some(Of::Layers)) {
+        for l in &session.map().layers {
+            key = egui::util::hash((key, l.id, l.dataset.features.len()));
+        }
+    }
+    key
 }
 
 /// After the list: with no list open, the help of the command whose parameters the cursor is in
@@ -1771,6 +1826,187 @@ mod tests {
         h.run();
         assert_eq!(h.state().workflow.script, "labels.style {}", "with its parameters' braces");
         assert!(h.query_by_label("labels.style").is_none(), "the list closed");
+    }
+
+    /// The highlighted entry is the box's active descendant, with what its help says, as the
+    /// highlight moves (#2619): a command its name and what it does, a field in an expression its
+    /// type (as the expression box says it).
+    #[test]
+    fn a_screen_reader_reads_the_highlighted_entry() {
+        use egui_kittest::kittest::{NodeT, Queryable};
+        let read = |h: &egui_kittest::Harness<'_, crate::RustGisApp>| {
+            let node = h.get_by_role(egui::accesskit::Role::MultilineTextInput);
+            node.accesskit_node().active_descendant().map(|row| (row.label().unwrap_or_default(), row.description().unwrap_or_default()))
+        };
+        let mut h = pane();
+        type_in(&mut h, "labels.sty");
+        let (label, said) = read(&h).expect("a row named");
+        assert_eq!(label, "labels.style");
+        assert_eq!(said, super::help(&h.state().session, "labels.style").unwrap().spoken());
+        h.key_press(egui::Key::Escape);
+        h.run();
+        assert_eq!(read(&h), None, "closed: no row named");
+        let mut h = pane();
+        type_in(&mut h, r#"select.byAttributes {"layer": "Countries", "where": "\"pop_"#);
+        let (label, said) = read(&h).expect("a row named");
+        assert_eq!(label, "pop_est");
+        assert!(!said.is_empty(), "the field's type");
+    }
+
+    /// The key of what a list's rows say (`rows_key`): a layer list's moves with a layer's count
+    /// of features, read with no command (a streamed layer's view); a command list's doesn't, so its
+    /// rows aren't read again; every list's moves with the session's revision (a command run).
+    #[test]
+    fn a_list_s_rows_are_keyed_by_what_they_read() {
+        use super::{Of, Offer, rows_key};
+        let mut app = crate::RustGisApp::with_sample();
+        let offer = |of: Of| Offer { start: 0, end: 0, items: Vec::new(), of: Some(of) };
+        let (layers, commands, tables) = (offer(Of::Layers), offer(Of::CommandIds), offer(Of::Tables));
+        let s = &mut app.session;
+        let was = [rows_key(s, &layers), rows_key(s, &commands), rows_key(s, &tables)];
+        let id = s.map().layer_by_name("Cities").map(|l| l.id);
+        if let Some(l) = id.and_then(|id| s.map_mut().layer_mut(id)) {
+            l.dataset.features.pop();
+        }
+        assert_ne!(rows_key(s, &layers), was[0], "a layer's count, with no command");
+        assert_eq!(rows_key(s, &commands), was[1], "a command list: no count in its key");
+        assert_eq!(rows_key(s, &tables), was[2]);
+        s.revision = s.revision.wrapping_add(1);
+        assert_ne!(rows_key(s, &tables), was[2], "a command run");
+        assert_ne!(rows_key(s, &commands), was[1]);
+    }
+
+    /// A layer's count of features changed while its list is open: the row says the new count, as
+    /// its help does, after a command and after a read with no command (`rows_key`).
+    #[test]
+    fn a_row_says_a_layer_s_new_count_while_its_list_is_open() {
+        use egui_kittest::kittest::{NodeT, Queryable};
+        let said = |h: &egui_kittest::Harness<'_, crate::RustGisApp>| {
+            let node = h.get_by_role(egui::accesskit::Role::MultilineTextInput);
+            node.accesskit_node().active_descendant().and_then(|row| Some((row.label()?, row.description()?)))
+        };
+        let count = |h: &egui_kittest::Harness<'_, crate::RustGisApp>| {
+            h.state().session.map().layer_by_name("Cities").map_or(0, |l| l.dataset.features.len())
+        };
+        let mut h = pane();
+        type_in(&mut h, r#"labels.style {"layer": "Citi"#);
+        let (label, before) = said(&h).expect("a row named");
+        assert_eq!(label, "Cities");
+        let n = count(&h);
+        assert!(before.contains(&format!(" {n} features")), "{before}");
+        // Some cities deleted as the app does it, by commands (which move the session's revision).
+        let session = &mut h.state_mut().session;
+        let revision = session.revision;
+        let ran = [
+            ("select.byAttributes", serde_json::json!({"layer": "Cities", "where": "pop_max > 10000000"})),
+            ("edit.enable", serde_json::json!({"on": true})),
+            ("edit.delete", serde_json::json!({})),
+        ]
+        .into_iter()
+        .all(|(id, params)| session.run(id, &params).is_ok());
+        assert!(ran && session.revision != revision, "deleted by commands");
+        h.run();
+        let left = count(&h);
+        assert!(left < n, "some deleted: {left} of {n}");
+        let (_, after) = said(&h).expect("still open");
+        assert!(after.contains(&format!(" {left} features")) && !after.contains(&format!(" {n} features")), "the new count: {after}");
+        // A streamed layer's read as the map is drawn: no command, the revision kept.
+        let session = &mut h.state_mut().session;
+        let id = session.map().layer_by_name("Cities").map(|l| l.id);
+        if let Some(l) = id.and_then(|id| session.map_mut().layer_mut(id)) {
+            l.dataset.features.pop();
+        }
+        h.run();
+        let (_, read) = said(&h).expect("still open");
+        assert!(read.contains(&format!(" {} features", left - 1)), "the count read with the view: {read}");
+    }
+
+    /// The highlighted row of the pane's list: its label and what it says.
+    fn row(h: &egui_kittest::Harness<'_, crate::RustGisApp>) -> Option<(String, String)> {
+        use egui_kittest::kittest::{NodeT, Queryable};
+        let node = h.get_by_role(egui::accesskit::Role::MultilineTextInput);
+        node.accesskit_node().active_descendant().and_then(|row| Some((row.label()?, row.description()?)))
+    }
+
+    /// The pane with Countries streamed (its dataset holds the features read for the view) and
+    /// `typed` in its box; Countries' id and count of features.
+    fn streamed(typed: &str) -> (egui_kittest::Harness<'static, crate::RustGisApp>, u32, usize) {
+        let mut h = pane();
+        let map = h.state_mut().session.map_mut();
+        let id = map.layer_by_name("Countries").map(|l| l.id).expect("Countries");
+        let layer = map.layer_mut(id).expect("Countries");
+        layer.dataset.windowed = true;
+        let n = layer.dataset.features.len();
+        type_in(&mut h, typed);
+        (h, id, n)
+    }
+
+    /// A layer's view read as the map reads it, with no command (`Layer::install`): new rows,
+    /// `change` made to them.
+    fn read_view(
+        h: &mut egui_kittest::Harness<'static, crate::RustGisApp>,
+        id: u32,
+        change: impl FnOnce(&mut Vec<rustgis_engine::data::Feature>),
+    ) {
+        let session = &mut h.state_mut().session;
+        let revision = session.revision;
+        if let Some(l) = session.map_mut().layer_mut(id) {
+            let mut rows: Vec<_> = l.dataset.features.iter().cloned().collect();
+            change(&mut rows);
+            l.dataset.features = rows.into();
+        }
+        assert_eq!(h.state().session.revision, revision, "no command");
+        h.run();
+    }
+
+    const WHERE_NAME: &str = r#"select.byAttributes {"layer": "Countries", "where": "name = '"#;
+
+    /// A streamed layer's view read while its values' list is open (#2718): the row says the
+    /// new count read for the view, the highlight kept on its value.
+    #[test]
+    fn a_value_s_note_says_a_streamed_layer_s_new_count() {
+        let (mut h, id, n) = streamed(WHERE_NAME);
+        let (label, before) = row(&h).expect("a value's row");
+        assert!(before.contains(&format!("the {n} features read for the view")), "{before}");
+        let name = h.state().session.map().layer(id).and_then(|l| l.dataset.field_index("name")).expect("name");
+        // A feature other than the highlighted value's leaves the view.
+        let other = |f: &rustgis_engine::data::Feature| !matches!(f.attrs.get(name), Some(rustgis_engine::data::Value::Text(t)) if label.contains(t.as_str()));
+        read_view(&mut h, id, |rows| {
+            if let Some(i) = rows.iter().rposition(other) {
+                rows.remove(i);
+            }
+        });
+        let (kept, after) = row(&h).expect("still open");
+        assert!(after.contains(&format!("the {} features read for the view", n - 1)), "the count read with the view: {after}");
+        assert_eq!(kept, label, "the highlight kept on its value");
+    }
+
+    /// A streamed layer's view read with as many features, but others (#2718): the list offers
+    /// the values read.
+    #[test]
+    fn a_streamed_layer_s_values_follow_its_view() {
+        let (mut h, id, _) = streamed(&format!("{WHERE_NAME}Zzy"));
+        assert_eq!(row(&h), None, "no value starts so");
+        let name = h.state().session.map().layer(id).and_then(|l| l.dataset.field_index("name")).expect("name");
+        read_view(&mut h, id, |rows| {
+            if let Some(a) = rows.last_mut().and_then(|f| f.attrs.get_mut(name)) {
+                *a = rustgis_engine::data::Value::Text("Zzyzx".into());
+            }
+        });
+        let (label, _) = row(&h).expect("the value read");
+        assert!(label.contains("Zzyzx"), "{label}");
+    }
+
+    /// Another layer's view read (#2718): the values' row still says its own layer's count.
+    #[test]
+    fn a_value_s_note_keeps_its_count_when_another_layer_reads() {
+        let (mut h, _, n) = streamed(WHERE_NAME);
+        let cities = h.state().session.map().layer_by_name("Cities").map(|l| l.id).expect("Cities");
+        read_view(&mut h, cities, |rows| {
+            rows.pop();
+        });
+        let (_, said) = row(&h).expect("still open");
+        assert!(said.contains(&format!("the {n} features read for the view")), "{said}");
     }
 
     /// In an expression's string (#1240) the list holds the line's layer's fields, Enter puts the

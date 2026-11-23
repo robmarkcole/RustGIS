@@ -20,8 +20,8 @@ pub enum Marker {
     Star,
     /// A character of a font, as QGIS's font markers draw one: the size is the font's em.
     Char(Glyph),
-    /// A PNG or JPEG image, as QGIS's raster image markers draw one: the size is its width, its
-    /// height as the image's proportions make it. Its fill and outline don't change it.
+    /// A PNG, JPEG or SVG image, as QGIS's raster image markers draw one: the size is its width,
+    /// its height as the image's proportions make it. Its fill and outline don't change it.
     Picture(Picture),
 }
 
@@ -113,7 +113,7 @@ pub const MAX_PICTURES_BYTES: usize = 64 << 20;
 /// The longest picture kept, in bytes of base64 (2 MiB): a marker's image is an icon.
 pub const MAX_PICTURE_BYTES: usize = 2 << 20;
 
-/// A picture marker's image: a PNG or JPEG as base64, kept once for the rest of the run so a
+/// A picture marker's image: a PNG, JPEG or SVG as base64, kept once for the rest of the run so a
 /// symbol showing one stays `Copy`. The same image is the same `Picture`, so two are compared
 /// (and hashed, for the sprites a point layer is stamped from) by where it's kept, not by its
 /// bytes. Empty (the default) for an image that wasn't kept: one longer than
@@ -1313,6 +1313,11 @@ impl Renderer {
         ramp: Ramp,
         base: Symbol,
     ) -> Result<Renderer, String> {
+        // The lowest number is how an open first class says it is open (`range_label`), so it
+        // can't be a bound of closed classes either.
+        if breaks.contains(&OPEN_BELOW) {
+            return Err(format!("manual breaks must be above {OPEN_BELOW:e}"));
+        }
         Self::graduated_by(ds, rows, field, ClassMethod::Manual, ramp, base, |vals| {
             manual_bounds(breaks, f64::is_finite, vals.last().copied())
         })
@@ -4540,6 +4545,9 @@ mod tests {
         assert_eq!(breaks(open(&b).unwrap()), b);
         // The lowest number marks the open first class, so as a bound it is refused, not dropped.
         assert_eq!(open(&[0.0, f64::MIN]).unwrap_err(), "manual breaks must be above -1.7976931348623157e308");
+        // Closed classes refuse it too: it would read as an open first class.
+        let closed = Renderer::graduated_manual(&heights(&[Some(1.0), Some(5.0)]), &[], "height", &[f64::MIN, 3.0], Ramp::Ember, base);
+        assert_eq!(closed.unwrap_err(), "manual breaks must be above -1.7976931348623157e308");
         // The open class alone stays one class of every value.
         let one = open(&[OPEN_ABOVE]).unwrap();
         assert_eq!(labels_of(&one), ["every value"]);

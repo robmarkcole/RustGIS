@@ -130,7 +130,10 @@ fn image_grid_tags<R: Read + Seek>(dec: &mut Decoder<R>) -> Result<Vec<u16>> {
         if matches!(key, 2048 | 3072) && (location != 0 || count != 1) {
             return Err(err("image grid has an invalid coordinate system GeoKey"));
         }
-        if matches!(key, 1024 | 1025) && (location != 0 || count != 1 || !matches!(value, 1 | 2)) {
+        if key == 1024 && (location != 0 || count != 1 || !matches!(value, 1 | 2)) {
+            return Err(err("image grid requires a projected or geographic coordinate system (GTModelTypeGeoKey 1 or 2)"));
+        }
+        if key == 1025 && (location != 0 || count != 1 || !matches!(value, 1 | 2)) {
             return Err(err("image grid requires two-dimensional area or point GeoTIFF georeferencing"));
         }
     }
@@ -1124,6 +1127,15 @@ fn decoding_limit() -> usize {
     max_samples().saturating_mul(4)
 }
 
+/// The tiff crate's limits for reading a whole file's image: [`decoding_limit`] decoded.
+fn limits() -> Limits {
+    let mut l = Limits::default();
+    l.decoding_buffer_size = decoding_limit();
+    l.intermediate_buffer_size = 256 << 20;
+    l.ifd_value_size = 64 << 20;
+    l
+}
+
 /// Fewest chunks worth decoding on more than one thread.
 #[cfg(not(target_arch = "wasm32"))]
 const PARALLEL_CHUNKS: u64 = 16;
@@ -1312,7 +1324,79 @@ pub fn read<R: Read + Seek>(r: R, name: &str) -> Result<Raster> {
 
 /// [`read`], with the no-data value a sidecar gives (see [`read_limited_with_nodata`]).
 pub(super) fn read_with_nodata<R: Read + Seek>(r: R, name: &str, sidecar_nodata: Option<f64>) -> Result<Raster> {
-    read_limited_with_nodata(reader(r).map_err(err)?, name, max_samples(), None, sidecar_nodata)
+    read_limited_with_nodata(reader(r).map_err(err)?, name, max_samples(), None, sidecar_nodata, None)
+}
+
+/// [`read`] of a file asked for in `asked` (a WCS coverage requested in its own system, #2032):
+/// a file that doesn't say its coordinate system, and whose coordinates aren't degrees, is read in
+/// `asked`, and said. One that names a system is read in it, as [`read`] reads it.
+pub fn read_asked_in<R: Read + Seek>(r: R, name: &str, asked: Crs) -> Result<Raster> {
+    read_limited_with_nodata(reader(r).map_err(err)?, name, max_samples(), None, None, Some(asked))
+}
+
+/// A single-band `UInt32` GeoTIFF of packed colour, each pixel `0xAABBGGRR` (alpha, blue, green
+/// and red bytes, as GeoLibre's colour tools write a composite), as four `UInt8` bands, red,
+/// green, blue and alpha, exact: read as one band (`grey`, [`read`] of `bytes`) its values are
+/// held as `f32`, whose 24 bits drop the red byte (#2594). A pixel whose alpha is 0, that is the
+/// file's no-data value (compared exactly), or that its transparency mask hides is see-through.
+/// `None` when it isn't packed colour: not one `UInt32` band, or a pixel left visible whose alpha
+/// byte is neither 0 nor 255, or none at 255 (a band of counts or IDs). `grey` tells which files
+/// to decode again; their raw values decide. A rotated or skewed file (read resampled north up),
+/// one without coordinates (a stand-in place), or one too large to hold four bands of, is an
+/// error, for the caller to say. The image is
+/// decoded once more, on one thread: at the peak, `grey`, the packed `u32`s and the four bands,
+/// six times the band. What `grey` lost as it was read (its `lost`) is left for the caller to say.
+pub fn unpack_rgba(grey: &Raster, bytes: &[u8]) -> Result<Option<Raster>> {
+    let [band] = &grey.bands[..] else { return Ok(None) };
+    if grey.data_type != "UInt32" {
+        return Ok(None);
+    }
+    // As `f32`, values under 2^24 are exact and only 0xFEFFFF80–0xFEFFFFFF round up to
+    // 0xFF000000: the raw values below settle those, and no-data. A value in between is no
+    // colour unless it is no-data; any value at 0xFF000000 or past may be an opaque one.
+    let between = |v: f32| (16_777_216.0..4_278_190_080.0).contains(&v);
+    let may_be_packed = !band.data.iter().any(|v| between(*v) && grey.is_valid(*v)) && band.data.iter().any(|v| *v >= 4_278_190_080.0);
+    if !may_be_packed {
+        return Ok(None);
+    }
+    let mut dec = Decoder::new(reader(std::io::Cursor::new(bytes)).map_err(err)?).map_err(err)?.with_limits(limits());
+    let (w, h) = dec.dimensions().map_err(err)?;
+    if geo_tags(&mut dec)?.affine.is_some() {
+        return Err(err("it is rotated or skewed, which packed colours aren't split for"));
+    }
+    let n = (w as usize).saturating_mul(h as usize);
+    // An overview's pixels aren't the image's: its colours come from the whole image, as four bands.
+    if grey.overview.is_some() || (grey.width, grey.height) != (w, h) || n.saturating_mul(4) > max_samples() {
+        return Err(err(format!(
+            "its {w} × {h} pixels are too many to hold as four bands: clip the tool's inputs to a smaller area first"
+        )));
+    }
+    let DecodingResult::U32(packed) = dec.read_image().map_err(err)? else { return Ok(None) };
+    if packed.len() != n || band.data.len() != n {
+        return Err(err(format!("its image holds {} values, not {w} × {h}", packed.len())));
+    }
+    // No-data, exactly, or hidden by the file's transparency mask (NaN as read).
+    let hole = |i: usize, p: u32| grey.nodata == Some(f64::from(p)) || band.data.get(i).is_some_and(|v| v.is_nan());
+    let shown = || packed.iter().enumerate().filter(|(i, p)| !hole(*i, **p)).map(|(_, p)| p >> 24);
+    if !shown().all(|a| a == 0 || a == 255) || !shown().any(|a| a == 255) {
+        return Ok(None);
+    }
+    // A file with no GeoTIFF tags has only a stand-in place, which the rebuilt raster would
+    // hold, and be written with, as coordinates.
+    if !grey.georeferenced {
+        return Err(err("it has no coordinates, and packed colours are split only with them"));
+    }
+    let (cols, rows) = (w as usize, h as usize);
+    let channel = |shift: u32| super::collected(cols, rows, packed.iter().map(|p| ((p >> shift) & 0xFF) as f32));
+    let opacity = packed.iter().enumerate().map(|(i, &p)| if hole(i, p) { 0.0 } else { (p >> 24) as f32 });
+    let alpha = super::collected(cols, rows, opacity)?;
+    let bands = vec![channel(0)?, channel(8)?, channel(16)?, alpha];
+    let mut rgba = Raster::new(grey.name.clone(), w, h, bands, grey.transform, grey.crs, None, ColorHint::Rgb { alpha: true }, "UInt8")?;
+    for (b, name) in rgba.bands.iter_mut().zip(["Red", "Green", "Blue", "Alpha"]) {
+        b.name = name.into();
+    }
+    rgba.copyright.clone_from(&grey.copyright);
+    Ok(Some(rgba))
 }
 
 /// What reading a GeoTIFF from the parts of it read so far came to.
@@ -1393,7 +1477,7 @@ fn read_file_with_revision(
     };
     let decoded = reader(std::io::BufReader::new(file))
         .map_err(err)
-        .and_then(|r| read_limited_with_nodata(r, name, max_samples(), Some(&open), sidecar_nodata));
+        .and_then(|r| read_limited_with_nodata(r, name, max_samples(), Some(&open), sidecar_nodata, None));
     // A file cut short while it is read fails to decode: the revision says whether that was a
     // change to wait out (Cancel is said as itself).
     if let Ok(original) = &revision
@@ -1414,7 +1498,7 @@ fn read_file_with_revision(
 /// [`read`], holding at most `max` samples (the tests' small limit exercises the overviews), with
 /// `open` making more readers of the same file for decoding it on several threads.
 pub(super) fn read_limited(r: Reader<'_>, name: &str, max: usize, open: Option<Opener<'_>>) -> Result<Raster> {
-    read_limited_with_nodata(r, name, max, open, None)
+    read_limited_with_nodata(r, name, max, open, None, None)
 }
 
 /// [`read_limited`], with the no-data value a sidecar gives (`.aux.xml`, applied after reading by
@@ -1425,19 +1509,14 @@ pub(super) fn read_limited_with_nodata(
     max: usize,
     open: Option<Opener<'_>>,
     sidecar_nodata: Option<f64>,
+    asked: Option<Crs>,
 ) -> Result<Raster> {
     // The full image says whether it is read as a palette image, whichever image is read, as a
     // COG window has it: a grey full image's stray colour table colours nothing, nor do palette
     // overviews of it.
     let palette = r.first_is_palette();
     let wide_rgb = r.first_is_wide_rgb();
-    let limits = {
-        let mut l = Limits::default();
-        l.decoding_buffer_size = decoding_limit();
-        l.intermediate_buffer_size = 256 << 20;
-        l.ifd_value_size = 64 << 20;
-        l
-    };
+    let limits = limits();
     let mut dec = Decoder::new(r).map_err(err)?.with_limits(limits.clone());
     let (full_w, full_h) = dec.dimensions().map_err(err)?;
     let geo = geo_tags(&mut dec)?;
@@ -1463,6 +1542,7 @@ pub(super) fn read_limited_with_nodata(
         Err(e) => (None, Some(format!("its Copyright tag: it can't be read ({e}), so it is left out"))),
     };
     let spp = samples(&mut dec);
+    let full_alpha = extra_alpha(&mut dec);
     let bytes = sample_bytes(&mut dec);
     // The decoded image is held at its own pixel size before conversion to f32, so bound bytes
     // as well as samples.
@@ -1492,9 +1572,14 @@ pub(super) fn read_limited_with_nodata(
             }
             let Ok((ow, oh)) = dec.dimensions() else { continue };
             let (ospp, obytes) = (samples(&mut dec), sample_bytes(&mut dec));
-            // An overview with another sample count (three of an RGBI image's four) would read
-            // as another kind of image: the full image is read sparsely instead.
-            if ospp == spp && fits(ow, oh, ospp, obytes) && best.is_none_or(|(_, bw, bh)| ow as u64 * oh as u64 > bw as u64 * bh as u64) {
+            // An overview with another sample count (three of an RGBI image's four), or another
+            // alpha role for the sample past the colour ones (an RGBA overview of an RGBI image),
+            // would read as another kind of image: the full image is read sparsely instead.
+            if ospp == spp
+                && extra_alpha(&mut dec) == full_alpha
+                && fits(ow, oh, ospp, obytes)
+                && best.is_none_or(|(_, bw, bh)| ow as u64 * oh as u64 > bw as u64 * bh as u64)
+            {
                 best = Some((index, ow, oh));
             }
         }
@@ -1757,7 +1842,10 @@ pub(super) fn read_limited_with_nodata(
             {
                 return Err(DataError::Format(e.clone()));
             }
-            if geo.geographic_model || degrees {
+            if let Some(asked) = asked.filter(|_| geo.custom_error.is_none() && !geo.geographic_model && !degrees) {
+                assumed = Some(format!("it doesn't say its coordinate system: read in {}, the system it was asked for in", asked.label()));
+                asked
+            } else if geo.geographic_model || degrees {
                 assumed = Some(match &geo.custom_error {
                     // The file's own projection couldn't be read, but its coordinates fit in degrees:
                     // why is said, not dropped.
@@ -1786,6 +1874,7 @@ pub(super) fn read_limited_with_nodata(
     r.copyright = copyright.filter(|c| !c.is_empty());
     r.lost.extend(copyright_lost);
     r.lost.extend(super::planetary::note_of(crs));
+    r.crs_assumed = assumed.is_some();
     r.lost.extend(assumed);
     r.lost.extend(turned);
     r.lost.extend(table_lost);
@@ -1925,8 +2014,10 @@ pub fn write(r: &Raster, band: usize) -> Result<Vec<u8>> {
 }
 
 /// Writes every band of a raster, for a layer whose pixels the project keeps: as [`write`] does
-/// when that keeps them all, otherwise as 32-bit float samples (RGB first for a colour raster,
-/// and alpha after them when it has one), which [`read`] reads back as the same bands.
+/// when that keeps them all. Otherwise: 8-bit samples when the raster is `UInt8` and every valid
+/// value is a whole number in 0–255 (an empty cell only where no-data can mark it), else 32-bit
+/// float samples (RGB first for a colour raster, and alpha after them when it has one). [`read`]
+/// reads them back as the same bands.
 pub fn write_all(r: &Raster) -> Result<Vec<u8>> {
     encode(r, 0, true)
 }
@@ -2583,6 +2674,24 @@ mod tests {
         }
         img.write_data(&[1u8, 2, 3, 4]).unwrap_or_else(|e| panic!("{e}"));
         out.into_inner()
+    }
+
+    /// A file asked for in a system (a WCS coverage, #2032) that doesn't say its own is read in it
+    /// when its coordinates aren't degrees, and says so; one that names its system, or whose
+    /// coordinates are degrees, is read as [`read`] reads it.
+    #[test]
+    fn a_file_without_its_system_is_read_in_the_one_asked_for() {
+        let lv95 = Crs::from_epsg(2056).unwrap();
+        let metres = placed_tiff((2_600_000.0, 1_200_100.0), 10.0, None);
+        assert!(read(std::io::Cursor::new(metres.clone()), "g").is_err());
+        let r = read_asked_in(std::io::Cursor::new(metres), "g", lv95).unwrap();
+        assert_eq!((r.crs, r.transform.origin_x), (lv95, 2_600_000.0));
+        assert!(r.crs_assumed && r.lost.iter().any(|l| l.contains("read in EPSG:2056, the system it was asked for in")), "{:?}", r.lost);
+        let named = placed_tiff((600_000.0, 5_200_000.0), 10.0, Some(&[1, 1, 0, 1, 3072, 0, 1, 25832]));
+        let r = read_asked_in(std::io::Cursor::new(named), "g", lv95).unwrap();
+        assert_eq!((r.crs, r.crs_assumed), (Crs::from_epsg(25832).unwrap(), false));
+        let degrees = placed_tiff((7.4, 47.0), 0.01, None);
+        assert_eq!(read_asked_in(std::io::Cursor::new(degrees), "g", lv95).unwrap().crs, Crs::LonLat);
     }
 
     /// A grid whose file gives no usable coordinate system but whose coordinates fit in degrees is
@@ -3611,6 +3720,58 @@ mod tests {
         }
     }
 
+    /// Sets the ExtraSamples value of each image with one, in turn, of a file
+    /// [`rgb_tiled_samples`] wrote.
+    fn set_extra_samples(bytes: &mut [u8], values: &[u16]) {
+        // The tag's entry: 338, type 3 (short), count 1, the value 0 as written.
+        let entry = [0x52, 0x01, 3, 0, 1, 0, 0, 0, 0, 0, 0, 0];
+        let at: Vec<usize> = (0..bytes.len().saturating_sub(12)).filter(|i| bytes[*i..*i + 12] == entry).collect();
+        assert_eq!(at.len(), values.len());
+        for (at, value) in at.iter().zip(values) {
+            bytes[at + 8..at + 10].copy_from_slice(&value.to_le_bytes());
+        }
+    }
+
+    /// An overview with the full image's sample count but another alpha role (an RGBA overview of
+    /// an RGBI image, or the reverse) is left out and said, not decoded with the full image's
+    /// colour layout; one with the same role is a level, with nothing said.
+    #[test]
+    fn cog_overviews_require_a_matching_alpha_sample() {
+        use super::super::cog::{self, Parse, Sparse};
+        for (full, overview) in [(0, 0), (2, 2), (0, 2), (2, 0)] {
+            let mut bytes = rgb_tiled_samples(&[(40, 16, 4), (20, 16, 4)], 8, 1, |b, x, y| (b * 10 + x + y) as u16);
+            set_extra_samples(&mut bytes, &[full, overview]);
+            let whole = Sparse::default().with_len(bytes.len() as u64).with(0, bytes);
+            let Parse::Done(layout) = cog::layout(&whole).unwrap() else { panic!("not a COG") };
+            let said: Vec<_> = layout.lost.iter().filter(|n| n.contains("overview(s)")).collect();
+            if full == overview {
+                assert_eq!(layout.levels.len(), 2);
+                assert!(said.is_empty(), "{:?}", layout.lost);
+            } else {
+                assert_eq!(layout.levels.len(), 1);
+                let role = if overview == 2 { "image 1 (4, with alpha)" } else { "image 1 (4, without alpha)" };
+                assert!(said.len() == 1 && said[0].contains("an alpha sample") && said[0].contains(role), "{:?}", layout.lost);
+            }
+        }
+    }
+
+    /// The scan stops at its most levels, and says so when the file holds more images; a file
+    /// with fewer says nothing of it.
+    #[test]
+    fn cog_says_when_it_stops_at_its_most_levels() {
+        use super::super::cog::{self, Parse, Sparse};
+        const STOPPED: &str = "the scan for overviews stopped at 32 levels";
+        for (images, cut) in [(32u32, false), (33, true)] {
+            // The full image 64 wide, its overviews 63, 62, … wide, smallest last.
+            let sizes: Vec<(u32, u32, u16)> = (0..images).map(|k| (64 - k, 16, 3)).collect();
+            let bytes = rgb_tiled_samples(&sizes, 8, 1, |b, x, y| (b + x + y) as u16);
+            let whole = Sparse::default().with_len(bytes.len() as u64).with(0, bytes);
+            let Parse::Done(layout) = cog::layout(&whole).unwrap() else { panic!("not a COG") };
+            assert_eq!(layout.levels.len(), 32.min(images as usize));
+            assert_eq!(layout.lost.iter().any(|n| n.contains(STOPPED)), cut, "{:?}", layout.lost);
+        }
+    }
+
     #[test]
     fn cog_overviews_require_matching_sample_counts() {
         use super::super::cog::{self, Parse, Sparse};
@@ -3628,11 +3789,9 @@ mod tests {
                     let Parse::Done(layout) = cog::layout(&whole).unwrap() else { panic!("not a COG") };
                     assert_eq!((layout.levels.len(), layout.bands), (1, usize::from(full)));
                     assert!(
-                        layout
-                            .lost
-                            .iter()
-                            .any(|n| n.contains(&format!("1 overview(s) with samples per pixel other than the full image's {full}"))
-                                && n.contains(&format!("image 1 ({overview})"))),
+                        layout.lost.iter().any(|n| n.contains(&format!(
+                            "1 overview(s) with samples per pixel or an alpha sample other than the full image's ({full})"
+                        )) && n.contains(&format!("image 1 ({overview})"))),
                         "{:?}",
                         layout.lost
                     );
@@ -3649,7 +3808,8 @@ mod tests {
             layout
                 .lost
                 .iter()
-                .any(|n| n.contains("1 overview(s) with samples per pixel other than the full image's 4") && n.contains("image 2 (3)")),
+                .any(|n| n.contains("1 overview(s) with samples per pixel or an alpha sample other than the full image's (4)")
+                    && n.contains("image 2 (3)")),
             "{:?}",
             layout.lost
         );

@@ -146,20 +146,35 @@ you edit the value or choose units; click **Apply elevation** to apply the new i
 - **Settings**: **Show Vertices** marks the vertices of the selected features even when Edit
   Vertices isn't on (`edit.settings={"showVertices": true}`).
 - **Elevation**: new features get a `z` attribute, constant or sampled from a raster surface at
-  the feature's label point; this is not a change to its geometry's coordinates.
+  the feature's label point, as the layer holds it, placed on the surface by the transformation
+  between the two systems; this is not a change to its geometry's coordinates. An edit whose
+  label point the surface's system can't give is refused.
 - **Ground to grid**: a scale factor and rotation applied to entered distances and directions
   (Move, and `edit.traverse`, which draws a line or polygon from distances and bearings).
 - **Topology**: rules (must not overlap, must not have gaps, must not self-intersect, must not
   have dangles, must be covered by); Validate lists the errors, and clicking one zooms to it.
+  Primary rows follow the layer's definition query, independently of selection, time windows
+  and display filters. For **must be covered by**, every resident row of the covering layer
+  supplies the reference coverage; its map filters do not narrow that reference set.
+  A layer held in a projected system is checked in its own coordinates, as the analysis tools
+  work in it. The dangle tolerance (`toleranceM`, 1 m by default) is measured flat there in its
+  unit, an overlap or gap counts from a square metre of it, and a covering layer is converted
+  into it, with a notice when its long edges, taken straight there, run more than a metre from
+  where a check in longitude/latitude takes them. A rule whose covering layer that system can't
+  hold is checked in longitude/latitude instead, and says so. A layer in Web Mercator, another
+  world projection or a geographic system is checked in longitude/latitude, its dangle tolerance
+  on the ground. An error at a place that can't be given in longitude/latitude, where the Error
+  Inspector would zoom, refuses the check, naming the layer and feature.
   On the desktop the check runs in the background, so the map stays in use: the status bar
   shows **Error Inspector** with its progress and **Cancel**, and a check that can be cancelled
   takes any amount of work (a gaps rule first joins all its polygons in one step, which
   **Cancel** stops only once it is done). A layer edited while it is checked makes the check say
-  so: run Validate again. Checked from a script, the assistant or the command line, it holds
-  the window and stops after a fixed amount of work, saying which rules weren't checked
-  completely (a gaps rule's join of its polygons has no such limit). A line or ring too complex
-  to check for self-intersections within the limit is listed at its first point, to be looked
-  at, and its rule is said to be incomplete.
+  so: run Validate again. Headless script, assistant and command-line calls check on their
+  caller's thread; when they cannot be cancelled, they stop after a fixed amount of work,
+  saying which rules weren't checked completely (a gaps rule's join has no such limit).
+  A desktop window requires the background queue instead of running the check inline. A line or
+  ring too complex to check for self-intersections within the limit is listed at its first point,
+  to be looked at, and its rule is said to be incomplete.
   Beyond 85.05° they follow the geometry tools (see
   [Geoprocessing tools](analysis.md#geoprocessing-tools), **Near the poles**).
 - **Status**: features added, changed and deleted per layer since the last save.
@@ -208,8 +223,12 @@ For multiclass annotation, choose an existing text **Class field**, or explicitl
 field** to add a text field named `class`. When choosing a target layer, a unique text field named
 `class` (ignoring case) is selected automatically. **No class field** remains an explicit opt-out
 while that target stays active; no class value is chosen automatically. Choose an **Active class** or enter a new name and
-click **Use class**. On desktop, creating the field runs in the background with progress and
+click **Use class**. Class names are trimmed, limited to 256 characters and cannot use the
+reserved missing-value marker `<Null>`. On desktop, creating the field runs in the background with progress and
 Cancel; wait for it before choosing a class. If cancelled, use **Retry class field creation**.
+On GeoPackage/PostGIS editing layers, a new local field does not create a database column.
+Save Edits reports fields with no matching column and keeps their local values. Save the project
+or export GeoJSON to preserve them, or create the database column before annotating.
 Each new circle or rotated box captures that class when the drag starts;
 changing the default afterwards affects subsequent shapes. Other template defaults are kept.
 **No class default** leaves the class to the normal template/default rules.
@@ -226,7 +245,10 @@ undoable. Class defaults reset when changing target layer, project or map; a rem
 must be restored or another field chosen before drawing with that default.
 Alternatively, right-click an annotation and choose **Change class** for a direct, undoable
 assignment from the same styled/recent classes. This changes only the clicked annotation and
-keeps the active class for new shapes. **Other class…** opens Annotate to enter another name.
+keeps the active class for new shapes. Missing colour rules are restored atomically with the
+attribute assignment; a refusal changes neither. **Other class…** opens Annotate to enter another name.
+This menu also works in ordinary polygon editing outside Annotate, with editing enabled and a
+unique text `class` field (or a class field chosen earlier in Annotate).
 Opening Annotate resets map tilt to zero without changing its bearing. While Annotate is open,
 or a circle/rotated-box tool is active, right-drag and Ctrl-drag in Explore pan instead of
 rotating/tilting; Shift+arrow keys also pan. Zoom remains available, and the box's rotation handle

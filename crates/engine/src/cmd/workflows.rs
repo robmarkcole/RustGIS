@@ -82,6 +82,7 @@ pub fn commands() -> Vec<C> {
             r#"{"layer": polygons, "count"?: points per polygon, "seed"?: number, "field"?: numeric field (count per polygon from it, scaled by "rate"), "rate"?: number, "name"?: output}"#,
         ),
         C::new("data.profile", "Data Engineering", "Analyze › Workflows", |s, p| {
+            // All resident rows: completeness profiling is independent of map filters/selection.
             let ds = feature_ds(s, p)?;
             let rows: Vec<Value> = network::profile_fields(ds)
                 .into_iter()
@@ -94,8 +95,8 @@ pub fn commands() -> Vec<C> {
         C::new("data.explore", "Exploratory Analysis", "Analyze › Workflows", explore).roles(&[]).effects(crate::policy::Effects::NONE)
             .view()
             .params(r#"{"layer"?, "fields"?: [numeric fields], "bins"?: number}"#),
-        C::new("data.similar", "Embeddings", "Analyze › Workflows", similar).roles(&[]).effects(crate::policy::Effects::NONE)
-            .params(r#"{"layer"?, "row"?: number (the selected feature when omitted), "fields"?: [numeric fields], "count"?: number, "select"?: bool}"#),
+        C::new("data.similar", "Embeddings", "Analyze › Workflows", super::similar::run).roles(&[]).effects(crate::policy::Effects::NONE)
+            .params(r#"{"layer"?, "row"?: number (zero-based whole number; selected feature when omitted or null), "fields"?: [numeric fields], "count"?: number (whole number 1 to 1000; default 10), "select"?: bool}"#),
         C::new("data.convert", "Data Interop", "Analyze › Workflows", convert).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
             .view()
             .params(r#"{"layer"?, "format": "geojson"|"csv"|"kml"|"gpx"|"wkt", "path"?: file (the text is returned without one), "nameField"?: field}"#),
@@ -142,6 +143,18 @@ pub struct Made {
     /// Made on another thread: the command's name and the map it was started on.
     ran: Option<(&'static str, u64)>,
     pub(crate) continuation: Option<crate::policy::Continuation>,
+    /// The file the work wrote, put in its place as the raster is added: a run cancelled or
+    /// abandoned before then leaves the file there as it was.
+    staged: Option<(rustgis_data::io::StagedWrite, Vec<String>)>,
+}
+
+impl Made {
+    /// With `file` to commit as it is added; `said`, what the run had to say, goes with the
+    /// error when it can't be (its `then` doesn't run).
+    pub(crate) fn committing(mut self, file: rustgis_data::io::StagedWrite, said: Vec<String>) -> Made {
+        self.staged = Some((file, said));
+        self
+    }
 }
 
 /// A workflow's work once its inputs are read: it reads nothing more of the session, so it runs on
@@ -169,13 +182,17 @@ pub(crate) fn made_then(raster: Raster, extra: Option<Value>, then: Option<Then>
 
 /// A layer made (styled, say), to be added as `name`.
 pub(crate) fn made_layer(name: String, layer: rustgis_map::RasterLayer, extra: Option<Value>, then: Option<Then>) -> Made {
-    Made { name, layer, extra, then, ran: None, continuation: None, inputs: Vec::new() }
+    Made { name, layer, extra, then, ran: None, continuation: None, inputs: Vec::new(), staged: None }
 }
 
 /// Adds a made raster as a layer: the command's answer is the layer's (its id, size and bands) and
 /// what the command says besides (`extra`), and what it does then.
 pub(crate) fn add_made(s: &mut Session, m: Made) -> CmdResult {
-    let Made { name, layer, extra, then, inputs, .. } = m;
+    let Made { name, layer, extra, then, inputs, staged, .. } = m;
+    if let Some((file, said)) = staged {
+        let path = file.destination().display().to_string();
+        file.commit().map_err(|e| if said.is_empty() { format!("{path}: {e}") } else { format!("{path}: {e} ({})", said.join("; ")) })?;
+    }
     rustgis_data::provenance::record(inputs);
     let mut v = super::raster::add_raster(s, &name, layer)?;
     if let (Some(Value::Object(more)), Some(o)) = (extra, v.as_object_mut()) {
@@ -236,6 +253,7 @@ pub(crate) const IN_BACKGROUND: &[(&str, &str, Start)] = &[
     ("stac.addBands", "Add STAC Bands", super::stac_bands::bands_work),
     ("stac.addIndex", "Add STAC Index", super::stac_bands::index_work),
     ("raster.process", "Process", super::imagery::process_work),
+    ("raster.rasterize", "Polygons to Raster", super::imagery::rasterize_work),
     ("imagery.mosaic", "Build Mosaic", super::imagery::mosaic_work),
     ("dl.classify", "Deep Learning", super::deeplearning::classify_work),
     ("embeddings.similarity", "Satellite Embedding Similarity", super::embeddings::similarity_work),
@@ -435,6 +453,8 @@ fn environments(s: &mut Session, p: &Value) -> CmdResult {
     // Both read before either is set, so a bad one changes nothing and says nothing; a cell size
     // given with a system is in its units.
     let mut note = None;
+    // A cell size another system had, which a new one doesn't take (in that system's units).
+    let mut dropped = None;
     let projected = match p.get("crs") {
         None => s.project.gp_env.projected,
         Some(Value::Null) => None,
@@ -448,6 +468,13 @@ fn environments(s: &mut Session, p: &Value) -> CmdResult {
         }
         Some(_) => return Err("crs is a projected coordinate system (such as \"EPSG:32616\"), or null".into()),
     };
+    // Any change of system, to another or to none, drops the old one's cell size.
+    if let Some(old) = s.project.gp_env.projected
+        && let Some(cell) = old.cell_size
+        && projected.is_none_or(|g| g.crs != old.crs)
+    {
+        dropped = Some((old.crs, cell, projected.is_none()));
+    }
     let size = match p.get("cellSize") {
         None => None,
         Some(Value::Null) => Some(None),
@@ -458,6 +485,23 @@ fn environments(s: &mut Session, p: &Value) -> CmdResult {
     }
     if let Some(note) = note {
         s.notify(format!("Environments: its coordinate system: {note}"), false);
+    }
+    // Said (#2639): always when the system is cleared; on a change of system, unless this call
+    // gives the new one its own cell size.
+    match (dropped, size) {
+        (Some((crs, cell, true)), _) => s.notify(
+            format!("Environments: the cell size {cell} in {}'s units was dropped with that system", crs.label()),
+            false,
+        ),
+        // (`cellSize: null` gives the new one none, so it is said too.)
+        (Some((crs, cell, false)), None | Some(None)) => s.notify(
+            format!(
+                "Environments: the cell size {cell} was in {}'s units, so it was dropped with that system: give cellSize for the new one, or each run picks its own",
+                crs.label()
+            ),
+            false,
+        ),
+        _ => {}
     }
     s.project.gp_env.projected = projected;
     if let Some(size) = size {
@@ -745,7 +789,9 @@ fn new_model(s: &mut Session, p: &Value) -> CmdResult {
     s.project.models.push(Model { name: name.clone(), steps, graph });
     notify_graph_dropped(s, dropped);
     let kept = name.chars().count() - if i > 1 { format!(" {i}").chars().count() } else { 0 };
-    if kept < length {
+    // Said here, and in the result (`"cut"`), so a caller doesn't say it again.
+    let cut = kept < length;
+    if cut {
         s.notify(
             format!("ModelBuilder: a model has that name already, so the name given is cut to {kept} characters to fit \" {i}\""),
             false,
@@ -772,7 +818,11 @@ fn new_model(s: &mut Session, p: &Value) -> CmdResult {
             false,
         );
     }
-    Ok(json!({"model": name, "steps": n}))
+    let mut answer = json!({"model": name, "steps": n});
+    if cut {
+        answer["cut"] = json!(true);
+    }
+    Ok(answer)
 }
 
 /// The model a command names (or the last one), or the graph it passes: its name, graph and
@@ -821,9 +871,16 @@ const SCRIPT_AHEAD: &str = "script.run";
 pub(crate) fn ahead_on_copy(s: &Session, command: &'static str, p: &Value) -> super::reads::ReadWork {
     let name = if command == SCRIPT_AHEAD { "Run Script" } else { "Run Model" };
     let (project, trusted) = (s.project.clone(), s.trusted_models.clone());
+    let readers = s.undo_memory.readers();
+    let retained = readers.retain(crate::undo_memory::allocations(&project));
     // The copy follows the extensions turned on or off here (#1752).
     let extensions = s.extensions().clone();
     let (view_size, active_layer, opened, p) = (s.view_size, s.active_layer, s.opened, p.clone());
+    let selection_intent = s.selection_intent;
+    let (selection_sequence, similar_selected) = (s.selection_sequence.clone(), s.similar_selected);
+    // Reserve before the worker starts: its inner reads belong to this admission, even when
+    // a newer UI request arrives while this script waits in the queue.
+    let selection_admission = s.selection_admission.clone().unwrap_or_else(|| (s.selection_epoch(), Default::default()));
     // What its tools ask of servers and files goes in this session's Diagnostics, as when they
     // run here: the run here takes their results and asks nothing.
     let requests = s.diagnostics.capture();
@@ -835,16 +892,23 @@ pub(crate) fn ahead_on_copy(s: &Session, command: &'static str, p: &Value) -> su
         copy.view_size = view_size;
         copy.active_layer = active_layer;
         copy.opened = opened;
+        copy.selection_intent = selection_intent;
+        copy.selection_sequence = selection_sequence;
+        copy.selection_admission = Some(selection_admission);
+        copy.similar_selected = similar_selected;
         // The copy shares this session's rows, which this session already counts in what the
         // process holds (#2431): it neither measures nor adds them again.
         copy.undo_memory.memory = None;
+        copy.undo_memory.use_readers(readers);
         copy.sync_policy_generation();
         copy.tools_ahead = Some(super::gp::Ahead::Recording(Vec::new()));
         copy.files_ahead = Some(super::gp::FilesAhead::Recording(Vec::new()));
         copy.grids_ahead = Some(crate::image_grid::Ahead::Recording(Vec::new()));
         copy.zones_ahead = Some(super::imagery::ZonesAhead::Recording(Vec::new()));
         let _ = copy.run(command, &p);
-        super::gp::ran_ahead(&mut copy)
+        let mut ran = super::gp::ran_ahead(&mut copy);
+        ran.retained = Some(retained);
+        ran
     })
 }
 
@@ -906,10 +970,11 @@ fn check_prepared_prefix(s: &Session, lines: &[(usize, String, Value)]) -> Resul
 #[cfg(not(target_arch = "wasm32"))]
 /// The commands a script's line may run on a copy of the session ([`runs_on_a_copy`]): those
 /// whose results are taken (a tool, a model, a batch) and those that change only what the taking compares
-/// by value (a selection, a layer's name or query, the environment, the projection). A line that
-/// makes rows of its own (a layer edit, a layer from a selection) isn't one. Table edits are the
+/// by value (a selection, a layer's name or query, topology rules, the environment, the projection).
+/// A line that makes rows of its own (a layer edit, a layer from a selection) isn't one. Table edits are the
 /// exception: their rows are recorded and taken, so later tools retain their shared input.
 pub(crate) const ON_A_COPY: &[&str] = &[
+    "project.coordinateSystem",
     "edit.enable",
     "edit.setValue",
     "edit.addFeature",
@@ -923,6 +988,9 @@ pub(crate) const ON_A_COPY: &[&str] = &[
     "gp.spatialJoin",
     "gp.zonalStats",
     "gp.env",
+    "data.similar",
+    "topology.rules",
+    "topology.validate",
     "select.all",
     "select.atPoint",
     "select.byAttributes",
@@ -1600,15 +1668,18 @@ fn interpolate_work(s: &Session, p: &Value) -> Result<Work, String> {
     // Features without a place or a number are left out, and said (by kind, with a count).
     let (mut no_point, mut no_value) = (0usize, 0usize);
     let mut pts: Vec<(Coord, f64)> = Vec::with_capacity(ds.features.len());
-    // Each place in longitude/latitude, whatever system the layer holds its coordinates in; one
-    // that can't be given there has no place. A point is converted alone; any other shape is
-    // converted first, so its label point (a polygon's centroid) is the one it has in
-    // longitude/latitude, not the one in the layer's own system. A shape with a place that can't
-    // be converted gives its label point in its own system, converted, as long as that converts.
-    let to = ds.lonlat_conversion()?;
-    let place = |g: &Geometry| match g {
-        Geometry::Point(c) => to.point(*c),
-        g => match Dataset::converted_to_lonlat(&to, g) {
+    // The run's system: the layer's own projected one it holds its coordinates in, as the
+    // interpolation tools take it (`rustgis_analysis::works_in`), its places taken as they are; else
+    // longitude/latitude, each place given there (one that can't be has no place). There a point
+    // is converted alone; any other shape is converted first, so its label point (a polygon's
+    // centroid) is the one it has in longitude/latitude. A shape with a place that can't be
+    // converted gives its label point in its own system, converted, as long as that converts.
+    let work = Some(ds.coord_crs()).filter(|c| rustgis_analysis::works_in(*c)).unwrap_or(Crs::LonLat);
+    let to = if work == Crs::LonLat { Some(ds.lonlat_conversion()?) } else { None };
+    let place = |g: &Geometry| match (&to, g) {
+        (None, g) => g.label_point(),
+        (Some(to), Geometry::Point(c)) => to.point(*c),
+        (Some(to), g) => match Dataset::converted_to_lonlat(to, g) {
             Some(g) => g.label_point(),
             None => g.label_point().and_then(|c| to.point(c)),
         },
@@ -1625,14 +1696,14 @@ fn interpolate_work(s: &Session, p: &Value) -> Result<Work, String> {
         pts.push((c, v));
     }
     let (layer_name, field_name) = (ds.name.clone(), field.to_string());
-    // The system: the one given, else the environment's, else the projected one the layer was read
-    // in, else degrees.
+    // The system: the one given, else the environment's, else the projected one the layer holds its
+    // coordinates in, else the one it was read in, else degrees.
     let env = &s.project.gp_env;
     // An empty `crs` is none given, as `null` is: the environment's system still applies.
     let given = p.get("crs").is_some_and(|v| !v.is_null() && v.as_str().is_none_or(|t| !t.trim().is_empty()));
     let (crs, crs_note) = match env.projected {
         Some(g) if !given => (g.crs, None),
-        _ => rustgis_analysis::raster_crs(ds, p, "Geostatistical Wizard")?,
+        _ => rustgis_analysis::raster_crs_in(ds, work, s.project.coordinate_system, p, "Geostatistical Wizard")?,
     };
     let crs_note = rustgis_analysis::in_its_units(p, crs, crs_note, &Extent::EMPTY, &[], &["cellSize"]);
     let env_extent = env.extent;
@@ -1662,7 +1733,7 @@ fn interpolate_work(s: &Session, p: &Value) -> Result<Work, String> {
     let neighbors = p.get("neighbors").and_then(Value::as_u64).unwrap_or(12).max(1) as usize;
     Ok(Box::new(move || {
         // Off the window's thread: the points, and the grid they set, in the system.
-        let (pts, beyond_note) = rustgis_analysis::points_in(crs, pts)?;
+        let (pts, beyond_note) = rustgis_analysis::points_from(work, crs, pts)?;
         let e = match env_extent {
             Some(e) if crs == Crs::LonLat => e,
             Some(e) => {
@@ -1778,6 +1849,15 @@ fn route(s: &mut Session, p: &Value) -> CmdResult {
             false,
         );
     }
+    if r.overflowing > 0 {
+        s.notify(
+            format!(
+                "{source_name}: {} line(s) cost so much that a segment's cost is past the largest number, and were closed in the route network",
+                r.overflowing
+            ),
+            false,
+        );
+    }
     Ok(json!({"layer": nid, "lengthKm": r.length_m / 1000.0, "cost": r.cost, "segments": r.rows.len()}))
 }
 
@@ -1882,10 +1962,13 @@ fn simulate(s: &mut Session, p: &Value) -> CmdResult {
         rustgis_map::rows::Rows::All => (0..l.dataset.features.len()).collect(),
         rustgis_map::rows::Rows::Subset(rows) => rows,
     };
-    // Placed in longitude/latitude, whatever system the polygons' layer holds its coordinates in,
-    // then held in that system, as the polygons are.
-    let polygons = l.dataset.in_lonlat()?;
+    // Placed in the polygons' own coordinates when their layer holds them in a projected system,
+    // spread evenly there (#2032 C2e-5), as the analysis tools work in it
+    // ([`rustgis_analysis::works_in`]); else in longitude/latitude, then held in the layer's
+    // system, as the polygons are.
     let system = (l.dataset.coord_crs(), l.dataset.crs);
+    let own = rustgis_analysis::works_in(system.0);
+    let polygons = if own { std::borrow::Cow::Borrowed(&l.dataset) } else { l.dataset.in_lonlat()? };
     let seed = f(p, "seed").map_or(42, |v| v.max(0.0) as u64);
     let pts: Vec<(usize, Coord)> = match ps(p, "field") {
         Some(fname) => {
@@ -1915,7 +1998,13 @@ fn simulate(s: &mut Session, p: &Value) -> CmdResult {
         ds.push(Some(Geometry::Point(*c)), vec![Attr::Int(*r as i64)]);
     }
     let n = ds.features.len();
-    hold_as(s, &mut ds, system)?;
+    // A cancel stops the sampling with the points made so far: none of them is added.
+    rustgis_data::progress::check().map_err(|e| e.to_string())?;
+    if own {
+        (ds.held_in, ds.crs) = system;
+    } else {
+        hold_as(s, &mut ds, system)?;
+    }
     if let Some(notice) = query_notice {
         s.notify_text(notice, false);
     }
@@ -1924,25 +2013,46 @@ fn simulate(s: &mut Session, p: &Value) -> CmdResult {
 }
 
 /// Holds `ds`, a layer made in longitude/latitude from another, as that layer is
-/// ([`Dataset::hold_as`]; `system` is its [`Dataset::coord_crs`] and [`Dataset::crs`]), and says
-/// so when it can't be: it stays in longitude/latitude then, as it was made. A cancel stops the
-/// command, which adds nothing.
+/// ([`Dataset::hold_as`]; `system` is its [`Dataset::coord_crs`] and [`Dataset::crs`]), or in the
+/// project's system ([`made_in`]), and says so when it can't be: it stays in longitude/latitude
+/// then, as it was made. A cancel stops the command, which adds nothing.
 pub(crate) fn hold_as(
     s: &mut Session,
     ds: &mut Dataset,
-    (held, crs): (rustgis_data::raster::Crs, Option<rustgis_data::raster::Crs>),
+    system: (rustgis_data::raster::Crs, Option<rustgis_data::raster::Crs>),
 ) -> Result<(), String> {
+    let (held, crs) = made_in(s, system);
     match ds.hold_as(held, crs) {
         Err(e) if matches!(rustgis_data::DataError::of_conversion(e.clone()), rustgis_data::DataError::Cancelled) => Err(e),
         Err(e) => {
-            s.notify(format!("{}: kept in longitude/latitude, as it was made, not in {}: {e}", ds.name, held.label()), false);
+            // Its refusal starts with the layer's name, named once here.
+            let why = e.strip_prefix(&format!("{}: ", ds.name)).unwrap_or(&e);
+            let whose = if held == system.0 { String::new() } else { "the project's ".to_string() };
+            s.notify(format!("{}: kept in longitude/latitude, as it was made, not in {whose}{}: {why}", ds.name, held.label()), false);
             Ok(())
         }
         Ok(()) => Ok(()),
     }
 }
 
-fn numeric_fields(ds: &Dataset, p: &Value) -> Result<Vec<usize>, String> {
+/// The system a layer made in longitude/latitude from another, held in `system` (its
+/// [`Dataset::coord_crs`] and [`Dataset::crs`]), is held in: the other's, unless that is one tools
+/// don't work in ([`rustgis_analysis::works_in`]: longitude/latitude, Web Mercator, a geographic
+/// one) and the project has a system of its own (#2032 C3a), which it then takes, as a tool's
+/// output does. A geocentric project system holds no map coordinates, so it is passed over.
+pub(crate) fn made_in(
+    s: &Session,
+    system: (rustgis_data::raster::Crs, Option<rustgis_data::raster::Crs>),
+) -> (rustgis_data::raster::Crs, Option<rustgis_data::raster::Crs>) {
+    use rustgis_data::raster::Crs;
+    match s.project.coordinate_system.filter(|c| *c != Crs::LonLat && !c.is_geocentric()) {
+        Some(p) if !rustgis_analysis::works_in(system.0) => (p, Some(p)),
+        _ => system,
+    }
+}
+
+/// Numeric fields requested by name, or all numeric fields when omitted; invalid names fail.
+pub(super) fn numeric_fields(ds: &Dataset, p: &Value) -> Result<Vec<usize>, String> {
     match p.get("fields").and_then(Value::as_array) {
         Some(a) => a
             .iter()
@@ -1957,7 +2067,7 @@ fn numeric_fields(ds: &Dataset, p: &Value) -> Result<Vec<usize>, String> {
     }
 }
 
-/// Histograms of numeric fields and their correlation matrix.
+/// Histograms and correlations over All resident rows, independent of map filters/selection.
 fn explore(s: &mut Session, p: &Value) -> CmdResult {
     let ds = feature_ds(s, p)?;
     let fields = numeric_fields(ds, p)?;
@@ -1998,31 +2108,6 @@ fn explore(s: &mut Session, p: &Value) -> CmdResult {
     Ok(
         json!({"histograms": hist, "fields": fields.iter().filter_map(|fi| ds.fields.get(*fi).map(|f| f.name.clone())).collect::<Vec<_>>(), "correlation": matrix}),
     )
-}
-
-fn similar(s: &mut Session, p: &Value) -> CmdResult {
-    let id = s.layer_id(p)?;
-    let l = s.map().layer(id).ok_or("no such layer")?;
-    let row = match p.get("row").and_then(Value::as_u64) {
-        Some(r) => r as usize,
-        None => *l.selection.first().ok_or("select a feature (or give row)")?,
-    };
-    if row >= l.dataset.features.len() {
-        return Err("no such row".into());
-    }
-    let fields = numeric_fields(&l.dataset, p)?;
-    if fields.is_empty() {
-        return Err("the layer has no numeric fields to compare".into());
-    }
-    let n = p.get("count").and_then(Value::as_u64).unwrap_or(10).clamp(1, 1000) as usize;
-    let found = network::similar(&l.dataset, row, &fields, n);
-    let rows: Vec<Value> = found.iter().map(|(r, d)| json!({"row": r, "distance": d})).collect();
-    if b(p, "select").unwrap_or(true) {
-        let mut sel: Vec<usize> = found.iter().map(|x| x.0).collect();
-        sel.push(row);
-        super::select::set(s, id, sel, super::select::Mode::New);
-    }
-    Ok(json!({"similar": rows}))
 }
 
 /// Converts text on the caller's thread for scripts and browser downloads. A streamed layer
@@ -2085,7 +2170,8 @@ pub(crate) fn convert_work(s: &Session, p: &Value) -> Result<super::exports::Wor
                 query,
             )
             .map_err(|e| e.to_string())?;
-            let mut notes = rustgis_data::export_notes([(&ds, layer.extent())], &path, rustgis_data::raster::Crs::LonLat);
+            let mut notes: rustgis_data::loss::Notes =
+                rustgis_data::export_notes([(&ds, layer.extent())], &path, rustgis_data::raster::Crs::LonLat).into();
             if format == "csv" {
                 notes.extend(result.csv.notes(&ds.fields, &path));
                 notes.extend(result.csv.coordinates_note(&ds.fields, &path));
@@ -2096,7 +2182,7 @@ pub(crate) fn convert_work(s: &Session, p: &Value) -> Result<super::exports::Wor
             }
             notes.extend(
                 rustgis_data::source::unread_dates_note(&ds.fields, &result.unread_dates)
-                    .map(|n| format!("{path}: {}: {n}, so they're empty in the export", ds.name)),
+                    .map(|n| format!("{path}: {}: {n} (empty in the export)", ds.name)),
             );
             notes.extend(
                 rustgis_data::source::rounded_dates_note(&ds.fields, &result.rounded_dates)
@@ -2104,10 +2190,15 @@ pub(crate) fn convert_work(s: &Session, p: &Value) -> Result<super::exports::Wor
             );
             notes.extend(
                 rustgis_data::source::null_text_note(&ds.fields, &result.null_text)
-                    .map(|n| format!("{path}: {}: {n}, so they're empty in the export", ds.name)),
+                    .map(|n| format!("{path}: {}: {n} (empty in the export)", ds.name)),
             );
-            notes.extend(result.read_notes.iter().map(|n| format!("{path}: {}: {n} when read for the export", ds.name)));
-            notes.extend(rustgis_data::source::not_utf8_note(&ds.fields, &result.not_utf8).map(|n| format!("{path}: {}: {n}", ds.name)));
+            notes.extend(
+                result.read_notes.iter().map(|n| n.clone().map_text(|t| format!("{path}: {}: {t} when read for the export", ds.name))),
+            );
+            notes.extend(
+                rustgis_data::source::not_utf8_note(&ds.fields, &result.not_utf8, result.not_utf8_in)
+                    .map(|n| format!("{path}: {}: {n}", ds.name)),
+            );
             (notes, result.null_numbers, result.query)
         } else {
             let (mut ds, unreadable) = if layer.is_streamed() {
@@ -2118,7 +2209,8 @@ pub(crate) fn convert_work(s: &Session, p: &Value) -> Result<super::exports::Wor
             };
             let report = rustgis_data::export::filter_dataset(&mut ds, query).map_err(|e| e.to_string())?;
             rustgis_data::progress::begin(ds.features.len());
-            let (text, mut notes) = converted(&ds, &params)?;
+            let (text, notes) = converted(&ds, &params)?;
+            let mut notes: rustgis_data::loss::Notes = notes.into();
             super::share::coalesce_read_zm(&mut notes, &path, &ds, &unreadable);
             rustgis_data::io::write_atomic(std::path::Path::new(&path), text.as_bytes()).map_err(|e| format!("{path}: {e}"))?;
             if unreadable.rows > 0 {
@@ -2180,7 +2272,7 @@ fn converted(ds: &Dataset, p: &Value) -> Result<(String, Vec<String>), String> {
     };
     let target = ps(p, "path").unwrap_or(&ds.name);
     let mut notes = rustgis_data::export_notes([(ds, ds.lonlat_extent())], target, rustgis_data::raster::Crs::LonLat);
-    // CSV holds a point a row, GPX a name for each feature and no areas; reading text back trims it or reads blanks as null.
+    // CSV holds a point a row, GPX a name for each feature and no areas; reading text back, CSV reads blanks as null and KML and GPX trim it.
     notes.extend(rustgis_data::io::export_losses_notes(ds, format, name_field, target).map_err(|e| e.to_string())?);
     // KML and GPX hold features with geometry only.
     if let ext @ ("kml" | "gpx") = format {

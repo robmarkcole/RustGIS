@@ -140,6 +140,7 @@ pub fn commands() -> Vec<C> {
             if let Some(b) = s.project.maps.get_mut(mi).and_then(|m| m.bookmarks.get_mut(bi)) {
                 b.name = name.clone();
             }
+            super::say_name_cut(s, "Rename Bookmark", "the name given", &new, &name);
             Ok(json!({"name": name}))
         }).inputs(bookmark_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
         .params(r#"{"name": string, "newName": string (a number is added when another bookmark has it), "map"?: name}"#),
@@ -202,6 +203,7 @@ pub fn commands() -> Vec<C> {
                 m.name = name.clone();
             }
             follow_renamed_map(s, &old, &name);
+            super::say_name_cut(s, "Rename Map", "the name given", s_name(p)?.trim(), &name);
             Ok(json!({"name": name}))
         }).transition(rename_transition).inputs(map_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
         .params(r#"{"name": string (the new name; a number is added when another map has it), "map"?: name (default: the active map)}"#),
@@ -262,8 +264,12 @@ pub(crate) fn map_at(input: &impl super::InputSource, p: &Value) -> Result<usize
 /// map, so the copy keeps them; layouts aren't copied and keep showing the original.
 fn duplicate_map(s: &mut Session, p: &Value) -> CmdResult {
     let i = map_at(s, p)?;
+    // A name given past the limit is refused, as map.rename refuses it, not cut (#2639).
+    let given = super::name_given(p, "a map's name", super::MAX_NAME)?;
     let mut m = s.project.maps.get(i).ok_or("no map")?.clone();
-    m.name = super::copy_name(ps(p, "name"), &m.name, |n| s.project.maps.iter().any(|x| x.name.eq_ignore_ascii_case(n)));
+    let (name, cut) =
+        super::copy_name("Duplicate Map", given.as_deref(), &m.name, |n| s.project.maps.iter().any(|x| x.name.eq_ignore_ascii_case(n)));
+    m.name = name;
     m.offline_area_id = None;
     m.label_lock = None;
     m.label_lock_line_anchors.clear();
@@ -280,6 +286,9 @@ fn duplicate_map(s: &mut Session, p: &Value) -> CmdResult {
     if !was_active {
         s.active_layer = s.map().layers.first().map(|l| l.id);
         s.table_layer = None;
+    }
+    if let Some(cut) = cut {
+        s.notify(cut, false);
     }
     Ok(json!({"name": name}))
 }
@@ -1015,6 +1024,7 @@ fn add_bookmark(s: &mut Session, p: &Value) -> CmdResult {
     let name = unique_bookmark_name(s, mi, None, &base);
     let m = s.project.maps.get_mut(mi).ok_or("no map")?;
     m.bookmarks.push(Bookmark { description, ..Bookmark::new(name.clone(), m.camera) });
+    super::say_name_cut(s, "New Bookmark", "the name given", &base, &name);
     Ok(json!({"name": name}))
 }
 
@@ -1108,8 +1118,8 @@ pub fn new_bookmark_name(map: &Map) -> String {
 pub(crate) const MAX_BOOKMARK_NAME: usize = 120;
 const MAX_DESCRIPTION: usize = 2_000;
 
-/// Most bookmarks a map keeps.
-pub(crate) const MAX_BOOKMARKS: usize = 10_000;
+/// Most bookmarks a map keeps: as many as a QGIS project import reads.
+pub(crate) use rustgis_map::qgis::MAX_BOOKMARKS;
 
 /// The map's bookmarks as a bookmarks file. Places are lon/lat and metres per pixel, so they
 /// open in the same place on a map in any projection.
@@ -1247,11 +1257,46 @@ fn new_map(s: &mut Session, p: &Value) -> CmdResult {
     }
     let mut m = Map::new(name.clone());
     (m.basemap, m.paper) = (s.map().basemap, s.map().paper);
+    // Drawn in the project's coordinate system, where the active map is looking; one a map can't
+    // be drawn in is said, and the map starts in Web Mercator as without one.
+    if let Some(crs) = s.project.coordinate_system {
+        match map_projection_for(crs) {
+            Ok(projection) => {
+                (m.projection, m.camera) = (s.map().projection.clone(), s.map().camera);
+                m.camera.bearing = 0.0;
+                m.camera.pitch = 0.0;
+                m.set_projection(projection);
+            }
+            Err(why) => s.notify(format!("New map '{name}' is drawn in Web Mercator: {why}"), false),
+        }
+    }
     s.project.maps.push(m);
     s.project.active_map = s.project.maps.len() - 1;
     s.active_layer = None;
     s.table_layer = None;
     Ok(json!({"name": name}))
+}
+
+/// The map projection for a coordinate system, or why a map can't be drawn in it: a map is
+/// drawn in Web Mercator, a world projection or a projected system with an EPSG or ESRI code.
+pub fn map_projection_for(crs: rustgis_data::raster::Crs) -> Result<Projection, String> {
+    use rustgis_data::raster::Crs;
+    match crs {
+        Crs::WebMercator => Ok(Projection::WebMercator),
+        c if c.is_geographic() => {
+            Err(format!("the project's coordinate system, {}, is in degrees, and a map is drawn in a projected one", c.label()))
+        }
+        // An ESRI system is a custom one named by its code.
+        c => {
+            let code = match c {
+                Crs::Epsg(_) => c.code(),
+                _ => Some(c.label()).filter(|l| l.starts_with("ESRI:")).ok_or_else(|| {
+                    format!("a map is drawn in a system with an EPSG or ESRI code, and the project's, {}, has none", c.label())
+                })?,
+            };
+            Projection::from_code(&code).map_err(|e| format!("a map can't be drawn in the project's coordinate system, {}: {e}", c.label()))
+        }
+    }
 }
 
 /// Uses the strict map selector for operations that accept map names or null.

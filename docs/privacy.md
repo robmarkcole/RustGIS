@@ -181,8 +181,11 @@ you ask. It does not upload your project. On Windows, **Download and Install** t
 the release's installer and its `SHA256SUMS` from GitHub's release downloads, only when you
 choose it. The web app checks its own site for service-worker
 updates when it loads and returns to view, and fetches app icons from `assets.rustgis.app`.
-It downloads language fonts from that asset server when needed. The web GeoLibre tools
-download their runner from jsDelivr when needed; the tool list is cached between visits.
+The desktop, phone and web apps automatically download fallback fonts from `assets.rustgis.app`
+when text needs glyphs that the current fonts lack; native apps keep them in the font cache
+for offline restarts. These requests download font files, not the text or project. The web
+GeoLibre tools download their runner from jsDelivr when needed; the tool list is cached between
+visits.
 
 ## Website analytics
 
@@ -200,5 +203,5 @@ words of a site search.
 
 You can block analytics with a content blocker or your browser's tracking protection; the sites
 work normally without them. Analytics run only on the sites we host: the measurement ID is added
-when those sites are deployed, so the desktop app, the command line and any copy you build
-yourself never load them.
+when those sites are deployed, so the desktop app, the command line, the Android and iOS apps
+and any copy you build yourself never load them.
