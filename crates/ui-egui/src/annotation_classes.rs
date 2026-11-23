@@ -354,7 +354,7 @@ mod tests {
 
     #[test]
     fn right_click_changes_only_the_clicked_shape_class_and_preserves_the_drawing_default() {
-        use egui_kittest::kittest::{NodeT, Queryable};
+        use egui_kittest::kittest::Queryable;
         use rustgis_engine::{Tool, box_edit::Frame, data::Value as Cell, geom::Coord};
         for (tool, row, center, value, pitch) in [
             (Tool::Circle, 0, [-100000., 0.], "truck", 0.),
@@ -425,9 +425,10 @@ mod tests {
                 vec![row],
                 "right-click targets the clicked object, not the old selection"
             );
-            if pitch != 0. {
-                assert!(h.get_by_label("Convert Polygon…").accesskit_node().is_disabled());
-            }
+            assert!(
+                h.query_by_label("Convert to Shape…").is_none(),
+                "known annotation shapes keep editing and class actions, without refitting"
+            );
             let depth = h.state().session.undo_depth();
             h.get_by_label("Change class").click();
             h.run();

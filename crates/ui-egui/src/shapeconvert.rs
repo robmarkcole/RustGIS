@@ -154,10 +154,17 @@ pub(crate) fn open(app: &mut RustGisApp, p: &Value) -> Result<(), String> {
 pub(crate) fn menu(app: &mut RustGisApp, ui: &mut egui::Ui) {
     let Some(target) = app.conversion.menu.filter(|t| t.current(app)) else { return };
     let layer = target.layer;
-    if ui
-        .add_enabled(crate::boxedit::ready(app), egui::Button::new(tl!("Convert Polygon…")))
-        .on_disabled_hover_text(tl!("Shape conversion requires a flat Earth map with zero pitch."))
-        .clicked()
+    // Imported GeoJSON has ordinary polygons until the user explicitly fits a shape.
+    // Known annotation shapes already have handles and should not invite another fit.
+    let annotating = app.ui.right == Some(RightPane::Annotation)
+        || matches!(app.session.tool, rustgis_engine::Tool::Circle | rustgis_engine::Tool::RotatedBox);
+    let known_shape = app.session.circle_spec(layer, target.row).is_some() || app.session.box_spec(layer, target.row).is_some();
+    if !(annotating && known_shape)
+        && ui
+            .add_enabled(crate::boxedit::ready(app), egui::Button::new(tl!("Convert to Shape…")))
+            .on_hover_text(tl!("Fit this polygon as an editable circle or rotated box."))
+            .on_disabled_hover_text(tl!("Shape conversion requires a flat Earth map with zero pitch."))
+            .clicked()
     {
         let _ = app.run("ui.convertShape", json!({"layer":layer}));
         ui.close();
@@ -228,7 +235,7 @@ pub(crate) fn panel(app: &mut RustGisApp, ui: &mut egui::Ui) {
         app.session.notify(tl!("Conversion closed because the source, selection or tool changed."), false);
         return;
     }
-    ui.heading(tl!("Convert Polygon"));
+    ui.heading(tl!("Convert to Shape"));
     ui.small(tl!("Replaces only this polygon. Its ID and attributes are preserved. Apply is undoable."));
     let mut changed = false;
     ui.add_enabled_ui(!f.pending, |ui| {
@@ -732,8 +739,22 @@ mod overlap_tests {
     fn shape_conversion_selection_tools_offer_the_right_click_menu() {
         use egui_kittest::kittest::Queryable;
         use rustgis_engine::Tool;
-        for tool in [Tool::Explore, Tool::Select, Tool::SelectPolygon, Tool::SelectLasso, Tool::SelectRadius] {
+        for (tool, annotation, tilted) in [
+            (Tool::Explore, false, false),
+            (Tool::Select, false, false),
+            (Tool::SelectPolygon, false, false),
+            (Tool::SelectLasso, false, false),
+            (Tool::SelectRadius, false, false),
+            (Tool::Select, true, false),
+            (Tool::Select, true, true),
+        ] {
             let mut app = super::tests::app();
+            if annotation {
+                app.ui.open_right(RightPane::Annotation);
+            }
+            if tilted {
+                app.run("map.setPitch", json!({"pitch":11.4})).unwrap();
+            }
             app.conversion.form = None;
             let id = app.session.active_layer.unwrap();
             let g = app.session.map().layer(id).unwrap().dataset.features[0].geometry.clone().unwrap();
@@ -765,7 +786,13 @@ mod overlap_tests {
             assert_eq!(h.state().session.map().layer(id).unwrap().selection, [1], "{tool:?}");
             assert!(h.query_by_label("Circle…").is_none());
             assert!(h.query_by_label("Rotated Box…").is_none());
-            h.get_by_label("Convert Polygon…").click();
+            assert!(h.query_by_label("Convert Polygon…").is_none(), "the conversion direction must be explicit");
+            if tilted {
+                use egui_kittest::kittest::NodeT;
+                assert!(h.get_by_label("Convert to Shape…").accesskit_node().is_disabled());
+                continue;
+            }
+            h.get_by_label("Convert to Shape…").click();
             h.run();
             assert_eq!(h.state().conversion.form.as_ref().unwrap().row, 1, "{tool:?}");
         }

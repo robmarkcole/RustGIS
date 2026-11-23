@@ -410,7 +410,7 @@ pub(crate) fn panel(app: &mut RustGisApp, ui: &mut egui::Ui) {
         && app.session.circle_spec(id, *row).is_none()
     {
         ui.small(tl!(
-            "This is an ordinary polygon. To edit it as an exact shape, right-click it and choose Convert to…; otherwise use Edit Vertices."
+            "This is an ordinary polygon. To edit it as an exact shape, right-click it and choose Convert to Shape…; otherwise use Edit Vertices."
         ));
     }
     let ready = crate::boxedit::ready(app) && drawing_frame(app).is_ok();

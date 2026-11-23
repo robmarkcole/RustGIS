@@ -5689,7 +5689,7 @@ mod tests {
         h.step();
         assert!(h.state().map.popup.is_none(), "Explore within Annotate also selects without a popup");
         assert_eq!(h.state().session.map().layer(layer).unwrap().selection, vec![2]);
-        assert!(h.query_by_label("This is an ordinary polygon. To edit it as an exact shape, right-click it and choose Convert to…; otherwise use Edit Vertices.").is_some());
+        assert!(h.query_by_label("This is an ordinary polygon. To edit it as an exact shape, right-click it and choose Convert to Shape…; otherwise use Edit Vertices.").is_some());
         assert!(h.state().session.box_spec(layer, 2).is_none());
         assert!(h.state().session.circle_spec(layer, 2).is_none(), "plain polygons are never automatically converted");
         let mut after = serde_json::to_value(&h.state().session.project).unwrap();

@@ -217,7 +217,7 @@ changing the default afterwards affects subsequent shapes. Other template defaul
 Opening Annotate from Explore starts in **Select / Edit** instead of opening feature-information popups.
 Click an annotation to select it; a circle or box constructed in this session automatically
 activates its editing handles. **Select / Edit** returns to selection without drawing new shapes.
-Reopened/imported polygons remain ordinary polygons: right-click and **Convert to…** to fit an
+Reopened/imported polygons remain ordinary polygons: right-click and **Convert to Shape…** to fit an
 exact circle or box, or use Edit Vertices. Selection never converts a polygon automatically.
 
 Select one annotation, choose the desired active class, then **Assign to selected annotation**.
@@ -560,8 +560,10 @@ styles too, which the topmost and visible modes leave out.
 
 Circles and rotated boxes shared as GeoJSON reopen as ordinary polygons. To edit one with
 constrained handles again, turn **Edit › Edit** on, select its loaded polygon layer, right-click
-the object and choose **Convert Polygon…**. Choose Circle or Rotated Box once, in the conversion
-pane. The **Editing** pane also has
+the object and choose **Convert to Shape…**. Choose Circle or Rotated Box once, in the conversion
+pane. Conversion restores constrained editing for imported geometry. Known circles and boxes
+hide this action while annotating: edit them with their
+handles or dimension controls instead. The **Editing** pane also has
 **Convert Selected Polygon…**, and Command Search has **Convert Polygon to Shape…**. These tools
 are available independently of any annotation workflow. A right-click keeps the selected object
 under the pointer; Alt-right-click cycles overlapping objects. In Explore, selection tools and
