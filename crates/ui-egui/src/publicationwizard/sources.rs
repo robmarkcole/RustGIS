@@ -145,9 +145,10 @@ mod tests {
         assert_eq!(d.params()["headings"], json!([PUBLICATION_HEADINGS[0], PUBLICATION_HEADINGS[1], "Col"]));
     }
 
-    /// A section left out takes no heading with it: not the reference's where there is none.
+    /// A heading typed for a section left out isn't sent: where a later heading follows, the
+    /// command's own goes in its place.
     #[test]
-    fn a_section_left_out_sends_no_heading() {
+    fn a_heading_typed_for_a_section_left_out_isnt_sent() {
         let mut d = draft();
         d.headings = [String::new(), "Ref".into(), String::new()];
         d.no_reference = true;
@@ -389,6 +390,22 @@ mod tests {
         h.state_mut().dialogs.publication.as_mut().unwrap().reference = "UTM 23S".into();
         h.run_steps(4);
         assert!(h.query_by_label(said).is_some());
+    }
+
+    /// A figure takes the command's default reference: the review says the lines or the tick set
+    /// on a sheet aren't used, and says nothing where neither was set.
+    #[test]
+    fn a_figures_review_says_the_sheets_reference_isnt_used() {
+        let typed = "The lines typed aren't used: a figure takes the default reference";
+        let tick = "\"No cartographic reference\" isn't used: a figure takes the default reference";
+        let mut h = at(Step::Review, |d| d.size = "figure-1col".into());
+        assert!(h.query_by_label_contains("default reference").is_none(), "nothing set, nothing lost");
+        h.state_mut().dialogs.publication.as_mut().unwrap().reference = "UTM 23S".into();
+        h.run_steps(4);
+        assert!(h.query_by_label(typed).is_some() && h.query_by_label(tick).is_none());
+        h.state_mut().dialogs.publication.as_mut().unwrap().no_reference = true;
+        h.run_steps(4);
+        assert!(h.query_by_label(tick).is_some() && h.query_by_label(typed).is_none());
     }
 
     /// Create puts the sources, the reference and the heading given on the sheet, and Undo takes
