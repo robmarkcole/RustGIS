@@ -69,8 +69,9 @@ mod tests {
         h.state_mut().run("map.new", json!({"name": "Rivers"})).unwrap();
         h.run_steps(2);
         assert_eq!(h.state().dialogs.publication.as_ref().unwrap().title, "Rivers");
-        click(&mut h, "Next");
-        click(&mut h, "Next");
+        for _ in 0..3 {
+            click(&mut h, "Next");
+        }
         h.get_by_label("Title").focus();
         h.run_steps(1);
         h.get_by_label("Title").type_text(" basins");

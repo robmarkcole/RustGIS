@@ -26,7 +26,7 @@ pub(crate) fn map_key(s: &Session) -> MapKey {
 
 /// The project (`Session::opened`) and the map in view a dialog or a form was opened on: layer ids
 /// are a map's own, so what it captured is only good while both are still in view.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MapOwner {
     project: u64,
     map: MapKey,

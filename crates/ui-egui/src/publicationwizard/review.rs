@@ -1,8 +1,9 @@
 //! The wizard's review step.
+use super::map::{area_label, name_label};
 use super::*;
 
 /// The review step: what was picked, step by step.
-pub(super) fn review_step(ui: &mut egui::Ui, d: &Draft) {
+pub(super) fn review_step(ui: &mut egui::Ui, s: &Session, d: &Draft) {
     let none = tl!("(none)");
     let or_none = |t: &str| if t.trim().is_empty() { none.to_string() } else { t.trim().to_string() };
     egui::Grid::new("publication_wizard_review").num_columns(2).spacing(egui::vec2(12.0, 6.0)).show(ui, |ui| {
@@ -13,6 +14,8 @@ pub(super) fn review_step(ui: &mut egui::Ui, d: &Draft) {
             ui.end_row();
         };
         row(tl!("Size"), size_label(&d.size));
+        row(tl!("Map extent"), area_label(s, &d.area));
+        row(tl!("Name"), name_label(s, &d.name));
         if d.figure() {
             // The figure note sends a sheet's texts to the caption. Its reference doesn't go there
             // (the figure draws the default one), so it is said here.
