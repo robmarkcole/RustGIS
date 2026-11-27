@@ -513,9 +513,14 @@ pub fn meshes(
 /// browser a panic aborts (`wasm32-unknown-unknown` unwinds nothing): there a panic is caught
 /// nowhere, as everywhere else in the web app.
 fn parallel<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<Option<R>> {
+    parallel_on(items, rustgis_data::threads::for_items(items.len()), f)
+}
+
+/// [`parallel`] on at most `threads` threads.
+pub(crate) fn parallel_on<T: Sync, R: Send>(items: &[T], threads: usize, f: impl Fn(&T) -> R + Sync) -> Vec<Option<R>> {
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let threads = rustgis_data::threads::for_items(items.len());
+        let threads = threads.min(items.len());
         if threads > 1 {
             let next = std::sync::atomic::AtomicUsize::new(0);
             let out: Mutex<Vec<Option<R>>> = Mutex::new((0..items.len()).map(|_| None).collect());
@@ -540,6 +545,9 @@ fn parallel<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<Op
             return out.into_inner().unwrap_or_else(|e| e.into_inner());
         }
     }
+    // One thread on the web: the count is only a ceiling.
+    #[cfg(target_arch = "wasm32")]
+    let _ = threads;
     items.iter().map(|i| std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(i))).ok()).collect()
 }
 

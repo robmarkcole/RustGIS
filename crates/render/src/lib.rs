@@ -27,6 +27,7 @@ mod line_markers;
 pub mod logo;
 mod mapgrid;
 mod mesh;
+mod mesh_tiles;
 mod native_tiles;
 mod pattern_fill;
 pub mod pdf;
@@ -4732,6 +4733,12 @@ fn render_frame(
     };
     // GPU meshes reach further (`GPU_CULL_MARGIN`), so the camera fast path can move them.
     let mesh_cull = cull_extent(view, GPU_CULL_MARGIN);
+    // A tilted view widens a far stroke past a tile's reach (the shader scales it by depth), so
+    // it keeps one mesh a layer; a flat one cuts its layers into tiles of the cull. A tilted
+    // view's bands are drawn as flat views (their cameras look straight down) for the shader to
+    // tilt, so they're told apart by what their labels are for.
+    let tilted = view.camera.pitch != 0.0 || matches!(labels_to, Labels::Tilted(..) | Labels::Shared);
+    let mesh_tiled = (!tilted).then_some(&mesh_cull);
     let mesh_visible = |e: &Extent| match &globe {
         Some(g) => g.may_see(e),
         None => e.intersects(&mesh_cull),
@@ -5574,9 +5581,10 @@ fn render_frame(
                 && layer.renderer.expression().is_none()
                 && !upright.contains(&layer.id);
             // Lyon refuses degenerate geometry tiny-skia draws fine, a layer too dense to mesh
-            // (`MAX_LAYER_VERTICES`) is quicker splatted, and zoomed in far, features reaching too
-            // far for f32 are drawn where they are by the CPU (#902): collect_layer reports all
-            // three, and the layer runs the CPU branch below like any ineligible one. It meshes the
+            // (`MAX_LAYER_VERTICES`) is quicker splatted, and zoomed in far, markers reaching too
+            // far for f32 are drawn where they are by the CPU (#902; lines and polygons are meshed
+            // in tiles, each from its own corner, `mesh_tiles`): collect_layer reports all three,
+            // and the layer runs the CPU branch below like any ineligible one. It meshes the
             // thinned copy the CPU draws. A turned or tilted view takes no CPU pictures
             // (`gpu_turned`), so there such a layer sends the whole view to the CPU renderer, not
             // just itself.
@@ -5616,6 +5624,7 @@ fn render_frame(
                             extents,
                             &rows,
                             &mesh_visible,
+                            mesh_tiled,
                             ctx.wireframe,
                             ctx.ppp,
                             map_per_px,
@@ -11499,30 +11508,32 @@ mod tests {
         }
     }
 
-    /// So does one with a layer drawn on the CPU for another reason: a polygon reaching too far
-    /// from its origin for f32, zoomed in all the way. The layer above it is never meshed.
+    /// So does a turned one with a layer drawn on the CPU for another reason: markers too far
+    /// apart for f32 from their origin, zoomed in all the way (a tilted view stands markers up,
+    /// drawn otherwise). The layer above it is never meshed.
     #[test]
-    fn a_turned_or_tilted_view_stops_trying_the_gpu_after_a_layer_drawn_on_the_cpu() {
+    fn a_turned_view_stops_trying_the_gpu_after_a_layer_drawn_on_the_cpu() {
         let mut m = Map::new("Map");
         // The world's outline is too far for f32 this far in as well: none.
         m.basemap = rustgis_map::Basemap::Blank;
-        // About 5 km across, over a view of a few centimetres.
-        square_layer(&mut m, "far", 1.0 - 0.025, 0.5 - 0.025, 0.05);
+        // One feature's markers about 5 km apart, one of them in a view of a few centimetres.
+        let mut far = Dataset::new("far", GeometryType::Point, vec![]);
+        far.push(Some(Geometry::MultiPoint(vec![Coord::new(1.0, 0.5), Coord::new(1.05, 0.5)])), vec![]);
+        m.add_dataset(far);
         square_layer(&mut m, "near", 1.0, 0.5, 1e-7);
         let at = lonlat_to_merc(Coord::new(1.0, 0.5));
-        for (bearing, pitch) in [(30.0, 0.0), (0.0, 50.0)] {
-            let camera = Camera { center: at, res: rustgis_map::camera::MIN_RES, bearing, pitch };
-            let view = View { width: 400.0, height: 600.0, pixels_per_point: 1.0, camera, sky: false };
-            MESHED.with(|m| m.borrow_mut().clear());
-            let Some(RenderOutput::Cpu(gpu)) = render_backend(&mut m, &view, Backend::Gpu) else {
-                panic!("turned {bearing}°, tilted {pitch}°: drawn on the CPU")
-            };
-            let meshed = MESHED.with(|m| m.borrow().clone());
-            assert!(meshed.contains(&("far".into(), false)), "turned {bearing}°, tilted {pitch}°: tried: {meshed:?}");
-            assert!(!meshed.iter().any(|(n, _)| n == "near"), "turned {bearing}°, tilted {pitch}°: went on: {meshed:?}");
-            let cpu = render(&mut m, &view).expect("cpu");
-            assert!(gpu.pixmap.data() == cpu.pixmap.data(), "turned {bearing}°, tilted {pitch}°: as the CPU draws it");
-        }
+        let (bearing, pitch) = (30.0, 0.0);
+        let camera = Camera { center: at, res: rustgis_map::camera::MIN_RES, bearing, pitch };
+        let view = View { width: 400.0, height: 600.0, pixels_per_point: 1.0, camera, sky: false };
+        MESHED.with(|m| m.borrow_mut().clear());
+        let Some(RenderOutput::Cpu(gpu)) = render_backend(&mut m, &view, Backend::Gpu) else {
+            panic!("turned {bearing}°, tilted {pitch}°: drawn on the CPU")
+        };
+        let meshed = MESHED.with(|m| m.borrow().clone());
+        assert!(meshed.contains(&("far".into(), false)), "turned {bearing}°, tilted {pitch}°: tried: {meshed:?}");
+        assert!(!meshed.iter().any(|(n, _)| n == "near"), "turned {bearing}°, tilted {pitch}°: went on: {meshed:?}");
+        let cpu = render(&mut m, &view).expect("cpu");
+        assert!(gpu.pixmap.data() == cpu.pixmap.data(), "turned {bearing}°, tilted {pitch}°: as the CPU draws it");
     }
 
     #[test]
@@ -11639,10 +11650,11 @@ mod tests {
     }
 
     #[test]
-    fn zoomed_in_past_f32_large_features_are_drawn_on_the_cpu_where_they_are() {
+    fn zoomed_in_past_f32_large_features_are_meshed_in_tiles_near_their_origins() {
         // A 10° square's west edge at the deepest zoom (#902): its vertices lie hundreds of km
-        // from the mesh's origin, which f32 can't hold to a pixel at a tenth of a millimetre per
-        // pixel, so the layer is drawn on the CPU, with the edge through the middle of the view.
+        // from the view, which f32 can't hold to a pixel at a tenth of a millimetre per pixel
+        // from one origin. Cut into tiles (#2541), each mesh holds only its tile's part, from the
+        // tile's corner: the edge lies where it belongs, through the middle of the view.
         let mut m = Map::new("Map");
         m.basemap = rustgis_map::Basemap::Blank;
         square_layer(&mut m, "s", 0.0, 40.0, 10.0);
@@ -11652,25 +11664,35 @@ mod tests {
         let view = View { width: 400.0, height: 300.0, pixels_per_point: 1.0, camera, sky: false };
         let Some(RenderOutput::Gpu(scene)) = render_backend(&mut m, &view, Backend::Gpu) else { panic!("gpu scene") };
         let kinds = cmd_kinds(&scene);
-        assert!(!kinds.contains(&"mesh"), "no mesh f32 would misplace: {kinds:?}");
-        let Some(pixmap) = scene.cmds.iter().find_map(|c| match c {
-            gpu_scene::DrawCmd::Image { pixmap, .. } => Some(pixmap),
-            _ => None,
-        }) else {
-            panic!("the square is drawn on the CPU: {kinds:?}")
-        };
-        let alpha = |x: u32| pixmap.pixel(x, 150).map_or(0, |p| p.alpha());
-        assert_eq!(alpha(195), 0, "west of the edge is outside the square");
-        assert!(alpha(205) > 0, "east of the edge is inside it");
+        assert!(kinds.contains(&"mesh") && !kinds.contains(&"image"), "meshed: {kinds:?}");
+        let map_per_px = rustgis_map::camera::MIN_RES;
+        assert!(gpu_scene::f32_holds(gpu_scene::reach(&scene.cmds), map_per_px), "every tile within f32's reach");
+        let mut west = f64::INFINITY;
+        for c in &scene.cmds {
+            if let gpu_scene::DrawCmd::Mesh { origin, vertices, square, .. } = c {
+                assert!(square.is_some(), "a tile");
+                west = vertices.iter().map(|v| origin[0] + f64::from(v.position[0])).fold(west, f64::min);
+            }
+        }
+        assert!(west.abs() < map_per_px, "the edge where it belongs: {west}");
 
-        // Zoomed out, the same square is a mesh, and the scene says how far in it holds.
+        // Zoomed out, the same square is cut into tiles too, and the scene says how far in it
+        // holds: as far as a tile's side (and its outline's reach past it) from its corner.
         let mut camera = view.camera;
         camera.res = 1_000.0;
         let view = View { camera, ..view };
         let Some(RenderOutput::Gpu(scene)) = render_backend(&mut m, &view, Backend::Gpu) else { panic!("gpu scene") };
         assert!(cmd_kinds(&scene).contains(&"mesh"));
-        let half = (rustgis_geom::lonlat_to_merc(Coord::new(10.0, 50.0)).y - rustgis_geom::lonlat_to_merc(Coord::new(0.0, 40.0)).y) / 2.0;
-        assert!((gpu_scene::reach(&scene.cmds) - half).abs() < 1.0, "reach {} vs {half}", gpu_scene::reach(&scene.cmds));
+        let side = crate::mesh_tiles::tile_side(1_000.0).expect("tiles");
+        let reach = gpu_scene::reach(&scene.cmds);
+        assert!(reach >= side && reach < side * 1.01, "reach {reach} vs a tile's side {side}");
+
+        // Tilted, its bands (each drawn as a flat view for the shader to tilt) keep one mesh a
+        // layer: a far stroke widens past a tile's reach.
+        let view = View { camera: Camera { pitch: 45.0, ..camera }, ..view };
+        let Some(RenderOutput::Gpu(scene)) = render_backend(&mut m, &view, Backend::Gpu) else { panic!("gpu scene") };
+        assert!(scene.tilt.is_some() && cmd_kinds(&scene).contains(&"mesh"), "a tilted scene: {:?}", cmd_kinds(&scene));
+        assert!(scene.cmds.iter().all(|c| !matches!(c, gpu_scene::DrawCmd::Mesh { square: Some(_), .. })), "no tiles in a tilted view");
     }
 
     #[test]

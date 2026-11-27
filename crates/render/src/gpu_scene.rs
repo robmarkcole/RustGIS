@@ -109,10 +109,19 @@ pub enum DrawCmd {
     /// picture lives. A see-through layer drawn alone is one at the layer's opacity, so a change
     /// of transparency alone draws nothing again.
     Image { pixmap: Arc<tiny_skia::Pixmap>, opacity: f32 },
-    /// Tessellated polygon fills and line/ring strokes of one layer run. Shared: a layer that looks
-    /// as it did keeps its mesh from one scene to the next (`layer_meshes`), and the GPU keeps the
-    /// buffers of a mesh it has uploaded while the mesh lives.
-    Mesh { origin: [f64; 2], vertices: Arc<Vec<MeshVertex>>, indices: Arc<Vec<u32>> },
+    /// Tessellated polygon fills and line/ring strokes of one layer run, or of one tile of it
+    /// (`mesh_tiles`). Shared: a layer that looks as it did keeps its meshes from one scene to
+    /// the next (`layer_meshes`), and the GPU keeps the buffers of a mesh it has uploaded while
+    /// the mesh lives.
+    Mesh {
+        origin: [f64; 2],
+        vertices: Arc<Vec<MeshVertex>>,
+        indices: Arc<Vec<u32>>,
+        /// A tile's mesh is drawn only inside its square (least x and y, greatest x and y, map
+        /// units from `origin`): its features are cut a stroke's reach past it, and the next
+        /// tile draws the rest.
+        square: Option<[f32; 4]>,
+    },
     /// Point markers: instances of a small set of unit-space shape templates, shared as
     /// [`DrawCmd::Mesh`] is.
     Points { origin: [f64; 2], instances: Arc<Vec<PointInstance>> },
@@ -141,8 +150,8 @@ impl DrawCmd {
     pub fn share(&self) -> Option<DrawCmd> {
         Some(match self {
             DrawCmd::Image { pixmap, opacity } => DrawCmd::Image { pixmap: Arc::clone(pixmap), opacity: *opacity },
-            DrawCmd::Mesh { origin, vertices, indices } => {
-                DrawCmd::Mesh { origin: *origin, vertices: Arc::clone(vertices), indices: Arc::clone(indices) }
+            DrawCmd::Mesh { origin, vertices, indices, square } => {
+                DrawCmd::Mesh { origin: *origin, vertices: Arc::clone(vertices), indices: Arc::clone(indices), square: *square }
             }
             DrawCmd::Points { origin, instances } => DrawCmd::Points { origin: *origin, instances: Arc::clone(instances) },
             DrawCmd::Extrusion { .. } => return None,

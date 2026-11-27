@@ -1,10 +1,11 @@
 //! Each layer's GPU mesh kept from one scene to the next (#1057): restyling, editing or
 //! filtering one layer of a map drawn on the GPU tessellates that layer again, not every layer.
 //!
-//! A layer's mesh ([`crate::mesh::collect_layer`]) is made from the layer, the geometry copy it
-//! draws, the rows it draws, and the view: which features reach it (the GPU's cull, wider than
-//! the view so the camera can move the scene), the 0.35 px decimation, the stroke widths in
-//! pixels and where f32 holds its vertices. A kept mesh is taken again when all of those are
+//! A layer's mesh ([`crate::mesh::collect_layer`]: its tiles' meshes and its markers) is made
+//! from the layer, the geometry copy it draws, the rows it draws, and the view: which features
+//! reach it (the GPU's cull, wider than the view so the camera can move the scene), the 0.35 px
+//! decimation, the tiles at that scale, the stroke widths in pixels and where f32 holds its
+//! vertices. A kept mesh is taken again when all of those are
 //! as they were: the layer by its look ([`LayerLook`]), the rest by [`Made`] and the rows drawn.
 //! The mesh taken is then the one tessellating the layer again would make, vertex for vertex.
 //!
@@ -125,8 +126,8 @@ impl Meshes {
 /// A command sharing `cmd`'s data, when it is a mesh or points.
 fn share(cmd: &DrawCmd) -> Option<DrawCmd> {
     match cmd {
-        DrawCmd::Mesh { origin, vertices, indices } => {
-            Some(DrawCmd::Mesh { origin: *origin, vertices: Arc::clone(vertices), indices: Arc::clone(indices) })
+        DrawCmd::Mesh { origin, vertices, indices, square } => {
+            Some(DrawCmd::Mesh { origin: *origin, vertices: Arc::clone(vertices), indices: Arc::clone(indices), square: *square })
         }
         DrawCmd::Points { origin, instances } => Some(DrawCmd::Points { origin: *origin, instances: Arc::clone(instances) }),
         _ => None,
@@ -349,8 +350,11 @@ mod tests {
     use rustgis_geom::{Coord, Extent};
     use rustgis_map::{Camera, Map, Renderer, Rgba, Symbol};
 
+    /// A square `s` degrees on a side, its south-west corner at `x` east and 0.2° north: clear of
+    /// the borders of the meshes' tiles at the views here, so a layer is one mesh.
     fn square(x: f64, s: f64) -> Geometry {
-        Geometry::Polygon(vec![vec![vec![Coord::new(x, 0.0), Coord::new(x + s, 0.0), Coord::new(x + s, s), Coord::new(x, s)]]])
+        let y = 0.2;
+        Geometry::Polygon(vec![vec![vec![Coord::new(x, y), Coord::new(x + s, y), Coord::new(x + s, y + s), Coord::new(x, y + s)]]])
     }
 
     /// A map of two polygon layers drawn on the GPU, `a` under `b`, and a view of them.
@@ -364,8 +368,8 @@ mod tests {
             d.push(Some(square(x, 1.0)), vec![]);
             m.add_dataset(d)
         };
-        let (a, b) = (layer("a", 0.0), layer("b", 2.0));
-        let camera = Camera { center: rustgis_geom::lonlat_to_merc(Coord::new(1.5, 0.5)), res: 2000.0, bearing: 0.0, pitch: 0.0 };
+        let (a, b) = (layer("a", 0.2), layer("b", 2.2));
+        let camera = Camera { center: rustgis_geom::lonlat_to_merc(Coord::new(1.7, 0.7)), res: 2000.0, bearing: 0.0, pitch: 0.0 };
         (m, a, b, View { width: 400.0, height: 300.0, pixels_per_point: 1.0, camera, sky: false })
     }
 
@@ -509,6 +513,7 @@ mod tests {
             origin: [0.0; 2],
             vertices: Arc::new(vec![bytemuck::Zeroable::zeroed(); n]),
             indices: Arc::new(Vec::new()),
+            square: None,
         };
         let one = bytes_of(&[mesh(4096)]) + ENTRY_BYTES + 1;
         // Room for two of the three.
@@ -579,6 +584,7 @@ mod tests {
             origin: [0.0; 2],
             vertices: Arc::new(vec![bytemuck::Zeroable::zeroed(); n]),
             indices: Arc::new(Vec::new()),
+            square: None,
         };
         let size = |n: usize| bytes_of(&[mesh(n)]) + ENTRY_BYTES + 1;
         let max = size(6000) + size(3000) + size(500);
