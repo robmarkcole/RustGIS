@@ -240,6 +240,13 @@ pub struct Toast {
     pub id: u64,
 }
 
+impl Toast {
+    /// Whether it still shows at `now`: errors stay longer.
+    pub(crate) fn live(&self, now: f64) -> bool {
+        now - self.at < if self.error { 6.0 } else { 3.0 }
+    }
+}
+
 /// A selection outline belongs to one unchanged view, not just to a tool code.
 struct SelectionGesture {
     tool: Tool,

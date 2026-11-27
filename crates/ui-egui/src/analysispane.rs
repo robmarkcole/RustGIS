@@ -2396,6 +2396,49 @@ fn script_cursor_height(ui: &Ui) -> f32 {
     ui.text_style_height(&egui::TextStyle::Small)
 }
 
+/// Before the box reads the keys: a paste into it that would take the script over the
+/// [`crate::SCRIPT_FILE_MAX_BYTES`] Load… accepts is taken out of the frame's events, so it is never
+/// laid out, and said (#3057). Refused whole, as half a script could still run. A script already over
+/// it takes a paste that doesn't make it larger. The selection a paste replaces is the one the last
+/// frame left.
+fn refuse_huge_paste(app: &mut RustGisApp, ui: &Ui, box_id: egui::Id) {
+    if !ui.memory(|m| m.has_focus(box_id)) || !ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Paste(_)))) {
+        return;
+    }
+    let script = &app.workflow.script;
+    let mut selected: usize = crate::widgets::cursor_range(ui.ctx(), box_id).map_or(0, |r| {
+        let (a, b) = (r.primary.index.0, r.secondary.index.0);
+        script.chars().skip(a.min(b)).take(a.abs_diff(b)).map(char::len_utf8).sum()
+    });
+    let mut len = script.len();
+    let mut refused = false;
+    ui.input_mut(|i| {
+        i.events.retain(|e| {
+            // The box ignores an empty paste, selection and all.
+            let egui::Event::Paste(text) = e else { return true };
+            if text.is_empty() {
+                return true;
+            }
+            let after = len.saturating_sub(selected).saturating_add(text.len());
+            if after > crate::SCRIPT_FILE_MAX_BYTES && after > len {
+                refused = true;
+                return false;
+            }
+            (len, selected) = (after, 0);
+            true
+        });
+    });
+    if refused {
+        let text = tl!("The paste would make the script larger than 1 MB: nothing was pasted").to_string();
+        // Once while it shows: a held key repeats, and each repeat comes here. One that has had
+        // its time is still listed until this frame's toasts are drawn.
+        let now = ui.input(|i| i.time);
+        if !app.map.toasts.iter().any(|t| t.text == text && t.live(now)) {
+            app.session.notify(text, true);
+        }
+    }
+}
+
 /// The Script pane's content: commands typed one per line, run in order, coloured as they're typed
 /// (#653). `fit`: the box grows down to the buttons (the pane's own layout); else it keeps its
 /// first lines, in a pane that scrolls as a whole.
@@ -2413,6 +2456,7 @@ fn script(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens, fit: bool) {
     // One id whether the pane scrolls as a whole or not, so resizing it across that keeps the
     // box's focus, cursor and selection.
     let box_id = egui::Id::unique("script_text");
+    refuse_huge_paste(app, ui, box_id);
     // Ctrl+Enter (⌘+Enter) runs the script (#773), taken before the box sees it, so it runs rather
     // than breaking the line; once a press, not again for each repeat of a key held down. The box
     // keeps the focus, so the list closes, as Escape closes it.
@@ -3852,6 +3896,105 @@ mod tests {
         h.run();
         // 150 held and 300,000 pasted, 200 kept.
         h.get_by_label("The Find field takes 200 characters: 299950 left out");
+    }
+
+    /// A paste that would take the script over what Load… accepts is refused whole and said; one
+    /// that reaches it goes in without a word (#3057).
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_paste_over_the_load_limit_is_refused_whole() {
+        use egui::Event;
+        let max = crate::SCRIPT_FILE_MAX_BYTES;
+        let mut h = find_harness(&"a".repeat(max - 10));
+        let said = h.state().session.notice_mark();
+        h.event(Event::Paste("b".repeat(10)));
+        h.run();
+        assert_eq!(h.state().workflow.script.len(), max);
+        assert_eq!(h.state().session.notice_mark(), said, "a paste that fits says nothing");
+        let kept = h.state().workflow.script.clone();
+        h.event(Event::Paste("c".into()));
+        h.run();
+        assert_eq!(h.state().workflow.script, kept);
+        assert_eq!(h.state().session.notice_mark(), said + 1);
+        let notices = &h.state().session.notices;
+        assert_eq!(notices.last().map(|n| n.text.as_str()), Some("The paste would make the script larger than 1 MB: nothing was pasted"));
+    }
+
+    /// The box's right-click Paste, whose clipboard comes on a later frame, is limited too: the box
+    /// has the focus when it lands (#3057).
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_paste_from_the_boxs_menu_is_limited_too() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        let mut app = RustGisApp::with_sample();
+        app.run("ui.pane.script", serde_json::json!({})).unwrap();
+        app.workflow.script = "map.zoomFull".into();
+        let builder = egui_kittest::Harness::builder().with_size(vec2(1400.0, 900.0)).with_max_steps(64);
+        let mut h = builder.build_ui_state(
+            |ui, app: &mut RustGisApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            app,
+        );
+        h.run_steps(4);
+        h.get_by_role(Role::MultilineTextInput).click_secondary();
+        h.run_steps(2);
+        h.get_by_label("Paste Ctrl+V").click();
+        h.run_steps(3);
+        h.event(egui::Event::Paste("a".repeat(crate::SCRIPT_FILE_MAX_BYTES)));
+        h.run_steps(2);
+        assert_eq!(h.state().workflow.script, "map.zoomFull");
+        let said = "The paste would make the script larger than 1 MB: nothing was pasted";
+        let times = |app: &RustGisApp| app.session.notices.iter().filter(|n| n.text == said).count();
+        assert_eq!(times(h.state()), 1);
+        // Refused again while the notice shows (a held Ctrl+V): not said twice.
+        h.event(egui::Event::Paste("a".repeat(crate::SCRIPT_FILE_MAX_BYTES)));
+        h.run_steps(2);
+        assert_eq!(h.state().workflow.script, "map.zoomFull");
+        assert_eq!(times(h.state()), 1);
+        // Once it has had its time, the next refusal says so again, though it is still listed.
+        h.state_mut().map.toasts.iter_mut().for_each(|t| t.at -= 10.0);
+        h.event(egui::Event::Paste("a".repeat(crate::SCRIPT_FILE_MAX_BYTES)));
+        h.run_steps(2);
+        assert_eq!(times(h.state()), 2);
+    }
+
+    /// The limit counts bytes, less those of the selection the paste replaces, and the pastes of one
+    /// frame together; a script already over it takes a paste that doesn't make it larger (#3057).
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn the_paste_limit_counts_what_the_paste_replaces() {
+        use egui::Event;
+        use egui::text::{CCursor, CCursorRange};
+        let max = crate::SCRIPT_FILE_MAX_BYTES;
+        let box_id = egui::Id::unique("script_text");
+        // The script, how many characters are selected, each paste of one frame, and the bytes and
+        // pasted characters the box holds after.
+        let cases: [(String, usize, &[usize], usize, usize); 6] = [
+            // Two bytes a character: five selected make room for ten.
+            ("é".repeat(max / 2), 5, &[10], max, 10),
+            ("é".repeat(max / 2), 5, &[11], max, 0),
+            // The second paste of a frame no longer replaces the selection, and counts the first.
+            ("a".repeat(max - 10), 0, &[6, 6], max - 4, 6),
+            ("a".repeat(max), 8, &[8, 1], max, 8),
+            // Already over: as large is let in, larger isn't.
+            ("a".repeat(max + 100), 50, &[50], max + 100, 50),
+            ("a".repeat(max + 100), 50, &[51], max + 100, 0),
+        ];
+        for (n, (script, selected, pastes, after, pasted)) in cases.into_iter().enumerate() {
+            let mut h = find_harness(&script);
+            let range = CCursorRange::two(CCursor::new(0), CCursor::new(selected));
+            crate::widgets::set_cursor_range(&h.ctx, box_id, range);
+            for &bytes in pastes {
+                h.input_mut().events.push(Event::Paste("b".repeat(bytes)));
+            }
+            h.run();
+            let script = &h.state().workflow.script;
+            assert_eq!((script.len(), script.matches('b').count()), (after, pasted), "case {n}");
+        }
     }
 
     /// The pane with `script` in it, its fonts installed first (the icons draw letters), and the

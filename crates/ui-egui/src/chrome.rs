@@ -2218,7 +2218,7 @@ pub fn notices(app: &mut RustGisApp, ctx: &egui::Context) {
     let t = Tokens::get(ctx);
     let now = ctx.input(|i| i.time);
     toast_new_notices(app, now);
-    app.map.toasts.retain(|toast| now - toast.at < if toast.error { 6.0 } else { 3.0 });
+    app.map.toasts.retain(|toast| toast.live(now));
     if app.map.toasts.is_empty() {
         return;
     }
