@@ -451,6 +451,35 @@ fn reset(s: &mut Session, p: Project) {
             false,
         ),
     }
+    // A block's water bed (#2434) that is missing, isn't a raster layer or shares its name with
+    // another layer gives no floor (`block::water_runs` reads it as the terrain command takes it):
+    // said, and kept, so a raster layer of that name brings it back.
+    let unread: Vec<String> = s
+        .project
+        .maps
+        .iter()
+        .filter_map(|m| {
+            let bed = m.view.terrain.as_ref()?.block.as_ref()?.water.as_ref()?.bed.as_ref()?;
+            let mut named = m.layers.iter().filter(|l| l.name.eq_ignore_ascii_case(bed));
+            let read = named.next().filter(|l| l.raster.is_some()).is_some() && named.next().is_none();
+            (!read).then(|| format!("{} ('{bed}')", m.name))
+        })
+        .collect();
+    match unread.as_slice() {
+        [] => {}
+        [one] => s.notify(
+            format!("{one}: the block's water bed is missing, isn't a raster layer, or shares its name with another layer, so its walls show the water down to its depth or field (none without either)"),
+            false,
+        ),
+        _ => s.notify(
+            format!(
+                "{} block diagrams have a water bed that is missing, isn't a raster layer, or shares its name with another layer, so their walls show the water down to its depth or field (none without either): {}",
+                unread.len(),
+                unread.join(", ")
+            ),
+            false,
+        ),
+    }
     // Water on a layer read a view at a time (#2305), which `map.terrain` refuses, would come
     // from the rows the view holds (the map draws none from it): dropped and said, as the project
     // opens.
@@ -494,8 +523,12 @@ fn reset(s: &mut Session, p: Project) {
         let Some(l) = m.layer_by_name(&w.layer) else { continue };
         let numeric = |f: &str| l.dataset.field_index(f).and_then(|i| l.dataset.fields.get(i)).is_some_and(|f| f.ty.is_numeric());
         let level = w.level.clone().filter(|f| !numeric(f));
-        let depth =
-            t.block.as_ref().and_then(|b| b.water.as_ref()).and_then(|bw| bw.field.clone().filter(|f| !numeric(f)).map(|f| (f, bw.depth)));
+        // The block's own depth, or its bed (#2434), takes the field's place; else no water.
+        let depth = t
+            .block
+            .as_ref()
+            .and_then(|b| b.water.as_ref())
+            .and_then(|bw| bw.field.clone().filter(|f| !numeric(f)).map(|f| (f, bw.depth, bw.bed.clone())));
         let layer = l.name.clone();
         let Some(t) = m.view.terrain.as_mut() else { continue };
         if let Some(field) = level {
@@ -504,18 +537,17 @@ fn reset(s: &mut Session, p: Project) {
             }
             levels.push((m.name.clone(), field, layer.clone()));
         }
-        if let Some((field, d)) = depth {
+        if let Some((field, d, bed)) = depth {
             if let Some(b) = t.block.as_mut() {
-                match d {
-                    Some(_) => {
-                        if let Some(bw) = b.water.as_mut() {
-                            bw.field = None;
-                        }
+                if d.is_some() || bed.is_some() {
+                    if let Some(bw) = b.water.as_mut() {
+                        bw.field = None;
                     }
-                    None => b.water = None,
+                } else {
+                    b.water = None;
                 }
             }
-            depths.push((m.name.clone(), field, layer, d));
+            depths.push((m.name.clone(), field, layer, d, bed));
         }
     }
     let lit = |s: &String| -> NoticeText { s.clone().into() };
@@ -543,13 +575,21 @@ fn reset(s: &mut Session, p: Project) {
     }
     match depths.as_slice() {
         [] => {}
-        [(map, field, layer, d)] => {
-            let (key, mut args) = match d {
-                Some(d) => (
+        [(map, field, layer, d, bed)] => {
+            let (key, mut args) = match (d, bed) {
+                (Some(d), Some(bed)) => (
+                    "{map}: the block's water depth field '{field}' isn't a numeric field of '{layer}', so its walls show the bed '{bed}' where it has heights and the water {depth} m deep elsewhere",
+                    vec![("bed", lit(bed)), ("depth", d.to_string().into())],
+                ),
+                (Some(d), None) => (
                     "{map}: the block's water depth field '{field}' isn't a numeric field of '{layer}', so its walls show all the water {depth} m deep",
                     vec![("depth", d.to_string().into())],
                 ),
-                None => (
+                (None, Some(bed)) => (
+                    "{map}: the block's water depth field '{field}' isn't a numeric field of '{layer}', so its walls show water only where the bed '{bed}' has heights",
+                    vec![("bed", lit(bed))],
+                ),
+                (None, None) => (
                     "{map}: the block's water depth field '{field}' isn't a numeric field of '{layer}', so its walls show no water",
                     vec![],
                 ),
@@ -558,14 +598,22 @@ fn reset(s: &mut Session, p: Project) {
             s.notify_text(NoticeText::format(key, args), false);
         }
         _ => {
-            let maps = NoticeText::list(depths.iter().map(|(map, field, layer, d)| {
+            let maps = NoticeText::list(depths.iter().map(|(map, field, layer, d, bed)| {
                 let args = [("map", lit(map)), ("field", lit(field)), ("layer", lit(layer))];
-                match d {
-                    Some(d) => NoticeText::format(
+                match (d, bed) {
+                    (Some(d), Some(bed)) => NoticeText::format(
+                        "{map} ('{field}' of '{layer}', its walls showing the bed '{bed}' where it has heights and the water {depth} m deep elsewhere)",
+                        args.into_iter().chain([("bed", lit(bed)), ("depth", d.to_string().into())]),
+                    ),
+                    (Some(d), None) => NoticeText::format(
                         "{map} ('{field}' of '{layer}', its walls showing all the water {depth} m deep)",
                         args.into_iter().chain([("depth", d.to_string().into())]),
                     ),
-                    None => NoticeText::format("{map} ('{field}' of '{layer}', its walls showing no water)", args),
+                    (None, Some(bed)) => NoticeText::format(
+                        "{map} ('{field}' of '{layer}', its walls showing water only where the bed '{bed}' has heights)",
+                        args.into_iter().chain([("bed", lit(bed))]),
+                    ),
+                    (None, None) => NoticeText::format("{map} ('{field}' of '{layer}', its walls showing no water)", args),
                 }
             }));
             s.notify_text(

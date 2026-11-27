@@ -7403,6 +7403,12 @@ fn references_follow_layer(s: &mut Session, old: &str, new: &str) {
     if let Some(walls) = s.map_mut().view.terrain.as_mut().and_then(|t| t.block.as_mut()).and_then(|b| b.walls_layer.as_mut()) {
         replace(walls);
     }
+    // And the raster its water's bed is read from (#2434).
+    if let Some(bed) =
+        s.map_mut().view.terrain.as_mut().and_then(|t| t.block.as_mut()).and_then(|b| b.water.as_mut()).and_then(|w| w.bed.as_mut())
+    {
+        replace(bed);
+    }
     // And the polygons it is cut to (#2318).
     if let Some(rustgis_map::view::BlockShape::Polygon { layer, .. }) =
         s.map_mut().view.terrain.as_mut().and_then(|t| t.block.as_mut()).map(|b| &mut b.shape)
@@ -7777,6 +7783,25 @@ fn terrain_follows_removal(s: &mut Session, names: &[String]) {
             format!(
                 "Terrain: the block's walls layer '{w}' was removed, so the walls are one colour until a layer of that name comes back"
             ),
+            false,
+        );
+    }
+    // And the raster its water's bed is read from (#2434): the walls fall back to the water's
+    // depth or field meanwhile.
+    let bed = s
+        .map()
+        .view
+        .terrain
+        .as_ref()
+        .and_then(|t| t.block.as_ref())
+        .and_then(|b| b.water.as_ref())
+        .map(|w| (w.bed.clone(), w.depth.is_some() || w.field.is_some()));
+    if let Some((Some(bed), fallback)) = bed.filter(|(b, _)| {
+        dem.is_none() && b.as_ref().is_some_and(|b| names.iter().any(|n| n.eq_ignore_ascii_case(b)) && named_layers(s, b) == 0)
+    }) {
+        let shows = if fallback { "show the water down to its depth or field" } else { "show no water" };
+        s.notify(
+            format!("Terrain: the block's water bed '{bed}' was removed, so the walls {shows} until a layer of that name comes back"),
             false,
         );
     }

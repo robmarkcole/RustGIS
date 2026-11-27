@@ -13171,7 +13171,7 @@ mod tests {
         m.view.terrain = Some(rustgis_map::view::Terrain {
             source: rustgis_map::view::TerrainSource::Layer("dem".into()),
             exaggeration: 1.0,
-            block: Some(block(Some(rustgis_map::view::BlockWater { depth: Some(300.0), field: None }))),
+            block: Some(block(Some(rustgis_map::view::BlockWater { depth: Some(300.0), field: None, bed: None }))),
             water: Some(rustgis_map::view::TerrainWater { layer: "lagos".into(), level: None, glint: 0.0, shore: 0.35 }),
         });
         let frame = render(&mut m, &view).expect("a frame");

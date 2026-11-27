@@ -202,6 +202,30 @@ block takes the water out of the walls (the rest of the block stays as it was); 
 it a layer without the depth field, is refused. Deleting the depth field keeps the water's own
 `depth` for all the water, or takes the water out of the walls when there is none, and says so.
 
+When the bed is measured, `"bed": "Bathymetry"` in the block's water names a raster layer of the
+bed's heights (metres on the DEM's vertical datum, stretched by the exaggeration as the level is;
+a topo-bathymetric DEM can be named as its own bed, and a raster of depths turns into heights with
+the raster calculator, `level − depth`). Along each wall's water the floor is then the bed's height,
+read at steps of the bed's cell at the block's centre, longer where that would take more than
+16 384 heights along all the walls' water (read once and kept until the layer, its data or the box
+change), with
+no shore ramp, as the bed reaches the shore itself; where the bed lies above the level there is
+no water. Where the bed has no data (off the raster, its no-data cells) the floor is the field's
+depth or the `"depth"`, with the ramp, as without a bed, and no water without either; one notice
+says along how many stretches and in how many water bodies. The bed alone is enough, without a
+depth or field. The water's shading runs from the level to the deepest point of each stretch.
+`map.terrain` refuses a bed that isn't a raster layer, or a name more than one layer has, before
+the terrain changes, and so a new box for the block that moves it off the bed it keeps. The bed's
+footprint is checked against the block's box when its data is there as the command runs; a bed
+still being read gives no floor until it is, and one whose data lands later off the box is kept,
+the frame then saying it has no heights along the walls' water. The bed is kept by name and
+follows its renames; removing it says the walls fall back to the depth or field meanwhile, and so
+does a project that opens without it, and a layer of its name that isn't a raster (renamed or
+added to it) is said by the frame. A bed deeper
+than the block's base is drawn at the base: give the block a larger `"depth"`. Only the walls show
+the bed: the ground over the water stays flat at its level. Saved projects require
+`terrain-block-water-bed`.
+
 **Water** on the terrain lies flat: `map.terrain` with `{"water": {"layer": "Lakes"}}` names a
 polygon layer of water bodies, and inside each polygon the ground is level, at the lowest height
 of the DEM along its shore, instead of rising and falling with a surface model that is noisy or

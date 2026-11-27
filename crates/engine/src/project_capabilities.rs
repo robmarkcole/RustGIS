@@ -1037,7 +1037,7 @@ fn map_capabilities<'a>(maps: impl IntoIterator<Item = &'a Map>) -> Vec<&'static
     let (mut polygon, mut svg) = (false, false);
     let (mut offline_area_id, mut paper, mut native, mut guided, mut weighed, mut cleared, mut deduped) =
         (false, false, false, false, false, false, false);
-    let mut crisp = false;
+    let (mut crisp, mut bed) = (false, false);
     for map in maps {
         offline_area_id |= map.offline_area_id.is_some();
         // A blank basemap's paper colour (#2532), which an older reader would draw and save white.
@@ -1065,6 +1065,8 @@ fn map_capabilities<'a>(maps: impl IntoIterator<Item = &'a Map>) -> Vec<&'static
             shore |= t.water.as_ref().is_some_and(|w| w.shore != rustgis_map::view::WATER_SHORE);
             // The water in a block's walls (#2317), which an older reader would save away.
             block_water |= t.block.as_ref().is_some_and(|b| b.water.is_some());
+            // Its bed read from a raster (#2434), which an older reader would save away.
+            bed |= t.block.as_ref().and_then(|b| b.water.as_ref()).is_some_and(|w| w.bed.is_some());
             // The layer a block's walls are coloured by (#2173), which an older reader would save away.
             walls_layer |= t.block.as_ref().is_some_and(|b| b.walls_layer.is_some());
         }
@@ -1086,6 +1088,7 @@ fn map_capabilities<'a>(maps: impl IntoIterator<Item = &'a Map>) -> Vec<&'static
         (water, "terrain-water"),
         (shore, "terrain-water-shore"),
         (block_water, "terrain-block-water"),
+        (bed, "terrain-block-water-bed"),
         (walls_layer, "terrain-block-walls-layer"),
         (relief, "shaded-relief-effects"),
         (light, "shaded-relief-light"),
@@ -1277,6 +1280,23 @@ mod tests {
             b.walls_layer = None;
         }
         assert_eq!(serde_json::to_value(&plain).unwrap()["requires"], json!(["terrain-block"]));
+    }
+
+    /// A block's water floor read from a bed raster (#2434) reads back by the raster's name, and
+    /// saving names it in `requires`; the same water without a bed doesn't.
+    #[test]
+    fn terrain_block_water_bed_fixture_requires_it() {
+        let fixture = Project::from_json(include_str!("../../../schema/fixtures/terrain_block_water_bed_v2.rgis")).unwrap();
+        let water = fixture.maps[0].view.terrain.as_ref().and_then(|t| t.block.as_ref()).and_then(|b| b.water.clone());
+        assert_eq!(water, Some(rustgis_map::view::BlockWater { depth: Some(8.0), field: None, bed: Some("batimetria".into()) }));
+        let saved = serde_json::to_value(&fixture).unwrap();
+        assert_eq!(saved["requires"], json!(["terrain-block", "terrain-water", "terrain-block-water", "terrain-block-water-bed"]));
+        assert_eq!(saved["maps"][0]["view"]["terrain"]["block"]["water"], json!({"depth": 8.0, "bed": "batimetria"}));
+        let mut plain = fixture;
+        if let Some(w) = plain.maps[0].view.terrain.as_mut().and_then(|t| t.block.as_mut()).and_then(|b| b.water.as_mut()) {
+            w.bed = None;
+        }
+        assert_eq!(serde_json::to_value(&plain).unwrap()["requires"], json!(["terrain-block", "terrain-water", "terrain-block-water"]));
     }
 
     /// A saved image marker reads back as the image it was, and saving names it again.
