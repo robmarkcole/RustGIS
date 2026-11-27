@@ -1319,6 +1319,12 @@ pub fn legend_fitted_mm(
     })
 }
 
+/// The width in mm [`legend`] draws `title` in, in a legend whose text is `text_size` points
+/// (#3095).
+pub fn legend_title_width_mm(title: &str, text_size: f64) -> f64 {
+    f64::from(text::measure(title, LEGEND_TITLE_PT * legend_size(text_size), true)) / PT_PER_MM
+}
+
 /// The height in mm [`legend`] gives a title above its rows, which [`legend_sizes_mm`] leaves out,
 /// in a legend whose text is `text_size` points (#2581).
 pub fn legend_title_mm(text_size: f64) -> f64 {

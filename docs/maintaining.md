@@ -363,6 +363,11 @@ requires `layout-publication-parts`, so an older reader refuses it instead of ma
 sheet or failing on the object. `null`, a `grid` or `scaleBar` of `{}`, and the north arrow given
 as the text `"auto"`, `"always"` or `"none"` need nothing.
 
+A saved `layout.publication` that leaves out or sets up its legend (`legend` as `"none"` or an
+object that gives something, #3095) requires `layout-publication-legend`, so an older reader
+refuses it instead of making the default legend. `null`, a `legend` of `{}`, a blank `title` and
+an empty `exclude` need nothing.
+
 ## New dependencies
 
 A proposal for a dependency answers:

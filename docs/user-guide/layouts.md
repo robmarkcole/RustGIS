@@ -165,6 +165,12 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
     (`{"units": "miles", "style": "line"}`), its box growing with a larger `textSize`. A `textSize` or `labelSize` you give is in points
     as written: unlike the defaults, it isn't scaled with the sheet.
     `"northArrow"` also takes `{"show": "auto"|"always", "style", "fill", "outline"}`.
+  - **Legend**: `"legend": "none"` leaves it out, and a raster's colorbar keeps its box; the answer's
+    `legendColumns` is then `null`.
+    `{"title": "Key", "columns": 2, "exclude": ["Rivers"]}` gives it a title (its box grows to
+    hold it), a fixed number of columns (1 to 6; otherwise the placement picks 1 to 3) and layers
+    to leave out besides the context ones. A title wider than the box is said in a warning. An
+    unknown layer or key is refused.
   - **Legend box**: over the map, the legend's box is left clear where the map shows nothing under
     it but its light plain paper or water: no layer, label, context layer, basemap shape or graticule
     line, no web tiles, and no veil. Dark basemaps keep a white backing so the dark legend text

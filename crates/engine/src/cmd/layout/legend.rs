@@ -350,11 +350,15 @@ pub(in crate::cmd::layout) fn legend_exclude(
     p: &Value,
 ) -> Result<Option<Vec<String>>, String> {
     let Some(v) = p.get("exclude").filter(|v| !v.is_null()) else { return Ok(None) };
+    excluded_layers(legend_map(input, l, frame)?, v).map(Some)
+}
+
+/// The layers of `map` that `v`, a legend's `exclude`, names, as the map spells them, each once.
+pub(in crate::cmd::layout) fn excluded_layers(map: &Map, v: &Value) -> Result<Vec<String>, String> {
     let names = v.as_array().ok_or("exclude is a list of layer names")?;
     if names.len() > rustgis_map::layout::MAX_LEGEND_EXCLUDED {
         return Err(format!("a legend leaves out at most {} layers", rustgis_map::layout::MAX_LEGEND_EXCLUDED));
     }
-    let map = legend_map(input, l, frame)?;
     let mut out: Vec<String> = Vec::new();
     for n in names {
         let n = n.as_str().ok_or("exclude is a list of layer names")?;
@@ -363,7 +367,7 @@ pub(in crate::cmd::layout) fn legend_exclude(
             out.push(name.clone());
         }
     }
-    Ok(Some(out))
+    Ok(out)
 }
 
 /// The map a legend's frame shows.

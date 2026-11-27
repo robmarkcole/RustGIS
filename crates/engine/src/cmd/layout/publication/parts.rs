@@ -91,3 +91,88 @@ pub(super) fn publication_north_arrow(p: &Value) -> Result<(Option<bool>, Elemen
         _ => Err(refused()),
     }
 }
+
+/// A legend's: its title, its columns and the layers it leaves out.
+const LEGEND_KEYS: &[&str] = &["title", "columns", "exclude"];
+
+/// What `"legend"` sets of a publication's legend; the default has no title, takes the columns the
+/// placement picks and leaves out no layer but the context ones.
+#[derive(Default)]
+pub(super) struct PublicationLegend {
+    pub(super) title: String,
+    pub(super) columns: Option<usize>,
+    /// The layers asked to be left out, as `map` spells them.
+    pub(super) exclude: Vec<String>,
+}
+
+/// The legend of a publication of `map`, as `"legend"` sets it up, or none.
+pub(super) fn publication_legend(p: &Value, map: &Map) -> Result<Option<PublicationLegend>, String> {
+    part(p, "legend", LEGEND_KEYS, PublicationLegend::default(), |o, base| {
+        let title = match o.get("title") {
+            None => base.title,
+            Some(v) => crate::cmd::within("title", "a legend's title", v.as_str().ok_or("title is text")?, 200)?,
+        };
+        // A blank title is none, rather than an empty line over the rows.
+        let title = if title.trim().is_empty() { String::new() } else { title };
+        let exclude = o.get("exclude").map(|v| excluded_layers(map, v)).transpose()?.unwrap_or_default();
+        Ok(PublicationLegend { title, columns: legend_columns_param(o)?, exclude })
+    })
+}
+
+impl PublicationLegend {
+    /// The layers the legend leaves out: those asked, and the `context` ones, none of them among
+    /// those asked. The asked ones go first, as a loaded project cuts a list past
+    /// `MAX_LEGEND_EXCLUDED` at its end.
+    pub(super) fn left_out(&self, context: &[String]) -> Vec<String> {
+        [&self.exclude, context].concat()
+    }
+
+    /// The legend's size in each number of columns the placement tries, in mm, its text `text_pt`
+    /// points, at the renderer's scale denominator `scale`, with its title when it has rows. A
+    /// legend asked for some columns has that size in every one, so the placement has no other to
+    /// pick. `None` when a complete source can't be read.
+    pub(super) fn sizes(
+        &self,
+        map: &mut Map,
+        scale: f64,
+        context: &[String],
+        text_pt: f64,
+    ) -> Option<[(f64, f64); PUBLICATION_LEGEND_COLUMNS]> {
+        let sizes = self.rows_sizes(map, scale, context, text_pt)?;
+        if self.title.is_empty() {
+            return Some(sizes);
+        }
+        let title_w = crate::render::layout::legend_title_width_mm(&self.title, text_pt);
+        let title_h = crate::render::layout::legend_title_mm(text_pt);
+        Some(sizes.map(|(w, h)| if h > 0.0 { (w.max(title_w), h + title_h) } else { (w, h) }))
+    }
+
+    /// [`PublicationLegend::sizes`] of the rows alone, without the title.
+    pub(super) fn rows_sizes(
+        &self,
+        map: &mut Map,
+        scale: f64,
+        context: &[String],
+        text_pt: f64,
+    ) -> Option<[(f64, f64); PUBLICATION_LEGEND_COLUMNS]> {
+        use crate::render::layout::{LegendAsked, legend_size_asked_mm, legend_sizes_in_columns_mm};
+        let exclude = self.left_out(context);
+        let labels = Default::default();
+        let sizes = match self.columns {
+            None => legend_sizes_in_columns_mm(map, scale, false, false, (false, text_pt), (&exclude, &labels))?,
+            Some(columns) => {
+                let asked = LegendAsked {
+                    all_classes: false,
+                    hide_other: false,
+                    show_no_data: false,
+                    layer_names: true,
+                    text_size: text_pt,
+                    exclude: &exclude,
+                    labels: &labels,
+                };
+                [legend_size_asked_mm(map, scale, &asked, columns)?; PUBLICATION_LEGEND_COLUMNS]
+            }
+        };
+        Some(sizes)
+    }
+}

@@ -15596,6 +15596,12 @@ fn a_publication_legend_leaves_out_context_layers() {
     assert_eq!(exclude, ["border"], "a name a data layer shares stays: {said:?}");
     let (exclude, said) = laid(json!({"contextInLegend": true})).unwrap();
     assert!(exclude.is_empty() && said.is_none(), "{exclude:?} {said:?}");
+    // One asked to be left out isn't named: "contextInLegend" wouldn't list it.
+    let (mut exclude, said) = laid(json!({"legend": {"exclude": ["Border"]}})).unwrap();
+    exclude.sort();
+    assert_eq!(exclude, ["around", "border"]);
+    let said = said.expect("said");
+    assert!(said.contains("1 context layer around the data (around)"), "{said}");
     let bad = laid(json!({"contextInLegend": "yes"})).unwrap_err();
     assert!(bad.contains("contextInLegend is true or false"), "{bad}");
     let _ = std::fs::remove_dir_all(&dir);

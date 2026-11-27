@@ -186,6 +186,7 @@ const COMMAND_CAPABILITIES: &[(&str, CommandCheck)] = &[
     ("layout-page-color", command_colours_the_page),
     ("layout-text-statistics", command_uses_text_statistics),
     ("layout-publication-parts", command_sets_publication_parts),
+    ("layout-publication-legend", command_sets_publication_legend),
 ];
 
 /// A saved `layout.publication` that leaves out or sets up its grid, scale bar or north arrow
@@ -200,6 +201,20 @@ fn command_sets_publication_parts(id: &str, params: &Value) -> bool {
                 || params.get("northArrow").is_some_and(Value::is_object)
         }
         "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_sets_publication_parts)),
+        _ => false,
+    }
+}
+
+/// A saved `layout.publication` that leaves out or sets up its legend (#3095): an older reader
+/// ignores `legend`, making the default one. `null` and an object giving nothing (each key
+/// `null`, a blank title or an empty list) ask for that default, so they require nothing.
+fn command_sets_publication_legend(id: &str, params: &Value) -> bool {
+    let nothing = |v: &Value| v.is_null() || v.as_str().is_some_and(|t| t.trim().is_empty()) || v.as_array().is_some_and(Vec::is_empty);
+    match id {
+        "layout.publication" => {
+            params.get("legend").is_some_and(|v| !v.is_null() && v.as_object().is_none_or(|o| !o.values().all(nothing)))
+        }
+        "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_sets_publication_legend)),
         _ => false,
     }
 }
@@ -1447,6 +1462,7 @@ mod tests {
             (&["layout-page-color"], "layout.page", json!({"color": "#0B1B2B"})),
             (&["layout-text-statistics"], "layout.addElement", json!({"kind": "text", "text": "{count:Cities}"})),
             (&["layout-publication-parts"], "layout.publication", json!({"grid": "none"})),
+            (&["layout-publication-legend"], "layout.publication", json!({"legend": "none"})),
             // An SVG image is a picture marker as well, in a node as in a saved command.
             (&["picture-markers", "svg-markers"], "layer.marker", json!({"image": svg})),
             (&[], "buffer", json!({"input": "Cities", "distance": 1})),
