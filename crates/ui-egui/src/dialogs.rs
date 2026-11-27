@@ -125,6 +125,9 @@ pub struct Dialogs {
     pub dxf: Option<DxfFile>,
     /// Select By Attributes' Values list: its field, and the values read for it.
     pub values: crate::fieldvalues::Form,
+    /// Select By Attributes' count of the rows its clause matches: counted once per clause and
+    /// set of rows, off the frame (#2946).
+    pub matching: crate::matchcount::Count,
     /// Reset collapsed then closed dialogs when reopening
     pub reset_collapse: bool,
 }
@@ -1061,6 +1064,8 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
         app.dialogs.open = None;
         // Its values read are dropped with the dialog.
         app.dialogs.values = Default::default();
+        // And so is a count still on its way (dropping it stops the worker).
+        app.dialogs.matching = Default::default();
         if which == "addDxf" {
             app.dialogs.dxf = None;
         }
@@ -3079,25 +3084,33 @@ fn select_by_attributes(app: &mut RustGisApp, ui: &mut egui::Ui, t: &Tokens) -> 
     crate::fieldvalues::said(ui, &app.dialogs.values);
     // Live validation, once no suggestion is offered: a word still being chosen isn't an error yet.
     let offering = crate::exprcomplete::offering(ui, id);
-    let check = app
+    // Counted once per clause and set of rows, off the frame (#2946); nothing while a word is
+    // still being chosen, nor for an empty clause.
+    let dialogs = &mut app.dialogs;
+    let shown = app
         .session
         .map()
-        .layer_by_name(&app.dialogs.layer)
-        .filter(|_| !offering)
-        .map(|l| rustgis_engine::data::query::select(&app.dialogs.text, &l.dataset));
-    match (&check, app.dialogs.text.trim().is_empty()) {
-        (_, true) => {}
-        (Some(Ok(rows)), _) => {
+        .layer_by_name(&dialogs.layer)
+        .filter(|_| !offering && !dialogs.text.trim().is_empty())
+        .map(|l| dialogs.matching.of(ui.ctx(), &dialogs.text, &l.name, &l.dataset, !cfg!(target_arch = "wasm32")));
+    match shown {
+        Some(crate::matchcount::Shown::Rows(n)) => {
             ui.label(
-                egui::RichText::new(crate::i18n::fmt("Valid expression · {n} matching rows", &[("n", &rows.len().to_string())]))
+                egui::RichText::new(crate::i18n::fmt("Valid expression · {n} matching rows", &[("n", &n.to_string())]))
                     .small()
                     .color(t.green),
             );
         }
-        (Some(Err(e)), _) => {
-            ui.label(egui::RichText::new(crate::i18n::fmt("Invalid: {error}", &[("error", e)])).small().color(t.red));
+        Some(crate::matchcount::Shown::Invalid(e)) => {
+            ui.label(egui::RichText::new(crate::i18n::fmt("Invalid: {error}", &[("error", &e)])).small().color(t.red));
         }
-        _ => {}
+        Some(crate::matchcount::Shown::Failed(e)) => {
+            ui.label(egui::RichText::new(e).small().color(t.red));
+        }
+        Some(crate::matchcount::Shown::Counting) => {
+            ui.label(egui::RichText::new(tl!("Counting matching rows…")).small().weak());
+        }
+        None => {}
     }
     buttons(app, ui, "Apply", |app| {
         let layer = app.dialogs.layer.clone();
@@ -3907,6 +3920,130 @@ mod tests {
 
     fn selected(app: &RustGisApp) -> usize {
         app.session.map().layer_by_name("Countries").map_or(0, |l| l.selection.len())
+    }
+
+    /// Frames until the count has landed (it runs on a thread of its own).
+    fn counted(h: &mut egui_kittest::Harness<'static, RustGisApp>) {
+        for _ in 0..400 {
+            h.step();
+            if !h.state().dialogs.matching.counting() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5)); // test-wait: the count runs on a thread of its own
+        }
+        panic!("the count never landed");
+    }
+
+    /// The count is made once for a clause and its rows, not once per frame, and reads as it
+    /// always did (#2946).
+    #[test]
+    fn select_by_attributes_counts_once_per_clause_not_per_frame() {
+        use egui_kittest::kittest::Queryable;
+        let mut h = sba_ready();
+        counted(&mut h);
+        assert_eq!(h.state().dialogs.matching.starts, 1);
+        h.run_steps(10);
+        for x in [200.0, 300.0, 250.0] {
+            h.hover_at(egui::pos2(x, 300.0));
+            h.step();
+        }
+        assert_eq!(h.state().dialogs.matching.starts, 1, "not counted again by frames");
+        assert!(h.query_by_label("Valid expression · 14 matching rows").is_some(), "the number as before");
+    }
+
+    /// An edit to the layer, another clause or another layer is counted again; none is answered
+    /// with the number for what was before (#2946).
+    #[test]
+    fn select_by_attributes_count_follows_the_rows_and_the_clause() {
+        use egui_kittest::kittest::Queryable;
+        use rustgis_engine::data::Value;
+        let mut h = sba_ready();
+        counted(&mut h);
+        let (id, fields) = h.state().session.map().layer_by_name("Countries").map(|l| (l.id, l.dataset.fields.len())).unwrap();
+        let pop = h.state().session.map().layer_by_name("Countries").and_then(|l| l.dataset.field_index("pop_est")).unwrap();
+        let mut attrs = vec![Value::Null; fields];
+        attrs[pop] = Value::Int(1_000_000_000);
+        h.state_mut().session.map_mut().layer_mut(id).unwrap().dataset.push(None, attrs);
+        counted(&mut h);
+        assert_eq!(h.state().dialogs.matching.starts, 2, "a row added");
+        assert!(h.query_by_label("Valid expression · 15 matching rows").is_some(), "one more than before");
+        h.state_mut().dialogs.text = "pop_est > 2000000000".into();
+        counted(&mut h);
+        assert_eq!(h.state().dialogs.matching.starts, 3, "another clause");
+        assert!(h.query_by_label("Valid expression · 0 matching rows").is_some());
+        h.state_mut().dialogs.text.clear();
+        h.run_steps(3);
+        assert_eq!(h.state().dialogs.matching.starts, 3, "an empty clause starts nothing");
+        assert!(h.query_by_label_contains("matching rows").is_none(), "and says nothing");
+    }
+
+    /// A value edited in place (the rows' number and the fields as before), another layer and a
+    /// layer removed are never answered with the number for what was there before (#2946).
+    #[test]
+    fn select_by_attributes_count_follows_a_value_edit_a_layer_switch_and_a_removal() {
+        use egui_kittest::kittest::Queryable;
+        use rustgis_engine::data::Value;
+        let mut h = sba_ready();
+        counted(&mut h);
+        let (id, pop, row) = {
+            let l = h.state().session.map().layer_by_name("Countries").unwrap();
+            let rows = rustgis_engine::data::query::select("pop_est > 100000000", &l.dataset).unwrap();
+            (l.id, l.dataset.field_index("pop_est").unwrap(), rows[0])
+        };
+        h.state_mut().session.map_mut().layer_mut(id).unwrap().dataset.features.set_value(row, pop, Value::Int(0));
+        counted(&mut h);
+        assert!(h.query_by_label("Valid expression · 13 matching rows").is_some(), "one fewer, the same length");
+        h.state_mut().dialogs.layer = "Cities".into();
+        counted(&mut h);
+        assert!(h.query_by_label_contains("Valid expression · 13").is_none(), "not Countries' number for Cities");
+        assert!(
+            h.query_by_label_contains("matching rows").is_some() || h.query_by_label_contains("Invalid:").is_some(),
+            "Cities has its own answer"
+        );
+        h.state_mut().dialogs.layer = "Countries".into();
+        counted(&mut h);
+        h.state_mut().session.run("layer.remove", &json!({"layer": "Countries"})).unwrap();
+        h.run_steps(3);
+        assert!(h.query_by_label_contains("matching rows").is_none(), "a layer that is gone has no count");
+    }
+
+    /// A clause that doesn't read is said at once and starts no count (#2946).
+    #[test]
+    fn select_by_attributes_names_a_bad_clause_without_counting() {
+        use egui_kittest::kittest::Queryable;
+        let mut h = sba_ready();
+        counted(&mut h);
+        h.state_mut().dialogs.text = "nope = 1".into();
+        h.step();
+        assert!(h.query_by_label("Invalid: no field named 'nope'").is_some(), "said in the frame that sees it");
+        assert_eq!(h.state().dialogs.matching.starts, 1, "no second count");
+    }
+
+    /// A clause typed is not counted in the frame that draws it (#2946): the count runs on a
+    /// thread of its own and is polled by a later frame, however fast it is.
+    #[test]
+    fn select_by_attributes_does_not_count_in_the_frame_that_draws_it() {
+        use egui_kittest::kittest::Queryable;
+        let mut h = sba_ready();
+        h.state_mut().dialogs.text = "pop_est > 100000000 OR pop_est < 1".into();
+        h.step();
+        assert!(h.query_by_label_contains("Counting matching rows…").is_some(), "says it is counting");
+        assert!(h.query_by_label_contains("Valid expression").is_none(), "no count in the frame that starts it");
+    }
+
+    /// Closing the dialog while it counts stops the count (#2946): the worker is not left reading
+    /// the layer's rows for a dialog that is gone.
+    #[test]
+    fn cancelling_select_by_attributes_stops_its_count() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        let mut h = sba_ready();
+        let stop = h.state().dialogs.matching.stop_flag();
+        assert!(!stop.load(std::sync::atomic::Ordering::Relaxed), "counting for the open dialog");
+        h.get_by_role_and_label(Role::Button, "Cancel").click();
+        h.run();
+        assert_eq!(h.state().dialogs.open, None, "Cancel closed it");
+        assert!(stop.load(std::sync::atomic::Ordering::Relaxed), "and the count was told to stop");
     }
 
     /// Enter on a focused Cancel cancels: the dialog closes and selects nothing (#2599).

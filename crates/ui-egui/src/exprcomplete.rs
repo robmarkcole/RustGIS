@@ -122,7 +122,14 @@ pub(crate) struct Offer {
 /// offer worked out over them is kept while it's the same (`Worked`), and its rows' descriptions
 /// while the offer is (`completion::List`).
 pub(crate) fn fields_key(ds: &Dataset) -> u64 {
-    egui::util::hash(ds.fields.iter().map(|f| (f.name.as_str(), f.ty.label(), f.alias.as_deref())).collect::<Vec<_>>())
+    // Fed to the hasher one by one: no list is built for it, as this runs every frame.
+    use std::hash::{Hash, Hasher};
+    let mut h = std::hash::DefaultHasher::new();
+    ds.fields.len().hash(&mut h);
+    for f in &ds.fields {
+        (f.name.as_str(), f.ty.label(), f.alias.as_deref()).hash(&mut h);
+    }
+    h.finish()
 }
 
 impl Offered for Offer {

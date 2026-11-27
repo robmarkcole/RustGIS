@@ -77,6 +77,7 @@ mod mapview;
 mod markerimages;
 mod markerpick;
 pub use markerpick::{MarkerImage, marker_file_too_large};
+mod matchcount;
 mod measure_units;
 mod modelbuilder;
 mod navui;

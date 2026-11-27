@@ -13,7 +13,8 @@ Mercator stops, is measured on the ground instead, so it may be selected outside
 stops at 85.05°, or left out inside it. The main Select button remains click/rectangle selection.
 All selection tools take only features that are drawn, in selectable layers: a definition query or
 a display filter hiding a feature keeps it out, and a click picks the feature drawn on top among the
-selectable layers. **Select By Attributes** takes a SQL clause and checks it as you type (buttons
+selectable layers. **Select By Attributes** takes a SQL clause and checks it as you type and shows how many rows
+match, saying "Counting matching rows…" until the desktop app has the number (buttons
 add a field or an operator, and the **Functions** and **Variables** menus add the language's
 functions and variables); **Select By Location** picks features that touch another layer's features or lie
 within a search distance of them (or, inverted, those that don't). Selected features draw in
