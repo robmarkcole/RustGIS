@@ -279,6 +279,12 @@ without its own (#2557). A saved `layout.update` that gives a frame a `border` o
 too, since an older reader warns that it ignores the key; `"border": null` only gives the default
 back and needs nothing. A saved `layout.import` whose `text` has such a frame requires it as well.
 
+Projects with section lines on a map frame (`sections`) require `layout-section`, so an older
+reader refuses them instead of drawing the frame without them and saving it again so (#2863). A
+saved `layout.addElement` of a section requires it too, and so does a `layout.update` with a
+`section` object, which an older reader warns that it ignores. A saved `layout.import` whose `text`
+has such a frame requires it as well.
+
 Projects with a legend, a scale bar or a grid whose text isn't its default size (`text_size` on
 a legend, 9 points by default, or on a scale bar, 8; `label_size` on a frame's grid, 8) require
 `layout-text-size`, so an older reader refuses them instead of drawing that text at the default

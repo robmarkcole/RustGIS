@@ -10,8 +10,8 @@ use rustgis_geom::{Coord, Extent};
 use rustgis_map::layout::{
     ArrowStyle, ChartLook, ColorScale, ElementKind, FrameShape, GRID_LABEL_PT, Grid, GridKind, INK, LAYOUT_TEXT_SIZE, LEGEND_TEXT_PT,
     Layout, LegendFit, LineHead, MAX_LEGEND_COLUMNS, Orientation, PT_PER_MM, SCALE_BAR_TEXT_PT, ScaleBarFit, ScaleBarStyle,
-    ScaleLabelPosition, ScaleUnits, TextAlign, TextCase, TextVAlign, TickSide, UnitLabelPosition, frame_camera, layout_text_in_range,
-    layout_text_scale, legend_columns_in_range,
+    ScaleLabelPosition, ScaleUnits, Section, SectionLine, TextAlign, TextCase, TextVAlign, TickSide, UnitLabelPosition, frame_camera,
+    layout_text_in_range, layout_text_scale, legend_columns_in_range,
 };
 use rustgis_map::symbology::LegendEntry;
 use rustgis_map::{Map, Rgba};
@@ -29,6 +29,7 @@ mod legend;
 mod losses;
 mod north;
 mod scale_bar;
+mod section;
 mod swatch;
 mod table;
 mod textbox;
@@ -43,6 +44,7 @@ pub use legend::*;
 pub use losses::*;
 use north::*;
 pub use scale_bar::*;
+pub use section::*;
 use swatch::*;
 use table::*;
 pub use textbox::*;
@@ -404,7 +406,7 @@ fn draw_page(
             ((e.x * k - f64::from(bounds.x())) as f32, (e.y * k - f64::from(bounds.y())) as f32, (e.w * k) as f32, (e.h * k) as f32);
         let Some(r) = Rect::from_xywh(x, y, ew.max(1.0), eh.max(1.0)) else { continue };
         match &e.kind {
-            ElementKind::MapFrame { shape, grid, extent_of, extent_color, extent_width, border_color, border_width, .. } => {
+            ElementKind::MapFrame { shape, grid, sections, extent_of, extent_color, extent_width, border_color, border_width, .. } => {
                 let Some(&(_, mi, cam, fw, fh)) = frame(e.id) else {
                     placeholder(&mut pm, r, "Missing map", ppp);
                     continue;
@@ -416,8 +418,11 @@ fn draw_page(
                 // The grid is drawn with the frame's map, before its attribution, which keeps
                 // clear of the grid's labels.
                 let grid = grid.as_ref().map(|g| (g, layout.decimal_comma));
+                let sections: Vec<_> =
+                    sections.iter().filter_map(|s| Some((s, section_ends(map, &cam, (fw, fh), shape, s.line).ok()?))).collect();
+                let over = FrameOver { grid, sections: &sections };
                 let mut failed_source = None;
-                let Some(mut frame_pm) = frame_canvas(map, &view, pm.is_recording(), &mut pending.frames, grid, &mut failed_source, env)
+                let Some(mut frame_pm) = frame_canvas(map, &view, pm.is_recording(), &mut pending.frames, over, &mut failed_source, env)
                 else {
                     if frame_requires_complete(map, &view) {
                         *source_error = failed_source_error(map, failed_source);
@@ -432,7 +437,7 @@ fn draw_page(
                     frame_pm.overflowed() || pm.recorded_cost().saturating_add(frame_pm.recorded_cost()) > crate::vector::max_cost();
                 if frame_pm.is_recording()
                     && too_large
-                    && let Some(pixels) = frame_canvas(map, &view, false, &mut pending.frames, grid, &mut None, env)
+                    && let Some(pixels) = frame_canvas(map, &view, false, &mut pending.frames, over, &mut None, env)
                 {
                     frame_pm = pixels;
                     if let Some(list) = record.as_deref_mut() {

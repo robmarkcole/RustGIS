@@ -1184,6 +1184,7 @@ fn report_pages_bytes(
             let (img, ..) = drawn?;
             keep_unfitted(&mut unfitted, page_layout, listed);
             say_report_unfitted(s, &unfitted);
+            say_sections_not_drawn(s, pages, 1);
             return Ok((img.encode_png().map_err(|e| e.to_string())?, pages.len()));
         }
         let (drawn, listed) = rustgis_render::layout::unfitted_legends(|| {
@@ -1211,7 +1212,31 @@ fn report_pages_bytes(
     }
     say_report_unfitted(s, &unfitted);
     super::layout::pictured_notices(s, &frames_pictured, &pages_pictured);
+    say_sections_not_drawn(s, pages, n);
     Ok((rustgis_render::pdf::write(&out, &doc.title), pages.len()))
+}
+
+/// Says the section lines (#2863) the layouts of the first `n` of `pages` don't draw, as the
+/// layout's own export says them: in one notice however many layouts leave one out, each line named
+/// with its layout, and a layout on several pages counted once.
+fn say_sections_not_drawn(s: &mut Session, pages: &[rustgis_render::report::Page], n: usize) {
+    let mut seen = Vec::new();
+    let mut gaps = std::collections::BTreeMap::new();
+    for page in pages.iter().take(n) {
+        let rustgis_render::report::Page::Layout(li) = page else { continue };
+        if seen.contains(li) {
+            continue;
+        }
+        seen.push(*li);
+        let Some(layout) = s.project.layouts.get(*li) else { continue };
+        for mut gap in rustgis_render::layout::sections_not_drawn(layout, &s.project.maps) {
+            gap.frame_name = format!("{} in layout '{}'", gap.frame_name, layout.name);
+            gaps.insert(gap, 1);
+        }
+    }
+    if let Some(note) = rustgis_render::layout::sections_notice(&gaps, 1) {
+        s.warn(format!("The report: {note}"));
+    }
 }
 
 /// Keeps the legends `listed` as cut on a page that draws the layout `layout` (by its index), each

@@ -75,9 +75,10 @@ pub(in crate::cmd::layout) fn place(p: &Value, l: &Layout, (dx, dy, dw, dh): (f6
 
 /// Said when a map frame is given a background: it draws its map and its paper itself.
 pub(in crate::cmd::layout) const NO_FRAME_BACKGROUND: &str = "a map frame takes no background: it draws its map and the paper behind it";
-/// Said when a grid or an extent indicator is added with a background: they go on a map frame.
+/// Said when a grid, an extent indicator or a section is added with a background: they go on a map
+/// frame.
 pub(in crate::cmd::layout) const NO_OVERLAY_BACKGROUND: &str =
-    "a grid or an extent indicator goes on a map frame, which takes no background";
+    "a grid, an extent indicator or a section goes on a map frame, which takes no background";
 /// What an element's `background` object takes.
 pub(in crate::cmd::layout) const BACKGROUND_KEYS: [&str; 5] = ["fill", "outline", "width", "radius", "padding"];
 
@@ -275,7 +276,7 @@ pub(in crate::cmd::layout) fn add_element(s: &mut Session, p: &Value) -> CmdResu
         return Err(ONLY_RECTANGLE_RADIUS.into());
     }
     // `null` too: on a line it means solid, so elsewhere it is refused rather than ignored.
-    if !matches!(kind, "line" | "arrow" | "rectangle" | "ellipse" | "circle") && p.get("dash").is_some() {
+    if !matches!(kind, "line" | "arrow" | "section" | "rectangle" | "ellipse" | "circle") && p.get("dash").is_some() {
         return Err(ONLY_DASH.into());
     }
     if !matches!(kind, "text" | "dynamicText") && gives(p, "rotation") {
@@ -289,6 +290,9 @@ pub(in crate::cmd::layout) fn add_element(s: &mut Session, p: &Value) -> CmdResu
     }
     if kind != "chart" && gives_chart_options_to(p, kind == "scaleBar") {
         return Err(ONLY_CHART_OPTIONS.into());
+    }
+    if kind != "section" && (gives(p, "direction") || gives(p, "at")) {
+        return Err(ONLY_SECTION.into());
     }
     // "unitLabel": null too, as layout.update refuses it, since it means something on a scale bar.
     if kind != "scaleBar" && (gives_scale_bar_details(p) || p.get("unitLabel").is_some()) {
@@ -305,6 +309,7 @@ pub(in crate::cmd::layout) fn add_element(s: &mut Session, p: &Value) -> CmdResu
             | "arrow"
             | "extentIndicator"
             | "grid"
+            | "section"
             | "scaleBar"
             | "legend"
             | "colorbar"
@@ -324,10 +329,10 @@ pub(in crate::cmd::layout) fn add_element(s: &mut Session, p: &Value) -> CmdResu
     if gives(p, "outline") && !shape {
         return Err(ONLY_OUTLINE.into());
     }
-    // The box the new element sits on (#2257). A grid or an extent indicator goes on a map frame,
-    // which has none: refused rather than dropped.
+    // The box the new element sits on (#2257). A grid, an extent indicator or a section goes on a
+    // map frame, which has none: refused rather than dropped.
     let background = match element_background(p, None)? {
-        BackgroundParam::Set(_) if matches!(kind, "grid" | "extentIndicator") => return Err(NO_OVERLAY_BACKGROUND.into()),
+        BackgroundParam::Set(_) if matches!(kind, "grid" | "extentIndicator" | "section") => return Err(NO_OVERLAY_BACKGROUND.into()),
         BackgroundParam::Set(b) => Some(b),
         BackgroundParam::Absent | BackgroundParam::Remove => None,
     };
@@ -602,6 +607,33 @@ pub(in crate::cmd::layout) fn add_element(s: &mut Session, p: &Value) -> CmdResu
             }
             return Ok(json!({"element": frame}));
         }
+        "section" => {
+            // The frame's box is its own, and a line has no text: refused rather than dropped.
+            let given = p.as_object().and_then(|o| o.keys().find(|k| !ADDED_SECTION_KEYS.contains(&k.as_str()) && gives(p, k)));
+            if let Some(k) = given {
+                return Err(format!("a section takes no \"{k}\" (it reads {})", ADDED_SECTION_KEYS.join(", ")));
+            }
+            let frame = frame_of(l, p)?;
+            unlocked(l, frame)?;
+            let Some(ElementKind::MapFrame { sections, center, .. }) = l.element(frame).map(|e| &e.kind) else {
+                return Err(format!("element {frame} isn't a map frame"));
+            };
+            if sections.len() >= MAX_SECTIONS {
+                return Err(format!("a map frame holds at most {MAX_SECTIONS} section lines"));
+            }
+            // The options given, over a horizontal line through the frame's middle.
+            let name = if gives(p, "name") { section_name(p, "name")? } else { Section::free_name(sections).unwrap_or_default() };
+            let turn = if center.x.abs() > 180.0 { 360.0 * (center.x / 360.0).round() } else { 0.0 };
+            let middle = Coord::new(center.x - turn, center.y);
+            let new = section_params(p, Section::new(name.clone(), SectionLine::Horizontal(middle)), sections, None)?;
+            let l = active(s, p)?;
+            if let Some(ElementKind::MapFrame { sections, .. }) = l.element_mut(frame).map(|e| &mut e.kind) {
+                sections.push(new);
+            }
+            say_held(s, "Add Element", held_width(p, "section width", rustgis_map::layout::SECTION_WIDTHS).into_iter().collect());
+            say_section_not_drawn(s, i, frame, &name);
+            return Ok(json!({"element": frame, "section": name}));
+        }
         o => return Err(format!("unknown element kind '{o}'")),
     };
     let warning = match &k {
@@ -635,6 +667,7 @@ pub(in crate::cmd::layout) fn add_element(s: &mut Session, p: &Value) -> CmdResu
         s.warn(said);
     }
     say_held(s, "Add Element", held_to_limits(p, Shape::of_name(kind)));
+    say_name_ignored(s, p, kind);
     let mut out = json!({"element": id});
     if let Some(w) = warning {
         out["warning"] = json!(w);
@@ -687,6 +720,91 @@ pub(in crate::cmd::layout) fn border_style(p: &Value, kind: &ElementKind) -> Res
     outline_style(p, current, (0.0, rustgis_map::layout::MAX_FRAME_BORDER_WIDTH))
 }
 
+/// Says that a `name` given for an element that isn't a section is ignored, as it always was.
+fn say_name_ignored(s: &mut Session, p: &Value, kind: &str) {
+    if gives(p, "name") {
+        s.notify(format!("Add Element ignores \"name\" for a {kind}: only a section takes one (layout.update names an element)"), false);
+    }
+}
+
+/// What a `direction` or an `at` given for an element that isn't a section is told.
+const ONLY_SECTION: &str = "only sections take a direction and a place (at)";
+/// What `layout.addElement` takes for a section.
+const ADDED_SECTION_KEYS: [&str; 9] = ["layout", "kind", "frame", "name", "direction", "at", "color", "width", "dash"];
+/// What a map frame's `"section"` object takes in `layout.update`.
+const SECTION_KEYS: [&str; 8] = ["name", "newName", "direction", "at", "color", "width", "dash", "remove"];
+
+/// The section name `p` gives as `key`, trimmed: refused blank or too long.
+fn section_name(p: &Value, key: &str) -> Result<String, String> {
+    let name = ps(p, key).map(str::trim).filter(|n| !n.is_empty()).ok_or_else(|| format!("{key} must be a section line's name"))?;
+    crate::cmd::within(key, "a section line's name", name, rustgis_map::layout::MAX_SECTION_NAME)
+}
+
+/// A section line with the options in `p` over `base`'s, its name one no other of its frame's
+/// `sections` has (`own` is its own index there); a bad value is an error, leaving nothing changed.
+fn section_params(p: &Value, base: Section, sections: &[Section], own: Option<usize>) -> Result<Section, String> {
+    let mut new = base;
+    if let Some(other) = Section::find(sections, &new.name).filter(|i| Some(*i) != own).and_then(|i| sections.get(i)) {
+        return Err(format!("the frame already has a section line '{}'", other.name));
+    }
+    if let Some(v) = p.get("at").filter(|v| !v.is_null()) {
+        let place = v.as_array().filter(|a| a.len() == 2).and_then(|a| Some((a.first()?.as_f64()?, a.get(1)?.as_f64()?)));
+        let (x, y) = place
+            .filter(|(x, y)| (-180.0..=180.0).contains(x) && (-90.0..=90.0).contains(y))
+            .ok_or("at is [longitude, latitude], within ±180 and ±90")?;
+        new.line = new.line.through(Coord::new(x, y));
+    }
+    if gives(p, "direction") {
+        new.line =
+            ps(p, "direction").and_then(|d| SectionLine::from_name(d, new.line.at())).ok_or("direction is horizontal or vertical")?;
+    }
+    (new.color, new.width) = outline_style(p, (new.color, new.width), rustgis_map::layout::SECTION_WIDTHS)?;
+    new.dash = element_dash(p)?.unwrap_or(new.dash);
+    Ok(new)
+}
+
+/// A map frame's section lines with the `"section"` object `v` of a `layout.update` applied, and
+/// the one changed (`None` when it is removed).
+pub(in crate::cmd::layout) fn sections_updated(v: &Value, sections: &[Section]) -> Result<(Vec<Section>, Option<String>), String> {
+    let o = v.as_object().ok_or("section is an object: the \"name\" of a section line and what changes of it")?;
+    if let Some(k) = o.keys().find(|k| !SECTION_KEYS.contains(&k.as_str())) {
+        return Err(format!("section takes no \"{k}\" (it reads {})", SECTION_KEYS.join(", ")));
+    }
+    let named = section_name(v, "name")?;
+    let i = Section::find(sections, &named).ok_or_else(|| format!("the frame has no section line '{named}'"))?;
+    let mut out = sections.to_vec();
+    if let Some(remove) = v.get("remove").filter(|v| !v.is_null())
+        && crate::cmd::bool_value(remove).ok_or("remove must be true or false")?
+    {
+        if let Some(k) = SECTION_KEYS.iter().find(|k| !matches!(**k, "name" | "remove") && gives(v, k)) {
+            return Err(format!("a removed section line takes no \"{k}\""));
+        }
+        out.remove(i);
+        return Ok((out, None));
+    }
+    let mut base = out.get(i).cloned().ok_or("no such section line")?;
+    if gives(v, "newName") {
+        base.name = section_name(v, "newName")?;
+    }
+    let new = section_params(v, base, sections, Some(i))?;
+    let name = new.name.clone();
+    if let Some(slot) = out.get_mut(i) {
+        *slot = new;
+    }
+    Ok((out, Some(name)))
+}
+
+/// Says that section line `name` of frame `frame` of layout `li` isn't drawn, when it isn't, and
+/// why. A hidden frame's isn't said: nothing of it is drawn.
+pub(in crate::cmd::layout) fn say_section_not_drawn(s: &mut Session, li: usize, frame: u32, name: &str) {
+    let Some(l) = s.project.layouts.get(li) else { return };
+    let gaps = rustgis_render::layout::sections_not_drawn(l, &s.project.maps);
+    let gap = gaps.into_iter().filter(|g| g.frame == frame && g.section == name).map(|g| (g, 1)).collect();
+    if let Some(note) = rustgis_render::layout::sections_notice(&gap, 1) {
+        s.warn(note);
+    }
+}
+
 /// An outline's colour and width (points, kept within `range`) from `color` and `width` in `p`,
 /// each keeping `current`'s when not given.
 pub(in crate::cmd::layout) fn outline_style(p: &Value, (c, w): (Rgba, f64), range: (f64, f64)) -> Result<(Rgba, f64), String> {
@@ -703,7 +821,7 @@ pub(in crate::cmd::layout) fn outline_style(p: &Value, (c, w): (Rgba, f64), rang
 }
 
 /// What a `dash` given for an element that draws no line or outline is told.
-pub(in crate::cmd::layout) const ONLY_DASH: &str = "only lines, arrows, rectangles, ellipses and circles take a dash";
+pub(in crate::cmd::layout) const ONLY_DASH: &str = "only lines, arrows, sections, rectangles, ellipses and circles take a dash";
 
 /// A line's or an outline's `dash` when given, read as a line layer's stroke reads it
 /// (`layer.lineStrokes`): `Some(None)` for solid (`null` or `[]`), `Some(Some(_))` for a pattern,
@@ -734,8 +852,8 @@ pub(in crate::cmd::layout) const ONLY_RECTANGLE_RADIUS: &str = "only a rectangle
 /// take them as applied: "color" is a text's, a line's, an arrow's, a scale bar's or a shape's
 /// outline (a rectangle's or an ellipse's), a legend's, colorbar's, table's or chart's ink (#2257),
 /// and, when adding, also an extent indicator's or a grid's.
-pub(in crate::cmd::layout) const ONLY_COLOR_ADDED: &str = "only text, lines, arrows, rectangles, ellipses, circles, extent indicators, grids, scale bars, \
-legends, colorbars, tables and charts take a color";
+pub(in crate::cmd::layout) const ONLY_COLOR_ADDED: &str = "only text, lines, arrows, rectangles, ellipses, circles, extent indicators, grids, sections, \
+scale bars, legends, colorbars, tables and charts take a color";
 pub(in crate::cmd::layout) const ONLY_COLOR_UPDATED: &str =
     "only text, lines, arrows, rectangles, ellipses, circles, scale bars, legends, colorbars, tables and charts take a color";
 pub(in crate::cmd::layout) const ONLY_FILL: &str = "only north arrows, rectangles, ellipses, circles and scale bars take a fill";

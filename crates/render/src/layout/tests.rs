@@ -2824,6 +2824,7 @@ fn colorbar_page(map: &Map, orientation: Orientation, reverse: bool, title: &str
             scale: 1e8,
             shape: FrameShape::Rectangle,
             grid: None,
+            sections: Vec::new(),
             extent_of: None,
             extent_color: rustgis_map::layout::INDICATOR_COLOR,
             extent_width: rustgis_map::layout::INDICATOR_WIDTH,
@@ -2919,6 +2920,7 @@ fn page_settles_with_suns(suns: &[f64]) {
             scale: 1e7,
             shape: FrameShape::Rectangle,
             grid: None,
+            sections: Vec::new(),
             extent_of: None,
             extent_color: rustgis_map::layout::INDICATOR_COLOR,
             extent_width: rustgis_map::layout::INDICATOR_WIDTH,
@@ -3076,6 +3078,7 @@ fn indicator_page(color: Rgba, width: f64) -> Pixmap {
         scale,
         shape: FrameShape::Rectangle,
         grid: None,
+        sections: Vec::new(),
         extent_of,
         extent_color: color,
         extent_width: width,
@@ -4100,6 +4103,7 @@ fn a_map_frame_border_takes_its_colour_and_width_or_none() {
                 scale: 1e7,
                 shape,
                 grid: None,
+                sections: Vec::new(),
                 extent_of: None,
                 extent_color: INDICATOR_COLOR,
                 extent_width: INDICATOR_WIDTH,
@@ -4162,6 +4166,7 @@ fn an_extent_indicator_on_a_globe_lands_on_the_area() {
         scale,
         shape: FrameShape::Rectangle,
         grid: None,
+        sections: Vec::new(),
         extent_of,
         extent_color: INDICATOR_COLOR,
         extent_width: INDICATOR_WIDTH,
@@ -4211,6 +4216,7 @@ fn a_frame_on_the_globe_is_outlined_by_what_it_shows() {
         scale,
         shape: FrameShape::Rectangle,
         grid: None,
+        sections: Vec::new(),
         extent_of,
         extent_color: INDICATOR_COLOR,
         extent_width: INDICATOR_WIDTH,
@@ -4265,6 +4271,7 @@ fn a_frame_partly_off_the_globe_is_outlined_without_a_chord() {
         scale,
         shape: FrameShape::Rectangle,
         grid: None,
+        sections: Vec::new(),
         extent_of,
         extent_color: INDICATOR_COLOR,
         extent_width: INDICATOR_WIDTH,
@@ -4338,6 +4345,7 @@ fn a_globe_frame_across_the_antimeridian_is_outlined_in_one_piece() {
         scale,
         shape: FrameShape::Rectangle,
         grid: None,
+        sections: Vec::new(),
         extent_of,
         extent_color: INDICATOR_COLOR,
         extent_width: INDICATOR_WIDTH,
@@ -4382,6 +4390,7 @@ fn outline_on(map: Map, source: (Coord, f64, f64, f64), locator: Map, view: (Coo
         scale,
         shape: FrameShape::Rectangle,
         grid: None,
+        sections: Vec::new(),
         extent_of,
         extent_color: INDICATOR_COLOR,
         extent_width: INDICATOR_WIDTH,
@@ -4581,6 +4590,7 @@ fn a_flat_frame_wider_than_the_world_is_outlined_where_it_is() {
         scale,
         shape: FrameShape::Rectangle,
         grid: None,
+        sections: Vec::new(),
         extent_of,
         extent_color: INDICATOR_COLOR,
         extent_width: INDICATOR_WIDTH,
@@ -4895,6 +4905,7 @@ fn colorbars_draw_the_raster_colour_scale() {
             scale: 1e8,
             shape: FrameShape::Rectangle,
             grid: None,
+            sections: Vec::new(),
             extent_of: None,
             extent_color: rustgis_map::layout::INDICATOR_COLOR,
             extent_width: rustgis_map::layout::INDICATOR_WIDTH,
@@ -5017,6 +5028,7 @@ fn grid_page(grid: rustgis_map::layout::Grid) -> Pixmap {
             scale: 2e8,
             shape: FrameShape::Rectangle,
             grid: Some(grid),
+            sections: Vec::new(),
             extent_of: None,
             extent_color: rustgis_map::layout::INDICATOR_COLOR,
             extent_width: rustgis_map::layout::INDICATOR_WIDTH,
@@ -5058,6 +5070,7 @@ fn winterthur_page(grid: rustgis_map::layout::Grid, projection: rustgis_map::Pro
             scale: 25_000.0,
             shape: FrameShape::Rectangle,
             grid: Some(grid),
+            sections: Vec::new(),
             extent_of: None,
             extent_color: rustgis_map::layout::INDICATOR_COLOR,
             extent_width: rustgis_map::layout::INDICATOR_WIDTH,
@@ -5314,6 +5327,7 @@ fn a_measured_grid_on_the_globe_seen_whole_is_drawn() {
             scale: 2e8,
             shape: FrameShape::Rectangle,
             grid: Some(grid),
+            sections: Vec::new(),
             extent_of: None,
             extent_color: rustgis_map::layout::INDICATOR_COLOR,
             extent_width: rustgis_map::layout::INDICATOR_WIDTH,
@@ -5348,6 +5362,7 @@ fn a_grid_on_the_globe_is_drawn_on_it() {
             scale: 2e8,
             shape: FrameShape::Rectangle,
             grid: Some(grid),
+            sections: Vec::new(),
             extent_of: None,
             extent_color: rustgis_map::layout::INDICATOR_COLOR,
             extent_width: rustgis_map::layout::INDICATOR_WIDTH,
@@ -5515,7 +5530,7 @@ fn a_frames_attribution_keeps_clear_of_its_grid_labels() {
         recorded: None,
         label_layers: Vec::new(),
     };
-    let framed = finish_frame(img, ppp, Some((&map, &view, &all, false)));
+    let framed = finish_frame(img, ppp, Some((&map, &view, &all, false)), &[]);
     let (a, b) = (labels_pm.pixmap(), framed.pixmap());
     assert_ne!(a.data(), b.data(), "the credit is drawn");
     for (_, [x0, y0, x1, y1]) in &labels {
@@ -6258,6 +6273,7 @@ fn colour_test_page() -> (Vec<Map>, Layout, u32) {
             scale: 10_000_000.0,
             shape: FrameShape::Rectangle,
             grid: None,
+            sections: Vec::new(),
             extent_of: None,
             extent_color: rustgis_map::layout::INDICATOR_COLOR,
             extent_width: rustgis_map::layout::INDICATOR_WIDTH,
@@ -7845,4 +7861,236 @@ fn a_background_is_drawn_under_its_element_and_turns_with_it() {
     // Alone, the element's picture holds no background.
     let (alone, _) = render_element(&l, id, &mut [], 96.0, (&PageInfo::default(), &Env::default()), &mut None).unwrap().unwrap();
     assert!(alone.pixels().iter().all(|c| c.alpha() == 0 || c.green() > 0), "no red in the element's own picture");
+}
+
+/// A section line (#2863) runs across its frame, straight on the page, through the place the
+/// frame shows there whatever its projection, bearing or copy of the world, within the frame's
+/// shape; on a tilted frame or the globe, only as far as there is ground. One whose place the
+/// frame doesn't show says why.
+#[test]
+fn a_section_line_runs_across_its_frame_through_its_place() {
+    use rustgis_map::Projection;
+    let (w, h) = (400.0, 200.0);
+    let at = Coord::new(-44.66, -22.38);
+    let ends = |map: &Map, (c, scale, bearing, pitch): (Coord, f64, f64, f64), shape: &FrameShape, line| {
+        section_ends(map, &frame_camera(map, c, scale, bearing, pitch), (w, h), shape, line)
+    };
+    let near = |a: f64, b: f64| (a - b).abs() < 0.6;
+    let rect = FrameShape::Rectangle;
+    let mut albers = Map::new("albers");
+    albers.projection = Projection::Custom("EPSG:10857".into());
+    for (map, bearing) in [(Map::new("m"), 0.0), (Map::new("m"), 40.0), (albers, -30.0)] {
+        let view = (Coord::new(at.x - 0.1, at.y + 0.05), 1e6, bearing, 0.0);
+        let cam = frame_camera(&map, view.0, view.1, view.2, view.3);
+        let (x, y) = cam.try_to_screen(map.to_map(at).unwrap(), w, h).unwrap();
+        assert!((0.0..w).contains(&x) && (0.0..h).contains(&y), "{x} {y}");
+        assert_eq!(ends(&map, view, &rect, SectionLine::Horizontal(at)), Ok([(0.0, y), (w, y)]));
+        assert_eq!(ends(&map, view, &rect, SectionLine::Vertical(at)), Ok([(x, 0.0), (x, h)]));
+        // Panned away, its place is outside the frame; the line elsewhere isn't drawn.
+        let away = (Coord::new(at.x + 5.0, at.y), 1e6, bearing, 0.0);
+        assert!(ends(&map, away, &rect, SectionLine::Horizontal(at)).unwrap_err().contains("outside the frame"));
+    }
+    // The copy of the place a frame across 180° shows, and one a turn away from the frame's own.
+    let map = Map::new("m");
+    for (center, place) in [(179.5, -179.5), (-179.5, 179.5), (224.0, -136.0)] {
+        let got = ends(&map, (Coord::new(center, 0.0), 5e7, 0.0, 0.0), &rect, SectionLine::Vertical(Coord::new(place, 0.0)));
+        assert!(got.is_ok_and(|[a, _]| (a.0 - w / 2.0).abs() < w / 2.0), "{center} {got:?}");
+    }
+    // Within its shape: a circle is as wide as the shorter side, and a polygon's outermost
+    // edges count, a place in its notch being outside the frame.
+    let here = (at, 1e6, 0.0, 0.0);
+    let [a, b] = ends(&map, here, &FrameShape::Circle, SectionLine::Horizontal(at)).unwrap();
+    assert!(near(a.0, 100.0) && near(b.0, 300.0), "{a:?} {b:?}");
+    let [a, b] = ends(&map, here, &FrameShape::Ellipse, SectionLine::Vertical(at)).unwrap();
+    assert!(near(a.1, 0.0) && near(b.1, h), "{a:?} {b:?}");
+    let notched = FrameShape::Polygon(vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.5, 0.25), (0.0, 1.0)]);
+    assert!(ends(&map, here, &notched, SectionLine::Horizontal(at)).is_err(), "in the notch");
+    let left = map.to_lonlat(frame_camera(&map, at, 1e6, 0.0, 0.0).to_map(40.0, h / 2.0, w, h)).unwrap();
+    let [a, b] = ends(&map, here, &notched, SectionLine::Horizontal(left)).unwrap();
+    assert!(near(a.0, 0.0) && near(b.0, w), "{a:?} {b:?}");
+    // Tilted to see the horizon, a vertical line stops there, its middle on the ground.
+    let tilted = (at, 5e4, 0.0, 80.0);
+    let cam = frame_camera(&map, at, 5e4, 0.0, 80.0);
+    let [a, b] = ends(&map, tilted, &rect, SectionLine::Vertical(at)).unwrap();
+    assert!(a.1 > 1.0 && near(b.1, h), "{a:?} {b:?}");
+    assert!(cam.try_to_map(a.0, a.1 + 1.0, w, h).is_some() && cam.try_to_map(a.0, a.1 - 1.0, w, h).is_none());
+    // On the globe, it stops at the limb, and a place on the far side isn't shown.
+    let mut globe = Map::new("g");
+    globe.projection = Projection::Globe;
+    let whole = (at, 5e8, 0.0, 0.0);
+    let [a, b] = ends(&globe, whole, &rect, SectionLine::Horizontal(at)).unwrap();
+    assert!(a.0 > 1.0 && b.0 < w - 1.0 && near(a.0 + b.0, w), "{a:?} {b:?}");
+    let far = SectionLine::Vertical(Coord::new(at.x + 180.0, -at.y));
+    assert!(ends(&globe, whole, &rect, far).unwrap_err().contains("map shows"));
+}
+
+/// A section's names stay in their frame across the line as along it, each clear of the other on
+/// a short line, and the frame's credit keeps clear of every one of them and in the frame: the
+/// left one too once it has gone left of the right one, and both of a vertical line's.
+#[test]
+fn section_names_stay_in_the_frame_and_clear_of_the_credit() {
+    let (w, h) = (200.0f32, 100.0f32);
+    let section = |line| Section::new("A".into(), line);
+    let at = Coord::new(0.0, 0.0);
+    let near_edges: [(Section, SectionEnds); 4] = [
+        (section(SectionLine::Horizontal(at)), [(0.0, 1.0), (200.0, 1.0)]),
+        (section(SectionLine::Horizontal(at)), [(0.0, 99.0), (200.0, 99.0)]),
+        (section(SectionLine::Vertical(at)), [(1.0, 0.0), (1.0, 100.0)]),
+        (section(SectionLine::Vertical(at)), [(199.0, 0.0), (199.0, 100.0)]),
+    ];
+    for (s, ends) in &near_edges {
+        let mut pm = Canvas::new(w as u32, h as u32).unwrap();
+        for (_, b) in draw_sections(&mut pm, &[(s, *ends)], 1.0) {
+            assert!(b[0] >= 0.0 && b[1] >= 0.0 && b[2] <= w && b[3] <= h, "{ends:?}: {b:?}");
+        }
+    }
+    // A credit 170 points wide goes left of the right name at the foot of the frame, and then
+    // not over the left one.
+    // A credit 100 points wide on a frame 37 points tall beside a vertical line near its right edge
+    // goes left of both its names, not above them out of the frame.
+    let credit_clear = |(w, h): (f32, f32), s: &Section, ends: SectionEnds, tw: f32| {
+        let mut pm = Canvas::new(w as u32, h as u32).unwrap();
+        let names = draw_sections(&mut pm, &[(s, ends)], 1.0);
+        let (bottom, right) = attribution_inset((w, h), tw, &names);
+        let size = crate::ATTRIBUTION_SIZE;
+        let (cx, cy) = (crate::attribution_center(w, tw, right), h - bottom - size * 0.9);
+        let (x0, x1, y0, y1) = (cx - tw / 2.0, cx + tw / 2.0, cy - size * 0.8, cy + size * 0.8);
+        assert!(x0 >= 0.0 && y0 >= 0.0 && y1 <= h, "the credit {:?} leaves the frame", (x0, y0, x1, y1));
+        for (_, b) in &names {
+            assert!(!(x0 < b[2] && b[0] < x1 && y0 < b[3] && b[1] < y1), "the credit {:?} covers {b:?}", (x0, y0, x1, y1));
+        }
+    };
+    let (s, ends) = &near_edges[1];
+    credit_clear((w, h), s, *ends, 170.0);
+    credit_clear((200.0, 37.0), &section(SectionLine::Vertical(at)), [(185.0, 0.0), (185.0, 37.0)], 100.0);
+    // On a line too short for both names at their size, they are drawn smaller, each clear of the
+    // other; on a long one, at their size.
+    for (length, smaller) in [(18.0, true), (30.0, true), (100.0, false)] {
+        for vertical in [true, false] {
+            let (line, ends) = if vertical {
+                (SectionLine::Vertical(at), [(100.0, 0.0), (100.0, length)])
+            } else {
+                (SectionLine::Horizontal(at), [(0.0, 50.0), (length, 50.0)])
+            };
+            let mut pm = Canvas::new(w as u32, h as u32).unwrap();
+            let names = draw_sections(&mut pm, &[(&section(line), ends)], 1.0);
+            let [(_, a), (_, b)] = names[..] else { panic!("two names") };
+            assert!(a[2] <= b[0] + 1e-3 || a[3] <= b[1] + 1e-3, "{length} {vertical}: {a:?} {b:?}");
+            let tall = a[3] - a[1];
+            assert_eq!(tall < SECTION_NAME_PT * 1.33 * 1.6 - 0.01, smaller, "{length} {vertical}: {tall}");
+        }
+    }
+}
+
+/// A place a flat Web Mercator frame can't show, nearer a pole than its 85.05°, isn't drawn at the
+/// latitude it is held to, but said; one just inside is drawn.
+#[test]
+fn a_section_line_past_mercators_reach_is_not_drawn() {
+    let map = Map::new("m");
+    let cam = frame_camera(&map, Coord::new(0.0, 84.9), 1e7, 0.0, 0.0);
+    let end = |lat: f64| section_ends(&map, &cam, (400.0, 200.0), &FrameShape::Rectangle, SectionLine::Horizontal(Coord::new(0.0, lat)));
+    assert_eq!(end(89.0), Err("its place isn't one the frame's map shows"));
+    assert!(end(85.0).is_ok(), "{:?}", end(85.0));
+}
+
+/// A frame's section lines are drawn over its map in their colour, dashed, with their names at
+/// both ends, clipped to its shape, as pixels and as vectors in a layer of their own; a frame
+/// without one draws the same page as before.
+#[test]
+fn section_lines_are_drawn_over_their_frame() {
+    use rustgis_map::layout::{FRAME_BORDER_COLOR, FRAME_BORDER_WIDTH, INDICATOR_COLOR, INDICATOR_WIDTH};
+    let blue = Rgba::rgb(0, 0, 255);
+    let page = |shape: FrameShape, sections: Vec<Section>| {
+        let mut map = Map::new("m");
+        (map.basemap, map.graticule) = (rustgis_map::Basemap::Blank, false);
+        let mut l = Layout::new("Layout", 100.0, 100.0);
+        let kind = ElementKind::MapFrame {
+            map: "m".into(),
+            center: Coord::new(0.0, 0.0),
+            scale: 1e7,
+            shape,
+            grid: None,
+            sections,
+            extent_of: None,
+            extent_color: INDICATOR_COLOR,
+            extent_width: INDICATOR_WIDTH,
+            border_color: FRAME_BORDER_COLOR,
+            border_width: FRAME_BORDER_WIDTH,
+            bearing: 0.0,
+            pitch: 0.0,
+        };
+        l.add("Frame", (20.0, 20.0, 60.0, 60.0), kind);
+        (l, map)
+    };
+    let section = |line| Section { color: blue, ..Section::new("A".into(), line) };
+    let middle = Coord::new(0.0, 0.0);
+    let blues = |shape: FrameShape, sections: Vec<Section>| {
+        let (l, map) = page(shape, sections);
+        let pm = render(&l, &mut [map], 254.0, &PageInfo::default()).unwrap();
+        // Ten pixels a millimetre; the share of the row (or column) through the middle, between
+        // two millimetres, in blue.
+        move |vertical: bool, from: u32, to: u32| {
+            let blue = (from * 10..to * 10).filter(|&i| {
+                let (x, y) = if vertical { (500, i) } else { (i, 500) };
+                let (r, g, b) = rgb(&pm, x, y);
+                b > 200 && r < 100 && g < 100
+            });
+            blue.count() as f64 / f64::from((to - from) * 10)
+        }
+    };
+    let horizontal = blues(FrameShape::Rectangle, vec![section(SectionLine::Horizontal(middle))]);
+    assert!(horizontal(false, 30, 70) > 0.99 && horizontal(false, 0, 20) == 0.0 && horizontal(false, 81, 100) == 0.0);
+    assert!(horizontal(true, 21, 49) == 0.0, "no vertical one");
+    let vertical = blues(FrameShape::Rectangle, vec![section(SectionLine::Vertical(middle))]);
+    assert!(vertical(true, 30, 70) > 0.99 && vertical(false, 30, 49) == 0.0);
+    let dashed = Section { dash: rustgis_map::symbology::Dash::new(&[6.0, 6.0]), ..section(SectionLine::Horizontal(middle)) };
+    let share = blues(FrameShape::Rectangle, vec![dashed.clone()])(false, 30, 70);
+    assert!((0.4..0.6).contains(&share), "{share}");
+    // A name is in a box of its colour at each end: pixels off the line there, none mid-way.
+    let (l, map) = page(FrameShape::Rectangle, vec![section(SectionLine::Horizontal(middle))]);
+    let pm = render(&l, &mut [map], 254.0, &PageInfo::default()).unwrap();
+    let off = |x: u32| rgb(&pm, x, 512) == (0, 0, 255);
+    assert!((205..230).any(off) && (770..795).any(off) && !(300..700).any(off));
+    // Clipped to a round frame, whose corners stay clear.
+    let off_centre = Coord::new(0.0, 2.2);
+    let (l, map) = page(FrameShape::Circle, vec![section(SectionLine::Horizontal(off_centre))]);
+    assert!(sections_not_drawn(&l, &[map]).is_empty());
+    let round = blues(FrameShape::Circle, vec![section(SectionLine::Vertical(off_centre))]);
+    assert!(round(true, 30, 70) > 0.99 && round(true, 0, 20) == 0.0);
+    // As vectors, in a layer of their own; none without a section.
+    let layers = |sections| {
+        let (l, map) = page(FrameShape::Rectangle, sections);
+        let (drawing, pictured) = render_drawing(&l, &mut [map], 96.0, &PageInfo::default()).unwrap();
+        assert!(pictured.is_empty());
+        let page = crate::pdf::Page::drawing(drawing, l.width, l.height);
+        let (bytes, _) = crate::pdf::write_with(&[page], "p", crate::pdf::Options::default());
+        String::from_utf8_lossy(&bytes).contains("(Section lines)")
+    };
+    assert!(layers(vec![dashed]) && !layers(Vec::new()));
+    let plain = |sections| {
+        let (l, map) = page(FrameShape::Rectangle, sections);
+        render(&l, &mut [map], 96.0, &PageInfo::default()).unwrap().data().to_vec()
+    };
+    // One whose place is outside the frame draws nothing, and is said, with its frame.
+    let away = section(SectionLine::Vertical(Coord::new(90.0, 0.0)));
+    assert_eq!(plain(vec![away.clone()]), plain(Vec::new()));
+    let (l, map) = page(FrameShape::Rectangle, vec![away, section(SectionLine::Horizontal(middle))]);
+    let gaps = sections_not_drawn(&l, &[map]);
+    assert_eq!(gaps.iter().map(|g| (g.frame, g.section.as_str())).collect::<Vec<_>>(), vec![(1, "A")]);
+    let note = |pages| sections_notice(&gaps.iter().cloned().map(|g| (g, 2)).collect(), pages).unwrap();
+    assert_eq!(note(1), "1 section line(s) not drawn: 'A' of Frame (1): its place is outside the frame");
+    assert!(note(5).contains("'A' of Frame (1) on 2 of 5 pages: "), "{}", note(5));
+    assert_eq!(sections_notice(&BTreeMap::new(), 5), None);
+    // A frame whose map is missing draws none of its own.
+    let gaps = sections_not_drawn(&l, &[]);
+    assert!(gaps.len() == 2 && gaps.iter().all(|g| g.why == "its frame's map is missing"), "{gaps:?}");
+    // Its colour's transparency is its name boxes' too: blended with the white map, and clear.
+    let faded = |alpha| {
+        let (l, map) =
+            page(FrameShape::Rectangle, vec![Section { color: Rgba::new(0, 0, 255, alpha), ..section(SectionLine::Horizontal(middle)) }]);
+        let pm = render(&l, &mut [map], 254.0, &PageInfo::default()).unwrap();
+        rgb(&pm, 209, 512)
+    };
+    let (solid, half) = (faded(255), faded(128));
+    assert!(solid == (0, 0, 255) && half.2 == 255 && (100..160).contains(&half.0), "{solid:?} {half:?}");
 }

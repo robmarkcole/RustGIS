@@ -15,6 +15,10 @@ pub enum ElementKind {
         shape: FrameShape,
         #[serde(default)]
         grid: Option<Grid>,
+        /// The section lines drawn over the frame (#2863). Left out with none, so layouts saved
+        /// before keep their bytes.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        sections: Vec<Section>,
         /// Another frame whose extent this one outlines (an extent indicator).
         #[serde(default)]
         extent_of: Option<u32>,
@@ -554,6 +558,11 @@ impl ElementKind {
     pub fn has_custom_border(&self) -> bool {
         matches!(self, ElementKind::MapFrame { border_color, border_width, .. }
             if !is_frame_border_color(border_color) || !is_frame_border_width(border_width))
+    }
+
+    /// Whether it is a map frame with section lines (#2863).
+    pub fn has_sections(&self) -> bool {
+        matches!(self, ElementKind::MapFrame { sections, .. } if !sections.is_empty())
     }
 
     /// The map frame this element belongs to.

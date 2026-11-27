@@ -144,6 +144,7 @@ fn page(map: &Map) -> map::layout::Layout {
             scale: 300_000_000.0,
             shape: FrameShape::Rectangle,
             grid: None,
+            sections: Vec::new(),
             extent_of: None,
             extent_color: map::Rgba::rgb(0, 0, 0),
             extent_width: 1.0,

@@ -9,13 +9,23 @@ pub fn frame_map(map: &mut Map, camera: rustgis_map::Camera, w: f64, h: f64, ppp
     let revisions = crate::archive_revisions([&*map]);
     let mut failed_source = None;
     let view = View { width: w, height: h, pixels_per_point: ppp, camera, sky: false };
-    let result = frame_canvas(map, &view, false, &mut false, None, &mut failed_source, &Env::default()).map(Canvas::into_pixmap);
+    let over = FrameOver::default();
+    let result = frame_canvas(map, &view, false, &mut false, over, &mut failed_source, &Env::default()).map(Canvas::into_pixmap);
     revisions.finish(map, failed_source, result, "could not draw the map frame")
+}
+
+/// What a page draws over a map frame's map, under its attribution.
+#[derive(Clone, Copy, Default)]
+pub(super) struct FrameOver<'a> {
+    /// The grid, and whether the layout writes a decimal comma.
+    pub(super) grid: Option<(&'a Grid, bool)>,
+    /// The section lines drawn, each with its ends ([`section_ends`]).
+    pub(super) sections: &'a [(&'a Section, SectionEnds)],
 }
 
 /// [`frame_map`] on a canvas: one that records (see [`crate::canvas`]) when `record` and the
 /// frame can be kept as vectors (flat, north up, without view effects), else its pixels; with
-/// `grid` (and whether the layout writes a decimal comma) drawn on it under the attribution.
+/// what goes `over` it drawn on it under the attribution.
 /// `pending` is set when some of its tiles, or a read of its streamed layers or rasters, were
 /// still on their way (in the browser, which doesn't wait for them).
 pub(super) fn frame_canvas(
@@ -23,7 +33,7 @@ pub(super) fn frame_canvas(
     view: &View,
     record: bool,
     pending: &mut bool,
-    grid: Option<(&Grid, bool)>,
+    over: FrameOver,
     failed_source: &mut Option<u64>,
     env: &Env,
 ) -> Option<Canvas> {
@@ -32,7 +42,8 @@ pub(super) fn frame_canvas(
     let (img, shadows) = crate::frame_with_shadows_to_come(|| crate::complete(map, view, record, failed_source, env));
     let img = img?;
     *pending |= img.tiles_pending || img.data_pending || shadows;
-    Some(finish_frame(img, view.pixels_per_point, grid.map(|(g, comma)| (&*map, view, g, comma))))
+    let grid = over.grid.map(|(g, comma)| (&*map, view, g, comma));
+    Some(finish_frame(img, view.pixels_per_point, grid, over.sections))
 }
 
 /// [`frame_map`] without waiting for tiles still on their way, for a preview drawn while the
@@ -45,22 +56,31 @@ pub fn frame_map_preview(map: &mut Map, camera: rustgis_map::Camera, w: f64, h: 
 /// Map preview during a layout pan, using the same expression context as its page.
 pub fn frame_map_preview_with(map: &mut Map, camera: rustgis_map::Camera, w: f64, h: f64, ppp: f64, env: &Env) -> Option<Pixmap> {
     let view = View { width: w, height: h, pixels_per_point: ppp, camera, sky: false };
-    crate::render_cpu(map, &view, false, false, &mut None, env).map(|img| finish_frame(img, ppp, None).into_pixmap())
+    crate::render_cpu(map, &view, false, false, &mut None, env).map(|img| finish_frame(img, ppp, None, &[]).into_pixmap())
 }
 
 /// A rendered frame map with its labels, its `grid` (drawn on `map` in `view`, with a decimal
-/// comma or not) and its attribution drawn on it: on its recording when it was recorded, else on
-/// its pixels. The attribution keeps clear of the grid's labels.
-pub(super) fn finish_frame(img: crate::Rendered, ppp: f64, grid: Option<(&Map, &View, &Grid, bool)>) -> Canvas {
+/// comma or not), its section lines and its attribution drawn on it: on its recording when it was
+/// recorded, else on its pixels. The attribution keeps clear of the grid's labels and the sections'
+/// names.
+pub(super) fn finish_frame(
+    img: crate::Rendered,
+    ppp: f64,
+    grid: Option<(&Map, &View, &Grid, bool)>,
+    sections: &[(&Section, SectionEnds)],
+) -> Canvas {
     let crate::Rendered { pixmap, recorded, labels, unplaced, label_layers, attribution, .. } = img;
     let mut pm = recorded.unwrap_or_else(|| Canvas::from_pixmap(pixmap));
     crate::draw_labels(&mut pm, (&unplaced, &labels, &label_layers), ppp as f32);
     // The grid is a layer of its own (#1815).
     pm.layer(grid.is_some().then_some("Grid"));
-    let grid_labels = grid.map(|(map, view, g, comma)| draw_grid(&mut pm, map, view, g, comma)).unwrap_or_default();
+    let mut kept_clear = grid.map(|(map, view, g, comma)| draw_grid(&mut pm, map, view, g, comma)).unwrap_or_default();
+    // So are the section lines (#2863).
+    pm.layer((!sections.is_empty()).then_some("Section lines"));
+    kept_clear.extend(draw_sections(&mut pm, sections, ppp));
     pm.layer(None);
     let (w, h) = (pm.width() as f32 / ppp as f32, pm.height() as f32 / ppp as f32);
-    let inset = crate::attribution_text(&attribution).map_or((0.0, 0.0), |(_, tw)| attribution_inset((w, h), tw, &grid_labels));
+    let inset = crate::attribution_text(&attribution).map_or((0.0, 0.0), |(_, tw)| attribution_inset((w, h), tw, &kept_clear));
     crate::draw_attribution(&mut pm, &attribution, ppp as f32, inset);
     pm
 }

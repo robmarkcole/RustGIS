@@ -844,6 +844,7 @@ fn elements_add_hit_and_remove_with_surrounds() {
             scale: 1e8,
             shape: FrameShape::Rectangle,
             grid: None,
+            sections: Vec::new(),
             extent_of: None,
             extent_color: INDICATOR_COLOR,
             extent_width: INDICATOR_WIDTH,
@@ -1297,6 +1298,7 @@ fn mgrs_labels_need_a_wgs84_utm_zone() {
                 scale: 25_000.0,
                 shape: FrameShape::Rectangle,
                 grid: Some(Grid { crs: crs.map(Into::into), kind, ..g.clone() }),
+                sections: Vec::new(),
                 extent_of: None,
                 extent_color: INDICATOR_COLOR,
                 extent_width: INDICATOR_WIDTH,
@@ -1652,6 +1654,49 @@ fn inks_are_saved_and_read_back() {
     assert_eq!(back, l);
     let mut text = ElementKind::text("t", 12.0, Rgba::rgb(0, 0, 0), false);
     assert!(!text.takes_ink() && text.ink_mut().is_none(), "a text's colour is its own option");
+}
+
+/// A frame's section lines (#2863): not written when none, read back as saved, and a hostile
+/// file's brought into range, a blank or repeated name given a free letter, with what was cut
+/// counted; a repaired frame needs nothing more.
+#[test]
+fn section_lines_are_saved_and_repaired() {
+    let frame = |sections: &str| -> Layout {
+        let text = format!(
+            r#"{{"name":"x","width":100,"height":100,"elements":[{{"id":1,"name":"f","x":0,"y":0,"w":50,"h":50,
+            "kind":{{"MapFrame":{{"map":"M","center":{{"x":0,"y":0}},"scale":1000000{sections}}}}}}}]}}"#
+        );
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("{e}"))
+    };
+    let held = |l: &Layout| match &l.elements[0].kind {
+        ElementKind::MapFrame { sections, .. } => sections.clone(),
+        _ => panic!("a map frame"),
+    };
+    let mut l = frame("");
+    assert!(!serde_json::to_string(&l).unwrap().contains("sections"), "none is not written");
+    assert!(l.clamp().is_empty() && !l.elements[0].kind.has_sections());
+    let one =
+        |name: &str| format!(r#"{{"name":"{name}","line":{{"Vertical":{{"x":1,"y":2}}}},"color":[1,2,3,255],"width":2,"dash":[4,2]}}"#);
+    let mut l = frame(&format!(r#","sections":[{}]"#, one("B")));
+    assert!(l.clamp().is_empty() && l.elements[0].kind.has_sections());
+    assert_eq!(held(&l)[0].line, SectionLine::Vertical(Coord::new(1.0, 2.0)));
+    assert_eq!(serde_json::from_str::<Layout>(&serde_json::to_string(&l).unwrap()).unwrap(), l);
+    // Spaces round a name are trimmed, which adjusts the frame; nothing of the name is cut.
+    let padded = format!("  {}  ", "n".repeat(MAX_SECTION_NAME));
+    let mut l = frame(&format!(r#","sections":[{}]"#, one(&padded)));
+    let repairs = l.clamp();
+    assert_eq!((repairs.elements_adjusted, repairs.elements_cut, held(&l)[0].name.as_str()), (1, 0, padded.trim()));
+    let hostile = r#"{"name":" a ","line":{"Horizontal":{"x":1e300,"y":-200}},"color":[0,0,0,255],"width":1e9}"#;
+    let long = "n".repeat(50);
+    let list = [hostile.to_string(), one("A"), one(""), one(&long)].into_iter().chain((0..40).map(|i| one(&format!("s{i}"))));
+    let mut l = frame(&format!(r#","sections":[{}]"#, list.collect::<Vec<_>>().join(",")));
+    let repairs = l.clamp();
+    assert_eq!((repairs.elements_adjusted, repairs.elements_cut), (1, 1));
+    let s = held(&l);
+    assert_eq!(s.len(), MAX_SECTIONS);
+    assert_eq!((s[0].name.as_str(), s[0].line.at(), s[0].width), ("a", Coord::new(-180.0, -90.0), SECTION_WIDTHS.1));
+    assert_eq!((s[1].name.as_str(), s[2].name.as_str(), s[3].name.len()), ("B", "C", MAX_SECTION_NAME), "the first A keeps its name");
+    assert!(l.clamp().is_empty(), "a repaired frame needs nothing more");
 }
 
 /// A text's block alignment, line spacing and case: left out of the file at their defaults, so a

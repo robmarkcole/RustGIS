@@ -83,7 +83,7 @@ pub(in crate::cmd::layout) fn element_inputs(input: &crate::cmd::InputContext<'_
     let kind = ps(p, "kind").ok_or("kind is required")?;
     if !matches!(kind, "table" | "chart" | "colorbar" | "legend") {
         let mut inputs = object_inputs(input, p)?;
-        if matches!(kind, "northArrow" | "scaleBar" | "extentIndicator" | "grid") {
+        if matches!(kind, "northArrow" | "scaleBar" | "extentIndicator" | "grid" | "section") {
             let layout = s.project.layouts.get(index(input, p)?).ok_or("no layout")?;
             inputs.state["frame"] = json!(frame_of(layout, p)?);
         }

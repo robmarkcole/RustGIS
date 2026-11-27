@@ -23,6 +23,7 @@ mod legend;
 mod lines;
 mod north;
 mod scale_bar;
+mod section;
 mod stats;
 mod text;
 
@@ -35,6 +36,7 @@ pub use legend::*;
 pub use lines::*;
 pub use north::*;
 pub use scale_bar::*;
+pub use section::*;
 pub use stats::*;
 pub use text::*;
 
@@ -535,7 +537,7 @@ impl Layout {
             let mut cut = e.name.chars().nth(200).is_some();
             e.name = e.name.chars().take(200).collect();
             match &mut e.kind {
-                ElementKind::MapFrame { center, scale, shape, grid, bearing, pitch, extent_width, border_width, .. } => {
+                ElementKind::MapFrame { center, scale, shape, grid, sections, bearing, pitch, extent_width, border_width, .. } => {
                     *scale = finite_or(*scale, 50_000_000.0).clamp(MIN_FRAME_SCALE, MAX_FRAME_SCALE);
                     *extent_width = finite_or(*extent_width, INDICATOR_WIDTH).clamp(MIN_INDICATOR_WIDTH, MAX_INDICATOR_WIDTH);
                     *border_width = finite_or(*border_width, FRAME_BORDER_WIDTH).clamp(0.0, MAX_FRAME_BORDER_WIDTH);
@@ -583,6 +585,7 @@ impl Layout {
                         g.width = finite_or(g.width, grid_width()).clamp(0.0, MAX_GRID_WIDTH);
                         g.label_size = layout_text_in_range(g.label_size, GRID_LABEL_PT);
                     }
+                    cut |= Section::clamp_all(sections);
                 }
                 ElementKind::Legend { exclude, columns, labels, text_size, fit, show_layer_names, .. } => {
                     *text_size = layout_text_in_range(*text_size, LEGEND_TEXT_PT);
@@ -721,8 +724,8 @@ pub struct LayoutRepairs {
     /// Elements kept with a value brought into range, a new id, a reference cleared, or a unit
     /// label's line breaks replaced.
     pub elements_adjusted: usize,
-    /// Elements with a name, text, polygon points, legend exclusions, scale bar unit labels or
-    /// legend labels cut to their limits (the same element may count as adjusted too).
+    /// Elements with a name, text, polygon points, section lines, legend exclusions, scale bar unit
+    /// labels or legend labels cut to their limits (the same element may count as adjusted too).
     pub elements_cut: usize,
     /// Elements removed: beyond the 500 a layout holds, or tied to a map frame it doesn't have.
     pub elements_removed: usize,

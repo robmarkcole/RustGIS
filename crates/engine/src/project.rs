@@ -112,6 +112,7 @@ pub const CAPABILITIES: &[&str] = &[
     "zarr-window",
     "blank-paper",
     "layout-frame-border",
+    "layout-section",
     NATIVE_COORDINATES,
     "layout-text-size",
     "layout-legend-fit",
@@ -2792,7 +2793,7 @@ pub(crate) fn layout_notices(
     let cut = total(|r| r.elements_cut);
     if cut > 0 {
         notices.push(format!(
-            "{name}: {cut} layout element(s) with a name, text, polygon points, legend exclusions, scale bar unit labels or legend labels cut to their limits {when} (in {})",
+            "{name}: {cut} layout element(s) with a name, text, polygon points, section lines, legend exclusions, scale bar unit labels or legend labels cut to their limits {when} (in {})",
             layout_names(repairs, |r| r.elements_cut)
         ));
     }

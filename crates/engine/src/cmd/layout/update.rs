@@ -221,7 +221,7 @@ pub(in crate::cmd::layout) fn update(s: &mut Session, p: &Value) -> CmdResult {
     // `true` adds the default one, an object changes the options it names, and null (not set)
     // leaves it as it is.
     let held;
-    let (restyled, new_grid, new_indicator, new_border) = {
+    let (restyled, new_grid, new_indicator, new_border, new_sections) = {
         let l = s.project.layouts.get(li).ok_or("no layout")?;
         let kind = &l.element(id).ok_or_else(|| format!("no element {id}"))?.kind;
         // `"extentIndicator": false` takes the frame's indicator away; an object restyles it.
@@ -258,7 +258,15 @@ pub(in crate::cmd::layout) fn update(s: &mut Session, p: &Value) -> CmdResult {
             (_, Some(_)) => return Err("only map frames have a grid".into()),
             _ => None,
         };
+        let sections = match (kind, p.get("section").filter(|v| !v.is_null())) {
+            (ElementKind::MapFrame { sections, .. }, Some(v)) => Some(sections_updated(v, sections)?),
+            (_, Some(_)) => return Err("only map frames have section lines".into()),
+            _ => None,
+        };
         let mut said = held_to_limits(p, Shape::of_kind(kind));
+        if let (Some((_, Some(_))), Some(v)) = (&sections, p.get("section")) {
+            said.extend(held_width(v, "section width", rustgis_map::layout::SECTION_WIDTHS));
+        }
         if let (ElementKind::MapFrame { .. }, Some(Some(_))) = (kind, &indicator)
             && let Some(v) = p.get("extentIndicator")
         {
@@ -269,7 +277,7 @@ pub(in crate::cmd::layout) fn update(s: &mut Session, p: &Value) -> CmdResult {
             said.extend(held_width(v, "border width", (0.0, rustgis_map::layout::MAX_FRAME_BORDER_WIDTH)));
         }
         held = said;
-        (restyle(kind, p)?, grid, indicator, border)
+        (restyle(kind, p)?, grid, indicator, border, sections)
     };
     // A line turned to an "angle" or made a "length" long, about its centre: its new box,
     // direction and heads.
@@ -626,8 +634,12 @@ pub(in crate::cmd::layout) fn update(s: &mut Session, p: &Value) -> CmdResult {
             extent_width,
             border_color,
             border_width,
+            sections,
             ..
         } => {
+            if let Some((new, _)) = &new_sections {
+                sections.clone_from(new);
+            }
             match new_indicator {
                 Some(None) => *extent_of = None,
                 Some(Some((c, w))) => (*extent_color, *extent_width) = (c, w),
@@ -789,6 +801,9 @@ pub(in crate::cmd::layout) fn update(s: &mut Session, p: &Value) -> CmdResult {
         if let Some(said) = said {
             s.notify(said, false);
         }
+    }
+    if let Some((_, Some(name))) = &new_sections {
+        say_section_not_drawn(s, li, id, name);
     }
     say_held(s, "Element Properties", held);
     if let Some(w) = font_told {

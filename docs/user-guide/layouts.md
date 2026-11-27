@@ -280,6 +280,20 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   `"grid": {…}` (`false` removes the grid). On a map on the globe the lines are drawn on the
   globe, and stop at its horizon. A frame that shows the whole globe has nothing beyond its rim,
   and so no labels along its edges.
+- **Section lines**: a frame can draw the traces of cross-sections over its map, up to 26 of them:
+  `layout.addElement={"kind":"section","frame":1,"name":"A","direction":"horizontal","at":[-44.66,-22.38]}`
+  draws one across the whole frame, straight on the page (`"direction"` is `"horizontal"` or
+  `"vertical"`), through a place, with its name in a box at both ends (A and A'). The name defaults
+  to the first free letter and the place to the frame's centre; `color`, `width` and `dash` set its
+  look. `layout.update={"element":1,"section":{"name":"A","at":[-44.7,-22.4],"color":"#1F5C84"}}`
+  changes one by its name, the keys not given keeping theirs (`"newName"` renames it, and
+  `"remove": true` removes it). The place is what is kept, so the line follows it when the frame is
+  moved, turned or rescaled, and on each page of a map series; the line runs to the frame's
+  edge, or to the outline of a round or polygon frame. A line whose place is outside the frame, or
+  that the frame's map can't show, isn't drawn: these commands, the layout view and exports say which
+  and why (for a map series' PDF, on how many of its pages). On a tilted frame or one on the globe,
+  the line runs through the place as the grid puts it there, only as far as there is ground along
+  it; it is straight on the page there, and not a straight section of the ground.
 - **Measured grids**: a grid's **Type** is a **Graticule** (latitudes and longitudes, as above)
   or a **Measured grid**, as ArcGIS Pro has them: eastings and northings in a projected coordinate
   system, for maps read with UTM or national grid coordinates (a hiking map at 1:25,000 with a
@@ -799,7 +813,7 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   Its page has layers (PDF optional content groups), which a vector editor that reads them opens
   as layers (VectorCraft, where it was checked), and PDF readers list in their layers panel:
   one for each element, named after it, and inside a map frame's, one for each map layer and one
-  for each layer's labels (`Labels: <layer>`), and one for the frame's grid. A map series' pages
+  for each layer's labels (`Labels: <layer>`), one for the frame's grid and one for its section lines. A map series' pages
   share them. `"pdf": {"layers": false}` on `layout.export` leaves them out. The map view's PDF
   (Publish › Print Map) has its map layers and labels as layers too.
   A PDF is also a GeoPDF: each map frame is georeferenced (an ISO 32000 geospatial viewport, the

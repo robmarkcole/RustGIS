@@ -1956,6 +1956,7 @@ pub(crate) mod tests {
                 scale: 500_000.0,
                 shape: FrameShape::Rectangle,
                 grid: None,
+                sections: Vec::new(),
                 extent_of: None,
                 extent_color: INDICATOR_COLOR,
                 extent_width: INDICATOR_WIDTH,
