@@ -459,9 +459,17 @@ pub struct CubeFiles {
     /// values, by the file's tile and day (one item each): only when a mask is asked for
     /// (`cube.reduce`'s `"mask"`).
     pub masks: std::collections::HashMap<(String, i64), (String, Vec<f64>)>,
+    /// Each file's item's other bands, in the order asked, by the file's tile and day: only when
+    /// several are asked for (`cube.reduce`'s `"assets"`).
+    pub bands: std::collections::HashMap<(String, i64), Vec<Band>>,
     pub collection: String,
     pub asset: String,
 }
+
+/// One of an item's other bands: its address, (scale, offset), and the stored values its metadata
+/// says aren't values.
+#[cfg(not(target_arch = "wasm32"))]
+pub type Band = (String, (f64, f64), Vec<f64>);
 
 /// The first moment after a period given as a year (`"2024"`) or a month (`"2024-03"`), so an
 /// end given so takes all of it; `None` for a date (an end on that day) or anything else.
@@ -483,9 +491,11 @@ pub(crate) fn period_after(v: &Value) -> Option<f64> {
 /// Searches a collection over an area and period, every page up to `max_items`, and
 /// groups the items' asset by tile and day: `{"url"?, "collection", "asset", "bbox"? | "view",
 /// "start", "end", "maxCloud"?}`. With `mask`, an asset key, each file's mask is the same item's
-/// asset of that key, and an item without one is left out (and said).
+/// asset of that key, and an item without one is left out (and said). With `others`, more band
+/// keys (`cube.reduce`'s `"assets"` after the first), each file's item's assets of those keys go
+/// in [`CubeFiles::bands`], and an item without one of them is left out (and said).
 #[cfg(not(target_arch = "wasm32"))]
-pub fn cube_files(s: &mut Session, p: &Value, max_items: usize, mask: Option<&str>) -> Result<CubeFiles, String> {
+pub fn cube_files(s: &mut Session, p: &Value, max_items: usize, mask: Option<&str>, others: &[String]) -> Result<CubeFiles, String> {
     let api = request_api(s, p)?;
     let collection = ps(p, "collection").map(str::trim).filter(|c| !c.is_empty()).ok_or("collection is required")?;
     let asset = ps(p, "asset").map(str::trim).filter(|a| !a.is_empty()).ok_or("asset is required (a band, such as NDVI)")?;
@@ -587,6 +597,8 @@ pub fn cube_files(s: &mut Session, p: &Value, max_items: usize, mask: Option<&st
     let mut without = 0usize;
     let mut masks: std::collections::HashMap<(String, i64), (String, Vec<f64>)> = Default::default();
     let mut unmasked = 0usize;
+    let mut bands: std::collections::HashMap<(String, i64), Vec<Band>> = Default::default();
+    let mut lacking = 0usize;
     // Each public bucket's region, found once ([`public_web`]).
     let mut regions: std::collections::HashMap<String, Option<String>> = Default::default();
     for i in &items {
@@ -595,6 +607,8 @@ pub fn cube_files(s: &mut Session, p: &Value, max_items: usize, mask: Option<&st
             continue;
         };
         let Some(a) = i.assets.iter().find(|a| a.key.eq_ignore_ascii_case(asset)) else {
+            // With several bands asked for, said with the items lacking one of the others.
+            lacking += usize::from(!others.is_empty());
             without += 1;
             continue;
         };
@@ -616,8 +630,16 @@ pub fn cube_files(s: &mut Session, p: &Value, max_items: usize, mask: Option<&st
                 }
             },
         };
+        // Its other bands: an item without one of them would give some cells' bands from
+        // another date's item.
+        let more: Option<Vec<_>> = others.iter().map(|k| i.assets.iter().find(|b| b.key.eq_ignore_ascii_case(k))).collect();
+        let Some(more) = more else {
+            lacking += 1;
+            without += 1;
+            continue;
+        };
         // Its codes for a failed retrieval not read whole: its values can't be told from them.
-        if a.codes_unread {
+        if a.codes_unread || more.iter().any(|b| b.codes_unread) {
             codes_unread += 1;
             without += 1;
             continue;
@@ -642,7 +664,17 @@ pub fn cube_files(s: &mut Session, p: &Value, max_items: usize, mask: Option<&st
             let mh = crate::render::rustgis_tiles::logins::inherit(&api, m.href.split('#').next().unwrap_or(&m.href));
             let mh = if s3::is_s3(&mh) { public_web(&mh, &mut regions)? } else { mh };
             let stored = m.nodata.iter().chain(&m.invalid).copied().collect();
-            masks.insert((key, d), (mh, stored));
+            masks.insert((key.clone(), d), (mh, stored));
+        }
+        if !more.is_empty() {
+            let mut these = Vec::with_capacity(more.len());
+            for b in more {
+                let bh = crate::render::rustgis_tiles::logins::inherit(&api, b.href.split('#').next().unwrap_or(&b.href));
+                let bh = if s3::is_s3(&bh) { public_web(&bh, &mut regions)? } else { bh };
+                let stored = b.nodata.iter().chain(&b.invalid).copied().collect();
+                these.push((bh, (b.scale.unwrap_or(1.0), b.offset.unwrap_or(0.0)), stored));
+            }
+            bands.insert((key, d), these);
         }
         // No scale or offset in the metadata reads as 1 and 0, the values as stored.
         let this = (a.scale.unwrap_or(1.0), a.offset.unwrap_or(0.0));
@@ -665,14 +697,17 @@ pub fn cube_files(s: &mut Session, p: &Value, max_items: usize, mask: Option<&st
     });
     let no_mask =
         mask.filter(|_| unmasked > 0).map(|key| format!("{unmasked} item(s) left out, as they have no asset {key} to mask them by"));
+    let all_of = std::iter::once(asset).chain(others.iter().map(String::as_str)).collect::<Vec<_>>().join(", ");
+    let no_band = (lacking > 0).then(|| format!("{lacking} item(s) left out, as they don't have all the assets {all_of}"));
     if tiles.is_empty() {
+        let has = if others.is_empty() { format!("an asset {asset}") } else { format!("all the assets {all_of}") };
         return Err(match (unread_codes, no_mask) {
             (Some(why), _) => format!("{collection}: {why}"),
-            (None, Some(_)) => format!("no item of {collection} has both an asset {asset} and the mask's {}", mask.unwrap_or_default()),
-            (None, None) => format!("no item of {collection} has an asset {asset}"),
+            (None, Some(_)) => format!("no item of {collection} has both {has} and the mask's {}", mask.unwrap_or_default()),
+            (None, None) => format!("no item of {collection} has {has}"),
         });
     }
-    for why in unread_codes.into_iter().chain(no_mask) {
+    for why in unread_codes.into_iter().chain(no_mask).chain(no_band) {
         s.warn(format!("{collection}: {why}"));
     }
     // Files reached through signed addresses (Planetary Computer's) expire within hours, so a
@@ -680,7 +715,13 @@ pub fn cube_files(s: &mut Session, p: &Value, max_items: usize, mask: Option<&st
     // The files' addresses come from the API's answer: each is checked as one that answer points
     // to (http or https, never a forbidden address, and not into the local network from a public
     // API), before a cube on the map or a trend reads it.
-    let all = || tiles.values().flat_map(|by_day| by_day.values()).chain(masks.values().map(|(m, _)| m));
+    let all = || {
+        tiles
+            .values()
+            .flat_map(|by_day| by_day.values())
+            .chain(masks.values().map(|(m, _)| m))
+            .chain(bands.values().flatten().map(|(b, ..)| b))
+    };
     if let Some(e) = all().find_map(|href| crate::render::rustgis_tiles::address::check(href, Some(&api)).err()) {
         return Err(e);
     }
@@ -701,6 +742,7 @@ pub fn cube_files(s: &mut Session, p: &Value, max_items: usize, mask: Option<&st
         scales_differ,
         coded,
         masks,
+        bands,
         collection: collection.to_string(),
         asset: asset.to_string(),
     })
@@ -764,8 +806,14 @@ pub struct StacCube {
     dates: Vec<f64>,
     /// Each date's files, with their (scale, offset), the stored values their metadata says
     /// aren't values, and when masked their mask (the same item's quality asset): its address and
-    /// the stored values its metadata says aren't values.
-    files: Vec<Vec<(String, (f64, f64), Vec<f64>, Option<Mask>)>>,
+    /// the stored values its metadata says aren't values; and its item's other bands, when several
+    /// are asked for (`"assets"`).
+    files: Vec<Vec<(String, (f64, f64), Vec<f64>, Option<Mask>, Vec<Band>)>>,
+    /// The bands asked for, when several (`"assets"`): a slice holds one band for each.
+    assets: Vec<String>,
+    /// Pixels with a value in some of the bands but not all at a date, left out of it (so each
+    /// cell's bands are the mean of the same pixels): said once the run has read its slices.
+    partial: std::sync::atomic::AtomicU64,
     /// The quality values that let a cell through, for a cube masked by its items' quality band.
     mask: Option<super::cube_mask::Test>,
     /// Band pixels read that their item's mask file doesn't cover, left out as not clear, and the
@@ -871,16 +919,22 @@ pub fn stac_cube(s: &mut Session, p: &Value) -> Result<StacCube, String> {
     if let Some(o) = searched.as_object_mut() {
         o.insert("bbox".into(), json!(bbox));
     }
+    // Several bands: the first read as `asset`, the others from the same items.
+    let assets = assets(p)?;
+    if let (Some(first), Some(o)) = (assets.first(), searched.as_object_mut()) {
+        o.insert("asset".into(), json!(first));
+    }
     let max_items = if s.long_runs.is_some() { MAX_SERIES_ITEMS } else { MAX_CUBE_ITEMS };
-    let CubeFiles { tiles, scales, nodata, masks, collection, asset, .. } =
-        cube_files(s, &searched, max_items, mask.as_ref().map(|m| m.asset.as_str()))?;
+    let CubeFiles { tiles, scales, nodata, masks, mut bands, collection, asset, .. } =
+        cube_files(s, &searched, max_items, mask.as_ref().map(|m| m.asset.as_str()), assets.get(1..).unwrap_or_default())?;
     // Every tile's file for a date, by day.
-    let mut by_day: std::collections::BTreeMap<i64, Vec<(String, (f64, f64), Vec<f64>, Option<Mask>)>> = Default::default();
+    let mut by_day: std::collections::BTreeMap<i64, Vec<(String, (f64, f64), Vec<f64>, Option<Mask>, Vec<Band>)>> = Default::default();
     for (tile, days) in &tiles {
         for (d, href) in days {
             let scale = scales.get(href).copied().unwrap_or((1.0, 0.0));
             let mask = masks.get(&(tile.clone(), *d)).map(|(m, stored)| (m.clone(), stored.iter().map(|v| *v as f32).collect()));
-            let file = (href.clone(), scale, nodata.get(href).cloned().unwrap_or_default(), mask);
+            let more = bands.remove(&(tile.clone(), *d)).unwrap_or_default();
+            let file = (href.clone(), scale, nodata.get(href).cloned().unwrap_or_default(), mask, more);
             by_day.entry(*d).or_default().push(file);
         }
     }
@@ -977,11 +1031,13 @@ pub fn stac_cube(s: &mut Session, p: &Value) -> Result<StacCube, String> {
         return Err(format!("no file of {collection}'s {asset} covers the area, only comes near it: take another bbox"));
     }
     // Within a run's block, and each slice within what a reader holds.
-    let per_slice = (MAX_PIECE_PIXELS / u64::from(factor).pow(2)).max(1);
+    // Several bands share both: a slice holds one of each.
+    let nb = assets.len().max(1) as u64;
+    let per_slice = (MAX_PIECE_PIXELS / u64::from(factor).pow(2) / nb).max(1);
     #[cfg(test)]
-    let block = PIECE_VALUES.with(|v| v.get()).unwrap_or(super::cube::MAX_VALUES);
+    let block = PIECE_VALUES.with(|v| v.get()).unwrap_or(super::cube::MAX_VALUES) / nb;
     #[cfg(not(test))]
-    let block = super::cube::MAX_VALUES;
+    let block = super::cube::MAX_VALUES / nb;
     let max = block.min(per_slice.saturating_mul(by_day.len() as u64));
     let rows = piece_rows(width, height, by_day.len(), read_tile_rows, max).ok_or_else(|| {
         format!(
@@ -1002,10 +1058,36 @@ pub fn stac_cube(s: &mut Session, p: &Value) -> Result<StacCube, String> {
         crs: layout.crs,
         rows,
         met: Default::default(),
-        label: format!("{collection} {asset}"),
+        label: if assets.is_empty() { format!("{collection} {asset}") } else { format!("{collection} {}", assets.join("-")) },
         mask: mask.map(|m| m.test),
         uncovered: Default::default(),
+        assets,
+        partial: Default::default(),
     })
+}
+
+/// The most bands `"assets"` takes.
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_ASSETS: usize = 16;
+
+/// `cube.reduce`'s `"assets"`: two or more of a collection's bands, read from the same items into
+/// one slice of a band each; empty when not given (one `"asset"`).
+#[cfg(not(target_arch = "wasm32"))]
+fn assets(p: &Value) -> Result<Vec<String>, String> {
+    let Some(v) = p.get("assets").filter(|v| !v.is_null()) else { return Ok(Vec::new()) };
+    if p.get("asset").is_some_and(|a| !a.is_null()) {
+        return Err("give asset (one band) or assets (several), not both".into());
+    }
+    let keys: Option<Vec<String>> =
+        v.as_array().and_then(|a| a.iter().map(|k| k.as_str().map(str::trim).filter(|k| !k.is_empty()).map(str::to_string)).collect());
+    let keys = keys.ok_or("assets is a list of the collection's bands, such as [\"B04\", \"B03\", \"B02\"]")?;
+    if !(2..=MAX_ASSETS).contains(&keys.len()) {
+        return Err(format!("assets takes 2 to {MAX_ASSETS} bands (one band is \"asset\"), not {}", keys.len()));
+    }
+    if let Some(k) = keys.iter().enumerate().find_map(|(n, k)| keys[..n].iter().any(|o| o.eq_ignore_ascii_case(k)).then_some(k)) {
+        return Err(format!("assets names {k} twice"));
+    }
+    Ok(keys)
 }
 
 /// The pixels of a clear share's mask read at once, and about the most over an area: its
@@ -1126,11 +1208,15 @@ impl super::cube::TimeCube for StacCube {
     fn masked(&self) -> bool {
         self.mask.is_some()
     }
+    fn assets(&self) -> &[String] {
+        &self.assets
+    }
     /// Band pixels their item's mask file doesn't cover: left out as not clear, and said with
-    /// their count and the first such mask.
+    /// their count and the first such mask; and pixels left out at a date for a value in only some
+    /// of the bands asked for.
     fn lost(&self) -> Vec<rustgis_data::loss::Note> {
         // Pixels with a value left out as not clear: a value lost.
-        match self.uncovered.lock().map(|u| u.clone()) {
+        let mut said = match self.uncovered.lock().map(|u| u.clone()) {
             Ok((n, Some(href))) if n > 0 => vec![rustgis_data::loss::Note::loss(
                 rustgis_data::loss::LossCode::DroppedValue,
                 crate::sources::message_with_address(
@@ -1141,7 +1227,20 @@ impl super::cube::TimeCube for StacCube {
                 ),
             )],
             _ => Vec::new(),
+        };
+        let partial = self.partial.load(std::sync::atomic::Ordering::Relaxed);
+        if partial > 0 {
+            // Values in some of a date's bands, left out with the rest of that date: values lost.
+            said.push(rustgis_data::loss::Note::loss(
+                rustgis_data::loss::LossCode::DroppedValue,
+                format!(
+                    "{}: {partial} pixel(s) had a value in some of the bands {} but not all at a date, so they were left out at that date (each cell's bands are of the same pixels)",
+                    self.label,
+                    self.assets.join(", ")
+                ),
+            ));
         }
+        said
     }
     /// The part of the area date `i`'s masks let through: a grid over the area of about
     /// [`SHARE_PIXELS`] cells (coarser than the band's for a large area), each cell clear when a
@@ -1219,9 +1318,11 @@ impl super::cube::TimeCube for StacCube {
         let h = self.rows.min(self.height - top);
         let w = self.width;
         let f = self.factor.max(1);
-        // Each cell's sum and count of the pixels read in it.
-        let mut sum = vec![0.0f64; w as usize * h as usize];
-        let mut count = vec![0u32; w as usize * h as usize];
+        // Each band's cells' sum and count of the pixels read in them.
+        let nb = self.assets.len().max(1);
+        let cells = w as usize * h as usize;
+        let mut sums = vec![vec![0.0f64; cells]; nb];
+        let mut counts = vec![vec![0u32; cells]; nb];
         // The area's grid at the level read: a cell is `f` × `f` of its pixels.
         let grid = rustgis_data::raster::GeoTransform {
             pixel_width: self.transform.pixel_width / f64::from(f),
@@ -1229,8 +1330,7 @@ impl super::cube::TimeCube for StacCube {
             ..self.transform
         };
         let (wf, top_f, hf) = (i64::from(w) * i64::from(f), i64::from(top) * i64::from(f), i64::from(h) * i64::from(f));
-        for (href, (k, o), fill, mask) in files {
-            let fill: Vec<f32> = fill.iter().map(|v| *v as f32).collect();
+        for (href, scale, fill, mask, more) in files {
             // Cached per address for the process (`with_info`, a failure too, for a while), so a
             // file's header is fetched once however many pieces and dates read it.
             let info = cog::info_blocking(href)?;
@@ -1262,7 +1362,6 @@ impl super::cube::TimeCube for StacCube {
             self.met.store(true, std::sync::atomic::Ordering::Relaxed);
             let cols = (fc0 as u32, fc1 as u32);
             let rows = (fr0 as u32, fr1 as u32);
-            let read = cog::read_values_blocking(&info, href, self.level, 0, cols, rows)?;
             // A masked cube's pixels go in only where the same item's mask lets them through.
             let keep = match (&self.mask, mask) {
                 (Some(test), Some(m)) => Some(self.mask_window(m, test, &lt, cols, rows)?),
@@ -1271,33 +1370,71 @@ impl super::cube::TimeCube for StacCube {
                 (Some(_), None) => return Err(crate::sources::message_with_address(href, "has no quality band to mask its cells by")),
                 _ => None,
             };
-            // The band pixels with a value that the mask file doesn't cover.
+            // The item's pixels with a value that the mask file doesn't cover, and those with a value
+            // in only some of the bands asked for.
             let mut outside = 0u64;
             let across = (fc1 - fc0) as usize;
-            for (r, line) in read.chunks(across).enumerate() {
-                let row = ((fr0 - dy - top_f) as usize + r) / f as usize;
-                for (c, v) in line.iter().enumerate() {
-                    let col = ((fc0 - dx) as usize + c) / f as usize;
-                    let cell = row * w as usize + col;
-                    if !v.is_finite() || fill.contains(v) {
-                        continue;
+            let mut partial = 0u64;
+            let bands = std::iter::once((href, scale, fill)).chain(more.iter().map(|(h, s, f)| (h, s, f)));
+            // Every band's window is read before any pixel goes in, so a cell's bands are the mean of
+            // the same pixels: one with a value in only some of them goes in none (said).
+            let mut reads: Vec<(Vec<f32>, Vec<f32>, (f64, f64))> = Vec::with_capacity(nb);
+            for (b, (bh, (k, o), fill)) in bands.enumerate() {
+                let fill: Vec<f32> = fill.iter().map(|v| *v as f32).collect();
+                // The item's other bands are read on its first band's pixels, the same window.
+                let read = if b == 0 {
+                    cog::read_values_blocking(&info, href, self.level, 0, cols, rows)?
+                } else {
+                    let bi = cog::info_blocking(bh)?;
+                    let same = bi.layout.crs == self.crs
+                        && bi.layout.levels.get(self.level).is_some_and(|l| {
+                            (l.width, l.height) == (lv.width, lv.height) && offset_in(&grid, &bi.layout.transform_of(l)) == Some((dx, dy))
+                        });
+                    if !same {
+                        return Err(crate::sources::message_with_address(
+                            bh,
+                            &format!("not on the pixels of its item's {}: assets takes bands of one cell size", self.assets.join(", ")),
+                        ));
                     }
-                    let clear = match &keep {
-                        None => true,
-                        Some(kept) => match kept.get(r * across + c).copied().flatten() {
-                            Some(clear) => clear,
-                            None => {
-                                outside += 1;
-                                false
-                            }
-                        },
-                    };
-                    if clear && let (Some(s), Some(n)) = (sum.get_mut(cell), count.get_mut(cell)) {
-                        *s += f64::from(*v) * k + o;
+                    cog::read_values_blocking(&bi, bh, self.level, 0, cols, rows)?
+                };
+                reads.push((read, fill, (*k, *o)));
+            }
+            let pixels = reads.iter().map(|(r, ..)| r.len()).min().unwrap_or(0);
+            for i in 0..pixels {
+                let valued = reads.iter().filter(|(read, fill, _)| read[i].is_finite() && !fill.contains(&read[i])).count();
+                if valued == 0 {
+                    continue;
+                }
+                let clear = match &keep {
+                    None => true,
+                    Some(kept) => match kept.get(i).copied().flatten() {
+                        Some(clear) => clear,
+                        None => {
+                            outside += 1;
+                            false
+                        }
+                    },
+                };
+                if !clear {
+                    continue;
+                }
+                if valued < reads.len() {
+                    partial += 1;
+                    continue;
+                }
+                let (r, c) = (i / across, i % across);
+                let row = ((fr0 - dy - top_f) as usize + r) / f as usize;
+                let col = ((fc0 - dx) as usize + c) / f as usize;
+                let cell = row * w as usize + col;
+                for ((read, _, (k, o)), (sum, count)) in reads.iter().zip(sums.iter_mut().zip(&mut counts)) {
+                    if let (Some(s), Some(n)) = (sum.get_mut(cell), count.get_mut(cell)) {
+                        *s += f64::from(read[i]) * k + o;
                         *n += 1;
                     }
                 }
             }
+            self.partial.fetch_add(partial, std::sync::atomic::Ordering::Relaxed);
             if outside > 0
                 && let (Ok(mut u), Some((m, _))) = (self.uncovered.lock(), mask)
             {
@@ -1305,7 +1442,11 @@ impl super::cube::TimeCube for StacCube {
                 u.1.get_or_insert_with(|| m.clone());
             }
         }
-        let vals: Vec<f32> = sum.iter().zip(&count).map(|(s, n)| if *n > 0 { (s / f64::from(*n)) as f32 } else { f32::NAN }).collect();
+        let bands: Vec<Vec<f32>> = sums
+            .iter()
+            .zip(&counts)
+            .map(|(sum, count)| sum.iter().zip(count).map(|(s, n)| if *n > 0 { (s / f64::from(*n)) as f32 } else { f32::NAN }).collect())
+            .collect();
         let transform = rustgis_data::raster::GeoTransform {
             origin_y: self.transform.origin_y + f64::from(top) * self.transform.pixel_height,
             ..self.transform
@@ -1314,7 +1455,7 @@ impl super::cube::TimeCube for StacCube {
             &self.label,
             w,
             h,
-            vec![vals],
+            bands,
             transform,
             self.crs,
             None,
@@ -1380,7 +1521,7 @@ fn add_cube(s: &mut Session, p: &Value) -> CmdResult {
             collection,
             asset,
             ..
-        } = cube_files(s, p, MAX_CUBE_ITEMS, None)?;
+        } = cube_files(s, p, MAX_CUBE_ITEMS, None, &[])?;
         // A tile layer's look has no way to name them, so on the map they are values.
         if coded > 0 {
             s.warn(format!(

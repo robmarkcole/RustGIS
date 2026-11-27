@@ -26,10 +26,10 @@ use crate::{CmdResult, CommandSpec as C, Session};
 
 pub fn commands() -> Vec<C> {
     vec![C::new("cube.trend", "Trend Analysis", "Analyze › Workflows", trend_cmd).inputs(cube_inputs).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network).with(crate::policy::Effect::Files)).params(
-        r#"{"cube"?: an entry of cube.catalog (its STAC API, collection, band, cell size and cloud cap, or its Zarr store and variable) | "layers"?: [raster layers, a date each; one on another grid is resampled (nearest) onto the first's] | "layer"?: a Zarr layer (or "path" | "url", "variable", "index", "crs" as for zarr.reduce) or a raster of several bands, a date each (default: the active layer) | "collection": a STAC collection (desktop; read in place over an area, in pieces when large; with url, asset, bbox, maxCloud, cellSize and resampling below, and "start", "end"), "url"?: the collection's STAC API (as for stac.addCube), "asset"?: the collection's band, such as NDVI, "mask"?: a collection's quality band (as for cube.reduce), "bbox"?: [w, s, e, n] | "view" (the collection's area), "maxCloud"?: a collection's cloud cover cap, "cellSize"?: a collection's cell size in the files' units (the overview level nearest it is read), "resampling"?: "nearest" (default: that overview's pixels as stored) | "average" (each cell the mean of the full images' pixels in it, which reads them), "band"?: 1-based (a stack's band), "dates"?: [dates] (a stack's or the bands' dates, in their order; default: read from the layers' names or files, or the bands' names), "start"?, "end"?: dates (a whole number from 1000 to 9999 is a year; an end given as a year or a month takes all of it), "months"?: [1–12] (one season across years), "test"?: "hamedRao" (default) | "yueWang" | "seasonal" | "original", "seasons"?: parts of a year for the seasonal test (default 12), "alpha"?: 0.05 (above 0, below 0.5), "minValid"?: dates a cell needs (default: half of them, at least 4; the seasonal test also needs 4 in seasons of two or more), "per"?: "year" (default) | "decade", "name"?: text, "ran"?: (internal: a trend the app has worked out)} → four raster layers: Sen's slope, the test's Z and p-value, and the slope where p < alpha"#,
+        r#"{"cube"?: an entry of cube.catalog (its STAC API, collection, band, cell size and cloud cap, or its Zarr store and variable) | "layers"?: [raster layers, a date each; one on another grid is resampled (nearest) onto the first's] | "layer"?: a Zarr layer (or "path" | "url", "variable", "index", "crs" as for zarr.reduce) or a raster of several bands, a date each (default: the active layer) | "collection": a STAC collection (desktop; read in place over an area, in pieces when large; with url, asset, bbox, maxCloud, cellSize and resampling below, and "start", "end"), "url"?: the collection's STAC API (as for stac.addCube), "asset"?: the collection's band, such as NDVI ("assets", several bands, is cube.reduce's: a trend refuses it), "mask"?: a collection's quality band (as for cube.reduce), "bbox"?: [w, s, e, n] | "view" (the collection's area), "maxCloud"?: a collection's cloud cover cap, "cellSize"?: a collection's cell size in the files' units (the overview level nearest it is read), "resampling"?: "nearest" (default: that overview's pixels as stored) | "average" (each cell the mean of the full images' pixels in it, which reads them), "band"?: 1-based (a stack's band), "dates"?: [dates] (a stack's or the bands' dates, in their order; default: read from the layers' names or files, or the bands' names), "start"?, "end"?: dates (a whole number from 1000 to 9999 is a year; an end given as a year or a month takes all of it), "months"?: [1–12] (one season across years), "test"?: "hamedRao" (default) | "yueWang" | "seasonal" | "original", "seasons"?: parts of a year for the seasonal test (default 12), "alpha"?: 0.05 (above 0, below 0.5), "minValid"?: dates a cell needs (default: half of them, at least 4; the seasonal test also needs 4 in seasons of two or more), "per"?: "year" (default) | "decade", "name"?: text, "ran"?: (internal: a trend the app has worked out)} → four raster layers: Sen's slope, the test's Z and p-value, and the slope where p < alpha"#,
     ),
     C::new("cube.reduce", "Summarise a Data Cube over Time", "Analyze › Workflows", reduce_cmd).inputs(cube_inputs).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network).with(crate::policy::Effect::Files)).params(
-        r#"{"cube"?: an entry of cube.catalog (as for cube.trend) | "layers"?: [raster layers, a date each; one on another grid is resampled (nearest) onto the first's] | "layer"?: a Zarr layer or a raster of several bands, a date each (default: the active layer) | "path"?: a Zarr store's folder | "url"?: a Zarr store's address, or a STAC collection's API (as for stac.addCube) | "collection": a STAC collection (desktop; read in place over an area, in pieces when large; with url, asset, bbox, maxCloud, cellSize and resampling below, and "start", "end"), "variable"?, "index"?, "crs"?: a Zarr variable's (as for zarr.reduce), "asset"?: the collection's band, such as NDVI, "mask"?: {"asset": the items' quality band, such as SCL, Fmask, qa_pixel or CMASK, and one of "keep": [classes] | "drop": [classes] | "bits": {"set"?: [bits on], "unset"?: [bits off]} (bits 0–63)} (a collection's: a cell is taken at a date only where the same item's quality band lets it through, read onto the band's grid by nearest neighbour; items without it are left out), "bbox"?: [w, s, e, n] | "view" (the collection's area), "maxCloud"?: a collection's cloud cover cap, "cellSize"?: a collection's cell size in the files' units (the overview level nearest it is read), "resampling"?: "nearest" (default) | "average" (as for cube.trend), "band"?: 1-based (a stack's band), "dates"?: [dates] (a stack's or the bands' dates, in their order; default: read from the layers' names or files, or the bands' names), "stat": "mean"|"median"|"min"|"max"|"sum"|"std" (the population standard deviation, n)|"count"|"countAbove"|"first" (the value at the cell's first date with one, in "order": the best pixel)|"mode" or "majority" (a categorical cube's most frequent class; the least of those tied)|"modeCount" (how many dates had the mode)|"variety" (how many classes)|"changes" (how many times the class changed from one valued date to the next)|"longestRun" (the class of the longest run of dates in one class; the least of those tied)|"longestRunLength" (how many dates that run lasted)|"frequency" (a layer for each class met: its count of dates)|"countIn" (how many dates in the classes given), "order"?: first's order of the dates: "clear" (the default with a mask: by the share of the area the mask lets through, the clearest first) | "date" (the default without one: the earliest first) | "-date" (the latest first), "above"?: number (countAbove's threshold), "classes"?: [whole numbers 0–255, at most 256] (countIn's classes), "by"?: "all" (default: one layer) | "year" (a layer for each calendar year) | "month" (a layer for each month of the year, across years), "start"?, "end"?: dates (as for cube.trend), "months"?: [1–12] (a season across years), "minValid"?: 0–1 (a cell with a smaller share of its group's dates is left empty; default 0), "name"?: text} → raster layers of the statistic, one for each group (frequency: one for each class of each group)"#,
+        r#"{"cube"?: an entry of cube.catalog (as for cube.trend) | "layers"?: [raster layers, a date each; one on another grid is resampled (nearest) onto the first's] | "layer"?: a Zarr layer or a raster of several bands, a date each (default: the active layer) | "path"?: a Zarr store's folder | "url"?: a Zarr store's address, or a STAC collection's API (as for stac.addCube) | "collection": a STAC collection (desktop; read in place over an area, in pieces when large; with url, asset, bbox, maxCloud, cellSize and resampling below, and "start", "end"), "variable"?, "index"?, "crs"?: a Zarr variable's (as for zarr.reduce), "asset"?: the collection's band, such as NDVI, "assets"?: [2–16 of the collection's bands, such as ["B04", "B03", "B02"]] (instead of asset, for mean, median or first: one layer a group with a band for each, drawn as RGB when three; a cell goes in at a date only with a value in every band, and median takes each cell's bands from one date, the one whose bands' sum is the middle (the lower of two); items without all of them are left out), "mask"?: {"asset": the items' quality band, such as SCL, Fmask, qa_pixel or CMASK, and one of "keep": [classes] | "drop": [classes] | "bits": {"set"?: [bits on], "unset"?: [bits off]} (bits 0–63)} (a collection's: a cell is taken at a date only where the same item's quality band lets it through, read onto the band's grid by nearest neighbour; items without it are left out), "bbox"?: [w, s, e, n] | "view" (the collection's area), "maxCloud"?: a collection's cloud cover cap, "cellSize"?: a collection's cell size in the files' units (the overview level nearest it is read), "resampling"?: "nearest" (default) | "average" (as for cube.trend), "band"?: 1-based (a stack's band), "dates"?: [dates] (a stack's or the bands' dates, in their order; default: read from the layers' names or files, or the bands' names), "stat": "mean"|"median"|"min"|"max"|"sum"|"std" (the population standard deviation, n)|"count"|"countAbove"|"first" (the value at the cell's first date with one, in "order": the best pixel)|"mode" or "majority" (a categorical cube's most frequent class; the least of those tied)|"modeCount" (how many dates had the mode)|"variety" (how many classes)|"changes" (how many times the class changed from one valued date to the next)|"longestRun" (the class of the longest run of dates in one class; the least of those tied)|"longestRunLength" (how many dates that run lasted)|"frequency" (a layer for each class met: its count of dates)|"countIn" (how many dates in the classes given), "order"?: first's order of the dates: "clear" (the default with a mask: by the share of the area the mask lets through, the clearest first) | "date" (the default without one: the earliest first) | "-date" (the latest first), "above"?: number (countAbove's threshold), "classes"?: [whole numbers 0–255, at most 256] (countIn's classes), "by"?: "all" (default: one layer) | "year" (a layer for each calendar year) | "month" (a layer for each month of the year, across years), "start"?, "end"?: dates (as for cube.trend), "months"?: [1–12] (a season across years), "minValid"?: 0–1 (a cell with a smaller share of its group's dates is left empty; default 0), "name"?: text} → raster layers of the statistic, one for each group (frequency: one for each class of each group)"#,
     )]
 }
 
@@ -112,6 +112,11 @@ pub trait TimeCube: Send + Sync {
     fn clear_share(&self, i: usize, cancel: &AtomicBool) -> Result<Option<f64>, String> {
         let _ = (i, cancel);
         Ok(None)
+    }
+    /// The bands a slice holds, when several (a STAC collection's `"assets"`), from the slice's
+    /// band on: empty for a cube of one band.
+    fn assets(&self) -> &[String] {
+        &[]
     }
 }
 
@@ -315,6 +320,15 @@ pub fn cube_from(s: &mut Session, p: &Value, needs: Needs) -> Result<Box<dyn Tim
     // A mask is the same item's quality asset: only a STAC collection's items have one.
     if p.get("mask").is_some_and(|m| !m.is_null()) && !matches!(choice, CubeChoice::Collection) {
         return Err("mask is read from a STAC collection's items (\"collection\"), each date's from its own item".into());
+    }
+    // Several bands are a STAC collection's items' assets, summarised together; a trend is of one.
+    if p.get("assets").is_some_and(|a| !a.is_null()) {
+        if needs.ordered {
+            return Err(format!("a {what} is of one band: give \"asset\", not \"assets\""));
+        }
+        if !matches!(choice, CubeChoice::Collection) {
+            return Err("assets are a STAC collection's bands (\"collection\"), read from the same items".into());
+        }
     }
     if let CubeChoice::Layers(list) = choice {
         let list = list.as_array().ok_or("layers is a list of raster layers")?;
@@ -1769,10 +1783,14 @@ impl ReduceRun {
     /// stops it between slices.
     pub fn run(&self, cancel: &AtomicBool, done: &AtomicUsize) -> Result<Vec<Raster>, String> {
         let outputs = self.groups.len();
+        // A slot for each band of each group (one band but for "assets"): group `g`'s are
+        // `g * nb..(g + 1) * nb`, folded together so a cell's bands take the same dates.
+        let nb = self.cube.assets().len().max(1);
+        let slots = outputs * nb;
         let too_many = |cells: usize| {
-            let values = (cells as u64).saturating_mul(outputs as u64);
+            let values = (cells as u64).saturating_mul(slots as u64);
             (values > MAX_REDUCED).then(|| {
-                format!("{cells} cells × {outputs} outputs is {values} values, more than {MAX_REDUCED}: take a smaller area, a coarser cell size or fewer outputs")
+                format!("{cells} cells × {slots} output bands is {values} values, more than {MAX_REDUCED}: take a smaller area, a coarser cell size or fewer outputs")
             })
         };
         // A cube that knows its size is refused before it reads anything.
@@ -1784,8 +1802,8 @@ impl ReduceRun {
         let mut stitch = Stitch::default();
         // Each group's columns so far, by class for frequency; and for frequency each group's
         // value where a class is missing, for a class met first in a later piece.
-        let mut bands: Vec<Columns> = vec![Vec::new(); outputs];
-        let mut masks: Vec<Vec<f32>> = vec![Vec::new(); outputs];
+        let mut bands: Vec<Columns> = vec![Vec::new(); slots];
+        let mut masks: Vec<Vec<f32>> = vec![Vec::new(); slots];
         let frequency = self.stat == Stat::Frequency;
         // The cells of the pieces read so far, for a cube that didn't know its size.
         let mut read_cells = 0usize;
@@ -1797,23 +1815,27 @@ impl ReduceRun {
             // cube's) they come as read, and the groups open are those of the dates in flight, a
             // couple of years' for 16-day composites. Totals are f64 and the outputs f32, so the
             // order of arrival can move an output's last bit at most, and only then.
-            let mut totals: Vec<Option<Totals>> = (0..outputs).map(|_| None).collect();
+            let mut totals: Vec<Option<Totals>> = (0..slots).map(|_| None).collect();
             let mut seen = vec![0usize; outputs];
-            let mut finished: Vec<Option<(Columns, Vec<f32>)>> = vec![None; outputs];
+            let mut finished: Vec<Option<(Columns, Vec<f32>)>> = vec![None; slots];
             let mut place = |k: usize, slice: Option<(Arc<Raster>, usize)>| -> Result<(), String> {
                 let g = self.group_of.get(k).copied().filter(|g| *g < outputs).ok_or("a date in no group")?;
+                let span = g * nb..(g + 1) * nb;
                 // A date with nothing written only lowers the counts.
                 if let Some((r, b)) = slice {
                     let i = self.steps.get(k).copied().unwrap_or(0);
-                    let vals = &r.bands.get(b).ok_or("the slice has no such band")?.data;
+                    let layers: Vec<&[f32]> = (b..b + nb)
+                        .map(|j| r.bands.get(j).map(|x| x.data.as_slice()).ok_or("the slice has no such band"))
+                        .collect::<Result<_, _>>()?;
+                    let vals = layers.first().copied().unwrap_or_default();
                     match &grid {
                         None => {
                             if let Some(e) = too_many(vals.len()) {
                                 return Err(e);
                             }
-                            // The median holds every date's value of the piece's cells.
+                            // The median holds every date's value of the piece's cells, each band's.
                             if self.stat == Stat::Median
-                                && let Some(e) = too_many_values(vals.len(), self.steps.len())
+                                && let Some(e) = too_many_values(vals.len().saturating_mul(nb), self.steps.len())
                             {
                                 return Err(e);
                             }
@@ -1821,20 +1843,27 @@ impl ReduceRun {
                         }
                         Some(first) => off_grid(self.cube.as_ref(), i, first, &r)?,
                     }
-                    let slot = totals.get_mut(g).ok_or("a date in no group")?;
-                    if slot.is_none() {
-                        let dates = self.groups.get(g).map_or(0, |(_, d)| *d);
+                    let group = totals.get_mut(span.clone()).ok_or("a date in no group")?;
+                    let dates = self.groups.get(g).map_or(0, |(_, d)| *d);
+                    for slot in group.iter_mut().filter(|t| t.is_none()) {
                         *slot = Some(Totals::new(self.stat, vals.len(), dates)?);
                     }
-                    let t = slot.as_mut().ok_or("a date in no group")?;
-                    t.at(rank.get(k).copied().unwrap_or(0));
+                    let mut ts: Vec<&mut Totals> = group.iter_mut().flatten().collect();
+                    let cells = ts.first().map_or(0, |t| t.cells());
+                    for t in &mut ts {
+                        t.at(rank.get(k).copied().unwrap_or(0));
+                    }
                     let nodata = r.nodata.map(|v| v as f32);
-                    for (c, v) in vals.iter().enumerate().take(t.cells()) {
-                        if v.is_finite() && Some(*v) != nodata {
-                            t.add(c, f64::from(*v));
+                    let valued = |v: Option<&f32>| v.is_some_and(|v| v.is_finite() && Some(*v) != nodata);
+                    // A cell goes in at a date only with a value in every band, so they keep together.
+                    for c in 0..cells {
+                        if layers.iter().all(|l| valued(l.get(c))) {
+                            for (t, l) in ts.iter_mut().zip(&layers) {
+                                t.add(c, f64::from(l.get(c).copied().unwrap_or(f32::NAN)));
+                            }
                         }
                     }
-                    if let Some(e) = t.refused() {
+                    if let Some(e) = ts.iter().find_map(|t| t.refused()) {
                         return Err(e.to_string());
                     }
                     // The groups being read at once (every month's, by month) share the cap.
@@ -1846,9 +1875,11 @@ impl ReduceRun {
                 *n += 1;
                 let dates = self.groups.get(g).map_or(0, |(_, d)| *d);
                 if *n >= dates
-                    && let (Some(t), Some(out)) = (totals.get_mut(g).and_then(Option::take), finished.get_mut(g))
+                    && let Some(outs) = finish_group(totals.get_mut(span.clone()).unwrap_or_default(), self.min_share, dates, frequency)
                 {
-                    *out = Some(finish(&t, self.min_share, dates, frequency));
+                    for (out, slot) in outs.into_iter().zip(finished.get_mut(span).unwrap_or_default()) {
+                        *slot = Some(out);
+                    }
                     if let Some(e) = classes_over(&totals, &finished, class_cap(self.stat)) {
                         return Err(e);
                     }
@@ -1867,22 +1898,33 @@ impl ReduceRun {
             {
                 return Err(e);
             }
-            for (g, (band, mask)) in bands.iter_mut().zip(&mut masks).enumerate() {
+            for g in 0..outputs {
                 let dates = self.groups.get(g).map_or(0, |(_, d)| *d);
+                let span = g * nb..(g + 1) * nb;
+                let done_before: Vec<_> = finished.get_mut(span.clone()).unwrap_or_default().iter_mut().filter_map(Option::take).collect();
                 // A group with no data written in this piece: no values, as its totals would give.
-                let (columns, piece_mask) = match (finished.get_mut(g).and_then(Option::take), totals.get_mut(g).and_then(Option::take)) {
-                    (Some(out), _) => out,
-                    (None, Some(t)) => finish(&t, self.min_share, dates, frequency),
-                    (None, None) => finish(&Totals::new(self.stat, cells, 0)?, self.min_share, dates, frequency),
-                };
-                // Their full length when the cube knows it, so they don't grow by doubling.
-                stack_columns(band, mask, columns, &piece_mask, whole)?;
-                if let (0, Some(total)) = (piece, whole)
-                    && frequency
+                let outs = if done_before.len() == nb {
+                    done_before
+                } else if let Some(outs) = finish_group(totals.get_mut(span.clone()).unwrap_or_default(), self.min_share, dates, frequency)
                 {
-                    reserve(mask, total)?;
+                    outs
+                } else {
+                    let none = finish(&Totals::new(self.stat, cells, 0)?, self.min_share, dates, frequency);
+                    vec![none; nb]
+                };
+                for ((columns, piece_mask), (band, mask)) in outs
+                    .into_iter()
+                    .zip(bands.get_mut(span.clone()).unwrap_or_default().iter_mut().zip(masks.get_mut(span).unwrap_or_default()))
+                {
+                    // Their full length when the cube knows it, so they don't grow by doubling.
+                    stack_columns(band, mask, columns, &piece_mask, whole)?;
+                    if let (0, Some(total)) = (piece, whole)
+                        && frequency
+                    {
+                        reserve(mask, total)?;
+                    }
+                    mask.extend(piece_mask);
                 }
-                mask.extend(piece_mask);
             }
             // Frequency's columns are known as they are met: their values within the outputs' cap.
             let columns: usize = bands.iter().map(Vec::len).sum();
@@ -1903,6 +1945,29 @@ impl ReduceRun {
         }
         done.store(self.total(), Ordering::Relaxed);
         let grid = &grid;
+        // Several bands: one raster a group, a band for each asset (drawn as RGB when three).
+        if nb > 1 {
+            let mut slots = bands.into_iter();
+            let outputs = self
+                .groups
+                .iter()
+                .map(|(name, _)| {
+                    let columns: Vec<Vec<f32>> = slots
+                        .by_ref()
+                        .take(nb)
+                        .map(|c| c.into_iter().next().map(|(_, b)| b).ok_or_else(|| format!("{name}: a band came out with no values")))
+                        .collect::<Result<_, _>>()?;
+                    let hint = if nb == 3 { raster::ColorHint::Rgb { alpha: false } } else { raster::ColorHint::Gray };
+                    let mut r = Raster::new(name.clone(), grid.width, height, columns, grid.transform, grid.crs, None, hint, "Float32")
+                        .map_err(|e| e.to_string())?;
+                    for (band, asset) in r.bands.iter_mut().zip(self.cube.assets()) {
+                        band.name.clone_from(asset);
+                    }
+                    Ok(r)
+                })
+                .collect();
+            return with_lost(outputs, self.cube.as_ref());
+        }
         let outputs = self
             .groups
             .iter()
@@ -1929,6 +1994,51 @@ type Columns = Vec<(Option<f32>, Vec<f32>)>;
 fn finish(t: &Totals, min_share: f64, dates: usize, frequency: bool) -> (Columns, Vec<f32>) {
     let mask = if frequency { t.mask(min_share, dates) } else { Vec::new() };
     (t.columns(min_share, dates), mask)
+}
+
+/// A group's slots' columns (a slot for each band), their totals taken: `None` when the group has
+/// none yet. Several bands' median is taken whole ([`median_of_dates`]).
+fn finish_group(slots: &mut [Option<Totals>], min_share: f64, dates: usize, frequency: bool) -> Option<Vec<(Columns, Vec<f32>)>> {
+    let ts: Vec<Totals> = slots.iter_mut().filter_map(Option::take).collect();
+    if ts.is_empty() {
+        return None;
+    }
+    if ts.len() > 1 && ts.first().is_some_and(|t| t.stat == Stat::Median) {
+        return Some(median_of_dates(&ts, min_share, dates).into_iter().map(|b| (vec![(None, b)], Vec::new())).collect());
+    }
+    Some(ts.iter().map(|t| finish(t, min_share, dates, frequency)).collect())
+}
+
+/// Several bands' median (`ts`, a band each over the same cells, each cell's values of the same
+/// dates in the same order): each cell's bands from one date, the one whose bands' sum is the
+/// middle (the lower of the two for an even count; ties by the bands' values), so a cell is
+/// one date's pixel rather than each band's own middle, which can mix dates into a colour no
+/// date had.
+fn median_of_dates(ts: &[Totals], min_share: f64, dates: usize) -> Vec<Vec<f32>> {
+    let need = (min_share.clamp(0.0, 1.0) * dates as f64 - 1e-9).ceil().max(1.0) as u32;
+    let Some(t0) = ts.first() else { return Vec::new() };
+    let per = t0.per;
+    let mut out: Vec<Vec<f32>> = ts.iter().map(|_| Vec::with_capacity(t0.n.len())).collect();
+    let mut keys: Vec<(f64, usize)> = Vec::new();
+    for (c, k) in t0.n.iter().enumerate() {
+        let value = |t: &Totals, j: usize| t.values.get(c * per + j).copied().unwrap_or(f32::NAN);
+        keys.clear();
+        if *k >= need {
+            keys.extend((0..(*k as usize).min(per)).map(|j| (ts.iter().map(|t| f64::from(value(t, j))).sum(), j)));
+        }
+        let pick = keys.len().checked_sub(1).map(|n| n / 2).map(|m| {
+            let by = |a: &(f64, usize), b: &(f64, usize)| {
+                a.0.total_cmp(&b.0).then_with(|| {
+                    ts.iter().map(|t| value(t, a.1).total_cmp(&value(t, b.1))).find(|o| o.is_ne()).unwrap_or(std::cmp::Ordering::Equal)
+                })
+            };
+            keys.select_nth_unstable_by(m, by).1.1
+        });
+        for (o, t) in out.iter_mut().zip(ts) {
+            o.push(pick.map_or(f32::NAN, |j| value(t, j)));
+        }
+    }
+    out
 }
 
 /// The most cells × classes the groups being read count at once: [`MAX_VALUES`], or for frequency,
@@ -2000,6 +2110,13 @@ pub fn reduce_start(s: &mut Session, p: &Value) -> Result<ReduceRun, String> {
     let merged = super::cube_catalog::with_entry(p)?;
     let p: &Value = &merged;
     let stat = Stat::parse(p)?;
+    // Several bands keep a cell's bands together: from the same dates (mean), or one date's.
+    if p.get("assets").is_some_and(|a| !a.is_null()) && !matches!(stat, Stat::Mean | Stat::Median | Stat::First) {
+        return Err(format!(
+            "assets takes mean, median or first, which keep each cell's bands of the same dates, not {}: give one \"asset\" for it",
+            stat.code()
+        ));
+    }
     let min_share = min_share(p)?;
     let by = match ps(p, "by").map(str::trim) {
         None | Some("") => By::All,

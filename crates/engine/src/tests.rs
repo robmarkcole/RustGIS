@@ -41,6 +41,9 @@ mod cancellation;
 #[cfg(not(target_arch = "wasm32"))]
 #[path = "tests/cube_mask.rs"]
 mod cube_mask;
+#[cfg(not(target_arch = "wasm32"))]
+#[path = "tests/cube_rgb.rs"]
+mod cube_rgb;
 
 #[path = "tests/permission_policy.rs"]
 mod permission_policy;

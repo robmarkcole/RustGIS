@@ -2329,6 +2329,17 @@ is the data cube summary's only.
   values below). The example below keeps SCL's dark areas (2) and unclassified pixels (7), which a
   hilly area needs (they can hold shadows or low cloud): drop them for a stricter mask.
 
+- **Several bands:** `"assets": ["B04", "B03", "B02"]` (instead of `"asset"`) reads 2 to 16 of a
+  collection's bands from the same items and makes one layer of a band for each, drawn as RGB when
+  there are three. It takes **mean**, **median** and **first**, which keep each cell's bands
+  together: a pixel goes in at a date only with a value in every band (one with a value in only
+  some is left out at that date, and said with how many), so an averaged cell's bands are the mean
+  of the same pixels, first takes all its bands from the
+  same date, and median takes them from one date too, the one whose bands' sum is the middle (the
+  lower of the two middle ones for an even count), not each band's own middle, which can mix dates
+  into a colour no date had. The bands have to be on one grid of pixels (one cell size); a
+  band on another is refused, and an item without all of them is left out and said.
+
 - **Classes:** a series of categorical rasters, such as yearly land-cover maps (MapBiomas, ESA
   WorldCover), is summarised as classes with eight more statistics:
   - **mode**, each cell's most frequent class, the least of those tied (`"majority"` too);
@@ -2381,6 +2392,7 @@ rustgis-cli run --cmd 'cube.reduce={"layers":["ndvi_2015","ndvi_2016","ndvi_2017
 rustgis-cli run --data cobertura_1985.tif --data cobertura_1986.tif --data cobertura_1987.tif --cmd 'cube.reduce={"layers":["cobertura_1985","cobertura_1986","cobertura_1987"],"stat":"changes"}'
 rustgis-cli run --cmd 'cube.reduce={"url":"https://data.inpe.br/bdc/stac/v1","collection":"mod13q1-6.1","asset":"NDVI","bbox":[-44.8,-7.5,-44.3,-7.0],"start":"2001","end":"2025","cellSize":1000,"stat":"mean","by":"year","minValid":0.5,"name":"NDVI"}' --save urucui.rgis
 rustgis-cli run --cmd 'cube.reduce={"url":"https://data.inpe.br/bdc/stac/v1","collection":"S2-16D-2","asset":"B04","mask":{"asset":"SCL","keep":[2,4,5,6,7]},"bbox":[-43.003,-20.838,-42.754,-20.655],"start":"2025-06-01","end":"2025-08-31","stat":"first","name":"B04 cloud-free"}' --save vicosa.rgis
+rustgis-cli run --cmd 'cube.reduce={"url":"https://data.inpe.br/bdc/stac/v1","collection":"S2-16D-2","assets":["B04","B03","B02"],"mask":{"asset":"SCL","keep":[2,4,5,6,7]},"bbox":[-43.003,-20.838,-42.754,-20.655],"start":"2025-06-01","end":"2025-08-31","stat":"median","name":"RGB cloud-free"}' --save vicosa_rgb.rgis
 ```
 
 ## Categorical raster area by zone
