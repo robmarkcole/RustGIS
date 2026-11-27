@@ -126,7 +126,9 @@ pub(crate) fn reload_workspace(cache: &Path) -> std::io::Result<std::sync::Arc<R
 }
 
 /// Runs a program, reading its output as it comes (so a chatty one can't block on a full pipe) and
-/// killing it if it runs past `timeout`. `what` names it in the timeout error.
+/// killing it if it runs past `timeout` or its run is cancelled ([`crate::progress`], which
+/// [`crate::DataError`] reports as `Cancelled`). `what` names it in the timeout error. Each of its two
+/// outputs keeps its first 64 MiB; the rest is read and dropped.
 pub(crate) fn output(c: Command, timeout: std::time::Duration, what: &str) -> std::io::Result<std::process::Output> {
     output_with_budget(c, timeout, what, None)
 }
@@ -161,6 +163,9 @@ pub(crate) fn output_with_budget(
     run(c, timeout, what, workspace, None)
 }
 
+/// The most of a program's standard output, and of its standard error, that is kept.
+const PIPE_LIMIT: u64 = 64 << 20;
+
 fn run(
     mut c: Command,
     timeout: std::time::Duration,
@@ -192,11 +197,14 @@ fn run(
             return Err(e);
         }
     }
+    // Keeps the first `PIPE_LIMIT` bytes and reads the rest into the void, so a program that prints
+    // without end can't fill the memory, and can't block on a full pipe either.
     let drain = |p: Option<Box<dyn Read + Send>>| {
         std::thread::Builder::new().spawn(move || {
             let mut buf = Vec::new();
             if let Some(mut p) = p {
-                let _ = p.read_to_end(&mut buf);
+                let _ = p.by_ref().take(PIPE_LIMIT).read_to_end(&mut buf);
+                let _ = std::io::copy(&mut p, &mut std::io::sink());
             }
             buf
         })
@@ -218,6 +226,10 @@ fn run(
             && let Err(e) = check_workspace(dir, max, what)
         {
             break Err(e);
+        }
+        // Cancel: the program is killed below, as for a timeout, and the run ends as cancelled.
+        if let Err(e) = crate::progress::check() {
+            break Err(std::io::Error::other(e));
         }
         match child.try_wait() {
             Ok(Some(st)) => {
@@ -556,5 +568,45 @@ mod tests {
         std::fs::write(outside.path().join("unrelated"), [0; 129]).unwrap();
         std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).unwrap();
         assert!(check_workspace(dir.path(), 0, "GDAL").is_ok());
+    }
+
+    /// Cancel ends the program at the next 50 ms look, not at the timeout, and says so as `Cancelled`.
+    #[cfg(unix)]
+    #[test]
+    fn a_cancelled_run_kills_the_program() {
+        use crate::progress::{self, tests::Counted};
+        use std::sync::{Arc, atomic::Ordering};
+        for budgeted in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let probe = Arc::new(Counted { after_checks: Some(3), ..Default::default() });
+            let _guard = progress::install(Some(probe.clone()));
+            let mut c = Command::new("sleep");
+            c.arg("60");
+            let start = std::time::Instant::now();
+            let workspace = budgeted.then_some((dir.path(), 1024));
+            let e = output_with_budget(c, std::time::Duration::from_secs(120), "sleep", workspace).unwrap_err();
+            assert!(matches!(crate::DataError::from(e), crate::DataError::Cancelled));
+            assert!(start.elapsed() < std::time::Duration::from_secs(10), "the program was killed when cancelled, not at its timeout");
+            assert!(probe.checks.load(Ordering::Relaxed) >= 4, "the loop asked at each poll");
+        }
+        let out = output(Command::new("true"), std::time::Duration::from_secs(60), "true").unwrap();
+        assert!(out.status.success(), "without a probe a program only runs");
+    }
+
+    /// A program that prints more than the limit keeps the start of it and still finishes: its
+    /// pipes are read to the end.
+    #[cfg(unix)]
+    #[test]
+    fn output_past_the_limit_is_dropped_and_the_program_finishes() {
+        let mut c = Command::new("/bin/sh");
+        c.args(["-c", "head -c 100000000 /dev/zero; head -c 70000000 /dev/zero >&2; echo done >&2"]);
+        let out = output(c, std::time::Duration::from_secs(120), "printer").unwrap();
+        assert!(out.status.success());
+        assert_eq!(out.stdout.len() as u64, PIPE_LIMIT);
+        assert_eq!(out.stderr.len() as u64, PIPE_LIMIT, "the limit is per pipe");
+        let mut c = Command::new("/bin/sh");
+        c.args(["-c", "echo small; echo oops >&2"]);
+        let out = output(c, std::time::Duration::from_secs(60), "printer").unwrap();
+        assert_eq!((out.stdout.as_slice(), out.stderr.as_slice()), (&b"small\n"[..], &b"oops\n"[..]));
     }
 }
