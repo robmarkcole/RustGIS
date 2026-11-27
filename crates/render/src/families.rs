@@ -82,6 +82,7 @@ pub fn warm_up() {
     if WARMING.swap(true, Ordering::Relaxed) {
         return;
     }
+    crate::fonts::enable_async_cjk_scan();
     #[cfg(not(target_arch = "wasm32"))]
     if std::thread::Builder::new()
         .name("font-index".into())
@@ -201,9 +202,14 @@ fn font_dirs() -> Vec<PathBuf> {
     } else if cfg!(target_os = "android") {
         // Android's app home has no system fonts; manufacturer faces can live on /product.
         dirs.extend(crate::fonts::ANDROID_FONT_DIRS.iter().map(PathBuf::from));
+    } else if cfg!(target_os = "linux") {
+        dirs.extend(crate::fonts::linux_font_roots_with(
+            std::env::var_os("XDG_DATA_HOME").as_deref(),
+            home.as_deref().map(Path::as_os_str),
+        ));
     } else {
         dirs.extend(["/usr/share/fonts", "/usr/local/share/fonts"].map(PathBuf::from));
-        match std::env::var_os("XDG_DATA_HOME") {
+        match std::env::var_os("XDG_DATA_HOME").filter(|v| crate::fonts::is_posix_absolute(v)) {
             Some(d) => dirs.push(PathBuf::from(d).join("fonts")),
             None => dirs.extend(home.iter().map(|h| h.join(".local").join("share").join("fonts"))),
         }
@@ -517,5 +523,29 @@ mod tests {
         // A name table whose records point past its end.
         let table = [0u8, 0, 0, 1, 0, 18, 0, 3, 0, 1, 4, 9, 0, 1, 0xff, 0xff, 0, 0];
         assert_eq!(name(&table, 1), None);
+    }
+
+    #[test]
+    fn linux_font_roots_include_flatpak_host_and_xdg_roots() {
+        use std::ffi::OsStr;
+
+        let dirs = crate::fonts::linux_font_roots_with(Some(OsStr::new("/xdg/data")), Some(OsStr::new("/home/alice")));
+        assert_eq!(
+            dirs,
+            vec![
+                PathBuf::from("/usr/share/fonts"),
+                PathBuf::from("/usr/local/share/fonts"),
+                PathBuf::from("/run/host/fonts"),
+                PathBuf::from("/run/host/local-fonts"),
+                PathBuf::from("/run/host/user-fonts"),
+                PathBuf::from("/xdg/data/fonts"),
+                PathBuf::from("/home/alice/.fonts"),
+            ]
+        );
+        let fallback = crate::fonts::linux_font_roots_with(None, Some(OsStr::new("/home/alice")));
+        assert!(fallback.contains(&PathBuf::from("/home/alice/.local/share/fonts")));
+
+        let deduped = crate::fonts::linux_font_roots_with(Some(OsStr::new("/usr/share")), Some(OsStr::new("/home/alice")));
+        assert_eq!(deduped.iter().filter(|p| *p == &PathBuf::from("/usr/share/fonts")).count(), 1);
     }
 }

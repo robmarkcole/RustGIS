@@ -174,7 +174,13 @@ fn installed_cjk(region: CjkRegion) -> Option<&'static FontRef<'static>> {
     if none_installed {
         None
     } else {
-        FACES.get(cjk_slot(region))?.get_or_init(|| crate::fonts::cjk_font(region).and_then(parse_cjk)).as_ref()
+        // Once a face is parsed it is cached. Until then a temporary `None` (the Linux CJK root
+        // scan running in the background) is not cached, so the lookup runs again on the next call.
+        if let Some(face) = FACES.get(cjk_slot(region)).and_then(OnceLock::get) {
+            return face.as_ref();
+        }
+        let data = crate::fonts::cjk_font(region)?;
+        FACES.get(cjk_slot(region))?.get_or_init(|| parse_cjk(data)).as_ref()
     }
 }
 

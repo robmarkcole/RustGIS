@@ -64588,3 +64588,90 @@ fn a_transparency_reads_back_without_float_noise() {
     assert_eq!(crate::cmd::project::percent(33.3), json!(33.3));
     assert_eq!(crate::cmd::project::percent(0.0), json!(0.0));
 }
+
+/// Headless sessions emit the CJK font-folder scan notice once through `Session::run` when a
+/// fallback scan was lossy, stay silent when clean, and leave the summary untouched across every
+/// `Session::new` copy once a UI shell claims process-wide ownership for translation.
+#[test]
+fn headless_session_run_emits_cjk_scan_notice_only_when_lossy() {
+    use rustgis_render::fonts::CjkRootScanSummary;
+
+    struct SummaryGuard;
+    impl SummaryGuard {
+        fn set(summary: Option<CjkRootScanSummary>) -> Self {
+            crate::TEST_CJK_SCAN_SUMMARY.with_borrow_mut(|slot| *slot = Some(summary));
+            Self
+        }
+    }
+    impl Drop for SummaryGuard {
+        fn drop(&mut self) {
+            crate::TEST_CJK_SCAN_SUMMARY.with_borrow_mut(|slot| *slot = None);
+        }
+    }
+
+    struct UiNoticeGuard;
+    impl UiNoticeGuard {
+        fn set(value: bool) -> Self {
+            crate::TEST_UI_OWNS_CJK_SCAN_NOTICE.set(Some(value));
+            Self
+        }
+    }
+    impl Drop for UiNoticeGuard {
+        fn drop(&mut self) {
+            crate::TEST_UI_OWNS_CJK_SCAN_NOTICE.set(None);
+        }
+    }
+
+    let lossy = CjkRootScanSummary {
+        truncated_dirs: 2,
+        unreadable_dirs: 1,
+        entry_errors: 0,
+        thread_spawn_failed: false,
+        sample_path: Some(std::path::PathBuf::from("/run/host/fonts")),
+    };
+
+    // Lossy summary on a headless session emits one English notice and consumes it; clean/absent stay silent.
+    {
+        let _ui_guard = UiNoticeGuard::set(false);
+        assert!(!crate::ui_owns_cjk_scan_notice());
+        let mut headless = Session::new(Project::default());
+        {
+            let _guard = SummaryGuard::set(Some(lossy.clone()));
+            let mark = headless.notice_mark();
+            headless.run("connection.list", &Value::Null).unwrap();
+            let notices = headless.notices_since(mark);
+            assert_eq!(notices.len(), 1, "{notices:?}");
+            assert!(!notices[0].error);
+            assert!(notices[0].text.contains("CJK font folder search stopped early"), "{}", notices[0].text);
+            assert!(notices[0].text.contains("2 folder(s) reached the scan limit"), "{}", notices[0].text);
+            assert!(notices[0].text.contains("1 unreadable folder(s)"), "{}", notices[0].text);
+            assert!(notices[0].text.contains("/run/host/fonts"), "{}", notices[0].text);
+
+            // One-shot: a subsequent command emits nothing.
+            let mark2 = headless.notice_mark();
+            headless.run("connection.list", &Value::Null).unwrap();
+            assert!(headless.notices_since(mark2).is_empty(), "{:?}", headless.notices_since(mark2));
+        }
+
+        for clean in [Some(CjkRootScanSummary::default()), None] {
+            let _guard = SummaryGuard::set(clean);
+            let mark = headless.notice_mark();
+            headless.run("connection.list", &Value::Null).unwrap();
+            assert!(headless.notices_since(mark).is_empty(), "clean scan must stay silent: {:?}", headless.notices_since(mark));
+        }
+    }
+
+    // Once a UI front end claims process-wide ownership, even a separate temporary Session::new
+    // copy leaves the summary untouched inside Session::run so ui-egui can translate it.
+    crate::claim_ui_cjk_scan_notice();
+    assert!(crate::ui_owns_cjk_scan_notice());
+    let mut copy = Session::new(Project::default());
+    {
+        let _guard = SummaryGuard::set(Some(lossy));
+        let mark = copy.notice_mark();
+        copy.run("connection.list", &Value::Null).unwrap();
+        assert!(copy.notices_since(mark).is_empty(), "{:?}", copy.notices_since(mark));
+        let still_pending = crate::TEST_CJK_SCAN_SUMMARY.with_borrow(|slot| slot.as_ref().and_then(Option::as_ref).is_some());
+        assert!(still_pending, "copy session must not consume the CJK scan summary once UI owns it");
+    }
+}
