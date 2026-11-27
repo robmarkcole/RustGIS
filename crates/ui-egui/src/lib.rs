@@ -1672,6 +1672,38 @@ impl RustGisApp {
         }
     }
 
+    /// The file name Export Features and Export Table (`table`) suggest for layer or table `id`.
+    fn export_file_name(&self, id: u32, ext: &str, table: bool, annotation: bool) -> Result<String, String> {
+        if !table {
+            return annotation::export_name(self, id, ext, annotation);
+        }
+        Ok(self.session.project.table(id).map(|t| format!("{}.{ext}", t.dataset.name)).unwrap_or_default())
+    }
+
+    /// The standalone table `ui.exportTable` acts on: the one `p` names, refused when it no longer
+    /// has the contents `"instance"` names (those Export Table was opened on), else the one in the
+    /// attribute table.
+    fn export_table_target(&self, p: &Value) -> Result<u32, String> {
+        let gone = || tl!("the table Export Table was opened on is gone").to_string();
+        if p.get("table").is_none_or(Value::is_null) {
+            return self
+                .session
+                .table_standalone
+                .filter(|&id| self.session.project.table(id).is_some())
+                .ok_or_else(|| tl!("open a standalone table first").to_string());
+        }
+        let i = self.session.table_index(p)?;
+        let t = self.session.project.tables.get(i).ok_or_else(gone)?;
+        match p.get("instance") {
+            None | Some(Value::Null) => Ok(t.id),
+            Some(v) => match v.as_u64() {
+                Some(instance) if instance == t.instance_id() => Ok(t.id),
+                Some(_) => Err(gone()),
+                None => Err(crate::i18n::fmt("\"instance\" must be a table's instance number, not {value}", &[("value", &v.to_string())])),
+            },
+        }
+    }
+
     /// The Ctrl (⌘) shortcuts the keymap takes, as (Alt, Shift, key), the clipboard's left out:
     /// in a browser, what the web app keeps from the browser's own shortcuts (⌘D bookmarking
     /// the page, ⌘Y opening its history, ⌘= zooming it), as design tools in the browser do.
@@ -5636,31 +5668,54 @@ impl RustGisApp {
             "ui.exportLayer" if p.get("format").and_then(Value::as_str).is_none() => {
                 self.dialogs.open("exportLayer", &self.session)?;
             }
-            "ui.exportLayer" | "ui.annotationExport" if self.services.download.is_some() => {
+            // Without a format, the Export Table dialog asks for one, opened on the table named,
+            // else the one in the attribute table, else the last added.
+            "ui.exportTable" if p.get("format").and_then(Value::as_str).is_none() => {
+                let tables = &self.session.project.tables;
+                let id = match self.export_table_target(p) {
+                    Err(_) if p.get("table").is_none_or(Value::is_null) => {
+                        tables.last().map(|t| t.id).ok_or_else(|| tl!("the project has no standalone tables").to_string())?
+                    }
+                    target => target?,
+                };
+                self.dialogs.open_on_table("exportTable", &self.session, id)?;
+            }
+            "ui.exportLayer" | "ui.annotationExport" | "ui.exportTable" if self.services.download.is_some() => {
                 let annotation_export = id == "ui.annotationExport";
-                let id = self.export_target(p)?;
-                let construction_notes = self.session.layer_construction_output_notes(id)?;
-                let l = self.session.map().layer(id).ok_or_else(|| tl!("select a layer in the Layers pane first").to_string())?;
+                let table = id == "ui.exportTable";
+                let id = if table { self.export_table_target(p)? } else { self.export_target(p)? };
+                let construction_notes = if table { Default::default() } else { self.session.layer_construction_output_notes(id)? };
                 // Any format the dialog offers here (`dialogs::export_formats`): not GeoPackage or
                 // FlatGeobuf, which the data crate refuses in the browser.
                 let ext = p.get("format").and_then(Value::as_str).unwrap_or("geojson").to_ascii_lowercase();
                 let download_ext = if ext == "shp" { "zip".to_string() } else { ext.clone() };
-                let name = annotation::export_name(self, id, &download_ext, annotation_export)?;
+                let name = self.export_file_name(id, &download_ext, table, annotation_export)?;
                 rustgis_engine::cmd::share::gpkg_table(p, &ext)?;
-                // A streamed layer exports its whole source, not the features read for the view.
                 use std::borrow::Cow;
-                let (mut ds, lost) = if l.is_streamed() {
-                    let (dataset, lost) = l.load_all_counted()?;
-                    (Cow::Owned(dataset), lost)
+                let (mut ds, lost, query, source_name) = if table {
+                    let t =
+                        self.session.project.table(id).ok_or_else(|| tl!("the table Export Table was opened on is gone").to_string())?;
+                    (Cow::Borrowed(&t.dataset), Default::default(), None, t.dataset.name.clone())
                 } else {
-                    (Cow::Borrowed(&l.dataset), Default::default())
+                    let l = self.session.map().layer(id).ok_or_else(|| tl!("select a layer in the Layers pane first").to_string())?;
+                    // A streamed layer exports its whole source, not the features read for the view.
+                    let (ds, lost) = if l.is_streamed() {
+                        let (dataset, lost) = l.load_all_counted()?;
+                        (Cow::Owned(dataset), lost)
+                    } else {
+                        (Cow::Borrowed(&l.dataset), Default::default())
+                    };
+                    (ds, lost, l.definition_query.as_deref(), l.name.clone())
                 };
-                let query_report =
-                    rustgis_engine::data::export::filter_dataset(&mut ds, l.definition_query.as_deref()).map_err(|e| e.to_string())?;
-                let layer_name = l.name.clone();
-                // In the layer's own coordinate system, as share.exportLayer writes a file.
+                let query_report = rustgis_engine::data::export::filter_dataset(&mut ds, query).map_err(|e| e.to_string())?;
+                // A layer in its own coordinate system, as share.exportLayer writes a file; a table
+                // in longitude/latitude, as share.exportTable does.
                 use rustgis_engine::data::io;
-                let (crs, default_note) = io::default_export_in(&ds, &name, self.session.project.coordinate_system);
+                let (crs, default_note) = if table {
+                    (rustgis_engine::data::raster::Crs::LonLat, None)
+                } else {
+                    io::default_export_in(&ds, &name, self.session.project.coordinate_system)
+                };
                 let written = io::write_bytes_noted(&ds, &ext, crs, &name).map_err(|e| e.to_string());
                 let (bytes, left_out, unplaced, extent) = match written {
                     Ok(w) => w,
@@ -5692,7 +5747,7 @@ impl RustGisApp {
                 if lost.rows > 0 {
                     dbf_notes.push(rustgis_engine::cmd::whole::unread_note(&name, lost.rows));
                 }
-                dbf_notes.extend(rustgis_engine::cmd::share::read_notes(&name, &l.name, &lost));
+                dbf_notes.extend(rustgis_engine::cmd::share::read_notes(&name, &source_name, &lost));
                 // CSV holds a point a row, GPX a name for each feature and no areas; reading text back, CSV reads blanks as null and KML and GPX trim it.
                 dbf_notes.extend(io::export_losses_notes(&ds, &ext, io::name_field(&ds), &name).map_err(|e| e.to_string())?);
                 // NaN and infinities, which GeoJSON can't hold, written as null.
@@ -5707,7 +5762,7 @@ impl RustGisApp {
                     ));
                 }
                 if self.download(&name, bytes) {
-                    rustgis_engine::cmd::share::notify_export_query(&mut self.session, &name, &layer_name, &query_report);
+                    rustgis_engine::cmd::share::notify_export_query(&mut self.session, &name, &source_name, &query_report);
                     rustgis_engine::cmd::share::notify_null_numbers(&mut self.session, &name, null_numbers);
                     for note in notes.into_iter().chain(dbf_notes).chain(construction_notes) {
                         self.session.say(note);
@@ -5797,8 +5852,10 @@ impl RustGisApp {
                     return self.run("share.exportMap", args);
                 }
             }
-            "ui.exportLayer" | "ui.annotationExport" => {
+            "ui.exportLayer" | "ui.annotationExport" | "ui.exportTable" => {
                 let annotation_export = id == "ui.annotationExport";
+                let table = id == "ui.exportTable";
+                let (command, target_key) = if table { ("share.exportTable", "table") } else { ("share.exportLayer", "layer") };
                 let ext = p.get("format").and_then(Value::as_str).unwrap_or("geojson").to_ascii_lowercase();
                 let label = dialogs::EXPORT_FORMATS
                     .iter()
@@ -5808,9 +5865,11 @@ impl RustGisApp {
                 // Into a GeoPackage that exists: picked to open, as it is kept, not replaced.
                 // Checked as the command checks them, before a file is asked for; then passed on.
                 let gpkg = rustgis_engine::cmd::share::gpkg_table(p, &ext)?;
-                let id = self.export_target(p)?;
-                let name = annotation::export_name(self, id, &ext, annotation_export)?;
-                let with_table = |mut args: Value| {
+                let id = if table { self.export_table_target(p)? } else { self.export_target(p)? };
+                let name = self.export_file_name(id, &ext, table, annotation_export)?;
+                let arguments = |path: String| {
+                    let mut args = json!({"path": path});
+                    args[target_key] = json!(id);
                     for key in ["mode", "tableName"] {
                         if let Some(v) = p.get(key) {
                             args[key] = v.clone();
@@ -5820,11 +5879,11 @@ impl RustGisApp {
                 };
                 if gpkg.mode != rustgis_engine::data::io::GpkgMode::NewFile {
                     if let Some(path) = dialogs::pick_open(&["gpkg"], label) {
-                        let args = with_table(json!({"layer": id, "path": path}));
+                        let args = arguments(path);
                         #[cfg(not(target_arch = "wasm32"))]
-                        return exportjob::start(self, "share.exportLayer", args);
+                        return exportjob::start(self, command, args);
                         #[cfg(target_arch = "wasm32")]
-                        return self.run("share.exportLayer", args);
+                        return self.run(command, args);
                     }
                     return Ok(Value::Null);
                 }
@@ -5834,11 +5893,11 @@ impl RustGisApp {
                     let typed = std::path::Path::new(&path).extension().is_some_and(|e| e.eq_ignore_ascii_case(&ext));
                     let path = if typed { path } else { format!("{path}.{ext}") };
                     // Written on a thread of its own, with progress and Cancel in the status bar.
-                    let args = with_table(json!({"layer": id, "path": path}));
+                    let args = arguments(path);
                     #[cfg(not(target_arch = "wasm32"))]
-                    return exportjob::start(self, "share.exportLayer", args);
+                    return exportjob::start(self, command, args);
                     #[cfg(target_arch = "wasm32")]
-                    return self.run("share.exportLayer", args);
+                    return self.run(command, args);
                 }
             }
             // Add Zarr Variable, connected to a store (a link, a script).
@@ -9881,6 +9940,83 @@ mod download_service_tests {
                 );
             }
         }
+    }
+
+    /// The web Export Table downloads a standalone table and says what the file lost, once the
+    /// browser takes it: nothing for a clean table, a refused download, or contents that are gone.
+    #[test]
+    fn table_download_writes_the_table_and_says_what_is_lost() {
+        use rustgis_engine::data::{Dataset, Field, FieldType, Geometry, GeometryType, Value, loss::LossCode};
+        use rustgis_engine::geom::Coord;
+        let taken: std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>> = Default::default();
+        let with = |accept: bool| {
+            let taken = taken.clone();
+            let mut app = RustGisApp::with_sample().with_services(Services {
+                download: Some(Box::new(move |name, bytes| {
+                    if !accept {
+                        return Err("browser rejected download".into());
+                    }
+                    taken.lock().unwrap().push((name.to_string(), bytes));
+                    Ok(())
+                })),
+                ..Default::default()
+            });
+            for (name, level) in [("Totals", 2.5), ("Gaps", f64::NAN)] {
+                let mut ds = Dataset::new(name, GeometryType::None, vec![Field::new("level", FieldType::Double)]);
+                ds.push(None, vec![Value::Float(level)]);
+                app.session.project.add_table(ds);
+            }
+            let mut ds = Dataset::new("Sites", GeometryType::Point, vec![Field::new("population_2020", FieldType::Integer)]);
+            ds.push(Some(Geometry::Point(Coord::new(1.0, 2.0))), vec![Value::Int(7)]);
+            app.session.project.add_table(ds);
+            app
+        };
+        let mut app = with(true);
+        // What an export says besides that the download was offered.
+        let export = |app: &mut RustGisApp, table: &str, format: &str| {
+            let mark = app.session.notice_mark();
+            app.run("ui.exportTable", json!({"table": table, "format": format})).unwrap();
+            app.session
+                .notices_since(mark)
+                .iter()
+                .filter(|n| !n.text.starts_with("Download offered"))
+                .map(|n| (n.loss(), n.text.clone()))
+                .collect::<Vec<_>>()
+        };
+        for format in ["csv", "geojson", "parquet"] {
+            assert_eq!(export(&mut app, "Totals", format), [], "{format}");
+            let (name, bytes) = taken.lock().unwrap().pop().unwrap();
+            assert_eq!(name, format!("Totals.{format}"));
+            if format == "csv" {
+                assert_eq!(String::from_utf8(bytes).unwrap(), "level\n2.5\n");
+            }
+        }
+        let said = export(&mut app, "Gaps", "geojson");
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert_eq!(said[0].0, Some(LossCode::DroppedValue));
+        assert!(said[0].1.starts_with("Gaps.geojson: 1 attribute value(s)"), "{said:?}");
+        let said = export(&mut app, "Sites", "shp");
+        assert!(said.len() == 1 && said[0].1.contains("'population_2020' → 'population'"), "{said:?}");
+        assert_eq!(taken.lock().unwrap().pop().unwrap().0, "Sites.zip");
+        // Nothing the browser can't write, and no empty Shapefile: refused, nothing downloaded.
+        for (table, format) in [("Totals", "gpkg"), ("Totals", "fgb"), ("Totals", "shp")] {
+            taken.lock().unwrap().clear();
+            assert!(app.run("ui.exportTable", json!({"table": table, "format": format})).is_err(), "{table}.{format}");
+            assert!(taken.lock().unwrap().is_empty(), "{table}.{format}");
+        }
+        // Contents other than those the dialog was opened on, and no table at all.
+        let e = app.run("ui.exportTable", json!({"table": "Totals", "format": "csv", "instance": 0})).unwrap_err();
+        assert!(e.contains("is gone"), "{e}");
+        assert!(app.run("ui.exportTable", json!({"format": "csv"})).unwrap_err().contains("open a standalone table"));
+        assert!(taken.lock().unwrap().is_empty());
+        // The table in the attribute table, when none is named.
+        app.session.table_standalone = app.session.project.tables.first().map(|t| t.id);
+        app.run("ui.exportTable", json!({"format": "csv"})).unwrap();
+        assert_eq!(taken.lock().unwrap().pop().unwrap().0, "Totals.csv");
+        let mut refused = with(false);
+        let _ = refused.run("ui.exportTable", json!({"table": "Gaps", "format": "geojson"}));
+        assert!(refused.session.notices.iter().any(|n| n.error && n.text.contains("browser rejected download")));
+        assert!(!refused.session.notices.iter().any(|n| n.text.contains("written as null")), "nothing was downloaded");
     }
 
     /// The web download says the numbers GeoJSON can't hold, written as null, with their code, once

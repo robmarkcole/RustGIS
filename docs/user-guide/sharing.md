@@ -74,10 +74,15 @@ A feature with a place that can't be given in the system written (one far past w
 layer's own system reaches, exported in WGS 84) is written without its geometry, and the export
 says how many; a format that holds only features with geometry leaves it out. Copy, Data
 Interop, the shared web map, web layer, geodata service and locator, 3D files and the mobile
-map package do the same. The web app downloads every format but GeoPackage and FlatGeobuf. `share.exportTable` exports a
-standalone table. **Data › Export** also writes rasters to GeoTIFF, and **Data Interop** converts layers to
-KML, GPX or CSV with WKT. Layouts, reports and presentations export from their own tabs and panes
-(see [Layouts and Reports](layouts.md)).
+map package do the same. The web app downloads every format but GeoPackage and FlatGeobuf. **Data › Export** also writes
+rasters to GeoTIFF, and **Data Interop** converts layers to KML, GPX or CSV with WKT. Layouts, reports and
+presentations export from their own tabs and panes (see [Layouts and Reports](layouts.md)).
+
+To export a standalone table, such as a Summary Statistics result, right-click it in the Layers pane and
+choose **Export Table…**, or run **Export Table** from Command Search and pick the table. The dialog offers
+the formats above that can hold it: for a table without geometry, CSV, GeoJSON, GeoPackage and GeoParquet
+(no GeoPackage in the web app, which downloads the file). Scripts and the command line use
+`share.exportTable`.
 
 To export the largest rows of a Summary Statistics result, give `share.exportTable` an optional
 `sort` list and `limit`. Each sort key names a stored field; `descending` defaults to `false`.
@@ -112,7 +117,7 @@ its own view is still loading: it waits for the map to move there, without progr
 
 A GeoPackage export writes a new file by default, and refuses an existing `.gpkg` to protect its
 tables, even if the save dialog offers to replace the file. To put the layer into an existing
-GeoPackage instead, choose GeoPackage in **Export Features**, then under **Into** either
+GeoPackage instead, choose GeoPackage in **Export Features** (or **Export Table**), then under **Into** either
 **A new table in a GeoPackage** or **A table replaced in a GeoPackage**, name the table, and
 pick the file (on the desktop). The GeoPackage's other tables stay as they were: one table is
 added, or one feature or attribute table of that name is replaced (a feature table with its

@@ -930,6 +930,10 @@ fn contents(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                             let _ = app.run("ui.gp.open", json!({"tool": "xyTableToPoint", "table": id}));
                             ui.close();
                         }
+                        if ui.button(tl!("Export Table…")).clicked() {
+                            let _ = app.run("ui.exportTable", json!({"table": id}));
+                            ui.close();
+                        }
                         // Names can repeat: the id says which table. A view open on it closes itself.
                         if ui.button(tl!("Remove")).clicked() {
                             let _ = app.run("table.remove", json!({"table": id}));
@@ -8864,6 +8868,63 @@ pub(crate) mod tests {
         crate::click_in_one_frame(&mut h, at, 0.7);
         h.run_steps(3);
         assert_eq!(h.state().ui.right, Some(RightPane::Symbology));
+    }
+
+    /// A standalone table's menu opens Export Table on it, which offers the formats that hold a
+    /// table without geometry and writes the one picked on the export thread.
+    #[test]
+    fn a_standalone_tables_menu_exports_it() {
+        use egui_kittest::kittest::Queryable;
+        use rustgis_engine::data::{Dataset, Field, FieldType, GeometryType, Value as Cell};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("totals.csv");
+        let mut app = RustGisApp::with_sample();
+        let mut ds = Dataset::new("zone_totals", GeometryType::None, vec![Field::new("total", FieldType::Integer)]);
+        ds.push(None, vec![Cell::Int(42)]);
+        let table = app.session.project.add_table(ds);
+        // Added later: the menu's table is the one written, not the last.
+        app.session.project.add_table(Dataset::new("other", GeometryType::None, vec![]));
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).with_max_steps(64).build_ui_state(
+            |ui, app: &mut RustGisApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            app,
+        );
+        h.run_steps(6);
+        h.get_by_label("zone_totals").click_secondary();
+        h.run_steps(2);
+        h.get_by_label("Export Table…").click();
+        h.run_steps(4);
+        assert_eq!(h.state().dialogs.open, Some("exportTable"));
+        assert_eq!(h.state().dialogs.export_table.map(|(id, _)| id), Some(table));
+        h.get_by_label("Format").click();
+        h.run_steps(4);
+        for (label, offered) in [
+            ("GeoJSON", true),
+            ("GeoPackage", true),
+            ("GeoParquet", true),
+            ("Shapefile", false),
+            ("FlatGeobuf", false),
+            ("KML", false),
+            ("KMZ", false),
+            ("GPX", false),
+        ] {
+            assert_eq!(h.query_all_by_label(label).count() > 0, offered, "{label}");
+        }
+        h.key_press(egui::Key::Escape);
+        h.run_steps(4);
+        crate::dialogs::PICKED.with(|p| *p.borrow_mut() = Some(path.display().to_string()));
+        h.get_by_label("Export…").click();
+        h.run_steps(2);
+        assert_eq!(h.state().dialogs.open, None);
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while crate::exportjob::land(h.state_mut()) {
+            assert!(std::time::Instant::now() < end, "the export never landed");
+            std::thread::sleep(std::time::Duration::from_millis(10)); // test-wait: polls for the export thread's file
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "total\n42\n");
     }
 
     /// #808: a web tile layer is listed at its place among the map's layers, moves past them

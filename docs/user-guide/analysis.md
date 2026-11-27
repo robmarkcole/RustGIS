@@ -157,8 +157,9 @@ match ignoring case; an ambiguous name is refused. When two keys reach the same 
 names the key left out.
 
 A table's rows live in the project, as they were copied in when it was added: edits change the
-project, not the CSV or other file the table came from. **Export Table** (`share.exportTable`)
-writes the edited table to a file. Tables have no selection yet, so rows can't be deleted.
+project, not the CSV or other file the table came from. **Export Table** writes the edited table
+to a file: right-click the table in the Layers pane, or search for it in Command Search (scripts
+use `share.exportTable`). Tables have no selection yet, so rows can't be deleted.
 
 ```text
 edit.setValue={"table":"sites","row":0,"field":"street","value":"Rue Cler"}

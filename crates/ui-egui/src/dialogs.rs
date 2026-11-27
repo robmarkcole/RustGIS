@@ -4,6 +4,8 @@
 use egui::{Align2, vec2};
 use rustgis_engine::Session;
 use rustgis_engine::cmd::service_added::Removal;
+use rustgis_engine::data::GeometryType;
+use rustgis_engine::project::Table;
 use rustgis_engine::render::rustgis_tiles::{address::Reach, cache};
 use serde_json::{Value, json};
 use std::collections::hash_map::DefaultHasher;
@@ -101,6 +103,9 @@ pub struct Dialogs {
     /// The layer Export Features was opened on (its id and instance), exported whatever is
     /// selected while the dialog stays open.
     pub export_layer: Option<(u32, u64)>,
+    /// The standalone table picked in Export Table (its id and instance), refused once those
+    /// contents are gone: ids are reused by other projects.
+    pub export_table: Option<(u32, u64)>,
     pub flag: bool,
     pub error: Option<String>,
     pub info: Option<String>,
@@ -151,21 +156,34 @@ pub enum DxfSource {
 }
 
 impl Dialogs {
-    /// Opens Add Field or Calculate Field (`which`) on standalone table `id`.
+    /// Opens Add Field, Calculate Field or Export Table (`which`) on standalone table `id`.
     pub fn open_on_table(&mut self, which: &str, s: &Session, id: u32) -> Result<(), String> {
         // The name kept is a `&'static str`, as `open` keeps it.
         let name: &'static str = match which {
             "addField" => "addField",
             "calculateField" => "calculateField",
+            "exportTable" => "exportTable",
             other => return Err(format!("dialog '{other}' doesn't open on a table")),
         };
-        let dataset = &s.project.table(id).ok_or("no such table")?.dataset;
+        let table = s.project.table(id).ok_or("no such table")?;
         *self = Dialogs { open: Some(name), mode: "new", reset_collapse: true, table: Some((s.opened, id)), ..Dialogs::default() };
         match name {
             "addField" => self.b = "Double".into(),
-            _ => self.a = calculation_fields(dataset).last().map(|f| f.name.clone()).unwrap_or_default(),
+            "exportTable" => {
+                // Every table can be written as CSV.
+                self.mode = "csv";
+                self.gpkg_mode = "newFile";
+                self.pick_export_table(table);
+            }
+            _ => self.a = calculation_fields(&table.dataset).last().map(|f| f.name.clone()).unwrap_or_default(),
         }
         Ok(())
+    }
+
+    /// Makes `table` the one Export Table writes, and names a GeoPackage's table after it.
+    fn pick_export_table(&mut self, table: &Table) {
+        self.export_table = Some((table.id, table.instance_id()));
+        self.text = table.dataset.name.clone();
     }
 
     /// The standalone table the dialog acts on, as `"table"` names it in `p`; refused once another
@@ -418,6 +436,7 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
         "s3Connections" => "Choose S3 connection",
         "zarr" => "Add Zarr Variable",
         "exportLayer" => "Export Features",
+        "exportTable" => "Export Table",
         "saveProject" => "Save Project As",
         "exportOrbit" => "Export Orbit",
         "renameMap" => "Rename Map",
@@ -763,7 +782,8 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
             "s3" => crate::s3ui::dialog(app, ui),
             "s3Connections" => close = crate::connectionui::s3_chooser(app, ui),
             "zarr" => close = crate::zarrui::dialog(app, ui),
-            "exportLayer" => close = export_layer(app, ui),
+            "exportLayer" => close = export_data(app, ui, false),
+            "exportTable" => close = export_data(app, ui, true),
             "camera" => {
                 egui::Grid::new("cam").num_columns(2).spacing(vec2(10.0, 8.0)).show(ui, |ui| {
                     for (label, v) in
@@ -1099,21 +1119,83 @@ pub(crate) fn export_formats(web: bool) -> impl Iterator<Item = &'static (&'stat
     EXPORT_FORMATS.iter().filter(move |(_, e)| !(web && matches!(*e, "gpkg" | "fgb")))
 }
 
-/// Export Features: the active layer, in a format picked here (a file's type isn't changed by
-/// the filter chosen in a save dialog, and the web app has no save dialog).
-fn export_layer(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
+/// The formats Export Table offers: [`export_formats`], less, for a table without geometry,
+/// Shapefile and FlatGeobuf (which refuse it) and KML, KMZ and GPX (whose file would hold none
+/// of its rows).
+pub(crate) fn table_formats(web: bool, geometry: bool) -> impl Iterator<Item = &'static (&'static str, &'static str)> {
+    export_formats(web).filter(move |(_, e)| geometry || !matches!(*e, "shp" | "fgb" | "kml" | "kmz" | "gpx"))
+}
+
+/// Export Table's first row: the standalone table written, picked from the project's. One whose
+/// contents are gone shows none, and is refused on export.
+fn export_table_choice(app: &mut RustGisApp, ui: &mut egui::Ui) {
+    let label = ui.label(tl!("Table"));
+    let picked = app.dialogs.export_table;
+    let is_picked = |t: &Table| picked == Some((t.id, t.instance_id()));
+    let tables = &app.session.project.tables;
+    let shown = tables.iter().find(|t| is_picked(t)).map_or_else(String::new, |t| table_label(tables, t.id));
+    let mut chosen = None;
+    egui::ComboBox::from_id_salt("export_table_choice")
+        .selected_text(shown)
+        .width(220.0)
+        .show_ui(ui, |ui| {
+            for t in tables {
+                if ui.selectable_label(is_picked(t), table_label(tables, t.id)).clicked() {
+                    chosen = Some(t.id);
+                }
+            }
+        })
+        .response
+        .labelled_by(label.id);
+    if let Some(t) = chosen.and_then(|id| app.session.project.table(id)) {
+        app.dialogs.pick_export_table(t);
+    }
+}
+
+/// How Export Table names standalone table `id` among `tables`: its name, and where names repeat
+/// (the project allows it), which of them it is, in the Layers pane's order.
+fn table_label(tables: &[Table], id: u32) -> String {
+    let Some(name) = tables.iter().find(|t| t.id == id).map(|t| t.dataset.name.as_str()) else { return String::new() };
+    let same: Vec<u32> = tables.iter().filter(|t| t.dataset.name == name).map(|t| t.id).collect();
+    match same.iter().position(|&other| other == id) {
+        Some(k) if same.len() > 1 => {
+            crate::i18n::fmt("{name} ({k} of {n})", &[("name", name), ("k", &(k + 1).to_string()), ("n", &same.len().to_string())])
+        }
+        _ => name.to_string(),
+    }
+}
+
+/// Export Features (the active layer) and Export Table (`table`: a standalone table), in a format
+/// picked here (a file's type isn't changed by the filter chosen in a save dialog, and the web
+/// app has no save dialog).
+fn export_data(app: &mut RustGisApp, ui: &mut egui::Ui, table: bool) -> bool {
     let web = app.services.download.is_some();
-    egui::Grid::new("export_layer").num_columns(2).spacing(vec2(10.0, 8.0)).show(ui, |ui| {
-        ui.label(tl!("Layer"));
-        ui.label(&app.dialogs.layer);
+    egui::Grid::new("export_data").num_columns(2).spacing(vec2(10.0, 8.0)).show(ui, |ui| {
+        if table {
+            export_table_choice(app, ui);
+        } else {
+            ui.label(tl!("Layer"));
+            ui.label(&app.dialogs.layer);
+        }
         ui.end_row();
+        let geometry = !table
+            || app
+                .dialogs
+                .export_table
+                .and_then(|(id, _)| app.session.project.table(id))
+                .is_some_and(|t| t.dataset.geometry_type != GeometryType::None);
+        let formats = || table_formats(web, geometry);
+        // Another table picked may not take the format chosen for the last one.
+        if table && !formats().any(|(_, e)| *e == app.dialogs.mode) {
+            app.dialogs.mode = "csv";
+        }
         let input_label = ui.label(tl!("Format"));
         let shown = EXPORT_FORMATS.iter().find(|(_, e)| *e == app.dialogs.mode).map(|(l, _)| *l).unwrap_or("GeoJSON");
         egui::ComboBox::from_id_salt("export_format")
             .selected_text(shown)
             .width(220.0)
             .show_ui(ui, |ui| {
-                for (label, ext) in export_formats(web) {
+                for (label, ext) in formats() {
                     ui.selectable_value(&mut app.dialogs.mode, *ext, *label);
                 }
             })
@@ -1136,7 +1218,8 @@ fn export_layer(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
                 .labelled_by(into_label.id);
             ui.end_row();
             if !matches!(app.dialogs.gpkg_mode, "" | "newFile") {
-                let table_label = ui.label(tl!("Table"));
+                // Export Table's first row is already labelled "Table".
+                let table_label = ui.label(if table { tl!("Table name") } else { tl!("Table") });
                 ui.add(egui::TextEdit::singleline(&mut app.dialogs.text).desired_width(220.0)).labelled_by(table_label.id);
                 ui.end_row();
             }
@@ -1151,15 +1234,20 @@ fn export_layer(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
     }
     buttons(app, ui, if web { "Download" } else { "Export…" }, |app| {
         let mut p = json!({"format": app.dialogs.mode});
-        if let Some((layer, instance)) = app.dialogs.export_layer {
-            p["layer"] = json!(layer);
+        let (command, key, target) = if table {
+            ("ui.exportTable", "table", app.dialogs.export_table)
+        } else {
+            ("ui.exportLayer", "layer", app.dialogs.export_layer)
+        };
+        if let Some((id, instance)) = target {
+            p[key] = json!(id);
             p["instance"] = json!(instance);
         }
         if into_existing {
             p["mode"] = json!(app.dialogs.gpkg_mode);
             p["tableName"] = json!(app.dialogs.text);
         }
-        app.run("ui.exportLayer", p).map(|_| ())
+        app.run(command, p).map(|_| ())
     })
 }
 
@@ -3538,6 +3626,21 @@ fn calculation_preview(rows: &[rustgis_engine::cmd::edit::CalculationPreview]) -
 mod tests {
     use super::*;
 
+    /// Export Table's picker tells apart standalone tables that share a name, which the project
+    /// allows, so the one written is the one meant; a name used once stays as it is.
+    #[test]
+    fn export_table_labels_tell_tables_with_one_name_apart() {
+        use rustgis_engine::data::{Dataset, GeometryType};
+        let mut app = RustGisApp::with_sample();
+        let first = app.session.project.add_table(Dataset::new("totals", GeometryType::None, vec![]));
+        let other = app.session.project.add_table(Dataset::new("ranks", GeometryType::None, vec![]));
+        let second = app.session.project.add_table(Dataset::new("totals", GeometryType::None, vec![]));
+        let tables = &app.session.project.tables;
+        assert_eq!(table_label(tables, first), "totals (1 of 2)");
+        assert_eq!(table_label(tables, second), "totals (2 of 2)");
+        assert_eq!(table_label(tables, other), "ranks");
+    }
+
     /// The GeoPackage prompt belongs to the map it opened on, wherever that map goes among the maps;
     /// another map or project refuses it (#2959).
     #[test]
@@ -5032,6 +5135,42 @@ mod tests {
         }
         let web: Vec<&str> = export_formats(true).map(|(_, e)| *e).collect();
         assert_eq!(web, ["geojson", "parquet", "shp", "csv", "kml", "kmz", "gpx"]);
+    }
+
+    /// Export Table opened with no table named takes the last added; picking another renames a
+    /// GeoPackage's table after it and drops a format that one can't take.
+    #[test]
+    fn export_table_follows_the_table_picked() {
+        use egui_kittest::kittest::Queryable;
+        use rustgis_engine::data::{Dataset, Field, FieldType, Geometry, GeometryType, Value};
+        let mut app = RustGisApp::with_sample();
+        assert!(app.run("ui.exportTable", json!({})).unwrap_err().contains("no standalone tables"));
+        let plain = app.session.project.add_table(Dataset::new("plain", GeometryType::None, vec![]));
+        let mut ds = Dataset::new("sites", GeometryType::Point, vec![Field::new("n", FieldType::Integer)]);
+        ds.push(Some(Geometry::Point(rustgis_engine::geom::Coord::new(1.0, 2.0))), vec![Value::Int(1)]);
+        let sites = app.session.project.add_table(ds);
+        app.run("ui.exportTable", json!({})).unwrap();
+        assert_eq!(app.dialogs.export_table.map(|(id, _)| id), Some(sites));
+        assert_eq!((app.dialogs.mode, app.dialogs.text.as_str()), ("csv", "sites"));
+        app.dialogs.mode = "shp";
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(900.0, 700.0)).with_max_steps(64).build_ui_state(
+            |ui, app: &mut RustGisApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            app,
+        );
+        h.run_steps(4);
+        assert_eq!(h.state().dialogs.mode, "shp", "a table with geometry takes a Shapefile");
+        h.get_by_label("Table").click();
+        h.run_steps(4);
+        // The Layers pane lists the table by this name too: the choice is the one drawn last.
+        h.query_all_by_label("plain").last().unwrap().click();
+        h.run_steps(4);
+        let d = &h.state().dialogs;
+        assert_eq!(d.export_table.map(|(id, _)| id), Some(plain));
+        assert_eq!((d.mode, d.text.as_str()), ("csv", "plain"));
     }
 
     /// The Rename… dialog shows why a name over 200 characters isn't taken and stays open with
