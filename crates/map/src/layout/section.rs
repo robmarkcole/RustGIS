@@ -57,6 +57,14 @@ impl SectionLine {
             _ => None,
         }
     }
+
+    /// Its direction's name in commands.
+    pub fn code(self) -> &'static str {
+        match self {
+            SectionLine::Horizontal(_) => "horizontal",
+            SectionLine::Vertical(_) => "vertical",
+        }
+    }
 }
 
 impl Section {

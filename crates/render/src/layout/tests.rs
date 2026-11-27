@@ -7993,6 +7993,60 @@ fn a_section_line_past_mercators_reach_is_not_drawn() {
     assert!(end(85.0).is_ok(), "{:?}", end(85.0));
 }
 
+/// A section line moved across itself is drawn where it was moved to, its place kept along it
+/// whatever the frame's projection or bearing; in a round frame its place goes where the pointer
+/// is when the shape leaves it out. Off the frame, its ground or its projection, it isn't moved.
+#[test]
+fn a_section_line_moves_across_its_frame() {
+    use rustgis_map::Projection;
+    let (w, h) = (400.0, 200.0);
+    let at = Coord::new(-44.66, -22.38);
+    let moved = |map: &Map, (c, scale, bearing, pitch): (Coord, f64, f64, f64), shape: &FrameShape, line, by, along| {
+        section_moved(map, &frame_camera(map, c, scale, bearing, pitch), (w, h), shape, line, by, along)
+    };
+    let rect = FrameShape::Rectangle;
+    let mut albers = Map::new("albers");
+    albers.projection = Projection::Custom("EPSG:10857".into());
+    for (map, bearing) in [(Map::new("m"), 0.0), (Map::new("m"), 40.0), (albers, -30.0)] {
+        let view = (Coord::new(at.x - 0.1, at.y + 0.05), 1e6, bearing, 0.0);
+        let cam = frame_camera(&map, view.0, view.1, view.2, view.3);
+        let px = |at: Coord| cam.try_to_screen(map.to_map(at).unwrap(), w, h).unwrap();
+        let (x, y) = px(at);
+        let near = |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).abs() < 0.01 && (a.1 - b.1).abs() < 0.01;
+        let (line, ends) = moved(&map, view, &rect, SectionLine::Horizontal(at), -20.0, 7.0).unwrap();
+        assert!(near(px(line.at()), (x, y - 20.0)) && matches!(line, SectionLine::Horizontal(_)), "{line:?}");
+        assert!(near(ends[0], (0.0, y - 20.0)) && near(ends[1], (w, y - 20.0)), "{ends:?}");
+        let (line, ends) = moved(&map, view, &rect, SectionLine::Vertical(at), 25.0, 7.0).unwrap();
+        assert!(near(px(line.at()), (x + 25.0, y)) && matches!(line, SectionLine::Vertical(_)), "{line:?}");
+        assert!(near(ends[0], (x + 25.0, 0.0)) && near(ends[1], (x + 25.0, h)), "{ends:?}");
+        assert_eq!(moved(&map, view, &rect, SectionLine::Horizontal(at), h, 7.0), None, "below the frame");
+        assert_eq!(moved(&map, view, &rect, SectionLine::Vertical(at), -w, 7.0), None, "left of the frame");
+    }
+    // A place by a round frame's edge, moved up: the shape is narrower there, so it goes to the
+    // pointer, and there is no line where the pointer is off the shape too.
+    let map = Map::new("m");
+    let here = (at, 1e6, 0.0, 0.0);
+    let cam = frame_camera(&map, at, 1e6, 0.0, 0.0);
+    let edge = SectionLine::Horizontal(map.to_lonlat(cam.to_map(110.0, h / 2.0, w, h)).unwrap());
+    let (line, _) = moved(&map, here, &FrameShape::Circle, edge, -80.0, 210.0).unwrap();
+    let (x, y) = cam.try_to_screen(map.to_map(line.at()).unwrap(), w, h).unwrap();
+    assert!((x - 210.0).abs() < 0.01 && (y - 20.0).abs() < 0.01, "{x} {y}");
+    assert_eq!(moved(&map, here, &FrameShape::Circle, edge, -80.0, 110.0), None);
+    // Across 180°, the place keeps within the longitudes a command takes.
+    let line = SectionLine::Vertical(Coord::new(179.5, 0.0));
+    let (line, _) = moved(&map, (Coord::new(179.5, 0.0), 1e7, 0.0, 0.0), &rect, line, 60.0, 100.0).unwrap();
+    assert!((-180.0..-175.0).contains(&line.at().x), "{line:?}");
+    // Not over the horizon, nor off the globe.
+    let tilted = (at, 5e4, 0.0, 80.0);
+    assert!(moved(&map, tilted, &rect, SectionLine::Horizontal(at), 20.0, 200.0).is_some());
+    assert_eq!(moved(&map, tilted, &rect, SectionLine::Horizontal(at), -99.0, 200.0), None);
+    let mut globe = Map::new("g");
+    globe.projection = Projection::Globe;
+    let whole = (at, 5e8, 0.0, 0.0);
+    assert!(moved(&globe, whole, &rect, SectionLine::Vertical(at), 20.0, 100.0).is_some());
+    assert_eq!(moved(&globe, whole, &rect, SectionLine::Vertical(at), 190.0, 100.0), None);
+}
+
 /// A frame's section lines are drawn over its map in their colour, dashed, with their names at
 /// both ends, clipped to its shape, as pixels and as vectors in a layer of their own; a frame
 /// without one draws the same page as before.

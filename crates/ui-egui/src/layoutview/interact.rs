@@ -22,6 +22,10 @@ pub(super) enum Drag {
     NewGuide(bool),
     /// Moving a guide: vertical or horizontal, and its index.
     Guide(bool, usize),
+    /// Moving a map frame's section line across itself: the frame, the line's index and the line
+    /// as it was when taken, its place and name (a command that changes the frame's lines meanwhile
+    /// lets it go), and the pointer's page position (mm) at the start.
+    Section(u32, usize, Taken, (f64, f64)),
     /// Turning a line or arrow by its rotation handle: its id, its angle at the start, and the
     /// pointer's angle about its centre then (degrees).
     Rotate(u32, f64, f64),
@@ -102,6 +106,7 @@ pub(super) fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response,
             Some(Drag::Move(id, p)) => Some(Drag::Move(id, rebase(p))),
             Some(Drag::Resize(id, h, p)) => Some(Drag::Resize(id, h, rebase(p))),
             Some(Drag::PanFrame(id, p)) => Some(Drag::PanFrame(id, rebase(p))),
+            Some(Drag::Section(id, i, line, p)) => Some(Drag::Section(id, i, line, rebase(p))),
             d => d,
         };
     }
@@ -157,6 +162,18 @@ pub(super) fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response,
         };
         let rotating = matches!(app.layout.drag, Some(Drag::Rotate(..)));
         let knob = app.layout.drag.is_none() && rotate_at(app, layout, page, s, p).is_some();
+        // A section line shows which way it can be dragged, and where it can't be put.
+        let section = match app.layout.drag {
+            Some(Drag::Section(id, i, line, start)) => {
+                let lands = section_landing(app, layout, (id, i, line, start), to_mm(page, s, p)).is_some();
+                Some(if lands { section_cursor(section_vertical(layout, id, i)) } else { CursorIcon::NotAllowed })
+            }
+            None if !knob => {
+                let pans = ui.input(|i| i.modifiers.shift) || app.layout.navigate;
+                section_at(app, layout, page, s, p, pans).map(|(.., vertical)| section_cursor(vertical))
+            }
+            _ => None,
+        };
         match (vertical, handle) {
             _ if rotating => ui.ctx().set_cursor_icon(CursorIcon::Grabbing),
             _ if knob => ui.ctx().set_cursor_icon(CursorIcon::Grab),
@@ -166,6 +183,7 @@ pub(super) fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response,
             }
             (Some(true), _) => ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal),
             (Some(false), _) => ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical),
+            _ if section.is_some() => ui.ctx().set_cursor_icon(section.unwrap_or_default()),
             _ if matches!(app.layout.drag, Some(Drag::PanFrame(..))) => ui.ctx().set_cursor_icon(CursorIcon::Grabbing),
             _ if navigating => ui.ctx().set_cursor_icon(CursorIcon::Grab),
             _ if matches!(app.layout.drag, Some(Drag::Move(..))) => ui.ctx().set_cursor_icon(CursorIcon::Move),
@@ -234,6 +252,7 @@ pub(super) fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response,
         let handle = handle_at(app, layout, page, s, origin);
         let ruler = ruler_at(&app.layout, resp.rect, origin);
         let guide = guide_at(layout, page, s, origin);
+        let section = section_at(app, layout, page, s, origin, shift);
         // A line's rotation knob, outside its box, comes before anything under it.
         let rotate = ruler.is_none().then(|| rotate_at(app, layout, page, s, origin)).flatten();
         app.layout.drag = if let Some((id, c)) = rotate {
@@ -243,6 +262,10 @@ pub(super) fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response,
                 (Some(vertical), ..) => Some(Drag::NewGuide(vertical)),
                 (None, Some((id, h)), ..) => Some(Drag::Resize(id, h, p)),
                 (None, None, Some((vertical, i)), _) => Some(Drag::Guide(vertical, i)),
+                // The selected frame's section line, over its map.
+                (None, None, None, Some(_)) if section.is_some() => {
+                    section.and_then(|(id, i, _)| section_line(layout, id, i)).map(|(id, i, line)| Drag::Section(id, i, line, p))
+                }
                 // A locked element is selected and stays put, its map too.
                 (None, None, None, Some(id)) if locked(layout, id) => {
                     app.layout.selected = Some(id);
@@ -288,6 +311,15 @@ pub(super) fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response,
             (Some(Drag::Guide(v, i)), _) => {
                 let at = ui.input(|i| i.pointer.latest_pos());
                 drop_guide(app, layout, li, page, s, resp.rect, v, Some(i), at);
+            }
+            (Some(Drag::Section(id, i, line, start)), Some(end)) => {
+                // A press that hardly moved is a click; dropped where it isn't drawn, the line stays.
+                if ((end.0 - start.0).abs() > 0.2 || (end.1 - start.1).abs() > 0.2)
+                    && let Some((_, name, at, _)) = section_landing(app, layout, (id, i, line, start), end)
+                {
+                    let section = json!({"name": name, "at": [at.x, at.y]});
+                    let _ = app.run("layout.update", json!({"layout": li, "element": id, "section": section}));
+                }
             }
             (Some(Drag::PanFrame(id, start)), Some(end)) => pan_frame(app, layout, li, id, end.0 - start.0, end.1 - start.1),
             (Some(Drag::Rotate(id, a0, from)), _) => {

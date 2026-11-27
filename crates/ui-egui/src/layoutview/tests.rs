@@ -473,6 +473,177 @@ fn a_panned_frame_shows_map_beyond_its_edges() {
     assert_ne!(center(&h.state().session.project.layouts[li]), before, "the pan moved the frame's map");
 }
 
+/// Dragging a section line of the selected frame (#2863) moves its place across it in one undo
+/// step, and the frame stays; dropped off the frame, or in a frame that is locked, isn't
+/// selected or is being panned, the line stays.
+#[test]
+fn a_selected_frames_section_line_is_dragged() {
+    use egui::CursorIcon;
+    use rustgis_engine::map::layout::ElementKind;
+    let mut app = RustGisApp::with_sample();
+    app.run("layout.new", json!({"name": "Sections"})).unwrap();
+    app.layout.no_snap = true;
+    let li = app.session.active_layout.unwrap();
+    let frame = app.session.project.layouts[li].first_frame().unwrap();
+    app.run("layout.update", json!({"element": frame, "center": [10, 50], "scale": 1e7})).unwrap();
+    for (name, direction) in [("A", "horizontal"), ("B", "vertical")] {
+        let add = json!({"kind": "section", "frame": frame, "name": name, "direction": direction, "at": [10, 50]});
+        app.run("layout.addElement", add).unwrap();
+    }
+    app.layout.selected = Some(frame);
+    let area = Rc::new(Cell::new(Rect::NOTHING));
+    let shown = area.clone();
+    let mut fonts = false;
+    let mut h = egui_kittest::Harness::builder().with_size(vec2(1000.0, 760.0)).build_ui_state(
+        move |ui, app: &mut RustGisApp| {
+            if !fonts {
+                crate::theme::install_fonts(ui.ctx(), &[], None);
+                fonts = true;
+                return;
+            }
+            shown.set(ui.available_rect_before_wrap());
+            super::show(app, ui);
+        },
+        app,
+    );
+    h.run_steps(3);
+    let held = |app: &RustGisApp| {
+        let e = app.session.project.layouts[li].element(frame).unwrap().clone();
+        let ElementKind::MapFrame { sections, .. } = &e.kind else { panic!("a map frame") };
+        let at = |i: usize| sections[i].line.at();
+        (at(0), at(1), (e.x, e.y))
+    };
+    let button = |pos: Pos2, pressed| Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+    // From a share of the frame's width and height, by screen points: the cursor before and during.
+    let drag = |h: &mut egui_kittest::Harness<RustGisApp>, (u, v): (f64, f64), by: egui::Vec2| {
+        let layout = h.state().session.project.layouts[li].clone();
+        let e = layout.element(frame).unwrap();
+        let (page, s) = page_rect(&h.state().layout, area.get(), &layout);
+        let from = to_screen(page, s, (e.x + e.w * u, e.y + e.h * v));
+        h.event(Event::PointerMoved(from));
+        h.step();
+        let over = h.output().platform_output.cursor_icon;
+        h.event(button(from, true));
+        h.step();
+        for i in 1..=3 {
+            h.event(Event::PointerMoved(from + by * i as f32 / 3.0));
+            h.step();
+        }
+        let dragged = h.output().platform_output.cursor_icon;
+        h.event(button(from + by, false));
+        h.step();
+        h.run_steps(2);
+        (over, dragged)
+    };
+    let before = held(h.state());
+    assert_eq!(drag(&mut h, (0.25, 0.5), vec2(5.0, 40.0)), (CursorIcon::ResizeVertical, CursorIcon::ResizeVertical));
+    let after = held(h.state());
+    assert!(after.0.y < before.0.y - 0.1 && (after.0.x - before.0.x).abs() < 1e-6, "{before:?} → {after:?}");
+    assert_eq!((after.1, after.2), (before.1, before.2), "only that line");
+    // One undo step, the other line across the other way.
+    h.state_mut().run("edit.undo", json!({})).unwrap();
+    assert_eq!(held(h.state()), before);
+    h.run_steps(2);
+    assert_eq!(drag(&mut h, (0.5, 0.25), vec2(-40.0, 5.0)).0, CursorIcon::ResizeHorizontal);
+    let after = held(h.state());
+    assert!(after.1.x < before.1.x - 0.1 && (after.1.y - before.1.y).abs() < 1e-6, "{before:?} → {after:?}");
+    assert_eq!((after.0, after.2), (before.0, before.2));
+    // Dropped off the frame, it stays.
+    let layout = h.state().session.project.layouts[li].clone();
+    let half = layout.element(frame).unwrap().h as f32 * page_rect(&h.state().layout, area.get(), &layout).1 / 2.0;
+    assert_eq!(drag(&mut h, (0.25, 0.5), vec2(0.0, -half - 5.0)).1, CursorIcon::NotAllowed);
+    assert_eq!(held(h.state()), after);
+    // A line removed by a command while it is dragged: the drop moves no other line in its place.
+    let layout = h.state().session.project.layouts[li].clone();
+    let e = layout.element(frame).unwrap();
+    let (page, s) = page_rect(&h.state().layout, area.get(), &layout);
+    let from = to_screen(page, s, (e.x + e.w * 0.25, e.y + e.h * 0.5));
+    h.event(Event::PointerMoved(from));
+    h.step();
+    h.event(button(from, true));
+    h.step();
+    h.event(Event::PointerMoved(from + vec2(20.0, 20.0)));
+    h.step();
+    h.state_mut().run("layout.update", json!({"element": frame, "section": {"name": "A", "remove": true}})).unwrap();
+    h.event(Event::PointerMoved(from + vec2(20.0, 40.0)));
+    h.step();
+    h.event(button(from + vec2(20.0, 40.0), false));
+    h.step();
+    h.run_steps(2);
+    let e = h.state().session.project.layouts[li].element(frame).unwrap().clone();
+    let ElementKind::MapFrame { sections, .. } = &e.kind else { panic!("a map frame") };
+    assert!(sections.len() == 1 && sections[0].name == "B" && sections[0].line.at() == after.1, "{sections:?}");
+    h.state_mut().run("edit.undo", json!({})).unwrap();
+    assert_eq!(held(h.state()), after);
+    h.run_steps(2);
+    // Replaced meanwhile by another line of the same direction at the same place, at the same
+    // index: the drop doesn't move that one either.
+    let layout = h.state().session.project.layouts[li].clone();
+    let e = layout.element(frame).unwrap();
+    let (page, s) = page_rect(&h.state().layout, area.get(), &layout);
+    let from = to_screen(page, s, (e.x + e.w * 0.25, e.y + e.h * 0.5));
+    h.event(Event::PointerMoved(from));
+    h.step();
+    h.event(button(from, true));
+    h.step();
+    h.event(Event::PointerMoved(from + vec2(20.0, 20.0)));
+    h.step();
+    h.state_mut().run("layout.update", json!({"element": frame, "section": {"name": "B", "remove": true}})).unwrap();
+    h.state_mut().run("layout.update", json!({"element": frame, "section": {"name": "A", "remove": true}})).unwrap();
+    let add = json!({"kind": "section", "frame": frame, "name": "Z", "direction": "horizontal", "at": [after.0.x, after.0.y]});
+    h.state_mut().run("layout.addElement", add).unwrap();
+    h.event(Event::PointerMoved(from + vec2(20.0, 40.0)));
+    h.step();
+    h.event(button(from + vec2(20.0, 40.0), false));
+    h.step();
+    h.run_steps(2);
+    let e = h.state().session.project.layouts[li].element(frame).unwrap().clone();
+    let ElementKind::MapFrame { sections, .. } = &e.kind else { panic!("a map frame") };
+    assert!(sections.len() == 1 && sections[0].name == "Z" && sections[0].line.at() == after.0, "{sections:?}");
+    for _ in 0..3 {
+        h.state_mut().run("edit.undo", json!({})).unwrap();
+    }
+    assert_eq!(held(h.state()), after);
+    h.run_steps(2);
+    // Dropped beside the frame, at a height inside it: off the frame, it stays.
+    let layout = h.state().session.project.layouts[li].clone();
+    let quarter = layout.element(frame).unwrap().w as f32 * page_rect(&h.state().layout, area.get(), &layout).1 / 4.0;
+    assert_eq!(drag(&mut h, (0.75, 0.5), vec2(quarter + 10.0, 10.0)).1, CursorIcon::NotAllowed);
+    assert_eq!(held(h.state()), after);
+    // An ellipse's frame: dropped in a corner of its box, outside the ellipse, it stays too.
+    let shaped = |h: &mut egui_kittest::Harness<RustGisApp>, to: rustgis_engine::map::layout::FrameShape| {
+        let e = h.state_mut().session.project.layouts[li].elements.iter_mut().find(|e| e.id == frame).unwrap();
+        let ElementKind::MapFrame { shape, .. } = &mut e.kind else { panic!("a map frame") };
+        *shape = to;
+        h.state_mut().session.revision += 1;
+    };
+    shaped(&mut h, rustgis_engine::map::layout::FrameShape::Ellipse);
+    h.run_steps(2);
+    let layout = h.state().session.project.layouts[li].clone();
+    let e = layout.element(frame).unwrap();
+    let s = page_rect(&h.state().layout, area.get(), &layout).1;
+    let corner = vec2(-0.2 * e.w as f32 * s, -0.4 * e.h as f32 * s);
+    assert_eq!(drag(&mut h, (0.25, 0.5), corner).1, CursorIcon::NotAllowed);
+    assert_eq!(held(h.state()), after);
+    shaped(&mut h, rustgis_engine::map::layout::FrameShape::Rectangle);
+    h.run_steps(2);
+    // Map frames being navigated, a drag on the line pans the frame's map.
+    h.state_mut().layout.navigate = true;
+    drag(&mut h, (0.25, 0.5), vec2(0.0, 30.0));
+    assert_eq!(held(h.state()), after);
+    h.state_mut().layout.navigate = false;
+    h.state_mut().run("edit.undo", json!({})).unwrap();
+    // Locked, nothing moves; not selected, the drag moves the frame.
+    h.state_mut().run("layout.update", json!({"element": frame, "locked": true})).unwrap();
+    drag(&mut h, (0.25, 0.5), vec2(0.0, 30.0));
+    assert_eq!(held(h.state()), after);
+    h.state_mut().run("layout.update", json!({"element": frame, "locked": false})).unwrap();
+    h.state_mut().layout.selected = None;
+    drag(&mut h, (0.25, 0.5), vec2(0.0, 30.0));
+    let last = held(h.state());
+    assert!((last.0, last.1) == (after.0, after.1) && last.2.1 > after.2.1 + 1.0, "{after:?} → {last:?}");
+}
+
 /// Pressing a corner handle and dragging away fast resizes the element, though by the time
 /// egui starts the drag the pointer is already off the handle; it used to move the element.
 #[test]
@@ -1776,6 +1947,81 @@ fn an_overview_frame_shows_its_extent_indicator() {
     assert!(matches!(kind, ElementKind::MapFrame { extent_of: None, .. }), "removed");
     h.run_steps(2);
     assert!(h.query_by_label("Remove Extent Indicator").is_none(), "and its section with it");
+}
+
+/// A frame's Section Lines section (#2863) adds one each way, renames it, says one isn't drawn
+/// when its place is outside the frame, and removes it.
+#[test]
+fn a_frame_adds_names_and_removes_section_lines() {
+    use egui_kittest::kittest::Queryable;
+    let mut app = RustGisApp::with_sample();
+    app.run("layout.new", json!({"name": "Sections"})).unwrap();
+    let li = app.session.active_layout.unwrap();
+    let frame = app.session.project.layouts[li].first_frame().unwrap();
+    app.run("layout.update", json!({"element": frame, "center": [10, 50], "scale": 1e7})).unwrap();
+    app.layout.selected = Some(frame);
+    let mut fonts = false;
+    let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 1800.0)).build_ui_state(
+        move |ui, app: &mut RustGisApp| {
+            if !fonts {
+                crate::theme::install_fonts(ui.ctx(), &[], None);
+                fonts = true;
+                return;
+            }
+            with_format(app, ui);
+        },
+        app,
+    );
+    let held = |app: &RustGisApp| match &app.session.project.layouts[li].element(frame).unwrap().kind {
+        rustgis_engine::map::layout::ElementKind::MapFrame { sections, .. } => {
+            sections.iter().map(|s| (s.name.clone(), s.line.code())).collect::<Vec<_>>()
+        }
+        _ => panic!("a map frame"),
+    };
+    h.run_steps(3);
+    h.get_by_label("Section Lines").click();
+    h.run_steps(12);
+    h.get_by_label("Add Vertical").click();
+    h.run_steps(3);
+    assert_eq!(held(h.state()), [("A".to_string(), "vertical")]);
+    assert!(h.query_by_label_contains("Not drawn").is_none());
+    // Renamed when the field is left.
+    let name = h.get_all_by_role(egui::accesskit::Role::TextInput).find(|n| n.value().as_deref() == Some("A")).unwrap();
+    name.focus();
+    h.run_steps(2);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    h.run_steps(1);
+    h.event(egui::Event::Text("Serra".into()));
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    assert_eq!(held(h.state()), [("Serra".to_string(), "vertical")]);
+    // A name another line has is refused, and that is said.
+    h.get_by_label("Add Vertical").click();
+    h.run_steps(3);
+    let said = h.state().session.notices.len();
+    let name = h.get_all_by_role(egui::accesskit::Role::TextInput).find(|n| n.value().as_deref() == Some("A")).unwrap();
+    name.focus();
+    h.run_steps(2);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    h.run_steps(1);
+    h.event(egui::Event::Text("serra".into()));
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    assert_eq!(held(h.state()), [("Serra".to_string(), "vertical"), ("A".to_string(), "vertical")]);
+    let notices = &h.state().session.notices;
+    assert!(notices.len() > said && notices.iter().skip(said).any(|n| n.text.contains("Serra")), "{notices:?}");
+    h.state_mut().run("layout.update", json!({"element": frame, "section": {"name": "A", "remove": true}})).unwrap();
+    h.run_steps(3);
+    // Moved off the frame, it says so.
+    h.state_mut().run("layout.update", json!({"element": frame, "section": {"name": "Serra", "at": [-150, 0]}})).unwrap();
+    h.run_steps(3);
+    assert!(h.query_by_label("Not drawn: its place is outside the frame").is_some());
+    h.get_by_label("Remove Section Line").click();
+    h.run_steps(3);
+    assert!(held(h.state()).is_empty());
+    assert!(h.query_by_label("Remove Section Line").is_none());
 }
 
 /// A frame's Border section (#2557): Default Border shows only for a border of its own, and

@@ -257,7 +257,7 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   from the whole world down to site plans at 1:20, finds at 1:1 and 2:1 (a scale of 1:0.5).
   A frame can be turned and tilted like the map view: a new frame, or one matched to the view,
   takes the view's bearing and pitch, and **Bearing** and **Pitch** in its properties (or
-  `layout.update` with `bearing` and `pitch`) set them. Its north arrows turn with it. **Grid** draws a labelled graticule over a frame; **Extent Indicator** outlines another frame's
+  `layout.update` with `bearing` and `pitch`) set them. Its north arrows turn with it. **Grid** draws a labelled graticule over a frame; **Section Lines** draws the traces of cross-sections; **Extent Indicator** outlines another frame's
   extent (an overview map).
 - **Frame borders**: the **Border** section of a frame's properties sets the line drawn round it,
   along its shape for a round or polygon frame: its **Color** and **Line width** (dark grey and
@@ -293,20 +293,23 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   `"grid": {…}` (`false` removes the grid). On a map on the globe the lines are drawn on the
   globe, and stop at its horizon. A frame that shows the whole globe has nothing beyond its rim,
   and so no labels along its edges.
-- **Section lines**: a frame can draw the traces of cross-sections over its map, up to 26 of them:
+- **Section lines**: the **Section Lines** section of a frame's properties draws the traces of
+  cross-sections over its map, up to 26 a frame. **Add Horizontal** and **Add Vertical** add one
+  across the whole frame, straight on the page, through the place at the frame's centre, its name in
+  a box at both ends (A and A'); its **Name**, **Direction**, place (**Longitude** and
+  **Latitude**), **Dash**, **Color** and **Line width** are below. With the frame selected, a line
+  can also be dragged across its map, up or down, or sideways for a vertical one. The place is what
+  is kept, so the line follows it when the frame is moved, turned or rescaled, and on each page of a
+  map series; the line runs to the frame's edge, or to the outline of a round or polygon frame. A
+  line whose place is outside the frame, or that the frame's map can't show, isn't drawn: its
+  properties, the layout view and exports say which and why (for a map series' PDF, on how many of
+  its pages). On a tilted frame or one on the globe, the line runs through the place as the grid
+  puts it there, only as far as there is ground along it; it is straight on the page there, and not
+  a straight section of the ground. From a command:
   `layout.addElement={"kind":"section","frame":1,"name":"A","direction":"horizontal","at":[-44.66,-22.38]}`
-  draws one across the whole frame, straight on the page (`"direction"` is `"horizontal"` or
-  `"vertical"`), through a place, with its name in a box at both ends (A and A'). The name defaults
-  to the first free letter and the place to the frame's centre; `color`, `width` and `dash` set its
-  look. `layout.update={"element":1,"section":{"name":"A","at":[-44.7,-22.4],"color":"#1F5C84"}}`
-  changes one by its name, the keys not given keeping theirs (`"newName"` renames it, and
-  `"remove": true` removes it). The place is what is kept, so the line follows it when the frame is
-  moved, turned or rescaled, and on each page of a map series; the line runs to the frame's
-  edge, or to the outline of a round or polygon frame. A line whose place is outside the frame, or
-  that the frame's map can't show, isn't drawn: these commands, the layout view and exports say which
-  and why (for a map series' PDF, on how many of its pages). On a tilted frame or one on the globe,
-  the line runs through the place as the grid puts it there, only as far as there is ground along
-  it; it is straight on the page there, and not a straight section of the ground.
+  (the name defaults to the first free letter, the place to the frame's centre), then
+  `layout.update={"element":1,"section":{"name":"A","at":[-44.7,-22.4],"color":"#1F5C84"}}`
+  (`"newName"` renames it, and `"remove": true` removes it).
 - **Measured grids**: a grid's **Type** is a **Graticule** (latitudes and longitudes, as above)
   or a **Measured grid**, as ArcGIS Pro has them: eastings and northings in a projected coordinate
   system, for maps read with UTM or national grid coordinates (a hiking map at 1:25,000 with a

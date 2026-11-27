@@ -14,6 +14,7 @@ mod actions;
 mod format;
 mod handles;
 mod interact;
+mod section;
 mod snap;
 #[cfg(test)]
 mod tests;
@@ -25,6 +26,7 @@ pub use format::format;
 use format::*;
 use handles::*;
 use interact::*;
+use section::*;
 use snap::*;
 
 /// Width of the rulers along the view's top and left edges (points).
@@ -568,6 +570,14 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
         // The name over the turned box's topmost corner.
         let top = [rt, rb, lb].into_iter().fold(lt, |a, p| if p.y < a.y - 0.5 { p } else { a });
         painter.text(top + vec2(0.0, -4.0), Align2::LEFT_BOTTOM, &e.name, regular(11.0), accent);
+    }
+    // A section line being dragged: where it will be, and its place.
+    if let (Some(Drag::Section(id, i, line, start)), Some(p)) = (app.layout.drag, pointer)
+        && let Some((e, name, at, ends)) = section_landing(app, &layout, (id, i, line, start), to_mm(page, s, p))
+    {
+        painter.line_segment(section_on_screen(e, page, s, ends), Stroke::new(2.0, accent));
+        let label = format!("{name}: {:.4}°, {:.4}°", at.x, at.y);
+        painter.text(p + vec2(12.0, 12.0), Align2::LEFT_TOP, label, semibold(12.0), accent);
     }
     // A line being turned: where it will point, and its angle.
     if let (Some(Drag::Rotate(id, a0, from)), Some(p)) = (app.layout.drag, pointer)

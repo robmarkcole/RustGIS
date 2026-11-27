@@ -6,6 +6,69 @@ use super::*;
 /// A section line's ends in its frame's points, from its left or top.
 pub type SectionEnds = [(f64, f64); 2];
 
+/// The globe a frame `w` × `h` points shows, if its map is on one.
+fn section_globe(map: &Map, cam: &rustgis_map::Camera, (w, h): (f64, f64)) -> Option<rustgis_map::globe::Globe> {
+    map.projection.is_globe().then(|| rustgis_map::globe::Globe::new(cam, w, h))
+}
+
+/// Where the place `at` is on a frame `w` × `h` points, in its points; on a map whose world
+/// repeats, the copy nearest the frame's middle. `None` where the frame's map can't show it.
+fn section_px(
+    map: &Map,
+    cam: &rustgis_map::Camera,
+    globe: Option<&rustgis_map::globe::Globe>,
+    (w, h): (f64, f64),
+    mut at: Coord,
+) -> Option<(f64, f64)> {
+    if let Some(mid) = map.to_lonlat(cam.center).filter(|c| c.x.is_finite()) {
+        at.x += 360.0 * ((mid.x - at.x) / 360.0).round();
+    }
+    match globe {
+        Some(g) => g.forward(at),
+        // A projection that holds a place to its reach (Web Mercator past 85.05°) gives another
+        // place, back: that one isn't the frame's to show.
+        None => {
+            map.to_map(at).filter(|&m| map.to_lonlat(m).is_none_or(|back| same_place(back, at))).and_then(|m| cam.try_to_screen(m, w, h))
+        }
+    }
+    .filter(|(x, y)| x.is_finite() && y.is_finite())
+}
+
+/// `line` moved `by` points across itself (down, or right for a vertical one) on a frame drawn as
+/// for [`section_ends`], and its ends there. Its place keeps where it is along the line; where that
+/// isn't in the frame's shape there, it goes to `along` points from the frame's left (or top).
+/// `None` where the frame would not draw the line there.
+pub fn section_moved(
+    map: &Map,
+    cam: &rustgis_map::Camera,
+    (w, h): (f64, f64),
+    shape: &FrameShape,
+    line: SectionLine,
+    by: f64,
+    along: f64,
+) -> Option<(SectionLine, SectionEnds)> {
+    let globe = section_globe(map, cam, (w, h));
+    let vertical = matches!(line, SectionLine::Vertical(_));
+    let swap = |(x, y): (f64, f64)| if vertical { (y, x) } else { (x, y) };
+    let (own, across) = swap(section_px(map, cam, globe.as_ref(), (w, h), line.at())?);
+    let to = across + by;
+    [own, along].into_iter().find_map(|along| {
+        let (x, y) = swap((along, to));
+        let at = match &globe {
+            Some(g) => g.inverse(x, y),
+            None => cam.try_to_map(x, y, w, h).and_then(|m| map.to_lonlat(m)),
+        }?;
+        let at = Coord::new((at.x + 180.0).rem_euclid(360.0) - 180.0, at.y);
+        if !at.x.is_finite() || !(-90.0..=90.0).contains(&at.y) {
+            return None;
+        }
+        let moved = line.through(at);
+        let ends = section_ends(map, cam, (w, h), shape, moved).ok()?;
+        // Where the projection has no such place, its inverse can give one that is drawn elsewhere.
+        ((swap(ends[0]).1 - to).abs() < 0.5).then_some((moved, ends))
+    })
+}
+
 /// Where `line` is drawn on a frame `w` × `h` points showing `map` through `cam`, within its
 /// `shape`: its ends, the outermost of where it meets the shape's outline (#2863). It is straight
 /// on the page whatever the frame's projection or bearing. On a tilted frame or the globe it runs
@@ -21,22 +84,8 @@ pub fn section_ends(
     line: SectionLine,
 ) -> Result<SectionEnds, &'static str> {
     const NOT_SHOWN: &str = "its place isn't one the frame's map shows";
-    let globe = map.projection.is_globe().then(|| rustgis_map::globe::Globe::new(cam, w, h));
-    let mut at = line.at();
-    // On a map whose world repeats, the copy of the place nearest the frame's middle.
-    if let Some(mid) = map.to_lonlat(cam.center).filter(|c| c.x.is_finite()) {
-        at.x += 360.0 * ((mid.x - at.x) / 360.0).round();
-    }
-    let (px, py) = match &globe {
-        Some(g) => g.forward(at),
-        // A projection that holds a place to its reach (Web Mercator past 85.05°) gives another
-        // place, back: that one isn't the frame's to show.
-        None => {
-            map.to_map(at).filter(|&m| map.to_lonlat(m).is_none_or(|back| same_place(back, at))).and_then(|m| cam.try_to_screen(m, w, h))
-        }
-    }
-    .filter(|(x, y)| x.is_finite() && y.is_finite())
-    .ok_or(NOT_SHOWN)?;
+    let globe = section_globe(map, cam, (w, h));
+    let (px, py) = section_px(map, cam, globe.as_ref(), (w, h), line.at()).ok_or(NOT_SHOWN)?;
     // Along the line and across it: a vertical line is worked out with the axes swapped.
     let vertical = matches!(line, SectionLine::Vertical(_));
     let swap = |(x, y): (f64, f64)| if vertical { (y, x) } else { (x, y) };
