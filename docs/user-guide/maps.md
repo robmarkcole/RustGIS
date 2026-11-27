@@ -172,12 +172,13 @@ takes it back to the box. A block kept from before stays round when another key 
 `"shape": {"layer": "Bacias", "where": "nome = 'Rio Doce'"}` cuts the block to a study area: the
 polygons of a polygon layer that the expression picks (written as a definition query, among the
 rows the layer's own definition query keeps; all of them without `"where"`). Only the ground
-inside their outer rings is drawn and sets the base, the block's box is the one round them (so
+inside them is drawn and sets the base, the block's box is the one round them (so
 no `"extent"`), and it works over elevation tiles too. The walls stand along the outline where
 it faces you, a concave outline's hidden where nearer ground or walls stand in front of them,
 with everything a box's walls have; a wall's corner is outlined where the outline turns by more
-than 45°. A `"where"` that picks no polygon is refused. Holes are not cut: the ground inside
-them is drawn, and a notice says how many. Several polygons each stand as their own block on the
+than 45°. A `"where"` that picks no polygon is refused. Each hole is a well: its ground isn't
+drawn, its walls stand along it where they face you (on its far side), and its floor is drawn at
+the base, in the walls' colour in shade. Several polygons each stand as their own block on the
 same base (dissolve touching ones first for one outline). The outline follows the polygons to about a third of the
 finest mesh cell (a ring narrower than that is left out, and said), and is read again when the
 layer is edited. A box kept from before is dropped when the block is cut to polygons.

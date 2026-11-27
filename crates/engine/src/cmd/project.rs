@@ -401,9 +401,9 @@ fn reset(s: &mut Session, p: Project) {
         .collect();
     // A block cut to polygons (#2318) whose layer is missing or picks no polygon with an area
     // isn't drawn: said, and kept, so a polygon layer of that name, or an edit, brings it back.
-    // One whose outline was simplified to stay under 65 535 sides, or whose polygons have holes
-    // (not cut), is said as `map.terrain` says it. Each outline is read once.
-    let (mut uncut, mut simplified, mut holed) = (Vec::new(), Vec::new(), Vec::new());
+    // One whose outline was simplified to stay under 65 535 sides is said as `map.terrain` says
+    // it. Each outline is read once.
+    let (mut uncut, mut simplified) = (Vec::new(), Vec::new());
     for m in &s.project.maps {
         let Some(rustgis_map::view::BlockShape::Polygon { layer, filter }) =
             m.view.terrain.as_ref().and_then(|t| t.block.as_ref()).map(|b| &b.shape)
@@ -415,7 +415,6 @@ fn reset(s: &mut Session, p: Project) {
             continue;
         };
         simplified.extend(super::view::outline_simplified(layer, &o).map(|said| format!("{}: {said}", m.name)));
-        holed.extend(super::view::outline_holes(layer, &o).map(|said| format!("{}: {said}", m.name)));
     }
     match simplified.as_slice() {
         [] => {}
@@ -424,9 +423,6 @@ fn reset(s: &mut Session, p: Project) {
             format!("{} block diagrams cut to polygons have simplified outlines: {}", simplified.len(), simplified.join("; ")),
             false,
         ),
-    }
-    if !holed.is_empty() {
-        s.notify(holed.join("; "), false);
     }
     if !uncut.is_empty() {
         s.notify(

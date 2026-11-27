@@ -249,8 +249,8 @@ pub enum BlockShape {
         radius: Option<f64>,
     },
     /// The polygons of `layer` (by name, as the terrain's DEM) that `filter` picks among the rows
-    /// its definition query keeps (all of them without one): the ground inside their outer rings,
-    /// their holes not cut, the box being the one round them.
+    /// its definition query keeps (all of them without one): the ground inside them, each hole a
+    /// well, the box being the one round them.
     Polygon {
         layer: String,
         #[serde(rename = "where", default, skip_serializing_if = "Option::is_none")]

@@ -197,8 +197,9 @@ fn corners_box(m: [Coord; 3]) -> (Coord, Coord) {
 /// The parts of the triangle `m` (Web Mercator) inside the polygon outline `o`, each a polygon
 /// (concave, maybe) anticlockwise: each stretch of a ring inside the triangle runs from where it
 /// enters to where it leaves, then along the triangle's edge (anticlockwise, as the rings run)
-/// to where the next stretch of the same ring enters, until the part closes. A ring wholly inside
-/// is a part of its own. A ring that crosses none of it but holds it (its middle) adds the
+/// to where the next stretch of the same polygon (its outer ring or a hole) enters, until the
+/// part closes. An outer ring wholly inside is a part of its own, and a hole wholly inside is cut
+/// from the part round it. A polygon that crosses none of it but holds it (its middle) adds the
 /// whole triangle, which several touching or overlapping polygons can give alongside the parts of
 /// another ring that crosses it. A corner is marked with the outline's side (plus one) the part's edge from it runs along, 0
 /// along the triangle's edge. Only the sides near the triangle are looked at ([`Outline::near`]).
@@ -211,11 +212,12 @@ fn clip_outline(m: [Coord; 3], o: &Outline) -> Vec<Vec<Clipped>> {
     }
     let t = if area > 0.0 { m } else { [m[0], m[2], m[1]] };
     let mark = |p: Coord, on: u32| -> Clipped { ([0, 1, 2].map(|i| cross(m[(i + 1) % 3], m[(i + 2) % 3], p) / area), p, on) };
-    // The whole triangle when a ring that doesn't cross it holds its middle (a point strictly
-    // inside, so a ring only touching it doesn't count).
+    // The whole triangle when a polygon none of whose rings crosses it holds its middle (a point
+    // strictly inside, so a ring only touching it doesn't count), its holes wholly inside the
+    // triangle left out (they are cut from it below).
     let middle = Coord::new((t[0].x + t[1].x + t[2].x) / 3.0, (t[0].y + t[1].y + t[2].y) / 3.0);
-    let whole = |crossing: &[u32]| -> Option<Vec<Clipped>> {
-        o.inside_ring(middle, |r| !crossing.contains(&r)).then(|| t.iter().map(|c| mark(*c, 0)).collect())
+    let whole = |crossing: &[u32], within: &[u32]| -> Option<Vec<Clipped>> {
+        o.inside_ring(middle, |r| !crossing.contains(&o.kind(r).0) && !within.contains(&r)).then(|| t.iter().map(|c| mark(*c, 0)).collect())
     };
     // How far inside edge `e` (from corner e to the next) `p` lies.
     let len = [0, 1, 2].map(|e| (t[(e + 1) % 3].x - t[e].x).hypot(t[(e + 1) % 3].y - t[e].y).max(1e-300));
@@ -244,11 +246,8 @@ fn clip_outline(m: [Coord; 3], o: &Outline) -> Vec<Vec<Clipped>> {
         }
     }
     if parts.is_empty() {
-        return whole(&[]).into_iter().collect();
+        return whole(&[], &[]).into_iter().collect();
     }
-    let mut crossing: Vec<u32> = parts.iter().map(|p| sides[p.0].ring).collect();
-    crossing.sort_unstable();
-    crossing.dedup();
     let find = |k: usize| parts.binary_search_by_key(&k, |p| p.0).ok();
     let at = |k: usize, u: f64| sides.get(k).map_or(t[0], |s| Coord::new(s.a.x + (s.z.x - s.a.x) * u, s.a.y + (s.z.y - s.a.y) * u));
     // Where on the triangle's edge a point lies: the edge's number plus the share along it.
@@ -294,21 +293,45 @@ fn clip_outline(m: [Coord; 3], o: &Outline) -> Vec<Vec<Clipped>> {
         corners.push(mark(out, 0));
         chains.push((sides[parts[i].0].ring, corners, into, place(out)));
     }
-    // Rings wholly inside the triangle: parts of their own.
-    let mut out: Vec<Vec<Clipped>> = Vec::new();
+    // The polygons whose rings cross the triangle's edges.
+    let mut crossing: Vec<u32> = chains.iter().map(|c| o.kind(c.0).0).collect();
+    crossing.sort_unstable();
+    crossing.dedup();
+    // Rings wholly inside the triangle: an outer one a part of its own, a hole cut from the part
+    // of its polygon round it, below.
+    let mut out: Vec<(u32, Vec<Clipped>)> = Vec::new();
+    let mut wells: Vec<(u32, Vec<Clipped>)> = Vec::new();
     for i in 0..parts.len() {
         if !used[i] {
+            let ring = sides[parts[i].0].ring;
             let (corners, _) = follow(i, &mut used);
             if corners.len() >= 3 {
-                out.push(corners);
+                let (polygon, hole) = o.kind(ring);
+                if hole { wells.push((ring, corners)) } else { out.push((polygon, corners)) }
             }
         }
     }
-    out.extend(whole(&crossing));
-    if chains.is_empty() {
-        return out;
+    // The whole triangle from a polygon that neither crosses it, nor lies in it, nor has a hole
+    // in it; failing one, from each polygon with holes in it whose other rings hold it, those
+    // holes cut from it below.
+    let within: Vec<u32> = wells.iter().map(|w| w.0).collect();
+    let mut holed: Vec<u32> =
+        wells.iter().map(|w| o.kind(w.0).0).filter(|p| !crossing.contains(p) && !out.iter().any(|q| q.0 == *p)).collect();
+    holed.sort_unstable();
+    holed.dedup();
+    let crossed: Vec<u32> = crossing.iter().chain(out.iter().map(|p| &p.0)).chain(&holed).copied().collect();
+    if let Some(w) = whole(&crossed, &[]) {
+        out.push((u32::MAX, w));
+    } else {
+        for p in holed {
+            if o.inside_ring(middle, |r| o.kind(r).0 == p && !within.contains(&r)) {
+                out.push((p, t.iter().map(|c| mark(*c, 0)).collect()));
+            }
+        }
     }
-    // Each chain, then the triangle's edge on to the next chain of its ring, until back.
+    // Each chain, then the triangle's edge on to the next chain of its polygon (its outer ring
+    // or a hole: the rings of one polygon don't cross, so the next one met round the edge
+    // bounds the same ground), until back.
     let mut done = vec![false; chains.len()];
     for c0 in 0..chains.len() {
         if done[c0] {
@@ -318,10 +341,11 @@ fn clip_outline(m: [Coord; 3], o: &Outline) -> Vec<Vec<Clipped>> {
         loop {
             done[c] = true;
             piece.extend(chains[c].1.iter().copied());
-            let (ring, leaves) = (chains[c].0, chains[c].3);
+            let (polygon, leaves) = (o.kind(chains[c].0).0, chains[c].3);
             let ahead = |s: f64| (s - leaves).rem_euclid(3.0);
-            let Some(n) =
-                (0..chains.len()).filter(|j| chains[*j].0 == ring).min_by(|a, b| ahead(chains[*a].2).total_cmp(&ahead(chains[*b].2)))
+            let Some(n) = (0..chains.len())
+                .filter(|j| o.kind(chains[*j].0).0 == polygon)
+                .min_by(|a, b| ahead(chains[*a].2).total_cmp(&ahead(chains[*b].2)))
             else {
                 break;
             };
@@ -339,10 +363,40 @@ fn clip_outline(m: [Coord; 3], o: &Outline) -> Vec<Vec<Clipped>> {
             c = n;
         }
         if piece.len() >= 3 {
-            out.push(piece);
+            out.push((o.kind(chains[c0].0).0, piece));
         }
     }
-    out
+    // A hole wholly inside the triangle is cut from its polygon's part round it, joined to it
+    // by a seam there and back from the part's nearest corner: the hole runs the other way, so
+    // filled by winding it stays empty, and the seam's two edges, on no side, give no wall. A
+    // hole in no part of its polygon cuts nothing (one outside its own outer ring was already
+    // left out, [`Outline::from_polygons`]).
+    for (ring, hole) in wells {
+        let polygon = o.kind(ring).0;
+        let Some(h) = hole.first().copied() else { continue };
+        let Some((_, part)) = out.iter_mut().find(|(p, part)| *p == polygon && holds(part, h.1)) else { continue };
+        let d = |c: &Clipped| (c.1.x - h.1.x).hypot(c.1.y - h.1.y);
+        let Some(i) = (0..part.len()).min_by(|a, b| d(&part[*a]).total_cmp(&d(&part[*b]))) else { continue };
+        let mut cut = part[..=i].to_vec();
+        cut.last_mut().into_iter().for_each(|c| c.2 = 0);
+        cut.extend(hole.iter().copied());
+        cut.push((h.0, h.1, 0));
+        cut.extend(part[i..].iter().copied());
+        *part = cut;
+    }
+    out.into_iter().map(|p| p.1).collect()
+}
+
+/// Whether `p` lies inside the polygon `part` (by its corners' places), even-odd.
+fn holds(part: &[Clipped], p: Coord) -> bool {
+    let mut inside = false;
+    for (i, a) in part.iter().enumerate() {
+        let z = part[(i + 1) % part.len()];
+        if (a.1.y > p.y) != (z.1.y > p.y) && p.x < a.1.x + (p.y - a.1.y) / (z.1.y - a.1.y) * (z.1.x - a.1.x) {
+            inside = !inside;
+        }
+    }
+    inside
 }
 
 /// How near a corner must lie to a side of the box to be on it (Web Mercator metres).
@@ -1266,6 +1320,61 @@ pub(crate) fn draw_walls(
     let mut mask: Option<Mask> = None;
     // The part of it the last run filled, cleared before the next: a round block has hundreds of sides.
     let mut dirty: Option<tiny_skia::Rect> = None;
+    // A polygon block's wells: each hole's floor at the base, in the walls' colour as shaded at
+    // their foot facing away from the light, drawn first, so the ground and walls in front of it
+    // cover it and it shows only down the well, fogged at its nearest stretch. A hole with no
+    // stretch under the ground drawn is in the picture only when the view lies wholly inside it,
+    // its centre in the hole: fogged there (depth 1, [`rustgis_map::Camera::depth_scale`]).
+    for sides in b.outline.iter().flat_map(|o| o.hole_sides()) {
+        // Each side's stretches by binary search ([`of_side`]), not a scan of all of them.
+        let depth = sides.clone().filter_map(|s| u16::try_from(s).ok()).flat_map(|s| of_side(s).iter().map(|e| e.depth));
+        let around = || {
+            let c = cam.center;
+            sides.clone().map(|i| b.side(i)).fold(false, |inside, (_, a, z)| {
+                inside ^ ((a.y > c.y) != (z.y > c.y) && c.x < a.x + (c.y - a.y) / (z.y - a.y) * (z.x - a.x))
+            })
+        };
+        let Some(depth) = depth.min_by(f64::total_cmp).or_else(|| around().then_some(1.0)) else {
+            continue;
+        };
+        // Its ring in ground px raised to the base, cut to what stands in front of the eye
+        // ([`rustgis_map::Camera::near_v`]): a corner behind it projects nowhere, and leaving it
+        // out would join its neighbours across the floor. Where an edge crosses the limit, its
+        // place and rise are taken along it. A corner that still projects nowhere: no floor.
+        let raised = |m: Coord| {
+            let (u, v) = cam.ground_px(m);
+            (u, v, (b.base / ground.per_unit(m) / cam.res.max(1e-9)).clamp(-1e7, 1e7))
+        };
+        let ring: Vec<(f64, f64, f64)> = sides.map(|i| raised(b.side(i).1)).collect();
+        let ahead = |p: (f64, f64, f64)| cam.near_v(p.2, h) - p.1;
+        let mut cut = Vec::with_capacity(ring.len() + 2);
+        for (i, &a) in ring.iter().enumerate() {
+            let q = ring[(i + 1) % ring.len()];
+            let (da, dq) = (ahead(a), ahead(q));
+            if da >= 0.0 {
+                cut.push(a);
+            }
+            if (da >= 0.0) != (dq >= 0.0) {
+                let t = da / (da - dq);
+                cut.push((a.0 + (q.0 - a.0) * t, a.1 + (q.1 - a.1) * t, a.2 + (q.2 - a.2) * t));
+            }
+        }
+        let project = |p: &(f64, f64, f64)| {
+            cam.project_raised(p.0, p.1, p.2, w, h).map(|(x, y)| (x * k, y * k)).filter(|p| p.0.is_finite() && p.1.is_finite())
+        };
+        let Some(corners) = cut.iter().map(project).collect::<Option<Vec<_>>>().filter(|c| c.len() >= 3) else {
+            continue;
+        };
+        let mut floor = PathBuilder::new();
+        for (i, p) in corners.into_iter().enumerate() {
+            if i == 0 { floor.move_to(pt(p).0, pt(p).1) } else { floor.line_to(pt(p).0, pt(p).1) }
+        }
+        floor.close();
+        if let Some(path) = floor.finish() {
+            let tone = b.walls.shade(0.6 * 0.72).lerp(fog, fog_at(depth));
+            pm.fill_path(&path, &paint(tone, 1.0), FillRule::Winding, Transform::identity(), None);
+        }
+    }
     for (s, key, stretches) in &walk {
         let (s, key) = (*s, *key);
         let Some(n) = faces[s] else { continue };
@@ -1761,6 +1870,139 @@ mod tests {
     fn area(parts: &[Vec<Clipped>]) -> f64 {
         let ring = |p: &Vec<Clipped>| p.iter().zip(p.iter().cycle().skip(1)).map(|(a, b)| a.1.x * b.1.y - b.1.x * a.1.y).sum::<f64>() / 2.0;
         parts.iter().map(ring).sum()
+    }
+
+    #[test]
+    fn a_polygon_blocks_hole_is_cut_from_the_triangles_round_it_as_a_well() {
+        // #2318: a square 10 a side with a hole 2 a side in its middle (both given anticlockwise:
+        // the hole is turned round). Inside the hole nothing is ground; a triangle across its
+        // edge keeps the part outside it, its edge along the hole's side; one round the whole
+        // hole keeps all but the hole, in one part joined to it by a seam that gives no wall.
+        let ring = |c: &[(f64, f64)]| c.iter().map(|&(x, y)| Coord::new(x, y)).collect::<Vec<_>>();
+        let square = ring(&[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)]);
+        let hole = ring(&[(4.0, 4.0), (6.0, 4.0), (6.0, 6.0), (4.0, 6.0)]);
+        // A hole of a polygon whose outer ring has no area goes with it.
+        let flat = ring(&[(20.0, 0.0), (30.0, 0.0), (25.0, 0.0)]);
+        let alone = Outline::from_polygons(vec![vec![square.clone()], vec![flat, hole.clone()]]).expect("an outline");
+        assert_eq!((alone.side_count(), alone.holes(), alone.dropped()), (4, 0, 0));
+        // One lying outside its own outer ring cuts nothing and makes no ground: left out, counted.
+        let stray = ring(&[(20.0, 20.0), (22.0, 20.0), (22.0, 22.0), (20.0, 22.0)]);
+        let o = Outline::from_polygons(vec![vec![square.clone(), stray]]).expect("an outline");
+        assert_eq!((o.side_count(), o.holes(), o.stray()), (4, 0, 1));
+        let [x0, y0, x1, y1] = o.extent();
+        let b = Block { x0, y0, x1, y1, outline: Some(Arc::new(o)), ..unit_block() };
+        assert!(pieces([Coord::new(19.0, 20.5), Coord::new(21.0, 20.5), Coord::new(19.0, 21.5)], &b).is_empty());
+        let o = Outline::from_polygons(vec![vec![square, hole]]).expect("an outline");
+        assert_eq!((o.side_count(), o.holes()), (8, 1));
+        assert!(o.contains(Coord::new(2.0, 2.0)) && !o.contains(Coord::new(5.0, 5.0)));
+        let b = Block { x0: 0.0, y0: 0.0, x1: 10.0, y1: 10.0, outline: Some(Arc::new(o)), ..unit_block() };
+        assert!(pieces([Coord::new(4.5, 4.5), Coord::new(5.5, 4.5), Coord::new(4.5, 5.5)], &b).is_empty());
+        // Across the hole's west side: x 3 to 5, so the half from x 4 is in the hole.
+        let across = pieces([Coord::new(3.0, 4.5), Coord::new(5.0, 4.5), Coord::new(3.0, 5.5)], &b);
+        assert!((area(&across) - (1.0 - 0.25)).abs() < 1e-9, "{}", area(&across));
+        let mut out = Vec::new();
+        let screen = |p: &Vec<Clipped>| p.iter().map(|c| (c.1.x, c.1.y)).collect::<Vec<_>>();
+        across.iter().for_each(|p| edges(&b, p, &screen(p), 1.0, &mut out));
+        assert!(
+            out.len() == 1 && out[0].ends.iter().all(|e| (e.x - 4.0).abs() < 1e-9),
+            "{:?}",
+            out.iter().map(|e| e.ends).collect::<Vec<_>>()
+        );
+        // Round the whole hole: the triangle's 32 less the hole's 4, its four sides the walls.
+        let round = pieces([Coord::new(1.0, 1.0), Coord::new(9.0, 1.0), Coord::new(5.0, 9.0)], &b);
+        assert!(round.len() == 1 && (area(&round) - 28.0).abs() < 1e-9, "{}", area(&round));
+        out.clear();
+        edges(&b, &round[0], &screen(&round[0]), 1.0, &mut out);
+        let mut sides: Vec<u16> = out.iter().map(|e| e.side).collect();
+        sides.sort_unstable();
+        assert_eq!(sides, vec![4, 5, 6, 7]);
+        // A hole's walls face into it: its north side (its first, run east) faces south.
+        assert_eq!(b.side(4).1, Coord::new(4.0, 6.0));
+        assert!(b.beyond(4, Coord::new(5.0, 5.0)) > 0.0 && b.beyond(4, Coord::new(5.0, 7.0)) < 0.0);
+    }
+
+    #[test]
+    fn a_polygon_blocks_hole_seam_across_a_notch_fills_no_ground_outside_the_polygon() {
+        // #2318: a U, its bay x 1 to 2 from y = 1 up, the east arm's inner side with a spike into
+        // the bay to (1.2, 5), and a hole in the west arm. Every corner of the hole is nearer the
+        // spike's tip than any corner of the west arm, so the seam from the part's nearest corner
+        // crosses the bay. Filled as the frame fills it (by winding), the seam's two edges cancel:
+        // the bay stays bare, the hole too, and the walls are the outline's sides only.
+        let ring = |c: &[(f64, f64)]| c.iter().map(|&(x, y)| Coord::new(x, y)).collect::<Vec<_>>();
+        let u = ring(&[
+            (0.0, 0.0),
+            (3.0, 0.0),
+            (3.0, 10.0),
+            (2.0, 10.0),
+            (2.0, 5.2),
+            (1.2, 5.0),
+            (2.0, 4.8),
+            (2.0, 1.0),
+            (1.0, 1.0),
+            (1.0, 10.0),
+            (0.0, 10.0),
+        ]);
+        let hole = ring(&[(0.3, 4.8), (0.9, 4.8), (0.9, 5.2), (0.3, 5.2)]);
+        let o = Outline::from_polygons(vec![vec![u, hole.clone()]]).expect("an outline");
+        assert_eq!((o.side_count(), o.holes()), (15, 1));
+        let [x0, y0, x1, y1] = o.extent();
+        let b = Block { x0, y0, x1, y1, outline: Some(Arc::new(o)), ..unit_block() };
+        let o = b.outline.as_deref().expect("an outline");
+        let parts = pieces([Coord::new(-5.0, -5.0), Coord::new(30.0, -5.0), Coord::new(-5.0, 30.0)], &b);
+        assert_eq!(parts.len(), 1);
+        // The U's 30 less the bay's 9, plus the spike's 0.16, less the hole's 0.24.
+        assert!((area(&parts) - 20.92).abs() < 1e-9, "{}", area(&parts));
+        // The seam does run from the spike's tip, across the bay, to a corner of the hole.
+        let p = &parts[0];
+        let tip = Coord::new(1.2, 5.0);
+        assert!(p.iter().zip(p.iter().cycle().skip(1)).any(|(a, z)| a.1 == tip && hole.contains(&z.1)), "{p:?}");
+        // Drawn as the frame draws a part, 40 px a unit: every pixel more than 1.5 px from the
+        // outline is filled where the outline holds it and bare elsewhere (the bay, the hole).
+        let (k, m) = (40.0, 8.0);
+        let mut pm = Pixmap::new((3.0 * k + 2.0 * m) as u32, (10.0 * k + 2.0 * m) as u32).expect("a pixmap");
+        let mut pb = PathBuilder::new();
+        for (i, c) in p.iter().enumerate() {
+            let (x, y) = ((c.1.x * k + m) as f32, (c.1.y * k + m) as f32);
+            if i == 0 { pb.move_to(x, y) } else { pb.line_to(x, y) }
+        }
+        pb.close();
+        let path = pb.finish().expect("a path");
+        let mut paint = Paint { anti_alias: true, ..Paint::default() };
+        paint.set_color_rgba8(0, 0, 0, 255);
+        pm.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+        let off = |q: Coord| {
+            o.sides()
+                .iter()
+                .map(|s| {
+                    let (dx, dy) = (s.z.x - s.a.x, s.z.y - s.a.y);
+                    let u = (((q.x - s.a.x) * dx + (q.y - s.a.y) * dy) / (dx * dx + dy * dy)).clamp(0.0, 1.0);
+                    (q.x - s.a.x - u * dx).hypot(q.y - s.a.y - u * dy)
+                })
+                .fold(f64::INFINITY, f64::min)
+        };
+        let (mut bay, mut wrong) = (0, Vec::new());
+        for j in 0..pm.height() {
+            for i in 0..pm.width() {
+                let q = Coord::new((f64::from(i) + 0.5 - m) / k, (f64::from(j) + 0.5 - m) / k);
+                if off(q) * k <= 1.5 {
+                    continue;
+                }
+                let alpha = pm.pixel(i, j).map_or(0, |c| c.alpha());
+                let ground = o.contains(q);
+                bay += usize::from(!ground && q.x > 1.0 && q.x < 2.0 && q.y > 1.0 && q.y < 10.0);
+                if alpha != if ground { 255 } else { 0 } {
+                    wrong.push((q.x, q.y, alpha));
+                }
+            }
+        }
+        assert!(bay > 1000 && wrong.is_empty(), "{bay} {:?}", &wrong[..wrong.len().min(8)]);
+        // Its walls are the outline's 15 sides, none along the seam (it runs along none).
+        let mut out = Vec::new();
+        edges(&b, p, &p.iter().map(|c| (c.1.x, c.1.y)).collect::<Vec<_>>(), 1.0, &mut out);
+        let mut sides: Vec<u16> = out.iter().map(|e| e.side).collect();
+        sides.sort_unstable();
+        sides.dedup();
+        assert_eq!(sides, (0..15).collect::<Vec<u16>>());
     }
 
     #[test]

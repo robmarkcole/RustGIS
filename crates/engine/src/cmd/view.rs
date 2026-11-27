@@ -49,7 +49,7 @@ pub fn commands() -> Vec<C> {
         }).roles(&[]).effects(crate::policy::Effects::NONE)
         .params(r#"{"mode": "none"|"distance", "distance"?: metres from the view's centre}"#),
         C::new("map.terrain", "Terrain", "View › Scene", terrain).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network)).params(
-            r##"{"layer"?: a DEM raster layer (heights in metres; without layer or tiles, and no terrain yet, the active layer when it is a raster) | "tiles"?: elevation tile URL with {z}/{x}/{y}, "encoding"?: "terrarium"|"mapbox" (tiles; default terrarium), "exaggeration"?: 0 to 20 (default 1, or the terrain's), "block"?: a block diagram {"extent"?: "layer" (the DEM's extent, default) | [xmin, ymin, xmax, ymax] in map units (needed over tiles), "depth"?: metres from the lowest ground to the base (default half the relief, at least 100), "walls"?: "#RRGGBB" (default #C8B89A) | {"color"?: "#RRGGBB" (default #C8B89A), "layer"?: a polygon layer that holds all its features (not one read a view at a time; it may be hidden): its symbology colours the walls where its polygons meet the block's edge, and the walls are color off its polygons}, "shape"?: "box" (default) | "circle" (the largest circle in the box, its walls round it) | {"layer": a polygon layer, "where"?: sql (picks its polygons, as a definition query)} (the ground inside the polygons' outer rings, holes not cut, the box round them: no extent), "radius"?: a circle's radius in map units (default: the largest in the box), "water"?: the terrain's water shown in the walls' section {"depth"?: metres from the level to the floor, "field"?: a numeric field of the water layer holding each one's depth} (one of them needed), or false}, keys left out stay as the block had them and null puts one back to its default (a new block takes the defaults), and the block's "water" is given whole each time, replacing the old, or false to take it off (default: as it was), "water"?: water bodies drawn flat at their level {"layer": a polygon layer, "level"?: a numeric field of levels in metres (default: each polygon's lowest height along its shore), "glint"?: 0 to 1, how brightly a tilted view's water shines where it reflects the sun toward the eye (default 0.3; 0: none), "shore"?: 0 to 1, how dark the band along the water's shore is at the outline, fading a few pixels inside it (default 0.35; 0: none)}, or false to take it off (default: as it was), "off"?: true}"##,
+            r##"{"layer"?: a DEM raster layer (heights in metres; without layer or tiles, and no terrain yet, the active layer when it is a raster) | "tiles"?: elevation tile URL with {z}/{x}/{y}, "encoding"?: "terrarium"|"mapbox" (tiles; default terrarium), "exaggeration"?: 0 to 20 (default 1, or the terrain's), "block"?: a block diagram {"extent"?: "layer" (the DEM's extent, default) | [xmin, ymin, xmax, ymax] in map units (needed over tiles), "depth"?: metres from the lowest ground to the base (default half the relief, at least 100), "walls"?: "#RRGGBB" (default #C8B89A) | {"color"?: "#RRGGBB" (default #C8B89A), "layer"?: a polygon layer that holds all its features (not one read a view at a time; it may be hidden): its symbology colours the walls where its polygons meet the block's edge, and the walls are color off its polygons}, "shape"?: "box" (default) | "circle" (the largest circle in the box, its walls round it) | {"layer": a polygon layer, "where"?: sql (picks its polygons, as a definition query)} (the ground inside the polygons, each hole a well with its own walls and its floor at the base, the box round them: no extent), "radius"?: a circle's radius in map units (default: the largest in the box), "water"?: the terrain's water shown in the walls' section {"depth"?: metres from the level to the floor, "field"?: a numeric field of the water layer holding each one's depth} (one of them needed), or false}, keys left out stay as the block had them and null puts one back to its default (a new block takes the defaults), and the block's "water" is given whole each time, replacing the old, or false to take it off (default: as it was), "water"?: water bodies drawn flat at their level {"layer": a polygon layer, "level"?: a numeric field of levels in metres (default: each polygon's lowest height along its shore), "glint"?: 0 to 1, how brightly a tilted view's water shines where it reflects the sun toward the eye (default 0.3; 0: none), "shore"?: 0 to 1, how dark the band along the water's shore is at the outline, fading a few pixels inside it (default 0.35; 0: none)}, or false to take it off (default: as it was), "off"?: true}"##,
         ),
         C::new("map.exportOrbit", "Export Orbit", "View › Scene", |s, p| super::exports::write_here(s, p, "map.exportOrbit")).inputs(orbit_inputs).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
             .view()
@@ -458,31 +458,26 @@ fn block_polygons(s: &Session, o: &serde_json::Map<String, Value>) -> Result<rus
 
 /// What simplifying a polygon block's outline lost: rings narrower than the spacing, and corners
 /// past a third of the finest mesh cell or its smallest rings, to stay under 65 535 sides (said
-/// when it is set and when a project opens).
+/// when it is set and when a project opens), and holes left out as they lay outside their own
+/// polygon.
 pub(crate) fn outline_simplified(layer: &str, o: &rustgis_render::terrain::Outline) -> Option<String> {
     let (spacing, coarsened) = o.spacing();
     // Rings narrower than the spacing, with no area left once thinned (#2318).
     let narrow =
         (o.narrow() > 0).then(|| format!("{} ring(s) of '{layer}' narrower than {spacing:.0} m were left out of the block", o.narrow()));
-    let left = match o.dropped() {
-        0 if !coarsened => return narrow,
-        0 => String::new(),
-        n => format!(", and its {n} smallest ring(s) were left out"),
+    let stray = (o.stray() > 0)
+        .then(|| format!("{} hole(s) of '{layer}' lying outside their own polygon's outer ring were left out (not cut)", o.stray()));
+    let merged = match o.dropped() {
+        0 if !coarsened => None,
+        n => {
+            let left = if n == 0 { String::new() } else { format!(", and its {n} smallest ring(s) were left out") };
+            Some(format!(
+                "the outline of '{layer}' the block is cut to has too many corners: corners up to {spacing:.0} m apart were merged (less in smaller rings){left}, to stay under 65535 sides"
+            ))
+        }
     };
-    let said = format!(
-        "the outline of '{layer}' the block is cut to has too many corners: corners up to {spacing:.0} m apart were merged (less in smaller rings){left}, to stay under 65535 sides"
-    );
-    Some(match narrow {
-        Some(n) => format!("{said}; {n}"),
-        None => said,
-    })
-}
-
-/// The holes of a polygon block's polygons, which aren't cut: the ground inside them is drawn
-/// (said when it is set and when a project opens).
-pub(crate) fn outline_holes(layer: &str, o: &rustgis_render::terrain::Outline) -> Option<String> {
-    let n = o.holes();
-    (n > 0).then(|| format!("{n} hole(s) in the polygons of '{layer}' the block is cut to aren't cut: the ground inside them is drawn"))
+    let said: Vec<String> = [merged, narrow, stray].into_iter().flatten().collect();
+    (!said.is_empty()).then(|| said.join("; "))
 }
 
 /// The name of the polygon layer `name` for `what` (water, a block's walls), checked: a polygon
@@ -753,7 +748,7 @@ fn terrain(s: &mut Session, p: &Value) -> CmdResult {
     // A polygon block's outline as drawn: its sides and how near its corners were let lie.
     if let Some((_, o)) = &outline {
         let (spacing, coarsened) = o.spacing();
-        out["block"]["outline"] = json!({"sides": o.side_count(), "spacing": spacing, "coarsened": coarsened, "dropped": o.dropped(), "holes": o.holes(), "narrow": o.narrow()});
+        out["block"]["outline"] = json!({"sides": o.side_count(), "spacing": spacing, "coarsened": coarsened, "dropped": o.dropped(), "holes": o.holes(), "stray": o.stray(), "narrow": o.narrow()});
     }
     if matches!(t.source, TerrainSource::Layer(_)) && t.block.is_some() && dem_box.is_none() {
         out["block"]["pendingDem"] = json!(true);
@@ -839,7 +834,7 @@ fn terrain(s: &mut Session, p: &Value) -> CmdResult {
     m.view.terrain = Some(t);
     // A polygon block's outline simplified past a third of the finest mesh cell, or short of its
     // smallest rings, to stay under 65 535 sides: said, with how far.
-    for said in outline.iter().flat_map(|(layer, o)| [outline_simplified(layer, o), outline_holes(layer, o)]).flatten() {
+    for said in outline.iter().flat_map(|(layer, o)| outline_simplified(layer, o)) {
         s.notify(format!("Terrain: {said}"), false);
     }
     if block_cut {
