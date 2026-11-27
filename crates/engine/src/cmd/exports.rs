@@ -302,7 +302,7 @@ pub(crate) fn copy_notices_coded(copy: &mut Session, path: &str) -> Vec<(rustgis
             rustgis_data::loss::Note::plain(format!("{path}: {earlier} earlier notices from drawing it aren't shown")),
         ));
     }
-    said.extend(kept.into_iter().map(|n| (n.severity, rustgis_data::loss::Note { loss: n.loss(), text: n.text })));
+    said.extend(kept.into_iter().map(|n| (n.severity, rustgis_data::loss::Note { loss: n.loss(), text: n.text, tally: None })));
     said
 }
 

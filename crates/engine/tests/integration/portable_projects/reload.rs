@@ -1439,7 +1439,8 @@ fn project_open_reports_fresh_conversion_losses_once_per_kind_but_not_clean_conv
                     assert!(losses[0].text.starts_with("2 layers: "), "{}", losses[0].text);
                     assert!(losses[0].text.ends_with(&format!("first: {first}")), "{}", losses[0].text);
                 }
-                assert!(losses[0].text.contains("1 source feature(s)"), "{}", losses[0].text);
+                // One feature each: several layers' notice gives their total.
+                assert!(losses[0].text.contains(&format!("{layer_count} source feature(s)")), "{}", losses[0].text);
                 assert!(!losses[0].error);
             } else {
                 assert!(losses.is_empty(), "{notices:?}");

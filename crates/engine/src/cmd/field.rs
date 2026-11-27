@@ -654,7 +654,7 @@ pub(crate) fn export_work(s: &Session, p: &Value) -> Result<super::exports::Work
             let mark = s.notice_mark();
             super::exports::say_coded(
                 s,
-                other.into_iter().map(|n| (n.severity, rustgis_data::loss::Note { loss: n.loss(), text: n.text })).collect(),
+                other.into_iter().map(|n| (n.severity, rustgis_data::loss::Note { loss: n.loss(), text: n.text, tally: None })).collect(),
             );
             for note in notes.into_iter().chain(construction_notes) {
                 s.say(note);

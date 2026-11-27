@@ -479,10 +479,13 @@ fn convert_one_fresh_in(dir: &Path, src: &Path, layer: &str, family: Option<Fami
     )?
     .ok_or_else(|| DataError::Format(format!("layer '{layer}' has no compatible declared geometry")))?;
     if converted.unprojected {
-        converted.notes.push(crate::loss::Note::loss(
-            crate::loss::LossCode::AssumedCrs,
-            format!("GDAL: '{layer}' has no declared coordinate system; its coordinates were left unprojected"),
-        ));
+        converted.notes.push(
+            crate::loss::Note::loss(
+                crate::loss::LossCode::AssumedCrs,
+                format!("GDAL: '{layer}' has no declared coordinate system; its coordinates were left unprojected"),
+            )
+            .with_tally(crate::loss::Tally::new(crate::loss::Finder::Gdal, crate::loss::Counted::NoDeclaredCrs, Some(1))),
+        );
     }
     if converted.in_lonlat {
         converted.notes.push(in_lonlat_note(layer));
@@ -510,12 +513,19 @@ fn convert_one_fresh_in(dir: &Path, src: &Path, layer: &str, family: Option<Fami
             Some(0) => {}
             Some(count) => {
                 zm_dropped = true;
-                zm_note = Some(crate::loss::Note::loss(
-                    crate::loss::LossCode::DroppedZm,
-                    format!(
-                        "GDAL: '{layer}' contains Z or M coordinates on {count} source feature(s); conversion keeps only XY coordinates"
-                    ),
-                ));
+                zm_note = Some(
+                    crate::loss::Note::loss(
+                        crate::loss::LossCode::DroppedZm,
+                        format!(
+                            "GDAL: '{layer}' contains Z or M coordinates on {count} source feature(s); conversion keeps only XY coordinates"
+                        ),
+                    )
+                    .with_tally(crate::loss::Tally::new(
+                        crate::loss::Finder::Gdal,
+                        crate::loss::Counted::ZmDropped,
+                        Some(count),
+                    )),
+                );
             }
             None => {
                 // A layer that declares them may still hold only x and y: said without a code, as
@@ -524,7 +534,8 @@ fn convert_one_fresh_in(dir: &Path, src: &Path, layer: &str, family: Option<Fami
                 zm_dropped = info.has_zm;
                 zm_note = Some(crate::loss::Note::plain(format!(
                     "GDAL: '{layer}': an unknown number of source feature(s) may have had Z or M coordinates dropped; conversion keeps only XY coordinates"
-                )));
+                ))
+                .with_tally(crate::loss::Tally::new(crate::loss::Finder::Gdal, crate::loss::Counted::ZmDropped, None)));
             }
         }
     }
@@ -728,18 +739,20 @@ fn convert_one_in(dir: &Path, src: &Path, layer: &str, request: ConversionReques
             let count = counts.entry(line.to_string()).or_default();
             *count = count.saturating_add(1);
         }
-        let mut notes: crate::loss::Notes =
-            counts.into_iter().map(|(line, count)| format!("GDAL: {line} ({count} occurrence(s))")).collect();
+        let mut notes: crate::loss::Notes = counts.into_iter().map(|(line, count)| gdal_warning(line, count)).collect();
         // A layer declaring one geometry type holds no other; only a mixed layer is counted. A
         // count that fails doesn't undo a good conversion: the possible loss is said instead.
         if let Some(family) = family.filter(|_| kind.is_none()) {
             match count_other_families(&full, layer, family) {
                 Ok(0) => {}
-                Ok(other) => notes.push(crate::loss::Note::loss(
-                    crate::loss::LossCode::DroppedFeature,
-                    format!("GDAL: {other} features of another geometry type were left out"),
+                Ok(other) => notes.push(crate::loss::Note::tallied(
+                    Some(crate::loss::LossCode::DroppedFeature),
+                    crate::loss::Tally::new(crate::loss::Finder::Gdal, crate::loss::Counted::OtherGeometryType, Some(other)),
                 )),
-                Err(_) => notes.push("GDAL: an unknown number of features of another geometry type may have been left out"),
+                Err(_) => notes.push(crate::loss::Note::tallied(
+                    None,
+                    crate::loss::Tally::new(crate::loss::Finder::Gdal, crate::loss::Counted::OtherGeometryType, None),
+                )),
             }
         }
         notes
@@ -790,6 +803,15 @@ fn placement(fgb: &Path) -> Placement {
             });
         if same { Placement::LonLat } else { Placement::Own }
     })
+}
+
+/// A warning GDAL gave `count` times while converting, in its words. Its integer overflows,
+/// whatever the value, are counted as one kind, so several layers' are said once.
+fn gdal_warning(line: String, count: u64) -> crate::loss::Note {
+    use crate::loss::{Counted, Finder, Note, Tally};
+    let text = format!("GDAL: {line} ({count} occurrence(s))");
+    let counted = if line.to_ascii_lowercase().contains("integer overflow") { Counted::IntegerOverflow } else { Counted::Warning(line) };
+    Note::plain(text).with_tally(Tally::new(Finder::Gdal, counted, Some(count)))
 }
 
 /// The notice for a layer converted to longitude/latitude because its system can't be read.

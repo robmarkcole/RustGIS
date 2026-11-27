@@ -1066,6 +1066,7 @@ impl SourceLayer {
 
     /// Opens a replacement with fresh handles, windows, caches and selection.
     pub fn relinked(&self, path: &str, table: Option<&str>) -> Result<SourceLayer, String> {
+        use rustgis_data::loss::{Counted, Finder, Note, Tally};
         if self.embedded.is_some() || self.postgis.is_some() || self.mysql.is_some() || self.sqlserver.is_some() {
             return Err("the layer reads a database or data kept in the project: there's no file to repair".into());
         }
@@ -1118,20 +1119,21 @@ impl SourceLayer {
                 let out = fresh.output;
                 if out.skipped > 0 {
                     // A row is a feature: one without geometry isn't added, and its values go with it.
-                    conversion_notes.push(rustgis_data::loss::Note::loss(
-                        rustgis_data::loss::LossCode::DroppedFeature,
-                        format!("DuckDB: {} rows without a geometry were left out", out.skipped),
+                    conversion_notes.push(Note::tallied(
+                        Some(rustgis_data::loss::LossCode::DroppedFeature),
+                        Tally::new(Finder::Duckdb, Counted::RowsWithoutGeometry, Some(out.skipped)),
                     ));
                 }
                 if out.other_family > 0 {
-                    conversion_notes.push(format!("DuckDB: {} rows of another geometry type were left out", out.other_family));
+                    conversion_notes
+                        .push(Note::tallied(None, Tally::new(Finder::Duckdb, Counted::OtherGeometryType, Some(out.other_family))));
                 }
                 let part = out.parts.first().ok_or_else(|| format!("{path}: the table returns no {}", d.family.label()))?;
                 if part.zm_dropped > 0 {
-                    conversion_notes.push(rustgis_data::loss::Note::loss(
-                        rustgis_data::loss::LossCode::DroppedZm,
-                        rustgis_data::zm_note(Some(part.zm_dropped)),
-                    ));
+                    conversion_notes.push(
+                        Note::loss(rustgis_data::loss::LossCode::DroppedZm, rustgis_data::zm_note(Some(part.zm_dropped)))
+                            .with_tally(Tally::new(Finder::Duckdb, Counted::ZmDropped, Some(part.zm_dropped))),
+                    );
                 }
                 declared_empty = part.count == 0;
                 new.path = Some(part.path.display().to_string());
@@ -1189,7 +1191,7 @@ impl SourceLayer {
         }
         if probe.skipped > 0 {
             // A probe of one feature: the reads that follow count these rows as they say them.
-            conversion_notes.push(format!("{} rows could not be read while checking the replacement", probe.skipped));
+            conversion_notes.push(Note::tallied(None, Tally::new(Finder::Rustgis, Counted::UnreadableRows, probe.skipped.try_into().ok())));
         }
         if let Some(info) = new.info() {
             let mut info = info.clone();

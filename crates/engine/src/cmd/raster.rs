@@ -562,7 +562,7 @@ pub(crate) fn loss_lines(losses: Vec<(String, rustgis_data::loss::Note)>) -> Vec
     }
     let mut lines = Vec::new();
     for (code, parts, ranges, named) in kinds {
-        let line = |text: String| rustgis_data::loss::Note { loss: code, text };
+        let line = |text: String| rustgis_data::loss::Note { loss: code, text, tally: None };
         let differ = ranges.iter().any(|(lo, hi)| lo != hi);
         // A few rasters whose numbers differ: each its own, so none is lost in a range.
         if differ && named.len() <= 3 {
@@ -585,7 +585,7 @@ pub(crate) fn loss_lines(losses: Vec<(String, rustgis_data::loss::Note)>) -> Vec
             }
         };
         let each = if differ { ", each" } else { "" };
-        lines.push(rustgis_data::loss::Note { loss: code, text: format!("{who}{each}: {line}") });
+        lines.push(rustgis_data::loss::Note { loss: code, text: format!("{who}{each}: {line}"), tally: None });
     }
     lines
 }

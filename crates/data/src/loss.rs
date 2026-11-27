@@ -184,27 +184,40 @@ pub struct LossMessage {
 pub struct Note {
     pub text: String,
     pub loss: Option<LossCode>,
+    /// What the note counts, for code that groups or adds up notes: it reads this, never the
+    /// words, which may be reworded or translated. Boxed, so a note without one stays small.
+    pub tally: Option<Box<Tally>>,
 }
 
 impl Note {
     /// A note that reports a loss.
     pub fn loss(code: LossCode, text: impl Into<String>) -> Self {
-        Self { text: text.into(), loss: Some(code) }
+        Self { text: text.into(), loss: Some(code), tally: None }
     }
 
     /// A note that reports no loss.
     pub fn plain(text: impl Into<String>) -> Self {
-        Self { text: text.into(), loss: None }
+        Self { text: text.into(), loss: None, tally: None }
+    }
+
+    /// A note that says `tally` in its own words ([`Tally::text`]), with the loss it reports, if any.
+    pub fn tallied(loss: Option<LossCode>, tally: Tally) -> Self {
+        Self { text: tally.text(), loss, tally: Some(Box::new(tally)) }
+    }
+
+    /// The same note, counting `tally`.
+    pub fn with_tally(self, tally: Tally) -> Self {
+        Self { tally: Some(Box::new(tally)), ..self }
     }
 
     /// The same note, its text after `prefix: ` (the layer or file it is about).
     pub fn prefixed(self, prefix: &str) -> Self {
-        Self { text: format!("{prefix}: {}", self.text), loss: self.loss }
+        Self { text: format!("{prefix}: {}", self.text), ..self }
     }
 
     /// The same note, its text changed by `f` (a qualifier added).
     pub fn map_text(self, f: impl FnOnce(String) -> String) -> Self {
-        Self { text: f(self.text), loss: self.loss }
+        Self { text: f(self.text), ..self }
     }
 
     pub fn as_str(&self) -> &str {
@@ -264,6 +277,92 @@ impl PartialEq<&str> for Note {
 impl PartialEq<String> for Note {
     fn eq(&self, other: &String) -> bool {
         self == other.as_str()
+    }
+}
+
+/// Who found what a [`Tally`] counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Finder {
+    /// GDAL's conversion of a file RustGIS doesn't read itself.
+    Gdal,
+    /// DuckDB's conversion of a table.
+    Duckdb,
+    /// RustGIS's own check.
+    Rustgis,
+}
+
+impl Finder {
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::Gdal => "GDAL: ",
+            Self::Duckdb => "DuckDB: ",
+            Self::Rustgis => "",
+        }
+    }
+}
+
+/// What a [`Tally`] counts.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Counted {
+    /// Features or rows of another geometry type than the layer's, left out.
+    OtherGeometryType,
+    /// Rows without a geometry, left out.
+    RowsWithoutGeometry,
+    /// Features whose Z or M values were dropped.
+    ZmDropped,
+    /// Rows that couldn't be read while checking a replacement.
+    UnreadableRows,
+    /// A layer with no declared coordinate system, left unprojected: its count is 1.
+    NoDeclaredCrs,
+    /// Integer overflow warnings, whatever value overflowed.
+    IntegerOverflow,
+    /// Times a converting program gave this warning, in its own words.
+    Warning(String),
+}
+
+/// What a note counts, how many and who found it: what notes from several layers are grouped and
+/// added up by, so that rewording a note changes no decision or total.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Tally {
+    pub by: Finder,
+    pub counted: Counted,
+    /// How many, or `None` where the number isn't known.
+    pub count: Option<u64>,
+}
+
+impl Tally {
+    pub fn new(by: Finder, counted: Counted, count: Option<u64>) -> Self {
+        Self { by, counted, count }
+    }
+
+    /// What this count says, naming no layer, so that it also says a total over several.
+    pub fn text(&self) -> String {
+        let n = self.count.map_or_else(|| "an unknown number of".to_string(), |n| n.to_string());
+        let what = match (&self.counted, self.by) {
+            (Counted::OtherGeometryType, Finder::Duckdb) => match self.count {
+                Some(_) => format!("{n} rows of another geometry type were left out"),
+                None => format!("{n} rows of another geometry type may have been left out"),
+            },
+            (Counted::OtherGeometryType, _) => match self.count {
+                Some(_) => format!("{n} features of another geometry type were left out"),
+                None => format!("{n} features of another geometry type may have been left out"),
+            },
+            (Counted::RowsWithoutGeometry, _) => match self.count {
+                Some(_) => format!("{n} rows without a geometry were left out"),
+                None => format!("{n} rows without a geometry may have been left out"),
+            },
+            (Counted::ZmDropped, Finder::Gdal) => match self.count {
+                Some(_) => format!("{n} source feature(s) had Z or M coordinates; conversion keeps only XY coordinates"),
+                None => format!("{n} source feature(s) may have had Z or M coordinates dropped; conversion keeps only XY coordinates"),
+            },
+            (Counted::ZmDropped, _) => crate::zm_note(self.count),
+            (Counted::UnreadableRows, _) => format!("{n} rows could not be read while checking the replacement"),
+            // Said of each layer that has none, so with no count.
+            (Counted::NoDeclaredCrs, _) => "no declared coordinate system; the coordinates were left unprojected".to_string(),
+            (Counted::IntegerOverflow, _) => format!("{n} integer overflow warning(s)"),
+            (Counted::Warning(line), _) => format!("{line} ({n} occurrence(s))"),
+        };
+        format!("{}{what}", self.by.prefix())
     }
 }
 

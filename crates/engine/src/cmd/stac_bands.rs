@@ -460,6 +460,7 @@ mod desktop {
             .map(|((_, loss), texts, bands, files)| Note {
                 text: format!("{} ({files} file{}): {}", bands.join(", "), if files == 1 { "" } else { "s" }, texts.join("; ")),
                 loss,
+                tally: None,
             })
             .collect()
     }
@@ -1206,7 +1207,7 @@ mod tests {
         assert_eq!(merge_notes(&[(w(&["red"]), vec![edges("north"), pieces])]).len(), 2);
         assert!(merge_notes(&[(w(&["red"]), Vec::new()), (w(&["green"]), Vec::new())]).is_empty());
         // The same words as a coded and as a plain note are two notices, each keeping its code.
-        let rounded = |code: Option<LossCode>| Note { text: "values rounded to 32-bit floats".into(), loss: code };
+        let rounded = |code: Option<LossCode>| Note { text: "values rounded to 32-bit floats".into(), loss: code, tally: None };
         let split = merge_notes(&[
             (w(&["red"]), vec![rounded(Some(LossCode::ChangedRounded))]),
             (w(&["green"]), vec![rounded(None)]),
