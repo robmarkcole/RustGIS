@@ -41,7 +41,7 @@ pub fn commands() -> Vec<C> {
             r#"{"url": "a WCS address", "type"?: "wcs", "layer": "the coverage's name", "text"?: "the capabilities document, when already fetched", "documents"?: "additional fetched documents, as service.layers", "source_url"?: "the listed coverage's source_url", "describe"?: "its DescribeCoverage answer, when already fetched", "bbox"?: [west, south, east, north] | "view" (the default) | "full", "connection"?: "the saved web-service connection id whose login the request uses", "anonymous"?: boolean (never use a saved login for the coverage or its description)} → the GetCoverage address of a GeoTIFF (layer.addUrl adds it), its area in longitude/latitude, and "coverageCrs": the coverage's own system when it is asked in it (as layer.addUrl takes it, for an answer that doesn't say its system)"#,
         ),
         C::new("catalog.search", "Search Catalogue", "Home › Add", catalog_search).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network)).view().params(
-            r#"{"url": "a catalogue's CSW address", "query"?: "words anywhere in the records", "bbox"?: [west, south, east, north] | "view" (none by default), "start"?: "the first record's position (a page's next)", "text"?: "the GetRecords answer, when already fetched", "connection"?: "as service.layers"} → records with their service and download links (service.add or layer.addUrl add them; a link with "fromDocument": true came from a catalogue read from the internet: give layer.addUrl that too)"#,
+            r#"{"url": "a catalogue's CSW address", "query"?: "words anywhere in the records", "bbox"?: [west, south, east, north] | "view" (none by default; one across the antimeridian isn't asked for, which a note says), "start"?: "the first record's position (a page's next)", "bboxCrs"?: "CRS84" | "none" (how the area's coordinate system is named to the catalogue; by default CRS84, and none when the catalogue answers that with an exception to a request RustGIS makes (a supplied text isn't asked again); the answer's bboxCrs says which was read, to give with its next page), "text"?: "the GetRecords answer, when already fetched", "connection"?: "as service.layers"} → records with their service and download links (service.add or layer.addUrl add them; a link with "fromDocument": true came from a catalogue read from the internet: give layer.addUrl that too)"#,
         ),
     ];
     commands.extend(group::commands());
@@ -1858,17 +1858,80 @@ fn coverage(s: &mut Session, p: &Value) -> CmdResult {
     Ok(out)
 }
 
+/// Said when the records read are those of an area asked for without its coordinate system.
+pub const AREA_UNNAMED: &str = "the catalogue answered with an exception when the area's coordinate system was named (CRS84), so it was asked again without it, longitude first";
+
+/// Said when an area across the antimeridian was given: it isn't asked for ([`search_area`]).
+pub const AREA_ACROSS_ANTIMERIDIAN: &str =
+    "the area crosses the antimeridian, which the catalogue isn't asked for: the whole catalogue is searched";
+
+/// The notes `catalog.search` gives about its words alone, the same on every page of a search:
+/// control characters left out and words cut.
+pub fn words_notes(query: &str) -> Vec<String> {
+    let (_, unwritable, cut) = rustgis_data::ogc::search_words(query);
+    let mut notes = Vec::new();
+    if unwritable > 0 {
+        notes.push(format!("control characters left out of the words searched for: {unwritable}"));
+    }
+    if cut > 0 {
+        notes.push(format!("the words are cut to {} characters; left out: {cut}", rustgis_data::ogc::MAX_SEARCH_WORDS));
+    }
+    notes
+}
+
+/// The area `catalog.search` asks for, if any. A box across the antimeridian isn't asked for: the
+/// whole catalogue is searched.
+fn search_area(s: &Session, p: &Value) -> Result<Option<[f64; 4]>, String> {
+    match p.get("bbox") {
+        None | Some(Value::Null) => Ok(None),
+        Some(_) => Ok(Some(super::catalogs::area(s, p)?).filter(|a| a[0] <= a[2])),
+    }
+}
+
+/// Whether `catalog.search` names its area's coordinate system; `None` when it isn't told, so one
+/// refused with it named is asked for again without ([`records_again`]).
+fn area_named(p: &Value) -> Result<Option<bool>, String> {
+    match p.get("bboxCrs") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) if v == "CRS84" => Ok(Some(true)),
+        Some(v) if v == "none" => Ok(Some(false)),
+        Some(_) => Err("bboxCrs is \"CRS84\" or \"none\"".into()),
+    }
+}
+
 /// The GetRecords request `catalog.search` makes of its parameters (the app fetches it first).
 pub fn records_request(s: &Session, p: &Value) -> Result<String, String> {
     let url = url_of(p)?;
     let words = ps(p, "query").unwrap_or("");
-    let bbox = match p.get("bbox") {
-        None | Some(Value::Null) => None,
-        // A box across the antimeridian isn't asked for: the whole catalogue is searched.
-        Some(_) => Some(super::catalogs::area(s, p)?).filter(|a| a[0] <= a[2]),
-    };
+    let bbox = search_area(s, p)?;
+    let named = area_named(p)?.unwrap_or(true);
     let start = p.get("start").and_then(Value::as_u64).unwrap_or(1).clamp(1, 1_000_000);
-    Ok(crate::render::rustgis_tiles::logins::inherit(url, &rustgis_data::ogc::records_url(url, words, bbox, start)))
+    Ok(crate::render::rustgis_tiles::logins::inherit(url, &rustgis_data::ogc::records_url(url, words, bbox, named, start)))
+}
+
+/// `catalog.search`'s parameters for asking again after the answer `body`: the catalogue answered
+/// an area whose coordinate system was named with an exception, so it is asked for without
+/// ([`AREA_UNNAMED`]). With them, the error the answer is. `None` when there is nothing to ask again.
+pub fn records_again(s: &Session, p: &Value, body: &[u8]) -> Option<(Value, String)> {
+    if area_named(p).ok()?.is_some() || search_area(s, p).ok()?.is_none() || !rustgis_data::ogc::records_refused(body) {
+        return None;
+    }
+    let url = url_of(p).ok()?;
+    let refused = crate::sources::message_with_address(url, &rustgis_data::ogc::parse_records(url, body).err()?);
+    let mut again = p.clone();
+    again.as_object_mut()?.remove("text");
+    again["bboxCrs"] = json!("none");
+    Some((again, refused))
+}
+
+/// The error of a search refused with its area's coordinate system named (`first`) and failed
+/// again without (`second`): the first, with what the second says besides.
+pub fn refused_again(first: &str, second: &str) -> String {
+    let shared = first.match_indices(": ").filter_map(|(i, _)| first.get(..i + 2)).filter(|label| second.starts_with(label)).last();
+    match second.strip_prefix(shared.unwrap_or("")) {
+        Some(rest) if first != second => format!("{first} (asked again without the area's coordinate system: {rest})"),
+        _ => first.to_string(),
+    }
 }
 
 /// A WCS coverage's answer is a GeoTIFF; anything else (an XML exception, an HTML page, plain
@@ -1906,13 +1969,40 @@ pub(super) fn catalog_search_read(s: &mut Session, p: &Value, read: Option<Reach
         None if ps(p, "text").is_some() && !s.policy_user() => within.min(Reach::Public),
         None => within,
     };
-    let (page, reach) = match ps(p, "text") {
-        Some(text) => (
-            rustgis_data::ogc::parse_records(&request, text.as_bytes()).map_err(|e| crate::sources::message_with_address(url, &e))?,
-            within,
-        ),
-        None => fetch_records(url, &request, within)?,
+    let mut named = area_named(p)?.unwrap_or(true);
+    let mut notes = Vec::new();
+    let parse = |request: &str, bytes: &[u8]| {
+        rustgis_data::ogc::parse_records(request, bytes).map_err(|e| crate::sources::message_with_address(url, &e))
     };
+    let (request, page, reach) = match ps(p, "text") {
+        Some(text) => {
+            let page = parse(&request, text.as_bytes())?;
+            (request, page, within)
+        }
+        None => {
+            let (bytes, reach) = fetch_records(url, &request, within)?;
+            match records_again(s, p, &bytes) {
+                None => {
+                    let page = parse(&request, &bytes)?;
+                    (request, page, reach)
+                }
+                Some((again, refused)) => {
+                    let request = records_request(s, &again)?;
+                    let within = within.min(cache::ceiling_for(&request));
+                    let (page, reach) = fetch_records(url, &request, within)
+                        .and_then(|(bytes, reach)| Ok((parse(&request, &bytes)?, reach)))
+                        .map_err(|second| refused_again(&refused, &second))?;
+                    named = false;
+                    notes.push(AREA_UNNAMED.to_string());
+                    (request, page, reach)
+                }
+            }
+        }
+    };
+    notes.extend(words_notes(ps(p, "query").unwrap_or("")));
+    if p.get("bbox").is_some_and(|b| !b.is_null()) && search_area(s, p)?.is_none() {
+        notes.push(AREA_ACROSS_ANTIMERIDIAN.to_string());
+    }
     let mut dropped = 0usize;
     let records: Vec<Value> = page
         .records
@@ -1942,8 +2032,14 @@ pub(super) fn catalog_search_read(s: &mut Session, p: &Value, read: Option<Reach
         .collect();
     let mut out = json!({"matched": page.matched, "count": records.len(), "next": page.next, "records": records, "request": request});
     if dropped > 0 {
-        out["notes"] =
-            json!([format!("{dropped} links point to addresses RustGIS won't fetch for a catalogue on the web and are left out")]);
+        notes.push(format!("{dropped} links point to addresses RustGIS won't fetch for a catalogue on the web and are left out"));
+    }
+    if !notes.is_empty() {
+        out["notes"] = json!(notes);
+    }
+    // Given with the next page, it is read as this one was.
+    if search_area(s, p)?.is_some() {
+        out["bboxCrs"] = json!(if named { "CRS84" } else { "none" });
     }
     if !s.policy_user() {
         crate::sources::redact_url_fields(&mut out);
@@ -1951,18 +2047,18 @@ pub(super) fn catalog_search_read(s: &mut Session, p: &Value, read: Option<Reach
     Ok(out)
 }
 
-/// Reads a page of records within `ceiling`, with the reach the fetch connected at.
+/// Reads a GetRecords answer within `ceiling`, with the reach the fetch connected at.
 #[cfg(not(target_arch = "wasm32"))]
-fn fetch_records(url: &str, request: &str, ceiling: Reach) -> Result<(rustgis_data::ogc::RecordPage, Reach), String> {
+fn fetch_records(url: &str, request: &str, ceiling: Reach) -> Result<(Vec<u8>, Reach), String> {
     let fetched = cache::download_blocking_with_origin_within(request, cache::MAX_DOWNLOAD, cache::BLOCKING_TIMEOUT, &[], ceiling)
         .map_err(cache::large_file_hint)
         .map_err(|e| crate::sources::message_with_address(url, &e))?;
-    let page = rustgis_data::ogc::parse_records(request, &fetched.bytes).map_err(|e| crate::sources::message_with_address(url, &e))?;
-    Ok((page, fetched.origin.reach()))
+    let reach = fetched.origin.reach();
+    Ok((fetched.bytes, reach))
 }
 
 #[cfg(target_arch = "wasm32")]
-fn fetch_records(url: &str, _: &str, _: Reach) -> Result<(rustgis_data::ogc::RecordPage, Reach), String> {
+fn fetch_records(url: &str, _: &str, _: Reach) -> Result<(Vec<u8>, Reach), String> {
     Err(crate::sources::message_with_address(url, "in the web app, use Home › Add › Add Data › From Service › Search Catalogue"))
 }
 

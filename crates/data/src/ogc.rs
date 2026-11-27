@@ -2511,26 +2511,75 @@ pub struct RecordPage {
     pub records: Vec<Record>,
 }
 
+/// Characters of a search's words a catalogue is asked for.
+pub const MAX_SEARCH_WORDS: usize = 200;
+
+/// A search's words as a catalogue is asked for them, and how many characters were left out: those
+/// XML can't hold (control characters), and those past [`MAX_SEARCH_WORDS`].
+pub fn search_words(words: &str) -> (String, usize, usize) {
+    let words = words.trim();
+    let kept: Vec<char> = words.chars().filter(|c| !c.is_control() && !matches!(c, '\u{FFFE}' | '\u{FFFF}')).collect();
+    let unwritable = words.chars().count() - kept.len();
+    let text: String = kept.iter().take(MAX_SEARCH_WORDS).collect();
+    (text.trim().to_string(), unwritable, kept.len().saturating_sub(MAX_SEARCH_WORDS))
+}
+
 /// The GetRecords request (CSW 2.0.2, Dublin Core records) of a search: words anywhere in the
-/// records, within a longitude/latitude box, from position `start` (1-based).
-pub fn records_url(endpoint_url: &str, words: &str, bbox: Option<[f64; 4]>, start: u64) -> String {
-    let words: String = words.chars().filter(|c| !c.is_control()).take(200).collect::<String>().trim().replace('\'', "''");
-    let mut cql = Vec::new();
+/// records, within a longitude/latitude box, from position `start` (1-based). The search is a
+/// filter in XML (OGC Filter 1.1.0), which GeoNetwork, pycsw and Esri Geoportal all read; they
+/// don't share a form of CQL (#2889).
+///
+/// `named` says the box is in CRS84, which tells its longitudes from its latitudes. Not every
+/// catalogue reads that name: one that answers with an exception ([`records_refused`]) is asked
+/// again without it. It isn't left out at first: pycsw then takes the corners latitude first.
+pub fn records_url(endpoint_url: &str, words: &str, bbox: Option<[f64; 4]>, named: bool, start: u64) -> String {
+    let (mut names, mut terms) = (String::from(r#"xmlns:ogc="http://www.opengis.net/ogc""#), Vec::new());
+    let (words, ..) = search_words(words);
     if !words.is_empty() {
-        cql.push(format!("AnyText LIKE '%{words}%'"));
+        names.push_str(r#" xmlns:csw="http://www.opengis.net/cat/csw/2.0.2""#);
+        // Found as written: a wildcard or an escape among them stands for itself.
+        let mut literal = String::new();
+        for c in words.chars() {
+            if matches!(c, '%' | '_' | '\\') {
+                literal.push('\\');
+            }
+            literal.push(c);
+        }
+        let literal = literal.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+        terms.push(format!(
+            r#"<ogc:PropertyIsLike wildCard="%" singleChar="_" escapeChar="\"><ogc:PropertyName>csw:AnyText</ogc:PropertyName><ogc:Literal>%{literal}%</ogc:Literal></ogc:PropertyIsLike>"#
+        ));
     }
     if let Some([w, s, e, n]) = bbox {
-        cql.push(format!("BBOX(ows:BoundingBox,{w},{s},{e},{n})"));
+        names.push_str(r#" xmlns:ows="http://www.opengis.net/ows" xmlns:gml="http://www.opengis.net/gml""#);
+        let crs = if named { r#" srsName="urn:ogc:def:crs:OGC:1.3:CRS84""# } else { "" };
+        terms.push(format!(
+            "<ogc:BBOX><ogc:PropertyName>ows:BoundingBox</ogc:PropertyName><gml:Envelope{crs}><gml:lowerCorner>{w} {s}</gml:lowerCorner><gml:upperCorner>{e} {n}</gml:upperCorner></gml:Envelope></ogc:BBOX>"
+        ));
     }
     let mut q = format!(
         "SERVICE=CSW&VERSION=2.0.2&REQUEST=GetRecords&typeNames=csw:Record&resultType=results&elementSetName=full&outputSchema={}&maxRecords={RECORDS_PAGE}&startPosition={}",
         encode("http://www.opengis.net/cat/csw/2.0.2"),
         start.max(1)
     );
-    if !cql.is_empty() {
-        q.push_str(&format!("&constraintLanguage=CQL_TEXT&constraint_language_version=1.1.0&constraint={}", encode(&cql.join(" AND "))));
+    if !terms.is_empty() {
+        let all = if terms.len() > 1 { format!("<ogc:And>{}</ogc:And>", terms.concat()) } else { terms.concat() };
+        let filter = format!("<ogc:Filter {names}>{all}</ogc:Filter>");
+        q.push_str(&format!("&constraintLanguage=FILTER&constraint_language_version=1.1.0&constraint={}", encode(&filter)));
     }
     with_query(&endpoint(endpoint_url), &q)
+}
+
+/// Whether a GetRecords answer is an exception: the catalogue refusing the request, rather than
+/// its records or something else's answer.
+pub fn records_refused(body: &[u8]) -> bool {
+    let text = std::str::from_utf8(body).unwrap_or_default();
+    xml(text, 2_000_000).is_ok_and(|doc| is_exception(local(&doc.root_element())))
+}
+
+/// Whether a document's root says it is a service's exception.
+fn is_exception(root: &str) -> bool {
+    matches!(root, "ServiceExceptionReport" | "ExceptionReport")
 }
 
 /// What a link's protocol (or, when it says nothing useful, its address) makes it.
@@ -2579,7 +2628,7 @@ pub fn parse_records(url: &str, body: &[u8]) -> Result<RecordPage, String> {
     let root = doc.root_element();
     match local(&root) {
         "GetRecordsResponse" => {}
-        "ServiceExceptionReport" | "ExceptionReport" => {
+        name if is_exception(name) => {
             return Err(format!("the catalogue answered with an error: {}", text_of(&root).chars().take(300).collect::<String>()));
         }
         other => return Err(format!("not a catalogue's (CSW) answer (<{other}>)")),
@@ -9149,11 +9198,12 @@ mod tests {
             "https://cat.example.org/csw?SERVICE=CSW&REQUEST=GetCapabilities",
             "O'Brien\u{7}",
             Some([7.0, 46.0, 8.0, 47.0]),
+            true,
             21,
         );
         assert!(u.starts_with("https://cat.example.org/csw?SERVICE=CSW&VERSION=2.0.2&REQUEST=GetRecords&"), "{u}");
-        assert!(u.contains("&startPosition=21&") && u.contains("O%27%27Brien") && u.contains("BBOX%28ows:BoundingBox,7,46,8,47%29"), "{u}");
-        assert!(!records_url("https://cat.example.org/csw", " ", None, 0).contains("constraint="));
+        assert!(u.contains("&startPosition=21&") && u.contains("O%27Brien%25"), "{u}");
+        assert!(!records_url("https://cat.example.org/csw", " ", None, true, 0).contains("constraint"));
 
         let xml = r#"<csw:GetRecordsResponse xmlns:csw="http://www.opengis.net/cat/csw/2.0.2" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dct="http://purl.org/dc/terms/" xmlns:ows="http://www.opengis.net/ows">
             <csw:SearchResults numberOfRecordsMatched="45" numberOfRecordsReturned="2" nextRecord="3">
@@ -9197,6 +9247,67 @@ mod tests {
         assert!(parse_records("https://c.org/csw", deep.as_bytes()).unwrap_err().contains("deep"));
         let many = format!("<GetRecordsResponse>{}</GetRecordsResponse>", "<Record><title>t</title></Record>".repeat(1000));
         assert_eq!(parse_records("https://c.org/csw", many.as_bytes()).unwrap().records.len(), RECORDS_PAGE as usize * 5);
+    }
+
+    /// A search is a filter in XML which parses, with what was typed found as written (#2889): its
+    /// markup, and the wildcards and escape of the search, stand for themselves.
+    #[test]
+    fn a_catalogue_is_searched_by_a_filter_in_xml() {
+        // The constraint of a request, read back.
+        let filter = |words: &str, bbox: Option<[f64; 4]>, named: bool| {
+            let u = records_url("https://cat.example.org/csw?map=a", words, bbox, named, 1);
+            assert!(u.starts_with("https://cat.example.org/csw?map=a&SERVICE=CSW&"), "{u}");
+            let (head, constraint) = u.split_once("&constraint=").unwrap();
+            assert!(head.ends_with("&constraintLanguage=FILTER&constraint_language_version=1.1.0"), "{u}");
+            let mut bytes = Vec::new();
+            let mut rest = constraint.bytes();
+            while let Some(b) = rest.next() {
+                bytes.push(match b {
+                    b'%' => u8::from_str_radix(std::str::from_utf8(&[rest.next().unwrap(), rest.next().unwrap()]).unwrap(), 16).unwrap(),
+                    b => b,
+                });
+            }
+            String::from_utf8(bytes).unwrap()
+        };
+        let literal = |words: &str| {
+            let f = filter(words, None, true);
+            let doc = xml(&f, 1000).unwrap();
+            let name = doc.descendants().find(|n| local(n) == "PropertyName").unwrap();
+            assert_eq!((local(&name.parent().unwrap()), text_of(&name).as_str()), ("PropertyIsLike", "csw:AnyText"));
+            doc.descendants().find(|n| local(n) == "Literal").and_then(|n| n.text().map(String::from)).unwrap()
+        };
+        assert_eq!(literal(" solos "), "%solos%");
+        assert_eq!(literal("uso & <cobertura> ]]> \"d'água\""), "%uso & <cobertura> ]]> \"d'água\"%");
+        assert_eq!(literal(r"100%_a\b"), r"%100\%\_a\\b%");
+        assert_eq!(literal("a\u{7}b\u{FFFF}c"), "%abc%");
+        assert_eq!(literal(&"é".repeat(250)), format!("%{}%", "é".repeat(200)));
+        assert_eq!(search_words(" a\tb "), ("ab".to_string(), 1, 0));
+        assert_eq!(search_words(&"é".repeat(250)), ("é".repeat(200), 0, 50));
+        assert_eq!(search_words("solos"), ("solos".to_string(), 0, 0));
+
+        let area = Some([-43.5, -21.0, -42.0, -20.25]);
+        for named in [true, false] {
+            let f = filter("", area, named);
+            let doc = xml(&f, 1000).unwrap();
+            assert_eq!(local(&doc.root_element().first_child().unwrap()), "BBOX", "{f}");
+            let envelope = doc.descendants().find(|n| local(n) == "Envelope").unwrap();
+            assert_eq!(envelope.attribute("srsName"), named.then_some("urn:ogc:def:crs:OGC:1.3:CRS84"));
+            assert_eq!(child_text(&envelope, "lowerCorner").as_deref(), Some("-43.5 -21"));
+            assert_eq!(child_text(&envelope, "upperCorner").as_deref(), Some("-42 -20.25"));
+        }
+        // Both together.
+        let f = filter("solos", area, true);
+        let doc = xml(&f, 1000).unwrap();
+        let and = doc.root_element().first_child().unwrap();
+        assert_eq!(local(&and), "And", "{f}");
+        assert_eq!(and.children().map(|n| local(&n).to_string()).collect::<Vec<_>>(), ["PropertyIsLike", "BBOX"]);
+
+        // A refusal, told from records, a page that isn't a catalogue's and one that isn't XML.
+        assert!(records_refused(b"<ows:ExceptionReport xmlns:ows='o'>bad filter</ows:ExceptionReport>"));
+        assert!(records_refused(b"<?xml version='1.0'?>\n<ServiceExceptionReport/>"));
+        for other in [&b"<GetRecordsResponse/>"[..], b"<html/>", b"", b"\xff", b"<ExceptionReport>"] {
+            assert!(!records_refused(other), "{other:?}");
+        }
     }
 
     /// Every kind of document is read up to the limit, and what's past it is counted in a note.

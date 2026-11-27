@@ -29168,8 +29168,100 @@ fn wcs_coverages_and_catalogue_records() {
         json!([{"url": "https://geo.example.org/wms", "kind": "wms", "name": null, "protocol": "OGC:WMS", "fromDocument": true}])
     );
     assert!(v["notes"][0].as_str().is_some_and(|n| n.contains("1 links")), "{v}");
-    assert!(v["request"].as_str().is_some_and(|r| r.contains("AnyText%20LIKE%20%27%25forest%25%27")), "{v}");
+    assert!(v["request"].as_str().is_some_and(|r| r.contains("csw:AnyText") && r.contains("%25forest%25")), "{v}");
     assert!(s.run("catalog.search", &json!({"url": "https://cat.example.org/csw", "text": "<html/>"})).is_err());
+}
+
+/// `catalog.search` names its area's coordinate system (CRS84), and asks again without only a
+/// catalogue that answers that with an exception, said and given with the next page (#2889).
+#[test]
+fn a_catalogue_refusing_crs84_is_asked_for_the_area_without_it() {
+    use std::io::Write;
+    const REFUSED: &str = "<ows:ExceptionReport xmlns:ows='o'><ows:Exception><ows:ExceptionText>WORDS</ows:ExceptionText></ows:Exception></ows:ExceptionReport>";
+    const PAGE: &str = r#"<csw:GetRecordsResponse xmlns:csw="http://www.opengis.net/cat/csw/2.0.2"><csw:SearchResults numberOfRecordsMatched="443" nextRecord="21"/></csw:GetRecordsResponse>"#;
+    // A catalogue answering an area with CRS84 named, and without, as given: its address, and
+    // whether each request named it.
+    let serve = |named: String, unnamed: String| {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/csw", listener.local_addr().unwrap());
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = asked.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let is_named = read_request(&mut s).contains("CRS84");
+                log.lock().unwrap().push(is_named);
+                let body = if is_named { &named } else { &unnamed };
+                let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            }
+        });
+        (url, asked)
+    };
+    let refused = |words: &str| REFUSED.replace("WORDS", words);
+    let mut s = Session::new(Project::default());
+    let area = json!([-43, -21, -42, -20]);
+
+    // Read with CRS84: nothing said, asked once.
+    let (url, asked) = serve(PAGE.into(), refused("never asked"));
+    let v = s.run("catalog.search", &json!({"url": url, "query": "solos", "bbox": area})).unwrap();
+    assert_eq!((v["matched"].as_u64(), v["bboxCrs"].as_str(), v.get("notes")), (Some(443), Some("CRS84"), None), "{v}");
+    assert_eq!(asked.lock().unwrap().clone(), [true]);
+
+    // Refused, then read without it: said, and its next page is asked for without it at once.
+    let (url, asked) = serve(refused("CRS84?"), PAGE.into());
+    let v = s.run("catalog.search", &json!({"url": url, "query": "solos", "bbox": area})).unwrap();
+    assert_eq!((v["matched"].as_u64(), v["bboxCrs"].as_str()), (Some(443), Some("none")), "{v}");
+    assert_eq!(v["notes"], json!([crate::cmd::service::AREA_UNNAMED]));
+    assert!(v["request"].as_str().is_some_and(|r| r.contains("ows:BoundingBox") && !r.contains("CRS84")), "{v}");
+    let next = s.run("catalog.search", &json!({"url": url, "query": "solos", "bbox": area, "start": 21, "bboxCrs": "none"})).unwrap();
+    assert_eq!((next["bboxCrs"].as_str(), next.get("notes")), (Some("none"), None), "{next}");
+    // Named as told, it isn't asked again; nor are words alone.
+    let e = s.run("catalog.search", &json!({"url": url, "bbox": area, "bboxCrs": "CRS84"})).unwrap_err();
+    assert!(e.ends_with("the catalogue answered with an error: CRS84?"), "{e}");
+    let v = s.run("catalog.search", &json!({"url": url, "query": "solos"})).unwrap();
+    assert!(v.get("bboxCrs").is_none() && v.get("notes").is_none(), "{v}");
+    assert_eq!(asked.lock().unwrap().clone(), [true, false, false, true, false]);
+    assert!(s.run("catalog.search", &json!({"url": url, "bbox": area, "bboxCrs": "EPSG:4326"})).unwrap_err().contains("bboxCrs"));
+
+    // Refused both ways: the catalogue's words, the second's when they differ.
+    let (url, asked) = serve(refused("no areas"), refused("no areas"));
+    let e = s.run("catalog.search", &json!({"url": url, "bbox": area})).unwrap_err();
+    assert!(e.ends_with("the catalogue answered with an error: no areas"), "{e}");
+    assert_eq!(asked.lock().unwrap().clone(), [true, false]);
+    let (url, _) = serve(refused("no such system"), refused("no areas"));
+    let e = s.run("catalog.search", &json!({"url": url, "bbox": area})).unwrap_err();
+    assert!(e.ends_with("error: no such system (asked again without the area's coordinate system: no areas)"), "{e}");
+    // The note says what happened, not why: an exception may be about something else.
+    let (url, _) = serve(refused("the server is busy"), PAGE.into());
+    let v = s.run("catalog.search", &json!({"url": url, "bbox": area})).unwrap();
+    let note = v["notes"][0].as_str().unwrap_or_default();
+    assert!(note.contains("answered with an exception when") && !note.contains("refused"), "{note}");
+    // What isn't a catalogue's answer is no refusal.
+    let (url, asked) = serve("<html/>".into(), PAGE.into());
+    assert!(s.run("catalog.search", &json!({"url": url, "bbox": area})).is_err());
+    assert_eq!(asked.lock().unwrap().clone(), [true]);
+
+    // Words the catalogue isn't asked for are counted.
+    let p = json!({"url": "https://cat.example.org/csw", "query": format!("a\tb{}", "c".repeat(250)), "text": PAGE});
+    let v = s.run("catalog.search", &p).unwrap();
+    let said: Vec<&str> = v["notes"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+    assert_eq!(said, ["control characters left out of the words searched for: 1", "the words are cut to 200 characters; left out: 52"]);
+}
+
+/// An area across the antimeridian isn't asked for, so the whole catalogue is searched, and the
+/// answer says so; an area on one side says nothing of it.
+#[test]
+fn a_catalogue_area_across_the_antimeridian_is_said_to_be_left_out() {
+    const PAGE: &str = r#"<csw:GetRecordsResponse xmlns:csw="http://www.opengis.net/cat/csw/2.0.2"><csw:SearchResults numberOfRecordsMatched="443" nextRecord="21"/></csw:GetRecordsResponse>"#;
+    let mut s = Session::new(Project::default());
+    let search = |s: &mut Session, area: Value| {
+        s.run("catalog.search", &json!({"url": "https://cat.example.org/csw", "query": "solos", "bbox": area, "text": PAGE})).unwrap()
+    };
+    let v = search(&mut s, json!([170, -20, -170, -10]));
+    assert!(!v["request"].as_str().unwrap_or_default().contains("BoundingBox"), "{v}");
+    assert_eq!((v.get("bboxCrs"), &v["notes"]), (None, &json!([crate::cmd::service::AREA_ACROSS_ANTIMERIDIAN])), "{v}");
+    let v = search(&mut s, json!([-43, -21, -42, -20]));
+    assert!(v["request"].as_str().unwrap_or_default().contains("BoundingBox") && v.get("notes").is_none(), "{v}");
 }
 
 /// A KMZ's ground overlays become raster layers kept in the project; a KML whose picture is a web

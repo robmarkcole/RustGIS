@@ -29,7 +29,7 @@ cache.cancel
 cache.empty
 cache.emptyIndexes
 cache.fill
-catalog.search url query? bbox? start? text? connection?
+catalog.search url query? bbox? start? bboxCrs? text? connection?
 connection.browse id node? probe? answer? documents?
 connection.cancelToken id
 connection.duplicate id name?
