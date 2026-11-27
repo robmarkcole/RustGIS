@@ -112,10 +112,12 @@ mod tests {
         // Go back to Style while still ticked and switch to Poster: accent follows Poster.
         click(&mut h, "Back");
         click(&mut h, "Back");
+        click(&mut h, "Back");
         h.get_by_label("Poster").click();
         h.run_steps(2);
         assert_eq!(h.state().dialogs.publication.as_ref().unwrap().accent, Some(poster), "re-seeded to Poster");
         // Unticking on Poster must not remember Banner's or Poster's default as a custom colour.
+        click(&mut h, "Next");
         click(&mut h, "Next");
         click(&mut h, "Next");
         h.get_by_label("Pick a colour of your own").click();
@@ -123,8 +125,10 @@ mod tests {
         assert_eq!(h.state().dialogs.publication.as_ref().unwrap().accent, None);
         click(&mut h, "Back");
         click(&mut h, "Back");
+        click(&mut h, "Back");
         h.get_by_label("Editorial").click();
         h.run_steps(2);
+        click(&mut h, "Next");
         click(&mut h, "Next");
         click(&mut h, "Next");
         h.get_by_label("Pick a colour of your own").click();
@@ -133,6 +137,7 @@ mod tests {
         // A custom colour is kept when switching styles.
         let red = egui::Color32::from_rgb(0xC0, 0x30, 0x30);
         h.state_mut().dialogs.publication.as_mut().unwrap().accent = Some(red);
+        click(&mut h, "Back");
         click(&mut h, "Back");
         click(&mut h, "Back");
         h.get_by_label("Banner").click();

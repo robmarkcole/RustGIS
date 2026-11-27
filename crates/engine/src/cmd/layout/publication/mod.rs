@@ -193,8 +193,9 @@ pub(in crate::cmd::layout) fn publication(s: &mut Session, p: &Value) -> CmdResu
     let room_side = if labelled.left || labelled.right { LABEL_ROOM_SIDE * strip_scale } else { 0.0 };
     let room_end = if labelled.top || labelled.bottom { LABEL_ROOM_END * strip_scale } else { 0.0 };
     let reference = reference.unwrap_or_else(|| {
-        let line = if step.is_some() { "Datum: {datum} · Graticule: {grid}" } else { "Datum: {datum}" };
-        vec!["Projection: {projection}".into(), line.into()]
+        let [projection_line, datum_and_grid] = PUBLICATION_DEFAULT_REFERENCE;
+        let line = if step.is_some() { datum_and_grid } else { "Datum: {datum}" };
+        vec![projection_line.into(), line.into()]
     });
     let step_said = step.map_or_else(|| "—".to_string(), step_text);
     let fill = |t: &str| t.replace("{projection}", &projection).replace("{datum}", &datum).replace("{grid}", &step_said);
@@ -276,7 +277,7 @@ pub(in crate::cmd::layout) fn publication(s: &mut Session, p: &Value) -> CmdResu
     // lines in `body_pt`, `tw` wide. Each one's elements keep their names (`Sources`, `Reference`)
     // whatever its heading reads, the heading filled and wrapped like the rest.
     let sections = |tw: f64, head_pt: f64, body_pt: f64| -> Vec<(&'static str, Broken, Broken)> {
-        [("Sources", heading(0, "Sources"), &sources), ("Reference", heading(1, "Cartographic reference"), &reference)]
+        [("Sources", heading(0, PUBLICATION_HEADINGS[0]), &sources), ("Reference", heading(1, PUBLICATION_HEADINGS[1]), &reference)]
             .into_iter()
             .filter(|(.., texts)| !texts.is_empty())
             .map(|(name, head, texts)| {

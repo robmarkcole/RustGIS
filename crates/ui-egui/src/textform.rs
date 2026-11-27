@@ -26,22 +26,22 @@ pub struct StatLayer {
 }
 
 impl StatLayer {
-    /// The layers a text of `layout` can show figures of: those of the map its first frame shows
-    /// (as the page reads them), without a raster's or a graphics layer's, each with its numeric
-    /// fields. A name a token can't hold (`{`, `}`, or a field's `:`) is left out, and so is a layer
-    /// under another of its name, and a field after another of its name (case aside), which no token
-    /// reads.
+    /// The layers a text of `layout` can show figures of: those [`Self::of_map`] lists for the map
+    /// its first frame shows (as the page reads them).
     pub fn of(layout: &rustgis_engine::map::layout::Layout, maps: &[rustgis_engine::map::Map]) -> Vec<StatLayer> {
         use rustgis_engine::map::layout::ElementKind;
         let Some(ElementKind::MapFrame { map, .. }) = layout.first_frame().and_then(|f| layout.element(f)).map(|e| &e.kind) else {
             return Vec::new();
         };
-        let Some(map) = maps.iter().find(|m| m.name.eq_ignore_ascii_case(map)) else { return Vec::new() };
-        let holds = |name: &str, colon: bool| !name.is_empty() && !name.contains(['{', '}']) && !(colon && name.contains(':'));
-        map.layers
-            .iter()
-            .filter(|l| !l.graphics && l.raster.is_none() && holds(&l.name, false))
-            .filter(|l| map.layer_by_name(&l.name).is_some_and(|first| first.id == l.id))
+        maps.iter().find(|m| m.name.eq_ignore_ascii_case(map)).map_or_else(Vec::new, Self::of_map)
+    }
+
+    /// The layers of `map` a text can show figures of, without a raster's or a graphics layer's,
+    /// each with its numeric fields. A name a token can't hold (`{`, `}`, or a field's `:`) is left
+    /// out, and so is a layer under another of its name, and a field after another of its name (case
+    /// aside), which no token reads.
+    pub fn of_map(map: &rustgis_engine::map::Map) -> Vec<StatLayer> {
+        Self::readable(map)
             .map(|l| StatLayer {
                 name: l.name.clone(),
                 fields: l
@@ -55,36 +55,56 @@ impl StatLayer {
             })
             .collect()
     }
+
+    /// Whether [`Self::of_map`] lists any layer, without reading their fields.
+    pub fn any(map: &rustgis_engine::map::Map) -> bool {
+        Self::readable(map).next().is_some()
+    }
+
+    fn readable(map: &rustgis_engine::map::Map) -> impl Iterator<Item = &rustgis_engine::map::Layer> {
+        map.layers
+            .iter()
+            .filter(|l| !l.graphics && l.raster.is_none() && holds(&l.name, false))
+            .filter(|l| map.layer_by_name(&l.name).is_some_and(|first| first.id == l.id))
+    }
+}
+
+/// Whether a statistic token can hold `name` (a field's takes no `:` either).
+fn holds(name: &str, colon: bool) -> bool {
+    !name.is_empty() && !name.contains(['{', '}']) && !(colon && name.contains(':'))
 }
 
 /// The "Layer statistic" section of a Dynamic Text menu (#3036), the Format pane's and the
-/// ribbon's: a submenu per layer, a count and, for each numeric field, its sum, mean, least and
-/// greatest. `pick` takes the token chosen; with no layers there is no section.
+/// ribbon's: [`stat_layers`] under that name. `pick` takes the token chosen; with no layers there
+/// is no section.
 pub fn stat_menu(ui: &mut Ui, layers: &[StatLayer], mut pick: impl FnMut(String)) {
     if layers.is_empty() {
         return;
     }
     ui.separator();
-    crate::widgets::submenu(ui, tl!("Layer statistic"), |ui| {
-        for layer in layers {
-            crate::widgets::submenu(ui, &layer.name, |ui| {
-                let mut add = |ui: &mut Ui, what: &str, token: String| {
-                    if ui.button(format!("{what}  {token}")).clicked() {
-                        pick(token);
-                        ui.close();
-                    }
-                };
-                add(ui, tl!("Count"), format!("{{count:{}}}", layer.name));
-                for field in &layer.fields {
-                    crate::widgets::submenu(ui, field, |ui| {
-                        for (code, what) in [("sum", tl!("Sum")), ("mean", tl!("Mean")), ("min", tl!("Least")), ("max", tl!("Greatest"))] {
-                            add(ui, what, format!("{{{code}:{}:{field}}}", layer.name));
-                        }
-                    });
+    crate::widgets::submenu(ui, tl!("Layer statistic"), |ui| stat_layers(ui, layers, &mut pick));
+}
+
+/// A submenu per layer: a count and, for each numeric field, its sum, mean, least and greatest.
+pub fn stat_layers(ui: &mut Ui, layers: &[StatLayer], pick: &mut impl FnMut(String)) {
+    for layer in layers {
+        crate::widgets::submenu(ui, &layer.name, |ui| {
+            let mut add = |ui: &mut Ui, what: &str, token: String| {
+                if ui.button(format!("{what}  {token}")).clicked() {
+                    pick(token);
+                    ui.close();
                 }
-            });
-        }
-    });
+            };
+            add(ui, tl!("Count"), format!("{{count:{}}}", layer.name));
+            for field in &layer.fields {
+                crate::widgets::submenu(ui, field, |ui| {
+                    for (code, what) in [("sum", tl!("Sum")), ("mean", tl!("Mean")), ("min", tl!("Least")), ("max", tl!("Greatest"))] {
+                        add(ui, what, format!("{{{code}:{}:{field}}}", layer.name));
+                    }
+                });
+            }
+        });
+    }
 }
 
 /// What the form edits. A style is left out where the text doesn't have it.
@@ -617,6 +637,7 @@ mod tests {
             StatLayer::of(&layout, &[map.clone(), other.clone()]),
             [StatLayer { name: "Cities".into(), fields: vec!["pop".into()] }]
         );
+        assert_eq!(StatLayer::of_map(&map), StatLayer::of(&layout, std::slice::from_ref(&map)), "a map's own");
         let mut second = Layout::new("L2", 100.0, 100.0);
         second.add("Frame", (0.0, 0.0, 50.0, 50.0), frame("Other"));
         assert_eq!(StatLayer::of(&second, &[map, other]), [StatLayer { name: "Rivers".into(), fields: vec!["km".into()] }]);

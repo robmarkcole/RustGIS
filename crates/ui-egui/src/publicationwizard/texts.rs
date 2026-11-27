@@ -1,14 +1,14 @@
 //! The wizard's texts step.
 use super::*;
-use rustgis_engine::cmd::layout::MAX_PUBLICATION_TEXT;
 
-/// The texts step: the title, subtitle, note, sources and credit line.
-pub(super) fn texts_step(ui: &mut egui::Ui, d: &mut Draft) {
+/// The texts step: the title, subtitle, note, credit line and an editorial sheet's column heading.
+pub(super) fn texts_step(ui: &mut egui::Ui, d: &mut Draft, map: &Map) {
     egui::Grid::new("publication_wizard_texts").num_columns(2).spacing(egui::vec2(8.0, 8.0)).show(ui, |ui| {
-        let line = |ui: &mut egui::Ui, label: &str, text: &mut String| {
+        let line = |ui: &mut egui::Ui, d: &mut Draft, label: &str, field: Field| {
             let caption = ui.label(label);
-            ui.add(egui::TextEdit::singleline(text).char_limit(MAX_PUBLICATION_TEXT).desired_width(field_width(ui)))
-                .labelled_by(caption.id);
+            let edit = egui::TextEdit::singleline(d.field_mut(field)).char_limit(MAX_PUBLICATION_TEXT).desired_width(field_width(ui));
+            let r = ui.add(edit).labelled_by(caption.id);
+            d.edited(&r, field);
             ui.end_row();
         };
         let label = ui.label(tl!("Title"));
@@ -21,37 +21,36 @@ pub(super) fn texts_step(ui: &mut egui::Ui, d: &mut Draft) {
             )
             .labelled_by(label.id);
         d.title_typed |= title.changed();
+        d.edited(&title, Field::Title);
         ui.end_row();
-        line(ui, tl!("Subtitle"), &mut d.subtitle);
+        line(ui, d, tl!("Subtitle"), Field::Subtitle);
         let label = ui.label(tl!("Note"));
-        ui.add(egui::TextEdit::multiline(&mut d.note).desired_rows(3).char_limit(MAX_PUBLICATION_TEXT).desired_width(field_width(ui)))
+        let note = ui
+            .add(egui::TextEdit::multiline(&mut d.note).desired_rows(3).char_limit(MAX_PUBLICATION_TEXT).desired_width(field_width(ui)))
             .labelled_by(label.id);
+        d.edited(&note, Field::Note);
         ui.end_row();
-        line(ui, tl!("Sources"), &mut d.sources);
         let label = ui.label(tl!("Credit line"));
-        ui.add_enabled(
-            !d.no_author,
-            egui::TextEdit::singleline(&mut d.author)
-                .hint_text(default_credit())
-                .char_limit(MAX_PUBLICATION_TEXT)
-                .desired_width(field_width(ui)),
-        )
-        .labelled_by(label.id);
+        let author = ui
+            .add_enabled(
+                !d.off(Field::Author),
+                egui::TextEdit::singleline(&mut d.author)
+                    .hint_text(default_credit())
+                    .char_limit(MAX_PUBLICATION_TEXT)
+                    .desired_width(field_width(ui)),
+            )
+            .labelled_by(label.id);
+        d.edited(&author, Field::Author);
         ui.end_row();
         ui.label("");
         ui.checkbox(&mut d.no_author, tl!("No credit line"));
         ui.end_row();
+        if d.editorial() {
+            line(ui, d, tl!("Column heading"), Field::Heading(2));
+        }
     });
-    // The boxes take no more, and cut a longer paste to fit: said, not done unseen.
-    let at_limit = [&d.title, &d.subtitle, &d.note, &d.sources].iter().any(|t| t.chars().count() >= MAX_PUBLICATION_TEXT)
-        || (!d.no_author && d.author.chars().count() >= MAX_PUBLICATION_TEXT);
-    if at_limit {
-        ui.label(
-            egui::RichText::new(i18n::fmt("Each field takes at most {limit} characters.", &[("limit", &MAX_PUBLICATION_TEXT.to_string())]))
-                .small()
-                .weak(),
-        );
-    }
+    statistic_menu(ui, d, map, Field::Note);
+    limit_note(ui, d, &[Field::Title, Field::Subtitle, Field::Note, Field::Author, Field::Heading(2)]);
 }
 
 #[cfg(test)]

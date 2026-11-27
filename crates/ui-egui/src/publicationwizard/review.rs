@@ -26,7 +26,19 @@ pub(super) fn review_step(ui: &mut egui::Ui, d: &Draft) {
         row(tl!("Title"), or_none(&d.title));
         row(tl!("Subtitle"), or_none(&d.subtitle));
         row(tl!("Note"), or_none(&d.note));
-        row(tl!("Sources"), or_none(&d.sources));
+        let sources = lines(&d.sources).collect::<Vec<_>>().join("\n");
+        row(tl!("Sources"), or_none(&sources));
+        heading_row(&mut row, d, 0, tl!("Sources heading"), PUBLICATION_HEADINGS[0]);
+        let typed = lines(&d.reference).collect::<Vec<_>>().join("\n");
+        let reference = match d.left_out(Field::Reference) {
+            Some(_) if typed.is_empty() => none.to_string(),
+            Some(_) => tl!("(none; the lines typed aren't used)").to_string(),
+            None if typed.is_empty() => tl!("The default: projection, datum and graticule, filled in on the sheet").to_string(),
+            None => typed,
+        };
+        row(tl!("Reference"), reference);
+        heading_row(&mut row, d, 1, tl!("Reference heading"), PUBLICATION_HEADINGS[1]);
+        heading_row(&mut row, d, 2, tl!("Column heading"), none);
         let credit = if d.no_author {
             none.to_string()
         } else if d.author.trim().is_empty() {
@@ -41,6 +53,21 @@ pub(super) fn review_step(ui: &mut egui::Ui, d: &Draft) {
     if d.figure() {
         figure_note(ui);
     }
+}
+
+/// A heading's row: the one typed, or `or` for the command's; for a section left out, none, but
+/// one typed there is said not to be used rather than dropped unseen.
+fn heading_row(row: &mut impl FnMut(&str, String), d: &Draft, at: usize, label: &str, or: &str) {
+    let typed = d.headings[at].trim();
+    let value = match d.left_out(Field::Heading(at)) {
+        None if typed.is_empty() => or.to_string(),
+        None => typed.to_string(),
+        Some(_) if typed.is_empty() => return,
+        Some(LeftOut::NoSources) => i18n::fmt("{heading} (not used: no sources)", &[("heading", typed)]),
+        Some(LeftOut::NoReference) => i18n::fmt("{heading} (not used: no reference)", &[("heading", typed)]),
+        Some(LeftOut::NotEditorial) => i18n::fmt("{heading} (not used: not an editorial sheet)", &[("heading", typed)]),
+    };
+    row(label, value);
 }
 
 #[cfg(test)]

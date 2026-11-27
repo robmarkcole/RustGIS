@@ -81,19 +81,19 @@ pub(crate) fn datum_of(def: &str) -> Option<String> {
     param("+R=").map(|_| "a sphere".into())
 }
 
-/// Texts given as one or a list (up to 50), each of at most [`MAX_PUBLICATION_TEXT`] characters: a
-/// longer one is refused, not cut.
+/// Texts given as one or a list (up to [`MAX_PUBLICATION_LINES`]), each of at most
+/// [`MAX_PUBLICATION_TEXT`] characters: a longer one is refused, not cut.
 pub(in crate::cmd::layout) fn texts_of(p: &Value, k: &str) -> Result<Option<Vec<String>>, String> {
     let within = |t: &str| crate::cmd::within(k, "a publication layout's text", t, MAX_PUBLICATION_TEXT);
     match p.get(k) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(t)) => Ok(Some(vec![within(t)?])),
-        Some(Value::Array(a)) if a.len() <= 50 => a
+        Some(Value::Array(a)) if a.len() <= MAX_PUBLICATION_LINES => a
             .iter()
             .map(|v| v.as_str().ok_or_else(|| format!("{k} is a text or a list of texts")).and_then(within))
             .collect::<Result<_, _>>()
             .map(Some),
-        Some(_) => Err(format!("{k} is a text or a list of up to 50 texts")),
+        Some(_) => Err(format!("{k} is a text or a list of up to {MAX_PUBLICATION_LINES} texts")),
     }
 }
 

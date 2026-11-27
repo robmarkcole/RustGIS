@@ -1,19 +1,27 @@
-//! Publication Layout Wizard: `layout.publication` asked step by step (size, style, texts, accent),
-//! then made at once, as the New Layout › Publication Layout menu makes it (#2850).
+//! Publication Layout Wizard: `layout.publication` asked step by step (size, style, texts, sources
+//! and reference, accent), then made at once, as the New Layout › Publication Layout menu makes it
+//! (#2850).
 mod accent;
 mod review;
 mod size;
+mod sources;
 mod style;
 mod texts;
 
+use crate::textform::StatLayer;
 use crate::{RustGisApp, i18n, theme::Tokens};
 use accent::accent_step;
 use review::review_step;
 use rustgis_engine::Session;
-use rustgis_engine::cmd::layout::{PUBLICATION_PROFILES, publication_style_accent};
+use rustgis_engine::cmd::layout::{
+    MAX_PUBLICATION_LINES, MAX_PUBLICATION_TEXT, PUBLICATION_DEFAULT_REFERENCE, PUBLICATION_HEADINGS, PUBLICATION_PROFILES,
+    publication_style_accent,
+};
+use rustgis_engine::map::Map;
 use rustgis_engine::map::layout::PAGES;
 use serde_json::{Value, json};
 use size::size_step;
+use sources::sources_step;
 use style::style_step;
 use texts::texts_step;
 
@@ -23,8 +31,47 @@ pub enum Step {
     Size,
     Style,
     Texts,
+    Sources,
     Accent,
     Review,
+}
+
+impl Step {
+    /// Where [`Draft`] keeps what each of the two steps with text fields has of its own: the
+    /// texts step's at 0, the sources step's at 1.
+    fn slot(self) -> usize {
+        usize::from(self == Step::Sources)
+    }
+}
+
+/// Why `layout.publication` draws no place for a field's text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LeftOut {
+    NoSources,
+    NoReference,
+    NotEditorial,
+}
+
+/// A text field of the wizard that takes a layer statistic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Field {
+    Title,
+    Subtitle,
+    Note,
+    Sources,
+    Author,
+    Reference,
+    Heading(usize),
+}
+
+impl Field {
+    /// The step that asks for it.
+    fn step(self) -> Step {
+        match self {
+            Field::Title | Field::Subtitle | Field::Note | Field::Author | Field::Heading(2) => Step::Texts,
+            Field::Sources | Field::Reference | Field::Heading(_) => Step::Sources,
+        }
+    }
 }
 
 /// How a sheet is turned: `Auto` leaves it to `layout.publication` (the way the map comes out larger).
@@ -51,6 +98,19 @@ pub struct Draft {
     pub author: String,
     /// No credit line at all (`"author": ""`), rather than the command's default one.
     pub no_author: bool,
+    /// The cartographic reference's lines; empty leaves the command's default.
+    pub reference: String,
+    /// No cartographic reference at all (`"reference": []`).
+    pub no_reference: bool,
+    /// The headings of the sources, the reference and an editorial sheet's column; one left empty
+    /// is left to the command.
+    pub headings: [String; 3],
+    /// The field the cursor was last in on the texts step and on the sources step, which a layer
+    /// statistic added there goes to ([`Step::slot`]).
+    targets: [Option<Field>; 2],
+    /// Whether the last statistic added on each of those steps didn't fit its field, said until
+    /// that step's text changes or one fits there.
+    refused: [bool; 2],
     /// The style's colour, or `None` for the style's own.
     pub accent: Option<egui::Color32>,
     /// The colour last picked, which the swatch comes back with when the box is ticked again.
@@ -74,6 +134,11 @@ impl Draft {
             sources: String::new(),
             author: String::new(),
             no_author: false,
+            reference: String::new(),
+            no_reference: false,
+            headings: Default::default(),
+            targets: [None; 2],
+            refused: [false; 2],
             accent: None,
             picked: None,
         }
@@ -94,7 +159,10 @@ impl Draft {
 
     /// The steps this draft goes through, in order.
     fn steps(&self) -> &'static [Step] {
-        if self.figure() { &[Step::Size, Step::Review] } else { &[Step::Size, Step::Style, Step::Texts, Step::Accent, Step::Review] }
+        if self.figure() {
+            return &[Step::Size, Step::Review];
+        }
+        &[Step::Size, Step::Style, Step::Texts, Step::Sources, Step::Accent, Step::Review]
     }
 
     /// The step `by` places from this one, if there is one.
@@ -118,7 +186,7 @@ impl Draft {
         }
         p["style"] = json!(self.style);
         p["title"] = json!(self.title.trim());
-        for (key, text) in [("subtitle", &self.subtitle), ("note", &self.note), ("sources", &self.sources), ("author", &self.author)] {
+        for (key, text) in [("subtitle", &self.subtitle), ("note", &self.note), ("author", &self.author)] {
             if !text.trim().is_empty() {
                 p[key] = json!(text.trim());
             }
@@ -126,11 +194,126 @@ impl Draft {
         if self.no_author {
             p["author"] = json!("");
         }
+        let sources: Vec<&str> = lines(&self.sources).collect();
+        if !sources.is_empty() {
+            p["sources"] = json!(sources);
+        }
+        let reference: Vec<&str> = lines(&self.reference).collect();
+        if self.no_reference || !reference.is_empty() {
+            p["reference"] = json!(if self.no_reference { Vec::new() } else { reference });
+        }
+        let headings = self.headings_sent();
+        if !headings.is_empty() {
+            p["headings"] = json!(headings);
+        }
         if let Some(c) = self.accent {
             p["accent"] = json!(hex(c));
         }
         p
     }
+
+    /// `"headings"` up to the last one given, a gap before it filled with the command's own; none
+    /// for a section left out (no sources, no reference), and the column's only on an editorial
+    /// sheet, the one style that draws it.
+    fn headings_sent(&self) -> Vec<&str> {
+        let given = |i: usize| self.left_out(Field::Heading(i)).is_none() && !self.headings[i].trim().is_empty();
+        let Some(last) = (0..self.headings.len()).rev().find(|&i| given(i)) else { return Vec::new() };
+        (0..=last)
+            .map(|i| if given(i) { self.headings[i].trim() } else { PUBLICATION_HEADINGS.get(i).copied().unwrap_or_default() })
+            .collect()
+    }
+
+    fn editorial(&self) -> bool {
+        self.style == "editorial"
+    }
+
+    /// Why the sheet has no place for `field`'s text, if it hasn't: what is sent, what the review
+    /// says isn't used and which boxes are off all follow from this.
+    fn left_out(&self, field: Field) -> Option<LeftOut> {
+        match field {
+            Field::Heading(0) if lines(&self.sources).next().is_none() => Some(LeftOut::NoSources),
+            Field::Reference | Field::Heading(1) if self.no_reference => Some(LeftOut::NoReference),
+            Field::Heading(2) if !self.editorial() => Some(LeftOut::NotEditorial),
+            _ => None,
+        }
+    }
+
+    /// Whether `field`'s box is switched off or not shown. The sources' heading stays on with no
+    /// sources, which may be typed after it.
+    fn off(&self, field: Field) -> bool {
+        field == Field::Author && self.no_author || matches!(self.left_out(field), Some(LeftOut::NoReference | LeftOut::NotEditorial))
+    }
+
+    fn field_mut(&mut self, field: Field) -> &mut String {
+        let [sources, reference, column] = &mut self.headings;
+        match field {
+            Field::Title => &mut self.title,
+            Field::Subtitle => &mut self.subtitle,
+            Field::Note => &mut self.note,
+            Field::Sources => &mut self.sources,
+            Field::Author => &mut self.author,
+            Field::Reference => &mut self.reference,
+            Field::Heading(0) => sources,
+            Field::Heading(1) => reference,
+            Field::Heading(_) => column,
+        }
+    }
+
+    /// Notes `field` as its step's last one while it has the focus, typed into or not, and ends
+    /// its step's refusal note when its text changes.
+    fn edited(&mut self, r: &egui::Response, field: Field) {
+        if r.has_focus() {
+            self.targets[field.step().slot()] = Some(field);
+        }
+        if r.changed() {
+            self.refused[field.step().slot()] = false;
+        }
+    }
+
+    /// Adds a layer statistic to the field last focused on `own`'s step, or to `own` where none was
+    /// or that one is off now; one that would take the field past the limit isn't added.
+    fn add_statistic(&mut self, token: &str, own: Field) {
+        let slot = own.step().slot();
+        let field = self.targets[slot].filter(|&f| !self.off(f)).unwrap_or(own);
+        let text = self.field_mut(field);
+        if text.chars().count() + token.chars().count() > MAX_PUBLICATION_TEXT {
+            self.refused[slot] = true;
+            return;
+        }
+        text.push_str(token);
+        self.refused[slot] = false;
+        self.title_typed |= field == Field::Title;
+    }
+}
+
+/// A box's lines as the command takes a list: trimmed, the empty ones left out.
+fn lines(text: &str) -> impl Iterator<Item = &str> {
+    text.lines().map(str::trim).filter(|l| !l.is_empty())
+}
+
+/// The menu that adds a layer figure of the active map (the one the sheet shows), listed as the
+/// Format pane's Dynamic Text menu lists them; none where the map has no layer to read.
+fn statistic_menu(ui: &mut egui::Ui, d: &mut Draft, map: &Map, own: Field) {
+    if !StatLayer::any(map) {
+        return;
+    }
+    ui.menu_button(tl!("Insert Statistic"), |ui| {
+        crate::textform::stat_layers(ui, &StatLayer::of_map(map), &mut |token| d.add_statistic(&token, own));
+    });
+}
+
+/// The boxes take no more, cut a longer paste to fit and refuse a statistic past it: said, not
+/// done unseen.
+fn limit_note(ui: &mut egui::Ui, d: &mut Draft, fields: &[Field]) {
+    let limit = [("limit", &*MAX_PUBLICATION_TEXT.to_string())];
+    let note = if d.refused[d.step.slot()] {
+        i18n::fmt("The statistic wasn't added: each field takes at most {limit} characters.", &limit)
+    } else if fields.iter().any(|&f| !d.off(f) && d.field_mut(f).chars().count() >= MAX_PUBLICATION_TEXT) {
+        i18n::fmt("Each field takes at most {limit} characters.", &limit)
+    } else {
+        return;
+    };
+    ui.label(egui::RichText::new(note).small().weak());
 }
 
 /// A colour as `layout.publication` takes it: `#RRGGBB`.
@@ -153,6 +336,7 @@ fn step_name(step: Step) -> &'static str {
         Step::Size => tl_raw!("Size"),
         Step::Style => tl_raw!("Style"),
         Step::Texts => tl_raw!("Texts"),
+        Step::Sources => tl_raw!("Sources and reference"),
         Step::Accent => tl_raw!("Accent"),
         Step::Review => tl_raw!("Review"),
     }
@@ -239,7 +423,8 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                 .show(ui, |ui| match d.step {
                     Step::Size => size_step(ui, &mut d),
                     Step::Style => style_step(ui, &mut d, t.accent),
-                    Step::Texts => texts_step(ui, &mut d),
+                    Step::Texts => texts_step(ui, &mut d, app.session.map()),
+                    Step::Sources => sources_step(ui, &mut d, app.session.map()),
                     Step::Accent => accent_step(ui, &mut d, t.accent),
                     Step::Review => review_step(ui, &d),
                 });
@@ -374,7 +559,7 @@ mod tests {
         assert_eq!(
             d.params(),
             json!({"profile": "letter-landscape", "style": "panel", "title": "", "subtitle": "2026", "note": "A note",
-                "sources": "Natural Earth", "author": "J. G.", "accent": "#0B1B2B"})
+                "sources": ["Natural Earth"], "author": "J. G.", "accent": "#0B1B2B"})
         );
         d.orientation = Orientation::Portrait;
         d.no_author = true;
@@ -385,7 +570,7 @@ mod tests {
         assert_eq!(d.params(), json!({"profile": "figure-1col"}));
     }
 
-    /// A sheet goes through the five steps; a figure goes from its size to the review, the steps
+    /// A sheet goes through the six steps; a figure goes from its size to the review, the steps
     /// it takes nothing from skipped both ways. Back is off on the first step; Next becomes
     /// Create on the last.
     #[test]
@@ -394,13 +579,13 @@ mod tests {
         open(&mut app);
         let mut h = harness(app);
         assert!(h.get_by_role_and_label(Role::Button, "Back").accesskit_node().is_disabled(), "Back is off");
-        for want in [Step::Style, Step::Texts, Step::Accent, Step::Review] {
+        for want in [Step::Style, Step::Texts, Step::Sources, Step::Accent, Step::Review] {
             click(&mut h, "Next");
             assert_eq!(step(&h), want);
         }
         assert!(h.query_by_role_and_label(Role::Button, "Next").is_none());
         assert!(h.query_by_role_and_label(Role::Button, "Create").is_some());
-        for want in [Step::Accent, Step::Texts, Step::Style, Step::Size] {
+        for want in [Step::Accent, Step::Sources, Step::Texts, Step::Style, Step::Size] {
             click(&mut h, "Back");
             assert_eq!(step(&h), want);
         }
@@ -472,7 +657,7 @@ mod tests {
         let mut h = harness(app);
         let at = |h: &egui_kittest::Harness<'static, RustGisApp>| h.get_by_role_and_label(Role::Button, "Next").rect();
         let first = at(&h);
-        for _ in 0..3 {
+        for _ in 0..4 {
             click(&mut h, "Next");
             assert_eq!(at(&h), first, "{:?}", step(&h));
         }
@@ -493,7 +678,7 @@ mod tests {
             assert_ne!(next, "Next", "{code}: the language changed");
             let at = |h: &egui_kittest::Harness<'static, RustGisApp>| h.get_by_role_and_label(Role::Button, &next).rect();
             let first = at(&h);
-            for _ in 0..3 {
+            for _ in 0..4 {
                 h.get_by_role_and_label(Role::Button, &next).click();
                 h.run_steps(4);
                 assert_eq!(at(&h), first, "{code}: {:?}", step(&h));
