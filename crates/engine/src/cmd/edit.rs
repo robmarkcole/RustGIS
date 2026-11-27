@@ -1080,14 +1080,12 @@ fn add_field(s: &mut Session, p: &Json) -> CmdResult {
     if table {
         rustgis_data::progress::begin(ds.features.len());
     }
-    for row in &mut ds.features {
-        if table {
-            rustgis_data::progress::step(1).map_err(|e| e.to_string())?;
-        }
-        // Adding one column to shared rows should not double every row's attribute capacity.
-        row.attrs.reserve_exact(1);
-        row.attrs.push(Value::Null);
-    }
+    // A table's runs ahead on a worker, with progress and Cancel ([`table_ahead`]).
+    ds.features.try_add_columns(
+        1,
+        Value::Null,
+        || if table { rustgis_data::progress::step(1).map_err(|e| e.to_string()) } else { Ok(()) },
+    )?;
     Ok(Json::Null)
 }
 

@@ -1384,6 +1384,20 @@ impl Dataset {
         self.fields.len() - 1
     }
 
+    /// [`Dataset::ensure_field`] for several fields, returning their indices in order. The missing
+    /// ones are added together, so each row changes once however many there are.
+    pub fn ensure_fields<const N: usize>(&mut self, fields: [(&str, FieldType); N]) -> [usize; N] {
+        let before = self.fields.len();
+        let at = fields.map(|(name, ty)| {
+            self.field_index(name).unwrap_or_else(|| {
+                self.fields.push(Field::new(name, ty));
+                self.fields.len() - 1
+            })
+        });
+        self.features.add_columns(self.fields.len() - before, Value::Null);
+        at
+    }
+
     /// The features `rows` keeps, by position; a row past its end counts, so `&[]` keeps them all.
     pub fn kept_features<'a>(&'a self, rows: &'a [bool]) -> impl Iterator<Item = &'a Feature> {
         self.features.iter().enumerate().filter(|(r, _)| rows.get(*r).copied().unwrap_or(true)).map(|(_, f)| f)

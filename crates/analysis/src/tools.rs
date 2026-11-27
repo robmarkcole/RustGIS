@@ -6366,7 +6366,8 @@ fn merc_area_perimeter(mp: &MultiPolygon<f64>) -> (f64, f64) {
 /// Calculate Geometry Attributes: adds `area_km2` and `perimeter_km` to a polygon layer (see
 /// [`ground_area_perimeter`]), `length_km` to a line layer, and `point_x`/`point_y` (a label point)
 /// to any other, updating the layer in place. Polygon measurements and ambiguity counts check
-/// Cancel between features; measuring one feature's rings is an uninterruptible step.
+/// Cancel between features; measuring one feature's rings is an uninterruptible step, and so is
+/// adding the fields, which copies the layer's rows once when another owner shares them.
 ///
 /// In a layer's own projected system ([`Inputs::work_crs`]) the point's x and y are that system's,
 /// in its unit, as the layer holds them; areas and lengths are still measured on the ground, each
@@ -6398,8 +6399,7 @@ fn calculate_geometry(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
     }
     match ds.geometry_type {
         GeometryType::Polygon => {
-            let fa = out.ensure_field("area_km2", FieldType::Double);
-            let fp = out.ensure_field("perimeter_km", FieldType::Double);
+            let [fa, fp] = out.ensure_fields([("area_km2", FieldType::Double), ("perimeter_km", FieldType::Double)]);
             // Each feature's measures made on several cores for many (#1252), placed in their order.
             crate::control::begin(ds.features.len());
             let measured = crate::parallel::try_map(
@@ -6457,8 +6457,7 @@ fn calculate_geometry(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
             }
         }
         _ => {
-            let fx = out.ensure_field("point_x", FieldType::Double);
-            let fy = out.ensure_field("point_y", FieldType::Double);
+            let [fx, fy] = out.ensure_fields([("point_x", FieldType::Double), ("point_y", FieldType::Double)]);
             for f in &mut out.features {
                 let c = f.geometry.as_ref().and_then(|g| g.label_point());
                 if let Some(v) = f.attrs.get_mut(fx) {
