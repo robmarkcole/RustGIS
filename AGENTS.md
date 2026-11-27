@@ -115,6 +115,8 @@ measures.
   dead code in the browser build and fails it: put it behind `#[cfg(not(target_arch = "wasm32"))]`
   and check as CI does, with
   `RUSTFLAGS='-D warnings' cargo build --locked --target wasm32-unknown-unknown -p rustgis-web`.
+  The same CI job then runs that build in Chrome (`apps/rustgis-web/smoke/run.mjs`, steps in its
+  header), failing on any page error, console error or panic, such as `std::time` in the browser.
 - **Interface text is translatable**: wrap user-visible literals in `tl!("…")`, use
   `i18n::fmt("… {name} …", &[("name", …)])` instead of `format!` for messages, and pass labels to
   the ribbon widgets (they translate). Pull requests don't need to add the new strings to the

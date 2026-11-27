@@ -87,6 +87,26 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build for the browser
         run: cargo build --locked --target wasm32-unknown-unknown -p rustgis-web
+      # The build above compiles; this runs it. Trunk packages that same build (no second compile)
+      # with the deployed service worker, and the smoke test starts it in the runner's Chrome,
+      # offline, adds data, runs a command, saves and reopens, failing on any page error or panic
+      # (apps/rustgis-web/smoke/run.mjs).
+      - name: Run the web app in a browser
+        # About 40 s on a runner; a hang ends here rather than at the job's six hours.
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          # Pinned Trunk release, checksum-verified, as web-deploy.yml installs it.
+          curl -sSfL -o "$RUNNER_TEMP/trunk.tar.gz" https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-x86_64-unknown-linux-gnu.tar.gz
+          echo "f2b4680cd239693a646a2795e4633c625328d7b2a044fbe749fa3a2fe9e7036b  $RUNNER_TEMP/trunk.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin" && tar xzf "$RUNNER_TEMP/trunk.tar.gz" -C "$RUNNER_TEMP/bin" trunk
+          # The page names the release profile (`web`, fat LTO: a quarter of an hour), which would
+          # outrank --cargo-profile; this throwaway checkout drops it to package the dev build.
+          sed -i 's/ data-cargo-profile="web"//' apps/rustgis-web/index.html
+          if grep -q 'data-cargo-profile=' apps/rustgis-web/index.html; then echo "::error::apps/rustgis-web/index.html still names a Cargo profile" >&2; exit 1; fi
+          (cd apps/rustgis-web && "$RUNNER_TEMP/bin/trunk" build --locked --cargo-profile dev)
+          cargo xtask web-pwa dist/web
+          node apps/rustgis-web/smoke/run.mjs --dist dist/web --chrome "$(command -v google-chrome)"
 
   # The iOS app (apps/rustgis-mobile, #1902): linted for devices and built for the Simulator,
   # where macOS is tested (pushes to main, a manual run on every platform, a pull request labelled
