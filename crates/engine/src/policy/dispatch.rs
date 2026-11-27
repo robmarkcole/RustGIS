@@ -179,26 +179,47 @@ impl Session {
             let id = self.layer_id(&Value::Object(params.clone()))?;
             params.insert("layer".into(), json!(id));
         }
-        let mut op = self.authorize(command, &Value::Object(params))?;
-        self.check_read_command(&op)?;
-        let copy_command = matches!(command, "model.run" | "script.run") && self.policy_user();
-        if copy_command {
-            // A model's or script's native copy may read through several tools. Bind the original
-            // session's runtime stores, including web logins, before that copy exists.
-            let mut node = (*op.node).clone();
-            node.auth = Some(Arc::new(super::scope::RuntimeAccounts::capture(self)?));
-            op.node = Arc::new(node);
+        // A QGIS project's import runs on a copy that borrows the logins its services need: they
+        // are opened here, before its approval and its read record the accounts they are checked
+        // against (#2476).
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.import_opened = None;
+            if command == "project.importQgis" && self.policy_user() {
+                self.import_opened = crate::cmd::qgis::open_import_logins(self, &Value::Object(params.clone()));
+            }
         }
-        let node = op.node.clone();
-        let mut owner = self.continuation_for(node.clone())?;
-        if copy_command {
-            owner.accounts = self.policy_accounts();
-            owner.s3 = Some(vec![crate::render::rustgis_tiles::s3::account_identity()?]);
+        // The opened import is let go on every way out, refused or prepared: logins it opened end
+        // again unless the import holding them lands (`service_logins::reclaim_held`).
+        let prepared = (|s: &mut Self| -> Result<crate::cmd::reads::ReadAhead, String> {
+            let mut op = s.authorize(command, &Value::Object(params))?;
+            s.check_read_command(&op)?;
+            let copy_command = matches!(command, "model.run" | "script.run") && s.policy_user();
+            if copy_command {
+                // A model's or script's native copy may read through several tools. Bind the original
+                // session's runtime stores, including web logins, before that copy exists.
+                #[cfg(not(target_arch = "wasm32"))]
+                crate::service_logins::adopt_held(s);
+                let mut node = (*op.node).clone();
+                node.auth = Some(Arc::new(super::scope::RuntimeAccounts::capture(s)?));
+                op.node = Arc::new(node);
+            }
+            let node = op.node.clone();
+            let mut owner = s.continuation_for(node.clone())?;
+            if copy_command {
+                owner.accounts = s.policy_accounts();
+                owner.s3 = Some(vec![crate::render::rustgis_tiles::s3::account_identity()?]);
+            }
+            owner.check()?;
+            let current = owner.clone();
+            let still = Arc::new(move || current.check().is_ok());
+            s.with_node(node, |s| crate::render::rustgis_tiles::cache::with_still(still, || crate::cmd::reads::prepare(s, op, owner)))
+        })(self);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.import_opened = None;
         }
-        owner.check()?;
-        let current = owner.clone();
-        let still = Arc::new(move || current.check().is_ok());
-        self.with_node(node, |s| crate::render::rustgis_tiles::cache::with_still(still, || crate::cmd::reads::prepare(s, op, owner)))
+        prepared
     }
     /// Lands only the original read invocation; no result can be claimed by another command.
     pub(crate) fn finish_read(&mut self, read: crate::cmd::reads::Read) -> CmdResult {
@@ -210,18 +231,26 @@ impl Session {
             CommandOp::Registered { spec, params } => (spec.id, params.clone()),
             _ => return Err("not a registered read command".into()),
         };
+        // A project's import makes a map of its own: the user's own lands whichever map is shown by
+        // then, as a tool's project-wide output does, with every other check of its owner (#3120).
+        let project_wide = command == "project.importQgis" && owner.native_tool_owner();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.with_deferred_downloads(|s| {
                 s.command_epilogue(command, &params, |s| {
                     rustgis_data::provenance::record(inputs);
-                    s.check_delivery(&owner)?;
+                    if project_wide {
+                        s.check_delivery_owner(&owner)?;
+                        s.check_continuation_origin(&owner)?;
+                    } else {
+                        s.check_delivery(&owner)?;
+                    }
                     if let Some(source) = &source {
                         let layer = s.map().layer(s.layer_id(&params)?).ok_or("no such layer")?;
                         if !layer.source.as_ref().is_some_and(|current| current.same_opening(source)) {
                             return Err("the live source changed since this read started".into());
                         }
                     }
-                    s.resume(&owner, |s| {
+                    let land = |s: &mut Session| {
                         if !owner.native_tool_owner() && *op.node != s.command_node(command, &params)? {
                             return Err("the read command changed since it was authorized".into());
                         }
@@ -238,7 +267,8 @@ impl Session {
                             s.note_source(source);
                         }
                         result
-                    })?
+                    };
+                    if project_wide { s.resume_checked(&owner, land) } else { s.resume(&owner, land) }?
                 })
             })
         }));

@@ -1201,6 +1201,13 @@ pub struct Session {
     /// there. Its notices stay its own: the run there says them.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) requests_into: Option<rustgis_data::diagnostics::Capture>,
+    /// A QGIS project's import prepared for the read about to run it on a copy, its logins opened
+    /// before the read recorded the accounts (#2476): taken at once by that read.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) import_opened: Option<crate::cmd::qgis::ImportOpened>,
+    /// The project an import's first part read for it ([`cmd::reads::scan_import`]), while its read starts.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) import_scanned: Option<crate::cmd::qgis::ImportScan>,
     /// The tools run ahead that a model's run took, for the tests.
     #[cfg(test)]
     pub(crate) tools_taken: usize,
@@ -1612,6 +1619,10 @@ impl Session {
             zones_ahead: None,
             #[cfg(not(target_arch = "wasm32"))]
             requests_into: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            import_opened: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            import_scanned: None,
             #[cfg(test)]
             tools_taken: 0,
             #[cfg(test)]
@@ -2319,9 +2330,15 @@ impl Session {
     /// failed to start, or their worker failed): only the session still holds it. It goes back
     /// while nothing else changed the project since, newest set aside first so the oldest ends
     /// in front, and is freed and said otherwise. Run before each command run by itself, and by
-    /// the desktop as its background jobs end, so Undo sees it.
+    /// the desktop as its background jobs end, so Undo sees it. Logins opened for an import that
+    /// ended without landing end again here too ([`service_logins::reclaim_held`]).
     pub fn reclaim_rooms(&mut self) {
-        if self.depth > 0 || self.rooms.is_empty() {
+        if self.depth > 0 {
+            return;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        service_logins::reclaim_held(self);
+        if self.rooms.is_empty() {
             return;
         }
         let (ended, running): (Vec<_>, Vec<_>) =

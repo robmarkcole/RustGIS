@@ -292,6 +292,19 @@ pub(super) fn long_commands(boundaries: bool) {
         </symbol></symbols></renderer-v2></qgis>"#;
     std::fs::write(out("pin.qml"), marker).unwrap();
     read(&s, "style.importQgis", &json!({"layer": "Cities", "path": out("pin.qml")}));
+    // A QGIS project: imported on a copy of the session, Cancel looked at between its layers and
+    // within each layer's read (#2476).
+    let place = json!({"type": "FeatureCollection", "features": [
+        {"type": "Feature", "properties": {"name": "A"}, "geometry": {"type": "Point", "coordinates": [10.01, 45.01]}}]});
+    std::fs::write(out("place.geojson"), place.to_string()).unwrap();
+    std::fs::write(out("place.csv"), "name,x,y\nB,10.02,45.02\n").unwrap();
+    let project = r#"<qgis version="4.2.3"><title>Imported</title><layer-tree-group>
+        <layer-tree-layer id="Place" checked="Qt::Checked"/><layer-tree-layer id="Table" checked="Qt::Checked"/></layer-tree-group><projectlayers>
+        <maplayer type="vector"><id>Place</id><datasource>./place.geojson</datasource><layername>Place</layername><provider>ogr</provider></maplayer>
+        <maplayer type="vector"><id>Table</id><datasource>file:./place.csv?type=csv&amp;xField=x&amp;yField=y</datasource><layername>Table</layername><provider>delimitedtext</provider></maplayer>
+        </projectlayers></qgis>"#;
+    std::fs::write(out("import.qgs"), project).unwrap();
+    read(&s, "project.importQgis", &json!({"path": out("import.qgs")}));
 
     s.run("layer.addDataText", &json!({"fileName": "calc.csv", "text": "n,day\n1,01/02/2024\n2,02/03/2024\n"})).unwrap();
     s.run("edit.enable", &json!({"on": true})).unwrap();

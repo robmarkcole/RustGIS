@@ -356,7 +356,10 @@ pub fn temporary_probe(c: &Connection, secret: &str, insecure: bool, url: &str) 
 }
 
 /// An active login belongs to one connection in one session; the token is not a secret, but
-/// saved projects must never treat it as authority to use another session's login.
+/// saved projects must never treat it as authority to use another session's login. The one
+/// exception is a borrowing copy ([`SessionLogins::borrowing`]): a command's own run on a copy of
+/// its session, which uses the logins its session opened for it and opens none.
+#[derive(Clone)]
 struct ActiveLogin {
     origin: String,
     binding: String,
@@ -390,6 +393,18 @@ pub struct SessionLogins {
     said: BTreeSet<String>,
     /// Token generations under way, by connection id (see [`crate::service_tokens`]).
     pub(crate) pending: BTreeMap<String, crate::service_tokens::Pending>,
+    /// For a borrowing copy ([`SessionLogins::borrowing`]), why its session couldn't open the
+    /// login of each origin it was opened for, by origin: a login not open is refused with it.
+    borrowed: Option<BTreeMap<String, String>>,
+    /// While set, a login opened here leaves the layers and tiles of its connection as they are
+    /// and is recorded here instead ([`borrow_for`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    holding: Option<Vec<String>>,
+    /// Logins opened for a command running on a copy (Import QGIS Project) that haven't rebound
+    /// their connection's layers yet, with the token the running command keeps: rebound as it
+    /// lands ([`release_held`]), ended when it doesn't ([`reclaim_held`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    held: Vec<(std::sync::Arc<()>, Vec<String>)>,
 }
 
 impl SessionLogins {
@@ -403,12 +418,39 @@ impl SessionLogins {
             failed: BTreeMap::new(),
             said: BTreeSet::new(),
             pending: BTreeMap::new(),
+            borrowed: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            holding: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            held: Vec::new(),
         }
+    }
+
+    /// The logins a copy of this session uses while it runs a command of this session's on a
+    /// thread of its own (Import QGIS Project, #2476): those open here for `origins`, which this
+    /// session opened for it before it started, and why each that isn't couldn't be (`refused`,
+    /// by origin). The copy opens no login itself: it reads no saved login and asks for none, and a
+    /// login not open is refused with that reason. Dropping it ends none of the logins it borrowed,
+    /// which stay this session's; one logged out here meanwhile is no longer active, and its
+    /// requests are refused.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn borrowing(&self, origins: &BTreeSet<String>, refused: BTreeMap<String, String>) -> Self {
+        let mut copy = Self::new();
+        copy.active = self.active.iter().filter(|(_, a)| origins.contains(&a.origin)).map(|(id, a)| (id.clone(), a.clone())).collect();
+        copy.anonymous = self.anonymous;
+        copy.logged_out.clone_from(&self.logged_out);
+        copy.borrowed = Some(refused);
+        copy
     }
 
     /// Starts or ends [`SessionLogins::anonymous`] reads, saying what it was.
     pub(crate) fn set_anonymous(&mut self, on: bool) -> bool {
         std::mem::replace(&mut self.anonymous, on)
+    }
+
+    /// Whether these are a borrowing copy's ([`SessionLogins::borrowing`]).
+    pub(crate) fn is_borrowing(&self) -> bool {
+        self.borrowed.is_some()
     }
 
     /// Whether [`SessionLogins::anonymous`] reads are running: nothing may pick a login for them.
@@ -450,7 +492,9 @@ pub(crate) fn anonymously<T>(s: &mut Session, on: bool, f: impl FnOnce(&mut Sess
 impl Drop for SessionLogins {
     fn drop(&mut self) {
         let mut ended = false;
-        for active in self.active.values() {
+        // A borrowing copy's logins are its session's, which ends them.
+        let own = if self.borrowed.is_some() { BTreeMap::new() } else { std::mem::take(&mut self.active) };
+        for active in own.values() {
             ended |= logins::deactivate(&active.binding);
         }
         for op in self.pending.values() {
@@ -485,6 +529,10 @@ fn clear_cache() {
 /// Other sessions and other connections at this origin retain their own bindings.
 /// Returns the number of addresses that could not be rebound; resolution reports it once.
 pub(crate) fn activate(s: &mut Session, c: &Connection, secret: Option<&Secret>, insecure: bool) -> Result<usize, String> {
+    // A borrowing copy neither opens a login nor ends one of its session's.
+    if s.web_logins.borrowed.is_some() {
+        return Err(REQUIRED.into());
+    }
     let origin = login_origin(c).ok_or(NO_ORIGIN)?;
     let next = match secret {
         Some(secret) => {
@@ -502,6 +550,16 @@ pub(crate) fn activate(s: &mut Session, c: &Connection, secret: Option<&Secret>,
         }
     }
     retry(s, &c.id);
+    // Opened for an import running on a copy: its layers here wait until the import lands. (A
+    // login replaced here was this session's already, and its session password with it.)
+    #[cfg(not(target_arch = "wasm32"))]
+    if !replaced && let Some(held) = s.web_logins.holding.as_mut() {
+        held.push(c.id.clone());
+        return Ok(0);
+    }
+    // Opened here by anything else: this session's, which no import's end may end.
+    #[cfg(not(target_arch = "wasm32"))]
+    unhold(s, &c.id);
     let failed = reselect(s, c, &origin);
     // Only a login that was replaced or removed leaves cached authenticated responses to drop;
     // a first login, or none, changes no cached tile.
@@ -521,7 +579,12 @@ pub(crate) fn reselect(s: &mut Session, c: &Connection, origin: &str) -> usize {
 }
 
 pub(crate) fn deactivate(s: &mut Session, c: &Connection, _origin: Option<String>) {
-    if let Some(old) = s.web_logins.active.remove(&c.id) {
+    #[cfg(not(target_arch = "wasm32"))]
+    unhold(s, &c.id);
+    // (A borrowing copy only stops using its session's login, which stays active there.)
+    if let Some(old) = s.web_logins.active.remove(&c.id)
+        && s.web_logins.borrowed.is_none()
+    {
         logins::deactivate(&old.binding);
         clear_cache();
     }
@@ -626,7 +689,9 @@ fn lapsed(c: &Connection, secret: &Secret) -> bool {
 /// isn't asked for the same expired payload again. The saved login itself is left as it is.
 /// The connection stays chosen for its origin, so asking for a new login finds it.
 fn expire(s: &mut Session, c: &Connection) -> String {
-    if let Some(old) = s.web_logins.active.remove(&c.id) {
+    if let Some(old) = s.web_logins.active.remove(&c.id)
+        && s.web_logins.borrowed.is_none()
+    {
         logins::deactivate(&old.binding);
         clear_cache();
     }
@@ -727,6 +792,23 @@ pub fn request(s: &mut Session, connection: Option<&str>, url: &str) -> Result<S
     if c.auth.is_empty() {
         return Ok(plain.to_string());
     }
+    // A borrowing copy opens no login: one its session didn't open for it is refused, saying why.
+    if let Some(refused) = &s.web_logins.borrowed
+        && !logged_in(s, &c)
+    {
+        return Err(refused.get(&origin).cloned().unwrap_or_else(|| REQUIRED.to_string()));
+    }
+    // A login opened for a running import is used here too: it is this session's from now on.
+    // Another import opening its logins borrows it too, and holds it as well.
+    #[cfg(not(target_arch = "wasm32"))]
+    if logged_in(s, &c) && s.web_logins.held.iter().any(|(_, ids)| ids.contains(&c.id)) {
+        if let Some(holding) = s.web_logins.holding.as_mut() {
+            holding.push(c.id.clone());
+        } else {
+            unhold(s, &c.id);
+            rebind_held(s, std::slice::from_ref(&c.id));
+        }
+    }
     if !logged_in(s, &c) {
         // Confirmed already: a web connection's session secret is kept only after its login passed
         // the plain-http:// check (`connection.login`), and is forgotten when the connection's
@@ -736,6 +818,112 @@ pub fn request(s: &mut Session, connection: Option<&str>, url: &str) -> Result<S
     }
     let active = s.web_logins.active.get(&c.id).ok_or(REQUIRED)?;
     logins::bind(&active.binding, plain).map_err(str::to_string)
+}
+
+/// The logins a copy of `s` running one of its commands uses ([`SessionLogins::borrowing`]): the
+/// login of each web address in `addresses`' origins, opened here first as a request to it would
+/// open it (a saved login read, a choice of connection asked for), and why each that couldn't be
+/// wasn't. The copy then sends only what `s` could send.
+///
+/// A login opened here leaves the layers and tiles already using its connection as they are,
+/// since the command may yet be cancelled: the token it gives the command keeps it pending until
+/// the command lands and calls [`release_held`], which rebinds them. A command that never lands
+/// drops its token, and [`reclaim_held`] ends the login again, as it was before.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn borrow_for<'a>(s: &mut Session, addresses: impl IntoIterator<Item = &'a str>) -> (SessionLogins, std::sync::Arc<()>) {
+    let (mut origins, mut refused) = (BTreeSet::new(), BTreeMap::new());
+    let outer = s.web_logins.holding.replace(Vec::new());
+    for address in addresses {
+        let Some(origin) = logins::origin(logins::inner(address)) else { continue };
+        if origins.insert(origin.clone())
+            && let Err(e) = request(s, None, address)
+        {
+            refused.insert(origin, e);
+        }
+    }
+    let opened = std::mem::replace(&mut s.web_logins.holding, outer).unwrap_or_default();
+    let token = std::sync::Arc::new(());
+    if !opened.is_empty() {
+        s.web_logins.held.push((token.clone(), opened));
+    }
+    (s.web_logins.borrowing(&origins, refused), token)
+}
+
+/// The command holding `token` ([`borrow_for`]) landed: the logins opened for it rebind their
+/// connections' layers and tiles here now, as any login opened here does.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn release_held(s: &mut Session, token: &std::sync::Arc<()>) {
+    let Some(i) = s.web_logins.held.iter().position(|(t, _)| std::sync::Arc::ptr_eq(t, token)) else { return };
+    let (_, ids) = s.web_logins.held.remove(i);
+    // The session's from now on: another import still running that holds one too can't end it.
+    for id in &ids {
+        unhold(s, id);
+    }
+    rebind_held(s, &ids);
+}
+
+/// Logins opened for a command that ended without landing (cancelled, refused, failed) end again,
+/// unless another command still running holds them: what it opened leaves nothing behind.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn reclaim_held(s: &mut Session) {
+    if s.web_logins.held.iter().all(|(t, _)| std::sync::Arc::strong_count(t) > 1) {
+        return;
+    }
+    let (ended, running): (Vec<_>, Vec<_>) =
+        std::mem::take(&mut s.web_logins.held).into_iter().partition(|(t, _)| std::sync::Arc::strong_count(t) == 1);
+    s.web_logins.held = running;
+    let mut cleared = false;
+    for id in ended.into_iter().flat_map(|(_, ids)| ids) {
+        if s.web_logins.held.iter().any(|(_, ids)| ids.contains(&id)) {
+            continue;
+        }
+        if let Some(old) = s.web_logins.active.remove(&id) {
+            logins::deactivate(&old.binding);
+            s.database_logins.clear_session_password(&id);
+            cleared = true;
+        }
+    }
+    // The copy may have cached what it was sent with these logins.
+    if cleared {
+        clear_cache();
+    }
+}
+
+/// `id`'s login is no import's to end: opened, ended or used here by something else.
+#[cfg(not(target_arch = "wasm32"))]
+fn unhold(s: &mut Session, id: &str) {
+    for (_, ids) in &mut s.web_logins.held {
+        ids.retain(|held| held != id);
+    }
+}
+
+/// Logins opened for imports still running become this session's: a model's or a script's copy
+/// about to borrow every login here (`RuntimeAccounts::capture`) may outlast them. Their layers and
+/// tiles rebind now.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn adopt_held(s: &mut Session) {
+    let ids: Vec<String> = s.web_logins.held.iter_mut().flat_map(|(_, ids)| std::mem::take(ids)).collect();
+    rebind_held(s, &ids);
+}
+
+/// Rebinds the layers and tiles of each of `ids`' connections still logged in here.
+#[cfg(not(target_arch = "wasm32"))]
+fn rebind_held(s: &mut Session, ids: &[String]) {
+    for id in ids {
+        let Some(c) = s.connections.connections.iter().find(|c| c.id == *id).cloned() else { continue };
+        if !logged_in(s, &c) {
+            continue;
+        }
+        if let Some(origin) = login_origin(&c) {
+            let failed = reselect(s, &c, &origin);
+            if failed > 0 {
+                s.notify(
+                    format!("{}: {failed} address(es) could not carry the service login; their previous addresses were kept.", c.name),
+                    true,
+                );
+            }
+        }
+    }
 }
 
 /// Opens a service using its existing or remembered login without retrying a failed store read

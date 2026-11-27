@@ -3461,6 +3461,11 @@ impl RustGisApp {
             if id == "style.importQgis" {
                 return readjob::run(self, "style.importQgis", params);
             }
+            // Importing a project reads its files and asks its services for their layers: on a copy
+            // of the session on a thread of its own, with progress and Cancel (#2476).
+            if id == "project.importQgis" {
+                return readjob::run(self, "project.importQgis", params);
+            }
             // Publishing hashes, reads and writes the whole file: on a thread of its own, with
             // progress and Cancel, as an export is.
             if id == "source.publish" {

@@ -285,7 +285,11 @@ with the login saved in RustGIS for it, if there is one. Other source settings R
 value, which may be a key written on its own, is taken as a login, never named. A service that
 doesn't answer, or doesn't list the layer, leaves that layer out, noted. In the web app, a web
 service's layer is left out, noted: add it with **Home › Add › Add Data › From Service**. On the
-desktop, the import waits for each service in turn. A memory
+desktop, the import runs in the background, with its progress (layers done of the project's) and
+Cancel: the map comes in once every layer has been read and every service has answered, and a
+cancelled import adds nothing. A service whose login RustGIS keeps is asked with that login, which
+is opened first if it isn't yet (a saved login read, or a choice of connection asked for); one that
+can't be opened leaves the layer out, noted. A memory
 layer comes in empty with its fields, as QGIS opens it (QGIS doesn't save its features). A
 virtual layer that selects every column of one file's layer (`SELECT * FROM t`, with or without
 a `WHERE` clause, its fields named with or without the table, or no query) comes in as that
