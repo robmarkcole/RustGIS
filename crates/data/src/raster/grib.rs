@@ -20,6 +20,9 @@
 //! out).
 
 mod complex;
+mod rows;
+
+pub use rows::{HEAD, Plan, Rows, cut, plan};
 
 use super::{Crs, Exact, GeoTransform, Raster, Uncounted, max_samples};
 use crate::{DataError, Result};
@@ -775,13 +778,18 @@ fn to_raster(fields: Vec<Field>, name: &str) -> Result<Raster> {
         r.rounded = rounded;
     }
     if past > 0 {
-        let (what, has) = if past == 1 { ("1 value".to_string(), "has") } else { (format!("{past} values"), "have") };
-        r.lost.push(crate::loss::Note::loss(
-            crate::loss::LossCode::DroppedValue,
-            format!("{what} past the range of 32-bit floats (±3.4 × 10^38) {has} no value"),
-        ));
+        r.lost.push(past_note(past));
     }
     Ok(r)
+}
+
+/// What says values past `f32`'s range, in every notice about them.
+const PAST: &str = "past the range of 32-bit floats (±3.4 × 10^38)";
+
+/// The notice of `past` values past `f32`'s range, which have no value.
+fn past_note(past: u64) -> crate::loss::Note {
+    let (what, has) = if past == 1 { ("1 value".to_string(), "has") } else { (format!("{past} values"), "have") };
+    crate::loss::Note::loss(crate::loss::LossCode::DroppedValue, format!("{what} {PAST} {has} no value"))
 }
 
 /// Octets `o..o + n` (0-based offset `o`) of `b`, unsigned, big-endian; 0 past the end.
@@ -880,6 +888,20 @@ fn field_values(
 /// ([`field_values`]); with fewer bits there than that, an error.
 fn unpack(
     data: &[u8],
+    packed: (usize, u32),
+    scale: (f64, i64, i64),
+    mask: Option<&[u8]>,
+    at: (usize, &Grid),
+    uncounted: Uncounted,
+) -> std::result::Result<(Vec<f32>, u64, u64), Skip> {
+    unpack_from(data, 0, packed, scale, mask, at, uncounted)
+}
+
+/// [`unpack`], the first value starting `skip` bits into `data` (a run of rows cut from a data
+/// section starts inside an octet when a row isn't a whole number of them).
+fn unpack_from(
+    data: &[u8],
+    skip: u32,
     (count, bits): (usize, u32),
     (r, e, d): (f64, i64, i64),
     mask: Option<&[u8]>,
@@ -889,13 +911,13 @@ fn unpack(
     if bits > MAX_BITS {
         return Err(Skip::Other(format!("values of {bits} bits")));
     }
-    let need = (count as u64).saturating_mul(u64::from(bits)).div_ceil(8);
+    let need = (count as u64).saturating_mul(u64::from(bits)).saturating_add(u64::from(skip)).div_ceil(8);
     if (data.len() as u64) < need {
         return Err(Skip::Damaged("a data section shorter than its values".to_string()));
     }
     reference(r)?;
     let scale = scaling(r, e, d);
-    let mut bit = 0u64;
+    let mut bit = u64::from(skip);
     field_values(at, mask, count, uncounted, || {
         let x = self::bits(data, bit, bits) as f64;
         bit += u64::from(bits);
@@ -1031,19 +1053,7 @@ fn grib1(b: &[u8], room: usize, first: Option<Grid>, uncounted: Uncounted) -> st
         return Err(Skip::Other(format!("predefined grids (grid {})", pds[6])));
     }
     let d = signed(pds, 26, 2);
-    let century = i64::from(pds[24]);
-    let year = (century - 1) * 100 + i64::from(pds[12]);
-    let name = format!(
-        "{}:kpds5={}:kpds6={}:kpds7={}:TR={}:P1={}:P2={}:TimeU={}",
-        date(year, u32::from(pds[13]), u32::from(pds[14]), u32::from(pds[15])),
-        pds[8],
-        pds[9],
-        be(pds, 10, 2),
-        pds[20],
-        pds[18],
-        pds[19],
-        pds[17],
-    );
+    let name = grib1_name(pds);
     let gds_at = 8 + pds.len();
     let gds = section1(b, gds_at)?;
     let grid = grib1_grid(gds)?;
@@ -1089,6 +1099,23 @@ fn grib1(b: &[u8], room: usize, first: Option<Grid>, uncounted: Uncounted) -> st
         unpack(data, (count, bits), (r, e, d), bitmap, (points, &grid), uncounted)?
     };
     Ok(Field { name, grid, values, rounded, past })
+}
+
+/// A GRIB1 field's band name, from its product definition section (of 28 octets or more).
+fn grib1_name(pds: &[u8]) -> String {
+    let octet = |o: usize| pds.get(o).copied().unwrap_or(0);
+    let year = (i64::from(octet(24)) - 1) * 100 + i64::from(octet(12));
+    format!(
+        "{}:kpds5={}:kpds6={}:kpds7={}:TR={}:P1={}:P2={}:TimeU={}",
+        date(year, u32::from(octet(13)), u32::from(octet(14)), u32::from(octet(15))),
+        octet(8),
+        octet(9),
+        be(pds, 10, 2),
+        octet(20),
+        octet(18),
+        octet(19),
+        octet(17),
+    )
 }
 
 /// A GRIB1 grid description section: a regular latitude/longitude grid only.

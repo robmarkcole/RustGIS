@@ -54358,6 +54358,99 @@ fn a_plugin_commands_grib_range_is_added_when_the_app_completes_it() {
     assert_eq!(layer.raster.as_ref().unwrap().data.as_ref().unwrap().bands[0].data, vec![3.0, 4.0]);
 }
 
+/// A GRIB1 message of a 60 × 40 grid of 1° cells from 60° N, 10° E, north to south: value `k` is
+/// `k`, 16 bits each (4,884 octets, more than the 4,096 read first).
+#[cfg(not(target_arch = "wasm32"))]
+fn grib1_grid_message() -> Vec<u8> {
+    let mut m = b"GRIB\0\x13\x14\x01".to_vec();
+    m.extend([0, 0, 28, 2, 7, 96, 255, 0x80, 11, 105, 0, 2, 26, 11, 18, 6, 0, 1, 0, 0, 0, 0, 0, 0, 21, 0, 0, 0]);
+    // Grid description: 60 × 40, 60° N 10° E to 21° N 69° E, 1°.
+    m.extend([0, 0, 32, 0, 255, 0, 0, 60, 0, 40, 0, 0xea, 0x60, 0, 0x27, 0x10, 0x80, 0, 0x52, 0x08, 0x01, 0x0d, 0x88]);
+    m.extend([0x03, 0xe8, 0x03, 0xe8, 0, 0, 0, 0, 0]);
+    // Binary data: 11 octets, 2,400 values and one octet of padding (4,812).
+    m.extend([0, 0x12, 0xcc, 8, 0, 0, 0, 0, 0, 0, 16]);
+    m.extend((0..2400u16).flat_map(u16::to_be_bytes));
+    m.push(0);
+    m.extend(b"7777");
+    assert_eq!(m.len(), 4884);
+    m
+}
+
+/// `layer.addUrl` with `"bytes"` and `"bbox"` (#3055) asks for the record's first 4,096 octets,
+/// then for the rows of the box only, and adds the cells the box touches, saying how much it
+/// read. A record that can't be read by rows is downloaded whole and cut to the box, and said;
+/// where rows aren't read yet (a plugin's command in the app, the app's own check) it is refused.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn the_rows_of_a_box_of_a_grib_record_are_asked_for_alone() {
+    let mut file = grib1_message(1, 2);
+    file.extend(grib1_grid_message());
+    let (base, sent) = serve_ranges(file.clone());
+    let count = || sent.load(std::sync::atomic::Ordering::Relaxed);
+    let mut s = Session::new(Project::default());
+    let url = format!("{base}/run/PREC.grb");
+    let cells = |s: &Session, r: &Value| {
+        let raster = s.map().layer(r["layer"].as_u64().unwrap() as u32).unwrap().raster.as_ref().unwrap().data.clone().unwrap();
+        (raster.width, raster.height, raster.transform.origin_x, raster.transform.origin_y, raster.bands[0].data.clone())
+    };
+    // Rows 35 to 37 of 40, columns 1 and 2: the record's first 4,096 octets and three rows of 120.
+    let mark = s.notice_mark();
+    let r = s.run("layer.addUrl", &json!({"url": url, "bytes": [88, 4971], "bbox": [10.6, 22.7, 12.4, 25.3], "name": "Rain"})).unwrap();
+    assert_eq!(cells(&s, &r), (2, 3, 10.5, 25.5, vec![2101.0, 2102.0, 2161.0, 2162.0, 2221.0, 2222.0]));
+    assert_eq!(count(), 4096 + 360);
+    let said: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+    assert!(said.contains(&"Rain: read 3 of 40 rows (5 kB of 5 kB)".to_string()), "{said:?}");
+    assert!(!said.iter().any(|n| n.contains("whole record")), "{said:?}");
+    // Rows the first read holds already, and a record no longer than it, are asked for once.
+    let r = s.run("layer.addUrl", &json!({"url": url, "bytes": [88, 4971], "bbox": [10.6, 56.7, 12.4, 59.3]})).unwrap();
+    assert_eq!(cells(&s, &r).4, vec![61.0, 62.0, 121.0, 122.0, 181.0, 182.0]);
+    let r = s.run("layer.addUrl", &json!({"url": url, "bytes": [0, 87], "bbox": [9.6, 59.6, 10.4, 60.4]})).unwrap();
+    assert_eq!(cells(&s, &r).4, vec![1.0]);
+    assert_eq!(count(), 4096 + 360 + 4096 + 88);
+    // `"bbox": false` is no box: the range is read as the file, as before boxes.
+    let r = s.run("layer.addUrl", &json!({"url": url, "bytes": [0, 87], "bbox": false})).unwrap();
+    assert_eq!(cells(&s, &r).4, vec![1.0, 2.0]);
+    assert_eq!(count(), 4096 + 360 + 4096 + 88 + 88);
+    // Two messages in the range: downloaded whole after the first read, cut to the box, and said.
+    let mark = s.notice_mark();
+    let r = s.run("layer.addUrl", &json!({"url": url, "bytes": [0, 4971], "bbox": [9.6, 59.6, 10.4, 60.4], "name": "Two"})).unwrap();
+    assert_eq!(cells(&s, &r).4, vec![1.0]);
+    assert_eq!(count(), 4096 + 360 + 4096 + 88 + 88 + 4096 + 4972);
+    let said: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+    let whole = "Two: a range that isn't one whole message of one field can't be read row by row: the whole record was downloaded (5 kB) and cut to the box";
+    assert!(said.contains(&whole.to_string()), "{said:?}");
+    // Refused before anything is fetched.
+    let before = count();
+    for (bbox, more, said) in [
+        (json!([170, 0, -170, 10]), json!(null), "a box across the antimeridian"),
+        (json!([10, 20, 5, 30]), json!(null), "a box across the antimeridian"),
+        (json!("here"), json!(null), "bbox is [west, south, east, north]"),
+        (json!([10.6, 56.7, 12.4, 59.3]), json!(1000), "doesn't go with \"cellSize\""),
+    ] {
+        let e = s.run("layer.addUrl", &json!({"url": url, "bytes": [88, 4971], "bbox": bbox, "cellSize": more})).unwrap_err();
+        assert!(e.contains(said), "{bbox}: {e}");
+    }
+    // Keys the rows of a box don't read are refused, never left out unsaid.
+    let asked = json!({"url": url, "bytes": [88, 4971], "bbox": [10.6, 56.7, 12.4, 59.3], "crs": "EPSG:4674", "layer": "2"});
+    let e = s.run("layer.addUrl", &asked).unwrap_err();
+    assert!(e.contains("the rows of a box (\"bbox\" with \"bytes\") don't read layer, crs: leave it out"), "{e}");
+    assert_eq!(count(), before);
+    // A box outside the record, known from its headers.
+    let e = s.run("layer.addUrl", &json!({"url": url, "bytes": [88, 4971], "bbox": [10, 70, 12, 80]})).unwrap_err();
+    assert!(e.contains("the box's latitudes (70° to 80°) are outside the record's grid (20.5° to 60.5°)"), "{e}");
+    assert_eq!(count(), before + 4096);
+    // The app's check of a range, and a plugin's command it runs: not read by rows yet, and said.
+    let asked = json!({"url": url, "bytes": [88, 4971], "bbox": [10.6, 56.7, 12.4, 59.3]});
+    let e = crate::cmd::layer::byte_range(&asked, &url).unwrap_err();
+    assert!(e.contains("is read on the command line for now, not in the app yet"), "{e}");
+    let mut s = world();
+    plugin("eng-grib-rows", &["edit", "network"]);
+    fetch_mode(true, true);
+    let e = s.run_leaving_downloads("plugin:eng-grib-rows/f", &json!({"op": "layer.addUrl", "params": asked})).unwrap_err();
+    assert!(e.contains("is read on the command line for now, not in the app yet"), "{e}");
+    assert!(s.take_url_requests().is_empty());
+}
+
 /// Each page of a map series is georeferenced with its own view, not the first page's (#1191).
 #[test]
 fn a_map_series_pdf_georeferences_each_page_with_its_view() {

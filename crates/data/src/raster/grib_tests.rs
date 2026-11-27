@@ -1539,3 +1539,179 @@ fn hostile_complex_packing_never_panics() {
         }
     }
 }
+
+/// The rows of `bbox` of `file` (one record) as [`plan`] and [`Rows::read`] give them from its
+/// first octets and one run of the others, checked against the whole record read and [`cut`]:
+/// the raster, and the octets of the run.
+fn by_rows(file: &[u8], bbox: [f64; 4]) -> (Raster, usize) {
+    let head = &file[..file.len().min(HEAD as usize)];
+    let Plan::Rows(rows) = plan(head, file.len() as u64, bbox).unwrap() else { panic!("read whole") };
+    let run = &file[rows.run.0 as usize..=rows.run.1 as usize];
+    let got = rows.read(run, "t").unwrap();
+    let want = cut(read_bytes(file, "t").unwrap(), bbox).unwrap();
+    assert_eq!((got.width, got.height, got.transform), (want.width, want.height, want.transform));
+    assert_eq!((&got.bands[0].data, &got.bands[0].name), (&want.bands[0].data, &want.bands[0].name));
+    assert_eq!(got.lost.texts().collect::<Vec<_>>(), want.lost.texts().collect::<Vec<_>>());
+    (got, run.len())
+}
+
+/// Why `file` isn't read by rows.
+fn read_whole(file: &[u8]) -> String {
+    match plan(&file[..file.len().min(HEAD as usize)], file.len() as u64, [10.6, 56.7, 12.4, 59.3]).unwrap() {
+        Plan::Whole(why) => why,
+        Plan::Rows(_) => panic!("read by rows"),
+    }
+}
+
+#[test]
+fn the_rows_of_a_box_are_the_whole_record_cut_to_it() {
+    // Rows of 5 values: at 12 bits a row is 60 bits, so the second starts inside an octet.
+    for bits in [8, 12, 16] {
+        let x: Vec<u32> = (0..30).map(|k| (k * 37 + 5) % (1 << bits)).collect();
+        // GRIB1, north to south from 60° N, 10° E: rows 1 to 3 and columns 1 and 2 of 6 × 5.
+        let mut g = G1::new(5, 6, x.clone());
+        g.bits = bits;
+        let (r, run) = by_rows(&g.bytes(), [10.6, 56.7, 12.4, 59.3]);
+        assert_eq!((r.width, r.height, run), (2, 3, (3 * 5 * bits as usize).div_ceil(8)), "{bits} bits");
+        assert_eq!(r.bands[0].data, [6, 7, 11, 12, 16, 17].map(|k| x[k] as f32), "{bits} bits");
+        let t = r.transform;
+        assert_eq!((t.origin_x, t.origin_y), (10.5, 59.5));
+        assert!(!r.lost.iter().any(|l| l.contains("reaches past")), "{:?}", r.lost);
+        // Alternating rows start on an even one: one more row is read, and cut.
+        g.scan = 0x10;
+        assert_eq!(by_rows(&g.bytes(), [10.6, 56.7, 12.4, 59.3]).1, (4 * 5 * bits as usize).div_ceil(8), "{bits} bits");
+        // GRIB2, south to north from 10° S, 300° E in cells of 0.5°.
+        let mut f = F2::new(5, 6, x.clone());
+        f.bits = bits;
+        let (r, _) = by_rows(&grib2_message(&[f]), [-59.6, -9.3, -58.9, -8.4]);
+        assert_eq!((r.width, r.height), (2, 3), "{bits} bits");
+        let mut f = F2::new(5, 6, x);
+        (f.bits, f.scan) = (bits, 0x50);
+        by_rows(&grib2_message(&[f]), [-59.6, -9.3, -58.9, -8.4]);
+    }
+    // The first row, the last row and every row.
+    let g = G1::new(5, 6, (0..30).collect());
+    for (bbox, rows) in [([10.6, 60.1, 12.0, 70.0], 1), ([10.6, 50.0, 12.0, 54.9], 1), ([0.0, 0.0, 20.0, 80.0], 6)] {
+        let r = by_rows(&g.bytes(), bbox).0;
+        assert_eq!(r.height, rows, "{bbox:?}");
+        // Smaller than the box, and said.
+        assert!(r.lost.says("the box reaches past the record's grid: the layer ends where the grid does"), "{:?}", r.lost);
+    }
+    // A grid round the globe from 0°, laid out from −180° as the whole record is, with BAM's
+    // latitudes: its notices are the whole record's.
+    let mut g = G1::new(6, 3, (1..=18).collect());
+    (g.lat1, g.lat2, g.lon1, g.lon2, g.di, g.dj) = (-60_000, 60_000, 0, 300_000, 60_000, 60_000);
+    let (r, _) = by_rows(&g.bytes(), [-100.0, -20.0, 100.0, 20.0]);
+    assert_eq!((r.width, r.height, r.transform.origin_x), (5, 1, -150.0));
+    assert_eq!(r.bands[0].data, vec![11.0, 12.0, 7.0, 8.0, 9.0]);
+    assert!(r.lost.says("its earth is a sphere of radius 6,367,470 m (GRIB1's); latitudes and longitudes are read as WGS 84's"));
+}
+
+#[test]
+fn a_box_outside_the_record_is_refused_by_name() {
+    let file = G1::new(5, 6, (0..30).collect()).bytes();
+    let e = plan(&file, file.len() as u64, [10.6, 70.0, 12.0, 80.0]).err().unwrap().to_string();
+    assert!(e.contains("the box's latitudes (70° to 80°) are outside the record's grid (54.5° to 60.5°)"), "{e}");
+    // Its longitudes: known once the rows are laid out.
+    let Plan::Rows(rows) = plan(&file, file.len() as u64, [100.0, 56.0, 110.0, 58.0]).unwrap() else { panic!("read whole") };
+    let e = rows.read(&file[rows.run.0 as usize..=rows.run.1 as usize], "t").err().unwrap().to_string();
+    assert!(e.contains("the box (100, 56, 110, 58) is outside the record's grid (9.5, 54.5, 14.5, 60.5)"), "{e}");
+    assert!(cut(read_bytes(&file, "t").unwrap(), [100.0, 56.0, 110.0, 58.0]).is_err());
+    // Fewer octets than the rows of a box inside the grid take.
+    let Plan::Rows(rows) = plan(&file, file.len() as u64, [10.0, 56.0, 12.0, 58.0]).unwrap() else { panic!("read whole") };
+    assert!(rows.read(&file[rows.run.0 as usize..=rows.run.1 as usize], "t").is_ok());
+    let e = rows.read(&file[rows.run.0 as usize..rows.run.1 as usize], "t").err().unwrap().to_string();
+    assert!(e.contains("a data section shorter than its values"), "{e}");
+}
+
+/// Values past `f32`'s range are counted over the box's cells when its rows are read alone, not
+/// over every cell of the rows read; a record read whole says they are the whole record's.
+#[test]
+fn values_past_f32_are_counted_in_the_box() {
+    const BOX: [f64; 4] = [10.6, 56.7, 12.4, 59.3];
+    let past = |r: &Raster| r.lost.texts().filter(|t| t.contains("past the range of 32-bit floats")).map(String::from).collect::<Vec<_>>();
+    let rows_of = |file: &[u8]| {
+        let Plan::Rows(rows) = plan(file, file.len() as u64, BOX).unwrap() else { panic!("read whole") };
+        rows.read(&file[rows.run.0 as usize..=rows.run.1 as usize], "t").unwrap()
+    };
+    // E = 130: a packed 1 is past the range. Row 1, column 0: in the rows read, outside the box.
+    let mut x = vec![0u32; 30];
+    x[5] = 1;
+    let mut g = G1::new(5, 6, x.clone());
+    g.e = 130;
+    let r = rows_of(&g.bytes());
+    assert!(past(&r).is_empty() && r.bands[0].data.iter().all(|v| *v == 0.0), "{:?}", r.lost);
+    // Read whole and cut, the count would be the record's: said as the record's, without one.
+    let whole = cut(read_bytes(&g.bytes(), "t").unwrap(), BOX).unwrap();
+    let said =
+        "values past the range of 32-bit floats (±3.4 × 10^38) in the whole record have no value: any among the box's cells are empty";
+    assert_eq!(past(&whole), vec![said.to_string()]);
+    // Row 1, column 1 too: one of the two is in the box.
+    x[6] = 1;
+    let mut g = G1::new(5, 6, x);
+    g.e = 130;
+    let r = rows_of(&g.bytes());
+    assert_eq!(past(&r), vec!["1 value past the range of 32-bit floats (±3.4 × 10^38) has no value".to_string()]);
+    assert!(r.bands[0].data[0].is_nan());
+}
+
+#[test]
+fn records_that_cant_be_read_by_rows_say_why() {
+    let x: Vec<u32> = (0..30).collect();
+    let mut masked = G1::new(5, 6, x[..29].to_vec());
+    masked.keep = Some((0..30).map(|k| k != 7).collect());
+    assert_eq!(read_whole(&masked.bytes()), "a record with a bitmap isn't read row by row yet");
+    // Read whole and cut, the masked point (row 1, column 2) has no value.
+    let r = cut(read_bytes(&masked.bytes(), "t").unwrap(), [10.6, 56.7, 12.4, 59.3]).unwrap();
+    assert!(r.bands[0].data[1].is_nan() && r.bands[0].data[0] == 6.0, "{:?}", r.bands[0].data);
+    let mut masked = F2::new(5, 6, x[..29].to_vec());
+    masked.keep = Some((0..30).map(|k| k != 7).collect());
+    assert_eq!(read_whole(&grib2_message(&[masked])), "a record with a bitmap isn't read row by row yet");
+    let complex = Cx::differenced(&[(0, 3, &[7, 0, 5, 7, 3]), (511, 0, &[0]), (0, 3, &[1])], &[100, 90], -4).message();
+    assert_eq!(read_whole(&complex), "complex packing (template 5.3) can't be read row by row");
+    let mut columns = G1::new(5, 6, x.clone());
+    columns.scan = 0x20;
+    assert!(read_whole(&columns.bytes()).starts_with("columns stored one after another"));
+    let mut constant = G1::new(5, 6, vec![]);
+    constant.bits = 0;
+    assert_eq!(read_whole(&constant.bytes()), "a constant field has no rows to read");
+    let mut second_order = G1::new(5, 6, x.clone());
+    second_order.bds_flags = 0x40;
+    assert!(read_whole(&second_order.bytes()).starts_with("spherical harmonics and second-order packing"));
+    let mut wide = G1::new(5, 6, x.clone());
+    wide.bits = 33;
+    assert_eq!(read_whole(&wide.bytes()), "values of 33 bits can't be read row by row");
+    let mut short = G1::new(5, 6, x[..20].to_vec());
+    short.bits = 16;
+    assert!(read_whole(&short.bytes()).starts_with("a data section that doesn't hold its grid's values"));
+    // Two messages in the range, and two fields in a message.
+    let mut two = G1::new(5, 6, x.clone()).bytes();
+    two.extend(G1::new(5, 6, x.clone()).bytes());
+    assert!(read_whole(&two).starts_with("a range that isn't one whole message of one field"));
+    let two = grib2_message(&[F2::new(5, 6, x.clone()), F2::new(5, 6, x)]);
+    assert!(read_whole(&two).starts_with("a range that isn't one whole message of one field"));
+}
+
+#[test]
+fn hostile_headers_never_panic_by_rows() {
+    for file in [G1::new(5, 6, (0..30).collect()).bytes(), grib2_message(&[F2::new(5, 6, (0..30).collect())])] {
+        for bbox in [[10.6, 56.7, 12.4, 59.3], [-59.6, -9.3, -58.9, -8.4], [-180.0, -90.0, 180.0, 90.0]] {
+            for n in 0..file.len() {
+                let _ = plan(&file[..n], file.len() as u64, bbox);
+            }
+            for i in 0..file.len() {
+                for x in [0x00, 0x01, 0x20, 0x7f, 0x80, 0xff] {
+                    let mut bad = file.clone();
+                    bad[i] = x;
+                    if let Ok(Plan::Rows(rows)) = plan(&bad, bad.len() as u64, bbox) {
+                        let _ = rows.read(&[], "t");
+                        let run = usize::try_from(rows.run.0).ok().zip(usize::try_from(rows.run.1).ok());
+                        if let Some(run) = run.and_then(|(a, b)| bad.get(a..=b)) {
+                            let _ = rows.read(run, "t");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
