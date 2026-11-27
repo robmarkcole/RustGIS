@@ -21,8 +21,7 @@ use frame::*;
 use legend::*;
 use north::*;
 use rustgis_engine::map::layout::{
-    Background, ElementKind, INK, LAYOUT_TEXT_SIZE, Layout, MAX_BACKGROUND_PADDING, MAX_BACKGROUND_RADIUS, MAX_BACKGROUND_WIDTH,
-    Orientation,
+    Element, ElementKind, INK, LAYOUT_TEXT_SIZE, Layout, MAX_BACKGROUND_PADDING, MAX_BACKGROUND_RADIUS, MAX_BACKGROUND_WIDTH, Orientation,
 };
 use rustgis_engine::map::symbology::Dash;
 use scalebar::*;
@@ -245,7 +244,7 @@ pub(super) fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li:
                 // A legend's, colorbar's, table's or chart's ink (#2257), on and off as a background
                 // is: off is the default dark grey, which isn't the same as a dark grey ink (a table
                 // keeps its white cells only without one). Turned on, it starts white over a dark
-                // background and dark grey otherwise, so its text never disappears.
+                // colour and dark grey otherwise (`first_ink`), so its text never disappears.
                 if e.kind.takes_ink() {
                     let ink = e.kind.ink();
                     let input_label = ui.label(tl!("Ink"));
@@ -253,8 +252,7 @@ pub(super) fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li:
                         let mut on = ink.is_some();
                         let hint = tl!("Its own colour for its text and lines; off, the default dark grey");
                         if ui.checkbox(&mut on, "").labelled_by(input_label.id).on_hover_text(hint).changed() {
-                            let page = layout.paper.unwrap_or(rustgis_engine::map::Rgba::rgb(0xFF, 0xFF, 0xFF));
-                            update(app, json!({"color": on.then(|| first_ink(e.background.as_ref(), page).hex())}));
+                            update(app, json!({"color": on.then(|| first_ink(layout, &e).hex())}));
                         }
                         let Some(current) = ink else { return };
                         let mut c = crate::theme::c32(current);
@@ -382,16 +380,38 @@ pub(super) fn choice(ui: &mut Ui, salt: (&str, u32), label: egui::Id, current: &
 }
 
 /// The ink an element starts with when Ink is turned on (#2257): white over what shows under its
-/// text, its background drawn on the page (`page`, the page's colour, #2855), when that is dark,
-/// else the default dark grey, so its text never disappears.
-pub(super) fn first_ink(background: Option<&Background>, page: rustgis_engine::map::Rgba) -> rustgis_engine::map::Rgba {
-    // No background: nothing drawn over the page, so the page itself shows under the text.
-    let fill = background.map_or(rustgis_engine::map::Rgba::new(0, 0, 0, 0), |b| b.fill);
-    let a = u16::from(fill.a());
-    let over = |c: u8, under: u8| u8::try_from((u16::from(c) * a + u16::from(under) * (255 - a)) / 255).unwrap_or(u8::MAX);
-    let shown = Color32::from_rgb(over(fill.r(), page.r()), over(fill.g(), page.g()), over(fill.b(), page.b()));
+/// text when that is dark, else the default dark grey, so its text never disappears. What shows is
+/// read at the centre of its box: the page's colour (#2855), the fills drawn there by the visible
+/// elements under it (#2953), then its own background.
+pub(super) fn first_ink(layout: &Layout, e: &Element) -> rustgis_engine::map::Rgba {
+    let centre = (e.x + e.w / 2.0, e.y + e.h / 2.0);
+    let page = layout.paper.unwrap_or(rustgis_engine::map::Rgba::rgb(0xFF, 0xFF, 0xFF));
+    let under = layout.elements.iter().take_while(|u| u.id != e.id).filter(|u| u.visible);
+    let fills = under.flat_map(|u| fills_at(u, centre)).chain(e.background.map(|b| b.fill));
+    let shown = fills.fold(Color32::from_rgb(page.r(), page.g(), page.b()), |below, fill| {
+        let a = u16::from(fill.a());
+        let over = |c: u8, under: u8| u8::try_from((u16::from(c) * a + u16::from(under) * (255 - a)) / 255).unwrap_or(u8::MAX);
+        Color32::from_rgb(over(fill.r(), below.r()), over(fill.g(), below.g()), over(fill.b(), below.b()))
+    });
     let white = rustgis_engine::map::Rgba::rgb(0xFF, 0xFF, 0xFF);
     if crate::theme::contrast(shown, Color32::WHITE) > crate::theme::contrast(shown, crate::theme::c32(INK)) { white } else { INK }
+}
+
+/// The fills `e` draws at a page point (mm), the lower first: its background's, rounded corners
+/// counted as square, then a rectangle's or an ellipse's own. Maps, pictures, text and lines have
+/// no one fill to read.
+fn fills_at(e: &Element, (x, y): (f64, f64)) -> impl Iterator<Item = rustgis_engine::map::Rgba> {
+    let (x, y) = e.unturned(x, y);
+    let inside = |(bx, by, bw, bh): (f64, f64, f64, f64)| x >= bx && x <= bx + bw && y >= by && y <= by + bh;
+    let background = e.background.filter(|_| inside(e.background_box())).map(|b| b.fill);
+    // The point from the box's centre, in half widths and half heights: within 1 of it, the ellipse.
+    let from_centre = (((x - e.x) / e.w) * 2.0 - 1.0).hypot(((y - e.y) / e.h) * 2.0 - 1.0);
+    let shape = match e.kind {
+        ElementKind::Rectangle { fill, .. } if inside((e.x, e.y, e.w, e.h)) => Some(fill),
+        ElementKind::Ellipse { fill, .. } if from_centre <= 1.0 => Some(fill),
+        _ => None,
+    };
+    background.into_iter().chain(shape)
 }
 
 /// A row of a layout element's text size in points, within [`LAYOUT_TEXT_SIZE`], labelled `label`

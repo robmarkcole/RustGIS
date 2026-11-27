@@ -4,6 +4,8 @@ use super::{
 };
 use crate::RustGisApp;
 use egui::{Event, Key, Modifiers, PointerButton, Pos2, Rect, vec2};
+use rustgis_engine::map::Rgba;
+use rustgis_engine::map::layout::{Background, ElementKind, INK, Layout};
 use serde_json::json;
 use std::{cell::Cell, rc::Rc};
 
@@ -24,26 +26,125 @@ fn frame_approximations_are_said_once_a_kind() {
     assert_eq!(n, 1);
 }
 
+/// A table at (10, 10, 40, 40) mm, centred on (30, 30), on a page of `paper`: the element whose
+/// ink starts, over whatever `under` adds before it and under whatever `over` adds after it.
+fn inked(paper: Rgba, background: Option<Rgba>, under: impl FnOnce(&mut Layout), over: impl FnOnce(&mut Layout)) -> Rgba {
+    let mut layout = Layout::new("Ink", 297.0, 210.0);
+    layout.paper = Some(paper);
+    under(&mut layout);
+    let id = layout.add("Table", (10.0, 10.0, 40.0, 40.0), ElementKind::Table { frame: 1, layer: "Cities".into(), rows: 3, color: None });
+    layout.element_mut(id).unwrap().background = background.map(Background::filled);
+    over(&mut layout);
+    first_ink(&layout, layout.element(id).unwrap())
+}
+
+const PAGE: Rgba = Rgba::rgb(0xFF, 0xFF, 0xFF);
+const NAVY: Rgba = Rgba::rgb(0x0B, 0x1B, 0x2B);
+const DARK: Rgba = Rgba::rgb(0x1E, 0x29, 0x3B);
+const CLEAR: Rgba = Rgba::new(0, 0, 0, 0);
+
+fn rectangle(fill: Rgba) -> ElementKind {
+    ElementKind::Rectangle { fill, outline: INK, width: 0.0, radius: 0.0, dash: None }
+}
+
+fn nothing(_: &mut Layout) {}
+
+/// A rectangle of `fill` covering the whole table.
+fn covering(fill: Rgba) -> impl FnOnce(&mut Layout) {
+    move |l| {
+        l.add("Box", (0.0, 0.0, 100.0, 100.0), rectangle(fill));
+    }
+}
+
 /// Ink starts white only over a dark background, so turning it on never hides the text (#2257).
 #[test]
 fn ink_starts_readable_on_its_background() {
-    use rustgis_engine::map::Rgba;
-    use rustgis_engine::map::layout::{Background, INK};
-    let white = Rgba::rgb(0xFF, 0xFF, 0xFF);
-    let on = |fill: Rgba| first_ink(Some(&Background { fill, ..serde_json::from_value(json!({})).unwrap() }), white);
-    assert_eq!(first_ink(None, white), INK);
-    assert_eq!(on(white), INK);
-    assert_eq!(on(Rgba::rgb(0x1E, 0x29, 0x3B)), white);
+    let on = |fill| inked(PAGE, Some(fill), nothing, nothing);
+    assert_eq!(inked(PAGE, None, nothing, nothing), INK);
+    assert_eq!(on(PAGE), INK);
+    assert_eq!(on(DARK), PAGE);
     // A dark fill seen through mostly: the page shows, so it reads as light.
     assert_eq!(on(Rgba::new(0x1E, 0x29, 0x3B, 0x20)), INK);
-    assert_eq!(on(Rgba::new(0x1E, 0x29, 0x3B, 0xE0)), white);
+    assert_eq!(on(Rgba::new(0x1E, 0x29, 0x3B, 0xE0)), PAGE);
     // On a dark page (#2855): white with no background, or over a fill the page shows through;
     // dark grey over a light fill.
-    let navy = Rgba::rgb(0x0B, 0x1B, 0x2B);
-    let on_navy = |fill: Rgba| first_ink(Some(&Background { fill, ..serde_json::from_value(json!({})).unwrap() }), navy);
-    assert_eq!(first_ink(None, navy), white);
-    assert_eq!(on_navy(Rgba::new(0xFF, 0xFF, 0xFF, 0x20)), white);
-    assert_eq!(on_navy(white), INK);
+    assert_eq!(inked(NAVY, None, nothing, nothing), PAGE);
+    assert_eq!(inked(NAVY, Some(Rgba::new(0xFF, 0xFF, 0xFF, 0x20)), nothing, nothing), PAGE);
+    assert_eq!(inked(NAVY, Some(PAGE), nothing, nothing), INK);
+}
+
+/// The fills shown under an element, in drawing order, decide its starting ink (#2953).
+#[test]
+fn ink_starts_readable_over_the_elements_under_it() {
+    assert_eq!(inked(NAVY, None, covering(PAGE), nothing), INK, "a white box on a dark page");
+    assert_eq!(inked(PAGE, None, covering(DARK), nothing), PAGE, "a dark box on a white page");
+    assert_eq!(inked(PAGE, Some(PAGE), covering(DARK), nothing), INK, "its own background is over the box");
+    assert_eq!(inked(PAGE, None, covering(Rgba::new(0x1E, 0x29, 0x3B, 0x20)), nothing), INK, "the page shows through");
+    let two = |l: &mut Layout| {
+        covering(DARK)(l);
+        covering(PAGE)(l);
+    };
+    assert_eq!(inked(PAGE, None, two, nothing), INK, "the later box is over the earlier one");
+    assert_eq!(inked(PAGE, None, nothing, covering(DARK)), INK, "a box drawn over it isn't under its text");
+    let hidden = |l: &mut Layout| {
+        covering(DARK)(l);
+        l.elements[0].visible = false;
+    };
+    assert_eq!(inked(PAGE, None, hidden, nothing), INK, "a hidden box shows nothing");
+    let aside = |l: &mut Layout| {
+        l.add("Box", (0.0, 0.0, 25.0, 25.0), rectangle(DARK));
+    };
+    assert_eq!(inked(PAGE, None, aside, nothing), INK, "a box short of the centre");
+}
+
+/// An ellipse covers only its own shape, and a background reaches as far as its padding and
+/// turns with its text (#2953).
+#[test]
+fn ink_reads_each_shape_as_drawn() {
+    let ellipse = |rect| {
+        move |l: &mut Layout| {
+            l.add("Ellipse", rect, ElementKind::Ellipse { fill: DARK, outline: INK, width: 0.0, dash: None });
+        }
+    };
+    assert_eq!(inked(PAGE, None, ellipse((0.0, 0.0, 60.0, 60.0)), nothing), PAGE, "the centre is inside");
+    // The centre (30, 30) is in this ellipse's box, near its corner, outside the ellipse.
+    assert_eq!(inked(PAGE, None, ellipse((28.0, 28.0, 60.0, 60.0)), nothing), INK, "only in its box");
+    let padded = |padding| {
+        move |l: &mut Layout| {
+            let id = l.add("Box", (0.0, 0.0, 25.0, 60.0), rectangle(CLEAR));
+            l.element_mut(id).unwrap().background = Some(Background { padding, ..Background::filled(DARK) });
+        }
+    };
+    assert_eq!(inked(PAGE, None, padded(10.0), nothing), PAGE, "reached by the padding");
+    assert_eq!(inked(PAGE, None, padded(0.0), nothing), INK);
+    // 10 by 60 mm centred on (50, 30): turned a quarter, 60 by 10, over (30, 30).
+    let turned = |turn: f64| {
+        move |l: &mut Layout| {
+            let mut kind = ElementKind::text("N", 8.0, INK, false);
+            if let ElementKind::Text { rotation, .. } = &mut kind {
+                *rotation = turn;
+            }
+            let id = l.add("Text", (45.0, 0.0, 10.0, 60.0), kind);
+            l.element_mut(id).unwrap().background = Some(Background::filled(DARK));
+        }
+    };
+    assert_eq!(inked(PAGE, None, turned(90.0), nothing), PAGE, "turned over the centre");
+    assert_eq!(inked(PAGE, None, turned(0.0), nothing), INK);
+}
+
+/// A map or a picture under an element has no one fill to read: the page decides, as before.
+#[test]
+fn ink_reads_no_map_or_picture() {
+    let picture = |l: &mut Layout| {
+        l.add("Picture", (0.0, 0.0, 100.0, 100.0), ElementKind::Picture { image: String::new() });
+    };
+    assert_eq!(inked(PAGE, None, picture, nothing), INK);
+    assert_eq!(inked(NAVY, None, picture, nothing), PAGE);
+    let map = |l: &mut Layout| {
+        let kind = serde_json::from_value(json!({"MapFrame": {"map": "Map", "center": {"x": 0.0, "y": 0.0}, "scale": 1000000.0}}));
+        l.add("Map", (0.0, 0.0, 100.0, 100.0), kind.unwrap());
+    };
+    assert_eq!(inked(NAVY, None, map, nothing), PAGE);
 }
 
 /// In the browser, a page drawn while its frames' tiles were on their way is drawn again as
