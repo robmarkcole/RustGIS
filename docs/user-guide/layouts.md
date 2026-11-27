@@ -54,8 +54,9 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
     0.01°, and what lies past ±180° or ±90° is left out of the frame; an area with nothing to frame,
     one gone by Create, or one picked before the map or the project was switched or the map renamed,
     is said and nothing is made); without a name the layout is `Publication`; the review says when a
-    layout has that name, so the new one is numbered. A figure goes from its size to its map and the
-    review, as it takes no style, texts or accent. A field left empty is left out (for the credit
+    layout has that name, so the new one is numbered. A figure goes from its size to its map, its
+    reference (each line typed; with no heading, and it can be left out) and the review, as it takes
+    no style, accent or other text. A field left empty is left out (for the credit
     line, the reference and the headings, the command's default applies); the title is the
     exception: empty, it means no title. A layout the command refuses is said, and the wizard stays
     open. The window can be resized. Its steps are listed on the left, and a click goes to one; a

@@ -17,16 +17,7 @@ pub(super) fn review_step(ui: &mut egui::Ui, s: &Session, d: &Draft) {
         row(tl!("Map extent"), area_label(s, &d.area));
         row(tl!("Name"), name_label(s, &d.name));
         if d.figure() {
-            // The figure note sends a sheet's texts to the caption. Its reference doesn't go there
-            // (the figure draws the default one), so it is said here.
-            let unused = if d.no_reference {
-                Some(tl!("\"No cartographic reference\" isn't used: a figure takes the default reference"))
-            } else {
-                lines(&d.reference).next().map(|_| tl!("The lines typed aren't used: a figure takes the default reference"))
-            };
-            if let Some(unused) = unused {
-                row(tl!("Reference"), unused.to_string());
-            }
+            row(tl!("Reference"), reference_value(d));
             return;
         }
         let turned = match d.orientation {
@@ -43,14 +34,7 @@ pub(super) fn review_step(ui: &mut egui::Ui, s: &Session, d: &Draft) {
         let sources = lines(&d.sources).collect::<Vec<_>>().join("\n");
         row(tl!("Sources"), or_none(&sources));
         heading_row(&mut row, d, 0, tl!("Sources heading"), PUBLICATION_HEADINGS[0]);
-        let typed = lines(&d.reference).collect::<Vec<_>>().join("\n");
-        let reference = match d.left_out(Field::Reference) {
-            Some(_) if typed.is_empty() => none.to_string(),
-            Some(_) => tl!("(none; the lines typed aren't used)").to_string(),
-            None if typed.is_empty() => tl!("The default: projection, datum and graticule, filled in on the sheet").to_string(),
-            None => typed,
-        };
-        row(tl!("Reference"), reference);
+        row(tl!("Reference"), reference_value(d));
         heading_row(&mut row, d, 1, tl!("Reference heading"), PUBLICATION_HEADINGS[1]);
         heading_row(&mut row, d, 2, tl!("Column heading"), none);
         let credit = if d.no_author {
@@ -66,6 +50,18 @@ pub(super) fn review_step(ui: &mut egui::Ui, s: &Session, d: &Draft) {
     });
     if d.figure() {
         figure_note(ui);
+    }
+}
+
+/// The reference as it will be drawn: the lines typed, or the command's default; left out, none,
+/// but lines typed then are said not to be used.
+fn reference_value(d: &Draft) -> String {
+    let typed = lines(&d.reference).collect::<Vec<_>>().join("\n");
+    match d.left_out(Field::Reference) {
+        Some(_) if typed.is_empty() => tl!("(none)").to_string(),
+        Some(_) => tl!("(none; the lines typed aren't used)").to_string(),
+        None if typed.is_empty() => tl!("The default: projection, datum and graticule, filled in on the sheet").to_string(),
+        None => typed,
     }
 }
 
