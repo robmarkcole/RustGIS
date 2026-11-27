@@ -8,7 +8,8 @@ pub(super) fn review_step(ui: &mut egui::Ui, d: &Draft) {
     egui::Grid::new("publication_wizard_review").num_columns(2).spacing(egui::vec2(12.0, 6.0)).show(ui, |ui| {
         let mut row = |key: &str, value: String| {
             ui.label(egui::RichText::new(key).weak());
-            ui.label(value);
+            // A long value wraps in what the keys leave rather than widening the window.
+            ui.add(egui::Label::new(value).wrap());
             ui.end_row();
         };
         row(tl!("Size"), size_label(&d.size));

@@ -342,6 +342,18 @@ fn step_name(step: Step) -> &'static str {
     }
 }
 
+/// A step's name as the list shows it, in display form (`tl!`).
+fn step_label(step: Step) -> &'static str {
+    match step {
+        Step::Size => tl!("Size"),
+        Step::Style => tl!("Style"),
+        Step::Texts => tl!("Texts"),
+        Step::Sources => tl!("Sources"),
+        Step::Accent => tl!("Accent"),
+        Step::Review => tl!("Review"),
+    }
+}
+
 /// What a figure leaves out, said where its size is picked and in the review: the texts and
 /// accent typed for a sheet aren't drawn on it.
 fn figure_note(ui: &mut egui::Ui) {
@@ -367,12 +379,33 @@ fn field_width(ui: &egui::Ui) -> f32 {
     ui.available_width().min(260.0)
 }
 
-/// The wizard's width, where the screen has room for it.
-const WIDTH: f32 = 380.0;
+/// The size the window opens at, tall enough for the tallest step in English (the style step's
+/// seven styles, their outlines and descriptions), with room for the rounding a high-density
+/// screen adds to each line. A narrower screen narrows it (`dialog_width`); on a shorter one
+/// egui's window limits its height to the screen.
+const SIZE: egui::Vec2 = egui::vec2(600.0, 515.0);
 
-/// The height every step takes: the style step's seven styles, their outlines and descriptions,
-/// with room for the rounding a high-density screen adds to each line.
-const STEP_HEIGHT: f32 = 415.0;
+/// The smallest size it can be dragged to.
+const MIN_SIZE: egui::Vec2 = egui::vec2(420.0, 360.0);
+
+/// The narrowest screen that has the list of steps beside the fields.
+const LIST_FROM: f32 = 480.0;
+
+/// The width of the list of steps.
+const LIST_WIDTH: f32 = 110.0;
+
+/// The steps of this draft, each clickable to go to it.
+fn step_list(ui: &mut egui::Ui, d: &mut Draft) {
+    ui.vertical(|ui| {
+        ui.set_width(LIST_WIDTH);
+        for &step in d.steps() {
+            let item = egui::Button::selectable(d.step == step, step_label(step)).wrap().min_size(egui::vec2(LIST_WIDTH, 0.0));
+            if ui.add(item).clicked() {
+                d.step = step;
+            }
+        }
+    });
+}
 
 /// Shows the wizard while it is open; Create runs `layout.publication` as the menu does, and the
 /// wizard stays open on a layout the command refuses.
@@ -389,20 +422,21 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
     let (mut open, mut close, mut create) = (true, false, false);
     // Narrower on a screen too narrow for it, as the other dialogs are.
     let frame = egui::Frame::window(&ctx.global_style());
-    let width = crate::widgets::dialog_width(ctx, WIDTH, frame);
+    let screen = ctx.content_rect();
+    let width = crate::widgets::dialog_width(ctx, SIZE.x, frame);
+    let list = screen.width() >= LIST_FROM;
     egui::Window::new(tl!("Publication Layout Wizard"))
         .id(egui::Id::unique("publication_wizard"))
         .frame(frame)
         .open(&mut open)
         .collapsible(false)
-        .resizable(false)
-        .auto_sized()
-        // One width on every step and in every language: a long row wraps instead of widening it.
-        .max_width(width)
+        .resizable(true)
+        .default_size(egui::vec2(width, SIZE.y))
+        .min_width(MIN_SIZE.x.min(width))
+        .min_height(MIN_SIZE.y)
         .pivot(egui::Align2::CENTER_CENTER)
-        .default_pos(ctx.content_rect().center())
+        .default_pos(screen.center())
         .show(ctx, |ui| {
-            ui.set_width(width);
             let steps = d.steps();
             let at = steps.iter().position(|s| *s == d.step).unwrap_or(0);
             let heading = i18n::fmt(
@@ -411,25 +445,39 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
             );
             ui.label(egui::RichText::new(heading).strong());
             ui.separator();
-            // Every step in a box of one size, so the window keeps its size and Next stays under
-            // the pointer from step to step: as tall as the tallest step (the styles and their
-            // descriptions) in English, a step that runs longer in another language scrolling
-            // inside it, its text wrapped to its width rather than widening the window. Each step
-            // scrolls on its own, so one scrolled down doesn't open the next partway down.
-            egui::ScrollArea::vertical()
-                .id_salt(("publication_wizard_step", d.step))
-                .max_height(STEP_HEIGHT)
-                .auto_shrink([false, false])
-                .show(ui, |ui| match d.step {
-                    Step::Size => size_step(ui, &mut d),
-                    Step::Style => style_step(ui, &mut d, t.accent),
-                    Step::Texts => texts_step(ui, &mut d, app.session.map()),
-                    Step::Sources => sources_step(ui, &mut d, app.session.map()),
-                    Step::Accent => accent_step(ui, &mut d, t.accent),
-                    Step::Review => review_step(ui, &d),
-                });
-            ui.separator();
+            // The step takes the room the window leaves above the buttons, whatever its own
+            // height, so Next stays under the pointer from step to step; a step taller than that
+            // scrolls inside it, its text wrapped to its width rather than widening the window.
+            // Each step scrolls on its own, so one scrolled down doesn't open the next partway
+            // down.
             let size = egui::vec2(84.0, 28.0);
+            let spacing = ui.spacing().item_spacing.y;
+            // The buttons, and the separator above them (6 points, egui's default) with the
+            // spacing on both sides of it.
+            let footer = size.y + 6.0 + 2.0 * spacing;
+            let body = egui::vec2(ui.available_width(), (ui.available_height() - footer).max(0.0));
+            ui.allocate_ui_with_layout(body, egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                ui.set_min_size(body);
+                if list {
+                    step_list(ui, &mut d);
+                    ui.separator();
+                }
+                ui.vertical(|ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt(("publication_wizard_step", d.step))
+                        .max_height(body.y)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| match d.step {
+                            Step::Size => size_step(ui, &mut d),
+                            Step::Style => style_step(ui, &mut d, t.accent),
+                            Step::Texts => texts_step(ui, &mut d, app.session.map()),
+                            Step::Sources => sources_step(ui, &mut d, app.session.map()),
+                            Step::Accent => accent_step(ui, &mut d, t.accent),
+                            Step::Review => review_step(ui, &d),
+                        });
+                });
+            });
+            ui.separator();
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                     match d.moved(1) {
@@ -649,6 +697,139 @@ mod tests {
         assert_eq!(app.dialogs.publication.as_ref().map(|d| d.step), Some(Step::Review));
     }
 
+    /// The names the step list holds, in order, and the one it marks as the current step.
+    fn listed(h: &egui_kittest::Harness<'static, RustGisApp>) -> (Vec<&'static str>, Vec<&'static str>) {
+        let (mut names, mut current) = (Vec::new(), Vec::new());
+        for name in ["Size", "Style", "Texts", "Sources", "Accent", "Review"] {
+            if let Some(n) = h.query_by_role_and_label(Role::Button, name) {
+                names.push(name);
+                if n.accesskit_node().toggled() == Some(egui::accesskit::Toggled::True) {
+                    current.push(name);
+                }
+            }
+        }
+        (names, current)
+    }
+
+    fn window(h: &egui_kittest::Harness<'static, RustGisApp>) -> egui::Rect {
+        h.get_by_role_and_label(Role::Window, "Publication Layout Wizard").rect()
+    }
+
+    /// Drags the window's bottom right corner `by` points.
+    fn resize(h: &mut egui_kittest::Harness<'static, RustGisApp>, by: egui::Vec2) {
+        let corner = window(h).right_bottom() - vec2(1.0, 1.0);
+        h.hover_at(corner);
+        h.run_steps(2);
+        h.drag_at(corner);
+        h.run_steps(2);
+        h.hover_at(corner + by);
+        h.run_steps(2);
+        h.drop_at(corner + by);
+        h.run_steps(4);
+    }
+
+    /// The steps are listed in order with the current one marked; a figure lists only its own,
+    /// from the moment its size is picked.
+    #[test]
+    fn the_steps_are_listed_with_the_current_one_marked() {
+        let mut app = app();
+        open(&mut app);
+        let mut h = harness(app);
+        assert_eq!(listed(&h), (vec!["Size", "Style", "Texts", "Sources", "Accent", "Review"], vec!["Size"]));
+        click(&mut h, "Next");
+        assert_eq!(listed(&h).1, ["Style"]);
+        click(&mut h, "Back");
+        h.state_mut().dialogs.publication.as_mut().unwrap().size = "figure-1col".into();
+        h.run_steps(2);
+        assert_eq!(listed(&h), (vec!["Size", "Review"], vec!["Size"]));
+    }
+
+    /// A step clicked in the list is the one shown, first, middle or last, keeping what was
+    /// entered; Back is off on the first and Next is Create on the last.
+    #[test]
+    fn a_step_clicked_in_the_list_is_shown() {
+        let mut app = app();
+        open(&mut app);
+        app.dialogs.publication.as_mut().unwrap().subtitle = "Kept".into();
+        let mut h = harness(app);
+        for (name, want) in [("Review", Step::Review), ("Texts", Step::Texts), ("Size", Step::Size)] {
+            click(&mut h, name);
+            assert_eq!(step(&h), want);
+            assert_eq!(h.query_by_role_and_label(Role::Button, "Create").is_some(), want == Step::Review);
+            let back = h.get_by_role_and_label(Role::Button, "Back").accesskit_node().is_disabled();
+            assert_eq!(back, want == Step::Size, "{want:?}");
+        }
+        assert_eq!(h.state().dialogs.publication.as_ref().unwrap().subtitle, "Kept");
+    }
+
+    /// Each step in the list is reached with Tab.
+    #[test]
+    fn tab_reaches_every_step_in_the_list() {
+        let mut app = app();
+        open(&mut app);
+        let mut h = harness(app);
+        let mut reached = Vec::new();
+        for _ in 0..30 {
+            h.key_press(egui::Key::Tab);
+            h.run_steps(2);
+            for name in ["Size", "Style", "Texts", "Sources", "Accent", "Review"] {
+                if h.query_by_role_and_label(Role::Button, name).is_some_and(|n| n.accesskit_node().is_focused()) {
+                    reached.push(name);
+                }
+            }
+        }
+        for name in ["Size", "Style", "Texts", "Sources", "Accent", "Review"] {
+            assert!(reached.contains(&name), "{name} not reached: {reached:?}");
+        }
+    }
+
+    /// It opens about 600 by 515 points, and can't be dragged smaller than about 420 by 360;
+    /// Next stays inside it.
+    #[test]
+    fn the_window_opens_at_its_size_and_keeps_a_smallest_one() {
+        let mut app = app();
+        open(&mut app);
+        // Longer than the row: typed texts must not widen the window either.
+        app.dialogs.publication.as_mut().unwrap().sources = "Natural Earth and the national mapping agency ".repeat(4);
+        let mut h = harness(app);
+        let first = window(&h).size();
+        assert!((590.0..=640.0).contains(&first.x) && (500.0..=555.0).contains(&first.y), "opens at {first:?}");
+        resize(&mut h, vec2(-500.0, -400.0));
+        let small = window(&h);
+        assert!((415.0..=460.0).contains(&small.width()) && (355.0..=420.0).contains(&small.height()), "smallest {small:?}");
+        let next = h.get_by_role_and_label(Role::Button, "Next").rect();
+        assert!(small.contains_rect(next), "Next at {next:?} outside {small:?}");
+        assert_eq!(listed(&h).0.len(), 6, "the list stays");
+        // Each step wraps or scrolls inside that size: none makes the window wider or taller.
+        for _ in 0..5 {
+            click(&mut h, "Next");
+            // Within the point a high-density screen's rounding of a wrapped line may add.
+            let now = window(&h).size();
+            assert!((now - small.size()).abs().max_elem() <= 1.0, "{:?}: {now:?}", step(&h));
+        }
+    }
+
+    /// Made larger, the step's area takes the room: Next goes down with the window and stays
+    /// there from step to step.
+    #[test]
+    fn a_larger_window_gives_the_step_the_room() {
+        let mut app = app();
+        open(&mut app);
+        let mut h = harness(app);
+        let at = |h: &egui_kittest::Harness<'static, RustGisApp>| h.get_by_role_and_label(Role::Button, "Next").rect();
+        let (before, size) = (at(&h), window(&h).size());
+        resize(&mut h, vec2(150.0, 150.0));
+        let grown = window(&h).size() - size;
+        assert!(grown.x > 100.0 && grown.y > 100.0, "grew by {grown:?}");
+        let larger = at(&h);
+        let moved = larger.right_bottom() - before.right_bottom();
+        assert!(moved.y > 50.0, "Next moved by {moved:?}");
+        for _ in 0..4 {
+            click(&mut h, "Next");
+            assert_eq!(at(&h), larger, "{:?}", step(&h));
+        }
+    }
+
     /// Next stays where it was from one step to the next: every step is as tall as the tallest.
     #[test]
     fn next_stays_under_the_pointer_from_step_to_step() {
@@ -703,6 +884,25 @@ mod tests {
         open(&mut app);
         app.dialogs.publication.as_mut().unwrap().step = Step::Style;
         let h = harness_sized(app, vec2(320.0, 900.0));
+        let next = h.get_by_role_and_label(Role::Button, "Next").rect();
+        assert!(next.left() >= 0.0 && next.right() <= 320.0, "Next at {next:?} on a screen 320 wide");
+        let (_, about) = crate::ribbon::publication_style("panel").unwrap();
+        let text = h.get_by_label(about).rect();
+        assert!(text.right() <= 320.0, "{text:?} runs off a screen 320 wide");
+        assert_eq!(listed(&h).0, Vec::<&str>::new(), "the list is hidden");
+        assert!(h.query_by_label("Step 2 of 6: Style").is_some(), "the heading still says the step");
+    }
+
+    /// A screen that narrows while the wizard is open (a phone turned, a browser resized) keeps
+    /// it on the screen.
+    #[test]
+    fn a_screen_narrowed_while_open_keeps_the_wizard_on_it() {
+        let mut app = app();
+        open(&mut app);
+        app.dialogs.publication.as_mut().unwrap().step = Step::Style;
+        let mut h = harness(app);
+        h.set_size(vec2(320.0, 900.0));
+        h.run_steps(6);
         let next = h.get_by_role_and_label(Role::Button, "Next").rect();
         assert!(next.left() >= 0.0 && next.right() <= 320.0, "Next at {next:?} on a screen 320 wide");
         let (_, about) = crate::ribbon::publication_style("panel").unwrap();

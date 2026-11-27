@@ -8,7 +8,13 @@ pub(super) fn sources_step(ui: &mut egui::Ui, d: &mut Draft, map: &Map) {
         heading(ui, d, tl!("Sources heading"), 0);
         list(ui, d, tl!("Reference"), Field::Reference, &PUBLICATION_DEFAULT_REFERENCE.join("\n"), 2);
         ui.label("");
-        ui.checkbox(&mut d.no_reference, tl!("No cartographic reference"));
+        // Wrapped to the column: a long label would widen the narrowed window.
+        let width = field_width(ui);
+        ui.horizontal(|ui| {
+            ui.set_max_width(width);
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+            ui.checkbox(&mut d.no_reference, tl!("No cartographic reference"));
+        });
         ui.end_row();
         heading(ui, d, tl!("Reference heading"), 1);
     });
@@ -165,8 +171,9 @@ mod tests {
     #[test]
     fn the_step_asks_for_the_sources_the_reference_and_their_headings() {
         let mut h = at(Step::Sources, |_| {});
+        // By role: the step list has a button named "Sources" too.
         for label in ["Sources", "Sources heading", "Reference", "Reference heading"] {
-            assert!(h.query_by_label(label).is_some(), "{label}");
+            assert!(h.query_by_role_and_label(Role::Label, label).is_some(), "{label}");
         }
         assert!(!h.get_by_label("Reference").accesskit_node().is_disabled());
         h.get_by_role_and_label(Role::CheckBox, "No cartographic reference").click();
