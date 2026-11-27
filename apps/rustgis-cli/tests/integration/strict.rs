@@ -47,6 +47,7 @@ fn a_strict_run_stops_at_a_loss_it_does_not_allow() {
     let (code, err, printed, wrote) = run(lossy, &["--strict"]);
     assert_eq!((code, printed, wrote), (Some(3), false, false), "{err}");
     assert!(err.contains("stopped after layer.addData") && err.contains("dropped.ring (1 notice): Correct the unreadable"), "{err}");
+    assert!(err.contains("https://rustgis.app/user-guide/loss-codes/#dropped.ring"), "the code's entry in the guide: {err}");
     // Allowed by its code or its kind, it runs to the end; another kind doesn't allow it.
     for allow in [&["--allow", "dropped.ring"][..], &["--allow", "dropped"], &["--allow=dropped.ring"]] {
         let (code, err, _, wrote) = run(lossy, &[&["--strict"][..], allow].concat());

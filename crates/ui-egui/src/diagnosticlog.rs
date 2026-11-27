@@ -5,6 +5,7 @@ use rustgis_engine::data::diagnostics::{Filter, NetworkKind, Record, Severity};
 
 use crate::{RustGisApp, theme::Tokens};
 
+/// The Messages pane: its filters, Copy diagnostics and Clear, then the entries, newest first.
 pub(crate) fn show(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     // Background requests may finish without another UI action (including HEAD probes).
     ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
@@ -57,9 +58,10 @@ pub(crate) fn show(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     egui::ScrollArea::vertical().id_salt("diagnostic_log_entries").auto_shrink([false, false]).show(ui, |ui| {
         egui::Frame::NONE.inner_margin(egui::Margin::symmetric(12, 8)).show(ui, |ui| {
             let mut shown = false;
-            for record in records.iter().rev().filter(|r| app.ui.diagnostic_filter.matches(r)) {
+            let filter = app.ui.diagnostic_filter;
+            for record in records.iter().rev().filter(|r| filter.matches(r)) {
                 shown = true;
-                ui.push_id(record.id, |ui| entry(ui, record, t));
+                ui.push_id(record.id, |ui| entry(ui, record, t, &mut app.ui.open_url));
                 ui.separator();
             }
             if !shown {
@@ -70,7 +72,9 @@ pub(crate) fn show(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     app.ui.diagnostic_snapshot = Some((generation, records));
 }
 
-fn entry(ui: &mut Ui, record: &Record, t: &Tokens) {
+/// One entry: its time, severity and source, the message, the loss code with a link to its entry
+/// in the guide (set in `open_url` when clicked), and any technical details.
+fn entry(ui: &mut Ui, record: &Record, t: &Tokens, open_url: &mut Option<String>) {
     // Literal labels, so each is found and translated with the interface's other strings.
     let (severity, color) = match record.severity {
         Severity::Error => (tl!("Error"), t.red),
@@ -90,6 +94,15 @@ fn entry(ui: &mut Ui, record: &Record, t: &Tokens) {
         ui.label(RichText::new(source).small().color(t.text_dim));
     });
     ui.add(egui::Label::new(&record.message).wrap().selectable(true));
+    if let Some(code) = record.loss {
+        // The code is an identifier, never translated; its guide entry says what to do.
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(code.spec().id).small().monospace().color(t.text_dim));
+            if ui.link(RichText::new(tl!("What this means")).small()).on_hover_text(code.doc_url()).clicked() {
+                *open_url = Some(code.doc_url());
+            }
+        });
+    }
     if !record.details.is_empty() || record.network.is_some() {
         egui::CollapsingHeader::new(tl!("Technical details")).show(ui, |ui| {
             if let Some(network) = &record.network {

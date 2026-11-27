@@ -146,7 +146,11 @@ impl Strict {
             };
             if LossKind::from_id(v).is_none() && LossCode::from_id(v).is_none() {
                 let kinds: Vec<&str> = LossKind::ALL.iter().map(|k| k.id()).collect();
-                return Err(format!("--allow {v}: not a loss kind ({}) or code (listed in the command line guide)", kinds.join(", ")));
+                return Err(format!(
+                    "--allow {v}: not a loss kind ({}) or code (listed at {})",
+                    kinds.join(", "),
+                    rustgis_engine::data::loss::GUIDE
+                ));
             }
             allow.push(v.to_string());
         }
@@ -186,7 +190,7 @@ impl Strict {
             let spec = code.spec();
             // A counted notice says how many it lost in its text; this counts the notices.
             let notices = if n == 1 { "1 notice".to_string() } else { format!("{n} notices") };
-            said.push_str(&format!("\n  {} ({notices}): {}", spec.id, spec.action));
+            said.push_str(&format!("\n  {} ({notices}): {}\n    {}", spec.id, spec.action, code.doc_url()));
         }
         Err(said)
     }

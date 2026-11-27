@@ -3599,7 +3599,7 @@ impl Session {
         if severity == rustgis_data::diagnostics::Severity::Error && self.rerun_said.iter().any(|said| said == text.as_str()) {
             return;
         }
-        self.diagnostics.push_redacted(severity, source.unwrap_or("Application"), &text);
+        self.diagnostics.push_redacted(severity, source.unwrap_or("Application"), &text, loss);
         self.notices.push(Notice {
             text: text.into_string(),
             error: severity == rustgis_data::diagnostics::Severity::Error,

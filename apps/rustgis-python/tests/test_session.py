@@ -159,6 +159,8 @@ def test_losses_are_warnings_with_their_code(tmp_path):
     with pytest.warns(rustgis.ChangedWarning) as seen:
         s.run("edit.calculateField", table="records", field="n", expression="n + 1.5")
     assert [w.message.code for w in seen if issubclass(w.category, rustgis.DataLossWarning)] == ["changed.truncated"]
+    [url] = [w.message.url for w in seen if issubclass(w.category, rustgis.DataLossWarning)]
+    assert url == "https://rustgis.app/user-guide/loss-codes/#changed.truncated"
     s.notices()
     with warnings.catch_warnings(record=True) as seen:
         warnings.simplefilter("always")

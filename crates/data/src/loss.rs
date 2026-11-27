@@ -1,7 +1,7 @@
 //! Shared classification for data-loss notices, independent of their wording.
 //!
 //! A code's identifier is public: scripts match on it (`rustgis-cli run --strict --allow`), so it
-//! is never translated, renamed or reused. The command line guide lists every code, checked by
+//! is never translated, renamed or reused. The guide has an entry for each code ([`GUIDE`]), checked by
 //! `the_guide_lists_every_code`.
 
 /// What happened to the data.
@@ -152,7 +152,16 @@ loss_codes! {
     ),
 }
 
+/// The guide's page of loss codes, which has an entry for each, anchored by its identifier.
+pub const GUIDE: &str = "https://rustgis.app/user-guide/loss-codes/";
+
 impl LossCode {
+    /// The address of this code's entry in the guide: what it means, where it is said and what to
+    /// do about it.
+    pub fn doc_url(self) -> String {
+        format!("{GUIDE}#{}", self.spec().id)
+    }
+
     /// The code this identifier names.
     pub fn from_id(id: &str) -> Option<LossCode> {
         Self::ALL.iter().copied().find(|code| code.spec().id == id)
@@ -536,18 +545,22 @@ mod tests {
 
     #[test]
     fn the_guide_lists_every_code() {
-        let guide = include_str!("../../../docs/cli.md").replace("\r\n", "\n");
-        let section = guide.split("\n### Loss codes\n").nth(1).unwrap_or_default();
-        let section = section.split("\n#").next().unwrap_or_default();
-        let rows: Vec<&str> = section.lines().filter(|l| l.starts_with("| `")).collect();
+        let guide = include_str!("../../../docs/user-guide/loss-codes.md").replace("\r\n", "\n");
+        let headings: Vec<&str> = guide.lines().filter(|l| l.starts_with("### `")).collect();
         for code in LossCode::ALL {
             let spec = code.spec();
-            let row = format!("| `{}` | {} |", spec.id, spec.action);
-            assert!(rows.contains(&row.as_str()), "docs/cli.md: the loss codes should list\n{row}");
+            // The anchor each notice links to ([`LossCode::doc_url`]), and what to do under it.
+            let heading = format!("### `{0}` {{ #{0} }}", spec.id);
+            let entry = guide.split(&format!("\n{heading}\n")).nth(1).unwrap_or_default();
+            let entry = entry.split("\n### ").next().unwrap_or_default().split("\n## ").next().unwrap_or_default();
+            assert!(!entry.is_empty(), "docs/user-guide/loss-codes.md should have the entry\n{heading}");
+            let action = format!("**What to do:** {}", spec.action);
+            assert!(entry.replace('\n', " ").contains(&action), "docs/user-guide/loss-codes.md: `{}` should say\n{action}", spec.id);
+            assert!(code.doc_url().ends_with(&format!("/user-guide/loss-codes/#{}", spec.id)));
         }
-        for row in rows {
-            let id = row.trim_start_matches("| `").split('`').next().unwrap_or_default();
-            assert!(LossCode::from_id(id).is_some(), "docs/cli.md lists `{id}`, which is not a loss code");
+        for heading in headings {
+            let id = heading.trim_start_matches("### `").split('`').next().unwrap_or_default();
+            assert!(LossCode::from_id(id).is_some(), "docs/user-guide/loss-codes.md lists `{id}`, which is not a loss code");
         }
     }
 }

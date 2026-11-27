@@ -98,6 +98,8 @@ pub struct Record {
     pub message: String,
     pub details: String,
     pub network: Option<Network>,
+    /// The loss the message reports, if any: the pane links to its entry in the guide.
+    pub loss: Option<crate::loss::LossCode>,
 }
 
 #[derive(Default)]
@@ -204,13 +206,14 @@ impl History {
             message: bounded(message, MAX_MESSAGE_BYTES),
             details: bounded(details, MAX_DETAILS_BYTES),
             network: None,
+            loss: None,
         });
     }
 
     /// [`History::push`] for a message already through [`redact`] (a notice the session redacted
     /// for its status bar): it is only bounded, so a notice isn't redacted again for each copy.
     /// Only a [`Redacted`], which `redact` alone makes, gets this path.
-    pub fn push_redacted(&self, severity: Severity, source: &str, message: &Redacted) {
+    pub fn push_redacted(&self, severity: Severity, source: &str, message: &Redacted, loss: Option<crate::loss::LossCode>) {
         self.retain(Record {
             id: 0,
             timestamp_ms: timestamp_ms(),
@@ -219,6 +222,7 @@ impl History {
             message: truncated(message.as_str(), MAX_MESSAGE_BYTES),
             details: String::new(),
             network: None,
+            loss,
         });
     }
 
@@ -261,6 +265,9 @@ impl History {
                 record.source,
                 record.message
             );
+            if let Some(code) = record.loss {
+                let _ = writeln!(report, "Loss: {} ({})", code.spec().id, code.doc_url());
+            }
             if !record.details.is_empty() {
                 let _ = writeln!(report, "{}", record.details);
             }
@@ -318,6 +325,7 @@ impl Capture {
                     message,
                     details: String::new(),
                     network: None,
+                    loss: None,
                 },
             );
             guard.absences_overflow_said = Some(id);
@@ -335,6 +343,7 @@ impl Capture {
             ),
             details: String::new(),
             network: Some(Network { url, method: known_method(method), status: Some(status), duration_ms: None, kind: NetworkKind::Http }),
+            loss: None,
         };
         let id = store(&mut guard, record);
         guard.absences_said.push((server, id));
@@ -374,6 +383,7 @@ impl Capture {
             message: bounded(message, MAX_MESSAGE_BYTES),
             details: bounded(details, MAX_DETAILS_BYTES),
             network: Some(network),
+            loss: None,
         };
         let mut state = lock(&state);
         if once
@@ -1818,13 +1828,26 @@ mod tests {
     fn text_already_redacted_is_only_bounded() {
         let history = History::default();
         let long = "word ".repeat(1000);
-        history.push_redacted(Severity::Info, "Application", &Redacted::new(&long));
+        history.push_redacted(Severity::Info, "Application", &Redacted::new(&long), None);
         history.push(Severity::Info, "Application", &long, "");
         let records = history.records();
         assert_eq!(records[0].message, records[1].message);
         assert!(records[0].message.len() <= MAX_MESSAGE_BYTES && records[0].message.ends_with('…'));
         // What the type holds has been through `redact`, whatever went in.
         assert_eq!(Redacted::new("Authorization: Bearer hidden").as_str(), "[REDACTED]");
+    }
+
+    #[test]
+    fn a_loss_keeps_its_code_and_the_report_gives_its_guide_entry() {
+        let history = History::default();
+        let code = crate::loss::LossCode::DroppedRing;
+        history.push_redacted(Severity::Warning, "layer.addData", &Redacted::new("1 ring left out"), Some(code));
+        history.push_redacted(Severity::Info, "layer.addData", &Redacted::new("added"), None);
+        let records = history.records();
+        assert_eq!(records.iter().map(|r| r.loss).collect::<Vec<_>>(), [Some(code), None]);
+        let report = history.report(Filter::All);
+        assert!(report.contains("Loss: dropped.ring (https://rustgis.app/user-guide/loss-codes/#dropped.ring)"), "{report}");
+        assert_eq!(report.matches("Loss: ").count(), 1, "{report}");
     }
 
     #[test]
