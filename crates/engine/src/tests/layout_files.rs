@@ -82,6 +82,13 @@ fn a_layout_file_requiring_scale_bar_details_opens() {
 }
 
 #[test]
+fn a_layout_file_requiring_legend_fit_opens() {
+    let (mut s, bare) = with_layout();
+    s.run("layout.import", &json!({"text": headed(&bare, 2, json!(["layout-legend-fit"]))})).unwrap();
+    assert_eq!(s.project.layouts.len(), 2);
+}
+
+#[test]
 fn a_layout_file_requiring_text_block_opens() {
     let (mut s, bare) = with_layout();
     s.run("layout.import", &json!({"text": headed(&bare, 2, json!(["layout-text-block"]))})).unwrap();
@@ -118,6 +125,7 @@ fn a_saved_layout_file_requires_what_its_elements_use_and_reads_back_the_same() 
         ("outline", include_str!("../../../../schema/fixtures/layout_chart_outline.rgis")),
         ("border", include_str!("../../../../schema/fixtures/layout_frame_border.rgis")),
         ("legend-text", include_str!("../../../../schema/fixtures/layout_legend_text.rgis")),
+        ("legend-fit", include_str!("../../../../schema/fixtures/layout_legend_fit.rgis")),
         ("scale-grid-text", include_str!("../../../../schema/fixtures/layout_scale_grid_text.rgis")),
         ("page-color", include_str!("../../../../schema/fixtures/layout_page_color.rgis")),
         ("plain", include_str!("../../../../schema/fixtures/layout_no_data.rgis")),
@@ -175,6 +183,25 @@ fn a_layout_file_with_scale_bar_details_says_so_in_its_header() {
     // This RustGIS reads it back.
     s.run("layout.import", &json!({"text": text})).unwrap();
     assert!(s.project.layouts[2].elements.iter().any(|e| e.kind.scale_bar_uses_details()));
+}
+
+/// A layout file with a legend that fits its box, leaves its layer names off or has more than
+/// three columns requires `layout-legend-fit`, so an older RustGIS refuses it instead of drawing the
+/// legend as set by hand, named and in three columns; a plain legend's file requires nothing.
+#[test]
+fn a_layout_file_with_a_fitted_legend_says_so_in_its_header() {
+    let (mut s, _) = with_layout();
+    let legend = s.project.layouts[0].elements.iter().find(|e| e.kind.code() == "legend").unwrap().id;
+    let (_, plain) = saved_file(&mut s, 0, "plain-legend");
+    assert_eq!(plain["format"], json!(crate::project::FORMAT));
+    assert!(plain.get("requires").is_none(), "{plain}");
+    s.run("layout.update", &json!({"element": legend, "fit": "adjustColumns"})).unwrap();
+    assert!(s.project.layouts[0].elements.iter().any(|e| e.kind.legend_uses_fit()));
+    let (text, fitted) = saved_file(&mut s, 0, "fitted-legend");
+    assert_eq!(fitted["requires"], json!(["layout-legend-fit"]));
+    // This RustGIS reads it back.
+    s.run("layout.import", &json!({"text": text})).unwrap();
+    assert!(s.project.layouts[1].elements.iter().any(|e| e.kind.legend_uses_fit()));
 }
 
 /// A layout file with a text placed down its box, spaced or cased requires `layout-text-block`, so

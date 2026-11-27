@@ -424,9 +424,18 @@ pub(in crate::cmd::layout) fn update(s: &mut Session, p: &Value) -> CmdResult {
         }
     };
     let new_columns = legend_columns_param(p)?;
+    let new_names = legend_names_param(p)?;
     let kind_of = s.project.layouts.get(li).and_then(|l| l.element(id)).map(|e| &e.kind);
     let is_legend = kind_of.is_some_and(|k| matches!(k, ElementKind::Legend { .. }));
     let sized = is_legend || kind_of.is_some_and(|k| matches!(k, ElementKind::ScaleBar { .. }));
+    // A legend's fit; a scale bar's is read with its other options (`restyle`), by its own names.
+    let new_fit = if is_legend { legend_fit_param(p)? } else { None };
+    if gives(p, "fit") && !sized {
+        return Err(ONLY_FIT.into());
+    }
+    if new_names.is_some() && !is_legend {
+        return Err(ONLY_LEGEND_NAMES.into());
+    }
     if p.get("textSize").is_some_and(|v| !v.is_null()) && !sized {
         return Err(ONLY_LAYOUT_TEXT_SIZE.into());
     }
@@ -539,9 +548,27 @@ pub(in crate::cmd::layout) fn update(s: &mut Session, p: &Value) -> CmdResult {
                 *bold = v;
             }
         }
-        ElementKind::Legend { title, all_classes, hide_other, show_no_data, exclude, columns, labels, text_size, .. } => {
+        ElementKind::Legend {
+            title,
+            all_classes,
+            hide_other,
+            show_no_data,
+            exclude,
+            columns,
+            labels,
+            text_size,
+            fit,
+            show_layer_names,
+            ..
+        } => {
             if let Some(names) = new_exclude {
                 *exclude = names;
+            }
+            if let Some(v) = new_fit {
+                *fit = v;
+            }
+            if let Some(shown) = new_names {
+                *show_layer_names = LayerNames::from_shown(shown);
             }
             if let Some(pt) = new_text_size {
                 *text_size = pt;

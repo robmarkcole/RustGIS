@@ -1,5 +1,7 @@
 //! Where a publication layout's surrounds go over or beside the map.
 
+use rustgis_map::layout::MAX_LEGEND_COLUMNS;
+
 /// The surrounds a publication layout places in the map frame's corners.
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum Surround {
@@ -36,6 +38,12 @@ pub(crate) fn legend_room(
     }
     Some((w.min(room_w.max(MIN_LEGEND_MM)), h.min(room_h.max(MIN_LEGEND_MM))))
 }
+
+/// The most columns `layout.publication` lays its legend in: the three it always chose among, so
+/// raising [`MAX_LEGEND_COLUMNS`] for the legends' fits leaves the layouts it makes as they were. It
+/// measures its legend in those alone ([`crate::render::layout::legend_sizes_in_columns_mm`]).
+pub(super) const PUBLICATION_LEGEND_COLUMNS: usize = 3;
+const _: () = assert!(PUBLICATION_LEGEND_COLUMNS <= MAX_LEGEND_COLUMNS);
 
 /// Whether a publication legend laid out in more columns beats it in fewer, each as the share of it
 /// shown and the area (mm²) the surrounds leave over the drawing: it shows more of itself, or as

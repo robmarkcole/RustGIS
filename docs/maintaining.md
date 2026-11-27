@@ -289,6 +289,15 @@ nothing. A saved `layout.update` isn't told which element it changes, so any `te
 `null` requires it there. A saved `layout.import` whose `text` has such an element requires it
 as well.
 
+Projects with a legend that fits its box by shrinking its text or adding columns, that leaves its
+layer names off, or that has more than three columns (`fit`, `show_layer_names`, `columns` on a
+legend element) require `layout-legend-fit`, so an older reader refuses them instead of drawing
+the legend at its size, its names shown and in three columns, and saving it again without them.
+Saved `layout.addElement` and `layout.update` commands that set one require it too;
+`"fit": "manual"`, `"showLayerNames": true`, three columns or fewer, `null`, and a scale bar's own
+`fit` values need nothing. A saved `layout.import` whose `text` has such a legend requires it as
+well, and a layout file (`.rgislayout`) with one lists it in its header.
+
 Projects with a scale bar that has subdivisions, divisions before zero, labels below, a unit
 label of its own or placed elsewhere, decimals or a fit other than the defaults
 (`subdivisions`, `divisions_before_zero`, `label_position`, `unit_label`, `unit_label_position`,

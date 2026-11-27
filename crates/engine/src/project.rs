@@ -114,6 +114,7 @@ pub const CAPABILITIES: &[&str] = &[
     "layout-frame-border",
     NATIVE_COORDINATES,
     "layout-text-size",
+    "layout-legend-fit",
     "layout-scale-bar-details",
     "label-guide",
     "label-weight",

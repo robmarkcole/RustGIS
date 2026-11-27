@@ -97,8 +97,9 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
     The colorbar's title is the raster's name: the legend's box widens for it, up to its cap (45% of
     the frame's width, or the side column's), and a longer name wraps there, the box taller by its lines.
     `"colorbar": "none"` leaves it out, and the legend's box is sized for the legend alone: hiding
-    the colorbar afterwards would leave its room empty in the box. The legend takes the fewest columns, up to three,
-    that fit the largest rectangle the map leaves free; when none fits, a long one is laid in more
+    the colorbar afterwards would leave its room empty in the box. The publication lays its legend
+    in the fewest columns, up to three (a legend takes up to six, below), that fit the largest
+    rectangle the map leaves free; when none fits, a long one is laid in more
     when that shows more of it, or as much while covering at least a quarter less of what the map
     draws (the answer's `legendColumns`); in a side column it stays in one. Polygon layers with no
     fill and no labels, such as neighbouring borders, don't count as what the map draws here, unless
@@ -375,15 +376,46 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
     overview, which can miss a rare one the map draws at full resolution; so can the classes of a
     raster under a mask with more than about four million cells, whose masked statistics read a
     sample of them: adding the legend, and `layout.publication`, say so.
-  - **Columns** (`"columns"`, 1 to 3): its rows side by side under its title, as even as they go,
+  - **Columns** (`"columns"`, 1 to 6): its rows side by side under its title, as even as they go,
     each column as wide as its widest row, with its own column of symbols, and a layer's name
     staying with the row under it. The box keeps its size, so widen it for the columns: in a box
     too narrow they close up and long labels run into the next or past the box, and a box too
-    short fills each column in turn and leaves out the last rows.
+    short fills each column in turn and leaves out the last rows (a **Fit**, below, can change
+    that).
     A legend says when its box loses rows or closes its columns up when it is given `"columns"`,
-    `"textSize"` (`null` included), `"showNoData"` or `"labels"`, and, in columns or at a text
-    size of its own, when its box or what it lists changes. A legend in one column at the default
-    size is told so only when given one of those.
+    `"textSize"` (`null` included), `"showNoData"`, `"labels"`, `"fit"` or `"showLayerNames"`, and,
+    in columns, at a text size of its own or with a fit, when its box or what it lists changes. A
+    legend in one column at the default size and with no fit is told so only when given one of
+    those. A manual legend is checked when it is added or changed, as it always has been, not again
+    when the map's layers change later. A legend with a fit is checked then too, and again by every
+    export, which says, in the same words, when its fit no longer makes it fit (a layer added to the
+    map, the frame's scale changed); the drawing itself fits again on every draw, as below.
+  - **Fit** (`"fit"`): what gives way when the rows don't fit the box. **Manual** (`"manual"`, the
+    default) keeps the text's size and the columns and leaves out the last rows, as legends always
+    have. **Shrink the text** (`"adjustSize"`) draws the rows' text a quarter point smaller at a
+    time, down to 4 points, until they fit; **Add columns** (`"adjustColumns"`) adds columns, up to
+    six, until they fit, never more than fit across the box, so columns never run into each other
+    because a column was added; **Add columns, then shrink the text** (`"adjustColumnsAndSize"`)
+    adds columns first. Under a fit, **Text size** is the size the text shrinks from. **Columns**
+    is the fewest columns a fit that adds columns starts at; under **Shrink the text** the rows are
+    laid in exactly the columns set. Both stay settable. The title keeps its size, and point
+    symbols keep the size the map draws them at (a row is never shorter than its symbol), but a web
+    layer's legend picture and the length and height of line and polygon swatches shrink with the
+    text. A fitted legend is drawn just as a manual one of the size and columns it fitted to, in
+    the layout view and every export, and it fits itself again on every draw, so when the map's
+    layers change it follows them. A legend that can't fit even at 4 points or in the most columns
+    its box takes says so, naming what it tried; one that fits says nothing.
+  - **Layer names** (`"showLayerNames"`, on by default): off, the name over each layer's classes,
+    and over a web layer's legend picture, is left off. A layer drawn in one symbol keeps its name
+    beside its swatch, since that is what labels it; classes that carry no label of their own
+    (some raster classes) are then drawn as bare swatches.
+  - **In scripts and files**: scripts set `"fit": "adjustSize"` and `"showLayerNames": false` on
+    `layout.addElement` and `layout.update` (a scale bar's `fit` takes its own values); an unknown
+    fit is refused, and `null` leaves each as it is. Each change is one undo step, and a value set
+    back to its default (`"manual"`, names on) is no longer saved. A project with a legend that has
+    a fit, leaves its layer names off or has more than three columns can't be opened by an older
+    RustGIS, and a layout file (`.rgislayout`) with such a legend lists that in its header, so an
+    older RustGIS refuses it as well.
   - **Text size** (`"textSize"`, 4 to 100 points, 9 by default; a size outside that range is
     refused): the size of its layers' names and classes' labels. Its title, rows, indents and the
     gap between columns follow in proportion, and so do a web layer's legend pictures and the length

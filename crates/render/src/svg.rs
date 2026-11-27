@@ -492,6 +492,8 @@ mod tests {
                 labels: Default::default(),
                 color: None,
                 text_size: rustgis_map::layout::LEGEND_TEXT_PT,
+                fit: rustgis_map::layout::LegendFit::Manual,
+                show_layer_names: rustgis_map::layout::LayerNames::Shown,
             },
         );
         assert_eq!(picture_dpi(&layout, 600.0, |e| !written_as_svg(e)), 600.0);
@@ -534,6 +536,8 @@ mod tests {
                 labels: Default::default(),
                 color: None,
                 text_size: rustgis_map::layout::LEGEND_TEXT_PT,
+                fit: rustgis_map::layout::LegendFit::Manual,
+                show_layer_names: rustgis_map::layout::LayerNames::Shown,
             },
         );
         let info = PageInfo::default();
@@ -855,5 +859,83 @@ mod tests {
         }
         let (s, p) = (fnv(&svg), fnv(&pdf));
         assert_eq!((s, p), (PINNED_TEXT_SVG, PINNED_TEXT_PDF), "{s:#x} {p:#x}");
+    }
+
+    /// How [`legends_export_as_before`]'s pages were written as SVG and as a vector PDF before
+    /// legends had a fit, layer names to leave off or more than three columns, in the built-in
+    /// face: each page of [`crate::layout::legend_pin_pages`] in turn.
+    #[cfg(not(target_arch = "wasm32"))]
+    const PINNED_LEGEND_SVG: [u64; 18] = [
+        0xdde9_9bbd_fcfa_7b03, // 1: one column, roomy
+        0x434f_548a_b50a_d07f, // 2: two columns, roomy
+        0x71c1_fa20_bd53_8683, // 3: three columns, roomy
+        0x81df_80de_1501_6f46, // 4: one column, short
+        0xc8f1_9adc_aefe_782f, // 5: two columns, short
+        0x7f24_8684_f29d_4892, // 6: three columns, short
+        0xdde9_9bbd_fcfa_7b03, // 7: one column, narrow
+        0xaa01_df65_0173_015e, // 8: two columns, narrow
+        0x23a2_a454_7d20_f432, // 9: three columns, narrow
+        0xdbab_b441_685c_fbc4, // 10: 14 pt, two columns
+        0x621c_672e_2968_bf38, // 11: 5 pt, three columns, short
+        0xd2c2_978b_14ce_f64c, // 12: no title, what the frame draws, other left out
+        0x8546_8a86_082b_7af2, // 13: labelled, excluded, ink
+        0x878e_7b18_1718_8c95, // 14: no-data rows, two columns
+        0xaae8_b8f8_936e_ecff, // 15: across the right edge
+        0x4546_c89f_1cf7_5dff, // 16: shorter than its title
+        0x4546_c89f_1cf7_5dff, // 17: nothing to list
+        0xa10a_680a_ac4d_2b58, // 18: what the frame draws, no-data asked
+    ];
+    #[cfg(not(target_arch = "wasm32"))]
+    const PINNED_LEGEND_PDF: [u64; 18] = [
+        0xe316_5ff2_9099_46df, // 1: one column, roomy
+        0xdc6c_aa9d_bfa7_2264, // 2: two columns, roomy
+        0x523d_fde1_8e25_b26b, // 3: three columns, roomy
+        0x3c1d_85dd_54b4_cde8, // 4: one column, short
+        0xa5ea_4672_820f_7bb1, // 5: two columns, short
+        0x3ce3_aef6_103c_ea2c, // 6: three columns, short
+        0xe316_5ff2_9099_46df, // 7: one column, narrow
+        0x0853_87ac_de13_68de, // 8: two columns, narrow
+        0xbc8b_12e8_b710_8539, // 9: three columns, narrow
+        0x728a_470d_c6a9_dccf, // 10: 14 pt, two columns
+        0xb7be_f398_0c8a_9815, // 11: 5 pt, three columns, short
+        0x78ab_2e33_4226_39a9, // 12: no title, what the frame draws, other left out
+        0x32f7_77da_1f52_9178, // 13: labelled, excluded, ink
+        0x1c4b_2dcc_00bc_3477, // 14: no-data rows, two columns
+        0x97fe_9568_01e8_cac8, // 15: across the right edge
+        0x7e4f_2651_6981_e5bf, // 16: shorter than its title
+        0x7e4f_2651_6981_e5bf, // 17: nothing to list
+        0x26d6_182c_6b62_bbe2, // 18: what the frame draws, no-data asked
+    ];
+
+    /// The SVG and the vector PDF of a legend with none of the fitting settings are byte for byte
+    /// main's, page by page: in a process of its own, told to use the built-in face before any
+    /// text.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn legends_export_as_before() {
+        if std::env::var_os("RUSTGIS_LEGEND_EXPORT_PIN_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "svg::tests::legends_export_as_before", "--nocapture"])
+                .env("RUSTGIS_LEGEND_EXPORT_PIN_CHILD", "1")
+                .env("RUSTGIS_BUILTIN_FONTS", "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"), "the test didn't run in the child process");
+            return;
+        }
+        let info = PageInfo::default();
+        let (mut svg, mut pdf) = (Vec::new(), Vec::new());
+        for (i, (l, mut maps)) in crate::layout::legend_pin_pages().into_iter().enumerate() {
+            let page = format!("page {}", i + 1);
+            let written = layout_svg(&l, &mut maps, 72.0, &info).unwrap().0.into_bytes();
+            svg.push((page.clone(), fnv(&written)));
+            let (drawing, _) = crate::layout::render_drawing(&l, &mut maps, 150.0, &info).unwrap();
+            let bytes = crate::pdf::write(&[crate::pdf::Page::drawing(drawing, l.width, l.height)], "Legends");
+            pdf.push((page, fnv(&bytes)));
+        }
+        let mut wrong = crate::layout::pin_mismatches("SVG", &svg, &PINNED_LEGEND_SVG);
+        wrong.extend(crate::layout::pin_mismatches("PDF", &pdf, &PINNED_LEGEND_PDF));
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 }

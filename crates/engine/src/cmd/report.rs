@@ -1167,19 +1167,38 @@ fn report_pages_bytes(
     let mut out = Vec::new();
     let mut held = 0usize;
     let (mut frames_pictured, mut pages_pictured) = (Vec::new(), Vec::new());
+    // The legends its layouts' pages drew under a fit still cut, by layout ([`keep_unfitted`]).
+    let mut unfitted = Vec::new();
     // Counted, and stopped on Cancel, a page at a time.
     rustgis_data::progress::begin(n);
     for k in 0..n {
         rustgis_data::progress::step(1).map_err(|e| e.to_string())?;
+        let page_layout = match pages.get(k) {
+            Some(rustgis_render::report::Page::Layout(li)) => Some(*li),
+            _ => None,
+        };
         if !pdf {
-            let (img, ..) = rustgis_render::report::draw_page(doc, pages, k, dpi, &s.project.layouts, &mut s.project.maps)?;
+            let (drawn, listed) = rustgis_render::layout::unfitted_legends(|| {
+                rustgis_render::report::draw_page(doc, pages, k, dpi, &s.project.layouts, &mut s.project.maps)
+            });
+            let (img, ..) = drawn?;
+            keep_unfitted(&mut unfitted, page_layout, listed);
+            say_report_unfitted(s, &unfitted);
             return Ok((img.encode_png().map_err(|e| e.to_string())?, pages.len()));
         }
-        let (page, pictured) = rustgis_render::report::pdf_page(doc, pages, k, dpi, &s.project.layouts, &mut s.project.maps)?;
+        let (drawn, listed) = rustgis_render::layout::unfitted_legends(|| {
+            rustgis_render::report::pdf_page(doc, pages, k, dpi, &s.project.layouts, &mut s.project.maps)
+        });
+        let (page, pictured) = drawn?;
+        keep_unfitted(&mut unfitted, page_layout, listed);
         if page.overflowed() {
             // Too large for vectors all the same: the page as one picture.
             pages_pictured.push(k + 1);
-            let (img, w, h) = rustgis_render::report::draw_page(doc, pages, k, dpi, &s.project.layouts, &mut s.project.maps)?;
+            let (drawn, listed) = rustgis_render::layout::unfitted_legends(|| {
+                rustgis_render::report::draw_page(doc, pages, k, dpi, &s.project.layouts, &mut s.project.maps)
+            });
+            let (img, w, h) = drawn?;
+            keep_unfitted(&mut unfitted, page_layout, listed);
             out.push(rustgis_render::pdf::Page::new(&img, w, h));
         } else {
             frames_pictured.extend(pictured);
@@ -1190,8 +1209,36 @@ fn report_pages_bytes(
             return Err(format!("the PDF passed {} MB at page {}; export at a lower dpi", PDF_BUDGET >> 20, k + 1));
         }
     }
+    say_report_unfitted(s, &unfitted);
     super::layout::pictured_notices(s, &frames_pictured, &pages_pictured);
     Ok((rustgis_render::pdf::write(&out, &doc.title), pages.len()))
+}
+
+/// Keeps the legends `listed` as cut on a page that draws the layout `layout` (by its index), each
+/// with that layout: the ids are a layout's own, so two layouts' legends sharing one are two. Only
+/// an exact repeat (the same legend of the same layout, cut the same way) is dropped: the page
+/// drawn again as a picture, or the layout on another page of the report. A page that draws no
+/// layout draws no legend.
+fn keep_unfitted(
+    kept: &mut Vec<(usize, rustgis_render::layout::UnfittedLegend)>,
+    layout: Option<usize>,
+    listed: Vec<rustgis_render::layout::UnfittedLegend>,
+) {
+    let Some(li) = layout else { return };
+    for l in listed {
+        let item = (li, l);
+        if !kept.contains(&item) {
+            kept.push(item);
+        }
+    }
+}
+
+/// Says the legends [`keep_unfitted`] kept, each named with its layout, as a layout's export
+/// says its own ([`super::layout::say_unfitted_legends_in`]).
+fn say_report_unfitted(s: &mut Session, kept: &[(usize, rustgis_render::layout::UnfittedLegend)]) {
+    let named: Vec<_> =
+        kept.iter().map(|(li, l)| (s.project.layouts.get(*li).map(|layout| (*li, layout.name.clone())), l.clone())).collect();
+    super::layout::say_unfitted_legends_in(s, &named);
 }
 
 /// Resolves the report creator's string-name or active/default layer convention.
@@ -1426,4 +1473,33 @@ pub fn index(s: &Session, p: &Value) -> Result<usize, String> {
 /// The live report layer, using the same active-first resolver as approval.
 pub fn layer_of(s: &Session, i: usize) -> Result<&Layer, String> {
     layer_of_input(s, i)
+}
+
+#[cfg(test)]
+mod tests {
+    use rustgis_map::layout::LegendFit;
+    use rustgis_render::layout::UnfittedLegend;
+
+    /// A page drawn again as a picture, or a layout shown on two pages, lists its legends again:
+    /// kept once. Two layouts' legends sharing an id, or one legend cut otherwise, are kept apart;
+    /// a page that draws no layout keeps nothing.
+    #[test]
+    fn a_reports_cut_legends_are_kept_once_by_layout() {
+        let cut = |columns: usize| UnfittedLegend {
+            id: 3,
+            name: "Key".into(),
+            fit: LegendFit::AdjustColumns,
+            columns,
+            too_wide: false,
+            too_tall: true,
+        };
+        let mut kept = Vec::new();
+        super::keep_unfitted(&mut kept, Some(0), vec![cut(1)]);
+        // The vector page, then the same page drawn as a picture.
+        super::keep_unfitted(&mut kept, Some(0), vec![cut(1)]);
+        super::keep_unfitted(&mut kept, Some(1), vec![cut(1)]);
+        super::keep_unfitted(&mut kept, Some(0), vec![cut(2)]);
+        super::keep_unfitted(&mut kept, None, vec![cut(3)]);
+        assert_eq!(kept, [(0, cut(1)), (1, cut(1)), (0, cut(2))]);
+    }
 }

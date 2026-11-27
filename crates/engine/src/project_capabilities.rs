@@ -175,6 +175,7 @@ const COMMAND_CAPABILITIES: &[(&str, CommandCheck)] = &[
     ("blank-paper", command_uses_blank_paper),
     ("layout-frame-border", command_uses_frame_border),
     ("layout-text-size", command_uses_text_size),
+    ("layout-legend-fit", command_uses_legend_fit),
     ("layout-scale-bar-details", command_uses_scale_bar_details),
     ("dggs-system", command_uses_dggs_system),
     ("label-weight", command_weighs_labels),
@@ -377,6 +378,43 @@ fn command_uses_text_size(id: &str, params: &Value) -> bool {
         }
         "layout.import" => imported_layout_uses(params, &["\"text_size\"", "\"label_size\""], |e| e.kind.has_custom_text_size()),
         "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_uses_text_size)),
+        _ => false,
+    }
+}
+
+/// Whether a layout element is a legend that fits its box by shrinking its text or adding columns,
+/// leaves its layer names off, or has more than three columns, once brought into range: an older
+/// reader would draw it at its size, its names shown and in three columns.
+fn legends_fitting(e: &rustgis_map::layout::Element) -> bool {
+    e.kind.legend_uses_fit()
+}
+
+/// A layout command that gives a legend a fit, leaves its layer names off or lays it in more than
+/// three columns: an older reader ignores `showLayerNames`, refuses a legend's `fit` names as a
+/// scale bar's, or ignores them on a legend, and takes three columns at most. Each key is read on
+/// its own by the command's own reader ([`crate::cmd::layout::legend_fit_param`],
+/// [`crate::cmd::layout::legend_names_param`], [`crate::cmd::layout::legend_columns_param`]), so
+/// one the command refuses doesn't hide another one set. `"manual"`, `true`, three columns or
+/// fewer and `null` keep a legend as an older reader draws it; a scale bar's fit names aren't a
+/// legend's, and a value the command refuses changes nothing, so neither needs it. A key given to
+/// another kind counts too, though its command refuses it: an over-count that asks for the
+/// capability sooner, never a missing one. A `layout.import` requires it for such a legend once
+/// its layout is read into range, so a fit or layer-names value that isn't one, read as the
+/// default, needs nothing.
+fn command_uses_legend_fit(id: &str, params: &Value) -> bool {
+    use crate::cmd::layout::{legend_columns_param, legend_fit_param, legend_names_param};
+    use rustgis_map::layout::{LEGEND_COLUMNS_BEFORE_FIT, LegendFit};
+    match id {
+        "layout.addElement" | "layout.update" => {
+            legend_fit_param(params).is_ok_and(|fit| fit.is_some_and(|fit| fit != LegendFit::Manual))
+                || legend_names_param(params) == Ok(Some(false))
+                || legend_columns_param(params).is_ok_and(|n| n.is_some_and(|n| n > LEGEND_COLUMNS_BEFORE_FIT))
+        }
+        // A layout file, read as `layout.import` reads it, which `report.existingTemplate` also does.
+        "layout.import" | "report.existingTemplate" => {
+            imported_layout_uses(params, &["\"fit\"", "\"show_layer_names\"", "\"columns\""], legends_fitting)
+        }
+        "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_uses_legend_fit)),
         _ => false,
     }
 }
@@ -1087,6 +1125,7 @@ fn layout_capabilities(layouts: &[rustgis_map::layout::Layout]) -> Vec<&'static 
         (elements().any(charts_outlined), "layout-chart-outline"),
         (elements().any(|e| e.kind.has_custom_border()), "layout-frame-border"),
         (elements().any(|e| e.kind.has_custom_text_size()), "layout-text-size"),
+        (elements().any(legends_fitting), "layout-legend-fit"),
         (elements().any(bar_details), "layout-scale-bar-details"),
         (layouts.iter().any(|l| l.paper.is_some()), "layout-page-color"),
         (elements().any(text_statistics), "layout-text-statistics"),
@@ -1382,6 +1421,7 @@ mod tests {
             (&["blank-paper"], "map.basemap", json!({"name": "blank", "color": "#112233"})),
             (&["layout-frame-border"], "layout.update", json!({"element": 1, "border": {}})),
             (&["layout-text-size"], "layout.update", json!({"element": 1, "textSize": 12})),
+            (&["layout-legend-fit"], "layout.update", json!({"element": 1, "fit": "adjustSize"})),
             (&["dggs-system"], "a5Grid", json!({"system": "H3"})),
             (&["dggs-system"], "a5Aggregate", json!({"system": "S2"})),
             (&["label-weight"], "labels.placement", json!({"weight": 9})),
@@ -2031,6 +2071,84 @@ mod tests {
                 let saved = serde_json::to_value(Project::from_json(&document.to_string()).unwrap()).unwrap();
                 let expected = if required { json!(["layout-chart-stack"]) } else { Value::Null };
                 assert_eq!(saved.get("requires").cloned().unwrap_or(Value::Null), expected, "{id} {params}");
+            }
+        }
+    }
+
+    /// A legend with a fit, its layer names off or more than three columns is required where it is
+    /// saved, so an older reader refuses the project instead of drawing it as set by hand, named and
+    /// in three columns, and saving it again without them; so is a saved command that sets one. The
+    /// defaults, null, a scale bar's fit and values read as them need nothing.
+    #[test]
+    fn legend_fit_capability_follows_saved_layouts_and_commands() {
+        use rustgis_map::layout::{ElementKind, LayerNames, LegendFit};
+        let fixture = Project::from_json(include_str!("../../../schema/fixtures/layout_legend_fit.rgis")).unwrap();
+        let saved = serde_json::to_value(&fixture).unwrap();
+        assert_eq!(saved["requires"], json!(["layout-legend-fit"]));
+        let reread = Project::from_json(&saved.to_string()).unwrap();
+        assert!(reread.layouts[0].elements[1].kind.legend_uses_fit());
+        // Each of the three on its own is required.
+        for one in 0..3 {
+            let mut alone = fixture.clone();
+            if let ElementKind::Legend { fit, show_layer_names, columns, .. } = &mut alone.layouts[0].elements[1].kind {
+                (*fit, *show_layer_names, *columns) = [
+                    (LegendFit::AdjustSize, LayerNames::Shown, 3),
+                    (LegendFit::Manual, LayerNames::Hidden, 1),
+                    (LegendFit::Manual, LayerNames::Shown, 4),
+                ][one];
+            }
+            assert_eq!(serde_json::to_value(&alone).unwrap()["requires"], json!(["layout-legend-fit"]), "{one}");
+        }
+        let mut clean = fixture;
+        if let ElementKind::Legend { fit, show_layer_names, columns, .. } = &mut clean.layouts[0].elements[1].kind {
+            (*fit, *show_layer_names, *columns) = (LegendFit::Manual, LayerNames::Shown, 3);
+        }
+        let base = serde_json::to_value(&clean).unwrap();
+        assert!(base.get("requires").is_none(), "a manual, named legend in three columns needs nothing");
+        for key in ["\"fit\"", "show_layer_names"] {
+            assert!(!base["layouts"].to_string().contains(key), "nor writes {key}");
+        }
+        // A fit name it doesn't know and layer names that aren't true or false read as the defaults.
+        let mut damaged = base["layouts"][0].clone();
+        damaged["elements"][1]["kind"]["Legend"]["fit"] = json!("adjustFrame");
+        damaged["elements"][1]["kind"]["Legend"]["show_layer_names"] = json!("no");
+        for (id, params, required) in [
+            ("layout.addElement", json!({"kind": "legend", "fit": "adjustSize"}), true),
+            ("layout.addElement", json!({"kind": "legend", "showLayerNames": false, "fit": "shrink"}), true),
+            ("layout.update", json!({"element": 2, "fit": "AdjustColumns"}), true),
+            ("layout.update", json!({"element": 2, "fit": " adjustColumnsAndSize "}), true),
+            ("layout.update", json!({"element": 2, "showLayerNames": false}), true),
+            ("layout.update", json!({"element": 2, "columns": 4}), true),
+            ("layout.update", json!({"element": 2, "columns": 6, "fit": "adjustWidth"}), true),
+            ("layout.update", json!({"element": 2, "columns": 3}), false),
+            ("layout.update", json!({"element": 2, "fit": "manual", "showLayerNames": true}), false),
+            ("layout.update", json!({"element": 2, "fit": "adjustWidth"}), false),
+            ("layout.update", json!({"element": 2, "fit": "adjustFrame", "columns": 9}), false),
+            ("layout.update", json!({"element": 2, "showLayerNames": "false", "columns": 4.5}), false),
+            ("layout.update", json!({"element": 2, "fit": null, "showLayerNames": null, "columns": null}), false),
+            ("layout.import", json!({"text": saved["layouts"][0].to_string()}), true),
+            ("layout.import", json!({"text": base["layouts"][0].to_string()}), false),
+            ("layout.import", json!({"text": damaged.to_string()}), false),
+            ("layout.import", json!({"path": "legends.rgislayout"}), false),
+            // A report section's template is a layout file read as `layout.import` reads it.
+            ("report.existingTemplate", json!({"text": saved["layouts"][0].to_string()}), true),
+            ("report.existingTemplate", json!({"text": base["layouts"][0].to_string()}), false),
+        ] {
+            // A scale bar's fit name is its details' to require, not this.
+            let bar = params.get("fit") == Some(&json!("adjustWidth"));
+            let script = format!("{id}= {params}");
+            for value in [
+                json!([{"name": "Task", "steps": [{"title": "Legend", "command": id, "params": params}]}]),
+                json!([{"name": "Script", "steps": [{"title": "Legend", "command": "script.run", "params": {"script": script}}]}]),
+            ] {
+                let mut document = base.clone();
+                document["tasks"] = value;
+                let saved = serde_json::to_value(Project::from_json(&document.to_string()).unwrap()).unwrap();
+                let requires = saved.get("requires").and_then(Value::as_array).cloned().unwrap_or_default();
+                assert_eq!(requires.contains(&json!("layout-legend-fit")), required, "{id} {params}");
+                let others: Vec<&Value> = requires.iter().filter(|r| *r != "layout-legend-fit").collect();
+                let expected: Vec<Value> = if bar { vec![json!("layout-scale-bar-details")] } else { vec![] };
+                assert_eq!(others, expected.iter().collect::<Vec<_>>(), "{id} {params}: {requires:?}");
             }
         }
     }

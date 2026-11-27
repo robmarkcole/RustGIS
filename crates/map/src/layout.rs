@@ -584,13 +584,17 @@ impl Layout {
                         g.label_size = layout_text_in_range(g.label_size, GRID_LABEL_PT);
                     }
                 }
-                ElementKind::Legend { exclude, columns, labels, text_size, .. } => {
+                ElementKind::Legend { exclude, columns, labels, text_size, fit, show_layer_names, .. } => {
                     *text_size = layout_text_in_range(*text_size, LEGEND_TEXT_PT);
+                    // A file's unknown name or wrong kind of value is read as a marker: back to the
+                    // default.
+                    *fit = fit.kept();
+                    *show_layer_names = show_layer_names.kept();
                     // Names stay whole: a layer's own name isn't cut, and a cut one would no
                     // longer match it.
                     cut |= exclude.len() > MAX_LEGEND_EXCLUDED;
                     exclude.truncate(MAX_LEGEND_EXCLUDED);
-                    *columns = (*columns).clamp(1, MAX_LEGEND_COLUMNS);
+                    *columns = legend_columns_in_range(*columns);
                     // The same for the names labelled; a label is cut to its length, and a blank
                     // one shows the name, as it would without.
                     labels.retain(|_, label| !label.trim().is_empty());

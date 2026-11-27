@@ -4,12 +4,15 @@ use super::*;
 use crate::RustGisApp;
 use crate::widgets::Dragged;
 use egui::Ui;
-use rustgis_engine::map::layout::{Element, ElementKind, Layout, MAX_LEGEND_COLUMNS};
+use rustgis_engine::map::layout::{Element, ElementKind, Layout, LegendFit, MAX_LEGEND_COLUMNS};
 use serde_json::{Value, json};
 
 /// A legend's rows in the grid.
 pub(super) fn legend_property_rows(app: &mut RustGisApp, ui: &mut Ui, li: usize, e: &Element, update: &dyn Fn(&mut RustGisApp, Value)) {
-    let ElementKind::Legend { title, all_classes, hide_other, show_no_data, columns, text_size, .. } = &e.kind else { return };
+    let ElementKind::Legend { title, all_classes, hide_other, show_no_data, columns, text_size, fit, show_layer_names, .. } = &e.kind
+    else {
+        return;
+    };
     let id = e.id;
     let drag_key = |field: &str| number_key(li, id, field);
     let input_label = ui.label(tl!("Title"));
@@ -39,10 +42,40 @@ pub(super) fn legend_property_rows(app: &mut RustGisApp, ui: &mut Ui, li: usize,
     let input_label = ui.label(tl!("Columns"));
     let mut n = *columns as u64;
     let drag = Dragged::lend(ui, drag_key("columns"), &mut n);
-    let r =
-        ui.add(egui::DragValue::new(&mut n).update_while_editing(false).range(1..=MAX_LEGEND_COLUMNS as u64)).labelled_by(input_label.id);
+    let r = ui
+        .add(egui::DragValue::new(&mut n).update_while_editing(false).range(1..=MAX_LEGEND_COLUMNS as u64))
+        .labelled_by(input_label.id)
+        .on_hover_text(tl!("The columns its rows are laid in; a fit that adds columns starts from these"));
     if drag.settled(ui, &r, &mut n) && n as usize != *columns {
         update(app, json!({"columns": n}));
+    }
+    ui.end_row();
+    let input_label = ui.label(tl!("Fit"));
+    let current = fit.kept();
+    egui::ComboBox::from_id_salt(("legend_fit", id))
+        .selected_text(tl!(current.label()))
+        .show_ui(ui, |ui| {
+            for v in LegendFit::ALL {
+                if ui.selectable_label(current == v, tl!(v.label())).clicked() && current != v {
+                    update(app, json!({"fit": v.code()}));
+                }
+            }
+        })
+        .response
+        .labelled_by(input_label.id)
+        .on_hover_text(tl!(
+            "What gives way when the rows don't fit the box: the text's size, the columns, or nothing, leaving the last rows out"
+        ));
+    ui.end_row();
+    let input_label = ui.label(tl!("Layer names"));
+    let mut names = show_layer_names.shown();
+    if ui
+        .checkbox(&mut names, "")
+        .labelled_by(input_label.id)
+        .on_hover_text(tl!("The name over each layer's classes; a layer drawn in one symbol keeps its name"))
+        .changed()
+    {
+        update(app, json!({"showLayerNames": names}));
     }
     ui.end_row();
     // Its names' and labels' points; the title, rows and swatches follow (#2581).

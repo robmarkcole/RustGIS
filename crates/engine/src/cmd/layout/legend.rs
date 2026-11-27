@@ -3,6 +3,11 @@
 use super::*;
 
 pub(in crate::cmd::layout) const ONLY_LEGEND_COLUMNS: &str = "only legends have columns";
+/// A legend's layer names given to another element.
+pub(in crate::cmd::layout) const ONLY_LEGEND_NAMES: &str = "only legends take showLayerNames";
+/// A fit given to an element that is neither a legend nor a scale bar, each of which reads `fit`
+/// as its own.
+pub(in crate::cmd::layout) const ONLY_FIT: &str = "only legends and scale bars take fit";
 /// Refuse the optional no-data key on an element that cannot display it.
 pub(in crate::cmd::layout) const ONLY_LEGEND_NO_DATA: &str = "only legends take showNoData";
 pub(in crate::cmd::layout) const ONLY_LEGEND_LABELS: &str = "only legends label layers";
@@ -11,21 +16,38 @@ pub(in crate::cmd::layout) const ONLY_LEGEND_LABELS: &str = "only legends label 
 /// that still fits.
 pub(in crate::cmd::layout) const LEGEND_FIT_MM: f64 = 1e-6;
 
-/// What a legend's rows `size` in `columns` columns lose in a box `room`, in mm, each said once.
-pub(in crate::cmd::layout) fn legend_fit_warnings(columns: usize, (w, h): (f64, f64), (room_w, room_h): (f64, f64)) -> Vec<&'static str> {
-    // With no rows there is nothing to lose, in a box shorter than its title too.
-    let (too_wide, too_tall) = (h > 0.0 && w > room_w + LEGEND_FIT_MM, h > 0.0 && h > room_h + LEGEND_FIT_MM);
+/// Whether a legend's rows `(w, h)` in mm are wider and taller than their room: none are when it
+/// has no rows, in a box shorter than its title too.
+pub(in crate::cmd::layout) fn overflows((w, h): (f64, f64), (room_w, room_h): (f64, f64)) -> (bool, bool) {
+    (h > 0.0 && w > room_w + LEGEND_FIT_MM, h > 0.0 && h > room_h + LEGEND_FIT_MM)
+}
+
+/// What a legend drawn in `columns` columns loses in its box when its rows are `too_wide` or
+/// `too_tall` for it, each said once. A manual legend says it as it always has; a fit that still
+/// leaves them out says what it tried: the smallest text, the most columns its box takes across,
+/// or both.
+pub(in crate::cmd::layout) fn legend_fit_warnings(fit: LegendFit, columns: usize, (too_wide, too_tall): (bool, bool)) -> Vec<String> {
+    let smallest = LAYOUT_TEXT_SIZE.start();
+    let across = if columns == 1 { "one column".to_string() } else { format!("{columns} columns") };
+    let even = match fit.kept() {
+        LegendFit::AdjustSize => format!(" even with its text shrunk to {smallest} points"),
+        LegendFit::AdjustColumns => format!(" even in {across}"),
+        LegendFit::AdjustColumnsAndSize => format!(" even in {across} with its text shrunk to {smallest} points"),
+        LegendFit::Manual | LegendFit::Invalid => String::new(),
+    };
     let mut said = Vec::new();
     if columns > 1 {
         // Its columns close up rather than leave one out.
         if too_wide {
-            said.push("the legend's columns are wider than its box: they close up, long labels run into the next, and the last column's past the box");
+            said.push(format!(
+                "the legend's columns are wider than its box{even}: they close up, long labels run into the next, and the last column's past the box"
+            ));
         }
         if too_tall {
-            said.push("the legend lists more than fits its box: its last rows are left out");
+            said.push(format!("the legend lists more than fits its box{even}: its last rows are left out"));
         }
     } else if too_wide || too_tall {
-        said.push("the legend lists more than fits its box: its last rows or the ends of long labels are left out");
+        said.push(format!("the legend lists more than fits its box{even}: its last rows or the ends of long labels are left out"));
     }
     said
 }
@@ -89,23 +111,41 @@ pub(in crate::cmd::layout) fn say_raster_keys(s: &mut Session, li: usize, id: u3
 
 /// Whether a legend `kind`, after a command with `p`, says what it loses in its box (#2581): the
 /// one rule `layout.addElement` and `layout.update` both take. Told when it is given what sets
-/// what it needs of its box (its columns, its missing-value row, or its text size, `null`
-/// included, which gives the default back) or labels (text chosen for the box), and, in columns
-/// or at a text size of its own, when its box or what it lists changes. A move changes neither.
+/// what it needs of its box (its columns, its missing-value row, its fit, its layer names, or its
+/// text size, `null` included, which gives the default back) or labels (text chosen for the box),
+/// and, in columns, at a text size of its own or under a fit, which can stop fitting, when its box
+/// or what it lists changes. A move changes neither.
 pub(in crate::cmd::layout) fn tells_legend_fit(kind: &ElementKind, p: &Value) -> bool {
-    let ElementKind::Legend { columns, text_size, .. } = kind else { return false };
+    let ElementKind::Legend { columns, text_size, fit, .. } = kind else { return false };
     let given = |k: &str| p.get(k).is_some_and(|v| !v.is_null());
-    let watched = *columns > 1 || *text_size != rustgis_map::layout::LEGEND_TEXT_PT;
+    let watched = *columns > 1 || *text_size != rustgis_map::layout::LEGEND_TEXT_PT || fit.kept() != LegendFit::Manual;
     let refitted = ["w", "h", "title", "allClasses", "hideOther", "exclude", "labels"].iter().any(|k| given(k));
-    ["columns", "showNoData", "labels"].iter().any(|k| given(k)) || p.get("textSize").is_some() || (watched && refitted)
+    ["columns", "showNoData", "labels", "fit", "showLayerNames"].iter().any(|k| given(k))
+        || p.get("textSize").is_some()
+        || (watched && refitted)
 }
 
 /// Says what a legend loses in its box, as `layout.publication` does for its own, or that it can't
-/// tell.
+/// tell. A manual legend is measured in its own columns at its own size; a fitted one by the
+/// drawing's own fit ([`crate::render::layout::legend_fitted_mm`]), in the room its title leaves,
+/// so it says nothing when the page draws it whole and what it tried when it can't.
 pub(in crate::cmd::layout) fn say_legend_fit(s: &mut Session, li: usize, id: u32) {
     let Some(l) = s.project.layouts.get(li) else { return };
     let Some(e) = l.element(id) else { return };
-    let ElementKind::Legend { frame, title, all_classes, hide_other, show_no_data, exclude, columns, labels, text_size, .. } = &e.kind
+    let ElementKind::Legend {
+        frame,
+        title,
+        all_classes,
+        hide_other,
+        show_no_data,
+        exclude,
+        columns,
+        labels,
+        text_size,
+        fit,
+        show_layer_names,
+        ..
+    } = &e.kind
     else {
         return;
     };
@@ -113,9 +153,10 @@ pub(in crate::cmd::layout) fn say_legend_fit(s: &mut Session, li: usize, id: u32
         Some(ElementKind::MapFrame { map, center, scale, .. }) => Some((map.clone(), *center, *scale)),
         _ => None,
     };
-    let (room_w, room_h) = (e.w, e.h - if title.is_empty() { 0.0 } else { crate::render::layout::legend_title_mm(*text_size) });
+    let room = (e.w, e.h - if title.is_empty() { 0.0 } else { crate::render::layout::legend_title_mm(*text_size) });
     let (all_classes, hide_other, show_no_data, exclude, columns, labels, text_size) =
         (*all_classes, *hide_other, *show_no_data, exclude.clone(), *columns, labels.clone(), *text_size);
+    let (fit, layer_names) = (fit.kept(), show_layer_names.shown());
     let found = shown
         .and_then(|(name, center, scale)| Some((s.project.maps.iter_mut().find(|m| m.name.eq_ignore_ascii_case(&name))?, center, scale)));
     let Some((map, center, scale)) = found else {
@@ -123,20 +164,74 @@ pub(in crate::cmd::layout) fn say_legend_fit(s: &mut Session, li: usize, id: u32
         return;
     };
     let at = crate::render::layout::frame_render_scale(map, center, scale);
-    let Some(sizes) = crate::render::layout::legend_sizes_with_no_data_mm(
-        map,
-        at,
+    let asked = crate::render::layout::LegendAsked {
         all_classes,
         hide_other,
-        (show_no_data, text_size),
-        (&exclude, &labels),
-    ) else {
+        show_no_data,
+        layer_names,
+        text_size,
+        exclude: &exclude,
+        labels: &labels,
+    };
+    let measured = if fit == LegendFit::Manual {
+        let n = rustgis_map::layout::legend_columns_in_range(columns);
+        crate::render::layout::legend_size_asked_mm(map, at, &asked, n).map(|size| (n, overflows(size, room)))
+    } else {
+        crate::render::layout::legend_fitted_mm(map, at, &asked, (columns, fit), room).map(|f| (f.columns, (f.too_wide, f.too_tall)))
+    };
+    let Some((drawn, verdict)) = measured else {
         s.warn("a layer's source couldn't be read through, so the legend's fit in its box wasn't checked; exporting says why");
         return;
     };
-    let size = sizes[columns.clamp(1, MAX_LEGEND_COLUMNS) - 1];
-    for said in legend_fit_warnings(columns, size, (room_w, room_h)) {
+    for said in legend_fit_warnings(fit, drawn, verdict) {
         s.warn(said);
+    }
+}
+
+/// Says what the legends under a fit that an export drew still lose in their boxes
+/// ([`rustgis_render::layout::unfitted_legends`]), in the words setting the fit gave
+/// ([`legend_fit_warnings`]): a fit can stop succeeding after it is set, as when a layer is added to
+/// its map. One notice a reason, with how many legends it is true of and which, by name (shortened,
+/// as [`crate::project::short_name`] does) and id, the first ten, as a scale bar's notices count
+/// theirs. A manual legend is not listed, so its export says what it did.
+pub(in crate::cmd::layout) fn say_unfitted_legends(s: &mut Session, unfitted: &[rustgis_render::layout::UnfittedLegend]) {
+    let listed: Vec<_> = unfitted.iter().map(|l| (None, l.clone())).collect();
+    say_unfitted_legends_in(s, &listed);
+}
+
+/// [`say_unfitted_legends`] of legends each in the layout it names (by its index and name), when
+/// one does: a report draws several layouts, whose legends' ids can be the same, and names each
+/// legend's layout (shortened as its name is), `"Legend" (3) in "Atlas"`. A legend is the same
+/// legend by its layout's index and its id: listed again (another page of a series, cut another
+/// way that a reason's words don't tell apart), it is named and counted once under that reason.
+pub(in crate::cmd) fn say_unfitted_legends_in(
+    s: &mut Session,
+    unfitted: &[(Option<(usize, String)>, rustgis_render::layout::UnfittedLegend)],
+) {
+    // Each reason, in the order first met, with the legends it is true of, each once.
+    let mut said: Vec<(String, Vec<((Option<usize>, u32), String)>)> = Vec::new();
+    for (layout, l) in unfitted {
+        let mut named = format!("\"{}\" ({})", crate::project::short_name(&l.name), l.id);
+        if let Some((_, layout)) = layout {
+            named.push_str(&format!(" in \"{}\"", crate::project::short_name(layout)));
+        }
+        let legend = (layout.as_ref().map(|(li, _)| *li), l.id);
+        for reason in legend_fit_warnings(l.fit, l.columns, (l.too_wide, l.too_tall)) {
+            match said.iter_mut().find(|(r, _)| *r == reason) {
+                Some((_, legends)) if legends.iter().any(|(at, _)| *at == legend) => {}
+                Some((_, legends)) => legends.push((legend, named.clone())),
+                None => said.push((reason, vec![(legend, named.clone())])),
+            }
+        }
+    }
+    for (reason, legends) in said {
+        let n = legends.len();
+        let mut names = legends.into_iter().take(10).map(|(_, named)| named).collect::<Vec<_>>().join(", ");
+        if n > 10 {
+            names.push_str(&format!(" and {} more", n - 10));
+        }
+        let notice = if n == 1 { format!("Legend {names}: {reason}") } else { format!("{n} legends ({names}): {reason}") };
+        s.warn(notice);
     }
 }
 
@@ -157,14 +252,31 @@ pub(in crate::cmd::layout) const BAR_FIT_KEYS: [&str; 10] = [
     "fit",
 ];
 
-/// The `"columns"` a legend is given, refused outside 1 to [`MAX_LEGEND_COLUMNS`].
-pub(in crate::cmd::layout) fn legend_columns_param(p: &Value) -> Result<Option<usize>, String> {
+/// The `"columns"` a legend is given, refused outside 1 to [`MAX_LEGEND_COLUMNS`]: the one reader
+/// the commands and the `layout-legend-fit` capability check share.
+pub(crate) fn legend_columns_param(p: &Value) -> Result<Option<usize>, String> {
     let Some(v) = p.get("columns").filter(|v| !v.is_null()) else { return Ok(None) };
     v.as_u64()
         .and_then(|n| usize::try_from(n).ok())
         .filter(|n| (1..=MAX_LEGEND_COLUMNS).contains(n))
         .map(Some)
         .ok_or_else(|| format!("columns is a whole number from 1 to {MAX_LEGEND_COLUMNS}"))
+}
+
+/// The `"fit"` a legend is given, by name in any case: the one reader the commands and the
+/// `layout-legend-fit` capability check share. A scale bar reads its own `fit` (`restyle`).
+pub(crate) fn legend_fit_param(p: &Value) -> Result<Option<LegendFit>, String> {
+    given_choice(p, "fit", LegendFit::from_name, "manual, adjustSize, adjustColumns or adjustColumnsAndSize")
+}
+
+/// The `"showLayerNames"` a legend is given, `true` or `false` only (`null` is not given): the one
+/// reader the commands and the `layout-legend-fit` capability check share.
+pub(crate) fn legend_names_param(p: &Value) -> Result<Option<bool>, String> {
+    match p.get("showLayerNames") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(shown)) => Ok(Some(*shown)),
+        Some(_) => Err("showLayerNames is true or false".into()),
+    }
 }
 
 /// What a colorbar with no layer of its own on `frame` says when the frame's map shows no raster
@@ -333,4 +445,40 @@ pub(in crate::cmd::layout) fn with_labels(
         return Err(format!("a legend can label at most {MAX_LEGEND_LABELS} layers"));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use rustgis_map::layout::LegendFit;
+    use rustgis_render::layout::UnfittedLegend;
+
+    use crate::{Project, Session};
+
+    /// What [`super::say_unfitted_legends`] says of `listed`.
+    fn said(listed: &[UnfittedLegend]) -> Vec<String> {
+        let mut s = Session::new(Project::default());
+        super::say_unfitted_legends(&mut s, listed);
+        s.notices.iter().map(|n| n.text.clone()).collect()
+    }
+
+    /// A one-column legend listed twice, too wide on one page of a series and too tall on another,
+    /// is under one reason, whose words are the same for both: named and counted once there. Two
+    /// legends under one reason are still both, counted.
+    #[test]
+    fn a_legend_is_named_once_under_each_reason() {
+        let cut = |id: u32, name: &str, (too_wide, too_tall): (bool, bool)| UnfittedLegend {
+            id,
+            name: name.into(),
+            fit: LegendFit::AdjustSize,
+            columns: 1,
+            too_wide,
+            too_tall,
+        };
+        let reason = "the legend lists more than fits its box even with its text shrunk to 4 points: its last rows or the ends of long labels are left out";
+        assert_eq!(said(&[cut(7, "Roads", (true, false)), cut(7, "Roads", (false, true))]), [format!("Legend \"Roads\" (7): {reason}")]);
+        assert_eq!(
+            said(&[cut(7, "Roads", (true, false)), cut(8, "Rivers", (false, true)), cut(7, "Roads", (false, true))]),
+            [format!("2 legends (\"Roads\" (7), \"Rivers\" (8)): {reason}")]
+        );
+    }
 }

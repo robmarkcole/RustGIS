@@ -8,9 +8,10 @@ use rustgis_data::GeometryType;
 use rustgis_data::query::{Env, SeriesPage};
 use rustgis_geom::{Coord, Extent};
 use rustgis_map::layout::{
-    ArrowStyle, ChartLook, ColorScale, ElementKind, FrameShape, GRID_LABEL_PT, Grid, GridKind, INK, Layout, LineHead, MAX_LEGEND_COLUMNS,
-    Orientation, PT_PER_MM, SCALE_BAR_TEXT_PT, ScaleBarFit, ScaleBarStyle, ScaleLabelPosition, ScaleUnits, TextAlign, TextCase, TextVAlign,
-    TickSide, UnitLabelPosition, frame_camera, layout_text_scale,
+    ArrowStyle, ChartLook, ColorScale, ElementKind, FrameShape, GRID_LABEL_PT, Grid, GridKind, INK, LAYOUT_TEXT_SIZE, LEGEND_TEXT_PT,
+    Layout, LegendFit, LineHead, MAX_LEGEND_COLUMNS, Orientation, PT_PER_MM, SCALE_BAR_TEXT_PT, ScaleBarFit, ScaleBarStyle,
+    ScaleLabelPosition, ScaleUnits, TextAlign, TextCase, TextVAlign, TickSide, UnitLabelPosition, frame_camera, layout_text_in_range,
+    layout_text_scale, legend_columns_in_range,
 };
 use rustgis_map::symbology::LegendEntry;
 use rustgis_map::{Map, Rgba};
@@ -505,7 +506,20 @@ fn draw_page(
                     scale_bar(&mut pm, r, map.ground_res_at(&cam), &bar, (*color, *fill), ppp, layout.decimal_comma);
                 }
             }
-            ElementKind::Legend { frame: f, title, all_classes, hide_other, show_no_data, exclude, columns, labels, color, text_size } => {
+            ElementKind::Legend {
+                frame: f,
+                title,
+                all_classes,
+                hide_other,
+                show_no_data,
+                exclude,
+                columns,
+                labels,
+                color,
+                text_size,
+                fit,
+                show_layer_names,
+            } => {
                 if let Some(&(_, mi, cam, ..)) = frame(*f)
                     && let Some(map) = maps.get(mi)
                 {
@@ -526,12 +540,27 @@ fn draw_page(
                         wait_for_tile_legends(map, scale, exclude, legend_deadline())?;
                     }
                     let size = legend_size(*text_size);
-                    let opts = LegendOptions { show_no_data: *show_no_data, hide_other: *hide_other, exclude, labels, scale, size };
+                    let names = show_layer_names.shown();
+                    let opts = LegendOptions {
+                        show_no_data: *show_no_data,
+                        hide_other: *hide_other,
+                        names,
+                        exclude,
+                        labels,
+                        scale,
+                        size,
+                        text_size: *text_size,
+                    };
                     // Whether a picture was still on its way when the rows were made: the very lookup
                     // that drew the legend, not an earlier one a retry or an eviction could outdate.
                     let ink = color.unwrap_or(INK);
-                    let missing = legend_missing(&mut pm, r, map, (title, *columns), drawn, opts, ink, ppp) && on_canvas;
+                    let (missing, fitted) = legend_missing(&mut pm, r, map, (title, *columns, *fit), drawn, opts, ink, ppp);
+                    let missing = missing && on_canvas;
                     pending.legends |= missing;
+                    // A fit still leaving rows out, for an export to say ([`unfitted_legends`]).
+                    if let Some(f) = fitted.filter(|f| on_canvas && !f.fits()) {
+                        unfitted((e.id, &e.name), *fit, &f);
+                    }
                     // An export's page drawn without a picture stays incomplete, whenever the
                     // picture lands after (see `finish_legends`).
                     if missing && wait_legends && LEGEND_BUDGET.get().is_some() {
@@ -855,6 +884,197 @@ pub(crate) fn plain_text_pages() -> Vec<Layout> {
     pages.push(page((90.0, 10.0, 60.0, 30.0), &|_| {}));
     pages.push(page((10.0, 74.0, 60.0, 30.0), &|_| {}));
     pages
+}
+
+/// The map `"Pins"` the legend pin pages key: polygons `"Parks"` in one symbol, points `"Sites"` in
+/// Unique Values (12 classes, `c0` drawn at 30 points, and a feature of another value), lines
+/// `"Roads"` in one dashed symbol, polygons `"Zones"` in Unique Values (5 classes, one with a
+/// 60-character label) and points `"Counts"` in Graduated Colors with a feature without a number,
+/// so a legend that shows no-data rows has one. One feature per class near (0, 0), so a legend of
+/// what the frame draws has rows.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+fn legend_pin_map() -> Map {
+    use rustgis_data::{Dataset, Field, FieldType, Geometry, Value};
+    use rustgis_map::{Renderer, Symbol};
+    let square = |x: f64, y: f64| {
+        Some(Geometry::Polygon(vec![vec![
+            [(0.0, 0.0), (0.02, 0.0), (0.02, 0.02), (0.0, 0.02), (0.0, 0.0)].map(|(dx, dy)| Coord::new(x + dx, y + dy)).to_vec(),
+        ]]))
+    };
+    let unique = |classes: Vec<(String, Symbol)>, other: Symbol, class_labels: BTreeMap<String, String>| Renderer::Unique {
+        field: "kind".into(),
+        classes,
+        other,
+        ramp: rustgis_map::Ramp::Ember,
+        class_labels,
+        other_label: None,
+        class_strokes: Default::default(),
+        other_strokes: Vec::new(),
+        class_fills: Default::default(),
+        other_fills: Vec::new(),
+        expression: None,
+    };
+    let kind = || vec![Field::new("kind", FieldType::Text)];
+    let mut map = Map::new("Pins");
+    let mut parks = Dataset::new("Parks", GeometryType::Polygon, Vec::new());
+    parks.push(square(-0.1, -0.1), Vec::new());
+    map.add_dataset(parks);
+    let mut sites = Dataset::new("Sites", GeometryType::Point, kind());
+    let mut classes = Vec::new();
+    for i in 0..12u8 {
+        let mut s = Symbol::default_for(GeometryType::Point, u32::from(i));
+        if i == 0 {
+            s.size = 30.0;
+        }
+        classes.push((format!("c{i}"), s));
+        sites.push(Some(Geometry::Point(Coord::new(0.01 * f64::from(i), 0.0))), vec![Value::Text(format!("c{i}"))]);
+    }
+    sites.push(Some(Geometry::Point(Coord::new(0.0, 0.05))), vec![Value::Text("elsewhere".into())]);
+    let id = map.add_dataset(sites);
+    if let Some(l) = map.layer_mut(id) {
+        l.renderer = unique(classes, Symbol::default_for(GeometryType::Point, 7), BTreeMap::new());
+    }
+    let mut roads = Dataset::new("Roads", GeometryType::Polyline, Vec::new());
+    roads.push(Some(Geometry::Line(vec![vec![Coord::new(-0.1, 0.0), Coord::new(0.1, 0.03)]])), Vec::new());
+    let id = map.add_dataset(roads);
+    if let Some(l) = map.layer_mut(id) {
+        l.line_strokes =
+            vec![rustgis_map::symbology::LineStroke { dash: rustgis_map::symbology::Dash::new(&[4.0, 2.0]), ..Default::default() }];
+    }
+    let mut zones = Dataset::new("Zones", GeometryType::Polygon, kind());
+    let mut classes = Vec::new();
+    for i in 0..5u8 {
+        classes.push((format!("z{i}"), Symbol::default_for(GeometryType::Polygon, u32::from(i))));
+        zones.push(square(0.03 * f64::from(i), -0.05), vec![Value::Text(format!("z{i}"))]);
+    }
+    let long = "Zoned for mixed residential and light commercial use (draft)";
+    let id = map.add_dataset(zones);
+    if let Some(l) = map.layer_mut(id) {
+        l.renderer = unique(classes, Symbol::default_for(GeometryType::Polygon, 5), [("z2".to_string(), long.to_string())].into());
+    }
+    let mut counts = Dataset::new("Counts", GeometryType::Point, vec![Field::new("n", FieldType::Double)]);
+    for v in [Value::Float(10.0), Value::Float(50.0), Value::Null] {
+        counts.push(Some(Geometry::Point(Coord::new(-0.05, 0.05))), vec![v]);
+    }
+    let id = map.add_dataset(counts);
+    if let Some(l) = map.layer_mut(id) {
+        let base = Symbol::default_for(GeometryType::Point, 3);
+        let method = rustgis_map::ClassMethod::EqualInterval;
+        // Kept in one symbol if it can't be classed, which the pins then fail on.
+        if let Ok(r) = Renderer::graduated(&l.dataset, &[], "n", 2, method, rustgis_map::Ramp::Ember, base) {
+            l.renderer = r;
+        }
+    }
+    map
+}
+
+/// Pages of one legend each with none of the fitting settings, in the combinations main draws, on
+/// a 220 x 150 mm page over a hidden frame of [`legend_pin_map`], every class listed and titled
+/// "Legend" unless said: 1 to 3, one, two and three columns in a box that holds them; 4 to 6, the
+/// same in a short box (rows left out); 7 to 9, the same in a narrow box (columns closing up, long
+/// labels running on); 10, text of 14 points in two columns, roomy; 11, text of 5 points in three
+/// columns, short; 12, no title, what the frame draws, `<all other values>` left out; 13, a layer
+/// labelled, one excluded, in an ink of its own; 14, no-data rows, in two columns; 15, a box across
+/// the page's right edge, its title's ink leaving the page; 16, a box shorter than its title; 17,
+/// every layer excluded, nothing to list, in two columns; 18, what the frame draws with no-data
+/// rows asked for (which only a legend of every class adds), in two columns.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) fn legend_pin_pages() -> Vec<(Layout, Vec<Map>)> {
+    let (roomy, short, narrow) = ((10.0, 10.0, 200.0, 130.0), (10.0, 10.0, 200.0, 25.0), (10.0, 10.0, 30.0, 130.0));
+    // No pages without it, which the pins then fail on.
+    let frame = serde_json::json!({"MapFrame": {"map": "Pins", "center": {"x": 0, "y": 0}, "scale": 2000000}});
+    let Ok(frame) = serde_json::from_value::<ElementKind>(frame) else { return Vec::new() };
+    let page = |at: (f64, f64, f64, f64), columns: usize, f: &dyn Fn(&mut ElementKind)| {
+        let mut l = Layout::new("Pins", 220.0, 150.0);
+        let frame = l.add("Frame", (0.0, 0.0, 220.0, 150.0), frame.clone());
+        // Only the legend is painted; its hidden frame still provides the map and scale.
+        if let Some(e) = l.elements.first_mut() {
+            e.visible = false;
+        }
+        let mut kind = ElementKind::Legend {
+            frame,
+            title: "Legend".into(),
+            all_classes: true,
+            hide_other: false,
+            show_no_data: false,
+            exclude: Vec::new(),
+            columns,
+            labels: BTreeMap::new(),
+            color: None,
+            text_size: rustgis_map::layout::LEGEND_TEXT_PT,
+            fit: rustgis_map::layout::LegendFit::Manual,
+            show_layer_names: rustgis_map::layout::LayerNames::Shown,
+        };
+        f(&mut kind);
+        l.add("Legend", at, kind);
+        (l, vec![legend_pin_map()])
+    };
+    let mut pages = Vec::new();
+    for at in [roomy, short, narrow] {
+        for columns in 1..=3 {
+            pages.push(page(at, columns, &|_| {}));
+        }
+    }
+    let sized = |pt: f64| {
+        move |k: &mut ElementKind| {
+            if let ElementKind::Legend { text_size, .. } = k {
+                *text_size = pt;
+            }
+        }
+    };
+    pages.push(page(roomy, 2, &sized(14.0)));
+    pages.push(page(short, 3, &sized(5.0)));
+    pages.push(page(roomy, 1, &|k| {
+        if let ElementKind::Legend { title, all_classes, hide_other, .. } = k {
+            (*title, *all_classes, *hide_other) = (String::new(), false, true);
+        }
+    }));
+    pages.push(page(roomy, 1, &|k| {
+        if let ElementKind::Legend { labels, exclude, color, .. } = k {
+            *labels = [("Sites".to_string(), "Survey sites recorded during the 2019 field season".to_string())].into();
+            *exclude = vec!["Roads".into()];
+            *color = Some(Rgba::rgb(20, 60, 140));
+        }
+    }));
+    pages.push(page(roomy, 2, &|k| {
+        if let ElementKind::Legend { show_no_data, .. } = k {
+            *show_no_data = true;
+        }
+    }));
+    pages.push(page((212.0, 10.0, 60.0, 40.0), 1, &|_| {}));
+    pages.push(page((10.0, 10.0, 60.0, 3.0), 1, &|_| {}));
+    pages.push(page(roomy, 2, &|k| {
+        if let ElementKind::Legend { exclude, .. } = k {
+            *exclude = ["Parks", "Sites", "Roads", "Zones", "Counts"].map(String::from).to_vec();
+        }
+    }));
+    pages.push(page(roomy, 2, &|k| {
+        if let ElementKind::Legend { all_classes, show_no_data, .. } = k {
+            (*all_classes, *show_no_data) = (false, true);
+        }
+    }));
+    pages
+}
+
+/// Each of `got`'s hashes that isn't its `pinned` one, named for its page (and resolution), with
+/// both values, and the whole of `got` to pin when the change is meant; one more line when the
+/// counts differ. `what` names the output compared.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) fn pin_mismatches(what: &str, got: &[(String, u64)], pinned: &[u64]) -> Vec<String> {
+    let mut wrong: Vec<String> = got
+        .iter()
+        .zip(pinned)
+        .filter(|((_, g), p)| g != *p)
+        .map(|((name, g), p)| format!("{what} of {name}: got {g:#018x}, pinned {p:#018x}"))
+        .collect();
+    if got.len() != pinned.len() {
+        wrong.push(format!("{what}: {} hashes, {} pinned", got.len(), pinned.len()));
+    }
+    if !wrong.is_empty() {
+        let all: Vec<String> = got.iter().map(|(name, g)| format!("{g:#018x}, // {name}")).collect();
+        wrong.push(format!("{what}, all:\n{}", all.join("\n")));
+    }
+    wrong
 }
 
 #[expect(clippy::disallowed_methods, reason = "a thread the system refuses fails the test, as it should")]

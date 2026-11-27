@@ -36,15 +36,17 @@ pub(in crate::cmd::layout) fn changes_chart_look(p: &Value) -> bool {
 
 /// What a scale bar's details given for another element are told.
 pub(in crate::cmd::layout) const ONLY_SCALE_BAR_DETAILS: &str =
-    "only scale bars take subdivisions, divisionsBeforeZero, labelPosition, unitLabel, unitLabelPosition or fit";
+    "only scale bars take subdivisions, divisionsBeforeZero, labelPosition, unitLabel or unitLabelPosition";
 
 /// The keys only a scale bar takes: its details beyond its units, divisions, style and colours,
 /// and its `decimals`, which a chart takes too.
 pub(in crate::cmd::layout) const SCALE_BAR_KEYS: [&str; 6] =
     ["subdivisions", "divisionsBeforeZero", "labelPosition", "unitLabel", "unitLabelPosition", "fit"];
 
+/// Whether `p` gives a detail only a scale bar takes: its `fit` aside, which a legend takes too, by
+/// its own names ([`ONLY_FIT`]).
 pub(in crate::cmd::layout) fn gives_scale_bar_details(p: &Value) -> bool {
-    SCALE_BAR_KEYS.iter().any(|k| gives(p, k))
+    SCALE_BAR_KEYS.iter().filter(|k| **k != "fit").any(|k| gives(p, k))
 }
 
 /// A whole number from 0 to `hi` given as `k`, when it's given (and not null): an error when it's

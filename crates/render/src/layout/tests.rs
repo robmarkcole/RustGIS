@@ -1,5 +1,43 @@
 use super::*;
 
+thread_local! {
+    /// How often [`LegendRow::symbol_side`] measured a row on this thread, and
+    /// [`LegendRow::text_width`] a row's name or label: what a legend's layout costs, counted.
+    pub(super) static SYMBOL_SIDES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(super) static TEXT_MEASURES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// While a test counts them (`Some`): the column counts [`measure`] laid a legend's rows
+    /// into on this thread, in turn.
+    pub(super) static LAYOUTS_MEASURED: std::cell::RefCell<Option<Vec<usize>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// `rows` at 1:`scale`, measured at `size` times the default as the drawing measures them
+/// ([`Measured`]), given to `with`.
+fn measured<T>(rows: &[LegendRow], (scale, size): (f64, f32), with: impl FnOnce(Measured) -> T) -> T {
+    let sides = symbol_sides(rows, scale);
+    let sizes = RowSizes::of(rows, &sides, size);
+    with(Measured::new(rows, &sides, &sizes))
+}
+
+/// [`flow`] of `rows` measured at `at` ([`measured`]).
+fn flow_at(rows: &[LegendRow], columns: usize, limit: f32, at: (f64, f32)) -> (Vec<usize>, bool) {
+    measured(rows, at, |m| flow(m, columns, limit))
+}
+
+/// [`balanced`] of `rows` measured at `at` ([`measured`]).
+fn balanced_at(rows: &[LegendRow], columns: usize, at: (f64, f32)) -> (Vec<usize>, f32) {
+    measured(rows, at, |m| balanced(m, columns))
+}
+
+/// [`widest`] of `rows` measured at `at` ([`measured`]).
+fn widest_at(rows: &[LegendRow], at: (f64, f32)) -> f32 {
+    measured(rows, at, widest)
+}
+
+/// [`measure`] of `rows` measured at `at` ([`measured`]).
+fn measure_at(rows: &[LegendRow], columns: usize, at: (f64, f32)) -> (f32, f32) {
+    measured(rows, at, |m| measure(m, columns))
+}
+
 /// A chart element of layer "t" on frame 1, with `extra` keys (its field among them).
 fn chart_kind(extra: serde_json::Value) -> ElementKind {
     let mut chart = serde_json::json!({"frame": 1, "layer": "t"});
@@ -660,7 +698,16 @@ fn an_ink_colours_legends_colorbars_tables_and_charts() {
         ds.push(Some(Geometry::Point(Coord::new(0.0, 0.0))), vec![Value::Text(name.into()), Value::Float(n)]);
     }
     let map = Map::new("m");
-    let opts = LegendOptions { show_no_data: false, hide_other: false, exclude: &[], labels: &NO_LABELS, scale: 1e6, size: 1.0 };
+    let opts = LegendOptions {
+        show_no_data: false,
+        hide_other: false,
+        exclude: &[],
+        labels: &NO_LABELS,
+        scale: 1e6,
+        size: 1.0,
+        names: true,
+        text_size: 9.0,
+    };
     let grey = ColorScale::Ramp { lo: 0.0, hi: 10.0, colors: vec![Rgba::rgb(0, 0, 0), Rgba::rgb(255, 255, 255)] };
     let bar = |ink| Bar {
         title: "Height",
@@ -673,7 +720,7 @@ fn an_ink_colours_legends_colorbars_tables_and_charts() {
     };
     for (ink, expected) in [(INK, false), (red, true)] {
         let legend = draw(&|c| {
-            legend_missing(c, r, &map, ("Key", 1), None, opts, ink, 1.0);
+            legend_missing(c, r, &map, ("Key", 1, LegendFit::Manual), None, opts, ink, 1.0);
         });
         assert_eq!(reddish(&legend), expected, "legend {ink:?}");
         assert_eq!(reddish(&draw(&|c| colorbar(c, r, &grey, &bar(ink), 1.0))), expected, "colorbar {ink:?}");
@@ -718,7 +765,16 @@ fn layout_no_data_legend_follows_the_frame() {
     let fallback = l.renderer.symbol_for(&l.dataset, 2);
     let listed = |map: &mut Map, all: bool, show: bool| {
         let drawn = (!all).then(|| complete_shown_legends(map, 1e6, show, &mut None, &Env::default()).unwrap());
-        let opts = LegendOptions { show_no_data: show, hide_other: true, exclude: &[], labels: &NO_LABELS, scale: 1e6, size: 1.0 };
+        let opts = LegendOptions {
+            show_no_data: show,
+            hide_other: true,
+            exclude: &[],
+            labels: &NO_LABELS,
+            scale: 1e6,
+            size: 1.0,
+            names: true,
+            text_size: 9.0,
+        };
         legend_rows(map, drawn.as_deref(), &opts)
             .into_iter()
             .filter_map(|r| match r {
@@ -781,6 +837,8 @@ fn layout_text_clipping_uses_ink_and_visibility() {
             labels: BTreeMap::new(),
             color: None,
             text_size: rustgis_map::layout::LEGEND_TEXT_PT,
+            fit: rustgis_map::layout::LegendFit::Manual,
+            show_layer_names: rustgis_map::layout::LayerNames::Shown,
         },
     );
     assert_eq!(clipped_text(&l, &[Map::new("m")], 96.0, &info), vec![(legend, "Legend".into())]);
@@ -829,6 +887,8 @@ fn legend_page(url: &str) -> (Layout, Vec<Map>) {
             labels: BTreeMap::new(),
             color: None,
             text_size: rustgis_map::layout::LEGEND_TEXT_PT,
+            fit: rustgis_map::layout::LegendFit::Manual,
+            show_layer_names: rustgis_map::layout::LayerNames::Shown,
         },
     );
     let mut tile = rustgis_map::TileLayer::new("Walls", rustgis_map::TileKind::Raster, "https://tiles.test/red/{z}/{x}/{y}.png");
@@ -936,6 +996,8 @@ fn an_svg_export_gives_up_on_held_legends_at_one_deadline() {
             labels: BTreeMap::new(),
             color: None,
             text_size: rustgis_map::layout::LEGEND_TEXT_PT,
+            fit: rustgis_map::layout::LegendFit::Manual,
+            show_layer_names: rustgis_map::layout::LayerNames::Shown,
         },
     );
     // The thread-local budget and the shortened wait belong to this worker alone.
@@ -986,10 +1048,29 @@ fn a_legend_says_from_the_lookup_that_draws_it_whether_a_picture_is_missing() {
     let url = "https://tiles.test/waits/lookup-legend.png";
     let fetch = crate::tiles::tests::hold_fetch(url);
     let (_, maps) = legend_page(url);
-    let opts = || LegendOptions { show_no_data: false, hide_other: false, exclude: &[], labels: &NO_LABELS, scale: 1e6, size: 1.0 };
+    let opts = || LegendOptions {
+        show_no_data: false,
+        hide_other: false,
+        exclude: &[],
+        labels: &NO_LABELS,
+        scale: 1e6,
+        size: 1.0,
+        names: true,
+        text_size: 9.0,
+    };
     let mut canvas = Canvas::new(200, 200).unwrap();
     let draw = |canvas: &mut Canvas| {
-        legend_missing(canvas, Rect::from_xywh(0.0, 0.0, 200.0, 200.0).unwrap(), &maps[0], ("", 1), None, opts(), INK, 1.0)
+        legend_missing(
+            canvas,
+            Rect::from_xywh(0.0, 0.0, 200.0, 200.0).unwrap(),
+            &maps[0],
+            ("", 1, LegendFit::Manual),
+            None,
+            opts(),
+            INK,
+            1.0,
+        )
+        .0
     };
     assert!(draw(&mut canvas), "drawn while its picture is on its way");
     fetch.recv_timeout(std::time::Duration::from_secs(5)).unwrap()(Ok(red_picture()));
@@ -1279,7 +1360,16 @@ fn a_web_layers_legend_is_its_services_picture() {
     let red = |map: &Map, width: f32, exclude: &[String], scale: f64| {
         let mut pm = Pixmap::new(300, 400).unwrap();
         pm.fill(tiny_skia::Color::WHITE);
-        let opts = LegendOptions { show_no_data: false, hide_other: false, exclude, labels: &NO_LABELS, scale, size: 1.0 };
+        let opts = LegendOptions {
+            show_no_data: false,
+            hide_other: false,
+            exclude,
+            labels: &NO_LABELS,
+            scale,
+            size: 1.0,
+            names: true,
+            text_size: 9.0,
+        };
         crate::canvas::with_canvas(&mut pm, |c| legend(c, Rect::from_xywh(0.0, 0.0, width, 400.0).unwrap(), map, ("", 1), None, opts, 1.0));
         let hits: Vec<u32> = (0..pm.height())
             .flat_map(|y| (0..pm.width()).map(move |x| (x, y)))
@@ -1309,7 +1399,16 @@ fn a_web_layers_legend_is_its_services_picture() {
     map.tiles.push(second);
     let mut pm = Pixmap::new(70, 200).unwrap();
     pm.fill(tiny_skia::Color::WHITE);
-    let opts = LegendOptions { show_no_data: false, hide_other: false, exclude: &[], labels: &NO_LABELS, scale: 1e6, size: 1.0 };
+    let opts = LegendOptions {
+        show_no_data: false,
+        hide_other: false,
+        exclude: &[],
+        labels: &NO_LABELS,
+        scale: 1e6,
+        size: 1.0,
+        names: true,
+        text_size: 9.0,
+    };
     crate::canvas::with_canvas(&mut pm, |c| legend(c, Rect::from_xywh(0.0, 0.0, 70.0, 200.0).unwrap(), &map, ("", 1), None, opts, 1.0));
     let red_rows =
         (0..pm.height()).filter(|&y| (0..pm.width()).any(|x| pm.pixel(x, y).is_some_and(|p| p.red() > 200 && p.green() < 60))).count();
@@ -1623,19 +1722,28 @@ fn a_legends_rows_go_into_columns() {
             expression: None,
         };
     }
-    let opts = || LegendOptions { show_no_data: false, hide_other: false, exclude: &[], labels: &NO_LABELS, scale: 1e6, size: 1.0 };
+    let opts = || LegendOptions {
+        show_no_data: false,
+        hide_other: false,
+        exclude: &[],
+        labels: &NO_LABELS,
+        scale: 1e6,
+        size: 1.0,
+        names: true,
+        text_size: 9.0,
+    };
     let rows = legend_rows(&map, None, &opts());
     assert_eq!(rows.len(), 32);
-    assert_eq!(balanced(&rows, 1, (1e6, 1.0)), (vec![0], 32.0 * LEGEND_ROW));
-    assert_eq!(balanced(&rows, 2, (1e6, 1.0)), (vec![0, 16], 16.0 * LEGEND_ROW));
-    assert_eq!(balanced(&rows, 3, (1e6, 1.0)).1, 11.0 * LEGEND_ROW);
-    assert_eq!(balanced(&[], 3, (1e6, 1.0)), (vec![0], 0.0));
+    assert_eq!(balanced_at(&rows, 1, (1e6, 1.0)), (vec![0], 32.0 * LEGEND_ROW));
+    assert_eq!(balanced_at(&rows, 2, (1e6, 1.0)), (vec![0, 16], 16.0 * LEGEND_ROW));
+    assert_eq!(balanced_at(&rows, 3, (1e6, 1.0)).1, 11.0 * LEGEND_ROW);
+    assert_eq!(balanced_at(&[], 3, (1e6, 1.0)), (vec![0], 0.0));
     // Too short for them all: each filled in turn, and the last holds what fits of the rest.
-    let (starts, fits) = flow(&rows, 3, 5.0 * LEGEND_ROW, (1e6, 1.0));
+    let (starts, fits) = flow_at(&rows, 3, 5.0 * LEGEND_ROW, (1e6, 1.0));
     assert_eq!((starts, fits), (vec![0, 5, 10], false));
     // A layer's name isn't left at the foot of a column; the last, with none under it, can be.
     let heads = [LegendRow::Head("a"), LegendRow::Head("b"), LegendRow::Head("c"), LegendRow::Head("d"), LegendRow::Head("e")];
-    assert_eq!(flow(&heads, 3, 3.0 * LEGEND_ROW, (1e6, 1.0)), (vec![0, 2], true));
+    assert_eq!(flow_at(&heads, 3, 3.0 * LEGEND_ROW, (1e6, 1.0)), (vec![0, 2], true));
 
     let sizes = legend_sizes_mm(&mut map, 1e6, true, false, (&[], &NO_LABELS)).unwrap();
     let row = f64::from(LEGEND_ROW) * 25.4 / 96.0;
@@ -1666,7 +1774,9 @@ fn a_legends_rows_go_into_columns() {
     assert!(f64::from(right3) <= sizes[2].0 * mm_pt + 1.0, "{right3} across {:?}", sizes[2]);
     // A value out of range, from a file edited by hand, draws what the nearest would.
     assert_eq!(ink(0, 500.0, 500.0), (right1, down1));
-    assert_eq!(ink(9, 500.0, 500.0), (right3, down3));
+    let most = ink(MAX_LEGEND_COLUMNS, 500.0, 500.0);
+    assert_eq!(ink(9, 500.0, 500.0), most);
+    assert!(most.0 > right3 && most.1 < down3, "six columns, not three: {most:?}");
     // A box too narrow for the columns closes them up: the last still starts inside it, past
     // where the first two end in a box of their own.
     let narrow = f64::from(right3) as f32 * 0.8;
@@ -1678,7 +1788,7 @@ fn a_legends_rows_go_into_columns() {
 
 /// The widest class label of `rows`, in points.
 fn widest_label(rows: &[LegendRow]) -> f32 {
-    rows.iter().map(|row| row.width(0.0, 1.0) - 12.0).fold(0.0, f32::max)
+    rows.iter().map(|row| row.width(0.0, 1.0, row.text_width(1.0)) - 12.0).fold(0.0, f32::max)
 }
 
 /// A point layer in Unique Values, for a legend's rows.
@@ -1707,11 +1817,20 @@ fn a_layers_name_stays_with_its_class_only_in_columns() {
     let small = rustgis_map::Symbol::default_for(GeometryType::Point, 0);
     let classes = (0u32..4).map(|i| (format!("c{i}"), small)).collect();
     let map = classed_point_map(classes, small);
-    let opts = || LegendOptions { show_no_data: false, hide_other: true, exclude: &[], labels: &NO_LABELS, scale: 1e6, size: 1.0 };
+    let opts = || LegendOptions {
+        show_no_data: false,
+        hide_other: true,
+        exclude: &[],
+        labels: &NO_LABELS,
+        scale: 1e6,
+        size: 1.0,
+        names: true,
+        text_size: 9.0,
+    };
     let rows = legend_rows(&map, None, &opts());
-    let (starts, _) = flow(&rows, 2, LEGEND_ROW, (1e6, 1.0));
+    let (starts, _) = flow_at(&rows, 2, LEGEND_ROW, (1e6, 1.0));
     assert_eq!(starts, vec![0, 2]);
-    let first = widest(column_parts(&rows, &starts).next().unwrap(), (1e6, 1.0));
+    let first = widest_at(column_parts(&rows, &starts).next().unwrap(), (1e6, 1.0));
     let drawn_in_first = |columns: usize| {
         let mut pm = Pixmap::new(300, 15).unwrap();
         pm.fill(tiny_skia::Color::WHITE);
@@ -1731,27 +1850,718 @@ fn a_legends_columns_hold_large_point_symbols() {
     let small = rustgis_map::Symbol { size: 4.0, stroke_width: 0.0, ..rustgis_map::Symbol::default_for(GeometryType::Point, 0) };
     let classes = (0u32..10).map(|i| (format!("c{i}"), rustgis_map::Symbol { size: if i < 2 { 40.0 } else { 4.0 }, ..small })).collect();
     let map = classed_point_map(classes, small);
-    let opts = LegendOptions { show_no_data: false, hide_other: true, exclude: &[], labels: &NO_LABELS, scale: 1e6, size: 1.0 };
+    let opts = LegendOptions {
+        show_no_data: false,
+        hide_other: true,
+        exclude: &[],
+        labels: &NO_LABELS,
+        scale: 1e6,
+        size: 1.0,
+        names: true,
+        text_size: 9.0,
+    };
     let rows = legend_rows(&map, None, &opts);
     let tall = rows[1].height(1e6, 1.0);
     assert!(tall > 2.0 * LEGEND_ROW, "{tall}");
     // The name and the two large symbols, then the eight small ones: counted row by row, these
     // would be split at the middle.
-    let (starts, height) = balanced(&rows, 2, (1e6, 1.0));
+    let (starts, height) = balanced_at(&rows, 2, (1e6, 1.0));
     assert_eq!(starts, vec![0, 3], "{height}");
     assert_eq!(height, 8.0 * LEGEND_ROW);
     let parts: Vec<_> = column_parts(&rows, &starts).collect();
     assert!(
-        widest(parts[1], (1e6, 1.0)) < widest(parts[0], (1e6, 1.0)) - 20.0,
+        widest_at(parts[1], (1e6, 1.0)) < widest_at(parts[0], (1e6, 1.0)) - 20.0,
         "{} and {}",
-        widest(parts[0], (1e6, 1.0)),
-        widest(parts[1], (1e6, 1.0))
+        widest_at(parts[0], (1e6, 1.0)),
+        widest_at(parts[1], (1e6, 1.0))
     );
     // In one column, the small rows' labels line up with the large symbols' as before.
     assert_eq!(
-        widest(&rows, (1e6, 1.0)),
-        widest(parts[0], (1e6, 1.0)).max(swatch_column(&rows, (1e6, 1.0)) + 12.0 + widest_label(parts[1]))
+        widest_at(&rows, (1e6, 1.0)),
+        widest_at(parts[0], (1e6, 1.0))
+            .max(swatch_column(rows.iter().map(|row| row.symbol_side(1e6)), 1.0) + 12.0 + widest_label(parts[1]))
     );
+}
+
+/// A point layer in Unique Values with `n − 2` classes and the other values, under its name:
+/// `n` rows, as [`a_legends_rows_go_into_columns`] builds 32. Its symbols are small, so its
+/// rows shrink with the text down to the least size, and its labels about as wide as each other
+/// (the other values' too), so no column is much narrower than the rest.
+fn rows_map(n: usize) -> Map {
+    point_rows_map(n, Some(4.0))
+}
+
+/// [`rows_map`] with its symbols `symbol_size` points across, or as large as a point layer's own
+/// default when `None`: such a symbol holds its row open however small the text.
+fn point_rows_map(n: usize, symbol_size: Option<f64>) -> Map {
+    use rustgis_data::{Dataset, Field, FieldType, Geometry, Value};
+    let mut map = Map::new("m");
+    let mut d = Dataset::new("pts", GeometryType::Point, vec![Field::new("g", FieldType::Text)]);
+    d.push(Some(Geometry::Point(Coord::new(0.0, 0.0))), vec![Value::Text("c0".into())]);
+    let pts = map.add_dataset(d);
+    let s = |c| {
+        let symbol = rustgis_map::Symbol::default_for(GeometryType::Point, c);
+        rustgis_map::Symbol { size: symbol_size.map_or(symbol.size, |z| z as f32), ..symbol }
+    };
+    if let Some(l) = map.layers.iter_mut().find(|l| l.id == pts) {
+        let classes = (0..n.saturating_sub(2) as u32).map(|i| (format!("c{i}"), s(i))).collect();
+        l.renderer = rustgis_map::Renderer::Unique {
+            field: "g".into(),
+            classes,
+            other: s(31),
+            ramp: rustgis_map::Ramp::Ember,
+            class_labels: Default::default(),
+            other_label: Some("c99".into()),
+            class_strokes: Default::default(),
+            other_strokes: Vec::new(),
+            class_fills: Default::default(),
+            other_fills: Vec::new(),
+            expression: None,
+        };
+    }
+    map
+}
+
+/// A legend's options at 1:1e6 and its default text size, with or without its layers' names.
+fn opts(names: bool) -> LegendOptions<'static> {
+    let text_size = rustgis_map::layout::LEGEND_TEXT_PT;
+    LegendOptions { show_no_data: false, hide_other: false, names, exclude: &[], labels: &NO_LABELS, scale: 1e6, size: 1.0, text_size }
+}
+
+/// The legend of `map` titled `title`, its text `text_size` points, in `columns` under `fit`, in
+/// a box `w` × `h` at the corner of a white 600 × 600 pixmap.
+fn titled(map: &Map, title: &str, (w, h): (f32, f32), (columns, fit): (usize, LegendFit), text_size: f64) -> Pixmap {
+    let mut pm = Pixmap::new(600, 600).unwrap();
+    pm.fill(tiny_skia::Color::WHITE);
+    let opts = LegendOptions { size: legend_size(text_size), text_size, ..opts(true) };
+    crate::canvas::with_canvas(&mut pm, |c| {
+        legend_missing(c, Rect::from_xywh(0.0, 0.0, w, h).unwrap(), map, (title, columns, fit), None, opts, INK, 1.0);
+    });
+    pm
+}
+
+/// [`titled`] with no title.
+fn drawn(map: &Map, room: (f32, f32), columns_fit: (usize, LegendFit), text_size: f64) -> Pixmap {
+    titled(map, "", room, columns_fit, text_size)
+}
+
+/// adjustSize draws the rows at the largest quarter point that holds them all: the next quarter
+/// up doesn't, nothing is cut, and the columns stay as set.
+#[test]
+fn adjust_size_shrinks_until_rows_fit() {
+    let map = rows_map(32);
+    let rows = legend_rows(&map, None, &opts(true));
+    // 20 of the 32 rows at 9 points.
+    let room = (500.0, 20.0 * LEGEND_ROW);
+    let f = fit_legend(&rows, (1, LegendFit::AdjustSize), room, (1e6, 9.0));
+    assert!(f.text_size < 9.0 && f.text_size >= 4.0 && (f.text_size * 4.0).fract() == 0.0, "{}", f.text_size);
+    assert_eq!((f.columns, f.too_wide, f.too_tall), (1, false, false));
+    assert_eq!(f.size, legend_size(f.text_size));
+    let at = |pt: f64| balanced_at(&rows, 1, (1e6, legend_size(pt))).1;
+    assert!(at(f.text_size) <= room.1 + 1e-3 && at(f.text_size + 0.25) > room.1, "the largest that fits");
+    // Manual keeps its size and is cut.
+    let m = fit_legend(&rows, (1, LegendFit::Manual), room, (1e6, 9.0));
+    assert_eq!((m.columns, m.text_size, m.too_tall), (1, 9.0, true));
+}
+
+/// adjustColumns adds the fewest columns that hold the rows, keeping their size; set to more it
+/// starts from those.
+#[test]
+fn adjust_columns_adds_columns_until_rows_fit() {
+    let map = rows_map(32);
+    let rows = legend_rows(&map, None, &opts(true));
+    let room = (600.0, 12.0 * LEGEND_ROW);
+    let f = fit_legend(&rows, (1, LegendFit::AdjustColumns), room, (1e6, 9.0));
+    assert_eq!((f.columns, f.text_size, f.too_tall, f.too_wide), (3, 9.0, false, false));
+    assert_eq!(fit_legend(&rows, (4, LegendFit::AdjustColumns), room, (1e6, 9.0)).columns, 4, "never fewer than set");
+    // Six at most: a box six columns can't fill is cut, and said.
+    let six = fit_legend(&rows, (1, LegendFit::AdjustColumns), (2000.0, 3.0 * LEGEND_ROW), (1e6, 9.0));
+    assert_eq!((six.columns, six.too_tall, six.too_wide), (MAX_LEGEND_COLUMNS, true, false));
+}
+
+/// adjustColumnsAndSize adds columns at the legend's size first, and shrinks the text only when
+/// the columns that fit across can't hold the rows.
+#[test]
+fn adjust_columns_and_size_adds_columns_before_shrinking() {
+    let map = rows_map(32);
+    let rows = legend_rows(&map, None, &opts(true));
+    let two_across = 2.0 * widest_at(&rows, (1e6, 1.0)) + LEGEND_COLUMN_GAP + 1.0;
+    let roomy = fit_legend(&rows, (1, LegendFit::AdjustColumnsAndSize), (600.0, 12.0 * LEGEND_ROW), (1e6, 9.0));
+    assert_eq!((roomy.columns, roomy.text_size, roomy.too_tall, roomy.too_wide), (3, 9.0, false, false), "columns, at its own size");
+    let narrow = fit_legend(&rows, (1, LegendFit::AdjustColumnsAndSize), (two_across, 12.0 * LEGEND_ROW), (1e6, 9.0));
+    assert!(
+        narrow.columns == 2 && narrow.text_size < 9.0 && !narrow.too_tall && !narrow.too_wide,
+        "{:?}",
+        (narrow.columns, narrow.text_size)
+    );
+    // The largest size at which some columns fit: a quarter point more, none does.
+    let up = narrow.text_size + LEGEND_FIT_STEP_PT;
+    let fits = |c: usize| {
+        let (w, h) = measure_at(&rows, c, (1e6, legend_size(up)));
+        w <= two_across && h <= 12.0 * LEGEND_ROW
+    };
+    assert!(!(1..=MAX_LEGEND_COLUMNS).any(fits), "{up} points fit in some columns");
+}
+
+/// The ink of `pm` in the pixel columns `xs`, any row.
+fn ink_in(pm: &Pixmap, xs: std::ops::Range<u32>) -> bool {
+    xs.into_iter().any(|x| (0..pm.height()).any(|y| pm.pixel(x, y).is_some_and(|p| p.red() < 200 || p.green() < 200 || p.blue() < 200)))
+}
+
+/// A fit never adds a column the box hasn't the width for, so columns never close up over each
+/// other because the fit added them: too narrow for two, it stays in one and says it is cut.
+#[test]
+fn legend_columns_never_draw_over_each_other() {
+    let map = rows_map(32);
+    let rows = legend_rows(&map, None, &opts(true));
+    let one_across = widest_at(&rows, (1e6, 1.0)) + 1.0;
+    let f = fit_legend(&rows, (1, LegendFit::AdjustColumns), (one_across, 5.0 * LEGEND_ROW), (1e6, 9.0));
+    assert_eq!((f.columns, f.too_wide, f.too_tall), (1, false, true));
+    // Shrunk to the least size it takes the most columns that fit across there, and no more.
+    let f = fit_legend(&rows, (1, LegendFit::AdjustColumnsAndSize), (one_across, 5.0 * LEGEND_ROW), (1e6, 9.0));
+    assert_eq!((f.text_size, f.too_wide, f.too_tall), (4.0, false, true), "{f:?}");
+    let across = |c: usize| measure_at(&rows, c, (1e6, legend_size(4.0))).0 <= one_across;
+    assert!(across(f.columns) && (f.columns + 1..=MAX_LEGEND_COLUMNS).all(|c| !across(c)), "{f:?}");
+    // The columns a fit adds, as drawn, sit side by side within the box: no ink in the gaps
+    // between them (a pixel either side aside, for the letters' edges), ink in each.
+    let room = (3.0 * one_across + 2.0 * LEGEND_COLUMN_GAP, 12.0 * LEGEND_ROW);
+    let f = fit_legend(&rows, (1, LegendFit::AdjustColumns), room, (1e6, 9.0));
+    assert_eq!((f.columns, f.too_wide, f.too_tall), (3, false, false));
+    let pm = drawn(&map, room, (1, LegendFit::AdjustColumns), 9.0);
+    let (starts, _) = balanced_at(&rows, 3, (1e6, 1.0));
+    let mut x = 0.0;
+    for (k, part) in column_parts(&rows, &starts).enumerate() {
+        let right = x + widest_at(part, (1e6, 1.0));
+        assert!(ink_in(&pm, x as u32..right as u32), "column {k} drawn");
+        assert!(!ink_in(&pm, right as u32 + 2..(right + LEGEND_COLUMN_GAP) as u32 - 1), "the gap after column {k}");
+        x = right + LEGEND_COLUMN_GAP;
+    }
+    assert!(x - LEGEND_COLUMN_GAP <= room.0 && !ink_in(&pm, room.0 as u32 + 2..600), "within the box");
+}
+
+/// The kinds of `rows`, a layer drawn in one symbol by the name it shows.
+fn row_kinds(rows: &[LegendRow]) -> Vec<String> {
+    rows.iter()
+        .map(|row| match row {
+            LegendRow::Plain(_, name) => format!("Plain({name})"),
+            LegendRow::Head(_) => "Head".into(),
+            LegendRow::Class(..) => "Class".into(),
+            LegendRow::Picture(_) => "Picture".into(),
+        })
+        .collect()
+}
+
+/// With layer names off a layer's classes and a web layer's legend picture lose the name over
+/// them; a layer drawn in one symbol keeps its name, which labels its swatch; a label still
+/// renames it.
+#[test]
+fn layer_names_can_be_left_off_a_legend() {
+    use rustgis_data::{Dataset, Geometry};
+    let url = "https://tiles.test/waits/names-off-legend.png";
+    let fetch = crate::tiles::tests::hold_fetch(url);
+    let mut map = rows_map(8);
+    let mut parks = Dataset::new("Parks", GeometryType::Polygon, Vec::new());
+    let ring = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 0.0)].map(|(x, y)| Coord::new(x, y)).to_vec();
+    parks.push(Some(Geometry::Polygon(vec![vec![ring]])), Vec::new());
+    map.add_dataset(parks);
+    let mut tile = rustgis_map::TileLayer::new("Walls", rustgis_map::TileKind::Raster, "https://tiles.test/red/{z}/{x}/{y}.png");
+    tile.legends = vec![rustgis_data::ogc::Legend { url: url.into(), ..Default::default() }];
+    map.tiles.push(tile);
+    assert!(tile_legends_pending(&map, 1e6, &[]), "the picture is asked for");
+    fetch.recv_timeout(std::time::Duration::from_secs(5)).unwrap()(Ok(red_picture()));
+    wait_for_tile_legends(&map, 1e6, &[], web_time::Instant::now() + LEGEND_WAIT).unwrap();
+    assert!(!tile_legends_pending(&map, 1e6, &[]), "the picture has landed");
+
+    let classes = std::iter::repeat_n("Class", 7).map(String::from);
+    // Parks, added last, is drawn on top and listed first.
+    let with: Vec<String> =
+        ["Plain(Parks)".to_string(), "Head".into()].into_iter().chain(classes.clone()).chain(["Head".into(), "Picture".into()]).collect();
+    let without: Vec<String> = ["Plain(Parks)".to_string()].into_iter().chain(classes).chain(["Picture".into()]).collect();
+    assert_eq!(row_kinds(&legend_rows(&map, None, &opts(true))), with);
+    assert_eq!(row_kinds(&legend_rows(&map, None, &opts(false))), without);
+    let labels = BTreeMap::from([("Parks".to_string(), "Green space".to_string())]);
+    for names in [true, false] {
+        let rows = legend_rows(&map, None, &LegendOptions { labels: &labels, ..opts(names) });
+        assert!(rows.iter().any(|row| matches!(row, LegendRow::Plain(_, "Green space"))), "names {names}");
+    }
+    // Measured as drawn: two rows less in one column, the picture's height the same either way.
+    let height = |layer_names: bool| {
+        let asked = LegendAsked {
+            all_classes: true,
+            hide_other: false,
+            show_no_data: false,
+            layer_names,
+            text_size: rustgis_map::layout::LEGEND_TEXT_PT,
+            exclude: &[],
+            labels: &NO_LABELS,
+        };
+        legend_sizes_asked_mm(&mut map.clone(), 1e6, &asked).unwrap()[0].1
+    };
+    let row = f64::from(LEGEND_ROW) * 25.4 / 96.0;
+    assert!((height(true) - height(false) - 2.0 * row).abs() < 1e-6, "{} and {}", height(true), height(false));
+    let wrapped = legend_sizes_with_no_data_mm(&mut map.clone(), 1e6, true, false, (false, 9.0), (&[], &NO_LABELS)).unwrap()[0].1;
+    assert_eq!(wrapped, height(true), "the sizes the commands measure show the names");
+}
+
+/// A fitted legend draws exactly as a manual legend of the columns and text size it fitted to,
+/// its title at its own size: one way of drawing a legend.
+#[test]
+fn a_fitted_legend_draws_as_a_manual_legend_of_its_fitted_size() {
+    let map = rows_map(32);
+    let rows = legend_rows(&map, None, &opts(true));
+    let two_across = 2.0 * widest_at(&rows, (1e6, 1.0)) + LEGEND_COLUMN_GAP + 1.0;
+    let tall = 12.0 * LEGEND_ROW;
+    let boxes = [
+        (LegendFit::AdjustSize, (130.0, 20.0 * LEGEND_ROW)),
+        (LegendFit::AdjustColumns, (600.0, tall)),
+        (LegendFit::AdjustColumnsAndSize, (two_across, tall)),
+    ];
+    for (fit, room) in boxes {
+        let f = fit_legend(&rows, (1, fit), room, (1e6, 9.0));
+        assert!((f.text_size < 9.0 || f.columns > 1) && !f.too_tall && !f.too_wide, "{fit:?} fits otherwise than set: {f:?}");
+        let fitted = drawn(&map, room, (1, fit), 9.0);
+        assert!(fitted.data() == drawn(&map, room, (f.columns, LegendFit::Manual), f.text_size).data(), "{fit:?}");
+        assert!(fitted.data() != drawn(&map, room, (1, LegendFit::Manual), 9.0).data(), "{fit:?} draws as set");
+        // Titled: the title as a manual legend's at 9 points, the rows as the manual legend's
+        // at the fitted size in the room the title leaves.
+        let title = LEGEND_ROW * LEGEND_TITLE_ROWS;
+        let rows_room = (room.0, room.1 - title);
+        let f = fit_legend(&rows, (1, fit), rows_room, (1e6, 9.0));
+        let with_title = titled(&map, "Legend", room, (1, fit), 9.0);
+        let manual = titled(&map, "Legend", room, (1, LegendFit::Manual), 9.0);
+        let mut below = Pixmap::new(600, 600).unwrap();
+        below.fill(tiny_skia::Color::WHITE);
+        let manual_opts = LegendOptions { size: f.size, text_size: f.text_size, ..opts(true) };
+        crate::canvas::with_canvas(&mut below, |c| {
+            let r = Rect::from_xywh(0.0, title, rows_room.0, rows_room.1).unwrap();
+            legend_missing(c, r, &map, ("", f.columns, LegendFit::Manual), None, manual_opts, INK, 1.0);
+        });
+        let line = 600 * 4;
+        let (top, rest) = with_title.data().split_at(title as usize * line);
+        assert!(top == &manual.data()[..title as usize * line], "{fit:?}: the title at its own size");
+        let from = (title.ceil() as usize - title as usize) * line;
+        assert!(rest[from..] == below.data()[(title.ceil() as usize * line)..], "{fit:?}: the rows at the fitted size");
+    }
+}
+
+/// A page of one legend of `map` (its frame hidden) at (5, 5) mm, `w` × `h` mm, in `columns`
+/// under `fit`, its text `text_size` points, titled `title`; and the scale its rows are at.
+fn fit_page(map: Map, (w, h): (f64, f64), (columns, fit): (usize, LegendFit), (title, text_size): (&str, f64)) -> (Layout, Vec<Map>, f64) {
+    let mut page = Layout::new("Fit", 120.0, 110.0);
+    let kind = serde_json::from_value(serde_json::json!({"MapFrame": {
+        "map": "m", "center": {"x": 0, "y": 0}, "scale": 150000000
+    }}))
+    .unwrap();
+    let frame = page.add("Frame", (0.0, 0.0, 60.0, 60.0), kind);
+    page.elements[0].visible = false;
+    page.add(
+        "Legend",
+        (5.0, 5.0, w, h),
+        ElementKind::Legend {
+            frame,
+            title: title.into(),
+            all_classes: true,
+            hide_other: false,
+            show_no_data: false,
+            exclude: Vec::new(),
+            columns,
+            labels: BTreeMap::new(),
+            color: None,
+            text_size,
+            fit,
+            show_layer_names: rustgis_map::layout::LayerNames::Shown,
+        },
+    );
+    let scale = frame_render_scale(&map, Coord::new(0.0, 0.0), 150_000_000.0);
+    (page, vec![map], scale)
+}
+
+/// A fit is decided in points, not pixels: a page drawn at 96 and at 300 dpi draws the legend
+/// as the manual legend of the one fit the commands measure for it.
+#[test]
+fn a_legends_fit_is_the_same_at_every_resolution() {
+    let mm = 25.4 / 96.0;
+    let row = f64::from(LEGEND_ROW) * mm;
+    let asked = LegendAsked {
+        all_classes: true,
+        hide_other: false,
+        show_no_data: false,
+        layer_names: true,
+        text_size: 9.0,
+        exclude: &[],
+        labels: &NO_LABELS,
+    };
+    for (fit, room) in [(LegendFit::AdjustSize, (40.0, 20.0 * row)), (LegendFit::AdjustColumns, (100.0, 12.0 * row))] {
+        let (page, mut maps, scale) = fit_page(rows_map(32), room, (1, fit), ("", 9.0));
+        let f = legend_fitted_mm(&mut maps[0], scale, &asked, (1, fit), room).unwrap();
+        assert!((f.text_size < 9.0 || f.columns > 1) && !f.too_tall && !f.too_wide, "{fit:?}: {f:?}");
+        let (manual, mut manual_maps, _) = fit_page(rows_map(32), room, (f.columns, LegendFit::Manual), ("", f.text_size));
+        let (as_set, mut as_set_maps, _) = fit_page(rows_map(32), room, (1, LegendFit::Manual), ("", 9.0));
+        for dpi in [96.0, 300.0] {
+            let got = render(&page, &mut maps, dpi, &PageInfo::default()).unwrap();
+            let want = render(&manual, &mut manual_maps, dpi, &PageInfo::default()).unwrap();
+            assert!(got.data() == want.data(), "{fit:?} at {dpi} dpi");
+            assert!(got.data() != render(&as_set, &mut as_set_maps, dpi, &PageInfo::default()).unwrap().data(), "{fit:?} as set");
+        }
+    }
+}
+
+/// A fitted legend's SVG and its vector PDF are those of the manual legend of the columns and
+/// text size it fitted to: both are written from the recorded page, so neither has a legend of
+/// its own to drift. It fails if the SVG or the PDF drew a legend by some path other than
+/// `legend_missing` (the fitted and the manual would then differ), or if the fit changed
+/// nothing (the fitted would then equal the manual legend as set).
+#[test]
+fn a_fitted_legend_exports_as_a_manual_legend_of_its_fitted_size() {
+    let mm = 25.4 / 96.0;
+    let row = f64::from(LEGEND_ROW) * mm;
+    let two_across = {
+        let map = rows_map(32);
+        f64::from(2.0 * widest_at(&legend_rows(&map, None, &opts(true)), (1e6, 1.0)) + LEGEND_COLUMN_GAP + 1.0) * mm
+    };
+    let asked = LegendAsked {
+        all_classes: true,
+        hide_other: false,
+        show_no_data: false,
+        layer_names: true,
+        text_size: 9.0,
+        exclude: &[],
+        labels: &NO_LABELS,
+    };
+    let info = PageInfo::default();
+    let export = |(page, mut maps, _): (Layout, Vec<Map>, f64)| {
+        let svg = crate::svg::layout_svg(&page, &mut maps, 72.0, &info).unwrap().0;
+        let (drawing, _) = render_drawing(&page, &mut maps, 150.0, &info).unwrap();
+        let pdf = crate::pdf::write(&[crate::pdf::Page::drawing(drawing, page.width, page.height)], "Legend");
+        (svg, pdf)
+    };
+    let boxes = [
+        (LegendFit::AdjustSize, (40.0, 20.0 * row)),
+        (LegendFit::AdjustColumns, (100.0, 12.0 * row)),
+        (LegendFit::AdjustColumnsAndSize, (two_across, 12.0 * row)),
+    ];
+    for (fit, room) in boxes {
+        let (_, mut maps, scale) = fit_page(rows_map(32), room, (1, fit), ("", 9.0));
+        let f = legend_fitted_mm(&mut maps[0], scale, &asked, (1, fit), room).unwrap();
+        assert!((f.text_size < 9.0 || f.columns > 1) && !f.too_tall && !f.too_wide, "{fit:?} fits otherwise than set: {f:?}");
+        let (svg, pdf) = export(fit_page(rows_map(32), room, (1, fit), ("", 9.0)));
+        let (manual_svg, manual_pdf) = export(fit_page(rows_map(32), room, (f.columns, LegendFit::Manual), ("", f.text_size)));
+        let (set_svg, set_pdf) = export(fit_page(rows_map(32), room, (1, LegendFit::Manual), ("", 9.0)));
+        // Not two empty pages: the legend's own text is in the SVG.
+        assert!(svg.contains(r#"aria-label="c0""#), "{fit:?}: the legend's text is written");
+        assert!(svg == manual_svg, "{fit:?}: the SVG of the fitted legend is the manual one's");
+        assert!(pdf == manual_pdf, "{fit:?}: the PDF of the fitted legend is the manual one's");
+        assert!(svg != set_svg, "{fit:?}: the SVG differs from the legend as set");
+        assert!(pdf != set_pdf, "{fit:?}: the PDF differs from the legend as set");
+    }
+}
+
+/// adjustSize with the default point symbols in a box too short for them: a row is never
+/// shorter than its symbol, so shrinking the text can't make 32 of them fit 20 rows' height. The
+/// fit goes to the 4 point floor and says it is still too tall. It fails if a fit stopped short
+/// of the floor (the size would be above 4), called a cut legend fitting (`too_tall` would be
+/// false), or if the symbols no longer held their rows open (the first assertion).
+#[test]
+fn adjust_size_stops_at_the_floor_when_symbols_hold_the_rows_open() {
+    let map = point_rows_map(32, None);
+    let rows = legend_rows(&map, None, &opts(true));
+    let room = (500.0, 20.0 * LEGEND_ROW);
+    let symbols: f32 = rows.iter().map(|row| row.symbol_side(1e6)).sum();
+    assert!(symbols > room.1, "the symbols alone ({symbols}) are taller than the room ({})", room.1);
+    let f = fit_legend(&rows, (1, LegendFit::AdjustSize), room, (1e6, 9.0));
+    assert_eq!((f.columns, f.text_size, f.too_wide, f.too_tall), (1, 4.0, false, true), "{f:?}");
+    assert_eq!(f.size, legend_size(4.0));
+    // The same rows with small symbols fit by shrinking (the test of that is above).
+    let small = rows_map(32);
+    let rows = legend_rows(&small, None, &opts(true));
+    assert!(!fit_legend(&rows, (1, LegendFit::AdjustSize), room, (1e6, 9.0)).too_tall);
+}
+
+/// A web layer's legend picture is a pixel a point at the default size and shrinks with the
+/// text: adjustSize draws it smaller than the manual legend and holds it in its box. It fails
+/// if a picture kept its size under a fit (the fitted height would equal the manual one, or
+/// the box would stay too short).
+#[test]
+fn adjust_size_shrinks_a_legend_picture() {
+    let url = "https://tiles.test/waits/fit-picture-legend.png";
+    let fetch = crate::tiles::tests::hold_fetch(url);
+    let mut map = Map::new("m");
+    let mut tile = rustgis_map::TileLayer::new("Walls", rustgis_map::TileKind::Raster, "https://tiles.test/red/{z}/{x}/{y}.png");
+    tile.legends = vec![rustgis_data::ogc::Legend { url: url.into(), ..Default::default() }];
+    map.tiles.push(tile);
+    assert!(tile_legends_pending(&map, 1e6, &[]), "the picture is asked for");
+    fetch.recv_timeout(std::time::Duration::from_secs(5)).unwrap()(Ok(red_picture()));
+    wait_for_tile_legends(&map, 1e6, &[], web_time::Instant::now() + LEGEND_WAIT).unwrap();
+    assert!(!tile_legends_pending(&map, 1e6, &[]), "the picture has landed");
+    let rows = legend_rows(&map, None, &opts(true));
+    assert_eq!(row_kinds(&rows), ["Head", "Picture"]);
+    // A box 70 percent as tall as the legend at 9 points.
+    let manual = measure_at(&rows, 1, (1e6, legend_size(9.0)));
+    let room = (500.0, 0.7 * manual.1);
+    let f = fit_legend(&rows, (1, LegendFit::AdjustSize), room, (1e6, 9.0));
+    assert!(f.text_size < 9.0 && f.text_size >= 4.0 && !f.too_tall && !f.too_wide, "{f:?}");
+    let fitted = measure_at(&rows, 1, (1e6, f.size));
+    assert!(fitted.1 < manual.1 && fitted.1 <= room.1 + 1e-3, "{} against {} in {}", fitted.1, manual.1, room.1);
+    assert!(rows[1].height(1e6, f.size) < rows[1].height(1e6, legend_size(9.0)), "the picture itself is smaller");
+    // As set it is cut.
+    assert!(fit_legend(&rows, (1, LegendFit::Manual), room, (1e6, 9.0)).too_tall);
+}
+
+/// A fit judges a legend's width in the columns the page draws it in. Six rows of one height,
+/// the second and third with long labels, in a box two rows tall: as even as they go in two
+/// columns (three and three) both long labels share the first column, but too tall for its box
+/// the legend is drawn in columns filled in turn to its height (two, then four), where each column
+/// holds a long label. In a box narrower than that and wider than the even split, two columns
+/// close up when drawn, so the fit stays in one, and set to two it says they are too wide. It
+/// fails if a fit measured a too-tall candidate's width in columns the page doesn't draw.
+#[test]
+fn a_fits_width_is_measured_in_the_columns_it_draws() {
+    let small = rustgis_map::Symbol { size: 4.0, stroke_width: 0.0, ..rustgis_map::Symbol::default_for(GeometryType::Point, 0) };
+    let long = "a label long enough to widen its column";
+    // Listed in their names' order.
+    let names = ["s0".to_string(), format!("s1, {long}"), format!("s2, {long}"), "s3".into(), "s4".into(), "s5".into()];
+    let map = classed_point_map(names.into_iter().map(|n| (n, small)).collect(), small);
+    let rows = legend_rows(&map, None, &LegendOptions { hide_other: true, ..opts(false) });
+    let at = (1e6, 1.0);
+    assert_eq!(row_kinds(&rows), ["Class"; 6]);
+    assert_eq!(balanced_at(&rows, 6, at).1, LEGEND_ROW, "rows of one height");
+    let room_h = 2.0 * LEGEND_ROW;
+    let width = |starts: &[usize]| column_parts(&rows, starts).map(|part| widest_at(part, at)).sum::<f32>() + LEGEND_COLUMN_GAP;
+    let even = balanced_at(&rows, 2, at).0;
+    let drawn = flow_at(&rows, 2, room_h, at).0;
+    assert_eq!((even.as_slice(), drawn.as_slice()), ([0, 3].as_slice(), [0, 2].as_slice()));
+    let (even_w, drawn_w) = (width(&even), width(&drawn));
+    assert!(even_w + 2.0 < drawn_w, "{even_w} {drawn_w}");
+    let room = ((even_w + drawn_w) / 2.0, room_h);
+    assert!(widest_at(&rows, at) < room.0, "one column fits across");
+    let f = fit_legend(&rows, (1, LegendFit::AdjustColumns), room, (1e6, 9.0));
+    assert_eq!((f.columns, f.too_wide, f.too_tall), (1, false, true), "{f:?}");
+    let f = fit_legend(&rows, (2, LegendFit::AdjustColumns), room, (1e6, 9.0));
+    assert_eq!((f.columns, f.too_wide, f.too_tall), (2, true, true), "{f:?}");
+    // As drawn: the fitted legend set to two columns is the manual legend of two.
+    let fitted = drawn_legend(&map, room, (2, LegendFit::AdjustColumns));
+    assert!(fitted.data() == drawn_legend(&map, room, (2, LegendFit::Manual)).data());
+}
+
+/// [`drawn`] for a legend of `map` with no layer names nor its other values.
+fn drawn_legend(map: &Map, (w, h): (f32, f32), (columns, fit): (usize, LegendFit)) -> Pixmap {
+    let mut pm = Pixmap::new(600, 600).unwrap();
+    pm.fill(tiny_skia::Color::WHITE);
+    let opts = LegendOptions { hide_other: true, ..opts(false) };
+    crate::canvas::with_canvas(&mut pm, |c| {
+        legend_missing(c, Rect::from_xywh(0.0, 0.0, w, h).unwrap(), map, ("", columns, fit), None, opts, INK, 1.0);
+    });
+    pm
+}
+
+/// A picture `side` pixels square, for a legend.
+fn red_picture_of(side: u32) -> Vec<u8> {
+    let mut image = Pixmap::new(side, side).unwrap();
+    image.fill(tiny_skia::Color::from_rgba8(220, 20, 20, 255));
+    image.encode_png().unwrap()
+}
+
+/// A web layer's legend picture wider than its box is narrowed to it as drawn
+/// ([`picture_scale`]), and shortened with it, so a fit counts it at the size it is drawn: a
+/// 256 pixel picture in a box 200 points wide is drawn about 194 across and down, whole in a box
+/// 300 tall, and it fits there; in one 100 tall it is cut, and said. It fails if a fit measured
+/// the picture at a pixel a point in a column that draws it smaller.
+#[test]
+fn a_legend_picture_is_measured_as_its_column_draws_it() {
+    let url = "https://tiles.test/waits/fit-wide-picture-legend.png";
+    let fetch = crate::tiles::tests::hold_fetch(url);
+    let mut map = Map::new("m");
+    let mut tile = rustgis_map::TileLayer::new("Walls", rustgis_map::TileKind::Raster, "https://tiles.test/red/{z}/{x}/{y}.png");
+    tile.legends = vec![rustgis_data::ogc::Legend { url: url.into(), ..Default::default() }];
+    map.tiles.push(tile);
+    assert!(tile_legends_pending(&map, 1e6, &[]), "the picture is asked for");
+    fetch.recv_timeout(std::time::Duration::from_secs(5)).unwrap()(Ok(red_picture_of(256)));
+    wait_for_tile_legends(&map, 1e6, &[], web_time::Instant::now() + LEGEND_WAIT).unwrap();
+    let rows = legend_rows(&map, None, &opts(false));
+    assert_eq!(row_kinds(&rows), ["Picture"]);
+    let LegendRow::Picture(p) = &rows[0] else { panic!("not a picture row") };
+    let rustgis_tiles::cache::Payload::Image(pic) = &**p else { panic!("not a picture") };
+    // The painter narrows it to its column: whole in 300 points, not in 100.
+    let k = picture_scale(Rect::from_xywh(0.0, 0.0, 200.0, 300.0).unwrap(), pic, 1.0);
+    let drawn_h = pic.height() as f32 * k;
+    assert!(k < 1.0 && drawn_h <= 300.0 && drawn_h > 100.0, "{k} {drawn_h}");
+    assert!(measure_at(&rows, 1, (1e6, 1.0)).0 > 200.0, "a pixel a point, it is wider than the box");
+    for fit in [LegendFit::AdjustColumns, LegendFit::AdjustColumnsAndSize, LegendFit::AdjustSize] {
+        let f = fit_legend(&rows, (1, fit), (200.0, 300.0), (1e6, 9.0));
+        assert!(f.fits() && f.text_size == 9.0, "{fit:?}: {f:?}");
+        let f = fit_legend(&rows, (1, fit), (200.0, 100.0), (1e6, 9.0));
+        assert!(f.too_tall && !f.too_wide, "{fit:?} cut: {f:?}");
+    }
+}
+
+/// Legends with nothing to list, a box shorter than its title or no room at all draw and fit
+/// without a panic, a NaN or a loop: nothing to list fits, rows with no room are cut and say so.
+#[test]
+fn legends_with_nothing_to_list_or_no_room_draw_safely() {
+    let empty = Map::new("m");
+    let none = legend_rows(&empty, None, &opts(true));
+    let rows_map8 = rows_map(8);
+    let rows = legend_rows(&rows_map8, None, &opts(true));
+    for fit in LegendFit::ALL.into_iter().chain([LegendFit::Invalid]) {
+        let f = fit_legend(&none, (6, fit), (0.0, 0.0), (1e6, 9.0));
+        assert!(!f.too_wide && !f.too_tall && f.text_size.is_finite() && f.columns == 6, "{fit:?}");
+        for room in [(0.0, 0.0), (-5.0, -5.0), (f32::INFINITY, 0.0), (1.0, f32::NAN), (f32::NAN, f32::NEG_INFINITY)] {
+            for (columns, pt) in [(0, 4.0), (usize::MAX, 100.0), (3, f64::NAN), (1, f64::INFINITY), (2, -3.0)] {
+                let f = fit_legend(&rows, (columns, fit), room, (1e6, pt));
+                assert!(
+                    (1..=MAX_LEGEND_COLUMNS).contains(&f.columns)
+                        && (4.0..=100.0).contains(&f.text_size)
+                        && f.size.is_finite()
+                        && f.size > 0.0
+                        && f.too_tall,
+                    "{fit:?} {room:?} {columns} {pt}: {f:?}"
+                );
+            }
+        }
+        // A measure that is no number never fits, whatever the room.
+        for room in [0.0, 100.0, f32::INFINITY] {
+            assert!(beyond(f32::NAN, room, 1.0), "{fit:?} {room}");
+        }
+        assert!(!beyond(100.0, 100.0, 1.0) && beyond(101.0, 100.0, 1.0), "{fit:?}");
+        // Drawn in a 0.1 mm box, and in a box shorter than its title.
+        for (w, h, title) in [(0.1, 0.1, ""), (40.0, 2.0, "Legend"), (0.1, 0.1, "Legend")] {
+            let (page, mut maps, _) = fit_page(rows_map(8), (w, h), (1, fit), (title, 9.0));
+            assert!(render(&page, &mut maps, 96.0, &PageInfo::default()).is_ok(), "{fit:?} in {w} × {h}");
+            let (page, mut maps, _) = fit_page(Map::new("m"), (w, h), (1, fit), (title, 9.0));
+            assert!(render(&page, &mut maps, 96.0, &PageInfo::default()).is_ok(), "{fit:?} in {w} × {h}, nothing listed");
+        }
+    }
+}
+
+/// Up to six columns, shared out as evenly as they go: 32 rows take six rows a column.
+#[test]
+fn a_legend_takes_up_to_six_columns() {
+    let map = rows_map(32);
+    let rows = legend_rows(&map, None, &opts(true));
+    assert_eq!(balanced_at(&rows, 6, (1e6, 1.0)).1, 6.0 * LEGEND_ROW);
+    let mut map = map;
+    let sizes = legend_sizes_mm(&mut map, 1e6, true, false, (&[], &NO_LABELS)).unwrap();
+    assert!(sizes.windows(2).all(|w| w[0].0 < w[1].0 && w[0].1 >= w[1].1), "{sizes:?}");
+    assert_eq!(sizes.len(), MAX_LEGEND_COLUMNS);
+}
+
+/// The calls to [`LegendRow::symbol_side`] and [`LegendRow::text_width`] `run` makes on this
+/// thread.
+fn legend_calls(run: impl FnOnce()) -> (usize, usize) {
+    SYMBOL_SIDES.set(0);
+    TEXT_MEASURES.set(0);
+    run();
+    (SYMBOL_SIDES.get(), TEXT_MEASURES.get())
+}
+
+/// What laying out a legend of 5,000 rows costs, counted in calls, never timed: a manual
+/// legend does no more than before fits existed, and a fit measures each row's point symbol
+/// once and its text once a size it tries, whatever the columns it tries there. It fails if a
+/// manual legend went through the fit, or a fit measured its rows again for each column count.
+#[test]
+fn a_legends_rows_are_measured_once_a_size() {
+    let r = 5_000;
+    let map = rows_map(r);
+    let rows = legend_rows(&map, None, &opts(true));
+    assert_eq!(rows.len(), r);
+    assert!(!rows.iter().any(|row| matches!(row, LegendRow::Picture(_))), "every row has a text");
+    // Manual, in one column in a box ten rows tall at the default size. The drawing measures
+    // the R rows' symbols once (`symbol_sides`) and their texts once (`RowSizes::of`), and
+    // `legend_column` takes its swatch column and each row's height from those measures, so
+    // it measures none again: R symbols, R texts. Before fits, the same drawing called
+    // `symbol_side` through `LegendRow::height` and `swatch_column`: `balanced` R for its total,
+    // 24 R for its 24 `flow`s, R for the last `flow` and R for the tallest column (27 R); the
+    // drawing's own `flow` R; `widest` over the one column, R for its swatches and R texts; and
+    // `legend_column` R for its swatches and 11 heights (ten rows drawn and the eleventh, which
+    // passes the box): 30 R + 11 symbols, R texts.
+    let manual = legend_calls(|| {
+        let mut pm = Pixmap::new(300, 150).unwrap();
+        crate::canvas::with_canvas(&mut pm, |c| {
+            legend(c, Rect::from_xywh(0.0, 0.0, 300.0, 10.0 * LEGEND_ROW).unwrap(), &map, ("", 1), None, opts(true), 1.0);
+        });
+    });
+    assert_eq!(manual, (r, r));
+    assert!(manual.0 <= 30 * r + 11 && manual.1 <= r, "no more than before fits: {manual:?}");
+    // adjustColumnsAndSize in a box it can never fit: 9 points fits in no columns, nor does 4,
+    // so `largest_fitting` stops after those two sizes, six column counts each. The symbols
+    // are measured once (R), the texts once a size (2 R), not once a layout tried: before,
+    // each of those 12 layouts measured every symbol 28 times and every text once.
+    let never = legend_calls(|| {
+        let f = fit_legend(&rows, (1, LegendFit::AdjustColumnsAndSize), (10.0, 10.0), (1e6, 9.0));
+        assert!(f.too_wide && f.too_tall && f.text_size == 4.0, "{f:?}");
+    });
+    assert_eq!(never, (r, 2 * r));
+    // From 100 points in a box that six columns fill at 4: the halving runs its course, 11
+    // sizes at most (`largest_fitting`), the symbols still measured once.
+    let room = measure_at(&rows, MAX_LEGEND_COLUMNS, (1e6, legend_size(4.0)));
+    let halved = legend_calls(|| {
+        let f = fit_legend(&rows, (1, LegendFit::AdjustColumnsAndSize), (room.0 + 1.0, room.1), (1e6, 100.0));
+        assert!(f.fits() && f.text_size < 100.0, "{f:?}");
+    });
+    assert!(halved.0 == r && halved.1 > 2 * r && halved.1 <= 11 * r, "{halved:?}");
+}
+
+/// A fitted legend that doesn't fit is listed once for each way it doesn't: a map series draws it
+/// a page, where it can be too wide on one and too tall on another, and both are said; the same
+/// way on a second page is not said again, and its columns are the first page's.
+#[test]
+fn a_fitted_legend_is_listed_once_for_each_way_it_does_not_fit() {
+    let fit = LegendFit::AdjustColumns;
+    let ((), listed) = legend::unfitted_legends(|| {
+        legend::unfitted((7, "Key"), fit, &legend::Fitted::verdict(2, true, false));
+        legend::unfitted((7, "Key"), fit, &legend::Fitted::verdict(3, true, false));
+        legend::unfitted((7, "Key"), fit, &legend::Fitted::verdict(1, false, true));
+        legend::unfitted((8, "Other"), fit, &legend::Fitted::verdict(1, false, true));
+    });
+    let said: Vec<_> = listed.iter().map(|l| (l.id, l.columns, l.too_wide, l.too_tall)).collect();
+    assert_eq!(said, [(7, 2, true, false), (7, 1, false, true), (8, 1, false, true)]);
+}
+
+/// A legend measured in one to three columns lays its rows out in those three column counts
+/// alone, and gives the very sizes the measure in one to six gives for them; the measure in one
+/// to six lays them out in each of the six once.
+#[test]
+fn a_legend_measured_in_fewer_columns_lays_out_no_more() {
+    let mut map = rows_map(50);
+    let laid = |run: &mut dyn FnMut()| {
+        LAYOUTS_MEASURED.set(Some(Vec::new()));
+        run();
+        LAYOUTS_MEASURED.take().unwrap_or_default()
+    };
+    let (mut three, mut six) = (None, None);
+    let in_three = laid(&mut || {
+        three = legend_sizes_in_columns_mm::<3>(&mut map, 1e6, true, false, (false, 9.0), (&[], &NO_LABELS));
+    });
+    let in_six = laid(&mut || {
+        six = legend_sizes_with_no_data_mm(&mut map, 1e6, true, false, (false, 9.0), (&[], &NO_LABELS));
+    });
+    assert_eq!((in_three, in_six), (vec![1, 2, 3], vec![1, 2, 3, 4, 5, 6]));
+    let (three, six) = (three.unwrap(), six.unwrap());
+    assert_eq!(three[..], six[..3]);
+}
+
+/// A legend measured in its own columns, as a manual legend's notice measures it, lays its rows out
+/// in that one column count alone (where main laid out three), and gives the size the measure in
+/// one to six gives for it; a count out of range is taken into range as the legend takes it.
+#[test]
+fn a_legend_measured_in_its_own_columns_lays_out_only_those() {
+    let mut map = rows_map(50);
+    let asked = LegendAsked {
+        all_classes: true,
+        hide_other: false,
+        show_no_data: false,
+        layer_names: true,
+        text_size: 9.0,
+        exclude: &[],
+        labels: &NO_LABELS,
+    };
+    let six = legend_sizes_asked_mm(&mut map, 1e6, &asked).unwrap();
+    for (columns, laid_in) in [(0, 1), (1, 1), (2, 2), (3, 3), (6, 6), (9, 6)] {
+        LAYOUTS_MEASURED.set(Some(Vec::new()));
+        let size = legend_size_asked_mm(&mut map, 1e6, &asked, columns).unwrap();
+        assert_eq!(LAYOUTS_MEASURED.take().unwrap_or_default(), [laid_in], "{columns}");
+        assert_eq!(Some(&size), six.get(laid_in - 1), "{columns}");
+    }
 }
 
 /// A legend shows a layer under the label it gives it, by the layer's name in any case (#1654):
@@ -1784,7 +2594,16 @@ fn a_legend_shows_a_layers_label() {
     let labels =
         |pairs: &[(&str, &str)]| -> BTreeMap<String, String> { pairs.iter().map(|(n, l)| (n.to_string(), l.to_string())).collect() };
     let names = |labels: &BTreeMap<String, String>| -> Vec<String> {
-        let opts = LegendOptions { show_no_data: false, hide_other: true, exclude: &[], labels, scale: 1e6, size: 1.0 };
+        let opts = LegendOptions {
+            show_no_data: false,
+            hide_other: true,
+            exclude: &[],
+            labels,
+            scale: 1e6,
+            size: 1.0,
+            names: true,
+            text_size: 9.0,
+        };
         legend_rows(&map, None, &opts)
             .iter()
             .filter_map(|r| match r {
@@ -1809,7 +2628,16 @@ fn a_legend_shows_a_layers_label() {
     let reach = |labels: &BTreeMap<String, String>| {
         let mut pm = Pixmap::new(400, 200).unwrap();
         pm.fill(tiny_skia::Color::WHITE);
-        let opts = LegendOptions { show_no_data: false, hide_other: true, exclude: &[], labels, scale: 1e6, size: 1.0 };
+        let opts = LegendOptions {
+            show_no_data: false,
+            hide_other: true,
+            exclude: &[],
+            labels,
+            scale: 1e6,
+            size: 1.0,
+            names: true,
+            text_size: 9.0,
+        };
         crate::canvas::with_canvas(&mut pm, |c| {
             legend(c, Rect::from_xywh(0.0, 0.0, 400.0, 200.0).unwrap(), &map, ("", 1), None, opts, 1.0)
         });
@@ -1852,7 +2680,16 @@ fn legends_leave_out_what_the_frame_does_not_draw() {
     let depth_without = |map: &Map, drawn: Option<&[(u32, Vec<LegendEntry>)]>, hide_other: bool, exclude: &[String]| {
         let mut pm = Pixmap::new(300, 400).unwrap();
         pm.fill(tiny_skia::Color::WHITE);
-        let opts = LegendOptions { show_no_data: false, hide_other, exclude, labels: &NO_LABELS, scale: 1e6, size: 1.0 };
+        let opts = LegendOptions {
+            show_no_data: false,
+            hide_other,
+            exclude,
+            labels: &NO_LABELS,
+            scale: 1e6,
+            size: 1.0,
+            names: true,
+            text_size: 9.0,
+        };
         crate::canvas::with_canvas(&mut pm, |c| {
             legend(c, Rect::from_xywh(0.0, 0.0, 300.0, 400.0).unwrap(), map, ("", 1), drawn, opts, 1.0)
         });
@@ -1881,7 +2718,16 @@ fn legends_leave_out_what_the_frame_does_not_draw() {
                 map,
                 ("", 1),
                 drawn,
-                LegendOptions { show_no_data: false, hide_other: false, exclude: &[], labels: &NO_LABELS, scale: 1e6, size: 1.0 },
+                LegendOptions {
+                    show_no_data: false,
+                    hide_other: false,
+                    exclude: &[],
+                    labels: &NO_LABELS,
+                    scale: 1e6,
+                    size: 1.0,
+                    names: true,
+                    text_size: 9.0,
+                },
                 1.0,
             )
         });
@@ -2147,7 +2993,16 @@ fn classes_map(n: u8) -> Map {
 #[test]
 fn a_legend_lists_a_classified_rasters_classes() {
     let mut map = classes_map(5);
-    let opts = LegendOptions { show_no_data: false, hide_other: true, exclude: &[], labels: &NO_LABELS, scale: 1e6, size: 1.0 };
+    let opts = LegendOptions {
+        show_no_data: false,
+        hide_other: true,
+        exclude: &[],
+        labels: &NO_LABELS,
+        scale: 1e6,
+        size: 1.0,
+        names: true,
+        text_size: 9.0,
+    };
     let labels = |rows: &[LegendRow]| -> Vec<String> {
         rows.iter()
             .map(|r| match r {
@@ -4865,6 +5720,116 @@ fn plain_texts_draw_as_before() {
     assert_eq!((fnv(&drawn), losses), (PINNED_TEXT_PIXELS, PINNED_TEXT_LOSSES), "{:#x} {:#x}", fnv(&drawn), losses);
 }
 
+/// How [`legends_draw_as_before`]'s pages drew before legends had a fit, layer names to leave
+/// off or more than three columns, in the built-in face: each page of
+/// [`crate::layout::legend_pin_pages`] at 96 dpi, the first three at 300 dpi after it.
+#[cfg(not(target_arch = "wasm32"))]
+const PINNED_LEGEND_PIXELS: [u64; 21] = [
+    0xfdc3_d550_3af3_da82, // 1: one column, roomy, 96 dpi
+    0xfa9a_c1b3_ef86_ded0, // 1: 300 dpi
+    0x9def_85e9_f2bf_79ce, // 2: two columns, roomy, 96 dpi
+    0xeb46_544e_ed74_f8e3, // 2: 300 dpi
+    0x5875_a607_ce55_8e8b, // 3: three columns, roomy, 96 dpi
+    0x1e6a_1390_09e4_a43a, // 3: 300 dpi
+    0x860a_f6db_8d10_a01a, // 4: one column, short
+    0x5dcb_a1db_07b2_9160, // 5: two columns, short
+    0x0235_53e1_a2df_0855, // 6: three columns, short
+    0xfdc3_d550_3af3_da82, // 7: one column, narrow (page 1's: one column has none to close up)
+    0x0e5a_0092_f5eb_407b, // 8: two columns, narrow
+    0xc34e_9a2b_2000_de11, // 9: three columns, narrow
+    0x6011_fd0f_a03d_920e, // 10: 14 pt, two columns
+    0xbb8d_03ca_f40c_1d9d, // 11: 5 pt, three columns, short
+    0x6867_5d22_3f63_43e8, // 12: no title, what the frame draws, other left out
+    0x4f28_090b_e840_a63d, // 13: labelled, excluded, ink
+    0xdfab_ac0a_fef8_0764, // 14: no-data rows, two columns
+    0xb7b0_2d21_13c9_ff7a, // 15: across the right edge
+    0x122e_6c5c_24ac_2eb1, // 16: shorter than its title
+    0x122e_6c5c_24ac_2eb1, // 17: nothing to list (page 16's: its title alone)
+    0x895d_688f_af95_5420, // 18: what the frame draws, no-data asked
+];
+/// How each of those pages measured: what [`text_losses`] found at each resolution it was
+/// drawn at, and its rows' sizes in one to three columns (alike on pages that differ only in
+/// their box).
+#[cfg(not(target_arch = "wasm32"))]
+const PINNED_LEGEND_MEASURES: [u64; 18] = [
+    0x698b_5830_84be_65fe, // 1: one column, roomy
+    0x698b_5830_84be_65fe, // 2: two columns, roomy
+    0x698b_5830_84be_65fe, // 3: three columns, roomy
+    0xbf3a_eef4_592a_7206, // 4: one column, short
+    0xbf3a_eef4_592a_7206, // 5: two columns, short
+    0xbf3a_eef4_592a_7206, // 6: three columns, short
+    0xbf3a_eef4_592a_7206, // 7: one column, narrow
+    0xbf3a_eef4_592a_7206, // 8: two columns, narrow
+    0xbf3a_eef4_592a_7206, // 9: three columns, narrow
+    0x4e3b_8653_1ac5_6e1d, // 10: 14 pt, two columns
+    0x5e46_780d_cd4a_87c4, // 11: 5 pt, three columns, short
+    0xab16_62c7_8d9c_398a, // 12: no title, what the frame draws, other left out
+    0xbdc6_2076_84cc_97c7, // 13: labelled, excluded, ink
+    0x0de9_b39c_7273_61da, // 14: no-data rows, two columns
+    0x6de4_4bc0_7e82_51cc, // 15: across the right edge
+    0xbf3a_eef4_592a_7206, // 16: shorter than its title
+    0x7249_b531_f330_3a30, // 17: nothing to list
+    0x18ef_3e69_73a3_50c9, // 18: what the frame draws, no-data asked
+];
+
+/// A legend with none of the fitting settings draws, and is measured for its size in one to
+/// three columns and for its title's ink, exactly as main did, page by page: every page at 96
+/// dpi, and the first three (one, two and three columns in a box that holds them) at 300 dpi
+/// too, which holds the scaling of rows, swatches and gaps with the resolution. Its size is
+/// measured at the scale its hidden frame draws the map at, as the commands measure it. In a
+/// process of its own, told to use the built-in face before any text.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn legends_draw_as_before() {
+    if std::env::var_os("RUSTGIS_LEGEND_PIN_CHILD").is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "layout::tests::legends_draw_as_before", "--nocapture"])
+            .env("RUSTGIS_LEGEND_PIN_CHILD", "1")
+            .env("RUSTGIS_BUILTIN_FONTS", "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"), "the test didn't run in the child process");
+        return;
+    }
+    let info = PageInfo::default();
+    let (mut drawn, mut measured) = (Vec::new(), Vec::new());
+    for (i, (l, mut maps)) in crate::layout::legend_pin_pages().into_iter().enumerate() {
+        let page = i + 1;
+        let mut said = String::new();
+        for dpi in if page <= 3 { &[96.0, 300.0][..] } else { &[96.0][..] } {
+            let pm = render(&l, &mut maps, *dpi, &info).unwrap();
+            drawn.push((format!("page {page} at {dpi} dpi"), fnv(std::slice::from_ref(&pm))));
+            let losses = format!("{:?}", text_losses(&l, &maps, *dpi, &info));
+            // The two pages that test the title's ink: across the page's right edge it is
+            // said to leave the page; in a box shorter than itself, main says nothing.
+            if *dpi == 96.0 && page == 15 {
+                assert!(losses.contains("off_page: true") && !losses.contains("below_box: true"), "page 15: {losses}");
+            }
+            if *dpi == 96.0 && page == 16 {
+                assert_eq!(losses, "[]", "page 16");
+            }
+            said.push_str(&losses);
+            said.push('\n');
+        }
+        let Some(ElementKind::MapFrame { map, center, scale, .. }) = l.elements.first().map(|e| &e.kind) else { panic!("a frame") };
+        let scale = frame_render_scale(&maps[map_index(&maps, map).unwrap()], *center, *scale);
+        let Some(ElementKind::Legend { all_classes, hide_other, show_no_data, exclude, labels, text_size, .. }) =
+            l.elements.last().map(|e| &e.kind)
+        else {
+            panic!("a legend page")
+        };
+        let sizes =
+            legend_sizes_with_no_data_mm(&mut maps[0], scale, *all_classes, *hide_other, (*show_no_data, *text_size), (exclude, labels));
+        // The first three only: these are the column counts main measures.
+        said.push_str(&format!("{:?}\n", sizes.map(|s| [s[0], s[1], s[2]])));
+        measured.push((format!("page {page}"), fnv_bytes(said.as_bytes())));
+    }
+    let mut wrong = crate::layout::pin_mismatches("drawing", &drawn, &PINNED_LEGEND_PIXELS);
+    wrong.extend(crate::layout::pin_mismatches("measures", &measured, &PINNED_LEGEND_MEASURES));
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 /// How [`scale_bars_without_details_draw_as_before`]'s bars drew before scale bars had details,
 /// their labels in the built-in face.
 #[cfg(not(target_arch = "wasm32"))]
@@ -5914,7 +6879,16 @@ fn point_legend_map(edit: impl FnOnce(&mut rustgis_map::Layer)) -> Map {
 fn point_legend(map: &Map) -> Pixmap {
     let mut pm = Pixmap::new(200, 200).unwrap();
     pm.fill(tiny_skia::Color::WHITE);
-    let opts = LegendOptions { show_no_data: false, hide_other: false, exclude: &[], labels: &NO_LABELS, scale: 1e6, size: 1.0 };
+    let opts = LegendOptions {
+        show_no_data: false,
+        hide_other: false,
+        exclude: &[],
+        labels: &NO_LABELS,
+        scale: 1e6,
+        size: 1.0,
+        names: true,
+        text_size: 9.0,
+    };
     crate::canvas::with_canvas(&mut pm, |c| legend(c, Rect::from_xywh(0.0, 0.0, 200.0, 200.0).unwrap(), map, ("", 1), None, opts, 1.0));
     pm
 }
@@ -5923,7 +6897,16 @@ fn point_legend(map: &Map) -> Pixmap {
 /// back on white.
 fn recorded_legend(map: &Map, side: u32) -> Pixmap {
     let mut c = Canvas::recording(side, side).unwrap();
-    let opts = LegendOptions { show_no_data: false, hide_other: false, exclude: &[], labels: &NO_LABELS, scale: 1e6, size: 1.0 };
+    let opts = LegendOptions {
+        show_no_data: false,
+        hide_other: false,
+        exclude: &[],
+        labels: &NO_LABELS,
+        scale: 1e6,
+        size: 1.0,
+        names: true,
+        text_size: 9.0,
+    };
     legend(&mut c, Rect::from_xywh(0.0, 0.0, side as f32, side as f32).unwrap(), map, ("", 1), None, opts, 1.0);
     let (_, _, items) = c.into_drawing().unwrap().finish();
     let mut pm = Pixmap::new(side, side).unwrap();
@@ -6138,7 +7121,16 @@ fn a_legend_grows_to_hold_a_large_point() {
     let mut pm = Pixmap::new(200, 200).unwrap();
     pm.fill(tiny_skia::Color::WHITE);
     let blank = pm.clone();
-    let opts = LegendOptions { show_no_data: false, hide_other: false, exclude: &[], labels: &NO_LABELS, scale: 1e6, size: 1.0 };
+    let opts = LegendOptions {
+        show_no_data: false,
+        hide_other: false,
+        exclude: &[],
+        labels: &NO_LABELS,
+        scale: 1e6,
+        size: 1.0,
+        names: true,
+        text_size: 9.0,
+    };
     crate::canvas::with_canvas(&mut pm, |c| legend(c, Rect::from_xywh(0.0, 0.0, 200.0, 47.0).unwrap(), &map, ("", 1), None, opts, 1.0));
     assert!(pm.data() == blank.data());
     // A size no page could hold stays a size a legend can take.
@@ -6173,7 +7165,16 @@ fn a_legends_text_size_scales_its_rows_but_not_its_point_symbols() {
     assert!((w - (48.0 + label) * mm).abs() < 1e-4, "{w} mm");
     let mut pm = Pixmap::new(200, 200).unwrap();
     pm.fill(tiny_skia::Color::WHITE);
-    let opts = LegendOptions { show_no_data: false, hide_other: false, exclude: &[], labels: &NO_LABELS, scale: 1e6, size: 2.0 };
+    let opts = LegendOptions {
+        show_no_data: false,
+        hide_other: false,
+        exclude: &[],
+        labels: &NO_LABELS,
+        scale: 1e6,
+        size: 2.0,
+        names: true,
+        text_size: 18.0,
+    };
     crate::canvas::with_canvas(&mut pm, |c| legend(c, Rect::from_xywh(0.0, 0.0, 200.0, 200.0).unwrap(), &map, ("", 1), None, opts, 1.0));
     assert!(same_corner(&pm, &drawn_point(&s(40.0), &[], (24.0, 24.0), 1.0), 48, 48), "the symbol as the map draws it");
     // A polygon's swatch is twice as wide, as its column is.
@@ -6183,7 +7184,7 @@ fn a_legends_text_size_scales_its_rows_but_not_its_point_symbols() {
     let across = |size: f32| {
         let mut pm = Pixmap::new(200, 200).unwrap();
         pm.fill(tiny_skia::Color::WHITE);
-        let opts = LegendOptions { size, ..opts };
+        let opts = LegendOptions { size, text_size: f64::from(size) * LEGEND_TEXT_PT, ..opts };
         crate::canvas::with_canvas(&mut pm, |c| {
             legend(c, Rect::from_xywh(0.0, 0.0, 200.0, 200.0).unwrap(), &map, ("", 1), None, opts, 1.0)
         });
@@ -6194,7 +7195,7 @@ fn a_legends_text_size_scales_its_rows_but_not_its_point_symbols() {
     assert_eq!(two - one, 16, "{one} and {two} px");
     // A line wider than its row, at a small size, is cut to its row (#2518): nothing above the
     // box.
-    let small = LegendOptions { size: 4.0 / 9.0, ..opts };
+    let small = LegendOptions { size: 4.0 / 9.0, text_size: 4.0, ..opts };
     let drawn = |map: &Map, at: (f32, f32), opts: LegendOptions| {
         let mut pm = Pixmap::new(200, 200).unwrap();
         pm.fill(tiny_skia::Color::WHITE);
@@ -6224,7 +7225,7 @@ fn a_legends_text_size_scales_its_rows_but_not_its_point_symbols() {
         rustgis_map::Symbol { fill: red, stroke: blue, stroke_width: 12.0, ..rustgis_map::Symbol::default_for(GeometryType::Polygon, 0) };
     let solid = rustgis_map::fills::FillLayer { color: Some(red), pattern: rustgis_map::fills::FillPattern::Solid };
     // (The stacked one at the default size: a stack is always composited, and cut, as #2518 set.)
-    for (fills, opts) in [(vec![], small), (vec![solid], LegendOptions { size: 1.0, ..opts })] {
+    for (fills, opts) in [(vec![], small), (vec![solid], LegendOptions { size: 1.0, text_size: 9.0, ..opts })] {
         let stacked = !fills.is_empty();
         let map = shape_legend_map(GeometryType::Polygon, |l| {
             l.renderer = rustgis_map::Renderer::Single(outlined);
@@ -6583,7 +7584,16 @@ fn a_recorded_point_is_cut_at_its_box() {
     };
     let map = point_legend_map(|l| l.renderer = rustgis_map::Renderer::Single(s));
     let mut c = Canvas::recording(2100, 2100).unwrap();
-    let opts = LegendOptions { show_no_data: false, hide_other: false, exclude: &[], labels: &NO_LABELS, scale: 1e6, size: 1.0 };
+    let opts = LegendOptions {
+        show_no_data: false,
+        hide_other: false,
+        exclude: &[],
+        labels: &NO_LABELS,
+        scale: 1e6,
+        size: 1.0,
+        names: true,
+        text_size: 9.0,
+    };
     legend(&mut c, Rect::from_xywh(0.5, 0.5, 2099.0, 2099.0).unwrap(), &map, ("", 1), None, opts, 1.0);
     let (_, _, items) = c.into_drawing().unwrap().finish();
     let mut pm = Pixmap::new(2100, 2100).unwrap();
@@ -6707,7 +7717,16 @@ fn an_oversized_point_stays_in_its_row() {
         });
         let mut pm = Pixmap::new(2100, 2100).unwrap();
         pm.fill(tiny_skia::Color::WHITE);
-        let opts = LegendOptions { show_no_data: false, hide_other: false, exclude: &[], labels: &NO_LABELS, scale: 1e6, size: 1.0 };
+        let opts = LegendOptions {
+            show_no_data: false,
+            hide_other: false,
+            exclude: &[],
+            labels: &NO_LABELS,
+            scale: 1e6,
+            size: 1.0,
+            names: true,
+            text_size: 9.0,
+        };
         crate::canvas::with_canvas(&mut pm, |c| {
             legend(c, Rect::from_xywh(0.0, 0.0, 2100.0, 2100.0).unwrap(), &map, ("", 1), None, opts, 1.0)
         });
@@ -6736,7 +7755,16 @@ fn a_see_through_point_larger_than_the_canvas_covers_it_from_off_its_edge() {
     });
     let mut pm = Pixmap::new(300, 300).unwrap();
     pm.fill(tiny_skia::Color::WHITE);
-    let opts = LegendOptions { show_no_data: false, hide_other: false, exclude: &[], labels: &NO_LABELS, scale: 1e6, size: 1.0 };
+    let opts = LegendOptions {
+        show_no_data: false,
+        hide_other: false,
+        exclude: &[],
+        labels: &NO_LABELS,
+        scale: 1e6,
+        size: 1.0,
+        names: true,
+        text_size: 9.0,
+    };
     crate::canvas::with_canvas(&mut pm, |c| {
         legend(c, Rect::from_xywh(-50.0, -50.0, 2100.0, 2100.0).unwrap(), &map, ("", 1), None, opts, 1.0)
     });

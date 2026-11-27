@@ -1757,6 +1757,90 @@ fn a_legend_leaves_out_the_layers_unticked() {
     assert_eq!(left_out(&h), ["Cities"]);
 }
 
+/// A legend's Fit and Layer names in the Format pane: shown at their defaults on opening and
+/// sending nothing then, each change one undo step, picking the current fit none, and a column
+/// count past six set at six.
+#[test]
+fn a_legends_fit_and_layer_names_are_one_undo_step_each() {
+    use egui::accesskit::{Action, ActionData, ActionRequest, Role, Toggled};
+    use egui_kittest::kittest::{NodeT, Queryable};
+    use rustgis_engine::map::layout::{ElementKind, LayerNames, LegendFit};
+    let mut app = RustGisApp::with_sample();
+    app.run("layout.new", json!({"name": "Key", "template": "map"})).unwrap();
+    let li = app.session.active_layout.unwrap();
+    let legend = app.session.project.layouts[li].elements.iter().find(|e| matches!(e.kind, ElementKind::Legend { .. })).unwrap().id;
+    app.layout.selected = Some(legend);
+    let set = |app: &RustGisApp| match &app.session.project.layouts[li].element(legend).unwrap().kind {
+        ElementKind::Legend { fit, show_layer_names, columns, .. } => (*fit, *show_layer_names, *columns),
+        other => panic!("{other:?}"),
+    };
+    let mut fonts = false;
+    let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).build_ui_state(
+        move |ui, app: &mut RustGisApp| {
+            if !fonts {
+                crate::theme::install_fonts(ui.ctx(), &[], None);
+                fonts = true;
+                return;
+            }
+            with_format(app, ui);
+        },
+        app,
+    );
+    let depth = h.state().session.undo_depth();
+    h.run_steps(3);
+    // Opening the pane sends nothing, and shows a plain legend's defaults.
+    assert_eq!(h.state().session.undo_depth(), depth, "opening the pane changed nothing");
+    assert_eq!(set(h.state()), (LegendFit::Manual, LayerNames::Shown, 1));
+    let shown_fit = |h: &egui_kittest::Harness<'_, RustGisApp>| h.get_by_role_and_label(Role::ComboBox, "Fit").value();
+    let names_ticked =
+        |h: &egui_kittest::Harness<'_, RustGisApp>| h.get_by_role_and_label(Role::CheckBox, "Layer names").accesskit_node().toggled();
+    assert_eq!(shown_fit(&h).as_deref(), Some("Manual"));
+    assert_eq!(names_ticked(&h), Some(Toggled::True));
+    let pick = |h: &mut egui_kittest::Harness<'_, RustGisApp>, item: &str| {
+        h.get_by_role_and_label(Role::ComboBox, "Fit").click();
+        h.run_steps(2);
+        h.get_by_label(item).click();
+        h.run_steps(3);
+    };
+    pick(&mut h, "Manual");
+    assert_eq!(h.state().session.undo_depth(), depth, "the fit already set is no step");
+    pick(&mut h, "Shrink the text");
+    assert_eq!(set(h.state()).0, LegendFit::AdjustSize);
+    assert_eq!(h.state().session.undo_depth(), depth + 1, "one step");
+    assert_eq!(shown_fit(&h).as_deref(), Some("Shrink the text"));
+    pick(&mut h, "Add columns");
+    assert_eq!(set(h.state()).0, LegendFit::AdjustColumns);
+    assert_eq!(h.state().session.undo_depth(), depth + 2);
+    assert_eq!(shown_fit(&h).as_deref(), Some("Add columns"));
+    // Manual again, picked while another fit is set: a change, so one step.
+    pick(&mut h, "Manual");
+    assert_eq!(set(h.state()).0, LegendFit::Manual);
+    assert_eq!(h.state().session.undo_depth(), depth + 3);
+    assert_eq!(shown_fit(&h).as_deref(), Some("Manual"));
+    pick(&mut h, "Add columns, then shrink the text");
+    assert_eq!(set(h.state()).0, LegendFit::AdjustColumnsAndSize);
+    assert_eq!(h.state().session.undo_depth(), depth + 4);
+    assert_eq!(shown_fit(&h).as_deref(), Some("Add columns, then shrink the text"));
+    h.get_by_role_and_label(Role::CheckBox, "Layer names").click();
+    h.run_steps(3);
+    assert_eq!(set(h.state()).1, LayerNames::Hidden);
+    assert_eq!(h.state().session.undo_depth(), depth + 5);
+    assert_eq!(names_ticked(&h), Some(Toggled::False));
+    // Past the most columns, set as assistive technology does: kept at six, in one step.
+    let (node, tree) = h.get_by_role_and_label(Role::SpinButton, "Columns").accesskit_node().locate();
+    h.event(egui::Event::AccessKitActionRequest(ActionRequest {
+        action: Action::SetValue,
+        target_tree: tree,
+        target_node: node,
+        data: Some(ActionData::NumericValue(9.0)),
+    }));
+    h.run_steps(3);
+    assert_eq!(set(h.state()), (LegendFit::AdjustColumnsAndSize, LayerNames::Hidden, 6));
+    assert_eq!(h.state().session.undo_depth(), depth + 6);
+    h.state_mut().run("edit.undo", json!({})).unwrap();
+    assert_eq!(set(h.state()), (LegendFit::AdjustColumnsAndSize, LayerNames::Hidden, 1), "one step undoes the columns alone");
+}
+
 /// The layout view with the Format pane beside it, as the app draws them: after following
 /// what agents ran (`RustGisApp::logic`), and saving drafts at the end.
 fn with_format(app: &mut RustGisApp, ui: &mut egui::Ui) {

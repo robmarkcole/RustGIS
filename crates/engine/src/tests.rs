@@ -8444,6 +8444,10 @@ fn hostile_junk() -> Vec<Value> {
         json!({"kind": "dynamicText", "element": 1, "valign": "", "lineSpacing": f64::MAX, "case": "x".repeat(5000)}),
         json!({"kind": "scaleBar", "element": 1, "valign": "middle", "lineSpacing": "1e309", "case": null}),
         json!({"kind": "legend", "element": 1, "decimals": 2, "textSize": f64::INFINITY, "fit": "adjustDivision", "unitLabel": "m"}),
+        // A legend's fit and layer names: of the wrong kind, too long, or given to another kind.
+        json!({"kind": "legend", "element": 1, "fit": {}, "showLayerNames": [null], "columns": f64::MAX}),
+        json!({"kind": "legend", "element": 1, "fit": "x".repeat(5000), "showLayerNames": "true", "columns": -1}),
+        json!({"kind": "text", "element": 1, "fit": "adjustSize", "showLayerNames": false}),
         // A QGIS project and style whose web layer and scale range are junk.
         json!({"text": "<qgis><projectlayers><maplayer type=\"raster\" hasScaleBasedVisibilityFlag=\"1\" minScale=\"NaN\" maxScale=\"-1e308\"><datasource>type=xyz&amp;url=&amp;zmax=999</datasource><layername></layername><provider>wms</provider><pipe><rasterrenderer opacity=\"inf\"/></pipe></maplayer></projectlayers></qgis>"}),
         // A label class placed along lines, with junk the placement and style read after it.
@@ -12971,6 +12975,472 @@ fn a_project_with_a_damaged_text_block_opens_and_says_so() {
     assert!(said.iter().any(|n| n.contains("1 layout element(s) with a value out of range")), "{said:?}");
 }
 
+/// A legend's fit and layer names through layout.addElement and layout.update: names checked
+/// before anything changes, refused for other elements, null leaving them as they are, one undo
+/// step, saved with the layout; up to six columns; `fit` read by kind, a scale bar keeping its own.
+#[test]
+fn layout_legends_take_a_fit_and_layer_names() {
+    use rustgis_map::layout::{ElementKind, LayerNames, LegendFit, ScaleBarFit};
+    let mut s = world();
+    s.run("layout.new", &json!({"page": "a4", "orientation": "landscape", "template": "map"})).unwrap();
+    let legend = s.project.layouts[0].elements.iter().find(|e| e.kind.code() == "legend").unwrap().id;
+    let bar = s.project.layouts[0].elements.iter().find(|e| e.kind.code() == "scaleBar").unwrap().id;
+    let of = |s: &Session| match &s.project.layouts[0].element(legend).unwrap().kind {
+        ElementKind::Legend { fit, show_layer_names, columns, .. } => (*fit, *show_layer_names, *columns),
+        k => panic!("{k:?}"),
+    };
+    assert_eq!(of(&s), (LegendFit::Manual, LayerNames::Shown, 1));
+    let depth = s.undo_depth();
+    s.run("layout.update", &json!({"element": legend, "fit": "adjustColumnsAndSize", "showLayerNames": false, "columns": 6})).unwrap();
+    assert_eq!((of(&s), s.undo_depth()), ((LegendFit::AdjustColumnsAndSize, LayerNames::Hidden, 6), depth + 1));
+    s.run("edit.undo", &Value::Null).unwrap();
+    assert_eq!(of(&s), (LegendFit::Manual, LayerNames::Shown, 1));
+    s.run("edit.redo", &Value::Null).unwrap();
+    s.run("layout.update", &json!({"element": legend, "fit": " ADJUSTSIZE "})).unwrap();
+    assert_eq!(of(&s).0, LegendFit::AdjustSize);
+    s.run("layout.update", &json!({"element": legend, "fit": null, "showLayerNames": null, "columns": null})).unwrap();
+    assert_eq!(of(&s), (LegendFit::AdjustSize, LayerNames::Hidden, 6), "null leaves each as it is");
+    // The defaults are given back by naming them.
+    s.run("layout.update", &json!({"element": legend, "fit": "manual", "showLayerNames": true})).unwrap();
+    assert_eq!(of(&s), (LegendFit::Manual, LayerNames::Shown, 6));
+    s.run("layout.update", &json!({"element": legend, "fit": "adjustSize", "showLayerNames": false})).unwrap();
+    // A bad value changes nothing, not even the good values given with it.
+    let before = of(&s);
+    for bad in [
+        json!({"fit": "adjustFrame"}),
+        json!({"fit": "adjustWidth"}),
+        json!({"fit": 2}),
+        json!({"fit": ["manual"]}),
+        json!({"fit": ""}),
+        json!({"showLayerNames": "false"}),
+        json!({"showLayerNames": 0}),
+        json!({"showLayerNames": {}}),
+        json!({"columns": 7}),
+        json!({"columns": 0}),
+        json!({"columns": 2.5}),
+    ] {
+        let mut p = bad.clone();
+        p["element"] = json!(legend);
+        p["title"] = json!("Changed");
+        p["showNoData"] = json!(true);
+        assert!(s.run("layout.update", &p).is_err(), "{bad}");
+        assert_eq!(of(&s), before, "{bad}");
+        assert!(
+            matches!(&s.project.layouts[0].element(legend).unwrap().kind,
+                ElementKind::Legend { title, show_no_data: false, .. } if title != "Changed"),
+            "{bad}"
+        );
+    }
+    let err = s.run("layout.update", &json!({"element": legend, "fit": "adjustWidth"})).unwrap_err().to_string();
+    assert!(err.contains("fit is manual, adjustSize, adjustColumns or adjustColumnsAndSize"), "{err}");
+    let err = s.run("layout.update", &json!({"element": legend, "showLayerNames": "no"})).unwrap_err().to_string();
+    assert!(err.contains("showLayerNames is true or false"), "{err}");
+    // The scale bar keeps its own fit; a legend's name there is refused as before.
+    s.run("layout.update", &json!({"element": bar, "fit": "adjustWidth"})).unwrap();
+    assert!(matches!(s.project.layouts[0].element(bar).unwrap().kind, ElementKind::ScaleBar { fit: ScaleBarFit::AdjustWidth, .. }));
+    let err = s.run("layout.update", &json!({"element": bar, "fit": "adjustSize"})).unwrap_err().to_string();
+    assert!(err.contains("fit is adjustDivisionValue, adjustDivision or adjustWidth"), "{err}");
+    let err = s.run("layout.update", &json!({"element": bar, "showLayerNames": false})).unwrap_err().to_string();
+    assert!(err.contains("only legends take showLayerNames"), "{err}");
+    assert!(matches!(s.project.layouts[0].element(bar).unwrap().kind, ElementKind::ScaleBar { fit: ScaleBarFit::AdjustWidth, .. }));
+    // Other kinds: fit and showLayerNames refused, null not.
+    let title = s.project.layouts[0].elements.iter().find(|e| e.name == "Title").unwrap().id;
+    let err = s.run("layout.update", &json!({"element": title, "fit": "adjustSize"})).unwrap_err().to_string();
+    assert!(err.contains("only legends and scale bars take fit"), "{err}");
+    let err = s.run("layout.update", &json!({"element": title, "showLayerNames": true})).unwrap_err().to_string();
+    assert!(err.contains("only legends take showLayerNames"), "{err}");
+    let err = s.run("layout.update", &json!({"element": title, "showLayerNames": 1})).unwrap_err().to_string();
+    assert!(err.contains("showLayerNames is true or false"), "a wrong kind of value is said as such: {err}");
+    s.run("layout.update", &json!({"element": title, "fit": null, "showLayerNames": null})).unwrap();
+    let err = s.run("layout.addElement", &json!({"kind": "text", "fit": "manual"})).unwrap_err().to_string();
+    assert!(err.contains("only legends and scale bars take fit"), "{err}");
+    let err = s.run("layout.addElement", &json!({"kind": "northArrow", "showLayerNames": false})).unwrap_err().to_string();
+    assert!(err.contains("only legends take showLayerNames"), "{err}");
+    // Given beside a key the element does take, the refused one still changes nothing, the valid
+    // one included: no element moved or added, no undo step.
+    let (layout, depth) = (s.project.layouts[0].clone(), s.undo_depth());
+    for (refused, said) in [
+        (json!({"fit": "adjustSize"}), "only legends and scale bars take fit"),
+        (json!({"showLayerNames": false}), "only legends take showLayerNames"),
+    ] {
+        let mut update = refused.clone();
+        update["element"] = json!(title);
+        update["x"] = json!(42);
+        let err = s.run("layout.update", &update).unwrap_err().to_string();
+        assert!(err.contains(said), "{update}: {err}");
+        let mut added = refused.clone();
+        added["kind"] = json!("text");
+        added["x"] = json!(42);
+        let err = s.run("layout.addElement", &added).unwrap_err().to_string();
+        assert!(err.contains(said), "{added}: {err}");
+        assert_eq!((&s.project.layouts[0], s.undo_depth()), (&layout, depth), "{refused}");
+    }
+    // Added: the legend takes them; a bad one adds nothing.
+    let count = s.project.layouts[0].elements.len();
+    let id = s.run("layout.addElement", &json!({"kind": "legend", "fit": "adjustColumns", "showLayerNames": false, "columns": 4})).unwrap()
+        ["element"]
+        .as_u64()
+        .unwrap() as u32;
+    assert!(matches!(
+        s.project.layouts[0].element(id).unwrap().kind,
+        ElementKind::Legend { fit: LegendFit::AdjustColumns, show_layer_names: LayerNames::Hidden, columns: 4, .. }
+    ));
+    let plain = s.run("layout.addElement", &json!({"kind": "legend", "fit": null, "showLayerNames": null})).unwrap()["element"]
+        .as_u64()
+        .unwrap() as u32;
+    assert!(matches!(
+        s.project.layouts[0].element(plain).unwrap().kind,
+        ElementKind::Legend { fit: LegendFit::Manual, show_layer_names: LayerNames::Shown, columns: 1, .. }
+    ));
+    for bad in [
+        json!({"kind": "legend", "fit": "shrink"}),
+        json!({"kind": "legend", "showLayerNames": "true"}),
+        json!({"kind": "scaleBar", "fit": "adjustColumns"}),
+        json!({"kind": "colorbar", "fit": "adjustWidth"}),
+    ] {
+        assert!(s.run("layout.addElement", &bad).is_err(), "{bad}");
+    }
+    assert_eq!(s.project.layouts[0].elements.len(), count + 2);
+    let back: rustgis_map::layout::Layout = serde_json::from_value(serde_json::to_value(&s.project.layouts[0]).unwrap()).unwrap();
+    assert_eq!(back, s.project.layouts[0]);
+}
+
+/// The size in mm of the legend `asked` of the frame `frame` of the first layout in one to six
+/// columns, measured as the page and the notices measure it.
+fn legend_sizes(s: &mut Session, frame: u32, asked: &crate::render::layout::LegendAsked) -> [(f64, f64); 6] {
+    use rustgis_map::layout::ElementKind;
+    let (map, center, scale) = match &s.project.layouts[0].element(frame).unwrap().kind {
+        ElementKind::MapFrame { map, center, scale, .. } => (map.clone(), *center, *scale),
+        k => panic!("{k:?}"),
+    };
+    let map = s.project.maps.iter_mut().find(|m| m.name.eq_ignore_ascii_case(&map)).unwrap();
+    let at = crate::render::layout::frame_render_scale(map, center, scale);
+    crate::render::layout::legend_sizes_asked_mm(map, at, asked).unwrap()
+}
+
+/// What a legend says about its box since `mark`, its notices only.
+fn legend_said(s: &Session, mark: u64) -> Vec<String> {
+    s.notices_since(mark).iter().map(|n| n.text.clone()).filter(|n| n.starts_with("the legend")).collect()
+}
+
+/// A manual legend that overflows its box says so as it always has; the same legend set to a fit
+/// that makes it fit says nothing, made a little smaller still nothing; given back manual, it says
+/// so again, word for word.
+#[test]
+fn a_manual_legend_that_overflows_still_warns_and_a_fitted_one_does_not() {
+    use std::collections::BTreeMap;
+    let mut s = world();
+    s.run("layout.new", &json!({"page": "a4", "orientation": "landscape", "template": "map"})).unwrap();
+    let frame = s.project.layouts[0].first_frame().unwrap();
+    let labels = BTreeMap::new();
+    let at = |pt: f64| crate::render::layout::LegendAsked {
+        all_classes: true,
+        hide_other: false,
+        show_no_data: false,
+        layer_names: true,
+        text_size: pt,
+        exclude: &[],
+        labels: &labels,
+    };
+    // A box as wide as its rows at 9 points, and half-way between their heights at 9 and at 4.
+    let (big, small) = (legend_sizes(&mut s, frame, &at(9.0))[0], legend_sizes(&mut s, frame, &at(4.0))[0]);
+    assert!(big.1 > small.1 + 10.0, "rows enough to tell the sizes apart: {big:?} {small:?}");
+    let title = crate::render::layout::legend_title_mm(9.0);
+    let h = title + (big.1 + small.1) / 2.0;
+    let manual = "the legend lists more than fits its box: its last rows or the ends of long labels are left out";
+    let mark = s.notice_mark();
+    let added = json!({"kind": "legend", "allClasses": true, "columns": 1, "x": 10, "y": 10, "w": big.0 + 5.0, "h": h});
+    let id = s.run("layout.addElement", &added).unwrap()["element"].clone();
+    assert_eq!(legend_said(&s, mark), [manual]);
+    let mark = s.notice_mark();
+    s.run("layout.update", &json!({"element": id, "fit": "adjustSize"})).unwrap();
+    assert_eq!(legend_said(&s, mark), Vec::<String>::new(), "it fits at a smaller size");
+    // Under a fit its box is watched: smaller, it still fits, and says nothing.
+    let mark = s.notice_mark();
+    s.run("layout.update", &json!({"element": id, "h": h - (big.1 - small.1) / 4.0})).unwrap();
+    assert_eq!(legend_said(&s, mark), Vec::<String>::new());
+    let mark = s.notice_mark();
+    s.run("layout.update", &json!({"element": id, "fit": "manual"})).unwrap();
+    assert_eq!(legend_said(&s, mark), [manual]);
+    // And a fit given back says nothing again; under a fit, a box too small for it is said.
+    s.run("layout.update", &json!({"element": id, "fit": "adjustSize"})).unwrap();
+    let mark = s.notice_mark();
+    s.run("layout.update", &json!({"element": id, "h": title + small.1 / 2.0})).unwrap();
+    assert_eq!(
+        legend_said(&s, mark),
+        [
+            "the legend lists more than fits its box even with its text shrunk to 4 points: its last rows or the ends of long labels are left out"
+        ]
+    );
+}
+
+/// A fit that can't make the legend fit, even at its smallest text and in the most columns its box
+/// takes, says what it tried and what is lost, once.
+#[test]
+fn a_fit_that_cannot_make_a_legend_fit_says_so() {
+    use std::collections::BTreeMap;
+    let mut s = world();
+    s.run("layout.new", &json!({"page": "a4", "orientation": "landscape", "template": "map"})).unwrap();
+    let frame = s.project.layouts[0].first_frame().unwrap();
+    let labels = BTreeMap::new();
+    let at = |pt: f64| crate::render::layout::LegendAsked {
+        all_classes: true,
+        hide_other: false,
+        show_no_data: false,
+        layer_names: true,
+        text_size: pt,
+        exclude: &[],
+        labels: &labels,
+    };
+    let (big, small) = (legend_sizes(&mut s, frame, &at(9.0)), legend_sizes(&mut s, frame, &at(4.0)));
+    // A box less than half as tall as its rows in six columns at 4 points: no fit makes them fit.
+    let h = small[5].1 / 2.0;
+    assert!(h > 1.0, "{small:?}");
+    // The most columns that fit across a box `w` wide, at the sizes `sizes`.
+    let across = |sizes: &[(f64, f64); 6], w: f64| (1..=6).filter(|c| sizes[c - 1].0 <= w).max().unwrap_or(1);
+    // Two columns wide at a size: wider than two of its columns, narrower than three.
+    let two = |sizes: &[(f64, f64); 6]| (sizes[1].0 + sizes[2].0) / 2.0;
+    let one = (big[0].0 + big[1].0) / 2.0;
+    assert_eq!((across(&big, two(&big)), across(&small, two(&small)), across(&big, one)), (2, 2, 1), "{big:?} {small:?}");
+    for (fit, w, expected) in [
+        (
+            "adjustSize",
+            big[0].0 + 5.0,
+            "the legend lists more than fits its box even with its text shrunk to 4 points: its last rows or the ends of long labels are left out",
+        ),
+        ("adjustColumns", two(&big), "the legend lists more than fits its box even in 2 columns: its last rows are left out"),
+        (
+            "adjustColumnsAndSize",
+            two(&small),
+            "the legend lists more than fits its box even in 2 columns with its text shrunk to 4 points: its last rows are left out",
+        ),
+        (
+            "adjustColumns",
+            one,
+            "the legend lists more than fits its box even in one column: its last rows or the ends of long labels are left out",
+        ),
+    ] {
+        let mark = s.notice_mark();
+        s.run(
+            "layout.addElement",
+            &json!({"kind": "legend", "allClasses": true, "title": "", "fit": fit, "x": 10, "y": 10, "w": w, "h": h}),
+        )
+        .unwrap();
+        assert_eq!(legend_said(&s, mark), [expected], "{fit} in {w} mm");
+    }
+    // Set to three columns in a box narrower than three at 9 points, and as tall as three: no
+    // count of columns from three up fits across, so it stays in three, too wide, and says so.
+    let (w, h) = (two(&big), big[2].1 + 5.0);
+    assert!(big[2].0 > w && big[2].1 < h, "{big:?}");
+    let mark = s.notice_mark();
+    s.run(
+        "layout.addElement",
+        &json!({"kind": "legend", "allClasses": true, "title": "", "columns": 3, "fit": "adjustColumns", "x": 10, "y": 10, "w": w, "h": h}),
+    )
+    .unwrap();
+    assert_eq!(
+        legend_said(&s, mark),
+        [
+            "the legend's columns are wider than its box even in 3 columns: they close up, long labels run into the next, and the last column's past the box"
+        ],
+        "in {w} × {h} mm"
+    );
+}
+
+/// A report whose pages draw layouts says, as a PDF and as a PNG of its first page, the fitted
+/// legends on them that no longer fit, as a layout's export says them, each with its layout: two
+/// layouts' legends sharing an id are both named, and a layout on two pages is said once. While
+/// they fit, nothing is said.
+#[test]
+fn a_report_says_the_fitted_legends_on_its_layouts_that_no_longer_fit() {
+    use std::collections::BTreeMap;
+    let mut s = world();
+    for name in ["Atlas A", "Atlas B"] {
+        s.run("layout.new", &json!({"name": name, "page": "a4", "orientation": "landscape", "template": "map"})).unwrap();
+    }
+    let frame = s.project.layouts[0].first_frame().unwrap();
+    let labels = BTreeMap::new();
+    let at = |pt: f64| crate::render::layout::LegendAsked {
+        all_classes: true,
+        hide_other: false,
+        show_no_data: false,
+        layer_names: true,
+        text_size: pt,
+        exclude: &[],
+        labels: &labels,
+    };
+    let point = r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[2.35,48.85]}}]}"#;
+    let added = json!({"fileName": "extra.geojson", "text": point, "name": "Extra"});
+    // Its rows in one column at 4 points, and at 9, without the layer and with it.
+    let (small, big) = (legend_sizes(&mut s, frame, &at(4.0))[0], legend_sizes(&mut s, frame, &at(9.0))[0]);
+    s.run("layer.addDataText", &added).unwrap();
+    let more = legend_sizes(&mut s, frame, &at(4.0))[0];
+    s.run("layer.remove", &json!({"layer": "Extra"})).unwrap();
+    assert!(more.1 > small.1, "the layer adds a row: {small:?} {more:?}");
+    // Shrunk, its rows fit without the layer, and not with it.
+    let title = crate::render::layout::legend_title_mm(9.0);
+    let (w, h) = (big.0.max(more.0) + 5.0, title + (small.1 + more.1) / 2.0);
+    let mut ids = Vec::new();
+    for (layout, name) in [("Atlas A", "Key A"), ("Atlas B", "Key B")] {
+        let legend = json!({"layout": layout, "kind": "legend", "allClasses": true, "fit": "adjustSize", "x": 10, "y": 10, "w": w, "h": h});
+        let id = s.run("layout.addElement", &legend).unwrap()["element"].as_u64().unwrap() as u32;
+        s.run("layout.update", &json!({"layout": layout, "element": id, "name": name})).unwrap();
+        ids.push(id);
+    }
+    assert_eq!(ids[0], ids[1], "the two layouts' legends share an id");
+    let id = ids[0];
+    s.run("report.new", &json!({"layer": "Countries", "name": "Atlas", "fields": ["name"], "where": "name LIKE 'F%'"})).unwrap();
+    for layout in ["Atlas A", "Atlas B", "Atlas A"] {
+        s.run("report.existingTemplate", &json!({"report": "Atlas", "layout": layout})).unwrap();
+    }
+    // What a legend's fit in its box is said to lose by the report as a PDF and as a PNG.
+    let said = |s: &mut Session| -> [Vec<String>; 2] {
+        [true, false].map(|pdf| {
+            let mark = s.notice_mark();
+            crate::cmd::report::report_bytes(s, 0, 48.0, pdf).unwrap();
+            s.notices_since(mark).iter().map(|n| n.text.clone()).filter(|n| n.contains("the legend lists")).collect()
+        })
+    };
+    assert_eq!(said(&mut s), [Vec::<String>::new(), Vec::new()], "they fit");
+    s.run("layer.addDataText", &added).unwrap();
+    let shrunk = "the legend lists more than fits its box even with its text shrunk to 4 points: its last rows or the ends of long labels are left out";
+    let [pdf, png] = said(&mut s);
+    assert_eq!(pdf, [format!("2 legends (\"Key A\" ({id}) in \"Atlas A\", \"Key B\" ({id}) in \"Atlas B\"): {shrunk}")]);
+    // A PNG is the report's first page: the first layout.
+    assert_eq!(png, [format!("Legend \"Key A\" ({id}) in \"Atlas A\": {shrunk}")]);
+}
+
+/// A legend whose fit made it fit when it was set, and no longer does once a layer is added to its
+/// map, says so at export, once an export, in the words setting the fit gave, after its name and
+/// id: as PNG, PDF and SVG, and as the page the Assistant is shown. Two that fail alike are one
+/// notice, counted and both named; one failing otherwise is a notice of its own; a long name is
+/// shortened, and an empty one, quotes or a line break in one keep the notice whole. While a legend
+/// still fits, an export says nothing of it; nor, as before, does a manual legend's.
+#[test]
+fn a_fitted_legend_that_no_longer_fits_says_so_at_export() {
+    use std::collections::BTreeMap;
+    let mut s = world();
+    s.run("layout.new", &json!({"page": "a4", "orientation": "landscape", "template": "map"})).unwrap();
+    let frame = s.project.layouts[0].first_frame().unwrap();
+    let labels = BTreeMap::new();
+    let at = |pt: f64| crate::render::layout::LegendAsked {
+        all_classes: true,
+        hide_other: false,
+        show_no_data: false,
+        layer_names: true,
+        text_size: pt,
+        exclude: &[],
+        labels: &labels,
+    };
+    let point = r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[2.35,48.85]}}]}"#;
+    let added = json!({"fileName": "extra.geojson", "text": point, "name": "Extra"});
+    // Its rows at 4 points, and at 9, without the layer and with it.
+    let (small, big) = (legend_sizes(&mut s, frame, &at(4.0)), legend_sizes(&mut s, frame, &at(9.0)));
+    s.run("layer.addDataText", &added).unwrap();
+    let more = legend_sizes(&mut s, frame, &at(4.0))[0];
+    s.run("layer.remove", &json!({"layer": "Extra"})).unwrap();
+    assert_eq!(legend_sizes(&mut s, frame, &at(4.0)), small, "the layer gone, its rows are as they were");
+    let small = small[0];
+    assert!(more.1 > small.1, "the layer adds a row: {small:?} {more:?}");
+    // As wide as any of them in one column, and as tall as its title and half-way between its rows
+    // at 4 points without the layer and with it: shrunk, they fit without it, and not with it.
+    let title = crate::render::layout::legend_title_mm(9.0);
+    let (w, h) = (big[0].0.max(more.0) + 5.0, title + (small.1 + more.1) / 2.0);
+    // Too narrow for two columns at 9 points, so adding columns leaves it in one, too short.
+    assert!(big[1].0 > w && big[0].1 > h, "{big:?}");
+    let dir = std::env::temp_dir().join(format!("rustgis-unfitted-legend-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // What a legend's fit in its box is said to lose since `mark`, as it is set or at export.
+    let fit_said = |s: &Session, mark: u64| -> Vec<String> {
+        let lost = |n: &str| n.contains("the legend lists") || n.contains("the legend's columns");
+        s.notices_since(mark).iter().map(|n| n.text.clone()).filter(|n| lost(n)).collect()
+    };
+    // What each export says of the legends' boxes.
+    let exports = |s: &mut Session| -> Vec<(&'static str, Vec<String>)> {
+        let mut told = Vec::new();
+        for ext in ["png", "pdf", "svg"] {
+            let mark = s.notice_mark();
+            s.run("layout.export", &json!({"path": dir.join(format!("page.{ext}")), "dpi": 48})).unwrap();
+            told.push((ext, fit_said(s, mark)));
+        }
+        let mark = s.notice_mark();
+        crate::cmd::layout::layout_png(s, 0, 48.0, None).unwrap();
+        told.push(("view", fit_said(s, mark)));
+        told
+    };
+    // The exports that said something of them.
+    let told = |s: &mut Session| exports(s).into_iter().filter(|(_, said)| !said.is_empty()).collect::<Vec<_>>();
+    // A legend added in the box `w` × `h` under `fit`, named `name`: its id.
+    let add = |s: &mut Session, fit: &str, (w, h): (f64, f64), name: &str| {
+        let legend = json!({"kind": "legend", "allClasses": true, "fit": fit, "x": 10, "y": 10, "w": w, "h": h});
+        let id = s.run("layout.addElement", &legend).unwrap()["element"].as_u64().unwrap() as u32;
+        s.run("layout.update", &json!({"element": id, "name": name})).unwrap();
+        id
+    };
+    // A long name with quotes and a line break, shortened to its first 100 characters.
+    let long = format!("Key \"A\"\nsecond line {}", "x".repeat(120));
+    let shortened = format!("{}…", long.chars().take(100).collect::<String>());
+    let mark = s.notice_mark();
+    let a = add(&mut s, "adjustSize", (w, h), &long);
+    assert_eq!(fit_said(&s, mark), Vec::<String>::new(), "it fits as added");
+    let said = told(&mut s);
+    assert!(said.is_empty(), "still fitting, its exports say nothing of it: {said:?}");
+    s.run("layer.addDataText", &added).unwrap();
+    let shrunk = "the legend lists more than fits its box even with its text shrunk to 4 points: its last rows or the ends of long labels are left out";
+    for (ext, said) in exports(&mut s) {
+        assert_eq!(said, [format!("Legend \"{shortened}\" ({a}): {shrunk}")], "{ext}");
+    }
+    // A second that fails alike, its name empty; a third that fails otherwise; a fourth that fits.
+    let b = add(&mut s, "adjustSize", (w, h), "");
+    // A command given an empty name keeps the one it had; a hand-edited file can hold one.
+    s.project.layouts[0].elements.iter_mut().find(|e| e.id == b).unwrap().name.clear();
+    let c = add(&mut s, "adjustColumns", (w, h), "Key C");
+    add(&mut s, "adjustSize", (w, big[0].1 + title + 20.0), "Roomy");
+    let one = "the legend lists more than fits its box even in one column: its last rows or the ends of long labels are left out";
+    for (ext, said) in exports(&mut s) {
+        assert_eq!(
+            said,
+            [format!("2 legends (\"{shortened}\" ({a}), \"\" ({b})): {shrunk}"), format!("Legend \"Key C\" ({c}): {one}")],
+            "{ext}"
+        );
+    }
+    // Made manual, their exports say nothing of their boxes, as before legends had a fit.
+    for id in [a, b, c] {
+        s.run("layout.update", &json!({"element": id, "fit": "manual"})).unwrap();
+    }
+    let said = told(&mut s);
+    assert!(said.is_empty(), "manual legends' exports: {said:?}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A hand-edited project whose legend has a fit or layer-names value of the wrong kind or not a
+/// name opens, the value repaired, and says so; columns past three are kept.
+#[test]
+fn a_project_with_a_damaged_legend_fit_opens_and_says_so() {
+    use rustgis_map::layout::{ElementKind, LayerNames, LegendFit};
+    let fixture = include_str!("../../../schema/fixtures/layout_legend_fit.rgis");
+    let fitted = |p: &crate::Project| match &p.layouts[0].element(2).unwrap().kind {
+        ElementKind::Legend { fit, show_layer_names, columns, .. } => (*fit, *show_layer_names, *columns),
+        k => panic!("{k:?}"),
+    };
+    let notices = |p: &mut crate::Project| -> Vec<String> {
+        p.take_read_notices(&[crate::project::ReadPart::Layouts]).iter().map(|n| n.english()).collect()
+    };
+    let mut clean = crate::Project::from_json(fixture).unwrap();
+    assert_eq!(fitted(&clean), (LegendFit::AdjustColumns, LayerNames::Hidden, 4));
+    let said = notices(&mut clean);
+    assert!(!said.iter().any(|n| n.contains("value out of range")), "{said:?}");
+    let edited = fixture.replace(
+        "\"columns\": 4, \"fit\": \"adjustColumns\", \"show_layer_names\": false",
+        "\"columns\": 5, \"fit\": \"adjustFrame\", \"show_layer_names\": \"no\"",
+    );
+    assert_ne!(edited, fixture);
+    let mut damaged = crate::Project::from_json(&edited).unwrap();
+    assert_eq!(fitted(&damaged), (LegendFit::Manual, LayerNames::Shown, 5));
+    let said = notices(&mut damaged);
+    assert!(said.iter().any(|n| n.contains("1 layout element(s) with a value out of range")), "{said:?}");
+}
+
 /// A scale bar's details through layout.addElement and layout.update: names and numbers checked
 /// before anything changes, refused for other elements, one undo step, saved with the layout.
 #[test]
@@ -13138,11 +13608,14 @@ fn layout_scale_bars_take_their_details() {
         assert_eq!(s.project.layouts[0].elements.len(), count, "{bad}");
     }
     let arrow = find(&s, "northArrow").id;
-    for bad in [json!({"unitLabel": null}), json!({"fit": "adjustWidth"})] {
+    // A fit is a legend's too, so another kind is told both take it.
+    for (bad, said) in
+        [(json!({"unitLabel": null}), "only scale bars"), (json!({"fit": "adjustWidth"}), "only legends and scale bars take fit")]
+    {
         let mut p = bad.clone();
         p["element"] = json!(arrow);
         let err = s.run("layout.update", &p).unwrap_err();
-        assert!(err.contains("only scale bars"), "{err}");
+        assert!(err.contains(said), "{err}");
     }
     // Decimals, which a chart takes too, are refused for the other elements still.
     assert!(s.run("layout.update", &json!({"element": arrow, "decimals": 2})).is_err());
@@ -13160,6 +13633,115 @@ fn layout_scale_bars_take_their_details() {
     let _ = std::fs::remove_file(&out);
     let back: rustgis_map::layout::Layout = serde_json::from_str(&serde_json::to_string(&s.project.layouts[0]).unwrap()).unwrap();
     assert_eq!(back, s.project.layouts[0]);
+}
+
+/// 64-bit FNV-1a over one byte slice.
+#[cfg(not(target_arch = "wasm32"))]
+fn fnv_bytes(b: &[u8]) -> u64 {
+    b.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3))
+}
+
+/// What [`legend_notices_and_publications_are_as_before`] heard and laid out before legends had a
+/// fit or more than three columns, in the built-in face: what each of its legends was told, in
+/// turn.
+#[cfg(not(target_arch = "wasm32"))]
+const PINNED_LEGEND_NOTICES: [u64; 6] = [
+    0x214b_b413_045f_6d4e, // 1: two columns, too narrow and too short
+    0x7daa_504e_46ff_6418, // 2: one column, too narrow
+    0x98c3_7e4b_aff1_2feb, // 3: text of 20 points
+    0x66ee_667f_12a6_c320, // 4: three columns that fit, then too short
+    0x744f_5513_44ff_865e, // 5: no-data rows, what the frame draws
+    0x7010_ddb2_f99e_6f4a, // 6: three columns, too narrow only
+];
+/// The answer and the layout of each of its publications, in turn.
+#[cfg(not(target_arch = "wasm32"))]
+const PINNED_PUBLICATIONS: [u64; 3] = [
+    0x975c_564c_cd22_6e09, // the default: two columns
+    0xd042_13d6_dfca_489f, // a panel: one column
+    0xb6ba_991c_c801_6290, // a thesis's half page: three columns
+];
+
+/// What main says about a legend's fit in its box, word for word, as added and when made 12 mm
+/// tall, case by case, and how `layout.publication` lays out the sample, its answer and its layout
+/// (the legend, its column count and box included), for a legend in two, one and three columns,
+/// before legends had a fit or more than three columns; in the built-in face, in a process of its
+/// own.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn legend_notices_and_publications_are_as_before() {
+    use rustgis_map::layout::ElementKind;
+    if std::env::var_os("RUSTGIS_LEGEND_NOTICE_PIN_CHILD").is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::legend_notices_and_publications_are_as_before", "--nocapture"])
+            .env("RUSTGIS_LEGEND_NOTICE_PIN_CHILD", "1")
+            .env("RUSTGIS_BUILTIN_FONTS", "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"), "the test didn't run in the child process");
+        return;
+    }
+    // Each hash that isn't its pinned one, named, with both values and all of them to pin.
+    let mismatches = |what: &str, got: &[(String, u64)], pinned: &[u64]| {
+        let mut wrong: Vec<String> = got
+            .iter()
+            .zip(pinned)
+            .filter(|((_, g), p)| g != *p)
+            .map(|((name, g), p)| format!("{what} {name}: got {g:#018x}, pinned {p:#018x}"))
+            .collect();
+        if got.len() != pinned.len() || !wrong.is_empty() {
+            let all: Vec<String> = got.iter().map(|(name, g)| format!("{g:#018x}, // {name}")).collect();
+            wrong.push(format!("{what}s, {} of {} pinned, all:\n{}", got.len(), pinned.len(), all.join("\n")));
+        }
+        wrong
+    };
+    let mut s = world();
+    s.run("layout.new", &json!({"name": "Notices", "page": "a4", "orientation": "landscape"})).unwrap();
+    let mut said = Vec::new();
+    for (i, p) in [
+        // Too narrow and too short in two columns.
+        json!({"kind": "legend", "columns": 2, "allClasses": true, "w": 30, "h": 20}),
+        // One column, too narrow.
+        json!({"kind": "legend", "columns": 1, "allClasses": true, "w": 15, "h": 80}),
+        json!({"kind": "legend", "textSize": 20, "allClasses": true, "w": 60, "h": 30}),
+        // Fits as added: said only once it is made 12 mm tall.
+        json!({"kind": "legend", "columns": 3, "allClasses": true, "w": 200, "h": 150}),
+        json!({"kind": "legend", "showNoData": true, "w": 40, "h": 10}),
+        // Too narrow only, in three columns, as added.
+        json!({"kind": "legend", "columns": 3, "allClasses": true, "w": 20, "h": 150}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mark = s.notice_mark();
+        let id = s.run("layout.addElement", &p).unwrap()["element"].clone();
+        let added: Vec<_> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+        let mark = s.notice_mark();
+        s.run("layout.update", &json!({"element": id, "h": 12})).unwrap();
+        let updated: Vec<_> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+        if i == 5 {
+            assert!(added.len() == 1 && added.iter().all(|n| n.contains("close up")), "{added:?}");
+        }
+        said.push((format!("case {} {p}", i + 1), fnv_bytes(format!("{p}: {added:?} {updated:?}\n").as_bytes())));
+    }
+    let mut laid = Vec::new();
+    let mut columns = Vec::new();
+    for p in [json!({}), json!({"style": "panel"}), json!({"profile": "thesis-half"})] {
+        let mut s = world();
+        let r = s.run("layout.publication", &p).unwrap();
+        let layout = s.project.layouts.last().unwrap();
+        columns.extend(layout.elements.iter().find_map(|e| match &e.kind {
+            ElementKind::Legend { columns, .. } => Some(*columns),
+            _ => None,
+        }));
+        laid.push((format!("publication {p}"), fnv_bytes(format!("{r}\n{}\n", serde_json::to_string(layout).unwrap()).as_bytes())));
+    }
+    // The sample's publications lay their legend in two columns (the default), one (a panel) and
+    // three (a thesis's half page).
+    assert_eq!(columns, [2, 1, 3]);
+    let mut wrong = mismatches("notice", &said, &PINNED_LEGEND_NOTICES);
+    wrong.extend(mismatches("publication", &laid, &PINNED_PUBLICATIONS));
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
 /// A publication's scale bar box is measured from every setting its bar has (#1379), as the
@@ -15918,9 +16500,9 @@ fn more_columns_win_by_showing_more_or_covering_less() {
     assert!(!more_columns_win((1.0, 0.0), (1.0, 0.0)), "nothing to gain");
 }
 
-/// `"columns"` on a legend: given and changed, refused outside 1 to 3 and on anything else.
+/// `"columns"` on a legend: given and changed, refused outside 1 to 6 and on anything else.
 #[test]
-fn a_legend_takes_columns_from_one_to_three() {
+fn a_legend_takes_columns_from_one_to_six() {
     use rustgis_map::layout::ElementKind;
     let mut s = Session::new(Project::default());
     s.run("layout.new", &json!({"template": "map"})).unwrap();
@@ -15937,9 +16519,18 @@ fn a_legend_takes_columns_from_one_to_three() {
     assert_eq!(columns(&s, id), 3);
     s.run("layout.update", &json!({"element": id, "title": "Key"})).unwrap();
     assert_eq!(columns(&s, id), 3, "another change leaves them");
-    for bad in [json!(0), json!(4), json!(1.5), json!("2"), json!(-1)] {
-        assert!(s.run("layout.update", &json!({"element": id, "columns": bad})).unwrap_err().contains("1 to 3"), "{bad}");
-        assert!(s.run("layout.addElement", &json!({"kind": "legend", "columns": bad})).unwrap_err().contains("1 to 3"), "{bad}");
+    let six = s.run("layout.addElement", &json!({"kind": "legend", "columns": 6})).unwrap();
+    assert_eq!(columns(&s, six["element"].as_u64().unwrap()), 6);
+    for n in [4, 5, 6] {
+        s.run("layout.update", &json!({"element": id, "columns": n})).unwrap();
+        assert_eq!(columns(&s, id), n as usize);
+    }
+    s.run("layout.update", &json!({"element": id, "columns": 3})).unwrap();
+    for bad in [json!(0), json!(7), json!(1.5), json!("2"), json!(-1)] {
+        let err = s.run("layout.update", &json!({"element": id, "columns": bad})).unwrap_err();
+        assert!(err.contains("columns is a whole number from 1 to 6"), "{bad}: {err}");
+        let err = s.run("layout.addElement", &json!({"kind": "legend", "columns": bad})).unwrap_err();
+        assert!(err.contains("columns is a whole number from 1 to 6"), "{bad}: {err}");
     }
     assert_eq!(columns(&s, id), 3);
     let err = s.run("layout.addElement", &json!({"kind": "northArrow", "columns": 2})).unwrap_err();
@@ -15953,7 +16544,7 @@ fn a_legend_takes_columns_from_one_to_three() {
     let old: ElementKind = serde_json::from_str(r#"{"Legend":{"frame":1,"title":"L"}}"#).unwrap();
     assert!(matches!(old, ElementKind::Legend { columns: 1, .. }), "{old:?}");
     // A value out of range, from a file edited by hand, is saved as the nearest.
-    for (given, kept) in [(0, 1), (999, 3)] {
+    for (given, kept) in [(0, 1), (5, 5), (999, 6)] {
         let mut l = s.project.layouts[0].clone();
         let Some(ElementKind::Legend { columns, .. }) = l.element_mut(id as u32).map(|e| &mut e.kind) else { panic!() };
         *columns = given;

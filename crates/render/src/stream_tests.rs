@@ -559,6 +559,8 @@ fn layout_export_keeps_all_drawn_legend_classes() {
             labels: Default::default(),
             color: None,
             text_size: rustgis_map::layout::LEGEND_TEXT_PT,
+            fit: rustgis_map::layout::LegendFit::Manual,
+            show_layer_names: rustgis_map::layout::LayerNames::Shown,
         },
     );
     let expected = layout::render(&page, &mut [base.clone()], 96.0, &layout::PageInfo::default()).unwrap();

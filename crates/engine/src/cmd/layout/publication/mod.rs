@@ -1088,7 +1088,7 @@ pub(in crate::cmd::layout) fn publication(s: &mut Session, p: &Value) -> CmdResu
         if context_in_legend { Vec::new() } else { legend_context(s.map(), center, scale, (fw, fh)) }
     };
     let mut context = context_at(s, center, scale);
-    let mut sizes = crate::render::layout::legend_sizes_with_no_data_mm(
+    let mut sizes = crate::render::layout::legend_sizes_in_columns_mm::<PUBLICATION_LEGEND_COLUMNS>(
         s.map_mut(),
         render_scale,
         false,
@@ -1276,7 +1276,7 @@ pub(in crate::cmd::layout) fn publication(s: &mut Session, p: &Value) -> CmdResu
     let (locator_side, arrow_size) = (size_of(Surround::Locator).map(|x| x.0), size_of(Surround::Arrow));
     // The fewest columns from `from` up in which the surrounds group in a band around `clip`, with
     // their places; the scale bar's box `scale_bar` is the one at the scale tried.
-    let grouped = |clip: Rect, from: usize, known: &[(f64, f64); MAX_LEGEND_COLUMNS], scale_bar: (f64, f64)| {
+    let grouped = |clip: Rect, from: usize, known: &[(f64, f64); PUBLICATION_LEGEND_COLUMNS], scale_bar: (f64, f64)| {
         (from..known.len()).find_map(|i| {
             bands_around(clip)
                 .iter()
@@ -1319,14 +1319,14 @@ pub(in crate::cmd::layout) fn publication(s: &mut Session, p: &Value) -> CmdResu
             // cut from it: a move is a translation on the page. So the search draws the map once per
             // scale it tries (at most four times), not once per place. Its legend is measured at
             // that scale, once, and those sizes are the ones laid out.
-            type Drawn = (f64, Option<(u32, u32, Vec<bool>)>, Option<[(f64, f64); MAX_LEGEND_COLUMNS]>, Vec<String>);
+            type Drawn = (f64, Option<(u32, u32, Vec<bool>)>, Option<[(f64, f64); PUBLICATION_LEGEND_COLUMNS]>, Vec<String>);
             let mut drawn: Option<Drawn> = None;
             let (mut chosen, mut chosen_context) = (known, context.clone());
             let mut unknown_at: Option<f64> = None;
             // Moved frames drawn on their own (below), by scale and move: a pass with the veil
             // tries the same moves as the one before it.
             // With the legend's context judged there, and its sizes with that context.
-            type Own = ((f64, f64, f64), (u32, u32, Vec<bool>), Vec<String>, [(f64, f64); MAX_LEGEND_COLUMNS]);
+            type Own = ((f64, f64, f64), (u32, u32, Vec<bool>), Vec<String>, [(f64, f64); PUBLICATION_LEGEND_COLUMNS]);
             let mut own_drawn: Vec<Own> = Vec::new();
             // A figure keeps its scale: its size is fixed, and a smaller scale costs it the most.
             for (factor, veil) in passes.into_iter().filter(|(factor, veil)| (!*veil || continuous) && (*factor == 1.0 || sheet)) {
@@ -1370,7 +1370,7 @@ pub(in crate::cmd::layout) fn publication(s: &mut Session, p: &Value) -> CmdResu
                         } else {
                             // A legend that can't be measured there (a source that can't be read
                             // through) leaves that scale untried too, which is said.
-                            let measured = crate::render::layout::legend_sizes_with_no_data_mm(
+                            let measured = crate::render::layout::legend_sizes_in_columns_mm::<PUBLICATION_LEGEND_COLUMNS>(
                                 s.map_mut(),
                                 render_scale,
                                 false,
@@ -1391,7 +1391,7 @@ pub(in crate::cmd::layout) fn publication(s: &mut Session, p: &Value) -> CmdResu
                     drawn = Some((tried, whole_frame, here, here_context));
                 }
                 let Some((_, Some(whole_frame), Some(here), here_context)) = &drawn else { continue };
-                let need = |sizes: &[(f64, f64); MAX_LEGEND_COLUMNS], room: (f64, f64)| {
+                let need = |sizes: &[(f64, f64); PUBLICATION_LEGEND_COLUMNS], room: (f64, f64)| {
                     sizes.iter().position(|size| whole(*size).0 <= room.0 && whole(*size).1 <= room.1)
                 };
                 // Of the places with the fewest columns, the one leaving the extent nearest the
@@ -1408,7 +1408,7 @@ pub(in crate::cmd::layout) fn publication(s: &mut Session, p: &Value) -> CmdResu
                     (u32, u32, Vec<bool>),
                     (f64, f64),
                     Option<Rect>,
-                    [(f64, f64); MAX_LEGEND_COLUMNS],
+                    [(f64, f64); PUBLICATION_LEGEND_COLUMNS],
                     Vec<String>,
                 );
                 let mut fits: Vec<Fit> = Vec::new();
@@ -1463,7 +1463,7 @@ pub(in crate::cmd::layout) fn publication(s: &mut Session, p: &Value) -> CmdResu
                             *here
                         } else {
                             let at_there = crate::render::layout::frame_render_scale(s.map(), there, tried);
-                            let measured = crate::render::layout::legend_sizes_with_no_data_mm(
+                            let measured = crate::render::layout::legend_sizes_in_columns_mm::<PUBLICATION_LEGEND_COLUMNS>(
                                 s.map_mut(),
                                 at_there,
                                 false,
@@ -1860,7 +1860,7 @@ pub(in crate::cmd::layout) fn publication(s: &mut Session, p: &Value) -> CmdResu
         let bar_need = bar.as_deref().map_or(0.0, |title| colorbar_mm(title, iw));
         let bar_fit = colorbar_fit(bar_need, ih, ch + bar_gap, over_map);
         let rows_h = (ih - bar_fit - if bar.is_some() { bar_gap } else { 0.0 }).max(0.0);
-        warnings.extend(legend_fit_warnings(legend_cols, (cw, ch), (iw, rows_h)).into_iter().map(String::from));
+        warnings.extend(legend_fit_warnings(LegendFit::Manual, legend_cols, overflows((cw, ch), (iw, rows_h))));
         let short = bar_need > bar_fit + LEGEND_FIT_MM;
         // In a column the colorbar takes the column's width, as its rows do.
         if let Some(layer) = bar.as_deref().filter(|_| (base_w > iw + LEGEND_FIT_MM && !legend_in_column) || short) {
@@ -1886,6 +1886,8 @@ pub(in crate::cmd::layout) fn publication(s: &mut Session, p: &Value) -> CmdResu
                     labels: Default::default(),
                     color: None,
                     text_size: legend_pt,
+                    fit: LegendFit::Manual,
+                    show_layer_names: LayerNames::Shown,
                 },
             );
         }

@@ -251,6 +251,14 @@ pub(in crate::cmd::layout) fn add_element(s: &mut Session, p: &Value) -> CmdResu
     if kind != "legend" && p.get("columns").is_some_and(|v| !v.is_null()) {
         return Err(ONLY_LEGEND_COLUMNS.into());
     }
+    // A value that isn't true or false is refused on any kind first, as the legend's arm would.
+    if legend_names_param(p)?.is_some() && kind != "legend" {
+        return Err(ONLY_LEGEND_NAMES.into());
+    }
+    // A legend and a scale bar each read `fit` as their own (their names don't overlap).
+    if !matches!(kind, "legend" | "scaleBar") && gives(p, "fit") {
+        return Err(ONLY_FIT.into());
+    }
     // A grid's "labels" is a bool and a legend's an object (read with it); on any other kind, or as
     // anything else on a grid, it is refused rather than left unread.
     match p.get("labels").filter(|v| !v.is_null()) {
@@ -352,6 +360,8 @@ pub(in crate::cmd::layout) fn add_element(s: &mut Session, p: &Value) -> CmdResu
             };
             let text_size =
                 text_size_param(p, "textSize", rustgis_map::layout::LEGEND_TEXT_PT)?.unwrap_or(rustgis_map::layout::LEGEND_TEXT_PT);
+            let fit = legend_fit_param(p)?.unwrap_or_default();
+            let show_layer_names = legend_names_param(p)?.map_or(LayerNames::Shown, LayerNames::from_shown);
             (
                 "Legend",
                 place(p, l, (pw - 70.0, 45.0, 60.0, 80.0))?,
@@ -366,6 +376,8 @@ pub(in crate::cmd::layout) fn add_element(s: &mut Session, p: &Value) -> CmdResu
                     labels,
                     color: ink,
                     text_size,
+                    fit,
+                    show_layer_names,
                 },
             )
         }
