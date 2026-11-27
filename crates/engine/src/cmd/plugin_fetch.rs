@@ -547,9 +547,15 @@ const MAX_EXPIRED: usize = 1024;
 /// asked for: the same address (spaces around it set aside), and every other key it gave that
 /// the front end passes on, with the same value. What the front end leaves out or sets itself,
 /// and what the app adds of its own (`id`), don't count. Another import of the same address
-/// (other columns, another name) isn't it.
+/// (other columns, another name) isn't it. A byte range of a GRIB file (`"bytes"`) comes back as
+/// the address the front end downloads, with the range marked in it
+/// ([`crate::cmd::layer::ranged_address`]).
 fn asked_by(asked: &Value, params: &Value) -> bool {
     let Some(o) = asked.as_object() else { return false };
+    let range = match asked.get("bytes").and_then(Value::as_array).map(Vec::as_slice) {
+        Some([a, b]) => a.as_u64().zip(b.as_u64()),
+        _ => None,
+    };
     // What the front end passes on to a download's own `layer.addUrl` (the desktop app's
     // `ui.addUrl`): only these come back, and must come back the same. Any other key (`whole`,
     // `cog`, `dates`, a `name` that isn't text…) it leaves out. `zoom` it passes on, but may change
@@ -562,7 +568,14 @@ fn asked_by(asked: &Value, params: &Value) -> bool {
         _ => false,
     };
     let given = o.iter().all(|(k, v)| match k.as_str() {
-        "url" => v.as_str().map(str::trim) == params["url"].as_str().map(str::trim),
+        "url" => {
+            let (u, given) = (v.as_str(), params["url"].as_str().map(str::trim));
+            // The desktop app marks a range on the address as asked, spaces and all; it may come
+            // marked on it trimmed too.
+            u.map(str::trim) == given
+                || u.zip(range)
+                    .is_some_and(|(u, r)| [u, u.trim()].iter().any(|u| given == Some(crate::cmd::layer::ranged_address(u, r).trim())))
+        }
         _ if passed_on(k, v) => params.get(k) == Some(v),
         _ => true,
     });
@@ -1329,6 +1342,28 @@ mod tests {
         assert!(asked_by(&json!({"url": u, "connection": "c1"}), &json!({"url": u, "connection": "c1"})));
         assert!(!asked_by(&json!({"url": u, "connection": "c1"}), &json!({"url": u, "connection": "c2"})));
         assert!(!asked_by(&json!({"url": u}), &json!({"url": u, "connection": "c1"})));
+    }
+
+    /// A byte range of a GRIB file lands under the address the front end downloads, the range
+    /// marked in it: that is what was asked, and another range of the same file isn't (#2428).
+    #[test]
+    fn a_byte_range_lands_under_its_marked_address() {
+        let u = "https://x.org/model.grb";
+        let asked = json!({"url": u, "bytes": [100, 199], "format": "grib", "name": "rain", "anonymous": true});
+        let ranged = crate::cmd::layer::ranged_address(u, (100, 199));
+        assert!(asked_by(&asked, &json!({"url": ranged, "name": "rain", "anonymous": true, "id": 3})));
+        let other = crate::cmd::layer::ranged_address(u, (200, 299));
+        assert!(!asked_by(&asked, &json!({"url": other, "name": "rain", "anonymous": true, "id": 3})));
+        // An address asked with spaces around it: the app marks the range on it as given.
+        let spaced = json!({"url": format!("{u} "), "bytes": [100, 199], "name": "rain", "anonymous": true});
+        let marked = crate::cmd::layer::ranged_address(&format!("{u} "), (100, 199));
+        assert!(asked_by(&spaced, &json!({"url": marked, "name": "rain", "anonymous": true, "id": 3})));
+        assert!(asked_by(&spaced, &json!({"url": ranged, "name": "rain", "anonymous": true, "id": 3})));
+        // Without a range asked, the marked address is another download.
+        assert!(!asked_by(
+            &json!({"url": u, "name": "rain", "anonymous": true}),
+            &json!({"url": ranged, "name": "rain", "anonymous": true})
+        ));
     }
 
     fn load_test_plugin(id: &str) -> String {
