@@ -312,8 +312,9 @@ thread_local! {
 
 /// Whether saving `value` saves a system whose PROJ definition doesn't place points as its WKT
 /// does ([`CustomCrs::wkt_needed`]): an older release reads only the definition, so a saved file
-/// with one requires `crs-wkt`. Written to nowhere to find out, and only when this run has such a
-/// system.
+/// with one requires `crs-wkt`. Serializes `value` to `io::sink()` (when this run has such a
+/// system); kept as a serialization oracle for tests alongside the direct [`Crs::needs_wkt`]
+/// field walks.
 pub fn saves_wkt(value: &impl Serialize) -> bool {
     let table: Vec<std::sync::Arc<CustomCrs>> = custom_table().lock().unwrap_or_else(|e| e.into_inner()).clone();
     if !table.iter().any(|d| d.wkt_needed()) {
@@ -495,6 +496,12 @@ impl Crs {
             Crs::Custom(i) => custom_table().lock().unwrap_or_else(|e| e.into_inner()).get(i as usize).cloned(),
             _ => None,
         }
+    }
+
+    /// Whether saving this coordinate system requires `crs-wkt` because its PROJ definition
+    /// doesn't place points as its WKT does ([`CustomCrs::wkt_needed`]).
+    pub fn needs_wkt(self) -> bool {
+        matches!(self, Crs::Custom(_)) && self.custom_def().is_some_and(|d| d.wkt_needed())
     }
 
     /// The coordinate system for an EPSG code, or `None` when it isn't known.
@@ -3582,5 +3589,29 @@ mod tests {
         assert_eq!(crs.label(), "EPSG:11476");
         let p = crs.transformer().unwrap().from_lonlat(Coord::new(-70.6, -33.45)).unwrap();
         assert!((p.x - 351290.3712547213).abs() < 1e-6 && (p.y - 6297679.510189325).abs() < 1e-6, "{p:?}");
+    }
+
+    /// [`Crs::needs_wkt`] matches [`saves_wkt`] without serializing.
+    #[test]
+    fn crs_needs_wkt_matches_saves_wkt() {
+        let grads = r#"GEOGCS["NTF (Paris)",DATUM["Nouvelle_Triangulation_Francaise_Paris",SPHEROID["Clarke 1880 (IGN)",6378249.2,293.466021293627,AUTHORITY["EPSG","7011"]],AUTHORITY["EPSG","6807"]],PRIMEM["Paris",2.33722917,AUTHORITY["EPSG","8903"]],UNIT["grad",0.0157079632679489,AUTHORITY["EPSG","9105"]]]"#;
+        let ntf_grads = crate::raster::wkt::crs_from_wkt(grads).unwrap();
+        let merchich = esri_crs(102144).unwrap();
+        let robinson = esri_crs(54030).unwrap();
+        let custom_proj = Crs::parse("+proj=robin +lon_0=0 +datum=WGS84 +units=m +no_defs").unwrap();
+
+        for (crs, expected) in [
+            (Crs::LonLat, false),
+            (Crs::WebMercator, false),
+            (Crs::Epsg(2056), false),
+            (Crs::Custom(u32::MAX), false),
+            (custom_proj, false),
+            (robinson, false),
+            (ntf_grads, true),
+            (merchich, true),
+        ] {
+            assert_eq!(crs.needs_wkt(), expected, "{crs:?}");
+            assert_eq!(crs.needs_wkt(), saves_wkt(&crs), "{crs:?}");
+        }
     }
 }
