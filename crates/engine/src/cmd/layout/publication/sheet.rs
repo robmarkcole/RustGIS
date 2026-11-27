@@ -99,7 +99,8 @@ pub(in crate::cmd::layout) enum Style {
     /// map in a light card, the footer in darker blocks.
     Poster,
     /// The map from one side of the page to the other, on a paper of its own colour: a kicker and
-    /// the title over it, the footer unboxed under a thin rule.
+    /// the title over it, up to three headline figures under it, the footer unboxed under a thin
+    /// rule.
     Edge,
 }
 

@@ -148,12 +148,13 @@ pub(in crate::cmd::layout) fn publication(s: &mut Session, p: &Value) -> CmdResu
     }
     // Only an edge sheet draws these: given to another, they are refused rather than left out.
     let edge = sheet && style == Style::Edge;
-    if let Some(k) = ["paper", "kicker"].into_iter().find(|k| !edge && p.get(*k).is_some_and(|v| !v.is_null())) {
+    if let Some(k) = ["paper", "kicker", "figures"].into_iter().find(|k| !edge && p.get(*k).is_some_and(|v| !v.is_null())) {
         return Err(format!("{k} is for a sheet with \"style\": \"edge\""));
     }
     // White is the page's own colour, kept as none, as `layout.page` keeps it.
     let page_colour = crate::cmd::opaque_color(p, "paper")?.flatten().filter(|c| *c != Rgba::rgb(0xFF, 0xFF, 0xFF));
     let kicker = one("kicker")?;
+    let headlines = headline_figures(p)?;
     // Where the coverage grid the placement searches is written as an image (#1379).
     let coverage_path = match p.get("coverage") {
         None | Some(Value::Null) => None,
@@ -204,11 +205,12 @@ pub(in crate::cmd::layout) fn publication(s: &mut Session, p: &Value) -> CmdResu
     let (map_name, crs) = (s.map().name.clone(), s.map().projection.label());
     // A layer statistic (#2853) by the figure it shows now, as `{map}` is by the map's name: the
     // layers are in the project, so the box is sized for what is drawn, not for the token written.
-    let figures = {
+    let stats = {
         let texts: Vec<&str> = [&kicker, &title, &subtitle, &note, &author]
             .into_iter()
             .filter_map(|t| t.as_deref())
             .chain(sources.iter().chain(&reference).chain(&headings).map(String::as_str))
+            .chain(headlines.iter().flat_map(|(value, label)| [Some(value), label.as_ref()]).flatten().map(String::as_str))
             .collect();
         crate::render::layout::statistic_figures(s.map(), comma, &texts)
     };
@@ -217,7 +219,7 @@ pub(in crate::cmd::layout) fn publication(s: &mut Session, p: &Value) -> CmdResu
         if !t.contains('{') {
             return t.to_string();
         }
-        let t = figures.iter().fold(t.to_string(), |t, (token, figure)| t.replace(token.as_str(), figure));
+        let t = stats.iter().fold(t.to_string(), |t, (token, figure)| t.replace(token.as_str(), figure));
         [
             ("{date}", "0000-00-00"),
             ("{time}", "00:00"),
@@ -392,7 +394,12 @@ pub(in crate::cmd::layout) fn publication(s: &mut Session, p: &Value) -> CmdResu
                 // The map's frame between `top` and `bottom`, at least 40 mm tall (on A4).
                 let room = |top: f64, bottom: f64| {
                     if bottom - top < 40.0 * k {
-                        Err("the texts leave the map no room: shorten the footer, the note or the subtitle".to_string())
+                        let texts = if headlines.is_empty() {
+                            "the footer, the note or the subtitle"
+                        } else {
+                            "the footer, the note, the subtitle or the figures"
+                        };
+                        Err(format!("the texts leave the map no room: shorten {texts}"))
                     } else {
                         Ok(bottom - top)
                     }
@@ -563,8 +570,9 @@ pub(in crate::cmd::layout) fn publication(s: &mut Session, p: &Value) -> CmdResu
                     }
                     Style::Edge => {
                         // A kicker, the title and the subtitle at the top left; the map from one side
-                        // of the page to the other; under a thin rule, the footer with no boxes. On a
-                        // dark paper (the rule a presentation's blank page uses) the texts are light.
+                        // of the page to the other; the headline figures; under a thin rule, the
+                        // footer with no boxes. On a dark paper (the rule a presentation's blank
+                        // page uses) the texts are light.
                         let dark = page_colour
                             .is_some_and(|c| 0.299 * f64::from(c.r()) + 0.587 * f64::from(c.g()) + 0.114 * f64::from(c.b()) < 140.0);
                         let (ink, soft) = if dark { (Rgba::rgb(0xF2, 0xEE, 0xE6), Rgba::rgb(0xCF, 0xC6, 0xB8)) } else { (ink, soft) };
@@ -576,8 +584,9 @@ pub(in crate::cmd::layout) fn publication(s: &mut Session, p: &Value) -> CmdResu
                             // As the renderer spaces them: 1.33 points of the drawing per point of spacing.
                             let added = spacing * 1.33 / rustgis_map::layout::PT_PER_MM;
                             let t = capitals(&fill(t));
+                            // Measured as drawn: what its tokens fill in is in capitals too.
                             let width = |x: &str| {
-                                let x = drawn(x);
+                                let x = drawn(x).to_uppercase();
                                 crate::render::report::width_mm(&x, pt as f32, true) + x.chars().count() as f64 * added
                             };
                             // As `broken`: a text with the map's name or a layer statistic is kept
@@ -591,8 +600,14 @@ pub(in crate::cmd::layout) fn publication(s: &mut Session, p: &Value) -> CmdResu
                             };
                             let kh = lines.lines.len() as f64 * pitch(pt) + 1.0 * k;
                             let mut kind = pub_text(lines, pt, accent, true, TextAlign::Left);
-                            if let ElementKind::Text { letter_spacing, .. } = &mut kind {
+                            // The stored text is in capitals but for its tokens, which the case
+                            // covers (#3126). With nothing left to raise, no case: a saved project
+                            // asks for none.
+                            if let ElementKind::Text { text, letter_spacing, case, .. } = &mut kind {
                                 *letter_spacing = spacing;
+                                if *text != text.to_uppercase() {
+                                    *case = TextCase::Upper;
+                                }
                             }
                             around.push(("Kicker".into(), (x0, y, iw, kh), kind));
                             y += kh;
@@ -618,7 +633,42 @@ pub(in crate::cmd::layout) fn publication(s: &mut Session, p: &Value) -> CmdResu
                             (x0, rule, iw, 1.0),
                             ElementKind::Line { color: soft, width: 0.5, dir: LineDir::Horizontal, head: LineHead::None, dash: None },
                         ));
-                        (page_w, page_h, (0.0, ft, page_w, room(ft, rule - 3.0 * k)?), None)
+                        // The headline figures, in columns of one width between the map and the rule,
+                        // as tall as the tallest.
+                        let mut bottom = rule - 3.0 * k;
+                        if !headlines.is_empty() {
+                            let (gap, value_pt) = (5.0 * k, 22.0 * k);
+                            let n = headlines.len() as f64;
+                            let cw = (iw - gap * (n - 1.0)) / n;
+                            let columns: Vec<(Broken, Broken)> = headlines
+                                .iter()
+                                .map(|(value, label)| {
+                                    let label = label.as_deref().map(|t| wrap(t, cw, body_pt)).unwrap_or_default();
+                                    (wrap_as(value, cw, value_pt, true), label)
+                                })
+                                .collect();
+                            let height = |b: &Broken, pt: f64| b.lines.len() as f64 * pitch(pt);
+                            let band = columns.iter().map(|(v, l)| height(v, value_pt) + height(l, body_pt)).fold(0.0, f64::max);
+                            let top = bottom - band;
+                            for (i, (value, label)) in columns.into_iter().enumerate() {
+                                let x = x0 + i as f64 * (cw + gap);
+                                let (vh, lh) = (height(&value, value_pt), height(&label, body_pt));
+                                around.push((
+                                    format!("Figure {} Value", i + 1),
+                                    (x, top, cw, vh),
+                                    pub_text(value, value_pt, ink, true, TextAlign::Left),
+                                ));
+                                if !label.lines.is_empty() {
+                                    around.push((
+                                        format!("Figure {} Label", i + 1),
+                                        (x, top + vh, cw, lh),
+                                        pub_text(label, body_pt, soft, false, TextAlign::Left),
+                                    ));
+                                }
+                            }
+                            bottom = top - 3.0 * k;
+                        }
+                        (page_w, page_h, (0.0, ft, page_w, room(ft, bottom)?), None)
                     }
                     Style::Panel => {
                         // The map at the left, as tall as the sheet allows; a pale panel at the right with

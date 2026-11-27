@@ -207,11 +207,13 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
     in darker blocks with amber headings; `"edge"` runs the map from one side of the page to the
     other with no border, a kicker, the title and subtitle over it and the footer with no boxes
     under a thin rule. An edge sheet also takes `"paper"` (`#RRGGBB`, the page's colour; on a dark
-    one the texts are light) and `"kicker"` (a short line in spaced capitals over the title);
-    other styles and figures refuse both. Its graticule labels sit at the page's side edges, so a
-    printer with no bleed may clip them. `"accent"` (`#RRGGBB`) colours the band, the panel's
-    tint, the headings and rules, a poster's page and an edge sheet's kicker (a deep brown, green
-    or blue by default, a brick red on an edge sheet).
+    one the texts are light), `"kicker"` (a short line in spaced capitals over the title) and
+    `"figures"` (up to three `{"value", "label"}`, the label optional, in columns of one width
+    under the map, the value large and bold; a value or label may hold layer statistics such as
+    `{count:Cities}`); other styles and figures refuse the three. Its graticule labels sit at the
+    page's side edges, so a printer with no bleed may clip them. `"accent"` (`#RRGGBB`) colours the
+    band, the panel's tint, the headings and rules, a poster's page and an edge sheet's kicker (a
+    deep brown, green or blue by default, a brick red on an edge sheet).
     A figure leaves the style to its caption. In the menu, each sheet opens a list of the seven
     styles, each saying what it looks like, in its default accent (`"accent"` in the command
     picks another).
