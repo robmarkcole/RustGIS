@@ -117,6 +117,9 @@ fn first_keyed_provider_is_the_first_key_provider_and_never_a_sign_in() {
     // Opper comes after Requesty, so its key never takes the place of another provider's either.
     assert_eq!(first_keyed(keyed(&["opper", "requesty"])), Some("requesty"));
     assert_eq!(first_keyed(keyed(&["opper"])), Some("opper"));
+    // Mistral follows the existing keyed presets.
+    assert_eq!(first_keyed(keyed(&["mistral", "opper"])), Some("opper"));
+    assert_eq!(first_keyed(keyed(&["mistral"])), Some("mistral"));
     assert_eq!(first_keyed(keyed(&[])), None);
 }
 
@@ -5456,4 +5459,121 @@ fn openrouter_data_policy_refusal_names_the_privacy_checkbox() {
     let generation = a.generation();
     assert!(matches!(a.receive(generation, Ok(response), &mut session), Step::Done));
     assert!(a.transcript.iter().any(|e| matches!(e, Entry::Note(n) if n.template.contains("Check Private routing"))));
+}
+
+#[test]
+fn mistral_rewrites_native_and_cross_provider_tool_call_ids_without_collisions() {
+    let turns = vec![
+        Turn::User("hello".into(), vec![]),
+        Turn::Assistant {
+            text: String::new(),
+            calls: vec![],
+            native: Some((
+                Api::OpenAi,
+                json!({
+                    "role":"assistant", "content":null, "tool_calls":[
+                        {"id":"call_from_another_provider", "type":"function", "function":{"name":"map_zoom", "arguments":"{}"}},
+                        {"id":"000000000", "type":"function", "function":{"name":"map_zoom", "arguments":"{}"}}
+                    ]
+                }),
+            )),
+        },
+        Turn::Results(vec![
+            ToolResult {
+                id: "call_from_another_provider".into(),
+                name: "map_zoom".into(),
+                content: "done".into(),
+                error: false,
+                images: vec![],
+            },
+            ToolResult { id: "000000000".into(), name: "map_zoom".into(), content: "done".into(), error: false, images: vec![] },
+        ]),
+    ];
+    let request = chat_request(&cfg("mistral"), "system", &turns, &[]);
+    let body: Value = serde_json::from_str(&request.body.unwrap()).unwrap();
+    assert_eq!(request.url, "https://api.mistral.ai/v1/chat/completions");
+    assert_eq!(body["messages"][2]["tool_calls"][0]["id"], "000000000");
+    assert_eq!(body["messages"][2]["tool_calls"][1]["id"], "000000001");
+    assert_eq!(body["messages"][3]["tool_call_id"], "000000000");
+    assert_eq!(body["messages"][4]["tool_call_id"], "000000001");
+    let original: Value = serde_json::from_str(&chat_request(&cfg("openai"), "system", &turns, &[]).body.unwrap()).unwrap();
+    assert_eq!(original["messages"][2]["tool_calls"][0]["id"], "call_from_another_provider");
+}
+
+#[test]
+fn mistral_lists_models_with_a_bearer_key() {
+    let req = models_request(&cfg("mistral"));
+    assert_eq!(req.url, "https://api.mistral.ai/v1/models");
+    assert!(req.headers.contains(&("Authorization".into(), "Bearer k".into())));
+}
+
+#[test]
+fn mistral_typed_stream_preserves_visible_text_thinking_and_signatures_for_replay() {
+    let thinking = json!({"type":"thinking", "thinking":[{"type":"text","text":"private thought"}], "signature":"signed"});
+    let chunks = [
+        json!({"choices":[{"delta":{"content":"Before "}}]}),
+        json!({"choices":[{"delta":{"content":[thinking.clone(), {"type":"text","text":"Hello"}]}}]}),
+        json!({"choices":[{"delta":{"content":" world"},"finish_reason":"stop"}]}),
+    ];
+    let response = streamed(&chunks);
+    let reply = parse_reply(Api::OpenAi, &response).unwrap();
+    assert_eq!(reply.text, "Before Hello world");
+    assert!(reply.notes.is_empty());
+    assert_eq!(reply.native["content"][1], thinking);
+    let replay = Turn::Assistant { text: reply.text.clone(), calls: vec![], native: Some((Api::OpenAi, reply.native.clone())) };
+    let request = chat_request(&cfg("openai"), "system", std::slice::from_ref(&replay), &[]);
+    let body: Value = serde_json::from_str(&request.body.unwrap()).unwrap();
+    assert_eq!(body["messages"][1]["content"], "Before Hello world");
+    let request = chat_request(&cfg("mistral"), "system", &[replay], &[]);
+    let body: Value = serde_json::from_str(&request.body.unwrap()).unwrap();
+    assert_eq!(body["messages"][1]["content"][1], thinking);
+
+    let mut preview = StreamPreview::new(Api::OpenAi);
+    preview.feed(&response.body);
+    assert_eq!(preview.text(), "Before Hello world");
+    let whole = HttpResponse {
+        status: 200,
+        headers: vec![],
+        body: json!({"choices":[{"message":reply.native, "finish_reason":"stop"}]}).to_string().into_bytes(),
+    };
+    assert_eq!(parse_reply(Api::OpenAi, &whole).unwrap().text, "Before Hello world");
+}
+
+#[test]
+fn typed_reply_notices_count_unsupported_parts_and_keep_the_native_content() {
+    let content = json!([
+        {"type":"text", "text":"Answer"},
+        {"type":"thinking", "thinking":[], "signature":"signed"},
+        {"type":"reference", "reference_ids":[0]},
+        {"type":"reference", "reference_ids":[1]}
+    ]);
+    let streamed = streamed(&[
+        json!({"choices":[{"delta":{"content":""}}]}),
+        json!({"choices":[{"delta":{"content":content.clone()}}]}),
+        json!({"choices":[{"delta":{"content":""}, "finish_reason":"stop"}]}),
+    ]);
+    let mut preview = StreamPreview::new(Api::OpenAi);
+    preview.feed(&streamed.body);
+    assert_eq!(preview.text(), "Answer");
+    let whole = HttpResponse {
+        status: 200,
+        headers: vec![],
+        body: json!({"choices":[{"message":{"role":"assistant", "content":content}, "finish_reason":"stop"}]}).to_string().into_bytes(),
+    };
+    for response in [streamed, whole] {
+        let mut session = sample();
+        let mut agent = Agent::new(cfg("mistral"), &session);
+        assert!(matches!(agent.ask("hello", &session), Step::Send(_)));
+        assert_eq!(agent.receive(agent.generation(), Ok(response), &mut session), Step::Done);
+        let notes: Vec<_> =
+            agent.transcript.iter().filter_map(|entry| if let Entry::Note(note) = entry { Some(note) } else { None }).collect();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].template, "The reply contains {count} content parts of type {kind} that aren't displayed.");
+        assert_eq!(notes[0].args, [("count", "2".to_string()), ("kind", "reference".to_string())]);
+        assert!(agent.transcript.iter().any(|entry| matches!(entry, Entry::Assistant(text) if text == "Answer")));
+        let Some(Turn::Assistant { native: Some((Api::OpenAi, native)), .. }) = agent.turns().last() else {
+            panic!("missing native reply")
+        };
+        assert_eq!(native["content"], content);
+    }
 }

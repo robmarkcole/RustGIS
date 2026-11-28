@@ -179,6 +179,20 @@ pub const PRESETS: &[Preset] = &[
         key_url: "https://platform.opper.ai",
         login: false,
     },
+    Preset {
+        id: "mistral",
+        description: "Mistral AI's own API, from France. Paid API requests aren't used for training by default; on a free account, turn training off under Privacy in the admin panel. Labs and Preview models may train regardless of that setting.",
+        label: "Mistral",
+        api: Api::OpenAi,
+        base_url: "https://api.mistral.ai/v1",
+        // Small 4 is generally available; Large 4 is a preview with different training terms.
+        model: "mistral-small-2603",
+        key_env: &["MISTRAL_API_KEY"],
+        url_env: "",
+        keyless: false,
+        key_url: "https://console.mistral.ai/api-keys",
+        login: false,
+    },
 ];
 
 /// The preset with this id.
@@ -696,6 +710,7 @@ impl Note {
 
 /// Every [`Note`] template RustGIS writes (the interface's catalogs translate each).
 pub const NOTE_TEMPLATES: &[&str] = &[
+    "The reply contains {count} content parts of type {kind} that aren't displayed.",
     "OpenRouter found no endpoint matching your data policy. Check Private routing in the Assistant settings or your OpenRouter privacy settings.",
     "The reply reached its length limit.",
     "The provider's content filter stopped the reply.",
@@ -766,6 +781,8 @@ pub struct Reply {
     pub text: String,
     pub calls: Vec<ToolCall>,
     pub native: Value,
+    /// Nonfatal diagnostics about content the interface cannot display.
+    pub notes: Vec<Note>,
     /// Why the reply stopped early (length limit, a refusal), if it did.
     pub cut: Option<Note>,
     /// A failed terminal response accompanying partial text.
@@ -879,12 +896,25 @@ fn stream_ended(api: Api, text: &str, events: &[Value]) -> bool {
 /// Chat Completions chunks: content and reasoning deltas, and calls whose arguments come in
 /// pieces, by index.
 fn openai_assembled(events: &[Value]) -> Value {
-    let (mut content, mut reasoning, mut finish) = (String::new(), String::new(), Value::Null);
+    let (mut content, mut reasoning, mut finish) = (Value::Null, String::new(), Value::Null);
     let mut calls: Vec<(String, String, String)> = Vec::new();
     for e in events {
         for choice in e.get("choices").and_then(Value::as_array).into_iter().flatten() {
             let delta = choice.get("delta").unwrap_or(&Value::Null);
-            content.push_str(delta.get("content").and_then(Value::as_str).unwrap_or(""));
+            if let Some(next) = delta.get("content").filter(|v| !v.is_null() && v.as_str() != Some("")) {
+                match (&mut content, next) {
+                    (Value::String(text), Value::String(more)) => text.push_str(more),
+                    (Value::Array(parts), Value::Array(more)) => parts.extend(more.iter().cloned()),
+                    (Value::Array(parts), Value::String(text)) => parts.push(json!({"type":"text", "text":text})),
+                    (Value::String(text), Value::Array(parts)) => {
+                        let mut all = vec![json!({"type":"text", "text":text})];
+                        all.extend(parts.iter().cloned());
+                        content = json!(all);
+                    }
+                    (Value::Null, Value::String(_) | Value::Array(_)) => content = next.clone(),
+                    _ => {}
+                }
+            }
             reasoning.push_str(delta.get("reasoning_content").and_then(Value::as_str).unwrap_or(""));
             for tc in delta.get("tool_calls").and_then(Value::as_array).into_iter().flatten() {
                 let id = tc.get("id").and_then(Value::as_str).filter(|id| !id.is_empty());
@@ -917,7 +947,10 @@ fn openai_assembled(events: &[Value]) -> Value {
             }
         }
     }
-    let mut message = json!({"role": "assistant", "content": if content.is_empty() { Value::Null } else { json!(content) }});
+    if content.as_str() == Some("") {
+        content = Value::Null;
+    }
+    let mut message = json!({"role": "assistant", "content": content});
     // Slots no piece named (a stray index) are no call.
     calls.retain(|c| !c.1.is_empty());
     if !calls.is_empty() {
@@ -1073,11 +1106,13 @@ impl StreamPreview {
         self.text.len() > before
     }
 
+    /// Extracts visible text from one event. Native thinking and signatures are assembled by
+    /// the completed-response parser rather than streamed into the answer.
     fn delta(&self, v: &Value) -> String {
         let s = |p: &str| v.pointer(p).and_then(Value::as_str).unwrap_or("").to_string();
         match self.api {
             Api::Responses if v.get("type").and_then(Value::as_str) == Some("response.output_text.delta") => s("/delta"),
-            Api::OpenAi => s("/choices/0/delta/content"),
+            Api::OpenAi => openai_content_text(v.pointer("/choices/0/delta/content")),
             Api::Anthropic if s("/delta/type") == "text_delta" => s("/delta/text"),
             Api::Gemini => v
                 .pointer("/candidates/0/content/parts")
@@ -1122,7 +1157,7 @@ fn header(k: &str, v: &str) -> (String, String) {
 // ---------------------------------------------------------------------------------------------
 // OpenAI Chat Completions
 
-/// Builds the OpenAI-shaped request; the OpenRouter privacy filter travels with every turn.
+/// Builds streamed Chat Completions with OpenRouter privacy filtering and Mistral call identifiers.
 fn openai_request(cfg: &Config, system: &str, turns: &[Turn], tools: &[ToolDef]) -> HttpRequest {
     let mut messages = vec![json!({"role": "system", "content": system})];
     for t in turns {
@@ -1134,7 +1169,16 @@ fn openai_request(cfg: &Config, system: &str, turns: &[Turn], tools: &[ToolDef])
                 |t| json!({"type": "text", "text": t}),
                 |p| json!({"type": "image_url", "image_url": {"url": p.data_url()}}),
             )})),
-            Turn::Assistant { native: Some((Api::OpenAi, m)), .. } => messages.push(m.clone()),
+            Turn::Assistant { native: Some((Api::OpenAi, m)), .. } => {
+                let mut message = m.clone();
+                // Mistral thinking/signature blocks are not valid assistant content for other
+                // compatible APIs. Keep the original turn; send only its visible text there.
+                if cfg.provider != "mistral" && message.get("content").is_some_and(Value::is_array) {
+                    let text = openai_content_text(message.get("content"));
+                    message["content"] = if text.is_empty() { Value::Null } else { json!(text) };
+                }
+                messages.push(message);
+            }
             Turn::Assistant { text, calls, .. } => {
                 let mut m = json!({"role": "assistant", "content": if text.is_empty() { Value::Null } else { json!(text) }});
                 if !calls.is_empty() {
@@ -1152,6 +1196,9 @@ fn openai_request(cfg: &Config, system: &str, turns: &[Turn], tools: &[ToolDef])
                 messages.extend(images_message(rs, "text", |i| json!({"type": "image_url", "image_url": {"url": i.data_url()}})));
             }
         }
+    }
+    if cfg.provider == "mistral" {
+        mistral_call_ids(&mut messages);
     }
     let tools: Vec<Value> = tools
         .iter()
@@ -1181,6 +1228,29 @@ fn openai_request(cfg: &Config, system: &str, turns: &[Turn], tools: &[ToolDef])
 /// `reasoning_effort` unset, so a 400 about it can only be about the model's default.
 pub fn refuses_reasoning_with_tools(e: &Error) -> bool {
     e.status == Some(400) && (e.param.as_deref() == Some("reasoning_effort") || e.detail.to_lowercase().contains("reasoning_effort"))
+}
+
+/// Mistral requires nine alphanumeric characters for call ids. Rewrite both sides only on the
+/// outgoing copy, including native messages from another OpenAI-compatible provider. Picture
+/// captions keep original ids as provenance; API call/result references use the mapped ids. Ordinals
+/// avoid truncation/hash collisions; a request cannot hold 16^9 distinct calls in memory.
+/// Format requirement: <https://huggingface.co/mistralai/Mistral-Large-Instruct-2407>.
+fn mistral_call_ids(messages: &mut [Value]) {
+    let mut ids = std::collections::BTreeMap::<String, String>::new();
+    for message in messages {
+        for call in message.get_mut("tool_calls").and_then(Value::as_array_mut).into_iter().flatten() {
+            if let Some(id) = call.get_mut("id").filter(|id| id.is_string()) {
+                let next = format!("{:09x}", ids.len());
+                let mapped = ids.entry(id.as_str().unwrap_or_default().to_string()).or_insert(next);
+                *id = json!(mapped);
+            }
+        }
+        if let Some(id) = message.get_mut("tool_call_id").filter(|id| id.is_string()) {
+            let next = format!("{:09x}", ids.len());
+            let mapped = ids.entry(id.as_str().unwrap_or_default().to_string()).or_insert(next);
+            *id = json!(mapped);
+        }
+    }
 }
 
 /// Whether the provider refused a request for the images in it (a model or server that doesn't
@@ -1216,10 +1286,48 @@ pub fn refuses_images(e: &Error) -> bool {
     matches!(e.status, Some(400 | 404 | 415 | 422 | 500)) && names_images && refused && !about_one_image
 }
 
+/// Visible text from Chat Completions string content or typed blocks. Thinking/signatures stay
+/// in the native message for replay; they never become the displayed answer or stream preview.
+fn openai_content_text(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter(|p| p.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|p| p.get("text").and_then(Value::as_str))
+            .collect(),
+        _ => String::new(),
+    }
+}
+
+/// Counts unsupported display parts once per type. Thinking is native replay metadata;
+/// other non-text parts remain native too, but their omission from the answer must be visible.
+fn openai_content_notes(content: Option<&Value>) -> Vec<Note> {
+    let mut counts = std::collections::BTreeMap::<&str, usize>::new();
+    for part in content.and_then(Value::as_array).into_iter().flatten() {
+        let kind = part.get("type").and_then(Value::as_str).unwrap_or("unknown");
+        if kind == "thinking" || (kind == "text" && part.get("text").is_some_and(Value::is_string)) {
+            continue;
+        }
+        *counts.entry(kind).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .map(|(kind, count)| {
+            Note::with(
+                "The reply contains {count} content parts of type {kind} that aren't displayed.",
+                [("count", count.to_string()), ("kind", kind.to_string())],
+            )
+        })
+        .collect()
+}
+
+/// Reads Chat Completions, retaining native typed content for the next request.
 fn openai_reply(v: &Value) -> Result<Reply, String> {
     let choice = v.get("choices").and_then(|c| c.get(0)).ok_or("the reply has no choices")?;
     let msg = choice.get("message").ok_or("the reply has no message")?;
-    let text = msg.get("content").and_then(Value::as_str).unwrap_or("").to_string();
+    let text = openai_content_text(msg.get("content"));
+    let notes = openai_content_notes(msg.get("content"));
     let calls = msg
         .get("tool_calls")
         .and_then(Value::as_array)
@@ -1253,7 +1361,7 @@ fn openai_reply(v: &Value) -> Result<Reply, String> {
     if let Some(o) = native.as_object_mut() {
         o.retain(|k, _| matches!(k.as_str(), "role" | "content" | "tool_calls" | "reasoning_content"));
     }
-    Ok(Reply { text, calls, native, cut, failure: None })
+    Ok(Reply { text, calls, native, notes, cut, failure: None })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1474,7 +1582,7 @@ fn responses_reply(resp: &HttpResponse) -> Result<Reply, Error> {
         })
         .collect();
     let failure = (!completed && last.get("error").is_some_and(Value::is_object)).then(|| Error::response(&last, resp));
-    Ok(Reply { text, calls, native: Value::Array(native), cut, failure })
+    Ok(Reply { text, calls, native: Value::Array(native), notes: Vec::new(), cut, failure })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1601,7 +1709,7 @@ fn anthropic_reply(v: &Value) -> Result<Reply, String> {
     if v.get("stop_reason").and_then(Value::as_str) == Some("refusal") {
         calls.clear();
     }
-    Ok(Reply { text, calls, native: Value::Array(content.clone()), cut, failure: None })
+    Ok(Reply { text, calls, native: Value::Array(content.clone()), notes: Vec::new(), cut, failure: None })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1741,7 +1849,7 @@ fn gemini_reply(v: &Value) -> Result<Reply, String> {
     if native.get("role").is_none() {
         native["role"] = json!("model");
     }
-    Ok(Reply { text, calls, native, cut, failure: None })
+    Ok(Reply { text, calls, native, notes: Vec::new(), cut, failure: None })
 }
 
 /// `v` if it is an object, else an empty one (providers require objects for tool input).

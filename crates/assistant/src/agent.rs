@@ -756,6 +756,7 @@ impl Agent {
     }
 
     /// Discards stale generations, applies provider recovery and records privacy-policy refusals.
+    /// Content notices reach the transcript for both normal replies and compaction summaries.
     fn receive_unguarded(&mut self, generation: u64, resp: Result<HttpResponse, crate::Error>, s: &mut Session) -> Step {
         if generation != self.generation || !self.waiting() {
             return Step::Done;
@@ -802,6 +803,9 @@ impl Agent {
             return Step::Retry(after);
         }
         self.retries = 0;
+        if let Ok(reply) = &parsed {
+            self.transcript.extend(reply.notes.iter().cloned().map(Entry::Note));
+        }
         if let State::Compacting { upto, resume } = self.state {
             return self.summarised(upto, resume, parsed);
         }

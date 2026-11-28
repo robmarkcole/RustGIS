@@ -102,6 +102,7 @@ Click the model name or the gear to open the settings. The assistant works with:
 | Requesty | A UK gateway to hundreds of models, which can move to another service when one fails. It logs requests up to 30 days by default; you can turn that off for each key. Some upstreams train on requests on paid plans too; Requesty may also train on free-plan requests. | `anthropic/claude-sonnet-5-5` | [app.requesty.ai](https://app.requesty.ai/api-keys), or `REQUESTY_API_KEY`; for the EU, set the **Address** to `https://router.eu.requesty.ai/v1` |
 | TrustedRouter | A US gateway to models from many services, run on servers whose software can be checked independently. The gateway doesn't keep request content; each service behind it follows its own policy and may keep or train on requests. | `trustedrouter/auto` | [trustedrouter.com](https://trustedrouter.com), or `TRUSTEDROUTER_API_KEY` |
 | Opper | A Swedish gateway to hundreds of models, built for keeping data in the EU. It doesn't store request content by default, but a model name without a route prefix may run outside the EU. | `claude-sonnet-5-5` | [platform.opper.ai](https://platform.opper.ai), or `OPPER_API_KEY` |
+| Mistral | Mistral AI's own API, from France. Paid API requests aren't used for training by default; on a free account, turn training off under Privacy in the admin panel. Labs and Preview models may train regardless of that setting. | `mistral-small-2603` | [console.mistral.ai](https://console.mistral.ai/api-keys), or `MISTRAL_API_KEY`; for [EU inference](https://docs.mistral.ai/inference/regional-inference), set **Address** to `https://api.eu.mistral.ai/v1` (supported models only; 10% surcharge) |
 
 Last checked: November 2026. These descriptions apply to the presets' default addresses.
 If **Address** is changed, the chosen service's policy applies. These summaries aren't guarantees
@@ -112,7 +113,8 @@ as OpenAI documents for Codex. See the providers' own policies: [Anthropic](http
 [ChatGPT/Codex](https://help.openai.com/en/articles/7730893-data-controls-in-chatgpt),
 [Gemini](https://ai.google.dev/gemini-api/terms), [OpenRouter](https://openrouter.ai/privacy),
 [Requesty privacy](https://www.requesty.ai/privacy) and [training terms](https://www.requesty.ai/terms), [TrustedRouter](https://trustedrouter.com/privacy),
-and [Opper](https://opper.ai/security-overview).
+[Opper](https://opper.ai/security-overview), and
+[Mistral](https://legal.mistral.ai/terms/commercial-terms-of-service/).
 
 The ↻ button lists the provider's models. The provider and model you last chose in the settings
 are used at start. Until you choose one, `RUSTGIS_ASSISTANT_PROVIDER` and
@@ -422,7 +424,7 @@ can be used only once), and the keychain is read under the same lock.
 Plain HTTP is only used for servers on your computer or local network.
 
 In the web app, the browser calls the provider directly. Anthropic, OpenAI, Gemini,
-OpenRouter, Requesty, TrustedRouter and Opper accept that; a local Ollama server must allow the page's origin
+OpenRouter, Requesty, TrustedRouter, Opper and Mistral accept that; a local Ollama server must allow the page's origin
 (`OLLAMA_ORIGINS=https://web.rustgis.app ollama serve`).
 
 ## Retries and long conversations
