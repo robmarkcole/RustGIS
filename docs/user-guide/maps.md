@@ -161,6 +161,27 @@ polygon layer of that name comes back. A plain `"walls": "#RRGGBB"` takes the la
 `{"walls": {"layer": "Geology"}}` keeps the walls' colour, `{"walls": {"color": "#806040"}}` keeps the layer, and
 `{"walls": {"layer": null}}` takes the layer off and keeps the colour.
 
+Soil over rock: `"walls": {"layer": "Geology", "top": {"layer": "Soils", "thickness": 150}}` adds a
+band along the top of the walls from a second polygon layer. Along each wall the band runs under
+the ground's edge, `thickness` metres deep (before exaggeration, so it is stretched as the relief
+is), in the solid fill the second layer's symbology gives the polygon under the box's edge there
+(as the walls take theirs; its hatches, markers, gradients and shapebursts are left off, said with
+how many polygons). Off its polygons there is no band, and the rock reaches the ground. In place
+of a number, `"thickness": {"field": "depth_m"}` takes each polygon's thickness from a numeric
+field of the second layer (metres, before exaggeration): under a polygon with no value over 0
+there is no band, said with how many, and a field the layer no longer has as a number (deleted,
+renamed or turned to text since) gives no band at all, said. The band
+is outlined along the ground and its foot, so the walls' contacts stop there, and two soil classes
+meet at a short line across it. It never reaches below the base: where the ground stands less
+than its thickness over the base it stops there, said. The band is schematic: real soil is a few
+metres deep at most, and a band that shows at the block's scale is far thicker, so give the figure
+a note such as "soil thickness not to scale". It works without a walls layer too, over the walls'
+colour. The top layer is checked, followed and said as the walls layer is (a polygon layer holding
+all its features, with a name of its own; renamed with it; when it is removed, or a project opens
+without it, no band until a layer of that name comes back). `"top": false` takes the band off, and
+a plain `"walls": "#RRGGBB"` takes it off with the layer. Only the map view draws the band: a 3D
+model's walls (`map.exportBlock`) leave it out, said. Saved projects require `terrain-block-walls-top`.
+
 `"shape": "circle"` cuts a round block: the largest circle inside the box (the DEM's extent or
 `"extent"`), centred in it, or a smaller one with `"radius"` (map units; one larger than the
 box's circle takes the box's). It reads the same at any bearing, which suits a figure that

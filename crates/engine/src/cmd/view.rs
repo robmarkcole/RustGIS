@@ -49,7 +49,7 @@ pub fn commands() -> Vec<C> {
         }).roles(&[]).effects(crate::policy::Effects::NONE)
         .params(r#"{"mode": "none"|"distance", "distance"?: metres from the view's centre}"#),
         C::new("map.terrain", "Terrain", "View › Scene", terrain).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network)).params(
-            r##"{"layer"?: a DEM raster layer (heights in metres; without layer or tiles, and no terrain yet, the active layer when it is a raster) | "tiles"?: elevation tile URL with {z}/{x}/{y}, "encoding"?: "terrarium"|"mapbox" (tiles; default terrarium), "exaggeration"?: 0 to 20 (default 1, or the terrain's), "block"?: a block diagram {"extent"?: "layer" (the DEM's extent, default) | [xmin, ymin, xmax, ymax] in map units (needed over tiles), "depth"?: metres from the lowest ground to the base (default half the relief, at least 100), "walls"?: "#RRGGBB" (default #C8B89A) | {"color"?: "#RRGGBB" (default #C8B89A), "layer"?: a polygon layer that holds all its features (not one read a view at a time; it may be hidden): its symbology colours the walls where its polygons meet the block's edge, and the walls are color off its polygons}, "shape"?: "box" (default) | "circle" (the largest circle in the box, its walls round it) | {"layer": a polygon layer, "where"?: sql (picks its polygons, as a definition query)} (the ground inside the polygons, each hole a well with its own walls and its floor at the base, the box round them: no extent), "radius"?: a circle's radius in map units (default: the largest in the box), "water"?: the terrain's water shown in the walls' section {"depth"?: metres from the level to the floor, "field"?: a numeric field of the water layer holding each one's depth, "bed"?: a raster layer of the bed's heights in metres on the DEM's datum (the floor where it has data, never above the level; elsewhere the field's depth or the depth)} (one of them needed), or false}, keys left out stay as the block had them and null puts one back to its default (a new block takes the defaults), and the block's "water" is given whole each time, replacing the old, or false to take it off (default: as it was), "water"?: water bodies drawn flat at their level {"layer": a polygon layer, "level"?: a numeric field of levels in metres (default: each polygon's lowest height along its shore), "glint"?: 0 to 1, how brightly a tilted view's water shines where it reflects the sun toward the eye (default 0.3; 0: none), "shore"?: 0 to 1, how dark the band along the water's shore is at the outline, fading a few pixels inside it (default 0.35; 0: none)}, or false to take it off (default: as it was), "off"?: true}"##,
+            r##"{"layer"?: a DEM raster layer (heights in metres; without layer or tiles, and no terrain yet, the active layer when it is a raster) | "tiles"?: elevation tile URL with {z}/{x}/{y}, "encoding"?: "terrarium"|"mapbox" (tiles; default terrarium), "exaggeration"?: 0 to 20 (default 1, or the terrain's), "block"?: a block diagram {"extent"?: "layer" (the DEM's extent, default) | [xmin, ymin, xmax, ymax] in map units (needed over tiles), "depth"?: metres from the lowest ground to the base (default half the relief, at least 100), "walls"?: "#RRGGBB" (default #C8B89A) | {"color"?: "#RRGGBB" (default #C8B89A), "layer"?: a polygon layer that holds all its features (not one read a view at a time; it may be hidden): its symbology colours the walls where its polygons meet the block's edge, and the walls are color off its polygons, "top"?: a band along the walls' top, soil over rock {"layer": a polygon layer as the walls' layer: its solid fill where its polygons meet the block's edge (no band off them), "thickness": metres down from the ground before exaggeration (schematic) | {"field": a numeric field of the layer holding each polygon's metres (no band under one without a value over 0)}}, or false}, "shape"?: "box" (default) | "circle" (the largest circle in the box, its walls round it) | {"layer": a polygon layer, "where"?: sql (picks its polygons, as a definition query)} (the ground inside the polygons, each hole a well with its own walls and its floor at the base, the box round them: no extent), "radius"?: a circle's radius in map units (default: the largest in the box), "water"?: the terrain's water shown in the walls' section {"depth"?: metres from the level to the floor, "field"?: a numeric field of the water layer holding each one's depth, "bed"?: a raster layer of the bed's heights in metres on the DEM's datum (the floor where it has data, never above the level; elsewhere the field's depth or the depth)} (one of them needed), or false}, keys left out stay as the block had them and null puts one back to its default (a new block takes the defaults), and the block's "water" is given whole each time, replacing the old, or false to take it off (default: as it was), "water"?: water bodies drawn flat at their level {"layer": a polygon layer, "level"?: a numeric field of levels in metres (default: each polygon's lowest height along its shore), "glint"?: 0 to 1, how brightly a tilted view's water shines where it reflects the sun toward the eye (default 0.3; 0: none), "shore"?: 0 to 1, how dark the band along the water's shore is at the outline, fading a few pixels inside it (default 0.35; 0: none)}, or false to take it off (default: as it was), "off"?: true}"##,
         ),
         C::new("map.exportOrbit", "Export Orbit", "View › Scene", |s, p| super::exports::write_here(s, p, "map.exportOrbit")).inputs(orbit_inputs).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
             .view()
@@ -339,16 +339,18 @@ fn terrain_block(
         None => Ok(left_out),
         Some(Value::Null) => Ok(BLOCK_WALLS),
         Some(Value::String(c)) => rustgis_map::Rgba::from_hex(c).ok_or("block's walls is an opaque colour, #RRGGBB"),
-        Some(_) => Err("block's walls is a colour, #RRGGBB, or {\"color\"?, \"layer\"?}"),
+        Some(_) => Err("block's walls is a colour, #RRGGBB, or {\"color\"?, \"layer\"?, \"top\"?}"),
     };
-    // A colour, or the colour and a polygon layer that colours the walls where it has a polygon.
-    let (kept_color, kept_layer) = base.map_or((BLOCK_WALLS, None), |b| (b.walls, b.walls_layer.clone()));
-    let (walls, walls_layer) = match b.get("walls") {
-        None => (kept_color, kept_layer),
-        Some(Value::Null) => (BLOCK_WALLS, None),
+    // A colour, or the colour and a polygon layer that colours the walls where it has a polygon,
+    // and a band along their top from another (#2607).
+    let (kept_color, kept_layer, kept_top) =
+        base.map_or((BLOCK_WALLS, None, None), |b| (b.walls, b.walls_layer.clone(), b.walls_top.clone()));
+    let (walls, walls_layer, walls_top) = match b.get("walls") {
+        None => (kept_color, kept_layer, kept_top),
+        Some(Value::Null) => (BLOCK_WALLS, None, None),
         Some(Value::Object(w)) => {
-            if let Some(k) = w.keys().find(|k| !matches!(k.as_str(), "color" | "layer")) {
-                return Err(format!("block's walls has no '{k}' (color, layer)"));
+            if let Some(k) = w.keys().find(|k| !matches!(k.as_str(), "color" | "layer" | "top")) {
+                return Err(format!("block's walls has no '{k}' (color, layer, top)"));
             }
             let layer = match w.get("layer") {
                 None => kept_layer,
@@ -356,10 +358,16 @@ fn terrain_block(
                 Some(Value::String(n)) => Some(polygon_layer(s, n, "block's walls", "the units the walls show")?),
                 Some(_) => return Err("block's walls' layer is a polygon layer's name".into()),
             };
-            (color(w.get("color"), kept_color)?, layer)
+            let top = match w.get("top") {
+                None => kept_top,
+                Some(Value::Null | Value::Bool(false)) => None,
+                Some(Value::Object(t)) => Some(walls_top_band(s, t)?),
+                Some(_) => return Err(WALLS_TOP.into()),
+            };
+            (color(w.get("color"), kept_color)?, layer, top)
         }
-        // A plain colour takes the walls' layer off.
-        other => (color(other, BLOCK_WALLS)?, None),
+        // A plain colour takes the walls' layers off.
+        other => (color(other, BLOCK_WALLS)?, None, None),
     };
     // The water in the walls' section (#2317): its depth, or the water layer's field holding it
     // (checked against the terrain's water once that is known, in `terrain`).
@@ -429,7 +437,7 @@ fn terrain_block(
     if b.get("radius").is_some_and(|r| !r.is_null()) && !matches!(shape, BlockShape::Circle { .. }) {
         return Err("block's radius is a circle's: give \"shape\": \"circle\" too".into());
     }
-    let block = rustgis_map::view::TerrainBlock { extent, depth, walls, walls_layer, shape, water };
+    let block = rustgis_map::view::TerrainBlock { extent, depth, walls, walls_layer, walls_top, shape, water };
     block.check()?;
     Ok(block)
 }
@@ -446,6 +454,40 @@ fn bed_layer(s: &Session, name: &str) -> Result<String, String> {
         return Err(format!("more than one layer is called '{name}': give the block's water bed a name of its own, then try again"));
     }
     Ok(l.name.clone())
+}
+
+/// What a block's walls' top (#2607) is, as its errors say.
+const WALLS_TOP: &str =
+    "block's walls' top is {\"layer\": a polygon layer, \"thickness\": metres | {\"field\": a numeric field of the layer}}, or false";
+
+/// The band along the top of a block's walls (#2607) from `"top": {"layer", "thickness"}`: a
+/// polygon layer as the walls' ([`polygon_layer`]) and its thickness, metres (checked by
+/// [`rustgis_map::view::TerrainBlock::check`]) or `{"field"}`, a numeric field of that layer.
+fn walls_top_band(s: &Session, t: &serde_json::Map<String, Value>) -> Result<rustgis_map::view::WallsTop, String> {
+    use rustgis_map::view::BandThickness;
+    if let Some(k) = t.keys().find(|k| !matches!(k.as_str(), "layer" | "thickness")) {
+        return Err(format!("block's walls' top has no '{k}' (layer, thickness)"));
+    }
+    let name = t.get("layer").and_then(Value::as_str).ok_or(WALLS_TOP)?;
+    let layer = polygon_layer(s, name, "block's walls' top", "the units the band shows")?;
+    let thickness = match t.get("thickness") {
+        Some(Value::Number(n)) => BandThickness::Metres(n.as_f64().ok_or(WALLS_TOP)?),
+        Some(Value::Object(f)) => {
+            if let Some(k) = f.keys().find(|k| k.as_str() != "field") {
+                return Err(format!("block's walls' top thickness has no '{k}' (field)"));
+            }
+            let f = f.get("field").and_then(Value::as_str).ok_or(WALLS_TOP)?;
+            let l = s.map().layer_by_name(&layer).ok_or_else(|| format!("no layer '{layer}'"))?;
+            let i = l.dataset.field_index(f).ok_or_else(|| format!("'{layer}' has no field '{f}' (the band's thickness)"))?;
+            let field = l.dataset.fields.get(i).ok_or_else(|| format!("'{layer}' has no field '{f}' (the band's thickness)"))?;
+            if !field.ty.is_numeric() {
+                return Err(format!("block's walls' top thickness field '{}' isn't numeric (metres)", field.name));
+            }
+            BandThickness::Field { field: field.name.clone() }
+        }
+        _ => return Err(WALLS_TOP.into()),
+    };
+    Ok(rustgis_map::view::WallsTop { layer, thickness })
 }
 
 /// A block cut to polygons (#2318) from `"shape": {"layer", "where"?}`: a polygon layer as the
@@ -750,9 +792,10 @@ fn terrain(s: &mut Session, p: &Value) -> CmdResult {
             (None, Some(d)) => (json!(d), "layer"),
             (None, None) => (json!("layer"), "layer"),
         };
-        let walls = match &b.walls_layer {
-            Some(l) => json!({"color": b.walls.hex(), "layer": l}),
-            None => json!(b.walls.hex()),
+        let walls = match (&b.walls_layer, &b.walls_top) {
+            (None, None) => json!(b.walls.hex()),
+            (l, None) => json!({"color": b.walls.hex(), "layer": l}),
+            (l, Some(top)) => json!({"color": b.walls.hex(), "layer": l, "top": top}),
         };
         // A circle's radius as drawn: the largest in the box when none is given or a larger one is
         // (`radius_capped`), when the box is known.
@@ -800,12 +843,16 @@ fn terrain(s: &mut Session, p: &Value) -> CmdResult {
         }
         return Err(e);
     }
-    // And the walls' layer (#1914), kept by name as the water's is.
-    if let Some(l) = t.block.as_ref().and_then(|b| b.walls_layer.as_ref())
-        && m.layers.iter().filter(|o| o.name.eq_ignore_ascii_case(l)).count() > 1
+    // And the walls' layer (#1914) and their top's (#2607), kept by name as the water's is.
+    let walls_layers =
+        t.block.as_ref().map(|b| [(b.walls_layer.as_ref(), "walls layer"), (b.walls_top.as_ref().map(|t| &t.layer), "walls' top layer")]);
+    if let Some((l, what)) = walls_layers
+        .into_iter()
+        .flatten()
+        .find_map(|(l, what)| l.filter(|l| m.layers.iter().filter(|o| o.name.eq_ignore_ascii_case(l)).count() > 1).map(|l| (l, what)))
     {
         let e = format!(
-            "more than one layer is called '{l}': give the block's walls layer a name of its own, then try again (Terrain stays as it was)"
+            "more than one layer is called '{l}': give the block's {what} a name of its own, then try again (Terrain stays as it was)"
         );
         if let Some(old) = old_terrain {
             m.view.terrain = Some(old);

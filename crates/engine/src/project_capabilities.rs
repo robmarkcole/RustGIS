@@ -1104,7 +1104,7 @@ fn map_capabilities<'a>(maps: impl IntoIterator<Item = &'a Map>) -> Vec<&'static
     let (mut polygon, mut svg) = (false, false);
     let (mut offline_area_id, mut paper, mut native, mut guided, mut weighed, mut cleared, mut deduped) =
         (false, false, false, false, false, false, false);
-    let (mut crisp, mut bed, mut soft) = (false, false, false);
+    let (mut crisp, mut bed, mut walls_top, mut soft) = (false, false, false, false);
     for map in maps {
         offline_area_id |= map.offline_area_id.is_some();
         // A blank basemap's paper colour (#2532), which an older reader would draw and save white.
@@ -1136,6 +1136,8 @@ fn map_capabilities<'a>(maps: impl IntoIterator<Item = &'a Map>) -> Vec<&'static
             bed |= t.block.as_ref().and_then(|b| b.water.as_ref()).is_some_and(|w| w.bed.is_some());
             // The layer a block's walls are coloured by (#2173), which an older reader would save away.
             walls_layer |= t.block.as_ref().is_some_and(|b| b.walls_layer.is_some());
+            // The band along their top (#2607), which an older reader would save away.
+            walls_top |= t.block.as_ref().is_some_and(|b| b.walls_top.is_some());
         }
         relief |= map.layers.iter().any(relief_effects);
         light |= map.layers.iter().any(relief_light);
@@ -1158,6 +1160,7 @@ fn map_capabilities<'a>(maps: impl IntoIterator<Item = &'a Map>) -> Vec<&'static
         (block_water, "terrain-block-water"),
         (bed, "terrain-block-water-bed"),
         (walls_layer, "terrain-block-walls-layer"),
+        (walls_top, "terrain-block-walls-top"),
         (relief, "shaded-relief-effects"),
         (light, "shaded-relief-light"),
         (soft, "shaded-relief-shadow-softness"),
@@ -1422,6 +1425,26 @@ mod tests {
             b.walls_layer = None;
         }
         assert_eq!(serde_json::to_value(&plain).unwrap()["requires"], json!(["terrain-block"]));
+    }
+
+    /// A band along the top of a block's walls (#2607) reads back as it was, and saving names it in
+    /// `requires`; the same block without it doesn't.
+    #[test]
+    fn terrain_block_walls_top_fixture_requires_it() {
+        let fixture = Project::from_json(include_str!("../../../schema/fixtures/terrain_block_walls_top_v2.rgis")).unwrap();
+        let top = fixture.maps[0].view.terrain.as_ref().and_then(|t| t.block.as_ref()).and_then(|b| b.walls_top.clone());
+        assert_eq!(
+            top,
+            Some(rustgis_map::view::WallsTop { layer: "solos".into(), thickness: rustgis_map::view::BandThickness::Metres(150.0) })
+        );
+        let saved = serde_json::to_value(&fixture).unwrap();
+        assert_eq!(saved["requires"], json!(["terrain-block", "terrain-block-walls-layer", "terrain-block-walls-top"]));
+        assert_eq!(saved["maps"][0]["view"]["terrain"]["block"]["walls_top"], json!({"layer": "solos", "thickness": 150.0}));
+        let mut plain = fixture;
+        if let Some(b) = plain.maps[0].view.terrain.as_mut().and_then(|t| t.block.as_mut()) {
+            b.walls_top = None;
+        }
+        assert_eq!(serde_json::to_value(&plain).unwrap()["requires"], json!(["terrain-block", "terrain-block-walls-layer"]));
     }
 
     /// A block's water floor read from a bed raster (#2434) reads back by the raster's name, and

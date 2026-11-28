@@ -304,6 +304,7 @@ mod tests {
                 depth: None,
                 walls: BLOCK_WALLS,
                 walls_layer: None,
+                walls_top: None,
                 shape: Default::default(),
                 water: None,
             }),

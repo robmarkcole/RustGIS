@@ -7480,6 +7480,10 @@ fn references_follow_layer(s: &mut Session, old: &str, new: &str) {
     if let Some(walls) = s.map_mut().view.terrain.as_mut().and_then(|t| t.block.as_mut()).and_then(|b| b.walls_layer.as_mut()) {
         replace(walls);
     }
+    // And the layer of its walls' top band (#2607).
+    if let Some(top) = s.map_mut().view.terrain.as_mut().and_then(|t| t.block.as_mut()).and_then(|b| b.walls_top.as_mut()) {
+        replace(&mut top.layer);
+    }
     // And the raster its water's bed is read from (#2434).
     if let Some(bed) =
         s.map_mut().view.terrain.as_mut().and_then(|t| t.block.as_mut()).and_then(|b| b.water.as_mut()).and_then(|w| w.bed.as_mut())
@@ -7838,6 +7842,12 @@ fn square_labels_follow_removal(s: &mut Session, names: &[String]) {
     }
 }
 
+/// What brings back a block's walls layer or top band after its layer is gone: a layer
+/// `rustgis_render::terrain::walls_layer` takes.
+fn back_as_walls_layer() -> &'static str {
+    "a polygon layer of that name comes back, the only layer so named and not one read a view at a time"
+}
+
 /// After layers called `names` are removed: a terrain drawn from one of them would lose its
 /// relief, or take another layer's heights by that name, so it is turned off, and said. Its water
 /// layer removed (#1915), the water keeps the name, so a layer of that name brings it back, and
@@ -7853,12 +7863,24 @@ fn terrain_follows_removal(s: &mut Session, names: &[String]) {
     }
     let dem = terrain_dem(s).filter(|d| names.iter().any(|n| n.eq_ignore_ascii_case(d)));
     // So does the block's walls layer (#1914): its walls are their own colour meanwhile. Not when
-    // the DEM goes too: the terrain, its block with it, is turned off below.
+    // the DEM goes too: the terrain, its block with it, is turned off below. Said whenever no layer
+    // of that name is left that the walls can be drawn from (`walls_layer`): none, or only one that
+    // isn't of polygons, or several sharing the name.
+    let drawable = |s: &Session, name: &str| rustgis_render::terrain::walls_layer(s.map(), name).is_some();
     let walls = s.map().view.terrain.as_ref().and_then(|t| t.block.as_ref()).and_then(|b| b.walls_layer.clone());
-    if let Some(w) = walls.filter(|w| dem.is_none() && names.iter().any(|n| n.eq_ignore_ascii_case(w)) && named_layers(s, w) == 0) {
+    if let Some(w) = walls.filter(|w| dem.is_none() && names.iter().any(|n| n.eq_ignore_ascii_case(w)) && !drawable(s, w)) {
+        s.notify(
+            format!("Terrain: the block's walls layer '{w}' was removed, so the walls are one colour until {}", back_as_walls_layer()),
+            false,
+        );
+    }
+    // And its walls' top band's (#2607): no band meanwhile.
+    let top = s.map().view.terrain.as_ref().and_then(|t| t.block.as_ref()).and_then(|b| b.walls_top.as_ref()).map(|t| t.layer.clone());
+    if let Some(l) = top.filter(|l| dem.is_none() && names.iter().any(|n| n.eq_ignore_ascii_case(l)) && !drawable(s, l)) {
         s.notify(
             format!(
-                "Terrain: the block's walls layer '{w}' was removed, so the walls are one colour until a layer of that name comes back"
+                "Terrain: the block's walls' top layer '{l}' was removed, so the walls have no top band until {}",
+                back_as_walls_layer()
             ),
             false,
         );
