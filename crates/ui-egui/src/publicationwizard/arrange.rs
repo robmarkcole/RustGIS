@@ -1,8 +1,6 @@
 //! The wizard's placement step: which corner each surround takes.
 use super::*;
-use rustgis_engine::cmd::layout::{
-    ARRANGEMENTS, Homes, corners_of, parse_arrangement, publication_style_has_column, usable_saved_arrangement,
-};
+use rustgis_engine::cmd::layout::{ARRANGEMENTS, Homes, corners_of, parse_arrangement, usable_saved_arrangement};
 
 /// The arrangement `layout.publication` is asked for.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -83,14 +81,20 @@ fn corner_labels() -> [&'static str; 4] {
 }
 
 /// The locator's place in [`Homes`].
-const LOCATOR: usize = 0;
+pub(super) const LOCATOR: usize = 0;
+
+/// The north arrow's.
+pub(super) const NORTH_ARROW: usize = 1;
+
+/// The scale bar's.
+pub(super) const SCALE_BAR: usize = 3;
 
 /// The locator and the legend, by their place in [`Homes`]: what a column style keeps in its
 /// column.
 const IN_COLUMN: [usize; 2] = [LOCATOR, 2];
 
 /// The surrounds' names, in [`Homes`]'s order.
-fn surround_labels() -> [&'static str; 4] {
+pub(super) fn surround_labels() -> [&'static str; 4] {
     [tl_raw!("Locator"), tl_raw!("North arrow"), tl_raw!("Legend"), tl_raw!("Scale bar")]
 }
 
@@ -123,12 +127,13 @@ pub(super) fn arrange_step(ui: &mut egui::Ui, s: &Session, d: &mut Draft) {
         let from = d.arrangement.held(s).ok().flatten().unwrap_or_else(|| favourite_homes(s));
         d.arrangement = Arrangement::Custom(from);
     }
-    // What `cmd/layout/publication` puts in no corner, whatever the arrangement: the locator and
-    // legend of a style with a column, which sit in it, and a figure's locator, which it doesn't
-    // draw unless asked (the wizard doesn't ask).
-    let figure = d.figure();
-    let column = !figure && publication_style_has_column(&d.style);
-    let cornered = |surround: usize| !(column && IN_COLUMN.contains(&surround) || figure && surround == LOCATOR);
+    // A surround takes no corner where the sheet doesn't draw it, nor where a style with a column
+    // keeps it there.
+    let column = d.column();
+    let free: [bool; 4] = std::array::from_fn(|at| d.draws(at, s) && !(column && IN_COLUMN.contains(&at)));
+    let cornered = |surround: usize| free[surround];
+    // A figure draws a locator only when asked.
+    let no_locator = d.figure() && !d.draws_locator(s);
     if let Arrangement::Custom(homes) = &mut d.arrangement {
         corner_pickers(ui, homes, cornered);
     }
@@ -152,7 +157,7 @@ pub(super) fn arrange_step(ui: &mut egui::Ui, s: &Session, d: &mut Draft) {
             }
         });
     }
-    let note = if figure {
+    let note = if no_locator {
         Some(tl!("A figure draws no locator."))
     } else {
         column.then(|| tl!("The locator and legend sit in this style's column: only the north arrow and scale bar take these corners."))
@@ -405,6 +410,54 @@ mod tests {
             assert_eq!(h.state().session.project.layouts.len(), before, "nothing made");
             assert_eq!(h.state().session.layout_favourite, json!("classic"));
             assert_eq!(h.state().dialogs.open, Some("publicationWizard"));
+        }
+    }
+
+    /// A surround the sheet won't draw takes no corner: one the elements step left out, a north
+    /// arrow left to the extent on a whole globe, and a legend with no colorbar to keep its place.
+    #[test]
+    fn a_surround_left_out_takes_no_corner() {
+        use super::super::elements::{LocatorChoice, NorthChoice};
+        type Set = fn(&mut RustGisApp);
+        fn draft_of(app: &mut RustGisApp) -> &mut Draft {
+            app.dialogs.publication.as_mut().unwrap()
+        }
+        let cases: [(&str, Set, [bool; 4]); 7] = [
+            ("no locator", |a| draft_of(a).elements.locator = LocatorChoice::None, [false, true, true, true]),
+            ("no north arrow", |a| draft_of(a).elements.north = NorthChoice::None, [true, false, true, true]),
+            ("no scale bar", |a| draft_of(a).elements.scale_bar = false, [true, true, true, false]),
+            ("no legend", |a| draft_of(a).elements.legend = false, [true, true, false, true]),
+            (
+                "a figure with a locator",
+                |a| (draft_of(a).size, draft_of(a).elements.locator) = ("figure-1col".into(), LocatorChoice::Inset),
+                [true, true, true, true],
+            ),
+            ("a whole globe", |a| a.session.map_mut().projection = rustgis_engine::map::Projection::Globe, [false, false, true, false]),
+            (
+                "a whole globe with an arrow asked for",
+                |a| {
+                    a.session.map_mut().projection = rustgis_engine::map::Projection::Globe;
+                    draft_of(a).elements.north = NorthChoice::Always;
+                },
+                [false, true, true, false],
+            ),
+        ];
+        for (case, set, free) in cases {
+            let h = placement(|app| {
+                draft_of(app).arrangement = Arrangement::Custom([0, 1, 2, 3]);
+                set(app);
+            });
+            for ((surround, corner), free) in
+                [("Locator", "Top left"), ("North arrow", "Top right"), ("Legend", "Bottom left"), ("Scale bar", "Bottom right")]
+                    .into_iter()
+                    .zip(free)
+            {
+                assert_eq!(shown(&h, &format!("{corner}: {surround}")), free, "{case}: {surround} in the grid");
+                let off = h.get_by_role_and_label(Role::ComboBox, surround).accesskit_node().is_disabled();
+                assert_eq!(off, !free, "{case}: {surround}'s picker");
+            }
+            let figure = h.query_by_label("A figure draws no locator.").is_some();
+            assert!(!figure, "{case}: no figure note");
         }
     }
 

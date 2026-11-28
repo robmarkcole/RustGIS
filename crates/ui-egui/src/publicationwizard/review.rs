@@ -1,4 +1,5 @@
 //! The wizard's review step.
+use super::elements::elements_value;
 use super::map::{area_label, name_label};
 use super::*;
 
@@ -17,6 +18,7 @@ pub(super) fn review_step(ui: &mut egui::Ui, s: &Session, d: &Draft) {
         row(tl!("Map extent"), area_label(s, &d.area));
         row(tl!("Name"), name_label(s, &d.name));
         if d.figure() {
+            row(tl!("Elements"), elements_value(s, d));
             placement_rows(&mut row, s, d);
             row(tl!("Reference"), reference_value(d));
             return;
@@ -29,6 +31,7 @@ pub(super) fn review_step(ui: &mut egui::Ui, s: &Session, d: &Draft) {
         row(tl!("Orientation"), turned.to_string());
         let style = crate::ribbon::publication_style(&d.style).map(|s| s.0.to_string()).unwrap_or_else(|| d.style.clone());
         row(tl!("Style"), style);
+        row(tl!("Elements"), elements_value(s, d));
         placement_rows(&mut row, s, d);
         row(tl!("Title"), or_none(&d.title));
         row(tl!("Subtitle"), or_none(&d.subtitle));

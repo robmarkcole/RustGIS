@@ -565,3 +565,12 @@ fn a_publication_legend_says_nothing_of_a_raster_it_does_not_key() {
         assert!(!w.contains("have no key in the legend"), "{legend}: {w}");
     }
 }
+
+/// The styles whose surrounds sit on cards, as the wizard is told them (#3172).
+#[test]
+fn only_modular_and_poster_put_their_surrounds_on_cards() {
+    use crate::cmd::layout::{PUBLICATION_STYLES, publication_style_cards};
+    let cards: Vec<&str> = PUBLICATION_STYLES.iter().map(|(id, _)| *id).filter(|id| publication_style_cards(id)).collect();
+    assert_eq!(cards, ["modular", "poster"]);
+    assert!(!publication_style_cards("unknown"));
+}

@@ -85,6 +85,11 @@ pub fn publication_style_has_column(style: &str) -> bool {
     Style::parse(style).is_some_and(Style::has_column)
 }
 
+/// Whether a [`PUBLICATION_STYLES`] style id sets its surrounds on cards, each with its own box.
+pub fn publication_style_cards(style: &str) -> bool {
+    Style::parse(style).is_some_and(Style::cards)
+}
+
 /// How a publication sheet is arranged around its map.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(in crate::cmd::layout) enum Style {
