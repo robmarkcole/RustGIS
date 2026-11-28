@@ -30,9 +30,25 @@ pub fn layout_bytes_with(
     georeference: bool,
     options: rustgis_render::pdf::Options,
 ) -> Result<Vec<u8>, String> {
+    layout_bytes_for(s, li, pdf, dpi, all, georeference, options, None)
+}
+
+/// [`layout_bytes_with`] for a file that may be downloaded to the path given: a PDF's pages are
+/// then held to that room too, and stopped as they pass it.
+#[expect(clippy::too_many_arguments, reason = "the export's own settings")]
+fn layout_bytes_for(
+    s: &mut Session,
+    li: usize,
+    pdf: bool,
+    dpi: f64,
+    all: bool,
+    georeference: bool,
+    options: rustgis_render::pdf::Options,
+    download: Option<(crate::cmd::exports::Room, &str)>,
+) -> Result<Vec<u8>, String> {
     let layout = s.project.layouts.get(li).ok_or("no layout")?;
     let revisions = rustgis_render::layout::archive_revisions(layout, &s.project.maps);
-    let result = layout_bytes_inner(s, li, pdf, dpi, all, georeference, options);
+    let result = layout_bytes_inner(s, li, pdf, dpi, all, georeference, options, download);
     let layout = s.project.layouts.get(li).ok_or("no layout")?;
     revisions.finish_revision(
         rustgis_render::layout::archive_revisions(layout, &s.project.maps),
@@ -143,6 +159,7 @@ pub(in crate::cmd::layout) fn layout_bytes_inner(
     all: bool,
     georeference: bool,
     options: rustgis_render::pdf::Options,
+    download: Option<(crate::cmd::exports::Room, &str)>,
 ) -> Result<Vec<u8>, String> {
     let saved = s.project.layouts.get(li).ok_or("no layout")?.clone();
     if let Some(note) = named_fonts_unread(&saved) {
@@ -229,6 +246,11 @@ pub(in crate::cmd::layout) fn layout_bytes_inner(
                     out.push(rustgis_render::pdf::Page::drawing(drawing, w, h).with_viewports(geo.viewports));
                 }
                 held += out.last().map_or(0, rustgis_render::pdf::Page::len);
+                if let Some((room, path)) = download
+                    && held > room.bytes
+                {
+                    return Err(room.refusal(path));
+                }
                 if held > PDF_BUDGET {
                     return Err(format!(
                         "the PDF passed {} MB at page {}; export at a lower dpi, or fewer pages",
@@ -461,21 +483,26 @@ pub(crate) fn export_work(s: &Session, p: &Value) -> Result<crate::cmd::exports:
     for m in &mut project.maps {
         m.detach_reads();
     }
+    let download = s.download_room()?;
     Ok(Box::new(move || {
         let mut copy = Session::new(project);
+        let mut held = None;
         let written = (|| {
             let bytes = if svg {
                 layout_svg(&mut copy, li, dpi)?.into_bytes()
             } else {
-                layout_bytes_with(&mut copy, li, pdf, dpi, all, georeference, options)?
+                let download = download.map(|room| (room, path.as_str()));
+                layout_bytes_for(&mut copy, li, pdf, dpi, all, georeference, options, download)?
             };
             rustgis_data::progress::check().map_err(|e| e.to_string())?;
-            rustgis_data::io::write_atomic(Path::new(&path), &bytes).map_err(|e| format!("{path}: {e}"))?;
-            Ok(json!({"path": path, "bytes": bytes.len()}))
+            let len = bytes.len();
+            held = crate::cmd::exports::place(download.is_some(), &path, bytes)?;
+            Ok(json!({"path": path, "bytes": len}))
         })();
         // What drawing it said (frames drawn as pictures, fonts it lacks), as the command says it
         // here.
-        crate::cmd::exports::drawn_on(&mut copy, written, path)
+        let wrote = crate::cmd::exports::drawn_on(&mut copy, written, path)?;
+        Ok(crate::cmd::exports::Wrote { download: held, ..wrote })
     }))
 }
 

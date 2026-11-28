@@ -1021,7 +1021,7 @@ pub fn pages(s: &Session, i: usize) -> Result<(Doc, Vec<rustgis_render::report::
 /// app's runs on a thread of its own ([`export_work`]).
 pub fn report_bytes(s: &mut Session, i: usize, dpi: f64, pdf: bool) -> Result<(Vec<u8>, usize), String> {
     let name = s.project.reports.get(i).map(|r| r.name.clone()).unwrap_or_default();
-    let (bytes, mut copy) = whole_bytes(detached(&s.project), s.path.clone(), i, dpi, pdf);
+    let (bytes, mut copy) = whole_bytes(detached(&s.project), s.path.clone(), i, dpi, pdf, None);
     super::exports::say_coded(s, super::exports::copy_notices_coded(&mut copy, &name));
     bytes
 }
@@ -1038,17 +1038,21 @@ pub(crate) fn export_work(s: &Session, p: &Value) -> Result<super::exports::Work
         return Err("export to a .pdf or .png file".into());
     }
     let (project, folder) = (detached(&s.project), s.path.clone());
+    let download = s.download_room()?;
     Ok(Box::new(move || {
-        let (bytes, mut copy) = whole_bytes(project, folder, i, dpi, pdf);
+        let (bytes, mut copy) = whole_bytes(project, folder, i, dpi, pdf, download.map(|room| (room, path.as_str())));
+        let mut held = None;
         let written = bytes.and_then(|(bytes, pages)| {
             rustgis_data::progress::check().map_err(|e| e.to_string())?;
-            rustgis_data::io::write_atomic(Path::new(&path), &bytes).map_err(|e| format!("{path}: {e}"))?;
-            Ok(json!({"path": path, "pages": pages, "bytes": bytes.len()}))
+            let len = bytes.len();
+            held = super::exports::place(download.is_some(), &path, bytes)?;
+            Ok(json!({"path": path, "pages": pages, "bytes": len}))
         });
         // The layers it lists are read whole; a layout drawn in it draws the others' views, and
         // one whose source fails there is said, as Export Layout says it.
         // What reading the layers lost keeps its code: said with the export's notes.
-        super::exports::drawn_on(&mut copy, written, path)
+        let wrote = super::exports::drawn_on(&mut copy, written, path)?;
+        Ok(super::exports::Wrote { download: held, ..wrote })
     }))
 }
 
@@ -1070,10 +1074,11 @@ fn whole_bytes(
     i: usize,
     dpi: f64,
     pdf: bool,
+    download: Option<(super::exports::Room, &str)>,
 ) -> (Result<(Vec<u8>, usize), String>, Session) {
     let mut copy = Session::new(project);
     copy.path = path;
-    let bytes = whole_copy(&mut copy, i).and_then(|()| drawn_bytes(&mut copy, i, dpi, pdf));
+    let bytes = whole_copy(&mut copy, i).and_then(|()| drawn_bytes(&mut copy, i, dpi, pdf, download));
     (bytes, copy)
 }
 
@@ -1138,7 +1143,13 @@ pub(crate) fn reported_layers(input: &impl super::InputSource, i: usize) -> Vec<
 
 /// The report as a PDF (every page) or a PNG (the first page), and its page count, drawn from
 /// the features `s`'s layers hold.
-fn drawn_bytes(s: &mut Session, i: usize, dpi: f64, pdf: bool) -> Result<(Vec<u8>, usize), String> {
+fn drawn_bytes(
+    s: &mut Session,
+    i: usize,
+    dpi: f64,
+    pdf: bool,
+    download: Option<(super::exports::Room, &str)>,
+) -> Result<(Vec<u8>, usize), String> {
     let (doc, pages) = pages(s, i)?;
     let revision = |s: &Session| {
         pages
@@ -1152,7 +1163,7 @@ fn drawn_bytes(s: &mut Session, i: usize, dpi: f64, pdf: bool) -> Result<(Vec<u8
             .unwrap_or_default()
     };
     let before = revision(s);
-    let result = super::share::saying_shadows(s, "The report", |s| report_pages_bytes(s, &doc, &pages, dpi, pdf));
+    let result = super::share::saying_shadows(s, "The report", |s| report_pages_bytes(s, &doc, &pages, dpi, pdf, download));
     before.finish_revision(revision(s), Some(result), "could not draw the report")?
 }
 
@@ -1162,6 +1173,7 @@ fn report_pages_bytes(
     pages: &[rustgis_render::report::Page],
     dpi: f64,
     pdf: bool,
+    download: Option<(super::exports::Room, &str)>,
 ) -> Result<(Vec<u8>, usize), String> {
     let n = if pdf { pages.len() } else { 1 };
     let mut out = Vec::new();
@@ -1206,6 +1218,12 @@ fn report_pages_bytes(
             out.push(page);
         }
         held += out.last().map_or(0, rustgis_render::pdf::Page::len);
+        // Where the file is downloaded, its pages are held to the room it has too.
+        if let Some((room, path)) = download
+            && held > room.bytes
+        {
+            return Err(room.refusal(path));
+        }
         if held > PDF_BUDGET {
             return Err(format!("the PDF passed {} MB at page {}; export at a lower dpi", PDF_BUDGET >> 20, k + 1));
         }

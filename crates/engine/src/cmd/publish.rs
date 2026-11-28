@@ -48,13 +48,18 @@ fn record(l: &rustgis_map::Layer) -> Result<(&rustgis_data::sync::Synced, &str),
 /// and its record is of the files written and those rows, so it reads `inSync`; the project then
 /// has a change to save.
 pub(crate) fn publish_work(s: &Session, p: &Value) -> Result<super::exports::Work, String> {
+    const WEB: &str = "the web app can't write files on this computer; publish from the desktop app";
     let id = s.layer_id(p)?;
     let l = s.map().layer(id).ok_or("the layer no longer exists")?;
+    // The layer's own source is written, not a path a download could be named after.
+    if s.downloads_files() {
+        return Err(WEB.into());
+    }
     let (synced, path) = record(l)?;
     #[cfg(target_arch = "wasm32")]
     {
         let _ = (synced, path);
-        Err("the web app can't write files on this computer".into())
+        Err(WEB.into())
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -92,6 +97,7 @@ pub(crate) fn publish_work(s: &Session, p: &Value) -> Result<super::exports::Wor
                     refused_notes: Vec::new(),
                     notes: [format!("{name} has no edits its file lacks, so {path} wasn't written")].into_iter().collect(),
                     written_path: None,
+                    download: None,
                     then: None,
                     owner: None,
                     crs_used: Vec::new(),
@@ -168,6 +174,7 @@ pub(crate) fn publish_work(s: &Session, p: &Value) -> Result<super::exports::Wor
                 refused_notes: Vec::new(),
                 notes: published.notes.into(),
                 written_path,
+                download: None,
                 then: Some(then),
                 owner: None,
                 crs_used: Vec::new(),

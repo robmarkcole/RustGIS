@@ -64,6 +64,10 @@ mod block_model;
 #[path = "tests/write_notices.rs"]
 mod write_notices;
 
+#[cfg(not(target_arch = "wasm32"))]
+#[path = "tests/browser_exports.rs"]
+mod browser_exports;
+
 #[path = "tests/held_layers.rs"]
 mod held_layers;
 #[path = "tests/map_system_places.rs"]
@@ -40011,6 +40015,9 @@ fn params_name_every_key_a_command_reads() {
         ("gp.zonalStats", "input"),
         ("gp.zonalStats", "target"),
         ("profile.alongSelected", "row"),
+        // The scan sees `exports::write_here`'s shared read of `path`, which `source.publish`
+        // never reaches: `takes_path` there guards it.
+        ("source.publish", "path"),
         ("sources.remove", "name"),
         ("sources.remove", "extra"),
     ];

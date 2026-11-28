@@ -1440,7 +1440,7 @@ fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, e
             });
         })),
         open_options: None,
-        download: Some(Box::new(|name: &str, bytes: Vec<u8>| download(name, &bytes))),
+        download: Some(Box::new(|name: &str, bytes: std::sync::Arc<Vec<u8>>| download(name, &bytes))),
         inbox: Some(inbox),
         geolibre_manifests: Some(Box::new(move |slot| crate::geolibre::manifests(slot, gl_list_ctx.clone()))),
         geolibre_run: Some(Box::new(move |job, slot| crate::geolibre::run(job, slot, gl_run_ctx.clone()))),

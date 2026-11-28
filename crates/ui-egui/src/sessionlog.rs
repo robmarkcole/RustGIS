@@ -579,7 +579,7 @@ mod tests {
         let got = std::rc::Rc::new(std::cell::RefCell::new(None));
         let sink = got.clone();
         app.services.download = Some(Box::new(move |name, bytes| {
-            *sink.borrow_mut() = Some((name.to_string(), String::from_utf8(bytes).unwrap()));
+            *sink.borrow_mut() = Some((name.to_string(), String::from_utf8(bytes.to_vec()).unwrap()));
             Ok(())
         }));
         save(&mut app);

@@ -1,5 +1,7 @@
 //! Analyze tab: run geoprocessing tools and keep their history.
 
+use std::sync::Arc;
+
 use rustgis_analysis::{Inputs, Output, OutputLayer, RasterInput};
 use rustgis_data::Dataset;
 use rustgis_data::loss::{LossCode, LossMessage};
@@ -3807,16 +3809,34 @@ pub fn writes_files(spec: &rustgis_analysis::ToolSpec) -> bool {
     spec.params.iter().any(|p| matches!(p.kind, rustgis_analysis::ParamKind::SaveFile { .. }))
 }
 
-/// A browser file export waiting for delivery, without a success record until acknowledged.
+/// A browser file waiting for delivery: a tool's output, without a success record until
+/// acknowledged, or an export's file, which says what it wrote only then.
 pub(crate) struct PendingFile {
     pub(crate) continuation: crate::policy::Continuation,
     pub(crate) id: u64,
     pub(crate) file_name: String,
-    pub(crate) bytes: Option<Vec<u8>>,
-    record: GpRecord,
-    losses: Vec<LossMessage>,
+    /// Shared with whatever else holds the file (a raster layer its own), until handed over.
+    pub(crate) bytes: Option<Arc<Vec<u8>>>,
+    from: Delivery,
 }
 
+impl PendingFile {
+    /// Whether an export command made it ([`queue_export`]).
+    pub(crate) fn is_export(&self) -> bool {
+        matches!(self.from, Delivery::Export(_))
+    }
+}
+
+/// What a pending file's acknowledgment completes.
+enum Delivery {
+    #[cfg_attr(not(any(target_arch = "wasm32", test)), expect(dead_code, reason = "the desktop writes a tool's file output itself"))]
+    Tool { record: Box<GpRecord>, losses: Vec<LossMessage> },
+    /// What the export says and does once its file is out, its bytes moved to the queue.
+    Export(Box<super::exports::Wrote>),
+}
+
+/// Queues a tool's file output for download under the name its `output` parameter gives (a name,
+/// not a path), else the tool's own.
 #[cfg(any(target_arch = "wasm32", test))]
 fn queue_file(s: &mut Session, file_name: String, bytes: Vec<u8>, record: GpRecord, losses: Vec<LossMessage>) -> CmdResult {
     let file_name =
@@ -3824,26 +3844,79 @@ fn queue_file(s: &mut Session, file_name: String, bytes: Vec<u8>, record: GpReco
     if file_name.is_empty() || file_name.contains(['/', '\\']) {
         return Err("output must be a file name, not a path, in the browser".into());
     }
-    const MAX_PENDING_BYTES: usize = 256 * 1024 * 1024;
-    let held = s.file_outputs.iter().filter_map(|f| f.bytes.as_ref()).map(Vec::len).sum::<usize>();
-    if s.file_outputs.len() >= 8 || bytes.len() > MAX_PENDING_BYTES.saturating_sub(held) {
-        return Err("file export queue limit reached (8 files or 256 MiB); split the task, model, or script into smaller runs".into());
+    queue(s, file_name, Arc::new(bytes), Delivery::Tool { record: Box::new(record), losses })
+}
+
+/// Queues an export's file for download under its name (`written_path`). The answer says it is
+/// pending, with what the file will say, for a caller that reads no notices later.
+pub(super) fn queue_export(s: &mut Session, mut wrote: super::exports::Wrote) -> CmdResult {
+    let (Some(bytes), Some(file_name)) = (wrote.download.take(), wrote.written_path.clone()) else {
+        return Err("this export made no file to download".into());
+    };
+    // Not exported until the download is taken: the claim goes from the pending answer, and what
+    // follows it (what the file leaves out) stays, under the file's name.
+    let exported = format!("Exported {file_name}");
+    let messages: Vec<String> = wrote
+        .completion_notes()
+        .into_iter()
+        .filter_map(|message| match message.strip_prefix(&exported) {
+            Some("") => None,
+            Some(note) if note.starts_with([' ', ';']) => Some(format!("{file_name}{note}")),
+            _ => Some(message),
+        })
+        .collect();
+    let mut out = queue(s, file_name, bytes, Delivery::Export(Box::new(wrote)))?;
+    out["messages"] = json!(messages);
+    Ok(out)
+}
+
+/// Why no more can wait for download, of the `cap` bytes that waiting files may hold in all.
+pub(crate) fn queue_full(cap: usize) -> String {
+    format!(
+        "file export queue limit reached ({} files or {} MiB); split the task, model, or script into smaller runs",
+        super::exports::MAX_DOWNLOADS,
+        super::exports::mib(cap)
+    )
+}
+
+/// Holds `bytes` for the front end to offer as the download `file_name` and acknowledge with
+/// `gp.fileDelivered`, within what the queue holds.
+fn queue(s: &mut Session, file_name: String, bytes: Arc<Vec<u8>>, from: Delivery) -> CmdResult {
+    use super::exports::{MAX_DOWNLOADS, mib};
+    // A file held only here gives back its spare room first: an encoder's buffer can be twice
+    // its length. One shared (a raster layer's own file) counts whole.
+    let bytes = match Arc::try_unwrap(bytes) {
+        Ok(mut file) => {
+            file.shrink_to_fit();
+            Arc::new(file)
+        }
+        Err(shared) => shared,
+    };
+    let cap = s.download_cap();
+    let held = s.waiting_download_bytes();
+    // An export whose writer takes a limit was stopped at it; this is what holds the others (a
+    // picture, an SVG, a PDF past its pages, the file a raster layer holds) to it.
+    // Measured as the queue counts what waits: by what the file holds, its spare room included.
+    let size = bytes.capacity();
+    if matches!(from, Delivery::Export(_)) && size > cap {
+        return Err(format!(
+            "{file_name}: {} MiB, more than the {} MiB a command can download in the browser; export less (a selection of features, a smaller size or fewer pages), use the Export buttons, or use the desktop app",
+            mib(size),
+            mib(cap)
+        ));
+    }
+    if s.waiting_download_count() >= MAX_DOWNLOADS || size > cap.saturating_sub(held) {
+        return Err(queue_full(cap));
     }
     s.next_pending = s.next_pending.wrapping_add(1);
     let id = s.next_pending;
-    s.file_outputs.push(PendingFile {
-        id,
-        file_name: file_name.clone(),
-        bytes: Some(bytes),
-        record,
-        losses,
-        continuation: s.continuation()?,
-    });
+    s.file_outputs.push(PendingFile { id, file_name: file_name.clone(), bytes: Some(bytes), from, continuation: s.continuation()? });
     s.request_only = true;
     Ok(json!({"pending": true, "download": id, "file": file_name}))
 }
 
-/// Records a completed file delivery through the generated-message history seam.
+/// Records a completed file delivery: a tool's through the generated-message history seam, an
+/// export's by saying what it wrote.
 fn file_delivered(s: &mut Session, p: &Value) -> CmdResult {
     let id = p.get("id").and_then(Value::as_u64).ok_or("id is required")?;
     let i = s.file_outputs.iter().position(|f| f.id == id).ok_or("no pending file with that id")?;
@@ -3851,32 +3924,49 @@ fn file_delivered(s: &mut Session, p: &Value) -> CmdResult {
     if s.file_outputs[i].bytes.is_some() {
         return Err("the file has not been handed to the download service".into());
     }
-    let mut file = s.file_outputs.remove(i);
+    let file = s.file_outputs.remove(i);
     let error = p.get("error").and_then(Value::as_str);
-    file.record.ok = error.is_none();
-    if let Some(error) = error {
-        file.record.messages.push(error.to_string());
-    }
     if let Some(report) = &mut s.model_run {
         report.file_delivered(id, error);
     }
-    for message in &file.record.messages {
-        if file.record.ok {
+    let (mut record, losses) = match file.from {
+        Delivery::Tool { record, losses } => (*record, losses),
+        Delivery::Export(wrote) => {
+            // An export leaves the project as it is: no Undo step for finishing one.
+            s.request_only = true;
+            let mut out = match error {
+                None => super::exports::said(s, *wrote)?,
+                Some(error) => {
+                    s.notify(error.to_string(), true);
+                    json!({"messages": [error]})
+                }
+            };
+            out["file"] = json!(file.file_name);
+            out["delivered"] = json!(error.is_none());
+            return Ok(out);
+        }
+    };
+    record.ok = error.is_none();
+    if let Some(error) = error {
+        record.messages.push(error.to_string());
+    }
+    for message in &record.messages {
+        if record.ok {
             s.notify_written(message.clone());
         } else {
             s.notify(message.clone(), true);
         }
     }
-    for loss in file.losses {
-        if file.record.ok {
+    for loss in losses {
+        if record.ok {
             publish_tool_loss(s, loss.code, &loss.text, true);
         } else {
             s.notify(loss.text.clone(), true);
         }
-        file.record.messages.push(loss.text);
+        record.messages.push(loss.text);
     }
-    let out = json!({"file": file.file_name, "delivered": file.record.ok, "messages": file.record.messages});
-    s.push_gp_record(file.record);
+    let out = json!({"file": file.file_name, "delivered": record.ok, "messages": record.messages});
+    s.push_gp_record(record);
     if s.project.gp_history.len() > 500 {
         s.project.gp_history.remove(0);
     }
@@ -4253,7 +4343,7 @@ mod file_tests {
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].1, "Elevation.pmtiles");
         assert!(files[0].2.starts_with(b"PMTiles\x03"));
-        assert_eq!(files[0].2, expected, "layer and group transparency are both applied");
+        assert_eq!(*files[0].2, expected, "layer and group transparency are both applied");
         assert_eq!(s.map().layers.len(), 1);
         assert!(
             s.run("gp.run", &json!({"tool": "rasterToPmtiles", "params": {"input": "Elevation", "minZoom": 2, "maxZoom": 1}})).is_err()
@@ -4277,6 +4367,21 @@ mod file_tests {
             }));
         }
         s.run("test.queueFile", &json!({"name":name,"bytes":bytes,"record":record}))
+    }
+
+    /// A file queued with spare room (an encoder's buffer) gives it back before it is admitted,
+    /// so what waits never passes the limit the queue counts it against.
+    #[test]
+    fn a_queued_file_is_held_to_the_limit_by_what_it_holds() {
+        let mut s = Session::new(crate::Project::default());
+        s.download_cap = Some(50);
+        s.registry.commands.push(C::new("test.queueRoomy", "File export", "Test", |s, _| {
+            let mut file = Vec::with_capacity(100);
+            file.extend_from_slice(&[7; 10]);
+            super::queue_file(s, "roomy.bin".into(), file, record(), Vec::new())
+        }));
+        assert_eq!(s.run("test.queueRoomy", &Value::Null).unwrap()["pending"], true);
+        assert_eq!(s.waiting_download_bytes(), 10);
     }
 
     fn record() -> GpRecord {
@@ -4472,7 +4577,7 @@ mod file_tests {
         assert!(s.project.gp_history.is_empty());
         assert!(s.run("gp.fileDelivered", &json!({"id": id})).is_err());
         assert!(s.project.gp_history.is_empty());
-        assert_eq!(s.take_gp_files(), vec![(id, "cities.pmtiles".into(), vec![1, 2, 3])]);
+        assert_eq!(s.take_gp_files(), vec![(id, "cities.pmtiles".into(), std::sync::Arc::new(vec![1, 2, 3]))]);
         assert!(s.take_gp_files().is_empty(), "bytes are handed over once");
         let out = s.run("gp.fileDelivered", &json!({"id": id, "error": "browser rejected download"})).unwrap();
         assert_eq!(out["delivered"], false);

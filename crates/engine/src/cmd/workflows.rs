@@ -2625,7 +2625,8 @@ fn convert(s: &mut Session, p: &Value) -> CmdResult {
     let construction_notes = s.constructions.export_notes(s.map().instance_id(), layer)?;
     let mut ds = Cow::Borrowed(feature_ds(s, p)?);
     let report = rustgis_data::export::filter_dataset(&mut ds, layer.definition_query.as_deref()).map_err(|e| e.to_string())?;
-    let (text, notes) = converted(&ds, p)?;
+    let (text, notes) = converted(&ds, p, None)?;
+    let text = String::from_utf8(text).map_err(|e| e.to_string())?;
     let null_numbers = rustgis_data::export::numbers_written_as_null(&ds.features, &ds.fields, conversion_format(p)?);
     let target = ds.name.clone();
     let query_note = super::share::query_export_note(&target, &layer.name, &report);
@@ -2653,10 +2654,14 @@ pub(crate) fn convert_work(s: &Session, p: &Value) -> Result<super::exports::Wor
     conversion_format(p)?;
     let params = p.clone();
     let (constructions, map) = (s.constructions.clone(), s.map().instance_id());
+    let download = s.download_room()?;
     Ok(Box::new(move || {
         let construction_notes = constructions.export_notes(map, &layer)?;
         let format = conversion_format(&params)?;
-        let chunks = if layer.is_streamed() && matches!(format, "geojson" | "csv") { layer.chunk_export()? } else { None };
+        // A download is made whole, in memory.
+        let chunks =
+            if download.is_none() && layer.is_streamed() && matches!(format, "geojson" | "csv") { layer.chunk_export()? } else { None };
+        let mut held = None;
         let query = layer.definition_query.as_deref();
         let (mut notes, null_numbers, query_report) = if let Some((source, ds)) = chunks {
             let result = rustgis_data::export::write_source_as_filtered(
@@ -2701,24 +2706,28 @@ pub(crate) fn convert_work(s: &Session, p: &Value) -> Result<super::exports::Wor
             (notes, result.null_numbers, result.query)
         } else {
             let (mut ds, unreadable) = if layer.is_streamed() {
-                let (ds, unreadable) = layer.load_all_counted()?;
+                let (ds, unreadable) =
+                    if download.is_some() { super::exports::read_for_download(&layer)? } else { layer.load_all_counted()? };
                 (Cow::Owned(ds), unreadable)
             } else {
                 (Cow::Borrowed(&layer.dataset), rustgis_map::Unreadable::default())
             };
             let report = rustgis_data::export::filter_dataset(&mut ds, query).map_err(|e| e.to_string())?;
             rustgis_data::progress::begin(ds.features.len());
-            let (text, notes) = converted(&ds, &params)?;
+            let (text, notes) = converted(&ds, &params, download)?;
             let mut notes: rustgis_data::loss::Notes = notes;
             super::share::coalesce_read_zm(&mut notes, &path, &ds, &unreadable);
-            rustgis_data::io::write_atomic(std::path::Path::new(&path), text.as_bytes()).map_err(|e| format!("{path}: {e}"))?;
+            held = super::exports::place(download.is_some(), &path, text)?;
             if unreadable.rows > 0 {
                 notes.push(super::whole::unread_note(&path, unreadable.rows));
             }
             notes.extend(super::share::read_notes(&path, &ds.name, &unreadable));
             (notes, rustgis_data::export::numbers_written_as_null(&ds.features, &ds.fields, format), report)
         };
-        let bytes = std::fs::metadata(&path).map_err(|e| format!("{path}: {e}"))?.len();
+        let bytes = match &held {
+            Some(bytes) => bytes.len() as u64,
+            None => std::fs::metadata(&path).map_err(|e| format!("{path}: {e}"))?.len(),
+        };
         notes.extend(construction_notes);
         notes.push(format!("Exported {path}"));
         let target = path.clone();
@@ -2737,6 +2746,7 @@ pub(crate) fn convert_work(s: &Session, p: &Value) -> Result<super::exports::Wor
             diagnostics: Vec::new(),
             refused_notes,
             written_path: Some(path),
+            download: held,
             then,
             #[cfg(not(target_arch = "wasm32"))]
             owner: None,
@@ -2754,8 +2764,9 @@ fn conversion_format(p: &Value) -> Result<&str, String> {
     }
 }
 
-/// Serializes a complete dataset and collects its loss notices for delivery after success.
-fn converted(ds: &Dataset, p: &Value) -> Result<(String, rustgis_data::loss::Notes), String> {
+/// Serializes a complete dataset and collects its loss notices for delivery after success. For a
+/// `download`, the text is stopped as soon as it passes that room.
+fn converted(ds: &Dataset, p: &Value, download: Option<super::exports::Room>) -> Result<(Vec<u8>, rustgis_data::loss::Notes), String> {
     let name_field =
         ps(p, "nameField").and_then(|n| ds.field_index(n)).or_else(|| ds.fields.iter().position(|f| f.name.eq_ignore_ascii_case("name")));
     let format = conversion_format(p)?;
@@ -2763,12 +2774,10 @@ fn converted(ds: &Dataset, p: &Value) -> Result<(String, rustgis_data::loss::Not
     // in: the text and what it loses are read from the copy there. A feature with a place that
     // can't be given there is written without its geometry, and said.
     let (lonlat, unplaced) = ds.in_lonlat_leaving_out()?;
-    let text = match format {
-        "geojson" => rustgis_data::io::to_geojson_text(&lonlat).map_err(|e| e.to_string())?,
-        "csv" => rustgis_data::io::to_csv(&lonlat).map_err(|e| e.to_string())?,
-        "kml" => rustgis_data::interop::to_kml(&lonlat, name_field).map_err(|e| e.to_string())?,
-        "gpx" => rustgis_data::interop::to_gpx(&lonlat, name_field).map_err(|e| e.to_string())?,
-        _ => rustgis_data::interop::to_wkt_csv(&lonlat).map_err(|e| e.to_string())?,
+    let encode = |limit: &rustgis_data::capped::Limit| rustgis_data::io::text_bytes_within(&lonlat, format, name_field, limit);
+    let text = match download {
+        Some(room) => room.encode(ps(p, "path").unwrap_or(&ds.name), encode)?,
+        None => encode(&rustgis_data::capped::Limit::none()).map_err(|e| e.to_string())?,
     };
     let target = ps(p, "path").unwrap_or(&ds.name);
     let mut notes = rustgis_data::export_notes([(ds, ds.lonlat_extent())], target, rustgis_data::raster::Crs::LonLat);

@@ -246,9 +246,9 @@ fn orbit_params(p: &Value) -> Result<Orbit, String> {
 /// the copy left out is said by the session's own landing check (`notice_landed_rasters`, after
 /// each command and on each frame of the app), not frame by frame here.
 pub(crate) fn orbit_work(s: &Session, p: &Value) -> Result<super::exports::Work, String> {
-    // Files are written by the desktop app; the browser's go through its services.
-    if cfg!(target_arch = "wasm32") {
-        return Err("exporting an orbit needs the desktop app".into());
+    // Refused where files are downloaded: the web app draws no animations ([`super::time::animate`]).
+    if s.downloads_files() {
+        return Err("the web app can't export an orbit; open the project in the desktop app and export it there".into());
     }
     let path = ps(p, "path").ok_or("path is required (a .gif, or a .zip of PNG frames)")?.to_string();
     let lower = path.to_ascii_lowercase();

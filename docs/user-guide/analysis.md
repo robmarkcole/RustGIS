@@ -522,7 +522,9 @@ vertex per ring allows for implicit ring closure. The work-limit error is distin
 the memory-limit error: simplify polygon rings, reduce the input extent, or narrow the zoom
 range. These limits reject the whole export rather than sampling or truncating it.
 Browser task, model and script runs can queue at most eight files or 256 MiB of archive bytes
-before downloads are submitted; split larger batches into separate runs. Browser success
+before downloads are submitted; split larger batches into separate runs, and start each run only after the previous run's downloads are submitted. A file still waiting when
+its script, model or task fails, or when another project replaces its own, is dropped with a
+notice, and its run is left out of the geoprocessing history. Browser success
 means the download was submitted, not confirmation that the browser saved it. Example:
 
 ```text

@@ -1084,6 +1084,9 @@ pub struct Session {
     /// Exercises the browser delivery path with real tools in native engine tests.
     #[cfg(test)]
     queue_gp_files: bool,
+    /// A smaller limit than [`cmd::exports::MAX_DOWNLOAD_BYTES`] for a test to reach.
+    #[cfg(test)]
+    pub(crate) download_cap: Option<usize>,
     /// Asynchronous runs started and not yet complete: (id, job, resolved params, start time).
     #[cfg(feature = "geolibre")]
     pub(crate) started: Vec<(u64, rustgis_geolibre::Job, serde_json::Value, u64, policy::Continuation)>,
@@ -1603,6 +1606,8 @@ impl Session {
             file_outputs: Vec::new(),
             #[cfg(test)]
             queue_gp_files: false,
+            #[cfg(test)]
+            download_cap: None,
             request_only: false,
             shared_steps: StepTally::default(),
             leave_downloads: false,
@@ -1820,10 +1825,87 @@ impl Session {
         r
     }
 
-    /// Takes tool files awaiting download. Metadata stays until `gp.fileDelivered` acknowledges
-    /// delivery, so producing bytes alone never records a successful run. Another caller's
-    /// queued files stay untouched until their owner or the native host takes them.
-    pub fn take_gp_files(&mut self) -> Vec<(u64, String, Vec<u8>)> {
+    /// Whether the files commands make reach the user as downloads: the browser has no filesystem
+    /// to write a path in, so a tool's file output and an export queue their bytes for the front
+    /// end ([`Session::take_gp_files`]).
+    pub(crate) fn downloads_files(&self) -> bool {
+        #[cfg(test)]
+        if self.queue_gp_files {
+            return true;
+        }
+        cfg!(target_arch = "wasm32")
+    }
+
+    /// The most bytes the files waiting for download may hold in all.
+    pub(crate) fn download_cap(&self) -> usize {
+        #[cfg(test)]
+        if let Some(cap) = self.download_cap {
+            return cap;
+        }
+        cmd::exports::MAX_DOWNLOAD_BYTES
+    }
+
+    /// Where files are downloaded, the room for one more; `None` where they are written. Refused
+    /// when no more can wait, before any of it is made.
+    pub(crate) fn download_room(&self) -> Result<Option<cmd::exports::Room>, String> {
+        if !self.downloads_files() {
+            return Ok(None);
+        }
+        let waiting = self.waiting_download_bytes();
+        let bytes = self.download_cap().saturating_sub(waiting);
+        if self.waiting_download_count() >= cmd::exports::MAX_DOWNLOADS || bytes == 0 {
+            return Err(cmd::gp::queue_full(self.download_cap()));
+        }
+        Ok(Some(cmd::exports::Room { bytes, waiting }))
+    }
+
+    /// The files waiting for download: this project's, and those of a project a command replaced,
+    /// kept until the command ends in case it gives that project back.
+    fn waiting_downloads(&self) -> impl Iterator<Item = &cmd::gp::PendingFile> {
+        self.file_outputs.iter().chain(self.put_aside.iter().flat_map(|aside| aside.file_outputs.iter()))
+    }
+
+    /// How many files wait for download, those put aside with a replaced project included.
+    pub(crate) fn waiting_download_count(&self) -> usize {
+        self.waiting_downloads().count()
+    }
+
+    /// The bytes the files waiting for download hold, those put aside included.
+    pub(crate) fn waiting_download_bytes(&self) -> usize {
+        self.waiting_downloads().filter_map(|f| f.bytes.as_ref()).map(|bytes| bytes.capacity()).sum()
+    }
+
+    /// Whether pending download `id` is an export's: no geoprocessing run records it.
+    pub fn is_export_file(&self, id: u64) -> bool {
+        self.file_outputs.iter().any(|file| file.id == id && file.is_export())
+    }
+
+    /// Says which queued downloads among `files` are dropped, and `why`: the exports in one
+    /// notice (the desktop would have written their files by now), the tools' file outputs in
+    /// another (a run is recorded only once its file is delivered, so these go unrecorded).
+    fn say_dropped_downloads<'a>(&mut self, files: impl IntoIterator<Item = &'a cmd::gp::PendingFile>, why: &str) {
+        let (exports, tools): (Vec<_>, Vec<_>) = files.into_iter().partition(|file| file.is_export());
+        let names = |files: Vec<&cmd::gp::PendingFile>| files.iter().map(|file| file.file_name.clone()).collect::<Vec<_>>();
+        let (exports, tools) = (names(exports), names(tools));
+        if !exports.is_empty() {
+            self.notify(format!("{} export(s) not downloaded, {why}: {}", exports.len(), listed(&exports)), true);
+        }
+        if !tools.is_empty() {
+            self.notify(
+                format!(
+                    "{} tool output file(s) not downloaded, {why}, so their runs aren't in the geoprocessing history: {}",
+                    tools.len(),
+                    listed(&tools)
+                ),
+                true,
+            );
+        }
+    }
+
+    /// Takes tool and export files awaiting download. Metadata stays until `gp.fileDelivered`
+    /// acknowledges delivery, so producing bytes alone never records a successful run. Another
+    /// caller's queued files stay untouched until their owner or the native host takes them.
+    pub fn take_gp_files(&mut self) -> Vec<(u64, String, std::sync::Arc<Vec<u8>>)> {
         let mut live = Vec::new();
         let mut refused: Vec<(String, Vec<String>)> = Vec::new();
         for mut file in std::mem::take(&mut self.file_outputs) {
@@ -2502,6 +2584,8 @@ impl Session {
             },
             _ => res,
         };
+        // Queued for download in a project the command opened, then gave up for the one before.
+        let mut opened_files = Vec::new();
         match (&res, snapshot) {
             // A command that only left a request for the front end (a download in the browser,
             // [`Session::request_url`]) changed nothing: no undo step, nothing to save yet. The
@@ -2583,7 +2667,7 @@ impl Session {
                 // Replaced during the command: what it held beside itself (its undo history, its
                 // trust, its unsaved state) comes back with it.
                 if self.opened != opened {
-                    self.give_back(opened);
+                    opened_files = self.give_back(opened);
                 }
                 if let Some(files) = files {
                     self.file_identity = files.identity;
@@ -2640,7 +2724,11 @@ impl Session {
             self.restore_url_request_checkpoint(requests);
             (self.plugin_retries, self.url_waits) = retry_state;
             // Keep only still-present old identities: drained bytes and terminal refusals stay consumed.
-            self.file_outputs.retain(|file| file_outputs.contains(&file.id));
+            let (kept, mut dropped): (Vec<_>, Vec<_>) =
+                std::mem::take(&mut self.file_outputs).into_iter().partition(|file| file_outputs.contains(&file.id));
+            self.file_outputs = kept;
+            dropped.append(&mut opened_files);
+            self.say_dropped_downloads(&dropped, "as the command that made them failed");
         }
         let quiet = std::mem::take(&mut self.quiet_failure);
         if let Err(e) = &res
@@ -2650,7 +2738,9 @@ impl Session {
         }
         // The command, and those it ran, are done: a replaced project stays replaced.
         if self.depth == 0 {
-            self.put_aside = None;
+            if let Some(replaced) = self.put_aside.take() {
+                self.say_dropped_downloads(&replaced.file_outputs, "as another project replaced theirs first");
+            }
             self.published_syncs.clear();
             // Frame maintenance and some policy adapters run a guard without command dispatch.
             // Otherwise the command epilogue trims once, after any maintenance steps.
@@ -2742,9 +2832,10 @@ impl Session {
     }
 
     /// Gives back what project `opened` held beside itself, when it is restored. Every field is
-    /// named (no `..`): one added to [`PutAside`] and not given back doesn't compile.
-    fn give_back(&mut self, opened: u64) {
-        let Some(a) = self.put_aside.take_if(|a| a.opened == opened) else { return };
+    /// named (no `..`): one added to [`PutAside`] and not given back doesn't compile. Returns the
+    /// files waiting for download that those given back take the place of.
+    fn give_back(&mut self, opened: u64) -> Vec<cmd::gp::PendingFile> {
+        let Some(a) = self.put_aside.take_if(|a| a.opened == opened) else { return Vec::new() };
         let PutAside {
             constructions,
             opened: _,
@@ -2811,7 +2902,7 @@ impl Session {
         self.opened_package = opened_package;
         self.file_identity = file_identity;
         (self.pending, self.plugin_runs, self.plugin_retries, self.url_waits) = (pending, plugin_runs, plugin_retries, url_waits);
-        self.file_outputs = file_outputs;
+        let replaced = std::mem::replace(&mut self.file_outputs, file_outputs);
         (self.downloading, self.downloaded, self.url_requests) = (downloading, downloaded, url_requests);
         self.downloaded_reach = downloaded_reach;
         self.restore_policy_work(policy_work);
@@ -2830,6 +2921,7 @@ impl Session {
         {
             self.sql_results = sql_results;
         }
+        replaced
     }
 
     /// Says what reading raster layers' pixels lost when it wasn't said as each was added (pixels
@@ -3781,7 +3873,8 @@ impl Session {
     /// Forgets undo/redo and extent history and marks the project clean (after new/open, or a
     /// front end setting up how the project starts): what [`PutAside`] holds, dropped.
     pub fn clear_history(&mut self) {
-        drop(self.take_project_state());
+        let replaced = self.take_project_state();
+        self.say_dropped_downloads(&replaced.file_outputs, "as another project replaced theirs first");
         self.undo_memory.clear();
         self.project_starts = self.project_starts.wrapping_add(1);
         // A state of its own: undo back past a replacement made within a command (a task's step)

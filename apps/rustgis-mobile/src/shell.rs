@@ -628,7 +628,10 @@ fn use_picker<P: Phone + 'static>(
         answer_ended(&answers, ended);
     }));
     let saver = phone.clone();
-    app.services.download = Some(Box::new(move |name: &str, bytes: Vec<u8>| saver.save_file(name, bytes, false)));
+    // The buttons' downloads are the only holder of their bytes, so nothing is copied here.
+    app.services.download = Some(Box::new(move |name: &str, bytes: std::sync::Arc<Vec<u8>>| {
+        saver.save_file(name, std::sync::Arc::unwrap_or_clone(bytes), false)
+    }));
     let saver = phone.clone();
     app.services.save_project = Some(Box::new(move |name: &str, bytes: Vec<u8>, document: Option<&str>| match document {
         Some(document) => saver.write_back(document, name, bytes),

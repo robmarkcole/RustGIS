@@ -44,6 +44,7 @@ use std::path::Path;
 
 use super::geotiff::{GeoKeys, fits_bytes, geo_keys};
 use super::{ColorHint, Raster};
+use crate::capped::Limit;
 use crate::{DataError, Result};
 
 /// Pixels along a tile's sides, in the full image and in every overview.
@@ -1050,9 +1051,19 @@ pub fn written_bands(r: &Raster, band: usize) -> Result<Vec<usize>> {
 
 /// A raster as the bytes of a cloud-optimised GeoTIFF (for the browser, which downloads them).
 pub fn write(r: &Raster, band: usize) -> Result<Vec<u8>> {
-    let mut out = std::io::Cursor::new(Vec::new());
-    write_to(r, band, Flavour::Auto, &mut out)?;
-    Ok(out.into_inner())
+    write_with_info(r, band).map(|(bytes, _)| bytes)
+}
+
+/// [`write`], also saying how the file is laid out, as [`write_file`] does.
+pub fn write_with_info(r: &Raster, band: usize) -> Result<(Vec<u8>, CogInfo)> {
+    write_with_info_within(r, band, &Limit::none())
+}
+
+/// [`write_with_info`] within `limit`: refused as soon as the file would pass it.
+pub fn write_with_info_within(r: &Raster, band: usize, limit: &Limit) -> Result<(Vec<u8>, CogInfo)> {
+    let mut out = limit.buffer();
+    let info = write_to(r, band, Flavour::Auto, &mut out);
+    limit.whole(info.map(|info| (out.into_inner(), info)))
 }
 
 /// Writes a cloud-optimised GeoTIFF to `path` through a temporary file beside it, synced and

@@ -15,6 +15,7 @@ use tiff::tags::Tag;
 use super::cog::Sparse;
 use super::crs::CustomCrs;
 use super::{ColorHint, Crs, Exact, GeoTransform, ImageGrid, Raster, Uncounted, max_samples};
+use crate::capped::Limit;
 use crate::{DataError, Result};
 
 fn err(e: impl std::fmt::Display) -> DataError {
@@ -2278,7 +2279,14 @@ fn alpha_hits_no_data(r: &Raster, opaque: f32, alpha: &[f32]) -> bool {
 /// COG writer ([`super::cogwrite::write_strips`]). A cancelled run stops it (with
 /// [`DataError::Cancelled`]) within a strip.
 pub fn write(r: &Raster, band: usize) -> Result<Vec<u8>> {
-    encode(r, band, false)
+    write_within(r, band, &Limit::none())
+}
+
+/// [`write`] within `limit`: refused as soon as the file would pass it.
+pub fn write_within(r: &Raster, band: usize, limit: &Limit) -> Result<Vec<u8>> {
+    let mut out = limit.buffer();
+    let made = encode(r, band, false, &mut out);
+    limit.whole(made.map(|()| out.into_inner()))
 }
 
 /// Writes every band of a raster, for a layer whose pixels the project keeps: as [`write`] does
@@ -2288,7 +2296,9 @@ pub fn write(r: &Raster, band: usize) -> Result<Vec<u8>> {
 /// reads them back as the same bands. An integer raster's alpha, when written as floats, is divided
 /// by its opaque value, as [`write`] does.
 pub fn write_all(r: &Raster) -> Result<Vec<u8>> {
-    encode(r, 0, true)
+    let mut out = std::io::Cursor::new(Vec::new());
+    encode(r, 0, true, &mut out)?;
+    Ok(out.into_inner())
 }
 
 /// Writes `data` (samples interleaved as `img` lays them out, a row after another) as `img`'s
@@ -2297,7 +2307,7 @@ fn put<T: Copy + Sync, const N: usize>(
     img: super::cogwrite::Strips,
     data: &[T],
     le: fn(T) -> [u8; N],
-    out: &mut std::io::Cursor<Vec<u8>>,
+    out: &mut (impl std::io::Write + std::io::Seek),
 ) -> Result<()> {
     put_cells(img, data, |v| le(*v), out)
 }
@@ -2308,7 +2318,7 @@ fn put_cells<T: Sync, const N: usize>(
     img: super::cogwrite::Strips,
     data: &[T],
     cell: impl Fn(&T) -> [u8; N] + Sync,
-    out: &mut std::io::Cursor<Vec<u8>>,
+    out: &mut (impl std::io::Write + std::io::Seek),
 ) -> Result<()> {
     let per_row = img.w as usize * usize::from(img.spp);
     super::cogwrite::write_strips(img, out, |rows, buf| {
@@ -2321,11 +2331,10 @@ fn put_cells<T: Sync, const N: usize>(
 /// [`write`] (or with `every`, [`write_all`]). Whether a single 8-bit band's cells are all bytes
 /// is one look over the band, on several threads, with no look at Cancel inside it: Cancel is
 /// looked at after it, and between strips as they are written.
-fn encode(r: &Raster, band: usize, every: bool) -> Result<Vec<u8>> {
+fn encode(r: &Raster, band: usize, every: bool, out: &mut (impl std::io::Write + std::io::Seek)) -> Result<()> {
     use super::cogwrite::{Sample, Strips, few_classes, geo_entries};
     // A scan's place is only where it was laid on the view: not coordinates to write into a file.
     r.require_coordinates().map_err(err)?;
-    let mut out = std::io::Cursor::new(Vec::new());
     let gt = r.transform;
     if gt.pixel_height > 0.0 || gt.pixel_width < 0.0 {
         return Err(err("only north-up rasters can be exported for now"));
@@ -2421,7 +2430,7 @@ fn encode(r: &Raster, band: usize, every: bool) -> Result<Vec<u8>> {
                     // Every band holds `n` values (checked above), so none is filled in.
                     data.extend(r.bands.iter().enumerate().map(|(bi, b)| $sample(bi, b.data.get(i).copied().unwrap_or(f32::NAN))));
                 }
-                put(image(&all[..], $kind, extras)?, &data, $le, &mut out)?;
+                put(image(&all[..], $kind, extras)?, &data, $le, out)?;
             }};
         }
         if as_bytes {
@@ -2446,13 +2455,13 @@ fn encode(r: &Raster, band: usize, every: bool) -> Result<Vec<u8>> {
             for i in 0..n {
                 data.extend([red.get(i), green.get(i), blue.get(i), a.get(i)].map(|v| v.copied().unwrap_or(0)));
             }
-            put(image(&[0, 1, 2, 3], Sample::Byte, fourth())?, &data, u8::to_le_bytes, &mut out)?;
+            put(image(&[0, 1, 2, 3], Sample::Byte, fourth())?, &data, u8::to_le_bytes, out)?;
         } else {
             let mut data = Vec::with_capacity(n * 3);
             for i in 0..n {
                 data.extend([red.get(i), green.get(i), blue.get(i)].map(|v| v.copied().unwrap_or(0)));
             }
-            put(image(&[0, 1, 2], Sample::Byte, Vec::new())?, &data, u8::to_le_bytes, &mut out)?;
+            put(image(&[0, 1, 2], Sample::Byte, Vec::new())?, &data, u8::to_le_bytes, out)?;
         }
     } else if rgb && let (Some(red), Some(green), Some(blue)) = (r.bands.first(), r.bands.get(1), r.bands.get(2)) {
         // Colour bands that aren't bytes (three embedding dimensions): kept as 32-bit floats, with
@@ -2470,14 +2479,14 @@ fn encode(r: &Raster, band: usize, every: bool) -> Result<Vec<u8>> {
                 for i in 0..n {
                     data.extend([cell(false, at(red, i)), cell(false, at(green, i)), cell(false, at(blue, i)), cell(true, at(alpha, i))]);
                 }
-                put(image(&[0, 1, 2, 3], Sample::Float, fourth())?, &data, f32::to_le_bytes, &mut out)?;
+                put(image(&[0, 1, 2, 3], Sample::Float, fourth())?, &data, f32::to_le_bytes, out)?;
             }
             None => {
                 let mut data = Vec::with_capacity(n * 3);
                 for i in 0..n {
                     data.extend([at(red, i), at(green, i), at(blue, i)]);
                 }
-                put(image(&[0, 1, 2], Sample::Float, Vec::new())?, &data, f32::to_le_bytes, &mut out)?;
+                put(image(&[0, 1, 2], Sample::Float, Vec::new())?, &data, f32::to_le_bytes, out)?;
             }
         }
     } else {
@@ -2492,12 +2501,12 @@ fn encode(r: &Raster, band: usize, every: bool) -> Result<Vec<u8>> {
             crate::progress::check()?;
             let nodata = r.nodata.map_or(0, |d| d as u8);
             let cell = |v: &f32| [if r.is_valid(*v) { *v as u8 } else { nodata }];
-            put_cells(image(&[band], Sample::Byte, Vec::new())?, &b.data, cell, &mut out)?;
+            put_cells(image(&[band], Sample::Byte, Vec::new())?, &b.data, cell, out)?;
         } else {
-            put(image(&[band], Sample::Float, Vec::new())?, &b.data, f32::to_le_bytes, &mut out)?;
+            put(image(&[band], Sample::Float, Vec::new())?, &b.data, f32::to_le_bytes, out)?;
         }
     }
-    Ok(out.into_inner())
+    Ok(())
 }
 
 #[cfg(test)]

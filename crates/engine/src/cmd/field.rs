@@ -669,6 +669,7 @@ pub(crate) fn export_work(s: &Session, p: &Value) -> Result<super::exports::Work
             notes: Default::default(),
             then: Some(then),
             written_path: None,
+            download: None,
             diagnostics,
             refused_notes: Vec::new(),
             owner: None,

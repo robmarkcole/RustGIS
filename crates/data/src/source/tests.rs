@@ -787,12 +787,99 @@ fn whole_reads_by_chunk_stay_within_the_memory_budget() {
         let src = open_path(&p, None).unwrap();
         assert!(src.visits_chunks(), "{ext}");
         let once = src.read(&Request::all()).unwrap().features;
-        let (whole, report) = materialize_within(src.as_ref(), MAX_READ_BYTES).unwrap();
+        let (whole, report) = materialize_within(src.as_ref(), MAX_READ_BYTES, None).unwrap();
         assert_eq!(whole.features.to_vec(), once, "{ext}");
         assert_eq!(report.skipped, 0, "{ext}");
         let half = chunk_memory::features_bytes(&once) as u64 / 2;
-        let error = materialize_within(src.as_ref(), half).unwrap_err().to_string();
+        let error = materialize_within(src.as_ref(), half, None).unwrap_err().to_string();
         assert!(error.contains("clip or filter it first"), "{ext}: {error}");
+    }
+}
+
+/// A source as its provider answers, counting its whole reads and the features it walks.
+struct Counted {
+    inner: Box<dyn FeatureSource>,
+    reads: std::sync::atomic::AtomicUsize,
+    walked: std::sync::atomic::AtomicUsize,
+}
+
+impl Counted {
+    /// `inner`, nothing read yet.
+    fn new(inner: Box<dyn FeatureSource>) -> Counted {
+        Counted { inner, reads: Default::default(), walked: Default::default() }
+    }
+}
+
+impl FeatureSource for Counted {
+    fn info(&self) -> &SourceInfo {
+        self.inner.info()
+    }
+
+    fn read(&self, req: &Request) -> Result<Batch> {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.read(req)
+    }
+
+    fn visits_chunks(&self) -> bool {
+        self.inner.visits_chunks()
+    }
+
+    fn visits_extent_chunks(&self) -> bool {
+        self.inner.visits_extent_chunks()
+    }
+
+    fn visit_chunks(&self, extent: Option<Extent>, bytes: usize, visit: &mut dyn FnMut(Vec<Feature>) -> Result<()>) -> Result<Batch> {
+        self.inner.visit_chunks(extent, bytes, &mut |chunk| {
+            self.walked.fetch_add(chunk.len(), std::sync::atomic::Ordering::Relaxed);
+            visit(chunk)
+        })
+    }
+
+    fn remote(&self) -> Option<Arc<remote::Remote>> {
+        self.inner.remote()
+    }
+}
+
+/// A budgeted read of a GeoJSON read in place, whose few features hold large geometries its count
+/// says nothing of, is refused as it is walked: it is never read at once, nor walked to its end.
+/// Within the budget it gives what one read gives.
+#[test]
+fn a_budgeted_read_of_a_geojson_stops_before_all_its_geometry_is_held() {
+    use std::sync::atomic::Ordering::Relaxed;
+    const FEATURES: usize = 12;
+    // 960 kB of coordinates a feature: more than a chunk in all.
+    let line = vec!["[1,2]"; 60_000].join(",");
+    let feature = format!(r#"{{"type":"Feature","properties":{{}},"geometry":{{"type":"LineString","coordinates":[{line}]}}}}"#);
+    let p = dir().join("budget-lines.geojson");
+    std::fs::write(&p, format!(r#"{{"type":"FeatureCollection","features":[{}]}}"#, vec![feature; FEATURES].join(","))).unwrap();
+    let src = Counted::new(open_path(&p, None).unwrap());
+    assert_eq!(src.info().count, Some(FEATURES as u64));
+    let error = materialize_up_to(&src, 1 << 20, "over the budget").unwrap_err().to_string();
+    assert!(error.contains("over the budget"), "{error}");
+    assert_eq!(src.reads.load(Relaxed), 0, "refused without a read of the whole source");
+    let walked = src.walked.load(Relaxed);
+    assert!(walked > 0 && walked < FEATURES, "{walked} features walked");
+
+    let (ds, report) = materialize_up_to(&src, MAX_READ_BYTES, "over the budget").unwrap();
+    assert_eq!(ds.features.to_vec(), src.inner.read(&Request::all()).unwrap().features);
+    assert_eq!(report.skipped, 0);
+    assert!(report.messages.is_empty(), "{:?}", report.messages);
+}
+
+/// A file read by its web address can only be read at once, and its count doesn't say what its
+/// geometry and text decode to: a budgeted read refuses it, even with its bytes already fetched.
+#[test]
+fn a_budgeted_read_refuses_a_file_by_its_web_address_before_reading_it() {
+    for (url, parquet) in [("https://test.example/budget.fgb", false), ("https://test.example/budget.geoparquet", true)] {
+        remote::testing::serve(url, big(4, parquet));
+        // Fetched whole, as a view of its whole extent leaves it: a read now needs nothing more.
+        let view: Arc<dyn FeatureSource> = Arc::from(open_url_blocking(url).unwrap());
+        assert!(read_blocking(&view, &Request::all()).unwrap().complete, "{url}");
+        let src = Counted::new(open_url_blocking(url).unwrap());
+        assert!(src.inner.read(&Request::all()).unwrap().complete, "{url}");
+        let error = materialize_up_to(&src, MAX_READ_BYTES, "over the budget").unwrap_err().to_string();
+        assert!(error.contains("by its web address") && error.contains("download"), "{url}: {error}");
+        assert_eq!(src.reads.load(std::sync::atomic::Ordering::Relaxed), 0, "{url}");
     }
 }
 

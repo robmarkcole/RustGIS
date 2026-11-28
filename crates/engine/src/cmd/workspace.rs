@@ -255,6 +255,12 @@ pub fn commands() -> Vec<C> {
         C::new("offline.package", "Package for the Field", "Data › Offline", |s, p| {
             let written = s.notice_mark();
             let path = super::ps(p, "path").ok_or("path is required")?.to_string();
+            // Refused before the package, and its offline area, are made.
+            if s.downloads_files() {
+                return Err(format!(
+                    "{path}: the web app can't write a field package to a path, from a script or the Assistant either; use Package for the Field on the ribbon, which downloads it"
+                ));
+            }
             super::field::not_the_project(s, std::path::Path::new(&path))?;
             let had = s.project.offline_areas.len();
             let (area, bytes, notes) = super::field::package_output(s, p)?;

@@ -814,13 +814,48 @@ pub fn layers(path: &Path) -> Result<Vec<String>> {
 /// source can, otherwise in one read up to [`MAX_LIMIT`]. A larger source, or an incomplete read,
 /// is refused.
 pub fn materialize(src: &dyn FeatureSource) -> Result<(Dataset, ReadReport)> {
-    materialize_within(src, MAX_READ_BYTES)
+    materialize_within(src, MAX_READ_BYTES, None)
 }
 
-/// [`materialize`], with `budget` bytes for a source read a chunk at a time.
-fn materialize_within(src: &dyn FeatureSource, budget: u64) -> Result<(Dataset, ReadReport)> {
+/// [`materialize`] for a caller that can hold only `budget` bytes of features: a larger source is
+/// refused with the error `refusal`. It is refused before it is read when the count it gives says
+/// its rows and their values alone are larger. A source that can be walked whole a chunk at a time
+/// ([`FeatureSource::visits_extent_chunks`], a GeoJSON read in place too) is refused as soon as
+/// what is read passes the budget, having held no more than a chunk, or one larger feature, past
+/// it. A file by its web address that can't be walked is refused before it is read, as neither its
+/// count nor its size says what its geometry and text decode to. Any other source read at once
+/// can't be stopped partway: it is measured once read.
+pub fn materialize_up_to(src: &dyn FeatureSource, budget: u64, refusal: &str) -> Result<(Dataset, ReadReport)> {
     let info = src.info();
-    let batch = if src.visits_chunks() { read_chunks(src, budget)? } else { read_at_once(src)? };
+    let row = std::mem::size_of::<Feature>().saturating_add(info.fields.len().saturating_mul(std::mem::size_of::<crate::Value>()));
+    if info.count.is_some_and(|n| n.saturating_mul(row as u64) > budget) {
+        return Err(DataError::Format(refusal.to_string()));
+    }
+    if src.remote().is_some() && !src.visits_extent_chunks() {
+        return Err(DataError::Format(format!(
+            "{}: a file read by its web address can't be read whole within a memory limit: download it and add the file, or use the desktop app",
+            info.name
+        )));
+    }
+    materialize_within(src, budget, Some(refusal))
+}
+
+/// [`materialize`], with `budget` bytes for a source read a chunk at a time. `refusal`, given by a
+/// caller held to the budget, is the error for a source over it: then a source that can only be
+/// walked by extent is walked too, and one read at once is measured against the budget.
+fn materialize_within(src: &dyn FeatureSource, budget: u64, refusal: Option<&str>) -> Result<(Dataset, ReadReport)> {
+    let info = src.info();
+    let batch = if src.visits_chunks() || (refusal.is_some() && src.visits_extent_chunks()) {
+        read_chunks(src, budget, refusal)?
+    } else {
+        let batch = read_at_once(src)?;
+        if let Some(refusal) = refusal
+            && chunk_memory::features_bytes(&batch.features) as u64 > budget
+        {
+            return Err(DataError::Format(refusal.to_string()));
+        }
+        batch
+    };
     let Batch { features, skipped, unread_dates, rounded_dates, null_text, notes, not_utf8, .. } = batch;
     let mut ds = Dataset::new(info.name.clone(), info.geometry_type, info.fields.clone());
     ds.crs = info.coordinate_system();
@@ -891,16 +926,18 @@ fn read_at_once(src: &dyn FeatureSource) -> Result<Batch> {
 }
 
 /// Every feature of a source that can be read a chunk at a time, with the rows it skipped and the
-/// values it counted, refusing the source once its features would hold more than `budget` bytes.
-fn read_chunks(src: &dyn FeatureSource, budget: u64) -> Result<Batch> {
+/// values it counted, refusing the source once its features would hold more than `budget` bytes,
+/// with the error `refusal` when given.
+fn read_chunks(src: &dyn FeatureSource, budget: u64, refusal: Option<&str>) -> Result<Batch> {
     let info = src.info();
     let row_bytes = std::mem::size_of::<Feature>() as u64;
     let too_large = || {
-        DataError::Format(format!(
-            "{}: the layer needs more than the {} MiB a whole read may hold: clip or filter it first",
-            info.name,
-            budget >> 20
-        ))
+        DataError::Format(match refusal {
+            Some(refusal) => refusal.to_string(),
+            None => {
+                format!("{}: the layer needs more than the {} MiB a whole read may hold: clip or filter it first", info.name, budget >> 20)
+            }
+        })
     };
     let no_memory = || DataError::Format(format!("{}: not enough memory to read the whole layer", info.name));
     // A count that alone is too many rows is refused before reading. It isn't trusted to size the

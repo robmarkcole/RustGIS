@@ -36,9 +36,19 @@ fn crc32(data: &[u8]) -> u32 {
 /// holds at most 65,535 entries and 4 GiB, and names of up to 65,535 bytes; beyond that it's an
 /// error rather than a damaged archive.
 pub fn write(entries: &[(String, Vec<u8>)]) -> Result<Vec<u8>, String> {
-    let too_big = || "the archive is too large for a zip file".to_string();
-    let count = u16::try_from(entries.len()).map_err(|_| too_big())?;
     let mut out = Vec::new();
+    write_to(entries, &mut out)?;
+    Ok(out)
+}
+
+/// [`write`]'s archive, written to `out` as it is made (a buffer held to a limit stops it there).
+/// Besides `out`, it holds the central directory and one entry's compressed bytes at a time.
+pub(crate) fn write_to(entries: &[(String, Vec<u8>)], out: &mut impl std::io::Write) -> Result<(), String> {
+    let too_big = || "the archive is too large for a zip file".to_string();
+    let failed = |e: std::io::Error| e.to_string();
+    let count = u16::try_from(entries.len()).map_err(|_| too_big())?;
+    // How much of the archive is written: where the next entry starts.
+    let mut written: usize = 0;
     let mut central = Vec::new();
     for (name, data) in entries {
         let n = name.as_bytes();
@@ -47,7 +57,7 @@ pub fn write(entries: &[(String, Vec<u8>)]) -> Result<Vec<u8>, String> {
         let crc = crc32(data);
         let z = miniz_oxide::deflate::compress_to_vec(data, 6);
         let (method, body): (u16, &[u8]) = if z.len() < data.len() { (8, &z) } else { (0, data) };
-        let offset = u32::try_from(out.len()).map_err(|_| too_big())?;
+        let offset = u32::try_from(written).map_err(|_| too_big())?;
         let body_len = u32::try_from(body.len()).map_err(|_| too_big())?;
         let header = |sig: u32, central: bool| {
             let mut h = Vec::new();
@@ -75,21 +85,23 @@ pub fn write(entries: &[(String, Vec<u8>)]) -> Result<Vec<u8>, String> {
             h.extend_from_slice(n);
             h
         };
-        out.extend_from_slice(&header(0x0403_4B50, false));
-        out.extend_from_slice(body);
+        let local = header(0x0403_4B50, false);
+        out.write_all(&local).map_err(failed)?;
+        out.write_all(body).map_err(failed)?;
+        written = written.saturating_add(local.len()).saturating_add(body.len());
         central.extend_from_slice(&header(0x0201_4B50, true));
     }
-    let cd_offset = u32::try_from(out.len()).map_err(|_| too_big())?;
+    let cd_offset = u32::try_from(written).map_err(|_| too_big())?;
     let cd_len = u32::try_from(central.len()).map_err(|_| too_big())?;
-    out.extend_from_slice(&central);
-    out.extend_from_slice(&0x0605_4B50u32.to_le_bytes());
-    out.extend_from_slice(&[0, 0, 0, 0]);
-    out.extend_from_slice(&count.to_le_bytes());
-    out.extend_from_slice(&count.to_le_bytes());
-    out.extend_from_slice(&cd_len.to_le_bytes());
-    out.extend_from_slice(&cd_offset.to_le_bytes());
-    out.extend_from_slice(&0u16.to_le_bytes());
-    Ok(out)
+    let mut end = central;
+    end.extend_from_slice(&0x0605_4B50u32.to_le_bytes());
+    end.extend_from_slice(&[0, 0, 0, 0]);
+    end.extend_from_slice(&count.to_le_bytes());
+    end.extend_from_slice(&count.to_le_bytes());
+    end.extend_from_slice(&cd_len.to_le_bytes());
+    end.extend_from_slice(&cd_offset.to_le_bytes());
+    end.extend_from_slice(&0u16.to_le_bytes());
+    out.write_all(&end).map_err(failed)
 }
 
 fn u16_at(b: &[u8], i: usize) -> Option<usize> {

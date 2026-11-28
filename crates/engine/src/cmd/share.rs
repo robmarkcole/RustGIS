@@ -12,7 +12,7 @@ use rustgis_data::raster::Crs;
 use rustgis_render::View;
 use serde_json::{Value, json};
 
-use super::exports::{Work, Wrote};
+use super::exports::{Room, Work, Wrote};
 use super::{f, need_layer, ps};
 use crate::{CommandSpec as C, Session};
 
@@ -421,15 +421,18 @@ pub(crate) fn map_work(s: &Session, p: &Value) -> Result<Work, String> {
         return Err("cog is for a GeoTIFF (.tif or .tiff) export".into());
     }
     let (mut map, view_size) = (s.map().detached(), s.view_size);
+    let download = s.download_room()?.is_some();
     Ok(Box::new(move || {
         let mut shadows = Vec::new();
+        let mut held = None;
         let written = (|| {
             let (png, said) = rustgis_render::shadows_said(|| png_of(&mut map, view_size, width, height, dpi));
             let png = png?;
             shadows = shadow_warnings(&path, &said);
             rustgis_data::progress::check().map_err(|e| e.to_string())?;
-            rustgis_data::io::write_atomic(Path::new(&path), &png).map_err(|e| format!("{path}: {e}"))?;
-            Ok(json!({"path": path, "bytes": png.len()}))
+            let bytes = png.len();
+            held = super::exports::place(download, &path, png)?;
+            Ok(json!({"path": path, "bytes": bytes}))
         })();
         // What the size limit did, and layers drawn without their cast shadows, are said of a
         // file written.
@@ -439,7 +442,7 @@ pub(crate) fn map_work(s: &Session, p: &Value) -> Result<Work, String> {
         } else {
             Vec::new()
         };
-        super::exports::drawn(std::slice::from_ref(&map), sized, written, path)
+        super::exports::drawn(std::slice::from_ref(&map), sized, written, path).map(|wrote| Wrote { download: held, ..wrote })
     }))
 }
 
@@ -487,8 +490,10 @@ fn geotiff_work(
     fits_pixels(&view, turned)?;
     let name = m.name.clone();
     let mut map = m.detached();
+    let download = s.download_room()?;
     Ok(Box::new(move || {
         let mut notices = notices;
+        let mut held = None;
         let written = (|| {
             let placed = rustgis_render::render_placed(&mut map, &view)?;
             rustgis_data::progress::check().map_err(|e| e.to_string())?;
@@ -502,14 +507,24 @@ fn geotiff_work(
             r.copyright = (!credits.is_empty()).then(|| credits.join(" | "));
             rustgis_data::progress::check().map_err(|e| e.to_string())?;
             let (bytes, tiled) = if cog {
-                // Tiles go to the file as they are made; its tiling is in the answer, as Export
-                // Raster gives it.
-                let c = rustgis_data::raster::cogwrite::write_file(&r, 0, Path::new(&path)).map_err(|e| format!("{path}: {e}"))?;
+                // Tiles go to the file as they are made (a download holds them all); its tiling
+                // is in the answer, as Export Raster gives it.
+                let c = if let Some(room) = download {
+                    let (bytes, c) = room.encode(&path, |limit| rustgis_data::raster::cogwrite::write_with_info_within(&r, 0, limit))?;
+                    held = Some(std::sync::Arc::new(bytes));
+                    c
+                } else {
+                    rustgis_data::raster::cogwrite::write_file(&r, 0, Path::new(&path)).map_err(|e| format!("{path}: {e}"))?
+                };
                 (c.bytes, Some(json!({"overviews": c.levels.len().saturating_sub(1), "bigTiff": c.big})))
             } else {
-                let bytes = rustgis_data::raster::geotiff::write(&r, 0).map_err(|e| format!("{path}: {e}"))?;
-                rustgis_data::io::write_atomic(Path::new(&path), &bytes).map_err(|e| format!("{path}: {e}"))?;
-                (bytes.len() as u64, None)
+                let bytes = match download {
+                    Some(room) => room.encode(&path, |limit| rustgis_data::raster::geotiff::write_within(&r, 0, limit))?,
+                    None => rustgis_data::raster::geotiff::write(&r, 0).map_err(|e| format!("{path}: {e}"))?,
+                };
+                let len = bytes.len() as u64;
+                held = super::exports::place(download.is_some(), &path, bytes)?;
+                (len, None)
             };
             let mut out = json!({"path": path, "width": r.width, "height": r.height, "crs": crs.label(), "bytes": bytes});
             if let Some(t) = tiled {
@@ -531,7 +546,7 @@ fn geotiff_work(
         if written.is_ok() {
             notices.splice(0..0, sized);
         }
-        super::exports::drawn(std::slice::from_ref(&map), notices, written, path)
+        super::exports::drawn(std::slice::from_ref(&map), notices, written, path).map(|wrote| Wrote { download: held, ..wrote })
     }))
 }
 
@@ -626,9 +641,10 @@ pub(crate) fn layer_work(s: &Session, p: &Value) -> Result<Work, String> {
     let compatibility = ps(p, "crs").and_then(|text| asked.and_then(|crs| rustgis_data::raster::wkt::typed_crs_note(text, crs)));
     let (boxes, map) = (s.constructions.clone(), s.map().instance_id());
     let project = s.project.coordinate_system;
+    let download = s.download_room()?;
     Ok(Box::new(move || {
         let note = boxes.export_notes(map, &l)?;
-        let mut wrote = write_layer(&l, &path, asked, project, gpkg)?;
+        let mut wrote = write_layer(&l, &path, asked, project, gpkg, download)?;
         wrote.notes.extend(note);
         if let Some(note) = compatibility {
             wrote.notes.insert(0, format!("crs: {note}"));
@@ -693,7 +709,16 @@ pub fn gpkg_dates_note(ds: &rustgis_data::Dataset, ext: &str, path: &str) -> Vec
 
 /// Writes layer `l` to `path`, in `asked` or the system the format defaults to (the project's,
 /// `project`, for a layer with none of its own); a GeoPackage's table goes where `gpkg` says.
-fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, project: Option<Crs>, gpkg: GpkgTable) -> Result<Wrote, String> {
+/// With `download`, the file is made in memory, within that room, and given back instead
+/// ([`Wrote::download`]).
+fn write_layer(
+    l: &rustgis_map::Layer,
+    path: &str,
+    asked: Option<Crs>,
+    project: Option<Crs>,
+    gpkg: GpkgTable,
+    download: Option<Room>,
+) -> Result<Wrote, String> {
     let ext = Path::new(&path).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     // A layer read in place from the GeoPackage it goes into is read whole first: SQLite can't
     // write a file while the same export is reading it.
@@ -701,10 +726,13 @@ fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, project: 
         && l.source.as_ref().and_then(|src| src.path.as_deref()).is_some_and(|src| same_file(Path::new(src), Path::new(&path)));
     // A streamed layer exports its whole source, not the features read for the view: a chunk at
     // a time where the source and format allow, so its size isn't limited by memory.
-    let chunks = if l.is_streamed() && rustgis_data::export::streams(&ext) && !from_target { l.chunk_export()? } else { None };
+    // A download is made whole, in memory.
+    let chunks =
+        if download.is_none() && l.is_streamed() && rustgis_data::export::streams(&ext) && !from_target { l.chunk_export()? } else { None };
+    let mut held = None;
     use std::borrow::Cow;
     let (mut whole, unreadable) = if l.is_streamed() && chunks.is_none() {
-        let (dataset, unreadable) = l.load_all_counted()?;
+        let (dataset, unreadable) = if download.is_some() { super::exports::read_for_download(l)? } else { l.load_all_counted()? };
         (Cow::Owned(dataset), unreadable)
     } else {
         (Cow::Borrowed(&l.dataset), rustgis_map::Unreadable::default())
@@ -779,8 +807,14 @@ fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, project: 
                 .map_err(|e| e.to_string())?;
             // The layer's box in longitude/latitude comes back with the write, taken from the places
             // converted for the file when it is written there, so each is converted once.
-            let (left_out, table, placed, lonlat) =
-                rustgis_data::io::write_path_placed(ds, Path::new(&path), crs, &gpkg).map_err(|e| e.to_string())?;
+            let (left_out, table, placed, lonlat) = if let Some(room) = download {
+                let (bytes, left_out, notes, lonlat) =
+                    room.encode(path, |limit| rustgis_data::io::write_bytes_noted_within(ds, &ext, crs, path, limit))?;
+                held = Some(std::sync::Arc::new(bytes));
+                (left_out, None, notes, lonlat)
+            } else {
+                rustgis_data::io::write_path_placed(ds, Path::new(&path), crs, &gpkg).map_err(|e| e.to_string())?
+            };
             lonlat_extent = Some(lonlat);
             // Old parts of a Shapefile written over that couldn't be removed.
             format_notes.extend(placed);
@@ -865,6 +899,7 @@ fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, project: 
         refused_notes,
         notes: said,
         written_path,
+        download: held,
         then,
         #[cfg(not(target_arch = "wasm32"))]
         owner: None,

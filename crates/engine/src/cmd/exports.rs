@@ -5,7 +5,17 @@
 //! [`export_land`] says what was written, as the command would have. The admitted operation owns
 //! preparation, file commit and delivery; a completed write remains written even if delivery
 //! is subsequently refused.
+//!
+//! The browser has no filesystem to write a path in ([`Session::downloads_files`]): there
+//! [`write_here`] names the export after the path's file, its work gives the bytes back instead
+//! of writing them ([`place`]), and the front end offers them as a download, as it does a tool's
+//! file output (`gp.fileDelivered`).
 
+use std::borrow::Cow;
+use std::sync::Arc;
+
+use rustgis_data::Dataset;
+use rustgis_data::capped::Limit;
 use serde_json::Value;
 
 use crate::{CmdResult, Session};
@@ -21,7 +31,11 @@ pub struct Wrote {
     /// Source failures to report if delivery cannot update their live layers.
     pub(crate) refused_notes: Vec<String>,
     /// A physical write completed, even if authority to deliver its result is later refused.
+    /// With `download` it is the download's name, and nothing is written yet.
     pub(crate) written_path: Option<String>,
+    /// The file's bytes when it is downloaded rather than written ([`place`]): what it says
+    /// (`notes`, `then`) is said once the front end has taken the download.
+    pub(crate) download: Option<Arc<Vec<u8>>>,
     /// What it does to the session once written, after its notes, and adds to its answer (a
     /// GeoPackage table replaced: the layers reading it read it again).
     pub(crate) then: Option<Then>,
@@ -35,7 +49,8 @@ pub struct Wrote {
 }
 
 impl Wrote {
-    fn completion_notes(&self) -> Vec<String> {
+    /// What it will say or has said of the file, as plain text.
+    pub(crate) fn completion_notes(&self) -> Vec<String> {
         self.notes
             .texts()
             .chain(self.diagnostics.iter().map(|(_, text)| text.as_str()))
@@ -78,6 +93,116 @@ pub fn runs_in_background(command: &str) -> Option<(&'static str, &'static str)>
     IN_BACKGROUND.iter().find(|(c, ..)| *c == command).map(|(c, name, _)| (*c, *name))
 }
 
+/// Puts an export's finished file where it goes: written at `path`, or, when it is downloaded
+/// (`download`, [`Session::downloads_files`]), given back for [`Wrote::download`]. The bytes are
+/// never copied: a file a layer holds is shared with the download.
+pub(crate) fn place(download: bool, path: &str, bytes: impl Into<Arc<Vec<u8>>>) -> Result<Option<Arc<Vec<u8>>>, String> {
+    let bytes = bytes.into();
+    if download {
+        return Ok(Some(bytes));
+    }
+    rustgis_data::io::write_atomic(std::path::Path::new(path), &bytes).map_err(|e| format!("{path}: {e}"))?;
+    Ok(None)
+}
+
+/// The most files that wait for download at once.
+pub(crate) const MAX_DOWNLOADS: usize = 8;
+
+/// The room for one more download: what the files waiting leave of the most bytes they may hold
+/// in all ([`Session::download_room`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Room {
+    pub(crate) bytes: usize,
+    /// What the files already waiting hold.
+    pub(crate) waiting: usize,
+}
+
+impl Room {
+    /// Why `path`'s file, stopped as it passed the room, can't be downloaded, and what to do.
+    pub(crate) fn refusal(self, path: &str) -> String {
+        let cap = mib(self.bytes.saturating_add(self.waiting));
+        let ways = "export less (a selection of features, a smaller size or fewer pages), use the Export buttons, or use the desktop app";
+        if self.waiting == 0 {
+            format!("{path}: stopped once the file passed the {cap} MiB a command can download in the browser; {ways}")
+        } else {
+            format!(
+                "{path}: stopped once the file passed what is left of the {cap} MiB that downloads can hold in the browser, {} MiB of it taken by those already waiting; split the task, model, or script into smaller runs, {ways}",
+                mib(self.waiting)
+            )
+        }
+    }
+
+    /// `path`'s file as `make` encodes it, stopped as soon as it passes the room, so no more of
+    /// it is ever held.
+    pub(crate) fn encode<T>(self, path: &str, make: impl FnOnce(&Limit) -> rustgis_data::Result<T>) -> Result<T, String> {
+        let limit = Limit::new(self.bytes);
+        make(&limit).map_err(|e| if limit.passed() { self.refusal(path) } else { format!("{path}: {e}") })
+    }
+}
+
+/// `bytes` in MiB, rounded up.
+pub(crate) fn mib(bytes: usize) -> usize {
+    bytes.div_ceil(1 << 20)
+}
+
+/// The most feature storage a layer read in place may take while its download is made, and the
+/// most the files waiting for download may hold. The features and the file are held at once, in
+/// the browser's memory. A fixed figure: the browser can't say what memory it has free, so
+/// `rustgis_data::memory::planned` would give its floor there.
+pub(crate) const MAX_DOWNLOAD_BYTES: usize = 256 << 20;
+
+/// Every feature of layer `l`, read in place, for a file made in memory to be downloaded: refused
+/// past [`MAX_DOWNLOAD_BYTES`] of features, before any is read when the source's count alone says
+/// so. A definition query is applied after the read, so it doesn't make the read smaller.
+pub(super) fn read_for_download(l: &rustgis_map::Layer) -> Result<(Dataset, rustgis_map::Unreadable), String> {
+    let refusal = format!(
+        "{}: the layer needs more than the {} MiB of features the web app reads for a download; zoom in, select the features you need, use Make Layer From Selected Features and export that layer, or use the desktop app",
+        l.name,
+        MAX_DOWNLOAD_BYTES >> 20
+    );
+    l.load_all_counted_up_to(MAX_DOWNLOAD_BYTES as u64, &refusal)
+}
+
+/// Export `command`'s parameters when its file is downloaded: `path` cut to the download's name,
+/// with what to say of that once it is downloaded. A Shapefile, several files, is downloaded as
+/// a `.zip`. Refused here, before anything is read, for a path with no file name and for the
+/// formats the browser can't write.
+fn for_download<'a>(command: &str, p: &'a Value) -> Result<(Cow<'a, Value>, Vec<String>), String> {
+    // No path, or parameters that aren't an object: the export says what it needs.
+    let Some(path) = super::ps(p, "path") else { return Ok((Cow::Borrowed(p), Vec::new())) };
+    let mut name = path.rsplit(['/', '\\']).next().unwrap_or_default().to_string();
+    if matches!(name.as_str(), "" | "." | "..") {
+        return Err(format!(
+            "{path}: the browser downloads an export under the file name its path ends in, and this one has none; end it in a name such as map.png"
+        ));
+    }
+    let folder = name != path;
+    let mut notes = Vec::new();
+    if matches!(command, "share.exportLayer" | "share.exportTable") {
+        let named = std::path::Path::new(&name);
+        match named.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase().as_str() {
+            "gpkg" | "fgb" => {
+                return Err(format!(
+                    "{path}: the web app can't write GeoPackage or FlatGeobuf files; export to .geojson, .csv, .parquet, .zip (a Shapefile), .kml, .kmz or .gpx, which it downloads, or use the desktop app"
+                ));
+            }
+            "shp" => {
+                name = named.with_extension("zip").to_string_lossy().into_owned();
+                notes.push(format!("{name}: a Shapefile is several files, so the browser downloads them in one .zip"));
+            }
+            _ => {}
+        }
+    }
+    if folder {
+        notes.push(format!("{name}: the browser chooses where downloads go, so the folder in '{path}' wasn't used"));
+    }
+    let mut p = p.clone();
+    if let Some(params) = p.as_object_mut() {
+        params.insert("path".into(), Value::String(name));
+    }
+    Ok((Cow::Owned(p), notes))
+}
+
 /// Background exports that render map, layout, report, or scene text with installed fonts.
 fn uses_fonts(command: &str) -> bool {
     matches!(command, "share.exportMap" | "layout.export" | "report.export" | "map.exportOrbit" | "map.exportBlock")
@@ -96,12 +221,18 @@ fn cjk_scan_pending() -> bool {
     rustgis_render::fonts::cjk_roots_pending()
 }
 
-/// `command`'s export written here: it says what it wrote.
+/// `command`'s export written here: it says what it wrote. Where files are downloaded
+/// ([`Session::downloads_files`]) it answers that the download is pending instead, and says what
+/// it wrote when the front end acknowledges it.
 pub(crate) fn write_here(s: &mut Session, p: &Value, command: &str) -> CmdResult {
     let &(_, name, start) = IN_BACKGROUND.iter().find(|(c, ..)| *c == command).ok_or_else(|| format!("{command} isn't an export"))?;
     if uses_fonts(command) && cjk_scan_pending() {
         return Err("CJK font folder scan is still running; try exporting again in a moment".into());
     }
+    // Only an export that takes a path is named after it (Publish to Source writes the layer's
+    // own source, and says itself what the browser can't do).
+    let takes_path = s.registry.get(command).and_then(|c| c.param_keys()).is_some_and(|keys| keys.contains(&"path"));
+    let (p, renamed) = if s.downloads_files() && takes_path { for_download(command, p)? } else { (Cow::Borrowed(p), Vec::new()) };
     let owner = s.continuation()?;
     owner.check()?;
     let current = owner.clone();
@@ -109,7 +240,7 @@ pub(crate) fn write_here(s: &mut Session, p: &Value, command: &str) -> CmdResult
     // The probe keeps authority checks at file commit even when the user cannot cancel this run.
     let control = if s.stoppable { rustgis_analysis::control::Control::stoppable() } else { rustgis_analysis::control::Control::new() };
     let (mut wrote, pending_cjk) = crate::render::rustgis_tiles::cache::with_still(still, || {
-        let work = start(s, p)?;
+        let work = start(s, &p)?;
         if uses_fonts(command) {
             let (res, hit) = rustgis_render::fonts::track_pending_cjk(|| written_under(name, &control, work));
             Ok::<_, String>((res?, hit))
@@ -123,8 +254,17 @@ pub(crate) fn write_here(s: &mut Session, p: &Value, command: &str) -> CmdResult
             "CJK font folder scan started during this export; re-run it once the scan finishes if CJK text is missing.".into(),
         ));
     }
-    s.check_continuation(&owner)
-        .map_err(|why| completion_with_notes(command, wrote.written_path.as_deref(), &wrote.completion_notes(), why))?;
+    s.check_continuation(&owner).map_err(|why| {
+        // A download not yet offered wrote nothing.
+        let written = wrote.written_path.as_deref().filter(|_| wrote.download.is_none());
+        completion_with_notes(command, written, &wrote.completion_notes(), why)
+    })?;
+    if wrote.download.is_some() {
+        for (i, note) in renamed.into_iter().enumerate() {
+            wrote.notes.insert(i, note);
+        }
+        return super::gp::queue_export(s, wrote);
+    }
     said(s, wrote)
 }
 
@@ -164,7 +304,7 @@ fn written_under(name: &str, control: &std::sync::Arc<rustgis_analysis::control:
 }
 
 /// Says what an export wrote, and gives its answer (or the failure its `then` says).
-fn said(s: &mut Session, wrote: Wrote) -> CmdResult {
+pub(super) fn said(s: &mut Session, wrote: Wrote) -> CmdResult {
     let Wrote { mut answer, notes, diagnostics, then, written_path, .. } = wrote;
     let mark = s.notice_mark();
     say(s, diagnostics);
@@ -303,6 +443,8 @@ pub(crate) fn drawn(
         diagnostics: notices,
         refused_notes,
         written_path,
+        // Its caller's, which placed the file ([`place`]).
+        download: None,
         then: Some(then),
         #[cfg(not(target_arch = "wasm32"))]
         owner: None,
@@ -546,6 +688,7 @@ mod tests {
                 refused_notes: Vec::new(),
                 notes: ["Exported x"].into_iter().collect(),
                 written_path: Some("x".into()),
+                download: None,
                 then: None,
                 #[cfg(not(target_arch = "wasm32"))]
                 owner: None,
