@@ -329,6 +329,11 @@ pub(in crate::cmd::layout) fn add_element(s: &mut Session, p: &Value) -> CmdResu
     if gives(p, "outline") && !shape {
         return Err(ONLY_OUTLINE.into());
     }
+    // A key the kind doesn't read is refused before anything is read or added (#3074), as a grid's
+    // and an extent indicator's are (#2890).
+    if let Some((what, keys)) = added_keys(kind) {
+        only_add_keys(p, what, keys, ADD_ACCEPTED_KEYS)?;
+    }
     // The box the new element sits on (#2257). A grid, an extent indicator or a section goes on a
     // map frame, which has none: refused rather than dropped.
     let background = match element_background(p, None)? {
@@ -568,7 +573,7 @@ pub(in crate::cmd::layout) fn add_element(s: &mut Session, p: &Value) -> CmdResu
             (name, rect, ElementKind::Line { color, width, dir, head, dash })
         }
         "extentIndicator" => {
-            only_add_keys(p, "an extent indicator", ADD_EXTENT_INDICATOR_KEYS)?;
+            only_add_keys(p, "an extent indicator", ADD_EXTENT_INDICATOR_KEYS, &[])?;
             let frame = frame_of(l, p)?;
             let of =
                 p.get("of").and_then(Value::as_u64).and_then(|v| u32::try_from(v).ok()).ok_or("of (the frame to outline) is required")?;
@@ -588,7 +593,7 @@ pub(in crate::cmd::layout) fn add_element(s: &mut Session, p: &Value) -> CmdResu
             return Ok(json!({"element": frame}));
         }
         "grid" => {
-            only_add_keys(p, "a grid", ADD_GRID_KEYS)?;
+            only_add_keys(p, "a grid", ADD_GRID_KEYS, &[])?;
             let frame = frame_of(l, p)?;
             unlocked(l, frame)?;
             // Options not given keep the frame's grid's, or the defaults for a new grid.
@@ -891,11 +896,190 @@ pub(in crate::cmd::layout) const ADD_GRID_KEYS: &[&str] = &[
     "off",
 ];
 
-/// Refuses any non-null key in `p` that `what` does not read, naming it and what `what` reads.
-pub(in crate::cmd::layout) fn only_add_keys(p: &Value, what: &str, allowed: &[&str]) -> Result<(), String> {
+/// Keys `layout.addElement` takes of any kind though a kind may not read them, so its error does not
+/// list them: `frame`, which the ribbon sends with every kind (a text, picture, rectangle, ellipse,
+/// circle, line or arrow has no frame to read it for, so it is dropped there still), and `name`,
+/// which a kind that isn't a section says it ignores (`say_name_ignored`) rather than refuses.
+const ADD_ACCEPTED_KEYS: &[&str] = &["frame", "name"];
+
+/// Keys read by `layout.addElement` for a north arrow (#3074).
+const ADD_NORTH_ARROW_KEYS: &[&str] = &["layout", "kind", "frame", "x", "y", "w", "h", "background", "style", "fill", "outline"];
+
+/// Keys read by `layout.addElement` for a scale bar (#3074).
+const ADD_SCALE_BAR_KEYS: &[&str] = &[
+    "layout",
+    "kind",
+    "frame",
+    "x",
+    "y",
+    "w",
+    "h",
+    "background",
+    "style",
+    "units",
+    "divisions",
+    "subdivisions",
+    "divisionsBeforeZero",
+    "labelPosition",
+    "unitLabel",
+    "unitLabelPosition",
+    "fit",
+    "decimals",
+    "textSize",
+    "color",
+    "fill",
+];
+
+/// Keys read by `layout.addElement` for a legend (#3074).
+const ADD_LEGEND_KEYS: &[&str] = &[
+    "layout",
+    "kind",
+    "frame",
+    "x",
+    "y",
+    "w",
+    "h",
+    "background",
+    "title",
+    "allClasses",
+    "hideOther",
+    "showNoData",
+    "exclude",
+    "columns",
+    "labels",
+    "textSize",
+    "fit",
+    "showLayerNames",
+    "color",
+];
+
+/// Keys read by `layout.addElement` for a colorbar (#3074).
+const ADD_COLORBAR_KEYS: &[&str] = &[
+    "layout",
+    "kind",
+    "frame",
+    "x",
+    "y",
+    "w",
+    "h",
+    "background",
+    "layer",
+    "title",
+    "orientation",
+    "ticks",
+    "tickSide",
+    "reverse",
+    "color",
+];
+
+/// Keys read by `layout.addElement` for a text or a dynamic text (#3074).
+const ADD_TEXT_KEYS: &[&str] = &[
+    "layout",
+    "kind",
+    "x",
+    "y",
+    "w",
+    "h",
+    "background",
+    "text",
+    "size",
+    "color",
+    "bold",
+    "italic",
+    "align",
+    "letterSpacing",
+    "font",
+    "fallback",
+    "rotation",
+    "wrap",
+    "valign",
+    "lineSpacing",
+    "case",
+];
+
+/// Keys read by `layout.addElement` for a picture (#3074).
+const ADD_PICTURE_KEYS: &[&str] = &["layout", "kind", "x", "y", "w", "h", "background", "image", "path"];
+
+/// Keys read by `layout.addElement` for a table (#3074).
+const ADD_TABLE_KEYS: &[&str] = &["layout", "kind", "frame", "x", "y", "w", "h", "background", "layer", "rows", "color"];
+
+/// Keys read by `layout.addElement` for a chart (#3074).
+const ADD_CHART_KEYS: &[&str] = &[
+    "layout",
+    "kind",
+    "frame",
+    "x",
+    "y",
+    "w",
+    "h",
+    "background",
+    "layer",
+    "field",
+    "color",
+    "label",
+    "group",
+    "statistic",
+    "order",
+    "bars",
+    "other",
+    "orientation",
+    "values",
+    "decimals",
+    "title",
+    "barColor",
+    "labelAlign",
+    "classes",
+    "stack",
+    "mirror",
+    "max",
+    "hideLabels",
+    "barOutline",
+];
+
+/// Keys read by `layout.addElement` for a rectangle (#3074).
+const ADD_RECTANGLE_KEYS: &[&str] =
+    &["layout", "kind", "x", "y", "w", "h", "background", "fill", "outline", "color", "width", "radius", "dash"];
+
+/// Keys read by `layout.addElement` for an ellipse or a circle (#3074).
+const ADD_ELLIPSE_KEYS: &[&str] = &["layout", "kind", "x", "y", "w", "h", "background", "fill", "outline", "color", "width", "dash"];
+
+/// Keys read by `layout.addElement` for a line or an arrow (#3074).
+const ADD_LINE_KEYS: &[&str] =
+    &["layout", "kind", "x", "y", "w", "h", "background", "color", "width", "dash", "dir", "head", "angle", "length"];
+
+/// What `layout.addElement` calls a kind of element in the error it gives for a key that kind
+/// doesn't read, and the keys it reads; `None` for a kind that checks its own keys (a grid, an
+/// extent indicator, a section) or isn't one.
+fn added_keys(kind: &str) -> Option<(&'static str, &'static [&'static str])> {
+    Some(match kind {
+        "northArrow" => ("a north arrow", ADD_NORTH_ARROW_KEYS),
+        "scaleBar" => ("a scale bar", ADD_SCALE_BAR_KEYS),
+        "legend" => ("a legend", ADD_LEGEND_KEYS),
+        "colorbar" => ("a colorbar", ADD_COLORBAR_KEYS),
+        "text" => ("a text", ADD_TEXT_KEYS),
+        "dynamicText" => ("a dynamic text", ADD_TEXT_KEYS),
+        "picture" => ("a picture", ADD_PICTURE_KEYS),
+        "table" => ("a table", ADD_TABLE_KEYS),
+        "chart" => ("a chart", ADD_CHART_KEYS),
+        "rectangle" => ("a rectangle", ADD_RECTANGLE_KEYS),
+        "ellipse" => ("an ellipse", ADD_ELLIPSE_KEYS),
+        "circle" => ("a circle", ADD_ELLIPSE_KEYS),
+        "line" => ("a line", ADD_LINE_KEYS),
+        "arrow" => ("an arrow", ADD_LINE_KEYS),
+        _ => return None,
+    })
+}
+
+/// Refuses any non-null key in `p` that `what` does not read, nor `accepted` (which it takes without
+/// listing them), naming it and what `what` reads. A key is shown cut to 40 characters, a control
+/// character as `?`, since it is the caller's text.
+pub(in crate::cmd::layout) fn only_add_keys(p: &Value, what: &str, allowed: &[&str], accepted: &[&str]) -> Result<(), String> {
     let Some(obj) = p.as_object() else { return Ok(()) };
-    if let Some(key) = obj.keys().find(|k| !obj.get(*k).is_none_or(Value::is_null) && !allowed.contains(&k.as_str())) {
-        return Err(format!("layout.addElement: {what} takes no \"{key}\" (it reads {})", allowed.join(", ")));
+    let unread = |k: &&String| !obj.get(*k).is_none_or(Value::is_null) && !allowed.contains(&k.as_str()) && !accepted.contains(&k.as_str());
+    if let Some(key) = obj.keys().find(unread) {
+        let shown: String = key.chars().map(|c| if c.is_control() { '?' } else { c }).collect();
+        let shown = if shown.chars().count() > 40 { shown.chars().take(40).chain(['…']).collect() } else { shown };
+        return Err(format!("layout.addElement: {what} takes no \"{shown}\" (it reads {})", allowed.join(", ")));
     }
     Ok(())
 }
@@ -1118,5 +1302,185 @@ mod tests {
             s.run("layout.addElement", &json!({"kind": "grid", "unitLabel": Value::Null})).unwrap_err(),
             super::ONLY_SCALE_BAR_DETAILS
         );
+    }
+
+    /// A layout on the sample's map (it has the layers a table and a chart name), and its frame.
+    fn sample_layout() -> (Session, u32) {
+        let mut s = Session::new(crate::sample::world_project());
+        s.run("layout.new", &json!({"name": "L", "template": "map"})).unwrap();
+        let frame = s.project.layouts[0].first_frame().unwrap();
+        (s, frame)
+    }
+
+    /// Each kind `layout.addElement` checks the keys of in `added_keys`, with what it must be given
+    /// to be added and what its error calls it.
+    fn added_kinds() -> Vec<(&'static str, Value, &'static str)> {
+        vec![
+            ("northArrow", json!({}), "a north arrow"),
+            ("scaleBar", json!({}), "a scale bar"),
+            ("legend", json!({}), "a legend"),
+            ("colorbar", json!({}), "a colorbar"),
+            ("text", json!({"text": "a"}), "a text"),
+            ("dynamicText", json!({}), "a dynamic text"),
+            ("picture", json!({"image": PNG}), "a picture"),
+            ("table", json!({"layer": "Countries"}), "a table"),
+            ("chart", json!({"layer": "Countries", "field": "pop_est"}), "a chart"),
+            ("rectangle", json!({}), "a rectangle"),
+            ("ellipse", json!({}), "an ellipse"),
+            ("circle", json!({}), "a circle"),
+            ("line", json!({}), "a line"),
+            ("arrow", json!({}), "an arrow"),
+        ]
+    }
+
+    /// A 1 x 1 PNG.
+    const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
+    #[test]
+    fn add_element_other_kinds_refuse_unread_parameters_without_mutating() {
+        let (mut s, _frame) = sample_layout();
+        let before_layout = s.project.layouts[0].clone();
+        let before_undo = s.undo_depth();
+
+        // One key per call: the keys are checked in alphabetical order, so several would hide which one is told.
+        let unread: [(&str, &[(&str, Value)]); 14] = [
+            ("northArrow", &[("bold", json!(true)), ("step", json!(5)), ("text", json!("hi"))]),
+            ("scaleBar", &[("bold", json!(true)), ("step", json!(5)), ("text", json!("hi"))]),
+            ("legend", &[("step", json!(5)), ("type", json!("measured")), ("bold", json!(true))]),
+            ("colorbar", &[("text", json!("hi")), ("bold", json!(true)), ("step", json!(5))]),
+            ("text", &[("step", json!(5)), ("divisions", json!(4)), ("ticks", json!(3)), ("angle", json!(20)), ("head", json!("end"))]),
+            ("dynamicText", &[("step", json!(5)), ("layer", json!("Countries"))]),
+            ("picture", &[("bold", json!(true)), ("step", json!(5))]),
+            ("table", &[("ticks", json!(3)), ("text", json!("hi")), ("bold", json!(true))]),
+            ("chart", &[("rows", json!(5)), ("text", json!("hi")), ("bold", json!(true))]),
+            (
+                "rectangle",
+                &[("text", json!("hi")), ("angle", json!(30)), ("divisions", json!(4)), ("step", json!(5)), ("units", json!("miles"))],
+            ),
+            ("ellipse", &[("dir", json!("falling")), ("length", json!(5)), ("text", json!("hi"))]),
+            ("circle", &[("angle", json!(30)), ("image", json!(PNG))]),
+            ("line", &[("text", json!("hi")), ("step", json!(5)), ("bold", json!(true))]),
+            ("arrow", &[("divisions", json!(4)), ("units", json!("miles"))]),
+        ];
+        let kinds = added_kinds();
+        for (kind, keys) in unread {
+            let (_, base, what) = kinds.iter().find(|(k, _, _)| *k == kind).unwrap();
+            for (key, val) in keys {
+                let mut p = base.clone();
+                p["kind"] = json!(kind);
+                p[*key] = val.clone();
+                let err = s.run("layout.addElement", &p).unwrap_err();
+                // Only a kind with a frame to read lists `frame`; none lists `name`, which is only ignored.
+                let frame =
+                    if matches!(kind, "northArrow" | "scaleBar" | "legend" | "colorbar" | "table" | "chart") { "frame, " } else { "" };
+                let told = format!("layout.addElement: {what} takes no \"{key}\" (it reads layout, kind, {frame}x, y, w, h, background, ");
+                assert!(err.starts_with(&told), "{kind} {key}: {err}");
+                assert_eq!(s.project.layouts[0], before_layout, "{kind} {key} mutated layout");
+                assert_eq!(s.undo_depth(), before_undo, "{kind} {key} pushed an undo step");
+            }
+        }
+
+        // The words of the issue's first example, in full.
+        let err = s.run("layout.addElement", &json!({"kind": "northArrow", "bold": true})).unwrap_err();
+        assert_eq!(
+            err,
+            "layout.addElement: a north arrow takes no \"bold\" (it reads layout, kind, frame, x, y, w, h, background, style, fill, outline)"
+        );
+
+        let err = s.run("layout.addElement", &json!({"kind": "rectangle", "angle": 30})).unwrap_err();
+        assert_eq!(
+            err,
+            "layout.addElement: a rectangle takes no \"angle\" (it reads layout, kind, x, y, w, h, background, fill, outline, color, width, radius, dash)"
+        );
+
+        // A picture's file is not read for a call that is refused anyway.
+        let err = s.run("layout.addElement", &json!({"kind": "picture", "path": "/nonexistent/3074.png", "bold": true})).unwrap_err();
+        assert!(err.starts_with("layout.addElement: a picture takes no \"bold\""), "{err}");
+        assert_eq!(s.project.layouts[0], before_layout);
+        assert_eq!(s.undo_depth(), before_undo);
+    }
+
+    #[test]
+    fn add_element_other_kinds_read_every_listed_key_and_ignore_null_unread_ones() {
+        let (mut s, frame) = sample_layout();
+        let said = |s: &Session, mark: u64| -> Vec<String> {
+            s.notices_since(mark).iter().map(|n| n.text.clone()).filter(|t| t.contains("takes no") || t.contains("ignores")).collect()
+        };
+
+        // What the ribbon sends with every kind.
+        for (kind, base, _) in added_kinds() {
+            let mut p = base;
+            p["kind"] = json!(kind);
+            p["layout"] = json!(0);
+            p["frame"] = json!(frame);
+            s.run("layout.addElement", &p).unwrap_or_else(|e| panic!("{kind}: {e}"));
+        }
+
+        // Null counts as not given.
+        for (kind, base, _) in added_kinds() {
+            let mut p = base;
+            p["kind"] = json!(kind);
+            for key in ["bold", "step", "of", "ticks", "angle", "divisions"] {
+                if p.get(key).is_none() && !super::added_keys(kind).is_some_and(|(_, keys)| keys.contains(&key)) {
+                    p[key] = Value::Null;
+                }
+            }
+            let mark = s.notice_mark();
+            s.run("layout.addElement", &p).unwrap_or_else(|e| panic!("{kind}: {e}"));
+            assert!(said(&s, mark).is_empty(), "{kind}: {:?}", said(&s, mark));
+        }
+
+        // Every key a kind reads, each given a value it takes.
+        let calls = [
+            json!({"kind": "northArrow", "layout": 0, "frame": frame, "x": 10, "y": 10, "w": 15, "h": 20, "style": "compass", "fill": "#112233", "outline": "#445566", "background": {"fill": "#FFFFFF"}}),
+            json!({"kind": "scaleBar", "frame": frame, "x": 10, "y": 10, "w": 60, "h": 12, "style": "stepped", "units": "miles", "divisions": 3, "subdivisions": 2, "divisionsBeforeZero": 1, "labelPosition": "below", "unitLabel": "mi", "unitLabelPosition": "afterBar", "fit": "adjustWidth", "decimals": 1, "textSize": 9, "color": "#112233", "fill": "#FFFFFF"}),
+            json!({"kind": "legend", "frame": frame, "title": "T", "allClasses": true, "hideOther": true, "showNoData": true, "exclude": [], "columns": 2, "labels": {}, "textSize": 8, "fit": "adjustSize", "showLayerNames": false, "color": "#112233"}),
+            json!({"kind": "colorbar", "frame": frame, "title": "T", "orientation": "vertical", "ticks": 3, "tickSide": "left", "reverse": true, "color": "#112233"}),
+            json!({"kind": "text", "text": "A", "size": 14, "color": "#112233", "bold": true, "italic": true, "align": "center", "letterSpacing": 1, "font": "Some Family", "fallback": "serif", "rotation": 90, "wrap": true, "valign": "middle", "lineSpacing": 1.5, "case": "upper", "name": "ignored"}),
+            json!({"kind": "dynamicText", "text": "{map}", "size": 10}),
+            json!({"kind": "picture", "image": PNG, "x": 10, "y": 10, "w": 20, "h": 20}),
+            json!({"kind": "table", "frame": frame, "layer": "Countries", "rows": 5, "color": "#112233"}),
+            json!({"kind": "chart", "frame": frame, "layer": "Countries", "field": "pop_est", "color": "#112233", "label": "name", "group": "continent", "statistic": "sum", "order": "ascending", "bars": 5, "other": true, "orientation": "vertical", "values": true, "decimals": 1, "title": "T", "barColor": "#445566", "labelAlign": "right", "classes": false, "mirror": true, "max": 1e9, "hideLabels": true, "barOutline": {"width": 1}}),
+            json!({"kind": "rectangle", "x": 10, "y": 10, "w": 30, "h": 20, "fill": "#112233", "outline": "#445566", "width": 2, "radius": 3, "dash": [4, 2]}),
+            json!({"kind": "ellipse", "x": 10, "y": 10, "w": 30, "h": 20, "fill": "#112233", "color": "#445566", "width": 2, "dash": [4, 2]}),
+            json!({"kind": "circle", "x": 10, "y": 10, "fill": "#112233", "outline": "#445566", "width": 2}),
+            json!({"kind": "line", "x": 10, "y": 10, "w": 30, "h": 20, "color": "#112233", "width": 2, "dash": [4, 2], "dir": "falling", "head": "both"}),
+            json!({"kind": "arrow", "angle": 30, "length": 40, "color": "#112233", "width": 2, "head": "start"}),
+        ];
+        for p in calls {
+            let kind = p["kind"].as_str().unwrap_or_default().to_string();
+            let mark = s.notice_mark();
+            s.run("layout.addElement", &p).unwrap_or_else(|e| panic!("{kind}: {e}"));
+            let says: Vec<String> = said(&s, mark).into_iter().filter(|t| !t.contains("\"name\"")).collect();
+            assert!(says.is_empty(), "{kind}: {says:?}");
+        }
+
+        // What was refused already keeps its words, and a name is still said to be ignored.
+        assert_eq!(
+            s.run("layout.addElement", &json!({"kind": "northArrow", "showLayerNames": false})).unwrap_err(),
+            super::ONLY_LEGEND_NAMES
+        );
+        assert_eq!(s.run("layout.addElement", &json!({"kind": "text", "fit": "manual"})).unwrap_err(), super::ONLY_FIT);
+        assert_eq!(s.run("layout.addElement", &json!({"kind": "ellipse", "radius": 4})).unwrap_err(), super::ONLY_RECTANGLE_RADIUS);
+        let mark = s.notice_mark();
+        s.run("layout.addElement", &json!({"kind": "rectangle", "name": "x"})).unwrap();
+        assert!(s.notices_since(mark).iter().any(|n| n.text.contains("ignores \"name\"")));
+    }
+
+    #[test]
+    fn add_element_unread_key_is_shown_cut_and_without_control_characters() {
+        let (mut s, _frame) = layout_session();
+        let before_layout = s.project.layouts[0].clone();
+        // The caller's key is echoed: 40 characters, a control character as `?`, the rest left out.
+        let key = format!("\u{1b}[31m{}", "x".repeat(5000));
+        let shown = format!("?[31m{}…", "x".repeat(35));
+        for kind in ["northArrow", "grid", "extentIndicator"] {
+            let mut p = json!({"kind": kind});
+            p[&key] = json!(1);
+            let err = s.run("layout.addElement", &p).unwrap_err();
+            assert!(err.starts_with("layout.addElement: ") && err.contains(&format!(" takes no \"{shown}\" (it reads ")), "{kind}: {err}");
+            assert!(!err.chars().any(char::is_control) && err.chars().count() < 600, "{kind}: {err}");
+        }
+        assert_eq!(s.project.layouts[0], before_layout);
     }
 }
