@@ -25982,6 +25982,33 @@ pub(crate) fn serve(body: &'static [u8], n: usize) -> String {
     format!("http://{addr}")
 }
 
+/// The `x` and `y` given to `layer.addUrl` reach the tables of a zip it answers with (#3062).
+#[test]
+fn add_url_of_a_zip_gives_its_tables_the_columns_given() {
+    let book = rustgis_data::sheets::xlsx(&[("ALL", &[&["id", "LongitudeOR", "LatitudeOR"], &["4", "13", "23"]])]);
+    let zip = rustgis_data::zip::write(&[
+        ("a.csv".into(), b"id,LongitudeOR,LatitudeOR\n1,10,20\n2,11,21\n".to_vec()),
+        ("book.xlsx".into(), book),
+        ("notes.csv".into(), b"id,name\n5,x\n".to_vec()),
+    ])
+    .unwrap();
+    let (base, _) = serve_files(vec![("/d/x.zip".into(), zip)]);
+    let mut s = Session::new(Project::default());
+    let mark = s.notice_mark();
+    s.run("layer.addUrl", &json!({"url": format!("{base}/d/x.zip"), "x": "LongitudeOR", "y": "LatitudeOR"})).unwrap();
+    let mut layers: Vec<(String, usize)> = s.map().layers.iter().map(|l| (l.dataset.name.clone(), l.dataset.features.len())).collect();
+    layers.sort();
+    assert_eq!(layers.iter().map(|(_, n)| *n).collect::<Vec<_>>(), [2, 1], "{layers:?}");
+    assert!(s.project.tables.iter().any(|t| t.dataset.name == "notes"));
+    let said = s.notices_since(mark);
+    assert!(
+        said.iter().any(|n| n.text.contains(
+            "used by 2 of 3 tables; the rest were read without them, lacking a column named: notes.csv (no x column 'LongitudeOR')"
+        )),
+        "{said:?}"
+    );
+}
+
 /// Serves each file by its exact path and query (others are 404) on a local port, keeping the
 /// paths asked for; returns the base address and them.
 fn serve_files(files: Vec<(String, Vec<u8>)>) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {

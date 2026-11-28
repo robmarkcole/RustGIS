@@ -25,3 +25,4 @@ mod snap_boxes;
 mod snapping_point_types;
 mod vertex_snap_identity;
 mod workflows;
+mod zip_columns;

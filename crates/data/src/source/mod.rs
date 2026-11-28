@@ -841,6 +841,7 @@ fn materialize_within(src: &dyn FeatureSource, budget: u64) -> Result<(Dataset, 
         unread_dates: unread_dates.clone(),
         rounded_dates: rounded.clone(),
         extrusion: None,
+        columns_lacking: None,
     };
     let null_text = null_text_note(&info.fields, &null_text);
     let not_utf8 = not_utf8_note(&info.fields, &not_utf8, src.text_encoding());

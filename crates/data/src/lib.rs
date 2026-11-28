@@ -791,6 +791,10 @@ pub struct ReadReport {
     /// The extrusion the reader suggests for the layer (a city model's volumes): applied when the
     /// layer is added, and only then; a reload keeps the layer's own.
     pub extrusion: Option<SuggestedExtrusion>,
+    /// A zip's table read with `CsvOptions::columns_optional` that lacked a column named (`x`, `y` or
+    /// `WKT`, and its name): read without the columns given. Not in `messages`: the zip reader takes it
+    /// and says it once for all its tables.
+    pub columns_lacking: Option<Box<(&'static str, String)>>,
 }
 
 /// An extrusion a reader suggests for a layer of polygons: heights from one field, on a base from
