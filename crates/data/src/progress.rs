@@ -97,7 +97,7 @@ pub fn step(n: usize) -> Result<()> {
 
 /// Runs a nested writer without resetting or advancing its source's scan count. Cancellation
 /// still reaches every writer check; dropping the guard restores the source probe on errors too.
-pub(crate) fn without_counting<T>(run: impl FnOnce() -> T) -> T {
+pub fn without_counting<T>(run: impl FnOnce() -> T) -> T {
     struct CancelOnly(Arc<dyn Probe>);
     impl Probe for CancelOnly {
         fn cancelled(&self) -> bool {

@@ -13,7 +13,8 @@ Mercator stops, is measured on the ground instead, so it may be selected outside
 stops at 85.05°, or left out inside it. The main Select button remains click/rectangle selection.
 All selection tools take only features that are drawn, in selectable layers: a definition query or
 a display filter hiding a feature keeps it out, and a click picks the feature drawn on top among the
-selectable layers. **Select By Attributes** takes a SQL clause and checks it as you type (buttons
+selectable layers. **Select By Attributes** takes a SQL clause and checks it as you type and shows how many rows
+match, saying "Counting matching rows…" until the desktop app has the number (buttons
 add a field or an operator, and the **Functions** and **Variables** menus add the language's
 functions and variables); **Select By Location** picks features that touch another layer's features or lie
 within a search distance of them (or, inverted, those that don't). Selected features draw in
@@ -31,6 +32,26 @@ ignoring letter case. The toolbar opens Select By Attributes and zooms to, switc
 deletes the selection, adds or calculates a field, and calculates geometry attributes.
 The first column, **Feature ID**, shows each feature's identifier, not its current row position
 after sorting or filtering. It is not a dataset field: do not use it as a geoprocessing field name.
+
+The cell last clicked is the current cell, shown with an outline. After a click or a scroll in the
+table, the **arrow keys** move it: up and down through the rows as the table sorts and filters them,
+left and right through the columns shown, **Feature ID** first. It stops at the edges, the table
+scrolls to keep it in view, and a held key keeps moving. With no current cell, or with its row or
+column no longer shown, an arrow starts at the first row or column shown. Moving it doesn't change
+the selection. **Enter** edits it, as a double-click does (Feature ID can't be edited). While the
+table is in use the arrow keys don't pan, turn or tilt the map or nudge a layout element; click or
+scroll the map or layout and they do again. While you type in a cell or in **Filter rows…**, the
+keys are the text box's. A shortcut you give an arrow key or Enter still runs its command.
+
+Right-click a row for **Zoom To**, **Remove from Selection**, **Copy** (the feature, as
+**Copy** in the ribbon does), **Copy Value** (the text of the cell clicked; a number is copied in
+full and a picture gives its stored data) and **Delete** (Undo brings the rows back; greyed while
+editing is off and on a layer read in place from its file). A right-click on a row that isn't selected selects it alone first, as a click
+on it does. One on a selected row keeps the selection, and Zoom To, Copy and Delete then act on the
+layer's whole selection, as their labels count it and as the table's toolbar does (selected rows a
+filter hides are among them); choosing one of them clears any selection in other layers.
+**Remove from Selection** takes out only the row clicked. In a standalone table only Copy Value
+can be chosen; the other rows are greyed.
 
 Right-click a column header for **Hide Column**, **Move Left**, **Move Right** and **Show All
 Columns**. A hidden column is only left out of the table: export, selection, expressions and the
@@ -137,8 +158,9 @@ match ignoring case; an ambiguous name is refused. When two keys reach the same 
 names the key left out.
 
 A table's rows live in the project, as they were copied in when it was added: edits change the
-project, not the CSV or other file the table came from. **Export Table** (`share.exportTable`)
-writes the edited table to a file. Tables have no selection yet, so rows can't be deleted.
+project, not the CSV or other file the table came from. **Export Table** writes the edited table
+to a file: right-click the table in the Layers pane, or search for it in Command Search (scripts
+use `share.exportTable`). Tables have no selection yet, so rows can't be deleted.
 
 ```text
 edit.setValue={"table":"sites","row":0,"field":"street","value":"Rue Cler"}
@@ -197,7 +219,14 @@ world projection (World Mercator, Plate Carrée, Robinson, Equal Earth and the l
 the antimeridian as a seam and the poles as lines, is worked on in longitude/latitude, as Web
 Mercator is. If another input has a place that system can't hold, the tool works in
 longitude/latitude instead, and its message says so. A layer in longitude/latitude, Web Mercator or
-another geographic system is worked on in longitude/latitude, as before. In a projected system a
+another geographic system is worked on in longitude/latitude, as before. There, a feature with a place
+that can't be given in longitude/latitude (one far past where its layer's own system reaches) is read
+without its geometry, and the tool's message says how many of each layer were; a tool that updates
+its input in place, as Calculate Geometry Attributes does, leaves that feature's geometry as it was.
+A layer read in place from its file (streamed) holds only the part the map shows: an update of it
+worked in longitude/latitude that read such a feature without its geometry is refused until you
+Load All Features, since that feature's stored geometry may not be in that part.
+In a projected system a
 tool works in, distances in metres (Buffer's, Simplify's tolerance, Points Along Lines' spacing,
 Near's, and the search distances of Select Layer By Location and Spatial Join) are measured flat
 there, in its unit, as distances in a projected system are: a kilometre is 1000 of its metres, or
@@ -493,7 +522,9 @@ vertex per ring allows for implicit ring closure. The work-limit error is distin
 the memory-limit error: simplify polygon rings, reduce the input extent, or narrow the zoom
 range. These limits reject the whole export rather than sampling or truncating it.
 Browser task, model and script runs can queue at most eight files or 256 MiB of archive bytes
-before downloads are submitted; split larger batches into separate runs. Browser success
+before downloads are submitted; split larger batches into separate runs, and start each run only after the previous run's downloads are submitted. A file still waiting when
+its script, model or task fails, or when another project replaces its own, is dropped with a
+notice, and its run is left out of the geoprocessing history. Browser success
 means the download was submitted, not confirmation that the browser saved it. Example:
 
 ```text
@@ -1605,13 +1636,15 @@ click them on the map:
 | --- | --- |
 | Raster Functions | Slope in degrees or percent, aspect, hillshade (8-bit shades from 1 to 255, with 0 for no data), NDVI, band math (`(b4-b3)/(b4+b3)`), remapping, thresholds, resampling |
 | Function Editor | Chains raster functions, each on the previous output |
+| Process | Clips a raster to the view or to a polygon layer, or resamples it ([below](#zonal-statistics-and-polygon-clipping)) |
+| Mosaic Rasters | Joins tiles of one grid into one raster, in the order listed, and can write it to a GeoTIFF ([under Imagery](#imagery)) |
 | Suitability Modeler | Scores rasters 1–10 and adds them with weights |
 | Visibility Analysis | A viewshed from a point on an elevation raster, with the Earth's curvature and the refraction of visible light (1/7, as `gdal_viewshed`). The ground along each ray is the cell each point falls in by default; `heights: "bilinear"` (**Ground heights › Between cells (bilinear)** in the Workflows pane) reads it between the cells' centres instead. Both are estimates of the ground between cell centres; between cells is closer on ground that bulges (a hill seen from its top), where the nearest cell can hide cells just inside the horizon. With no radius, or one longer than the raster's diagonal, the viewshed covers the whole raster. The map's **Viewshed N km Here** reads the ground as the Workflows pane's **Ground heights** says. On a raster round the whole Earth the rays don't cross its east–west edge, which the analysis says when the radius reaches it and the way across is shorter: the ground just across the edge is left out, worked out the long way round where the radius reaches the far edge through the raster too (always with no radius), or partly both, near the observer's row and not farther from it. The observer's height must be from 0 to 10,000 m. Ground with no data hides nothing, and next to it bilinear heights take the nearest cell's height; the analysis says how many cells this touched, in a notice. The answer gives both counts (0 when there is nothing to say): `acrossNoData` counts the visible cells whose rays crossed ground with no data (a hidden cell stays hidden whatever that ground is, so it isn't counted, and 0 doesn't mean no ray crossed any); `readNearest` counts every cell, visible or hidden, whose ray took a nearest height next to no data in bilinear mode |
 | Exploratory 3D Analysis | A line of sight between two points, split into seen and hidden parts, with the same curvature and refraction |
 | Geostatistical Wizard | An IDW surface from feature values, using 12 nearest neighbours by default |
 | Network Analysis | The shortest (or cheapest, by a cost field) route over a line layer |
 | Neighborhood Explorer | What lies within a distance of a point, with sums of numeric fields |
-| Simulation | Random points in polygons (a fixed number, or from a field × rate), spread in the layer's own coordinates when it is held in a projected system, else in longitude/latitude (then held in the project's coordinate system when it has one, other than a geocentric one) |
+| Simulation | Random points in polygons (a fixed number, or from a field × rate), spread in the layer's own coordinates when it is held in a projected system, else in longitude/latitude (then held in the project's coordinate system when it has one, other than a geocentric one; a polygon with a place that can't be given in longitude/latitude gets no points, and a notice counts them) |
 | Data Engineering | Counts, nulls, distinct values, min, max and mean of every field |
 | Exploratory Analysis | Histograms and correlations of numeric fields |
 | Embeddings | The features most like the selected one, by their numeric attributes |
@@ -1659,6 +1692,14 @@ keeps degree output. Percent slope is `100 × tan(slope × π / 180)` (the angle
 statistics; converting a mean angle would not give the mean percent. The result's band is
 named **Slope (degrees)** or **Slope (percent)**, which `raster.info` shows and a saved project
 or GeoTIFF export keeps; a later step in a chain names it again.
+
+Slope, aspect and hillshade keep a missing centre cell as NoData. At the raster boundary,
+they use the nearest edge cell for a neighbour outside the grid. An invalid neighbour inside
+the grid is replaced by the centre cell's elevation. A notice names the function and counts
+the valid output cells using each treatment; a cell can appear in both counts. These choices
+also apply in the Function Editor. A function run in blocks counts only kept output cells.
+For an intermediate terrain step in a tiled chain, the notice gives an upper bound that can
+include repeated margin evaluations needed by later steps; it says when this applies.
 
 Slope, aspect and hillshade need the cell size in the elevation's unit. On a projected DEM the
 cell size is taken as it is, so elevations must be in the same unit as the coordinates (feet
@@ -1720,11 +1761,17 @@ computer's memory, or on Linux the lowest memory limit of the control groups Rus
 own and those above it (set by a container runtime, or by systemd's `MemoryMax` for a service),
 when it is lower: each plans for a quarter of it, never below the web app's fixed limits and never
 above a ceiling. `limits.memorySource` says what they follow: `computer`, `container` (such a limit, lower than the computer's memory),
-`override` or `unknown`. For tests, or to reproduce a smaller computer, set the environment
+`phone`, `override` or `unknown`. For tests, or to reproduce a smaller computer, set the environment
 variable `RUSTGIS_MEMORY_BYTES` to the memory in bytes (such as `8589934592` for 8 GiB) before
 starting RustGIS: it replaces the memory read from the computer and any container limit, and the
 command line says so on every run. It isn't a way to go faster: a value above the computer's
 memory raises every limit past what it has, and a large job can then run out of memory.
+
+On a phone the limits plan the same way from what its system allows: on Android, the memory the
+device has, and no more than is free before Android starts ending processes; on iOS, what iOS says
+the app may still use. Where the web app's floor is lower (`rasterSamples`, `bufferBytes`), a
+phone takes it. There `undoBytes` plans for what is free too, once as RustGIS starts, and
+`threadScratchBytes` is the web app's 256 MiB (see [Memory](field-work.md#memory)).
 
 The limits below other than `threadScratchBytes`, `undoBytes` and `projectBytes` plan for less
 when memory is short, never below their floors. They plan for the smallest of three figures:
@@ -1791,7 +1838,7 @@ on a grid of any coordinate system, cell size and extent, and Polygons to Raster
 (`raster.rasterize`) burns polygons onto the same grids; Raster Functions › Resample matches a
 target raster's grid.
 
-The **Script** pane runs commands from text, one per line (`id {json}`); its box grows with the script down to the bottom of the pane,
+The **Script** pane runs commands from text, one per line (`id {json}`, or `id={json}` as on the command line); its box grows with the script down to the bottom of the pane,
 short of the buttons, and then scrolls, so **Run** stays in view; Ctrl+Enter (⌘+Enter on macOS)
 in the box runs the script too. Above a run's results, a line tells its number, how long it took
 and when it started (`Run #2 (0.84 s)`, and `14:04 UTC` on the right), so a run made again by
@@ -1806,12 +1853,15 @@ off with nothing to clear, and while a run is under way. **Load…**, off then t
 from a file (a `.txt` file in the browser; any file on the desktop and phone) in place of the pane's, emptying its
 results as Clear does, and Ctrl+Z (⌘+Z) brings the old script back; in the browser it uses the
 browser's file picker. A file that isn't UTF-8 text, or is over 1 MB, is refused with a notice
-naming it, and the script stays. Opening a
+naming it, and the script stays. A paste into the box that would take the script over 1 MB is
+refused too, with a notice: nothing is pasted, rather than part of it (a script already over 1 MB
+takes a paste that doesn't make it larger). Opening a
 project (New, Open, the sample, a template, or the same one again), from the app, a script, the
 assistant or an agent, starts the pane blank: the script, its results, the count and the Details
-window go with the old project. A script that opens a project itself stays, with its results, as
-the new project's Run #1. On the desktop, a script's tools, models and batches, with selections, layer
-renames and definition queries, the environment, the projection and spectral zones between them, are worked out
+window go with the old project, and the find bar closes, forgetting what was in it. A script that
+opens a project itself stays, with its results, as the new project's Run #1. On the desktop, a
+script's tools, models and batches, with selections, layer renames and definition queries, the
+environment, the projection and spectral zones between them, are worked out
 in the background first, so the map and the rest of the window stay in use: the status bar shows
 **Run Script** and **Cancel**, and the results say **Running…** until the run is added. From the
 first line of any other kind (an edit, Add Data, a save, an export, a style or a zoom, a plugin
@@ -1886,6 +1936,23 @@ so does a `"` where a string can start (after a space, `{`, `[`, `,` or `:`). A 
 before the same one steps over it, as does a `"` typed before the quote that ends its string, and
 Backspace in an empty `{}`, `[]` or `""` deletes both. The lists open in a quote that closed
 itself, and accepting keeps that quote. Pasting adds nothing.
+
+Ctrl+F (⌘+F on macOS) in the Script box opens a find bar over the box's top right, as a code editor
+does, with the selected text, if it is one line of up to 200 characters (the most each field takes:
+a longer paste is cut, and the bar and Messages say how many characters were left out), in its
+field. Every match is highlighted in the box, the current one stronger and outlined, and the bar
+says which it is (`3 of 12`, or `No results`). Enter and Shift+Enter (or F3 and Shift+F3), or the up
+and down arrows, go to the next and the previous match, round the ends, and scroll it into view. Two
+toggles inside the field make capitals count (**Aa**) and match only whole words (**ab** under a
+bracket: no letter, digit or `_` against the match); the search is plain text, without patterns. The
+arrow at the bar's left (or Ctrl+H, ⌥⌘F on macOS) shows a second field, for what to replace with,
+and two buttons: Replace changes the current match and Replace All every one, each as one step of
+the box's Undo (Ctrl+Z); both are off while a run is under way, and Replace All is off too when
+there are more matches than the bar keeps (10,000); one that would make the script larger than 1 MB
+replaces nothing and says so in Messages. The bar's shortcuts work from its fields, its buttons and
+the box. Escape in the bar, or the close button, closes it and leaves the current match selected in
+the box. Escape in the box closes it too, once no list or help is open over the box, and the cursor
+stays where it is.
 
 ## ModelBuilder
 
@@ -1977,7 +2044,10 @@ save and run models without the canvas:
 ## Imagery
 
 The Imagery tab's groups open their tools in the Workflows pane. The tab belongs to the Imagery
-[extension](index.md#extensions): turn it on in Plugins › Extensions to show the tab:
+[extension](index.md#extensions): turn it on in Plugins › Extensions to show the tab. Three
+commands described here aren't on the tab or part of the extension, and run whether or not it is on:
+**Mosaic Rasters**, **Project Raster** and **Polygons to Raster**. So does
+[Process](#zonal-statistics-and-polygon-clipping), on the Analyze tab.
 
 - **Ortho Mapping** and **Reality Mapping** workspaces mosaic georeferenced images into an
   orthomosaic, or elevation rasters into a surface model that exports as a 3D mesh (OBJ).
@@ -1990,8 +2060,23 @@ The Imagery tab's groups open their tools in the Workflows pane. The tab belongs
   images are in another geographic system (NAD83, say), the run says so. A geographic `crs` other
   than EPSG:4326 is refused.
 - **Georeference** places a raster from control points (column, row, longitude, latitude) or
-  stretches it over the map view. Those only shift and scale a north-up grid, as RustGIS's
-  geotransform has no rotation. With `transform` (`raster.georeference`) the points are fitted by any
+  stretches it over the map view (**Fit To Map View**, `"extent": "view"`). Those only shift and
+  scale a north-up grid, as RustGIS's geotransform has no rotation. Fitted to the view, the raster
+  is placed in the map's own system on a flat map of the Earth (Web Mercator's EPSG:3857, the map's
+  EPSG or ESRI code, or a preset's definition), so it fills the view as drawn; on the globe and
+  another body's map, over the longitude and latitude box the view shows. A turned or tilted map
+  is refused (Reset North first), as is a Web Mercator view wider than the world or across the
+  antimeridian; a view of a world copy past it is fitted to the same place within ±180°. Control
+  points without `transform` are longitude and latitude, and `pointsCrs` or `crs` with them is
+  refused. An `extent` of four
+  numbers is in degrees, or in `crs` when given (`{"extent": [2599000, 1199000, 2601000, 1201000],
+  "crs": "EPSG:2056"}`), and the raster is placed in that system; an entry that isn't a number is
+  refused, not passed over. An extent goes without control points, `transform` and `pointsCrs`:
+  any of them beside it is refused, as none would be used. So are `name`, `path`, `cellSize` and
+  `resampling` without `transform`, as only a warp makes a new raster; without one the layer itself
+  is placed. The `extent` it answers is in longitude/latitude, whatever system the raster is
+  placed in.
+  With `transform` (`raster.georeference`) the points are fitted by any
   of the Control Point Fit transforms and the raster is warped onto a new north-up grid covering the
   warped image: `{"layer": "scan", "transform": "spline", "points": [[column, row, x, y], …],
   "pointsCrs": "EPSG:4326", "crs": 32613, "resampling": "bilinear", "cellSize": 5, "name": "warped",
@@ -2031,20 +2116,19 @@ The Imagery tab's groups open their tools in the Workflows pane. The tab belongs
   every answer has the band names and, when the file gives any, `"wavelengths"` in nanometres.
   After GeoLibre's spectral profile.
 - **Change Detection** (difference, ratio, percent), **Indices** (NDVI, NDWI, SAVI, NBR, NDBI,
-  EVI), **Process** (clip to the view, to a box, or to a polygon layer's selected or all polygons,
-  with the cells outside them no-data; resample) and the **Pixel Editor** (set the pixels inside a
-  polygon). As in Project Raster, the cells outside the polygons are see-through instead (0, with
-  alpha 0) in an image with an alpha band, and a three-band colour image with neither alpha nor
-  no-data gains one for them, so an 8-bit image stays 8-bit when it is exported. A colour image
-  with a fourth band of data and no alpha (RGB and near-infrared) gets no-data there as before
-  (−3.4e38 when it has none). Project Raster doesn't give it an alpha band either: a colour image's
-  alpha is read from its fourth band, which holds its data. A clip that gained an alpha band has
-  four bands, so Mosaic Rasters refuses it beside three-band tiles, saying how many bands each
-  has: clip the others the same way, or mosaic first and clip the result.
+  EVI) and the **Pixel Editor** (set the pixels inside a polygon).
 - **Mosaic Rasters** (`raster.mosaic`) merges tiles of one grid, such as the 1 km tiles of a state
   elevation model, into one raster in their own coordinate system and cell size, optionally
   written to a GeoTIFF: `{"inputs": ["dgm_1.tif", "dgm_2.tif", …], "path": "dem.tif"}`. Inputs
-  are layers or file paths; where they overlap, the first one with data wins. Tiles in different
+  are layers or file paths; where they overlap, the first one with data wins. Its section in the
+  Workflows pane (Analyze › Workflows, or Command Search) lists them in that order: **Add** puts a
+  raster layer at the end, **Add File…** a file read as the mosaic runs and not added to the map,
+  and ↑ and ↓ move one. **Name** is the new layer's (by default the first input's, with
+  `_mosaic`), and **GeoTIFF › Choose…** writes the file too (none by default). In the desktop app
+  it runs on a thread of its own, its progress and Cancel in the pane, and a GeoTIFF it writes
+  replaces the file only once it is done (Cancel leaves the file as it was). The web app's section
+  joins layers only. From the Script pane, the AI Assistant, the command line or Python it runs in
+  place. Tiles in different
   coordinate systems or cell sizes, or opened from an overview, are refused rather than quietly
   resampled, as are tiles whose cells don't line up; the mosaic has to fit in memory (120 million
   values, cells times bands, or more on a computer with more memory: see Environments).
@@ -2235,10 +2319,20 @@ an even count), **min**, **max**, **sum**, **std** (the population standard devi
 of values, or **countAbove** a threshold (`"above"`), as Summarise over time does for a Zarr
 variable (see [Data](data.md)); or **first**, each cell's value at its first date with one, in the
 order `"order"` gives: `"date"` (the earliest first, the default without a mask), `"-date"` (the
-latest first) or `"clear"` (below). The median holds every date's value of the cells being read,
-within the run's 64 million values on the desktop and 16 million in the web app (cells × dates,
+latest first) or `"clear"` (below); or **firstDate**, the date of the value first takes in each
+cell, as the number of days since 1970-01-01 (empty where no date has a value), its legend naming
+each date held, a colour each (past 256 dates, the default stretch, the dates still named in the
+band; a day before 1970 is labelled by its number). A band's names are indexed by day, so a run's
+layers hold 2 million of them in all, about a hundred layers of today's dates: the layers past
+that keep their days unnamed, drawn as a stretch, and that is said. First and firstDate read the dates in that order and leave out what can't change a cell: a
+date whose cells all hold a better date's value is not read, nor a STAC item whose mask lets
+through only such cells (an item whose mask file doesn't cover all of its part of the area is
+read, so the pixels outside it are counted and said; and nothing is left out when `"minValid"`
+asks a cell for more than one date), so a dry season's composite reads little past its clearest
+dates. The median holds every date's value of
+the cells being read, within the run's 64 million values on the desktop and 16 million in the web app (cells × dates,
 4 bytes each: up to 256 MB; a STAC collection is read in pieces that keep to it), and like first
-is the data cube summary's only.
+and firstDate is the data cube summary's only.
 
 - **Cloud-free composites:** a STAC collection's dates can be masked by each item's own quality band
   with `"mask"`: `{"asset": "SCL", "keep": [4, 5, 6]}` takes a cell at a date only where the same
@@ -2258,6 +2352,18 @@ is the data cube summary's only.
   first and median, a cell no date has clear is left empty; the counts give 0 there (see Missing
   values below). The example below keeps SCL's dark areas (2) and unclassified pixels (7), which a
   hilly area needs (they can hold shadows or low cloud): drop them for a stricter mask.
+
+- **Several bands:** `"assets": ["B04", "B03", "B02"]` (instead of `"asset"`) reads 2 to 16 of a
+  collection's bands from the same items and makes one layer of a band for each, drawn as RGB when
+  there are three. It takes **mean**, **median**, **first** and **firstDate** (one band: the date
+  all of them were taken at), which keep each cell's bands
+  together: a pixel goes in at a date only with a value in every band (one with a value in only
+  some is left out at that date, and said with how many), so an averaged cell's bands are the mean
+  of the same pixels, first takes all its bands from the
+  same date, and median takes them from one date too, the one whose bands' sum is the middle (the
+  lower of the two middle ones for an even count), not each band's own middle, which can mix dates
+  into a colour no date had. The bands have to be on one grid of pixels (one cell size); a
+  band on another is refused, and an item without all of them is left out and said.
 
 - **Classes:** a series of categorical rasters, such as yearly land-cover maps (MapBiomas, ESA
   WorldCover), is summarised as classes with eight more statistics:
@@ -2300,7 +2406,10 @@ is the data cube summary's only.
   outputs hold up to 32 million values (cells times groups; 8 million in the web app). A summary by
   month keeps every month's totals while it reads, up to five times the outputs' memory for
   **std** (three for mean, min, max, sum and countAbove), so a large area by month may need a
-  coarser cell size or a smaller area. `rustgis-cli run` takes a STAC collection's search up to
+  coarser cell size or a smaller area. First and firstDate read one group after another, so they
+  hold the totals of the groups of the dates being read, one at a time read in turn (16 bytes a
+  cell, and 4 more for the best date's rank).
+  `rustgis-cli run` takes a STAC collection's search up to
   10,000 items, as for a trend (the app and Python 2,000), and prints a summary's progress
   (`cube.reduce: 42%`). The layers
   are named after what they hold (`NDVI mean 2001`, `NDVI mean 2001–2025 month 03`, or the
@@ -2311,6 +2420,7 @@ rustgis-cli run --cmd 'cube.reduce={"layers":["ndvi_2015","ndvi_2016","ndvi_2017
 rustgis-cli run --data cobertura_1985.tif --data cobertura_1986.tif --data cobertura_1987.tif --cmd 'cube.reduce={"layers":["cobertura_1985","cobertura_1986","cobertura_1987"],"stat":"changes"}'
 rustgis-cli run --cmd 'cube.reduce={"url":"https://data.inpe.br/bdc/stac/v1","collection":"mod13q1-6.1","asset":"NDVI","bbox":[-44.8,-7.5,-44.3,-7.0],"start":"2001","end":"2025","cellSize":1000,"stat":"mean","by":"year","minValid":0.5,"name":"NDVI"}' --save urucui.rgis
 rustgis-cli run --cmd 'cube.reduce={"url":"https://data.inpe.br/bdc/stac/v1","collection":"S2-16D-2","asset":"B04","mask":{"asset":"SCL","keep":[2,4,5,6,7]},"bbox":[-43.003,-20.838,-42.754,-20.655],"start":"2025-06-01","end":"2025-08-31","stat":"first","name":"B04 cloud-free"}' --save vicosa.rgis
+rustgis-cli run --cmd 'cube.reduce={"url":"https://data.inpe.br/bdc/stac/v1","collection":"S2-16D-2","assets":["B04","B03","B02"],"mask":{"asset":"SCL","keep":[2,4,5,6,7]},"bbox":[-43.003,-20.838,-42.754,-20.655],"start":"2025-06-01","end":"2025-08-31","stat":"median","name":"RGB cloud-free"}' --save vicosa_rgb.rgis
 ```
 
 ## Categorical raster area by zone
@@ -2377,12 +2487,23 @@ statistics. If a part subsequently fails projection onto the raster grid, it is 
 statistics cover the remaining valid parts. Large
 overlapping zones each require a separate pass over their raster window.
 
+**Process** (`raster.process`, Analyze › Raster) clips a raster to the view, to a box, or to a
+polygon layer's selected or all polygons, with the cells outside them no-data, or resamples it.
+As in [Project Raster](#imagery), the cells outside the polygons are see-through instead (0, with
+alpha 0) in an image with an alpha band, and a three-band colour image with neither alpha nor
+no-data gains one for them, so an 8-bit image stays 8-bit when it is exported. A colour image
+with a fourth band of data and no alpha (RGB and near-infrared) gets no-data there as before
+(−3.4e38 when it has none). Project Raster doesn't give it an alpha band either: a colour image's
+alpha is read from its fourth band, which holds its data. A clip that gained an alpha band has
+four bands, so Mosaic Rasters refuses it beside three-band tiles, saying how many bands each
+has: clip the others the same way, or mosaic first and clip the result.
+
 For `raster.process` polygon clipping, `selectedOnly: true` requires a selection,
 `selectedOnly: false` uses every polygon, and omitting it uses the selection when present.
-The Process pane initially checks Selected only when the chosen layer has a selection, and sends
-the choice explicitly. Clipping and Zonal Statistics share
-polygon transformation rules so a failed hole cannot silently enlarge the sampled area.
-A malformed ring or a failed projection rejects its complete polygon part in all raster masking
+The Process section of the Workflows pane (Analyze › Raster › Process) initially checks Selected
+only when the chosen layer has a selection, and sends the choice explicitly. Clipping and Zonal
+Statistics share polygon transformation rules so a failed hole cannot silently enlarge the sampled
+area. A malformed ring or a failed projection rejects its complete polygon part in all raster masking
 operations. Clipping skips invalid features and reports their count in the command result;
 its output bounds cover the valid polygons only.
 

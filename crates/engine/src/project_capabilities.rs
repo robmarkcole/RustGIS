@@ -60,6 +60,26 @@ impl Project {
         if !required.contains(&"picture-markers") && self.styles.iter().any(|s| s.renderer.has_picture_markers()) {
             required.push("picture-markers");
         }
+        if !required.contains(&"svg-markers") && self.styles.iter().any(|s| s.renderer.any_picture(svg_picture)) {
+            required.push("svg-markers");
+        }
+        // And its labels' weights (#2803): an older reader would apply the style without them.
+        if !required.contains(&"label-weight")
+            && self.styles.iter().any(|s| s.labels.in_order().any(|c| c.weight != rustgis_map::symbology::DEFAULT_LABEL_WEIGHT))
+        {
+            required.push("label-weight");
+        }
+        // And their clearances (#2828), for the same reason.
+        if !required.contains(&"label-clearance")
+            && self.styles.iter().any(|s| s.labels.in_order().any(|c| c.clearance != rustgis_map::symbology::DEFAULT_LABEL_CLEARANCE))
+        {
+            required.push("label-clearance");
+        }
+        // And whether they remove duplicates (#2847), for the same reason.
+        if !required.contains(&"label-duplicates") && self.styles.iter().any(|s| s.labels.in_order().any(|c| c.remove_duplicates.is_some()))
+        {
+            required.push("label-duplicates");
+        }
         let commands: Vec<&'static str> =
             COMMAND_CAPABILITIES.iter().filter_map(|&(name, uses)| self.uses_commands(uses).then_some(name)).collect();
         required.extend(commands.into_iter().filter(|name| !required.contains(name)).collect::<Vec<_>>());
@@ -79,47 +99,20 @@ impl Project {
             required.push("table-export-order");
         }
         // Saved layouts as well as saved commands: an older reader keeps neither.
-        if !required.contains(&"layout-element-background")
-            && self.layouts.iter().any(|l| l.elements.iter().any(|e| e.background.is_some()))
-        {
-            required.push("layout-element-background");
+        for name in layout_capabilities(&self.layouts) {
+            if !required.contains(&name) {
+                required.push(name);
+            }
         }
-        if !required.contains(&"layout-element-ink") && self.layouts.iter().any(|l| l.elements.iter().any(|e| e.kind.ink().is_some())) {
-            required.push("layout-element-ink");
-        }
-        if !required.contains(&"layout-element-wrap") && self.layouts.iter().any(|l| l.elements.iter().any(wraps)) {
-            required.push("layout-element-wrap");
-        }
-        if !required.contains(&"layout-chart-data") && self.layouts.iter().any(|l| l.elements.iter().any(charts_data)) {
-            required.push("layout-chart-data");
-        }
-        if !required.contains(&"layout-chart-look") && self.layouts.iter().any(|l| l.elements.iter().any(charts_look)) {
-            required.push("layout-chart-look");
-        }
-        if !required.contains(&"layout-chart-classes") && self.layouts.iter().any(|l| l.elements.iter().any(charts_classes)) {
-            required.push("layout-chart-classes");
-        }
-        if !required.contains(&"layout-chart-stack") && self.layouts.iter().any(|l| l.elements.iter().any(charts_stack)) {
-            required.push("layout-chart-stack");
-        }
-        if !required.contains(&"layout-frame-border") && self.layouts.iter().any(|l| l.elements.iter().any(|e| e.kind.has_custom_border()))
-        {
-            required.push("layout-frame-border");
-        }
-        if !required.contains(&"layout-text-size") && self.layouts.iter().any(|l| l.elements.iter().any(|e| e.kind.has_custom_text_size()))
-        {
-            required.push("layout-text-size");
+        // A presentation's map page draws its title over its map frame, where a layer statistic is
+        // filled in (#2853); the title of a page with no map frame is drawn as written.
+        if !required.contains(&"layout-text-statistics") && self.presentations.iter().any(presentation_uses_text_statistics) {
+            required.push("layout-text-statistics");
         }
         // A coordinate system whose PROJ definition, which an older reader reads, doesn't place
         // points as its WKT does (angles in grads, a datum transformation the definition can't
         // hold).
-        struct Payload<'a>(&'a Project);
-        impl Serialize for Payload<'_> {
-            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-                Project::serialize(self.0, serializer)
-            }
-        }
-        if rustgis_data::raster::crs::saves_wkt(&Payload(self)) {
+        if project_needs_wkt(self) {
             required.push("crs-wkt");
         }
         required
@@ -128,16 +121,29 @@ impl Project {
     /// Apply the same capability predicate to every replayable project container.
     fn uses_commands(&self, uses: CommandCheck) -> bool {
         self.models.iter().any(|m| model_uses(&m.steps, m.graph.as_ref(), uses))
-            || self.tasks.iter().any(|t| t.steps.iter().any(|s| uses(&s.command, &s.params)))
+            || self.tasks.iter().any(|t| t.steps.iter().any(|s| command_uses(&uses, &s.command, &s.params)))
             || self.gp_history.iter().any(|h| {
-                uses(if h.id.is_empty() { &h.tool } else { &h.id }, &h.params)
-                    || h.command.as_ref().is_some_and(|(id, params)| uses(id, params))
+                command_uses(&uses, if h.id.is_empty() { &h.tool } else { &h.id }, &h.params)
+                    || h.command.as_ref().is_some_and(|(id, params)| command_uses(&uses, id, params))
             })
             || self.notebooks.iter().any(|n| {
                 n.language().is_none()
                     && n.cells.iter().any(|c| c.kind == crate::cmd::notebook::CellKind::Code && script_uses(&c.source, uses))
             })
     }
+}
+
+/// What a task saved on its own needs: what a project saves for its tasks' steps (a `model.run`
+/// given its graph inline, and a script line, included), in the order its list has them.
+pub(crate) fn task_capabilities(steps: &[super::TaskStep]) -> Vec<&'static str> {
+    let mut required: Vec<&'static str> = COMMAND_CAPABILITIES
+        .iter()
+        .filter_map(|&(name, uses)| steps.iter().any(|s| command_uses(&uses, &s.command, &s.params)).then_some(name))
+        .collect();
+    if steps.iter().any(|s| command_uses_table_export_order(&s.command, &s.params)) {
+        required.push("table-export-order");
+    }
+    required
 }
 
 type CommandCheck = fn(&str, &Value) -> bool;
@@ -147,20 +153,197 @@ const COMMAND_CAPABILITIES: &[(&str, CommandCheck)] = &[
     ("tabulate-intersection-empty-zones", command_uses_tabulate_empty_zones),
     ("layout-element-background", command_uses_element_background),
     ("picture-markers", command_uses_picture_marker),
+    ("svg-markers", command_uses_svg_marker),
     ("graticule-mgrs", command_draws_mgrs_graticule),
     ("graticule-on-top", command_puts_graticule_on_top),
     ("graticule-color", command_colors_graticule),
     ("layout-element-ink", command_uses_element_ink),
     ("layout-element-wrap", command_uses_element_wrap),
+    ("layout-text-block", command_uses_text_block),
     ("layout-chart-data", command_uses_chart_data),
     ("layout-chart-look", command_uses_chart_look),
     ("layout-chart-classes", command_uses_chart_classes),
     ("layout-chart-stack", command_uses_chart_stack),
+    ("layout-chart-facing", command_uses_chart_facing),
+    ("layout-chart-outline", command_uses_chart_outline),
     ("blank-paper", command_uses_blank_paper),
     ("layout-frame-border", command_uses_frame_border),
+    ("layout-section", command_uses_section),
     ("layout-text-size", command_uses_text_size),
+    ("layout-legend-fit", command_uses_legend_fit),
+    ("layout-legend-class-labels", command_uses_legend_class_labels),
+    ("layout-legend-counts", command_uses_legend_counts),
+    ("layout-scale-bar-details", command_uses_scale_bar_details),
     ("dggs-system", command_uses_dggs_system),
+    ("label-weight", command_weighs_labels),
+    ("label-clearance", command_clears_labels),
+    ("label-duplicates", command_removes_duplicate_labels),
+    ("tile-resampling", command_resamples_tiles),
+    ("layout-page-color", command_colours_the_page),
+    ("layout-text-statistics", command_uses_text_statistics),
+    ("layout-publication-parts", command_sets_publication_parts),
+    ("layout-publication-legend", command_sets_publication_legend),
+    ("shaded-relief-shadow-softness", command_sets_shadow_softness),
 ];
+
+/// A saved `layout.publication` that leaves out or sets up its grid, scale bar or north arrow
+/// (#3094): an older reader ignores `grid` and `scaleBar`, making the default sheet, and refuses
+/// any `northArrow` object. `null`, and a grid or scale bar object giving nothing, ask for the
+/// default.
+fn command_sets_publication_parts(id: &str, params: &Value) -> bool {
+    let sets = |v: &Value| v.as_object().is_none_or(|o| o.values().any(|v| !v.is_null()));
+    match id {
+        "layout.publication" => {
+            ["grid", "scaleBar"].into_iter().any(|k| params.get(k).is_some_and(|v| !v.is_null() && sets(v)))
+                || params.get("northArrow").is_some_and(Value::is_object)
+        }
+        "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_sets_publication_parts)),
+        _ => false,
+    }
+}
+
+/// A saved `layout.publication` that leaves out or sets up its legend (#3095): an older reader
+/// ignores `legend`, making the default one. `null` and an object giving nothing (each key
+/// `null`, a blank title or an empty list) ask for that default, so they require nothing.
+fn command_sets_publication_legend(id: &str, params: &Value) -> bool {
+    let nothing = |v: &Value| v.is_null() || v.as_str().is_some_and(|t| t.trim().is_empty()) || v.as_array().is_some_and(Vec::is_empty);
+    match id {
+        "layout.publication" => {
+            params.get("legend").is_some_and(|v| !v.is_null() && v.as_object().is_none_or(|o| !o.values().all(nothing)))
+        }
+        "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_sets_publication_legend)),
+        _ => false,
+    }
+}
+
+/// A saved `raster.symbology` that sets a Shaded Relief's shadow softness (#3144): an older reader
+/// runs it without the key, saying nothing, so the shadows would be traced at the default disc.
+/// `null` asks for that default.
+fn command_sets_shadow_softness(id: &str, params: &Value) -> bool {
+    match id {
+        "raster.symbology" => params.get("shadowSoftness").is_some_and(|v| !v.is_null()),
+        "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_sets_shadow_softness)),
+        _ => false,
+    }
+}
+
+/// A saved `labels.placement` that has a class remove duplicates, read as the command reads it
+/// (#2847): an older reader runs it without the key, saying nothing, so every label would show.
+/// False or null is what an older reader keeps.
+fn command_removes_duplicate_labels(id: &str, params: &Value) -> bool {
+    match id {
+        "labels.placement" => params.get("removeDuplicates").and_then(crate::cmd::labels::number).is_some(),
+        "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_removes_duplicate_labels)),
+        _ => false,
+    }
+}
+
+/// A saved `map.addTiles` or `map.setTiles` drawing a tile layer's pictures nearest (#2804), read as
+/// the command reads it: an older reader runs it without the key, saying nothing, so the layer would
+/// stay blended. `bilinear` is what an older reader keeps.
+fn command_resamples_tiles(id: &str, params: &Value) -> bool {
+    match id {
+        "map.addTiles" | "map.setTiles" => {
+            crate::cmd::tiles::resampling(params).ok().flatten() == Some(rustgis_map::raster::Resampling::Nearest)
+        }
+        "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_resamples_tiles)),
+        _ => false,
+    }
+}
+
+/// A layout text holding a layer statistic (#2853): an older reader prints the token as written.
+fn text_statistics(e: &rustgis_map::layout::Element) -> bool {
+    matches!(&e.kind, rustgis_map::layout::ElementKind::Text { text, .. } if !rustgis_map::layout::stat_tokens(text).is_empty())
+}
+
+/// A presentation with a layer statistic in the title of a map page, which draws it over its map
+/// frame (#2853); the title of a page with no map frame is drawn as written.
+fn presentation_uses_text_statistics(p: &rustgis_map::presentation::Presentation) -> bool {
+    p.pages.iter().any(|page| {
+        matches!(page.kind, rustgis_map::presentation::PageKind::Map { .. }) && !rustgis_map::layout::stat_tokens(&page.title).is_empty()
+    })
+}
+
+/// A text, or a list of texts, with a layer statistic in one of them.
+fn holds_statistic(v: &Value) -> bool {
+    match v {
+        Value::String(t) => !rustgis_map::layout::stat_tokens(t).is_empty(),
+        Value::Array(texts) => texts.iter().any(holds_statistic),
+        _ => false,
+    }
+}
+
+/// [`holds_statistic`] for a list read as one text, its entries joined by `sep`: a token may be split
+/// across them.
+fn holds_statistic_joined(v: &Value, sep: &str) -> bool {
+    match v {
+        Value::Array(texts) => holds_statistic(&Value::String(texts.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(sep))),
+        other => holds_statistic(other),
+    }
+}
+
+/// What the JSON of a layout or presentation shows of a layer statistic (#2853): a file with none
+/// of these keys has none, so only the others are parsed.
+const STATISTIC_KEYS: [&str; 5] = ["{count:", "{sum:", "{mean:", "{min:", "{max:"];
+
+/// A layout command that gives a text a layer statistic (#2853), read as a text reads its tokens
+/// ([`rustgis_map::layout::stat_tokens`]): only a text takes `"text"`.
+fn command_uses_text_statistics(id: &str, params: &Value) -> bool {
+    match id {
+        "layout.addElement" | "layout.update" => params.get("text").is_some_and(holds_statistic),
+        // The texts a publication layout is made of, which keep the tokens as they are written.
+        "layout.publication" => {
+            let joined = |keys: &[&str], sep: &str| keys.iter().any(|k| params.get(*k).is_some_and(|v| holds_statistic_joined(v, sep)));
+            // A title, subtitle, note or author given as a list is joined with a space, the sources
+            // and the reference with a line break, as `publication` reads them; each heading is a
+            // text of its own.
+            joined(&["title", "subtitle", "note", "author"], " ")
+                || joined(&["sources", "reference"], "\n")
+                || params.get("headings").is_some_and(holds_statistic)
+        }
+        // A map page's title, which the page draws over its map frame; `updatePage` doesn't say the
+        // kind of the page it changes, so a title with a token counts.
+        "presentation.mapPage" | "presentation.updatePage" => params.get("title").is_some_and(holds_statistic),
+        // A layout file, read as `layout.import` reads it, which `report.existingTemplate` also does.
+        "layout.import" | "report.existingTemplate" => imported_layout_uses(params, &STATISTIC_KEYS, text_statistics),
+        "presentation.import" => crate::cmd::items::inline_text(params)
+            .ok()
+            .flatten()
+            .filter(|t| STATISTIC_KEYS.iter().any(|key| t.contains(key)) || t.contains('\\'))
+            .and_then(|t| serde_json::from_str::<rustgis_map::presentation::Presentation>(&t).ok())
+            .is_some_and(|p| presentation_uses_text_statistics(&p)),
+        "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_uses_text_statistics)),
+        _ => false,
+    }
+}
+
+/// A saved `labels.placement` that gives a class a clearance other than 2, read as the command
+/// reads it (#2828): an older reader runs it without the key, saying nothing, so the labels would
+/// keep 2 points apart as before. 2 or null is what an older reader keeps.
+fn command_clears_labels(id: &str, params: &Value) -> bool {
+    match id {
+        "labels.placement" => params
+            .get("clearance")
+            .and_then(crate::cmd::labels::number)
+            .is_some_and(|c| rustgis_map::symbology::label_clearance(c) != rustgis_map::symbology::DEFAULT_LABEL_CLEARANCE),
+        "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_clears_labels)),
+        _ => false,
+    }
+}
+
+/// A saved `labels.placement` that gives a class a weight other than 5, read as the command reads
+/// it (#2803): an older reader runs it without the key, saying nothing, so the labels would compete
+/// as before. 5 or null is what an older reader keeps.
+fn command_weighs_labels(id: &str, params: &Value) -> bool {
+    match id {
+        "labels.placement" => params
+            .get("weight")
+            .and_then(crate::cmd::labels::number)
+            .is_some_and(|w| rustgis_map::symbology::label_weight(w) != rustgis_map::symbology::DEFAULT_LABEL_WEIGHT),
+        "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_weighs_labels)),
+        _ => false,
+    }
+}
 
 /// A saved `map.graticule` that switches to the MGRS grid, its type read as the command reads it:
 /// an older reader refuses the type, so the command would fail there.
@@ -217,10 +400,88 @@ fn command_uses_text_size(id: &str, params: &Value) -> bool {
         "layout.update" => {
             params.get("textSize").is_some_and(|v| !v.is_null()) || params.get("grid").is_some_and(|g| sized(g, "labelSize", GRID_LABEL_PT))
         }
-        "layout.import" => imported_layout_uses(params, &["\"text_size\"", "\"label_size\""], |e| e.kind.has_custom_text_size()),
+        "layout.import" | "report.existingTemplate" => {
+            imported_layout_uses(params, &["\"text_size\"", "\"label_size\""], |e| e.kind.has_custom_text_size())
+        }
         "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_uses_text_size)),
         _ => false,
     }
+}
+
+/// Whether a layout element is a legend that fits its box by shrinking its text or adding columns,
+/// leaves its layer names off, or has more than three columns, once brought into range: an older
+/// reader would draw it at its size, its names shown and in three columns.
+fn legends_fitting(e: &rustgis_map::layout::Element) -> bool {
+    e.kind.legend_uses_fit()
+}
+
+/// A layout command that gives a legend a fit, leaves its layer names off or lays it in more than
+/// three columns: an older reader ignores `showLayerNames`, refuses a legend's `fit` names as a
+/// scale bar's, or ignores them on a legend, and takes three columns at most. Each key is read on
+/// its own by the command's own reader ([`crate::cmd::layout::legend_fit_param`],
+/// [`crate::cmd::layout::legend_names_param`], [`crate::cmd::layout::legend_columns_param`]), so
+/// one the command refuses doesn't hide another one set. `"manual"`, `true`, three columns or
+/// fewer and `null` keep a legend as an older reader draws it; a scale bar's fit names aren't a
+/// legend's, and a value the command refuses changes nothing, so neither needs it. A key given to
+/// another kind counts too, though its command refuses it: an over-count that asks for the
+/// capability sooner, never a missing one. An imported layout file requires it for such a legend
+/// once its layout is read into range, so a fit or layer-names value that isn't one, read as the
+/// default, needs nothing.
+fn command_uses_legend_fit(id: &str, params: &Value) -> bool {
+    use crate::cmd::layout::{legend_columns_param, legend_fit_param, legend_names_param};
+    use rustgis_map::layout::{LEGEND_COLUMNS_BEFORE_FIT, LegendFit};
+    match id {
+        "layout.addElement" | "layout.update" => {
+            legend_fit_param(params).is_ok_and(|fit| fit.is_some_and(|fit| fit != LegendFit::Manual))
+                || legend_names_param(params) == Ok(Some(false))
+                || legend_columns_param(params).is_ok_and(|n| n.is_some_and(|n| n > LEGEND_COLUMNS_BEFORE_FIT))
+        }
+        // A layout file, read as `layout.import` reads it, which `report.existingTemplate` also does.
+        "layout.import" | "report.existingTemplate" => {
+            imported_layout_uses(params, &["\"fit\"", "\"show_layer_names\"", "\"columns\""], legends_fitting)
+        }
+        "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_uses_legend_fit)),
+        _ => false,
+    }
+}
+
+/// A layout command that gives a legend its own text for a class (#3187): an older reader ignores
+/// `classLabels`, and a legend saved with them, drawing the layer's labels. `null`, a blank text
+/// and an empty object only give those back.
+fn command_uses_legend_class_labels(id: &str, params: &Value) -> bool {
+    match id {
+        "layout.addElement" | "layout.update" => params.get("classLabels").and_then(Value::as_object).is_some_and(|layers| {
+            layers
+                .values()
+                .filter_map(Value::as_object)
+                .any(|classes| classes.values().any(|t| t.as_str().is_some_and(|t| !t.trim().is_empty())))
+        }),
+        "layout.import" | "report.existingTemplate" => imported_layout_uses(params, &["\"class_labels\""], legend_labels_classes),
+        "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_uses_legend_class_labels)),
+        _ => false,
+    }
+}
+
+/// Whether a layout element is a legend with its own text for a class.
+fn legend_labels_classes(e: &rustgis_map::layout::Element) -> bool {
+    e.kind.legend_labels_classes()
+}
+
+/// A layout command that makes a legend show feature counts (#3237): an older reader ignores
+/// `showCounts`, and a legend saved with it, drawing no numbers. `false` and `null` ask for what
+/// it draws.
+fn command_uses_legend_counts(id: &str, params: &Value) -> bool {
+    match id {
+        "layout.addElement" | "layout.update" => crate::cmd::layout::legend_counts_param(params) == Ok(Some(true)),
+        "layout.import" | "report.existingTemplate" => imported_layout_uses(params, &["\"show_counts\""], legend_counts_features),
+        "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_uses_legend_counts)),
+        _ => false,
+    }
+}
+
+/// Whether a layout element is a legend that shows feature counts.
+fn legend_counts_features(e: &rustgis_map::layout::Element) -> bool {
+    e.kind.legend_counts_features()
 }
 
 /// A layout command that changes a map frame's border (#2557): an older reader warns that it
@@ -229,8 +490,37 @@ fn command_uses_text_size(id: &str, params: &Value) -> bool {
 fn command_uses_frame_border(id: &str, params: &Value) -> bool {
     match id {
         "layout.update" => params.get("border").is_some_and(|b| !b.is_null()),
-        "layout.import" => imported_layout_uses(params, &["\"border_"], |e| e.kind.has_custom_border()),
+        "layout.import" | "report.existingTemplate" => imported_layout_uses(params, &["\"border_"], |e| e.kind.has_custom_border()),
         "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_uses_frame_border)),
+        _ => false,
+    }
+}
+
+/// A layout command that adds or changes a map frame's section lines (#2863): an older reader
+/// refuses the kind `section`, and warns that it ignores a frame's `section`, drawing none.
+fn command_uses_section(id: &str, params: &Value) -> bool {
+    match id {
+        "layout.addElement" => params.get("kind").and_then(Value::as_str).is_some_and(|k| k.trim().eq_ignore_ascii_case("section")),
+        "layout.update" => params.get("section").is_some_and(|v| !v.is_null()),
+        // A layout file, read as `layout.import` reads it, which `report.existingTemplate` also does.
+        "layout.import" | "report.existingTemplate" => imported_layout_uses(params, &["\"sections\""], |e| e.kind.has_sections()),
+        "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_uses_section)),
+        _ => false,
+    }
+}
+
+/// A `layout.page` command that gives the page a colour other than white (#2855), read as the
+/// command reads it: an older reader ignores `color` and opens the page white. An imported layout
+/// file that has one needs it too.
+fn command_colours_the_page(id: &str, params: &Value) -> bool {
+    match id {
+        "layout.page" => crate::cmd::opaque_color(params, "color")
+            .is_ok_and(|c| c.flatten().is_some_and(|c| c != rustgis_map::Rgba::rgb(0xFF, 0xFF, 0xFF))),
+        "layout.import" | "report.existingTemplate" => imported_layout(params, &["\"paper\""]).is_some_and(|mut l| {
+            l.clamp();
+            l.paper.is_some()
+        }),
+        "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_colours_the_page)),
         _ => false,
     }
 }
@@ -254,7 +544,7 @@ fn command_uses_blank_paper(id: &str, params: &Value) -> bool {
 fn command_uses_element_background(id: &str, params: &Value) -> bool {
     match id {
         "layout.addElement" | "layout.update" => params.get("background").is_some_and(|b| !b.is_null()),
-        "layout.import" => imported_layout_uses(params, &["\"background\""], |e| e.background.is_some()),
+        "layout.import" | "report.existingTemplate" => imported_layout_uses(params, &["\"background\""], |e| e.background.is_some()),
         "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_uses_element_background)),
         _ => false,
     }
@@ -265,7 +555,7 @@ fn command_uses_element_background(id: &str, params: &Value) -> bool {
 /// and `layout.update`, so such a command fails there instead of losing the ink.
 fn command_uses_element_ink(id: &str, params: &Value) -> bool {
     match id {
-        "layout.import" => imported_layout_uses(params, &["\"color\""], |e| e.kind.ink().is_some()),
+        "layout.import" | "report.existingTemplate" => imported_layout_uses(params, &["\"color\""], |e| e.kind.ink().is_some()),
         "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_uses_element_ink)),
         _ => false,
     }
@@ -282,8 +572,44 @@ fn wraps(e: &rustgis_map::layout::Element) -> bool {
 fn command_uses_element_wrap(id: &str, params: &Value) -> bool {
     match id {
         "layout.addElement" | "layout.update" => params.get("wrap").and_then(crate::cmd::bool_value) == Some(true),
-        "layout.import" => imported_layout_uses(params, &["\"wrap\""], wraps),
+        "layout.import" | "report.existingTemplate" => imported_layout_uses(params, &["\"wrap\""], wraps),
         "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_uses_element_wrap)),
+        _ => false,
+    }
+}
+
+/// Whether a layout element is a text placed in the middle or at the bottom of its box, spaced
+/// other than at the usual line spacing, or drawn in upper or lower case, once brought into range:
+/// an older reader would draw it at the top, at the usual spacing and as typed.
+fn text_blocks(e: &rustgis_map::layout::Element) -> bool {
+    e.kind.text_uses_block()
+}
+
+/// A layout command that gives a text a block alignment, line spacing or case off its default:
+/// an older reader ignores `valign`, `lineSpacing` and `case` and draws the text at the top, at
+/// the usual spacing and as typed. Each is read on its own by the command's own reader
+/// ([`crate::cmd::layout::text_block_settings`]), so the defaults (`"top"`, `1` or `"1"`, `"none"`,
+/// in any case) and `null`, which leaves a text as it is, keep a text as an older reader draws it.
+/// A value the command refuses on a text needs nothing either: the command changes nothing. The
+/// keys are read here alone, so a block key given to another kind counts too, though its command
+/// refuses it: an over-count that asks for the capability sooner, never a missing one. An
+/// imported layout file requires it for such a text once its layout is read into range, so a name
+/// it doesn't know or a spacing that isn't a number, read as the default, needs nothing.
+fn command_uses_text_block(id: &str, params: &Value) -> bool {
+    use rustgis_map::layout::{LINE_SPACING, TextCase, TextVAlign};
+    match id {
+        "layout.addElement" | "layout.update" => {
+            let usual = (TextVAlign::Top, LINE_SPACING, TextCase::None);
+            // Each key on its own, so one the command refuses doesn't hide another one set.
+            ["valign", "lineSpacing", "case"].into_iter().any(|k| {
+                let one = Value::Object(params.get(k).into_iter().map(|v| (k.to_string(), v.clone())).collect());
+                crate::cmd::layout::text_block_settings(&one, usual).is_ok_and(|set| set != usual)
+            })
+        }
+        "layout.import" | "report.existingTemplate" => {
+            imported_layout_uses(params, &["\"valign\"", "\"line_spacing\"", "\"case\""], text_blocks)
+        }
+        "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_uses_text_block)),
         _ => false,
     }
 }
@@ -312,7 +638,9 @@ fn command_uses_chart_data(id: &str, params: &Value) -> bool {
                 || params.get("bars").and_then(Value::as_u64).is_some_and(|n| n != CHART_BARS as u64)
                 || params.get("other").and_then(crate::cmd::bool_value) == Some(true)
         }
-        "layout.import" => imported_layout_uses(params, &["\"group\"", "\"statistic\"", "\"order\"", "\"bars\"", "\"other\""], charts_data),
+        "layout.import" | "report.existingTemplate" => {
+            imported_layout_uses(params, &["\"group\"", "\"statistic\"", "\"order\"", "\"bars\"", "\"other\""], charts_data)
+        }
         "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_uses_chart_data)),
         _ => false,
     }
@@ -343,7 +671,7 @@ fn command_uses_chart_look(id: &str, params: &Value) -> bool {
                 && (only_chart() || text("orientation").as_deref() == Some("vertical") || params.get("title").is_some_and(|t| !t.is_null()))
         }
         "layout.update" => only_chart(),
-        "layout.import" => imported_layout_uses(
+        "layout.import" | "report.existingTemplate" => imported_layout_uses(
             params,
             &["\"orientation\"", "\"values\"", "\"decimals\"", "\"title\"", "\"bar_color\"", "\"label_align\""],
             charts_look,
@@ -368,7 +696,7 @@ fn command_uses_chart_classes(id: &str, params: &Value) -> bool {
             params.get("kind").and_then(Value::as_str).is_some_and(|k| k.trim().eq_ignore_ascii_case("chart")) && classes()
         }
         "layout.update" => classes(),
-        "layout.import" => imported_layout_uses(params, &["\"classes\""], charts_classes),
+        "layout.import" | "report.existingTemplate" => imported_layout_uses(params, &["\"classes\""], charts_classes),
         "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_uses_chart_classes)),
         _ => false,
     }
@@ -388,25 +716,136 @@ fn command_uses_chart_stack(id: &str, params: &Value) -> bool {
             params.get("kind").and_then(Value::as_str).is_some_and(|k| k.trim().eq_ignore_ascii_case("chart")) && stack()
         }
         "layout.update" => stack(),
-        "layout.import" => imported_layout_uses(params, &["\"stack\""], charts_stack),
+        "layout.import" | "report.existingTemplate" => imported_layout_uses(params, &["\"stack\""], charts_stack),
         "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_uses_chart_stack)),
         _ => false,
     }
 }
 
-/// Whether a `layout.import` carries its layout as `"text"` with an element `uses`: an older
-/// reader reads it without the keys it doesn't know. One read from a `"path"` is a layout file,
-/// which carries no format header yet (#2277). Every save asks, so a text with none of the
-/// feature's `keys` (a saved layout writes them only when set) isn't read through, unless it has a
-/// backslash: JSON may spell a key with escapes (`"\u0063olor"`). It is read once, whatever its
-/// keys.
+/// Whether a layout element is a scale bar with details an older reader's can't draw: it would
+/// draw a plain bar and save it again without them.
+fn bar_details(e: &rustgis_map::layout::Element) -> bool {
+    e.kind.scale_bar_uses_details()
+}
+
+/// A layout command that gives a scale bar a detail off its default: an older reader ignores the
+/// keys and draws a plain bar. Giving the defaults, `"decimals": "auto"`, or `"unitLabel": null`
+/// (the abbreviation an older reader's bar prints), keeps a bar as an older reader draws it.
+fn command_uses_scale_bar_details(id: &str, params: &Value) -> bool {
+    use rustgis_map::layout::{ScaleBarFit, ScaleLabelPosition, UnitLabelPosition};
+    // A fixed number of decimals, 0 included, not "auto". A chart takes decimals too: a
+    // `layout.addElement` says which kind it adds, but a `layout.update` doesn't say what it
+    // changes, so a chart's decimals there require this as well, as a scale bar's require
+    // `layout-chart-look`; the layout saved with the element requires what it holds anyway.
+    let fixed_decimals = |id: &str| {
+        crate::cmd::uint(params, "decimals").is_some()
+            && (id == "layout.update"
+                || params.get("kind").and_then(Value::as_str).is_some_and(|k| k.trim().eq_ignore_ascii_case("scaleBar")))
+    };
+    match id {
+        "layout.addElement" | "layout.update" => {
+            let num = |k: &str| crate::cmd::f(params, k);
+            let name = |k: &str| params.get(k).and_then(Value::as_str);
+            num("subdivisions").is_some_and(|n| n >= 2.0)
+                || num("divisionsBeforeZero").is_some_and(|n| n >= 1.0)
+                || name("labelPosition").and_then(ScaleLabelPosition::from_name).is_some_and(|v| v != ScaleLabelPosition::default())
+                || params.get("unitLabel").is_some_and(Value::is_string)
+                || name("unitLabelPosition").and_then(UnitLabelPosition::from_name).is_some_and(|v| v != UnitLabelPosition::default())
+                || fixed_decimals(id)
+                || name("fit").and_then(ScaleBarFit::from_name).is_some_and(|v| v != ScaleBarFit::default())
+        }
+        "layout.import" | "report.existingTemplate" => imported_layout_uses(
+            params,
+            &[
+                "\"subdivisions\"",
+                "\"divisions_before_zero\"",
+                "\"label_position\"",
+                "\"unit_label\"",
+                "\"unit_label_position\"",
+                "\"decimals\"",
+                "\"fit\"",
+            ],
+            bar_details,
+        ),
+        "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_uses_scale_bar_details)),
+        _ => false,
+    }
+}
+
+fn charts_facing(e: &rustgis_map::layout::Element) -> bool {
+    e.kind.chart_uses_facing()
+}
+
+/// A layout command that mirrors a chart, gives it a fixed maximum or hides its labels (#2487
+/// part 4): an older reader ignores those keys and draws the chart the usual way round, on its
+/// bars' own scale, labelled. `false`, `null` and `"auto"` keep a chart as an older reader draws
+/// it; only a chart takes the keys, so a `layout.update` is read by them alone.
+fn command_uses_chart_facing(id: &str, params: &Value) -> bool {
+    let facing = || {
+        let on = |k: &str| params.get(k).and_then(crate::cmd::bool_value) == Some(true);
+        on("mirror")
+            || on("hideLabels")
+            || params.get("max").and_then(Value::as_f64).and_then(|m| rustgis_map::layout::chart_max(Some(m))).is_some()
+    };
+    match id {
+        "layout.addElement" => {
+            params.get("kind").and_then(Value::as_str).is_some_and(|k| k.trim().eq_ignore_ascii_case("chart")) && facing()
+        }
+        "layout.update" => facing(),
+        "layout.import" | "report.existingTemplate" => {
+            imported_layout_uses(params, &["\"mirror\"", "\"max\"", "\"hide_labels\""], charts_facing)
+        }
+        "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_uses_chart_facing)),
+        _ => false,
+    }
+}
+
+fn charts_outlined(e: &rustgis_map::layout::Element) -> bool {
+    e.kind.chart_uses_outline()
+}
+
+/// A layout command that draws a line round a chart's bars (#2487 part 4b): an object without a
+/// width (the outline's, or the 0.5 points it is first given) or with one above 0. Null, or a
+/// width of 0, draws none, so it needs nothing.
+fn command_uses_chart_outline(id: &str, params: &Value) -> bool {
+    let outlined = || {
+        // The width read as the command reads it, a number or a number in text.
+        params.get("barOutline").filter(|o| o.is_object()).is_some_and(|o| match o.get("width") {
+            None | Some(Value::Null) => true,
+            Some(_) => crate::cmd::f(o, "width").is_some_and(|w| w > 0.0),
+        })
+    };
+    match id {
+        "layout.addElement" => {
+            params.get("kind").and_then(Value::as_str).is_some_and(|k| k.trim().eq_ignore_ascii_case("chart")) && outlined()
+        }
+        "layout.update" => outlined(),
+        "layout.import" | "report.existingTemplate" => imported_layout_uses(params, &["\"bar_outline\""], charts_outlined),
+        "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_uses_chart_outline)),
+        _ => false,
+    }
+}
+
+/// Whether a command carries its layout inline with an element `uses`, as `layout.import` and
+/// `report.existingTemplate` do: an older reader reads it without the keys it doesn't know. One
+/// read from a `"path"` is a layout file, whose own header requires what it uses (#2277). Every
+/// save asks, so a text with none of the feature's `keys` (a saved layout writes them only when
+/// set) isn't read through, unless it has a backslash: JSON may spell a key with escapes
+/// (`"\u0063olor"`). It is read once, whatever its keys.
 fn imported_layout_uses(params: &Value, keys: &[&str], uses: fn(&rustgis_map::layout::Element) -> bool) -> bool {
-    params
-        .get("text")
-        .and_then(Value::as_str)
+    imported_layout(params, keys).is_some_and(|l| l.elements.iter().any(uses))
+}
+
+/// The layout a command carries inline, read only when its text names one of `keys` (or escapes,
+/// which could hide one). `data` (base64) goes before `text`, as `report.existingTemplate` reads
+/// them; one it refuses is no layout. `data` is decoded for each check, rather than keeping it:
+/// only a step that carries it pays, and only on a save.
+fn imported_layout(params: &Value, keys: &[&str]) -> Option<rustgis_map::layout::Layout> {
+    crate::cmd::items::inline_text(params)
+        .ok()
+        .flatten()
         .filter(|t| keys.iter().any(|key| t.contains(key)) || t.contains('\\'))
-        .and_then(|t| serde_json::from_str::<rustgis_map::layout::Layout>(t).ok())
-        .is_some_and(|l| l.elements.iter().any(uses))
+        .and_then(|t| serde_json::from_str::<rustgis_map::layout::Layout>(&t).ok())
 }
 
 /// Require only executable payloads being saved: graph files omit steps, web tools omit graphs.
@@ -490,16 +929,35 @@ fn tool_uses(tools: &[&str], id: &str, params: &Value, uses: fn(&Value) -> bool)
 /// `layer.marker`, a line stroke's markers or a dot fill given an image: an older reader would
 /// leave its `image` out and keep the marker it had, or refuse `"image"` as a mark.
 fn command_uses_picture_marker(id: &str, params: &Value) -> bool {
-    let any = |list: &str, image: fn(&Value) -> Option<&Value>| {
-        params.get(list).and_then(Value::as_array).is_some_and(|l| l.iter().any(|v| image(v).is_some_and(Value::is_string)))
+    command_sets_marker_image(id, params, |_| true)
+}
+
+/// [`command_uses_picture_marker`] with an SVG (#2266 part E1b): a reader of PNG and JPEG markers
+/// only would refuse the command.
+fn command_uses_svg_marker(id: &str, params: &Value) -> bool {
+    command_sets_marker_image(id, params, rustgis_render::picture_marker_is_svg)
+}
+
+/// Whether command `id` gives a marker an image (base64) that `image` holds true for.
+fn command_sets_marker_image(id: &str, params: &Value, image: fn(&str) -> bool) -> bool {
+    let any = |list: &str, at: fn(&Value) -> Option<&Value>| {
+        params.get(list).and_then(Value::as_array).is_some_and(|l| l.iter().any(|v| at(v).and_then(Value::as_str).is_some_and(image)))
     };
     match id {
-        "layer.marker" => params.get("image").is_some_and(Value::is_string),
+        "layer.marker" => params.get("image").and_then(Value::as_str).is_some_and(image),
         "layer.lineStrokes" => any("strokes", |st| st.get("markers")?.get("image")),
         "layer.fillLayers" => any("fills", |f| f.get("image")),
-        "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_uses_picture_marker)),
+        "script.run" => params
+            .get("script")
+            .and_then(Value::as_str)
+            .is_some_and(|s| script_uses(s, |id, params| command_sets_marker_image(id, params, image))),
         _ => false,
     }
+}
+
+/// Whether marker image `p` is an SVG ([`command_uses_svg_marker`]'s reason, for saved symbology).
+fn svg_picture(p: rustgis_map::Picture) -> bool {
+    rustgis_render::picture_marker_is_svg(p.base64())
 }
 
 /// Use the executor's line grammar; comments/invalid lines are not executable commands, and
@@ -508,7 +966,39 @@ fn script_uses(script: &str, uses: impl Fn(&str, &Value) -> bool) -> bool {
     script
         .lines()
         .take(crate::cmd::workflows::MAX_SCRIPT_LINES)
-        .any(|line| crate::script_line(line).is_some_and(|parsed| parsed.is_ok_and(|(id, params)| uses(&id, &params))))
+        .any(|line| crate::script_line(line).is_some_and(|parsed| parsed.is_ok_and(|(id, params)| command_uses(&uses, &id, &params))))
+}
+
+/// `uses` on a saved command and, for a `model.run` given its graph inline, on each of the graph's
+/// tool nodes as on a saved model's steps (#2758): that graph is in no saved model, so nothing
+/// else reads it, and an older reader would run its nodes with the option dropped.
+fn command_uses(uses: &impl Fn(&str, &Value) -> bool, id: &str, params: &Value) -> bool {
+    uses(id, params) || (id == "model.run" && inline_graph_uses(params, uses))
+}
+
+/// A graph read as the run reads it (`model::graph_from_json_counted`): an object with `nodes`, at
+/// most `MAX_NODES` nodes and `MAX_EDGES` connections (a bigger one is refused there, so needs
+/// nothing), and only a node of kind `tool` runs, with `params` that aren't an object dropped (the
+/// checks read nothing from one). Read in place, without a copy, so a node the run drops (an empty
+/// or repeated id, an unreadable `x`, a `layer` that isn't text) is read here all the same: that
+/// only over-requires, which is safe, and a node it can't use never hides the others.
+///
+/// No recursion: a node is checked by the leaf check only. A node runs a tool (`model::tool_of`),
+/// so one naming a command, `model.run` included, fails there and is read as the id no check
+/// matches; and one naming `script.run` is skipped, as its check is the one that reads into a
+/// script, which could hold another graph.
+fn inline_graph_uses(params: &Value, uses: &impl Fn(&str, &Value) -> bool) -> bool {
+    let Some(graph) = params.get("graph") else { return false };
+    let few = |key: &str, max: usize| graph.get(key).and_then(Value::as_array).is_none_or(|list| list.len() <= max);
+    few("edges", crate::model::MAX_EDGES)
+        && graph.get("nodes").and_then(Value::as_array).filter(|nodes| nodes.len() <= crate::model::MAX_NODES).is_some_and(|nodes| {
+            nodes.iter().any(|node| {
+                let tool = node.get("tool").and_then(Value::as_str).unwrap_or("");
+                node.get("kind").and_then(Value::as_str) == Some("tool")
+                    && tool != "script.run"
+                    && uses(tool, node.get("params").unwrap_or(&Value::Null))
+            })
+        })
 }
 
 fn relief_effects(layer: &Layer) -> bool {
@@ -524,6 +1014,15 @@ fn relief_light(layer: &Layer) -> bool {
     layer.raster.as_ref().is_some_and(
         |r| matches!(&r.style.renderer, RasterRenderer::ShadedRelief { ambient, balanced, .. } if ambient.is_some() || *balanced),
     )
+}
+
+/// Whether a layer sets how soft its Shaded Relief's cast shadows are (#3144): an older reader
+/// would trace them at the default and save the layer again without the setting.
+fn sets_shadow_softness(layer: &Layer) -> bool {
+    layer
+        .raster
+        .as_ref()
+        .is_some_and(|r| matches!(&r.style.renderer, RasterRenderer::ShadedRelief { shadow_softness, .. } if shadow_softness.is_some()))
 }
 
 /// Whether a layer is a window of a Zarr variable following the time slider (#1720): an older
@@ -545,15 +1044,38 @@ fn label_guide(layer: &Layer) -> bool {
     layer.labels.in_order().any(|c| c.guide.is_some())
 }
 
+/// Whether a layer's label classes weigh other than the default (#2803): an older reader would
+/// drop the weights, and place and save the labels as without them.
+fn label_weight(layer: &Layer) -> bool {
+    layer.labels.in_order().any(|c| c.weight != rustgis_map::symbology::DEFAULT_LABEL_WEIGHT)
+}
+
+/// Whether a layer's label classes keep other than the default room free (#2828): an older reader
+/// would drop the clearances, and place and save the labels as without them.
+fn label_clearance(layer: &Layer) -> bool {
+    layer.labels.in_order().any(|c| c.clearance != rustgis_map::symbology::DEFAULT_LABEL_CLEARANCE)
+}
+
+/// Whether a layer's label classes remove duplicates (#2847): an older reader would drop the
+/// setting, and place and save every label.
+fn removes_duplicate_labels(layer: &Layer) -> bool {
+    layer.labels.in_order().any(|c| c.remove_duplicates.is_some())
+}
+
 /// The capabilities a layer needs, in [`map_capabilities`]'s order.
 fn layer_capabilities(layer: &Layer) -> Vec<&'static str> {
     [
         (relief_effects(layer), "shaded-relief-effects"),
         (relief_light(layer), "shaded-relief-light"),
+        (sets_shadow_softness(layer), "shaded-relief-shadow-softness"),
         (layer.size_by.is_some(), super::SIZE_BY_CAPABILITY),
         (layer.has_picture_markers(), "picture-markers"),
+        (layer.any_picture(svg_picture), "svg-markers"),
         (zarr_window(layer), "zarr-window"),
         (label_guide(layer), "label-guide"),
+        (label_weight(layer), "label-weight"),
+        (label_clearance(layer), "label-clearance"),
+        (removes_duplicate_labels(layer), "label-duplicates"),
         (held_natively(&layer.dataset), super::NATIVE_COORDINATES),
     ]
     .into_iter()
@@ -579,13 +1101,20 @@ fn map_capabilities<'a>(maps: impl IntoIterator<Item = &'a Map>) -> Vec<&'static
         mut on_top,
         mut grid_color,
     ) = (false, false, false, false, false, false, false, false, false, false, false, false, false, false, false);
-    let mut polygon = false;
-    let (mut offline_area_id, mut paper, mut native, mut guided) = (false, false, false, false);
+    let (mut polygon, mut svg) = (false, false);
+    let (mut offline_area_id, mut paper, mut native, mut guided, mut weighed, mut cleared, mut deduped) =
+        (false, false, false, false, false, false, false);
+    let (mut crisp, mut bed, mut soft) = (false, false, false);
     for map in maps {
         offline_area_id |= map.offline_area_id.is_some();
         // A blank basemap's paper colour (#2532), which an older reader would draw and save white.
         paper |= map.paper.is_some();
         guided |= map.layers.iter().any(label_guide);
+        weighed |= map.layers.iter().any(label_weight);
+        cleared |= map.layers.iter().any(label_clearance);
+        deduped |= map.layers.iter().any(removes_duplicate_labels);
+        // A tile layer drawn nearest (#2804), which an older reader would draw and save blended.
+        crisp |= map.tiles.iter().any(|t| t.resampling != rustgis_map::raster::Resampling::Bilinear);
         // An older reader doesn't know the MGRS graticule (#1042 piece 8): it refuses the
         // project by name rather than failing to read the type.
         mgrs |= map.graticule_type == rustgis_map::graticule::GraticuleType::Mgrs;
@@ -603,13 +1132,17 @@ fn map_capabilities<'a>(maps: impl IntoIterator<Item = &'a Map>) -> Vec<&'static
             shore |= t.water.as_ref().is_some_and(|w| w.shore != rustgis_map::view::WATER_SHORE);
             // The water in a block's walls (#2317), which an older reader would save away.
             block_water |= t.block.as_ref().is_some_and(|b| b.water.is_some());
+            // Its bed read from a raster (#2434), which an older reader would save away.
+            bed |= t.block.as_ref().and_then(|b| b.water.as_ref()).is_some_and(|w| w.bed.is_some());
             // The layer a block's walls are coloured by (#2173), which an older reader would save away.
             walls_layer |= t.block.as_ref().is_some_and(|b| b.walls_layer.is_some());
         }
         relief |= map.layers.iter().any(relief_effects);
         light |= map.layers.iter().any(relief_light);
+        soft |= map.layers.iter().any(sets_shadow_softness);
         sized |= map.layers.iter().any(|layer| layer.size_by.is_some());
         pictures |= map.layers.iter().any(Layer::has_picture_markers);
+        svg |= map.layers.iter().any(|layer| layer.any_picture(svg_picture));
         zarr |= map.layers.iter().any(zarr_window);
         native |= map.layers.iter().any(|layer| held_natively(&layer.dataset));
         legends |= map.tiles.iter().any(|tile| {
@@ -623,14 +1156,21 @@ fn map_capabilities<'a>(maps: impl IntoIterator<Item = &'a Map>) -> Vec<&'static
         (water, "terrain-water"),
         (shore, "terrain-water-shore"),
         (block_water, "terrain-block-water"),
+        (bed, "terrain-block-water-bed"),
         (walls_layer, "terrain-block-walls-layer"),
         (relief, "shaded-relief-effects"),
         (light, "shaded-relief-light"),
+        (soft, "shaded-relief-shadow-softness"),
         (legends, "normalized-legend-urls"),
         (sized, super::SIZE_BY_CAPABILITY),
         (pictures, "picture-markers"),
+        (svg, "svg-markers"),
         (zarr, "zarr-window"),
         (guided, "label-guide"),
+        (weighed, "label-weight"),
+        (cleared, "label-clearance"),
+        (deduped, "label-duplicates"),
+        (crisp, "tile-resampling"),
         (offline_area_id, "offline-map-area-id"),
         (paper, "blank-paper"),
         (native, super::NATIVE_COORDINATES),
@@ -641,6 +1181,77 @@ fn map_capabilities<'a>(maps: impl IntoIterator<Item = &'a Map>) -> Vec<&'static
     .into_iter()
     .filter_map(|(used, name)| used.then_some(name))
     .collect()
+}
+
+/// Whether saving `project` serializes any [`rustgis_data::raster::Crs`] requiring `crs-wkt`,
+/// inspected directly across all `Crs`-bearing fields without double-serializing the project.
+/// Every container struct is destructured exhaustively so adding a `Crs`-bearing field is a compile error.
+fn project_needs_wkt(project: &Project) -> bool {
+    let Project {
+        first_layer: _,
+        read_notices: _,
+        format: _,
+        name: _,
+        origin_id: _,
+        field_origin: _,
+        given: _,
+        maps,
+        active_map: _,
+        tables,
+        next_table_id: _,
+        gp_history: _,
+        layouts: _,
+        folders: _,
+        styles: _,
+        ramps: _,
+        tasks: _,
+        gp_env,
+        models: _,
+        workspaces,
+        link_views: _,
+        thumbnail: _,
+        jobs: _,
+        offline_areas,
+        reports: _,
+        presentations: _,
+        notebooks: _,
+        dl_models: _,
+        shared: _,
+        data_stores: _,
+        coordinate_system,
+        crs_from_first_layer: _,
+    } = project;
+    let super::GpEnvironment { extent: _, cell_size: _, projected } = gp_env;
+    coordinate_system.is_some_and(rustgis_data::raster::Crs::needs_wkt)
+        || projected.is_some_and(|p| {
+            let super::ProjectedCells { crs, cell_size: _ } = p;
+            crs.needs_wkt()
+        })
+        || workspaces.iter().any(|w| {
+            let crate::cmd::imagery::Workspace { name: _, kind: _, images: _, cell_size: _, crs, projected_cell_size: _, method: _ } = w;
+            crs.is_some_and(rustgis_data::raster::Crs::needs_wkt)
+        })
+        || tables.iter().any(|t| {
+            let super::Table { id: _, dataset, instance_id: _ } = t;
+            dataset.needs_wkt()
+        })
+        || maps.iter().any(Map::needs_wkt)
+        || offline_areas.iter().any(|a| {
+            let super::OfflineArea {
+                id: _,
+                name: _,
+                map: _,
+                extent: _,
+                created: _,
+                synced: _,
+                generation: _,
+                returned: _,
+                ids: _,
+                conflicts: _,
+                data,
+            } = a;
+            data.needs_wkt()
+        })
 }
 
 #[derive(Serialize)]
@@ -655,16 +1266,54 @@ struct Item<'a, T> {
 /// A map file has its own header, independent of the project it came from.
 pub(crate) fn map_file_bytes(map: &Map) -> Result<Vec<u8>, String> {
     let mut requires = map_capabilities([map]);
-    if rustgis_data::raster::crs::saves_wkt(map) {
+    if map.needs_wkt() {
         requires.push("crs-wkt");
     }
     serde_json::to_vec(&Item { format: FORMAT, requires, value: map }).map_err(|e| e.to_string())
 }
 
+/// A layout file has its own header, as a map file has: what its elements use, as the project
+/// holding it requires for them (#2277). Indented, as layout files have always been written. No
+/// `crs-wkt`: a layout holds no coordinate system, only a measured grid's as text.
+pub fn layout_file_bytes(layout: &rustgis_map::layout::Layout) -> Result<Vec<u8>, String> {
+    let requires = layout_capabilities(std::slice::from_ref(layout));
+    serde_json::to_vec_pretty(&Item { format: FORMAT, requires, value: layout }).map_err(|e| e.to_string())
+}
+
+/// What the elements of `layouts` use that an older reader would draw without and save again
+/// without: the project requires it for its layouts, and a layout file for its own.
+fn layout_capabilities(layouts: &[rustgis_map::layout::Layout]) -> Vec<&'static str> {
+    let elements = || layouts.iter().flat_map(|l| &l.elements);
+    [
+        (elements().any(|e| e.background.is_some()), "layout-element-background"),
+        (elements().any(|e| e.kind.ink().is_some()), "layout-element-ink"),
+        (elements().any(wraps), "layout-element-wrap"),
+        (elements().any(text_blocks), "layout-text-block"),
+        (elements().any(charts_data), "layout-chart-data"),
+        (elements().any(charts_look), "layout-chart-look"),
+        (elements().any(charts_classes), "layout-chart-classes"),
+        (elements().any(charts_stack), "layout-chart-stack"),
+        (elements().any(charts_facing), "layout-chart-facing"),
+        (elements().any(charts_outlined), "layout-chart-outline"),
+        (elements().any(|e| e.kind.has_custom_border()), "layout-frame-border"),
+        (elements().any(|e| e.kind.has_sections()), "layout-section"),
+        (elements().any(|e| e.kind.has_custom_text_size()), "layout-text-size"),
+        (elements().any(legends_fitting), "layout-legend-fit"),
+        (elements().any(legend_labels_classes), "layout-legend-class-labels"),
+        (elements().any(legend_counts_features), "layout-legend-counts"),
+        (elements().any(bar_details), "layout-scale-bar-details"),
+        (layouts.iter().any(|l| l.paper.is_some()), "layout-page-color"),
+        (elements().any(text_statistics), "layout-text-statistics"),
+    ]
+    .into_iter()
+    .filter_map(|(used, name)| used.then_some(name))
+    .collect()
+}
+
 /// A layer file keeps the same renderer capabilities as the layer saved inside a project.
 pub(crate) fn layer_file_bytes(layer: &Layer) -> Result<Vec<u8>, String> {
     let mut requires = layer_capabilities(layer);
-    if rustgis_data::raster::crs::saves_wkt(layer) {
+    if layer.needs_wkt() {
         requires.push("crs-wkt");
     }
     serde_json::to_vec(&Item { format: FORMAT, requires, value: layer }).map_err(|e| e.to_string())
@@ -719,6 +1368,24 @@ mod tests {
         serde_json::from_slice(bytes).unwrap()
     }
 
+    /// A tile layer drawn nearest (#2804) reads back as it was and saving names `tile-resampling`;
+    /// one drawn blended, as an older reader would, names nothing. So does a saved step setting it.
+    #[test]
+    fn tile_resampling_fixture_reads_its_setting() {
+        use rustgis_map::raster::Resampling;
+        let fixture = Project::from_json(include_str!("../../../schema/fixtures/tile_resampling.rgis")).unwrap();
+        let saved = serde_json::to_value(&fixture).unwrap();
+        assert_eq!(saved["requires"], json!(["tile-resampling"]));
+        assert_eq!(fixture.maps[0].tiles[0].resampling, Resampling::Nearest);
+        let reopened = Project::from_json(&saved.to_string()).unwrap();
+        assert_eq!(serde_json::to_value(&reopened).unwrap(), saved);
+        let mut plain = fixture;
+        plain.maps[0].tiles[0].resampling = Resampling::Bilinear;
+        assert!(serde_json::to_value(&plain).unwrap().get("requires").is_none());
+        assert!(command_resamples_tiles("map.setTiles", &json!({"index": 0, "resampling": "nearest"})));
+        assert!(!command_resamples_tiles("map.setTiles", &json!({"index": 0, "resampling": "bilinear"})));
+    }
+
     /// A saved MGRS graticule drawn on top in a color of its own (#1042 piece 8) reads back as it
     /// was, and saving names all three again; a map without them names none.
     #[test]
@@ -755,6 +1422,23 @@ mod tests {
             b.walls_layer = None;
         }
         assert_eq!(serde_json::to_value(&plain).unwrap()["requires"], json!(["terrain-block"]));
+    }
+
+    /// A block's water floor read from a bed raster (#2434) reads back by the raster's name, and
+    /// saving names it in `requires`; the same water without a bed doesn't.
+    #[test]
+    fn terrain_block_water_bed_fixture_requires_it() {
+        let fixture = Project::from_json(include_str!("../../../schema/fixtures/terrain_block_water_bed_v2.rgis")).unwrap();
+        let water = fixture.maps[0].view.terrain.as_ref().and_then(|t| t.block.as_ref()).and_then(|b| b.water.clone());
+        assert_eq!(water, Some(rustgis_map::view::BlockWater { depth: Some(8.0), field: None, bed: Some("batimetria".into()) }));
+        let saved = serde_json::to_value(&fixture).unwrap();
+        assert_eq!(saved["requires"], json!(["terrain-block", "terrain-water", "terrain-block-water", "terrain-block-water-bed"]));
+        assert_eq!(saved["maps"][0]["view"]["terrain"]["block"]["water"], json!({"depth": 8.0, "bed": "batimetria"}));
+        let mut plain = fixture;
+        if let Some(w) = plain.maps[0].view.terrain.as_mut().and_then(|t| t.block.as_mut()).and_then(|b| b.water.as_mut()) {
+            w.bed = None;
+        }
+        assert_eq!(serde_json::to_value(&plain).unwrap()["requires"], json!(["terrain-block", "terrain-water", "terrain-block-water"]));
     }
 
     /// A saved image marker reads back as the image it was, and saving names it again.
@@ -796,6 +1480,313 @@ mod tests {
         let fixture = Project::from_json(include_str!("../../../schema/fixtures/dggs_system.rgis")).unwrap();
         assert_eq!(fixture.models[0].steps[0].params["system"], "H3");
         assert_eq!(serde_json::to_value(&fixture).unwrap()["requires"], json!(["dggs-system"]));
+    }
+
+    /// A saved command that sets an SVG as a marker's image requires `svg-markers` as well as
+    /// `picture-markers`, in every replayable container: a reader of PNG and JPEG markers only
+    /// would refuse the command when it replays. A PNG requires `picture-markers` alone, and an
+    /// image that is neither is refused by the command anyway (#2266 part E1b).
+    #[test]
+    fn a_saved_command_setting_an_svg_marker_requires_svg_markers() {
+        use base64::Engine;
+        let svg = base64::engine::general_purpose::STANDARD.encode(r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 8 4"/>"#);
+        let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGD4DwABBAEAwS2OUAAAAABJRU5ErkJggg==";
+        let base = serde_json::to_value(Project::default()).unwrap();
+        for (image, expected) in [(png.to_string(), vec!["picture-markers"]), (svg, vec!["picture-markers", "svg-markers"])] {
+            for (command, params) in [
+                ("layer.marker", json!({"layer": "Cities", "image": image})),
+                ("layer.lineStrokes", json!({"layer": "Rivers", "strokes": [{"width": 1}, {"markers": {"image": image}}]})),
+                ("layer.fillLayers", json!({"layer": "Lakes", "fills": [{"pattern": "dots", "image": image}]})),
+            ] {
+                let script = format!("# Icons\n{command} {params}");
+                for (field, value) in [
+                    ("tasks", json!([{"name": "Task", "steps": [{"title": "Icon", "command": command, "params": params}]}])),
+                    (
+                        "tasks",
+                        json!([{"name": "Script", "steps": [{"title": "Icon", "command": "script.run", "params": {"script": script}}]}]),
+                    ),
+                    ("notebooks", json!([{"name": "Notebook", "cells": [{"kind": "code", "source": script}]}])),
+                    (
+                        "gp_history",
+                        json!([{"tool": "Marker", "params": {}, "command": [command, params], "ok": true, "messages": [], "millis": 0}]),
+                    ),
+                ] {
+                    let mut document = base.clone();
+                    document[field] = value;
+                    let project = Project::from_json(&document.to_string()).unwrap();
+                    assert_eq!(serde_json::to_value(&project).unwrap()["requires"], json!(expected), "{field} {command} {image}");
+                }
+            }
+        }
+    }
+
+    /// A `model.run` command given `graph` inline, as a saved task step, a script line in a task, a
+    /// notebook cell and a recorded command: what a project saves as `requires` for each (`None`:
+    /// no header).
+    fn saved_requires_of_inline_graph(run: &Value) -> Vec<Option<Value>> {
+        let script = format!("# Run\nmodel.run {run}");
+        let base = serde_json::to_value(Project::default()).unwrap();
+        [
+            ("tasks", json!([{"name": "Task", "steps": [{"title": "Run", "command": "model.run", "params": run}]}])),
+            ("tasks", json!([{"name": "Script", "steps": [{"title": "Run", "command": "script.run", "params": {"script": script}}]}])),
+            ("notebooks", json!([{"name": "Notebook", "cells": [{"kind": "code", "source": script}]}])),
+            ("gp_history", json!([{"tool": "Run", "params": {}, "command": ["model.run", run], "ok": true, "messages": [], "millis": 0}])),
+        ]
+        .into_iter()
+        .map(|(field, value)| {
+            let mut document = base.clone();
+            document[field] = value;
+            let project = Project::from_json(&document.to_string()).unwrap();
+            serde_json::to_value(&project).unwrap().get("requires").cloned()
+        })
+        .collect()
+    }
+
+    fn graph_of_one_tool(tool: &str, params: Value) -> Value {
+        json!({"graph": {"nodes": [{"id": "n", "kind": "tool", "tool": tool, "params": params}]}})
+    }
+
+    /// A saved command that runs a graph given inline requires what its tool nodes would as
+    /// saved steps, wherever the command is saved (#2758); one that needs nothing, none.
+    #[test]
+    fn an_inline_model_graph_requires_what_its_tool_nodes_do() {
+        for (capability, tool, needs, needs_not) in [
+            ("dggs-system", "a5Grid", json!({"system": "H3"}), json!({"system": "A5"})),
+            ("dggs-system", "a5Aggregate", json!({"system": "Hexagon"}), json!({})),
+            ("dggs-system", "A5 Grid", json!({"system": "S2"}), json!({"system": null})),
+            ("tabulate-intersection-unit", "tabulateIntersection", json!({"areaUnit": "ac"}), json!({"areaUnit": "km2"})),
+            (
+                "tabulate-intersection-empty-zones",
+                "tabulateIntersection",
+                json!({"includeEmptyZones": true}),
+                json!({"includeEmptyZones": false}),
+            ),
+            // As for a saved model's graph (`slope_percent_capability_follows_saved_executables`);
+            // no tool node runs a raster function, so this is parity, not a reachable run.
+            ("slope-percent", "raster.function", json!({"function": "slope", "units": "percent"}), json!({"function": "slope"})),
+        ] {
+            for (index, saved) in saved_requires_of_inline_graph(&graph_of_one_tool(tool, needs.clone())).into_iter().enumerate() {
+                assert_eq!(saved, Some(json!([capability])), "{tool} {needs} in container {index}");
+            }
+            for (index, saved) in saved_requires_of_inline_graph(&graph_of_one_tool(tool, needs_not.clone())).into_iter().enumerate() {
+                assert_eq!(saved, None, "{tool} {needs_not} in container {index}");
+            }
+        }
+    }
+
+    /// A node of an inline graph is checked as a step of a saved model is, by every capability: one
+    /// sample for each entry of `COMMAND_CAPABILITIES`, each requiring exactly its own name, so an
+    /// entry added later without a sample fails here. The walk takes a node's id and parameters as
+    /// they come, as a saved model's does, so every entry is reachable; only the tool-based ones
+    /// (`tabulate*`, `dggs-system`) are also a node a run can run, the rest are parity.
+    #[test]
+    fn an_inline_graph_node_is_checked_as_a_saved_step_is() {
+        let ink_layout = {
+            let fixture = Project::from_json(include_str!("../../../schema/fixtures/layout_element_ink.rgis")).unwrap();
+            serde_json::to_value(&fixture).unwrap()["layouts"][0].to_string()
+        };
+        let svg = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 8 4"/>"#)
+        };
+        let chart = json!({"kind": "chart"});
+        let samples: Vec<(&[&str], &str, Value)> = vec![
+            (&["slope-percent"], "raster.function", json!({"function": "slope", "units": "percent"})),
+            (&["slope-percent"], "raster.functionChain", json!({"steps": [{"function": "slope", "units": "percent"}]})),
+            (&["tabulate-intersection-unit"], "tabulateIntersection", json!({"areaUnit": "ac"})),
+            (&["tabulate-intersection-empty-zones"], "tabulateIntersection", json!({"includeEmptyZones": true})),
+            (&["layout-element-background"], "layout.update", json!({"element": 1, "background": {}})),
+            (&["picture-markers"], "layer.marker", json!({"image": "iVBORw0KGgo"})),
+            (&["graticule-mgrs"], "map.graticule", json!({"type": "mgrs"})),
+            (&["graticule-on-top"], "map.graticule", json!({"onTop": true})),
+            (&["graticule-color"], "map.graticule", json!({"color": "#000000"})),
+            (&["layout-element-ink"], "layout.import", json!({"text": ink_layout})),
+            (&["layout-element-wrap"], "layout.addElement", json!({"kind": "text", "wrap": true})),
+            (&["layout-text-block"], "layout.update", json!({"element": 1, "lineSpacing": 1.5})),
+            (&["layout-chart-data"], "layout.addElement", json!({"kind": "chart", "group": "Region"})),
+            (&["layout-chart-look"], "layout.update", json!({"element": 1, "values": true})),
+            (&["layout-chart-classes"], "layout.update", json!({"element": 1, "classes": true})),
+            (&["layout-chart-stack"], "layout.update", json!({"element": 1, "stack": "Kind"})),
+            (&["layout-chart-facing"], "layout.update", json!({"element": 1, "mirror": true})),
+            (&["layout-chart-outline"], "layout.update", json!({"element": 1, "barOutline": {"width": 1}})),
+            (&["layout-scale-bar-details"], "layout.update", json!({"element": 1, "subdivisions": 2})),
+            (&["blank-paper"], "map.basemap", json!({"name": "blank", "color": "#112233"})),
+            (&["layout-frame-border"], "layout.update", json!({"element": 1, "border": {}})),
+            (&["layout-section"], "layout.update", json!({"element": 1, "section": {"name": "A", "y": 0}})),
+            (&["layout-text-size"], "layout.update", json!({"element": 1, "textSize": 12})),
+            (&["layout-legend-fit"], "layout.update", json!({"element": 1, "fit": "adjustSize"})),
+            (&["layout-legend-class-labels"], "layout.update", json!({"element": 1, "classLabels": {"a": {"x": "X"}}})),
+            (&["layout-legend-counts"], "layout.update", json!({"element": 1, "showCounts": true})),
+            (&["dggs-system"], "a5Grid", json!({"system": "H3"})),
+            (&["dggs-system"], "a5Aggregate", json!({"system": "S2"})),
+            (&["label-weight"], "labels.placement", json!({"weight": 9})),
+            (&["label-clearance"], "labels.placement", json!({"clearance": 9})),
+            (&["label-duplicates"], "labels.placement", json!({"removeDuplicates": 20})),
+            (&["tile-resampling"], "map.addTiles", json!({"resampling": "nearest"})),
+            (&["layout-page-color"], "layout.page", json!({"color": "#0B1B2B"})),
+            (&["layout-text-statistics"], "layout.addElement", json!({"kind": "text", "text": "{count:Cities}"})),
+            (&["layout-publication-parts"], "layout.publication", json!({"grid": "none"})),
+            (&["layout-publication-legend"], "layout.publication", json!({"legend": "none"})),
+            (&["shaded-relief-shadow-softness"], "raster.symbology", json!({"type": "shadedRelief", "shadowSoftness": 1.5})),
+            // `null` is the default an older reader draws.
+            (&[], "raster.symbology", json!({"type": "shadedRelief", "shadowSoftness": null})),
+            // An SVG image is a picture marker as well, in a node as in a saved command.
+            (&["picture-markers", "svg-markers"], "layer.marker", json!({"image": svg})),
+            (&[], "buffer", json!({"input": "Cities", "distance": 1})),
+            (&[], "layout.addElement", chart),
+        ];
+        let mut covered = std::collections::BTreeSet::new();
+        for (capability, id, params) in samples {
+            let step = [ModelStep { tool: id.into(), params: params.clone() }];
+            let names: Vec<&str> =
+                COMMAND_CAPABILITIES.iter().filter_map(|&(name, uses)| model_uses(&step, None, uses).then_some(name)).collect();
+            assert_eq!(names, capability, "the sample {id} {params} requires exactly its own capability");
+            covered.extend(capability.iter().copied());
+            for (index, saved) in saved_requires_of_inline_graph(&graph_of_one_tool(id, params.clone())).into_iter().enumerate() {
+                // The documents are otherwise empty, so the header names only what the node needs.
+                assert_eq!(saved, (!capability.is_empty()).then(|| json!(capability)), "{id} {params} in container {index}");
+            }
+        }
+        let missing: Vec<&str> = COMMAND_CAPABILITIES.iter().map(|&(name, _)| name).filter(|name| !covered.contains(name)).collect();
+        assert!(missing.is_empty(), "add a sample for each command capability, missing: {missing:?}");
+    }
+
+    /// `report.existingTemplate` imports a layout file as `layout.import` does, so a step of it
+    /// requires what a `layout.import` of the same file does (#3226), by `text` or by `data`. Every
+    /// `layout_*` fixture is walked, so a capability added with one and read for `layout.import`
+    /// alone fails here.
+    #[test]
+    fn a_report_template_requires_what_layout_import_does() {
+        use base64::Engine;
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../schema/fixtures");
+        let needs = |id: &str, params: Value| -> Vec<&str> {
+            let step = [ModelStep { tool: id.into(), params }];
+            model_capabilities(&step, None)
+        };
+        let mut imported = std::collections::BTreeSet::new();
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if !name.starts_with("layout_") || !name.ends_with(".rgis") {
+                continue;
+            }
+            let project = Project::from_json(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            for layout in serde_json::to_value(&project).unwrap()["layouts"].as_array().unwrap() {
+                let text = layout.to_string();
+                let data = base64::engine::general_purpose::STANDARD.encode(&text);
+                let required = needs("layout.import", json!({"text": text}));
+                assert_eq!(needs("report.existingTemplate", json!({"text": text})), required, "{name} as text");
+                assert_eq!(needs("report.existingTemplate", json!({"data": data})), required, "{name} as data");
+                imported.extend(required);
+            }
+        }
+        // The fixtures reach each capability an imported layout asks for.
+        for capability in [
+            "layout-element-background",
+            "layout-element-ink",
+            "layout-element-wrap",
+            "layout-text-block",
+            "layout-chart-data",
+            "layout-chart-look",
+            "layout-chart-classes",
+            "layout-chart-stack",
+            "layout-chart-facing",
+            "layout-chart-outline",
+            "layout-frame-border",
+            "layout-text-size",
+            "layout-scale-bar-details",
+            "layout-page-color",
+        ] {
+            assert!(imported.contains(capability), "no layout fixture asks for {capability}");
+        }
+        // A layout named, or read from a file with its own header (#2277), needs nothing.
+        assert!(needs("report.existingTemplate", json!({"layout": "Layout"})).is_empty());
+        assert!(needs("report.existingTemplate", json!({"path": "regions.rgislayout"})).is_empty());
+    }
+
+    /// An inline graph is read as the run reads it: only an object with `nodes`, only nodes of kind
+    /// `tool` with an object for `params`; one it can't read it drops, not the rest.
+    #[test]
+    fn an_inline_graph_is_read_as_the_run_reads_it() {
+        let h3 = json!({"system": "H3"});
+        let node = |extra: Value| {
+            let mut n = json!({"id": "n", "kind": "tool", "tool": "a5Grid", "params": h3});
+            for (k, v) in extra.as_object().into_iter().flatten() {
+                n[k] = v.clone();
+            }
+            n
+        };
+        let none = |run: Value, why: &str| {
+            assert!(saved_requires_of_inline_graph(&run).iter().all(Option::is_none), "{why}");
+        };
+        let needs = |run: Value, why: &str| {
+            assert!(saved_requires_of_inline_graph(&run).iter().all(|r| r == &Some(json!(["dggs-system"]))), "{why}");
+        };
+        let graph = |nodes: Vec<Value>| json!({"graph": {"nodes": nodes}});
+        none(json!({"graph": graph(vec![node(json!({}))]).get("graph").map(Value::to_string)}), "a graph as text is refused by the run");
+        none(json!({"graph": null, "name": "Saved"}), "no graph: the named model is read as a saved model");
+        none(json!({"graph": []}), "not an object");
+        none(json!({"graph": {"nodes": "text"}}), "nodes not a list");
+        none(graph(vec![node(json!({"kind": null}))]), "no kind");
+        none(graph(vec![node(json!({"kind": "input"}))]), "an input node runs no tool");
+        none(graph(vec![node(json!({"kind": "output"}))]), "an output node runs no tool");
+        none(graph(vec![node(json!({"kind": "Tool"}))]), "kind is lowercase");
+        none(graph(vec![node(json!({"tool": 5}))]), "tool not text");
+        none(graph(vec![node(json!({"params": h3.to_string()}))]), "params as text are dropped");
+        none(graph(vec![node(json!({"params": [h3]}))]), "params as a list are dropped");
+        none(graph(vec![node(json!({"params": null}))]), "no params");
+        none(graph(vec![node(json!({"tool": "buffer"}))]), "another tool");
+        needs(graph(vec![node(json!({}))]), "the plain case");
+        needs(graph(vec![json!(5), json!({"id": 3}), json!(null), node(json!({}))]), "the run drops a node it can't read, not the rest");
+        needs(graph(vec![node(json!({"tool": "A5 Grid"}))]), "a tool by its former name");
+        needs(json!({"graph": {"nodes": [node(json!({}))], "edges": "junk"}}), "edges are not read");
+    }
+
+    /// A graph past the run's limits is refused there, so needs nothing; one no bigger is read to
+    /// its last node. Nested and cyclic graphs are read one level, without recursion.
+    #[test]
+    fn a_hostile_inline_graph_is_read_without_panic_or_hang() {
+        use crate::model::{MAX_EDGES, MAX_NODES};
+        let junk = || json!({"id": "j", "kind": "tool", "tool": "buffer", "params": {}});
+        let h3 = || json!({"id": "h", "kind": "tool", "tool": "a5Grid", "params": {"system": "H3"}});
+        let nodes_with_last = |count: usize, last: Value| {
+            let mut nodes = vec![junk(); count - 1];
+            nodes.push(last);
+            json!({"graph": {"nodes": nodes}})
+        };
+        let all = |run: Value, expected: Option<Value>, why: &str| {
+            for (index, saved) in saved_requires_of_inline_graph(&run).into_iter().enumerate() {
+                assert_eq!(saved, expected, "{why} (container {index})");
+            }
+        };
+        // A notebook cell is cut at `MAX_SOURCE` on load: the task and history containers cover the oversized graphs.
+        all(nodes_with_last(MAX_NODES, h3()), Some(json!(["dggs-system"])), "as many nodes as a run takes, the last one needing it");
+        all(nodes_with_last(MAX_NODES + 1, h3()), None, "one more is refused");
+        all(nodes_with_last(100_000, h3()), None, "far more is refused");
+        let mut edges = nodes_with_last(2, h3());
+        edges["graph"]["edges"] = json!(vec![json!({"from": "j", "to": "h", "toPort": "input"}); MAX_EDGES + 1]);
+        all(edges, None, "more connections than a run takes");
+        // A node that is itself a `model.run`, nested to the depth the project's JSON allows (128).
+        let mut nested = graph_of_one_tool("a5Grid", json!({"system": "H3"}));
+        for _ in 0..24 {
+            nested = json!({"graph": {"nodes": [{"id": "m", "kind": "tool", "tool": "model.run", "params": nested}]}});
+        }
+        all(nested, None, "a node is a tool, not a model run: nothing inside it is read");
+        // A node that is a script holding a graph holding a script, as deep as its escaping allows.
+        let mut cycle = graph_of_one_tool("a5Grid", json!({"system": "H3"}));
+        for _ in 0..12 {
+            let script = format!("model.run {cycle}");
+            cycle = json!({"graph": {"nodes": [{"id": "s", "kind": "tool", "tool": "script.run", "params": {"script": script}}]}});
+        }
+        all(cycle, None, "a script node is not read into");
+        // A script of as many graph lines as a script takes.
+        let line = format!("model.run {}", graph_of_one_tool("buffer", json!({})));
+        let script = vec![line; crate::cmd::workflows::MAX_SCRIPT_LINES].join("\n");
+        let base = serde_json::to_value(Project::default()).unwrap();
+        let mut document = base;
+        document["tasks"] = json!([{"name": "T", "steps": [{"title": "Run", "command": "script.run", "params": {"script": script}}]}]);
+        let project = Project::from_json(&document.to_string()).unwrap();
+        assert!(serde_json::to_value(&project).unwrap().get("requires").is_none());
     }
 
     /// All replayable project containers require non-default options only when requested.
@@ -1231,7 +2222,13 @@ mod tests {
                 let mut document = base.clone();
                 document["tasks"] = value;
                 let saved = serde_json::to_value(Project::from_json(&document.to_string()).unwrap()).unwrap();
-                let expected = if required { json!(["layout-chart-look"]) } else { Value::Null };
+                // An update's decimals may be a scale bar's too, which it can't tell apart.
+                let bar_too = id == "layout.update" && params.get("decimals").is_some_and(Value::is_u64);
+                let expected = match (required, bar_too) {
+                    (true, true) => json!(["layout-chart-look", "layout-scale-bar-details"]),
+                    (true, false) => json!(["layout-chart-look"]),
+                    _ => Value::Null,
+                };
                 assert_eq!(saved.get("requires").cloned().unwrap_or(Value::Null), expected, "{id} {params}");
             }
         }
@@ -1325,6 +2322,378 @@ mod tests {
                 document["tasks"] = value;
                 let saved = serde_json::to_value(Project::from_json(&document.to_string()).unwrap()).unwrap();
                 let expected = if required { json!(["layout-chart-stack"]) } else { Value::Null };
+                assert_eq!(saved.get("requires").cloned().unwrap_or(Value::Null), expected, "{id} {params}");
+            }
+        }
+    }
+
+    /// A legend with a fit, its layer names off or more than three columns is required where it is
+    /// saved, so an older reader refuses the project instead of drawing it as set by hand, named and
+    /// in three columns, and saving it again without them; so is a saved command that sets one. The
+    /// defaults, null, a scale bar's fit and values read as them need nothing.
+    #[test]
+    fn legend_fit_capability_follows_saved_layouts_and_commands() {
+        use rustgis_map::layout::{ElementKind, LayerNames, LegendFit};
+        let fixture = Project::from_json(include_str!("../../../schema/fixtures/layout_legend_fit.rgis")).unwrap();
+        let saved = serde_json::to_value(&fixture).unwrap();
+        assert_eq!(saved["requires"], json!(["layout-legend-fit"]));
+        let reread = Project::from_json(&saved.to_string()).unwrap();
+        assert!(reread.layouts[0].elements[1].kind.legend_uses_fit());
+        // Each of the three on its own is required.
+        for one in 0..3 {
+            let mut alone = fixture.clone();
+            if let ElementKind::Legend { fit, show_layer_names, columns, .. } = &mut alone.layouts[0].elements[1].kind {
+                (*fit, *show_layer_names, *columns) = [
+                    (LegendFit::AdjustSize, LayerNames::Shown, 3),
+                    (LegendFit::Manual, LayerNames::Hidden, 1),
+                    (LegendFit::Manual, LayerNames::Shown, 4),
+                ][one];
+            }
+            assert_eq!(serde_json::to_value(&alone).unwrap()["requires"], json!(["layout-legend-fit"]), "{one}");
+        }
+        let mut clean = fixture;
+        if let ElementKind::Legend { fit, show_layer_names, columns, .. } = &mut clean.layouts[0].elements[1].kind {
+            (*fit, *show_layer_names, *columns) = (LegendFit::Manual, LayerNames::Shown, 3);
+        }
+        let base = serde_json::to_value(&clean).unwrap();
+        assert!(base.get("requires").is_none(), "a manual, named legend in three columns needs nothing");
+        for key in ["\"fit\"", "show_layer_names"] {
+            assert!(!base["layouts"].to_string().contains(key), "nor writes {key}");
+        }
+        // A fit name it doesn't know and layer names that aren't true or false read as the defaults.
+        let mut damaged = base["layouts"][0].clone();
+        damaged["elements"][1]["kind"]["Legend"]["fit"] = json!("adjustFrame");
+        damaged["elements"][1]["kind"]["Legend"]["show_layer_names"] = json!("no");
+        let data = |text: &str| {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(text)
+        };
+        for (id, params, required) in [
+            ("layout.addElement", json!({"kind": "legend", "fit": "adjustSize"}), true),
+            ("layout.addElement", json!({"kind": "legend", "showLayerNames": false, "fit": "shrink"}), true),
+            ("layout.update", json!({"element": 2, "fit": "AdjustColumns"}), true),
+            ("layout.update", json!({"element": 2, "fit": " adjustColumnsAndSize "}), true),
+            ("layout.update", json!({"element": 2, "showLayerNames": false}), true),
+            ("layout.update", json!({"element": 2, "columns": 4}), true),
+            ("layout.update", json!({"element": 2, "columns": 6, "fit": "adjustWidth"}), true),
+            ("layout.update", json!({"element": 2, "columns": 3}), false),
+            ("layout.update", json!({"element": 2, "fit": "manual", "showLayerNames": true}), false),
+            ("layout.update", json!({"element": 2, "fit": "adjustWidth"}), false),
+            ("layout.update", json!({"element": 2, "fit": "adjustFrame", "columns": 9}), false),
+            ("layout.update", json!({"element": 2, "showLayerNames": "false", "columns": 4.5}), false),
+            ("layout.update", json!({"element": 2, "fit": null, "showLayerNames": null, "columns": null}), false),
+            ("layout.import", json!({"text": saved["layouts"][0].to_string()}), true),
+            ("layout.import", json!({"text": base["layouts"][0].to_string()}), false),
+            ("layout.import", json!({"text": damaged.to_string()}), false),
+            ("layout.import", json!({"path": "legends.rgislayout"}), false),
+            // A report section's template is a layout file read as `layout.import` reads it.
+            ("report.existingTemplate", json!({"text": saved["layouts"][0].to_string()}), true),
+            ("report.existingTemplate", json!({"text": base["layouts"][0].to_string()}), false),
+            // It reads `data` (base64) before `text`.
+            ("report.existingTemplate", json!({"data": data(&saved["layouts"][0].to_string())}), true),
+            ("report.existingTemplate", json!({"data": data(&base["layouts"][0].to_string())}), false),
+            ("report.existingTemplate", json!({"data": "not base64"}), false),
+            (
+                "report.existingTemplate",
+                json!({"data": data(&saved["layouts"][0].to_string()), "text": base["layouts"][0].to_string()}),
+                true,
+            ),
+            (
+                "report.existingTemplate",
+                json!({"data": data(&base["layouts"][0].to_string()), "text": saved["layouts"][0].to_string()}),
+                false,
+            ),
+        ] {
+            // A scale bar's fit name is its details' to require, not this.
+            let bar = params.get("fit") == Some(&json!("adjustWidth"));
+            let script = format!("{id}= {params}");
+            for value in [
+                json!([{"name": "Task", "steps": [{"title": "Legend", "command": id, "params": params}]}]),
+                json!([{"name": "Script", "steps": [{"title": "Legend", "command": "script.run", "params": {"script": script}}]}]),
+            ] {
+                let mut document = base.clone();
+                document["tasks"] = value;
+                let saved = serde_json::to_value(Project::from_json(&document.to_string()).unwrap()).unwrap();
+                let requires = saved.get("requires").and_then(Value::as_array).cloned().unwrap_or_default();
+                assert_eq!(requires.contains(&json!("layout-legend-fit")), required, "{id} {params}");
+                let others: Vec<&Value> = requires.iter().filter(|r| *r != "layout-legend-fit").collect();
+                let expected: Vec<Value> = if bar { vec![json!("layout-scale-bar-details")] } else { vec![] };
+                assert_eq!(others, expected.iter().collect::<Vec<_>>(), "{id} {params}: {requires:?}");
+            }
+        }
+    }
+
+    /// A text with a block setting is required where it is saved, so an older reader refuses the
+    /// project instead of drawing it at the top, at the usual spacing, as typed, and saving it again
+    /// without them; so is a saved command that sets one. The defaults, null and values read as
+    /// them need nothing.
+    #[test]
+    fn text_block_capability_follows_saved_layouts_and_commands() {
+        use rustgis_map::layout::ElementKind;
+        let fixture = Project::from_json(include_str!("../../../schema/fixtures/layout_text_block.rgis")).unwrap();
+        let saved = serde_json::to_value(&fixture).unwrap();
+        assert_eq!(saved["requires"], json!(["layout-text-block"]));
+        let reread = Project::from_json(&saved.to_string()).unwrap();
+        assert!(reread.layouts[0].elements[1].kind.text_uses_block());
+        assert!(!reread.layouts[0].elements[2].kind.text_uses_block());
+        let mut clean = fixture;
+        for e in &mut clean.layouts[0].elements {
+            if let ElementKind::Text { text, size, color, bold, .. } = &e.kind {
+                e.kind = ElementKind::text(text.clone(), *size, *color, *bold);
+            }
+        }
+        let base = serde_json::to_value(&clean).unwrap();
+        assert!(base.get("requires").is_none(), "a plain text needs nothing");
+        for key in ["valign", "line_spacing", "\"case\""] {
+            assert!(!base["layouts"].to_string().contains(key), "nor writes {key}");
+        }
+        // A name it doesn't know and a spacing that isn't a number read as the defaults.
+        let mut damaged = base["layouts"][0].clone();
+        damaged["elements"][1]["kind"]["Text"]["valign"] = json!("sideways");
+        damaged["elements"][1]["kind"]["Text"]["line_spacing"] = json!("x");
+        for (id, params, required) in [
+            ("layout.addElement", json!({"kind": "text", "valign": "middle"}), true),
+            ("layout.addElement", json!({"kind": "dynamicText", "case": "upper"}), true),
+            ("layout.update", json!({"element": 2, "lineSpacing": 1.5}), true),
+            ("layout.update", json!({"element": 2, "lineSpacing": "0.75"}), true),
+            ("layout.update", json!({"element": 2, "valign": "top", "lineSpacing": 1, "case": "none"}), false),
+            ("layout.update", json!({"element": 2, "valign": " Top ", "lineSpacing": "1", "case": "NONE"}), false),
+            ("layout.update", json!({"element": 2, "lineSpacing": 1.0}), false),
+            ("layout.update", json!({"element": 2, "valign": null, "lineSpacing": null, "case": null}), false),
+            ("layout.update", json!({"element": 2, "wrap": false}), false),
+            ("layout.import", json!({"text": saved["layouts"][0].to_string()}), true),
+            ("layout.import", json!({"text": base["layouts"][0].to_string()}), false),
+            ("layout.import", json!({"text": damaged.to_string()}), false),
+            ("layout.import", json!({"path": "texts.rgislayout"}), false),
+        ] {
+            let script = format!("{id}= {params}");
+            for value in [
+                json!([{"name": "Task", "steps": [{"title": "Text", "command": id, "params": params}]}]),
+                json!([{"name": "Script", "steps": [{"title": "Text", "command": "script.run", "params": {"script": script}}]}]),
+            ] {
+                let mut document = base.clone();
+                document["tasks"] = value;
+                let saved = serde_json::to_value(Project::from_json(&document.to_string()).unwrap()).unwrap();
+                let requires = saved.get("requires").and_then(Value::as_array).cloned().unwrap_or_default();
+                assert_eq!(requires.contains(&json!("layout-text-block")), required, "{id} {params}");
+                assert!(requires.iter().all(|r| r == "layout-text-block"), "{id} {params}: {requires:?}");
+            }
+        }
+    }
+
+    /// A scale bar with details is required where it is saved, so an older reader refuses the project
+    /// instead of drawing a plain bar and saving it again without them; so is a saved command that
+    /// sets one. The defaults, or a unit label taken back to its abbreviation, need nothing.
+    #[test]
+    fn scale_bar_details_capability_follows_saved_layouts_and_commands() {
+        use rustgis_map::layout::ElementKind;
+        let fixture = Project::from_json(include_str!("../../../schema/fixtures/layout_scale_bar_details.rgis")).unwrap();
+        let saved = serde_json::to_value(&fixture).unwrap();
+        // Its sized bar's text size is the text size capability's, as for any scale bar.
+        assert_eq!(saved["requires"], json!(["layout-text-size", "layout-scale-bar-details"]));
+        let reread = Project::from_json(&saved.to_string()).unwrap();
+        assert!(reread.layouts[0].elements[1].kind.scale_bar_uses_details());
+        assert!(!reread.layouts[0].elements[2].kind.scale_bar_uses_details());
+        let mut clean = fixture;
+        for e in &mut clean.layouts[0].elements {
+            if let ElementKind::ScaleBar { frame, units, divisions, style, color, fill, .. } = &e.kind {
+                let mut plain = ElementKind::scale_bar(*frame);
+                if let ElementKind::ScaleBar { units: u, divisions: d, style: st, color: c, fill: f, .. } = &mut plain {
+                    (*u, *d, *st, *c, *f) = (*units, *divisions, *style, *color, *fill);
+                }
+                e.kind = plain;
+            }
+        }
+        let base = serde_json::to_value(&clean).unwrap();
+        assert!(base.get("requires").is_none(), "a plain bar needs nothing");
+        for key in [
+            "subdivisions",
+            "divisions_before_zero",
+            "label_position",
+            "unit_label",
+            "unit_label_position",
+            "decimals",
+            "text_size",
+            "\"fit\"",
+        ] {
+            assert!(!base["layouts"].to_string().contains(key), "nor writes {key}");
+        }
+        let layout = &saved["layouts"][0];
+        let mut position_only = base["layouts"][0].clone();
+        position_only["elements"][1]["kind"]["ScaleBar"]["unit_label_position"] = json!("afterBar");
+        // One subdivision clamps to none, so a text whose only detail it is needs nothing.
+        let mut one_subdivision = base["layouts"][0].clone();
+        one_subdivision["elements"][1]["kind"]["ScaleBar"]["subdivisions"] = json!(1);
+        for (id, params, required) in [
+            ("layout.addElement", json!({"kind": "scaleBar", "subdivisions": 4}), true),
+            ("layout.update", json!({"element": 2, "labelPosition": "below"}), true),
+            ("layout.update", json!({"element": 2, "unitLabel": ""}), true),
+            ("layout.update", json!({"element": 2, "fit": "adjustWidth"}), true),
+            // A text size is no detail: the text size capability covers it.
+            ("layout.update", json!({"element": 2, "textSize": 9}), false),
+            ("layout.addElement", json!({"kind": "scaleBar", "textSize": 12}), false),
+            ("layout.update", json!({"element": 2, "unitLabel": null}), false),
+            // Fixed decimals, none too, are a detail; "auto" isn't. An update's may be a chart's,
+            // which it can't tell apart; an addElement's for a chart is the chart's alone.
+            ("layout.addElement", json!({"kind": "scaleBar", "decimals": 0}), true),
+            ("layout.addElement", json!({"kind": "scaleBar", "decimals": "auto"}), false),
+            ("layout.addElement", json!({"kind": "chart", "decimals": 2}), false),
+            ("layout.update", json!({"element": 2, "decimals": 2}), true),
+            ("layout.update", json!({"element": 2, "decimals": "2"}), true),
+            ("layout.update", json!({"element": 2, "decimals": 2.0}), true),
+            ("layout.update", json!({"element": 2, "decimals": "auto"}), false),
+            (
+                "layout.update",
+                json!({"element": 2, "subdivisions": 1, "divisionsBeforeZero": 0, "labelPosition": "above", "unitLabelPosition": "afterLabels", "decimals": "auto", "textSize": null, "fit": "adjustDivisionValue"}),
+                false,
+            ),
+            ("layout.update", json!({"element": 2, "divisions": 3}), false),
+            ("layout.import", json!({"text": layout.to_string()}), true),
+            ("layout.import", json!({"text": base["layouts"][0].to_string()}), false),
+            ("layout.import", json!({"text": position_only.to_string()}), true),
+            ("layout.import", json!({"text": one_subdivision.to_string()}), false),
+            ("layout.import", json!({"path": "bars.rgislayout"}), false),
+        ] {
+            let script = format!("{id}= {params}");
+            for value in [
+                json!([{"name": "Task", "steps": [{"title": "Bar", "command": id, "params": params}]}]),
+                json!([{"name": "Script", "steps": [{"title": "Bar", "command": "script.run", "params": {"script": script}}]}]),
+            ] {
+                let mut document = base.clone();
+                document["tasks"] = value;
+                let saved = serde_json::to_value(Project::from_json(&document.to_string()).unwrap()).unwrap();
+                // Decimals a chart takes too may require its capability as well, and a text size
+                // its own.
+                let requires = saved.get("requires").and_then(Value::as_array).cloned().unwrap_or_default();
+                assert_eq!(requires.contains(&json!("layout-scale-bar-details")), required, "{id} {params}");
+                assert!(
+                    requires
+                        .iter()
+                        .all(|r| ["layout-scale-bar-details", "layout-chart-look", "layout-text-size"].contains(&r.as_str().unwrap_or(""))),
+                    "{id} {params}"
+                );
+            }
+        }
+    }
+
+    /// A chart that faces another (#2487 part 4: mirrored, a fixed maximum, labels hidden) is
+    /// required where it is saved, so an older reader refuses the project instead of drawing it
+    /// the usual way round, on its own scale, labelled; so is a saved command that sets one. Each
+    /// at its default (`false`, `null`, `"auto"`) needs nothing, nor is written.
+    #[test]
+    fn chart_facing_capability_follows_saved_layouts_and_commands() {
+        use rustgis_map::layout::ElementKind;
+        let fixture = Project::from_json(include_str!("../../../schema/fixtures/layout_chart_facing.rgis")).unwrap();
+        let saved = serde_json::to_value(&fixture).unwrap();
+        assert_eq!(saved["requires"], json!(["layout-chart-facing"]));
+        let mut clean = fixture;
+        for e in &mut clean.layouts[0].elements {
+            if let ElementKind::Chart { mirror, max, hide_labels, .. } = &mut e.kind {
+                (*mirror, *max, *hide_labels) = (false, None, false);
+            }
+        }
+        let base = serde_json::to_value(&clean).unwrap();
+        assert!(base.get("requires").is_none(), "a chart drawn the usual way needs nothing");
+        for key in ["\"mirror\"", "\"max\"", "\"hide_labels\""] {
+            assert!(!base["layouts"].to_string().contains(key), "nor writes {key}");
+        }
+        // Each one alone requires it.
+        for key in ["mirror", "max", "hide_labels"] {
+            let mut one = base.clone();
+            one["layouts"][0]["elements"][1]["kind"]["Chart"][key] = if key == "max" { json!(100.0) } else { json!(true) };
+            let saved = serde_json::to_value(Project::from_json(&one.to_string()).unwrap()).unwrap();
+            assert_eq!(saved["requires"], json!(["layout-chart-facing"]), "{key}");
+        }
+        // A hand-edited maximum not above 0 is let go on read (and said), so it is neither written
+        // back nor required.
+        let mut kept = base.clone();
+        kept["layouts"][0]["elements"][1]["kind"]["Chart"]["max"] = json!(-5.0);
+        let saved_kept = serde_json::to_value(Project::from_json(&kept.to_string()).unwrap()).unwrap();
+        assert!(saved_kept.get("requires").is_none());
+        assert!(saved_kept["layouts"][0]["elements"][1]["kind"]["Chart"].get("max").is_none());
+        let mut document = base.clone();
+        document["tasks"] = json!([{"name": "Task", "steps": [{"title": "Chart", "command": "layout.import", "params": {"text": saved["layouts"][0].to_string()}}]}]);
+        let imported = serde_json::to_value(Project::from_json(&document.to_string()).unwrap()).unwrap();
+        assert_eq!(imported["requires"], json!(["layout-chart-facing"]));
+        for (id, params, required) in [
+            ("layout.addElement", json!({"kind": "chart", "mirror": true}), true),
+            ("layout.addElement", json!({"kind": "chart", "max": 100}), true),
+            ("layout.addElement", json!({"kind": "chart", "hideLabels": true}), true),
+            ("layout.addElement", json!({"kind": "chart", "mirror": false, "max": null, "hideLabels": false}), false),
+            ("layout.addElement", json!({"kind": "chart", "max": "auto"}), false),
+            ("layout.addElement", json!({"kind": "legend", "mirror": true}), false),
+            ("layout.update", json!({"element": 2, "mirror": true}), true),
+            ("layout.update", json!({"element": 2, "max": 50}), true),
+            ("layout.update", json!({"element": 2, "hideLabels": true}), true),
+            ("layout.update", json!({"element": 2, "mirror": false, "max": null, "hideLabels": false}), false),
+            ("layout.import", json!({"text": base["layouts"][0].to_string()}), false),
+        ] {
+            let script = format!("{id}= {params}");
+            for value in [
+                json!([{"name": "Task", "steps": [{"title": "Chart", "command": id, "params": params}]}]),
+                json!([{"name": "Script", "steps": [{"title": "Chart", "command": "script.run", "params": {"script": script}}]}]),
+            ] {
+                let mut document = base.clone();
+                document["tasks"] = value;
+                let saved = serde_json::to_value(Project::from_json(&document.to_string()).unwrap()).unwrap();
+                let expected = if required { json!(["layout-chart-facing"]) } else { Value::Null };
+                assert_eq!(saved.get("requires").cloned().unwrap_or(Value::Null), expected, "{id} {params}");
+            }
+        }
+    }
+
+    /// A line round a chart's bars (#2487 part 4b) requires `layout-chart-outline`, in a saved
+    /// layout and in the commands that give it one; none, null or a width of 0 need nothing.
+    #[test]
+    fn chart_outline_capability_follows_saved_layouts_and_commands() {
+        use rustgis_map::layout::ElementKind;
+        let fixture = Project::from_json(include_str!("../../../schema/fixtures/layout_chart_outline.rgis")).unwrap();
+        let saved = serde_json::to_value(&fixture).unwrap();
+        assert_eq!(saved["requires"], json!(["layout-chart-outline"]));
+        let mut clean = fixture;
+        for e in &mut clean.layouts[0].elements {
+            if let ElementKind::Chart { bar_outline, .. } = &mut e.kind {
+                *bar_outline = None;
+            }
+        }
+        let base = serde_json::to_value(&clean).unwrap();
+        assert!(base.get("requires").is_none(), "a chart without an outline needs nothing");
+        assert!(!base["layouts"].to_string().contains("\"bar_outline\""), "nor writes it");
+        // One of no width, or below 0 (a hand-edited file), is let go on read: it needs nothing
+        // and isn't written back.
+        for width in [0.0, -1.0] {
+            let mut zero = base.clone();
+            zero["layouts"][0]["elements"][1]["kind"]["Chart"]["bar_outline"] = json!({"color": [0, 0, 0, 255], "width": width});
+            let saved_zero = serde_json::to_value(Project::from_json(&zero.to_string()).unwrap()).unwrap();
+            assert!(saved_zero.get("requires").is_none(), "{width}");
+            assert!(!saved_zero["layouts"].to_string().contains("\"bar_outline\""), "{width}");
+        }
+        let mut document = base.clone();
+        document["tasks"] = json!([{"name": "Task", "steps": [{"title": "Chart", "command": "layout.import", "params": {"text": saved["layouts"][0].to_string()}}]}]);
+        let imported = serde_json::to_value(Project::from_json(&document.to_string()).unwrap()).unwrap();
+        assert_eq!(imported["requires"], json!(["layout-chart-outline"]));
+        for (id, params, required) in [
+            ("layout.addElement", json!({"kind": "chart", "barOutline": {}}), true),
+            ("layout.addElement", json!({"kind": "chart", "barOutline": {"color": "#000000", "width": 1}}), true),
+            ("layout.addElement", json!({"kind": "chart", "barOutline": {"width": 0}}), false),
+            ("layout.addElement", json!({"kind": "chart", "barOutline": null}), false),
+            ("layout.addElement", json!({"kind": "legend", "barOutline": {}}), false),
+            ("layout.update", json!({"element": 2, "barOutline": {"color": "#C2185B"}}), true),
+            ("layout.update", json!({"element": 2, "barOutline": {"width": 0}}), false),
+            ("layout.update", json!({"element": 2, "barOutline": {"width": "2"}}), true),
+            ("layout.update", json!({"element": 2, "barOutline": {"width": "0"}}), false),
+            ("layout.update", json!({"element": 2, "barOutline": null}), false),
+            ("layout.import", json!({"text": base["layouts"][0].to_string()}), false),
+        ] {
+            let script = format!("{id}= {params}");
+            for value in [
+                json!([{"name": "Task", "steps": [{"title": "Chart", "command": id, "params": params}]}]),
+                json!([{"name": "Script", "steps": [{"title": "Chart", "command": "script.run", "params": {"script": script}}]}]),
+            ] {
+                let mut document = base.clone();
+                document["tasks"] = value;
+                let saved = serde_json::to_value(Project::from_json(&document.to_string()).unwrap()).unwrap();
+                let expected = if required { json!(["layout-chart-outline"]) } else { Value::Null };
                 assert_eq!(saved.get("requires").cloned().unwrap_or(Value::Null), expected, "{id} {params}");
             }
         }
@@ -1701,6 +3070,159 @@ mod tests {
         assert!(Project::from_json(&unknown.to_string()).unwrap_err().contains("future-border"));
     }
 
+    /// A layout's page colour (#2855) is required where it is saved, so an older reader refuses
+    /// the project instead of opening the page white and saving it so. A white page is not
+    /// written and needs nothing; neither do a saved layout.page that gives white or null.
+    #[test]
+    fn page_color_capability_follows_saved_layouts_and_commands() {
+        let fixture = Project::from_json(include_str!("../../../schema/fixtures/layout_page_color.rgis")).unwrap();
+        let saved = serde_json::to_value(&fixture).unwrap();
+        assert_eq!(saved["requires"], json!(["layout-page-color"]));
+        assert_eq!(saved["layouts"][0]["paper"], json!([11, 27, 43, 255]));
+        let mut clean = fixture;
+        clean.layouts[0].paper = None;
+        let base = serde_json::to_value(&clean).unwrap();
+        assert!(base.get("requires").is_none() && base["layouts"][0].get("paper").is_none(), "a white page needs nothing");
+        for (params, required) in [
+            (json!({"color": "#0B1B2B"}), true),
+            (json!({"color": " #0b1b2b "}), true),
+            (json!({"color": "#FFFFFF"}), false),
+            (json!({"color": "#ffffff"}), false),
+            (json!({"color": null}), false),
+            (json!({"orientation": "portrait"}), false),
+        ] {
+            let script = format!("layout.page {params}");
+            for value in [
+                json!([{"name": "Task", "steps": [{"title": "Page", "command": "layout.page", "params": params}]}]),
+                json!([{"name": "Script", "steps": [{"title": "Page", "command": "script.run", "params": {"script": script}}]}]),
+            ] {
+                let mut document = base.clone();
+                document["tasks"] = value;
+                let saved = serde_json::to_value(Project::from_json(&document.to_string()).unwrap()).unwrap();
+                let expected = if required { json!(["layout-page-color"]) } else { Value::Null };
+                assert_eq!(saved.get("requires").cloned().unwrap_or(Value::Null), expected, "{params}");
+            }
+        }
+        // An imported layout's text with a page colour needs it; a white one, none.
+        for (layout, required) in [(&saved["layouts"][0], true), (&base["layouts"][0], false)] {
+            let mut document = base.clone();
+            document["tasks"] = json!([{"name": "Task", "steps": [{"title": "Import", "command": "layout.import", "params": {"text": layout.to_string()}}]}]);
+            let saved = serde_json::to_value(Project::from_json(&document.to_string()).unwrap()).unwrap();
+            assert_eq!(saved.get("requires").is_some(), required, "{layout}");
+        }
+    }
+
+    /// A layout text holding a layer statistic (#2853) is required where it is saved, so an older
+    /// reader refuses the project by name instead of printing the token; a text with other tokens,
+    /// or braces that aren't one, needs nothing.
+    #[test]
+    fn text_statistics_capability_follows_saved_layouts_and_commands() {
+        use rustgis_map::layout::{ElementKind, Layout};
+        // The fixture the schema check opens lists it.
+        let fixture = Project::from_json(include_str!("../../../schema/fixtures/layout_text_statistics.rgis")).unwrap();
+        assert_eq!(serde_json::to_value(&fixture).unwrap()["requires"], json!(["layout-text-statistics"]));
+        let with_text = |text: &str| {
+            let mut p = Project::default();
+            let mut l = Layout::new("L", 100.0, 100.0);
+            l.add("T", (10.0, 10.0, 50.0, 10.0), ElementKind::text(text, 12.0, rustgis_map::Rgba::rgb(0, 0, 0), false));
+            p.layouts.push(l);
+            serde_json::to_value(&p).unwrap()
+        };
+        let saved = with_text("{count:Sites} sites");
+        assert_eq!(saved["requires"], json!(["layout-text-statistics"]));
+        assert_eq!(Project::from_json(&saved.to_string()).unwrap().layouts[0].elements.len(), 1);
+        let base = with_text("{scale} {count:} {foo}");
+        assert_eq!(base.get("requires"), None);
+        let layout = saved["layouts"][0].to_string();
+        let data = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(&layout)
+        };
+        for (id, params, required) in [
+            ("layout.addElement", json!({"kind": "text", "text": "{sum:Sites:visits}"}), true),
+            ("layout.addElement", json!({"kind": "text", "text": "{scale}"}), false),
+            ("layout.addElement", json!({"kind": "legend", "title": "{count:Sites}"}), false),
+            ("layout.update", json!({"element": 1, "text": "Mean {mean:Sites:visits}"}), true),
+            ("layout.update", json!({"element": 1, "text": "{sum:Sites}"}), false),
+            ("layout.update", json!({"element": 1, "x": 3}), false),
+            ("layout.publication", json!({"extent": [-1, -1, 1, 1], "title": "{count:Sites}"}), true),
+            ("layout.publication", json!({"extent": [-1, -1, 1, 1], "sources": ["Data", "{mean:Sites:visits}"]}), true),
+            ("layout.publication", json!({"extent": [-1, -1, 1, 1], "author": "{max:Sites:visits}"}), true),
+            ("layout.publication", json!({"extent": [-1, -1, 1, 1], "title": "{scale} {projection}", "sources": "Data"}), false),
+            // A title, subtitle, note or author given as a list is joined with a space, and the sources
+            // and the reference with a line break, so a token may be split across their entries; the
+            // headings are each a text of their own.
+            ("layout.publication", json!({"extent": [-1, -1, 1, 1], "title": ["{count:New", "York}"]}), true),
+            ("layout.publication", json!({"extent": [-1, -1, 1, 1], "note": ["Data", "{sum:Sites:visits}"]}), true),
+            ("layout.publication", json!({"extent": [-1, -1, 1, 1], "sources": ["{count:New", "York}"]}), true),
+            ("layout.publication", json!({"extent": [-1, -1, 1, 1], "reference": ["{sum:Sites:vis", "its}"]}), true),
+            ("layout.publication", json!({"extent": [-1, -1, 1, 1], "headings": ["{count:New", "York}"]}), false),
+            ("layout.import", json!({"text": layout}), true),
+            // A report section's template is a layout file read as `layout.import` reads it.
+            ("report.existingTemplate", json!({"text": layout}), true),
+            ("report.existingTemplate", json!({"data": data}), true),
+        ] {
+            let script = format!("{id} {params}");
+            for value in [
+                json!([{"name": "Task", "steps": [{"title": "Figure", "command": id, "params": params}]}]),
+                json!([{"name": "Script", "steps": [{"title": "Figure", "command": "script.run", "params": {"script": script}}]}]),
+            ] {
+                let mut document = base.clone();
+                document["tasks"] = value;
+                let saved = serde_json::to_value(Project::from_json(&document.to_string()).unwrap()).unwrap();
+                let expected = if required { json!(["layout-text-statistics"]) } else { Value::Null };
+                assert_eq!(saved["requires"], expected, "{id} {params}");
+            }
+        }
+    }
+
+    /// A presentation's map page draws its title over its map frame, where a layer statistic is
+    /// filled in (#2853), so it is required where it is saved, in a project or a command; the title
+    /// of a page with no map frame, or without a token, needs nothing.
+    #[test]
+    fn text_statistics_capability_follows_presentation_map_pages() {
+        let map_page =
+            |title: &str| json!({"title": title, "kind": {"type": "map", "map": "World", "center": {"x": 0, "y": 0}, "widthM": 1000}});
+        let blank_page = |title: &str| json!({"title": title, "kind": {"type": "blank", "text": "", "background": [255, 255, 255, 255]}});
+        let presentation = |page: Value| json!({"name": "P", "width": 297, "height": 210, "pages": [page]}).to_string();
+        let base = serde_json::to_value(Project::default()).unwrap();
+        let data = |title: &str| {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(presentation(map_page(title)))
+        };
+        for (page, required) in [(map_page("{count:Sites}"), true), (map_page("Sites"), false), (blank_page("{count:Sites}"), false)] {
+            let mut document = base.clone();
+            document["presentations"] = json!([{"name": "P", "width": 297, "height": 210, "pages": [page.clone()]}]);
+            let saved = serde_json::to_value(Project::from_json(&document.to_string()).unwrap()).unwrap();
+            let expected = if required { json!(["layout-text-statistics"]) } else { Value::Null };
+            assert_eq!(saved.get("requires").cloned().unwrap_or(Value::Null), expected, "{page}");
+        }
+        for (id, params, required) in [
+            ("presentation.mapPage", json!({"title": "{count:Sites}"}), true),
+            ("presentation.mapPage", json!({"title": "Sites"}), false),
+            ("presentation.updatePage", json!({"page": 0, "title": "{sum:Sites:visits}"}), true),
+            ("presentation.blankPage", json!({"title": "{count:Sites}"}), false),
+            ("presentation.import", json!({"text": presentation(map_page("{count:Sites}"))}), true),
+            ("presentation.import", json!({"text": presentation(map_page("Sites"))}), false),
+            ("presentation.import", json!({"text": presentation(blank_page("{count:Sites}"))}), false),
+            // It reads `data` (base64) before `text`.
+            ("presentation.import", json!({"data": data("{count:Sites}")}), true),
+            ("presentation.import", json!({"data": data("Sites"), "text": presentation(map_page("{count:Sites}"))}), false),
+        ] {
+            let script = format!("{id} {params}");
+            for value in [
+                json!([{"name": "Task", "steps": [{"title": "Page", "command": id, "params": params}]}]),
+                json!([{"name": "Script", "steps": [{"title": "Page", "command": "script.run", "params": {"script": script}}]}]),
+            ] {
+                let mut document = base.clone();
+                document["tasks"] = value;
+                let saved = serde_json::to_value(Project::from_json(&document.to_string()).unwrap()).unwrap();
+                let expected = if required { json!(["layout-text-statistics"]) } else { Value::Null };
+                assert_eq!(saved.get("requires").cloned().unwrap_or(Value::Null), expected, "{id} {params}");
+            }
+        }
+    }
+
     /// A legend's, scale bar's or grid's text size other than its default (#2581) is required
     /// where it is saved, so an older reader refuses the project instead of drawing it at the
     /// default and saving it so. Default sizes are not written and need nothing.
@@ -1810,7 +3332,7 @@ mod tests {
         }))
         .unwrap();
         let clean = Layer::new_raster(1, "DEM", raster);
-        for field in ["shadow", "sky", "fill", "rock", "ambient", "balanced"] {
+        for field in ["shadow", "sky", "fill", "rock", "ambient", "balanced", "shadow_softness"] {
             let mut value = serde_json::to_value(&clean).unwrap();
             value["raster"]["style"]["renderer"]["ShadedRelief"][field] = match field {
                 "rock" => serde_json::to_value(rustgis_map::raster::Rock::DEFAULT).unwrap(),
@@ -1825,7 +3347,11 @@ mod tests {
                 json_bytes(&map_file_bytes(p.map()).unwrap()),
                 json_bytes(&layer_file_bytes(&layer).unwrap()),
             ] {
-                let needs = if matches!(field, "ambient" | "balanced") { "shaded-relief-light" } else { "shaded-relief-effects" };
+                let needs = match field {
+                    "ambient" | "balanced" => "shaded-relief-light",
+                    "shadow_softness" => "shaded-relief-shadow-softness",
+                    _ => "shaded-relief-effects",
+                };
                 assert_eq!(document["requires"], json!([needs]), "{field}: {document}");
             }
         }
@@ -1877,5 +3403,123 @@ mod tests {
         let project = Project::from_json(&document.to_string()).unwrap();
         assert!(serde_json::to_value(project).unwrap().get("requires").is_none());
         assert!(rustgis_analysis::resolve_published("share.exportTable").is_none(), "models and web tools execute analysis tools only");
+    }
+
+    #[test]
+    fn crs_wkt_direct_walk_matches_saves_wkt_across_all_fields() {
+        use rustgis_data::raster::Crs;
+        use rustgis_data::{Dataset, GeometryType};
+
+        fn payload_saves_wkt(p: &Project) -> bool {
+            struct Payload<'a>(&'a Project);
+            impl Serialize for Payload<'_> {
+                fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                    Project::serialize(self.0, serializer)
+                }
+            }
+            rustgis_data::raster::crs::saves_wkt(&Payload(p))
+        }
+
+        fn populated_project() -> Project {
+            let mut p = Project::default();
+            let mut layer = Layer::new(1, Dataset::new("pts", GeometryType::Point, vec![]));
+            layer.source = Some(rustgis_map::source::SourceLayer::default());
+            let mut map = Map::new("Map");
+            map.layers.push(layer);
+            p.maps = vec![map.clone()];
+            p.tables.push(super::super::Table::new(1, Dataset::new("tbl", GeometryType::None, vec![])));
+            p.workspaces.push(crate::cmd::imagery::Workspace {
+                name: "ws".into(),
+                kind: "ortho".into(),
+                images: vec![],
+                cell_size: None,
+                crs: None,
+                projected_cell_size: None,
+                method: "first".into(),
+            });
+            p.offline_areas.push(super::super::OfflineArea {
+                id: String::new(),
+                name: "Field".into(),
+                map: "Map".into(),
+                extent: rustgis_geom::Extent::new(0.0, 0.0, 1.0, 1.0),
+                created: 0.0,
+                synced: 0.0,
+                generation: String::new(),
+                returned: Vec::new(),
+                ids: Default::default(),
+                conflicts: Default::default(),
+                data: map,
+            });
+            p
+        }
+
+        let grads = r#"GEOGCS["NTF (Paris)",DATUM["Nouvelle_Triangulation_Francaise_Paris",SPHEROID["Clarke 1880 (IGN)",6378249.2,293.466021293627,AUTHORITY["EPSG","7011"]],AUTHORITY["EPSG","6807"]],PRIMEM["Paris",2.33722917,AUTHORITY["EPSG","8903"]],UNIT["grad",0.0157079632679489,AUTHORITY["EPSG","9105"]]]"#;
+        let wkt_crs = rustgis_data::raster::wkt::crs_from_wkt(grads).unwrap();
+        let plain_custom = Crs::parse("+proj=robin +lon_0=0 +datum=WGS84 +units=m +no_defs").unwrap();
+        assert!(wkt_crs.needs_wkt());
+        assert!(!plain_custom.needs_wkt());
+
+        let base = populated_project();
+        assert!(!project_needs_wkt(&base));
+        assert_eq!(project_needs_wkt(&base), payload_saves_wkt(&base));
+
+        for (crs, expected) in [(wkt_crs, true), (plain_custom, false)] {
+            let cases: Vec<(&str, Box<dyn FnOnce(&mut Project)>)> = vec![
+                ("project.coordinate_system", Box::new(move |p| p.coordinate_system = Some(crs))),
+                (
+                    "project.gp_env.projected",
+                    Box::new(move |p| p.gp_env.projected = Some(super::super::ProjectedCells { crs, cell_size: None })),
+                ),
+                ("project.workspaces[0].crs", Box::new(move |p| p.workspaces[0].crs = Some(crs))),
+                ("project.tables[0].dataset.crs", Box::new(move |p| p.tables[0].dataset.crs = Some(crs))),
+                ("project.tables[0].dataset.held_in", Box::new(move |p| p.tables[0].dataset.held_in = crs)),
+                ("project.maps[0].layers[0].dataset.crs", Box::new(move |p| p.maps[0].layers[0].dataset.crs = Some(crs))),
+                ("project.maps[0].layers[0].dataset.held_in", Box::new(move |p| p.maps[0].layers[0].dataset.held_in = crs)),
+                (
+                    "project.maps[0].layers[0].source.shapefile_crs",
+                    Box::new(move |p| p.maps[0].layers[0].source.as_mut().unwrap().shapefile_crs = Some(crs)),
+                ),
+                (
+                    "project.offline_areas[0].data.layers[0].dataset.crs",
+                    Box::new(move |p| p.offline_areas[0].data.layers[0].dataset.crs = Some(crs)),
+                ),
+                (
+                    "project.offline_areas[0].data.layers[0].dataset.held_in",
+                    Box::new(move |p| p.offline_areas[0].data.layers[0].dataset.held_in = crs),
+                ),
+                (
+                    "project.offline_areas[0].data.layers[0].source.shapefile_crs",
+                    Box::new(move |p| p.offline_areas[0].data.layers[0].source.as_mut().unwrap().shapefile_crs = Some(crs)),
+                ),
+            ];
+            for (name, apply) in cases {
+                let mut p = populated_project();
+                apply(&mut p);
+                assert_eq!(project_needs_wkt(&p), expected, "{name}");
+                assert_eq!(project_needs_wkt(&p), payload_saves_wkt(&p), "{name}");
+                assert_eq!(p.required_capabilities().contains(&"crs-wkt"), expected, "{name}");
+            }
+
+            // Windowed layers omit held_in when serialized, so held_in alone must not trigger crs-wkt.
+            let mut p = populated_project();
+            p.maps[0].layers[0].dataset.windowed = true;
+            p.maps[0].layers[0].dataset.held_in = crs;
+            assert!(!project_needs_wkt(&p));
+            assert_eq!(project_needs_wkt(&p), payload_saves_wkt(&p));
+
+            // Standalone Map::needs_wkt / Layer::needs_wkt agree with saves_wkt and bytes helpers.
+            let mut p = populated_project();
+            p.maps[0].layers[0].dataset.crs = Some(crs);
+            let map = &p.maps[0];
+            let layer = &map.layers[0];
+            assert_eq!(map.needs_wkt(), expected);
+            assert_eq!(map.needs_wkt(), rustgis_data::raster::crs::saves_wkt(map));
+            assert_eq!(layer.needs_wkt(), expected);
+            assert_eq!(layer.needs_wkt(), rustgis_data::raster::crs::saves_wkt(layer));
+            let map_doc = json_bytes(&map_file_bytes(map).unwrap());
+            let layer_doc = json_bytes(&layer_file_bytes(layer).unwrap());
+            assert_eq!(map_doc.get("requires").and_then(|v| v.as_array()).is_some_and(|a| a.iter().any(|x| x == "crs-wkt")), expected);
+            assert_eq!(layer_doc.get("requires").and_then(|v| v.as_array()).is_some_and(|a| a.iter().any(|x| x == "crs-wkt")), expected);
+        }
     }
 }

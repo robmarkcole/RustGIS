@@ -128,10 +128,11 @@ fn main() {
     let mut m = Map::new("bench");
     m.basemap = Basemap::Blank;
     let mut layers = Vec::new();
-    // The data's extent, longitude/latitude: the sequences are fitted to it.
+    // The data's extent, longitude/latitude: the sequences are fitted to it. A layer is held in
+    // its file's own system (a sheet's LV95, say), so its box is converted.
     let mut extent = rustgis_geom::Extent::EMPTY;
     for d in datasets {
-        extent = extent.union(&d.extent());
+        extent = extent.union(&d.extent_to_lonlat(&d.extent()));
         let vertices: usize = d.features.iter().filter_map(|f| f.geometry.as_ref()).map(rustgis_map::lod::vertices).sum();
         let (name, rows) = (d.name.clone(), d.features.len());
         layers.push((m.add_dataset(d), name, rows, vertices));

@@ -393,6 +393,13 @@ pub struct ServiceLayer {
     /// service's GetLegendGraphic, then its default style's picture; a WMTS layer's default
     /// style's, each for its scales. None when the service gives none.
     pub legends: Vec<Legend>,
+    /// The legend pictures its default style offers that RustGIS can't show: in a format other
+    /// than PNG or JPEG, or at an address other than the web's (an `ftp:` one). A WMS style's
+    /// `LegendURL`s are the one legend in other formats or sizes (WMS 1.3.0 §7.2.4.6.4), so a WMS
+    /// layer keeps the first it can show and loses nothing while it has one: its count is 1 when
+    /// none could be shown and the service draws none. A WMTS style's are for different scales,
+    /// so each it can't keep is counted.
+    pub legends_left_out: usize,
     /// The Web Mercator zooms its tiles are drawn at, least and greatest, when the service says:
     /// a WMS layer's scale hints, a WMTS layer's tile matrices. `None`: the usual range.
     pub zooms: Option<(u8, u8)>,
@@ -881,8 +888,8 @@ pub fn parse(url: &str, body: &[u8]) -> Result<Service, String> {
 /// Parses a service's XML document through [`crate::xml::parse`], which refuses deep nesting
 /// (a stack-overflow hazard) and, with the DTD allowed here, entities holding markup.
 fn xml(text: &str, nodes_limit: u32) -> Result<roxmltree::Document<'_>, String> {
-    // WMS 1.1.1 documents start with a DOCTYPE, so DTDs are allowed; roxmltree still refuses
-    // entity bombs and external entities, and the node count is capped.
+    // WMS 1.1.1 documents start with a DOCTYPE, so DTDs are allowed; what its entities expand to
+    // is bounded by `check_limits`, roxmltree reads no external entity, and the node count is capped.
     let opts = ParsingOptions { allow_dtd: true, nodes_limit, ..ParsingOptions::default() };
     crate::xml::parse(text.trim_start(), opts)
 }
@@ -1124,6 +1131,8 @@ fn wms(url: &str, root: &Node) -> Service {
         if let Some(l) = wms_legend(url, &styles).filter(|l| !legends.contains(l)) {
             legends.push(l);
         }
+        // Its style offers a picture, and none can be shown: its legend is lost.
+        let legends_left_out = usize::from(legends.is_empty() && wms_offers_legend(&styles));
         service.layers.push(ServiceLayer {
             zooms: Some(scales.zooms()),
             name,
@@ -1144,6 +1153,7 @@ fn wms(url: &str, root: &Node) -> Service {
             }),
             feature_info,
             legends,
+            legends_left_out,
         });
     }
     if cut_times > 0 {
@@ -1343,8 +1353,7 @@ const MAX_STYLES: usize = 64;
 /// A WMS layer's legend: its default style's (the one a GetMap with `STYLES=` draws: the one
 /// named `default`, else the first), the first of its `LegendURL`s in a format RustGIS shows.
 fn wms_legend(url: &str, styles: &[Node]) -> Option<Legend> {
-    let style =
-        styles.iter().find(|s| child_text(s, "Name").is_some_and(|n| n.eq_ignore_ascii_case("default"))).or_else(|| styles.first())?;
+    let style = wms_default_style(styles)?;
     children(style, "LegendURL").find_map(|l| {
         if !legend_format(child_text(&l, "Format").as_deref()) {
             return None;
@@ -1353,6 +1362,16 @@ fn wms_legend(url: &str, styles: &[Node]) -> Option<Legend> {
         let url = resolve(url, &href).filter(|h| is_web(h))?;
         Some(Legend { url, ..Legend::default() })
     })
+}
+
+/// The style a GetMap with `STYLES=` draws: the one named `default`, else the first.
+fn wms_default_style<'s, 'a, 'i>(styles: &'s [Node<'a, 'i>]) -> Option<&'s Node<'a, 'i>> {
+    styles.iter().find(|s| child_text(s, "Name").is_some_and(|n| n.eq_ignore_ascii_case("default"))).or_else(|| styles.first())
+}
+
+/// Whether a WMS layer's default style ([`wms_default_style`]) offers any legend picture.
+fn wms_offers_legend(styles: &[Node]) -> bool {
+    wms_default_style(styles).is_some_and(|s| children(s, "LegendURL").next().is_some())
 }
 
 /// A service's GetLegendGraphic request for a layer, when its capabilities offer one (the SLD
@@ -1546,16 +1565,21 @@ fn wmts(url: &str, root: &Node) -> Service {
         let default_style = children(&layer, "Style").find(|s| s.attribute("isDefault") == Some("true")).or_else(|| child(&layer, "Style"));
         let style = default_style.and_then(|s| child_text(&s, "Identifier")).unwrap_or_else(|| "default".into());
         // Its default style's legends (WMTS 1.0.0 §7.1.1.1.1), each for the scales it gives.
-        let legends: Vec<Legend> = default_style
-            .iter()
-            .flat_map(|s| children(s, "LegendURL"))
-            .filter(|l| legend_format(l.attribute("format")))
-            .filter_map(|l| {
-                let url = href(&l).and_then(|h| resolve(url, &h)).filter(|h| is_web(h))?;
-                Some(Legend { url, min_scale: scale_attr(&l, "minScaleDenominator"), max_scale: scale_attr(&l, "maxScaleDenominator") })
-            })
-            .take(MAX_LEGENDS)
-            .collect();
+        // The first [`MAX_LEGENDS`] it can show are kept; those it can't, and those past them,
+        // are lost (counted, not held).
+        let (mut legends, mut legends_left_out) = (Vec::new(), 0usize);
+        for l in default_style.iter().flat_map(|s| children(s, "LegendURL")) {
+            let shown =
+                legend_format(l.attribute("format")).then(|| href(&l).and_then(|h| resolve(url, &h)).filter(|h| is_web(h))).flatten();
+            match shown {
+                Some(url) if legends.len() < MAX_LEGENDS => legends.push(Legend {
+                    url,
+                    min_scale: scale_attr(&l, "minScaleDenominator"),
+                    max_scale: scale_attr(&l, "maxScaleDenominator"),
+                }),
+                _ => legends_left_out += 1,
+            }
+        }
         let linked: Vec<String> = children(&layer, "TileMatrixSetLink").filter_map(|l| child_text(&l, "TileMatrixSet")).collect();
         let bbox = child(&layer, "WGS84BoundingBox").and_then(|b| {
             let lo: Vec<f64> = child_text(&b, "LowerCorner")?.split_whitespace().filter_map(|t| t.parse().ok()).collect();
@@ -1696,6 +1720,7 @@ fn wmts(url: &str, root: &Node) -> Service {
             time,
             feature_info: None,
             legends,
+            legends_left_out,
         });
     }
     cut_listing(&mut service);
@@ -1844,6 +1869,7 @@ fn wfs(url: &str, root: &Node) -> Service {
             time: None,
             feature_info: None,
             legends: Vec::new(),
+            legends_left_out: 0,
         });
     }
     if let (n, Some(first)) = unread {
@@ -2014,6 +2040,7 @@ fn wcs(url: &str, root: &Node) -> Service {
             time: None,
             feature_info: None,
             legends: Vec::new(),
+            legends_left_out: 0,
         });
     };
     let (mut n, mut left, mut long_ids) = (0, 0, 0);
@@ -2484,26 +2511,75 @@ pub struct RecordPage {
     pub records: Vec<Record>,
 }
 
+/// Characters of a search's words a catalogue is asked for.
+pub const MAX_SEARCH_WORDS: usize = 200;
+
+/// A search's words as a catalogue is asked for them, and how many characters were left out: those
+/// XML can't hold (control characters), and those past [`MAX_SEARCH_WORDS`].
+pub fn search_words(words: &str) -> (String, usize, usize) {
+    let words = words.trim();
+    let kept: Vec<char> = words.chars().filter(|c| !c.is_control() && !matches!(c, '\u{FFFE}' | '\u{FFFF}')).collect();
+    let unwritable = words.chars().count() - kept.len();
+    let text: String = kept.iter().take(MAX_SEARCH_WORDS).collect();
+    (text.trim().to_string(), unwritable, kept.len().saturating_sub(MAX_SEARCH_WORDS))
+}
+
 /// The GetRecords request (CSW 2.0.2, Dublin Core records) of a search: words anywhere in the
-/// records, within a longitude/latitude box, from position `start` (1-based).
-pub fn records_url(endpoint_url: &str, words: &str, bbox: Option<[f64; 4]>, start: u64) -> String {
-    let words: String = words.chars().filter(|c| !c.is_control()).take(200).collect::<String>().trim().replace('\'', "''");
-    let mut cql = Vec::new();
+/// records, within a longitude/latitude box, from position `start` (1-based). The search is a
+/// filter in XML (OGC Filter 1.1.0), which GeoNetwork, pycsw and Esri Geoportal all read; they
+/// don't share a form of CQL (#2889).
+///
+/// `named` says the box is in CRS84, which tells its longitudes from its latitudes. Not every
+/// catalogue reads that name: one that answers with an exception ([`records_refused`]) is asked
+/// again without it. It isn't left out at first: pycsw then takes the corners latitude first.
+pub fn records_url(endpoint_url: &str, words: &str, bbox: Option<[f64; 4]>, named: bool, start: u64) -> String {
+    let (mut names, mut terms) = (String::from(r#"xmlns:ogc="http://www.opengis.net/ogc""#), Vec::new());
+    let (words, ..) = search_words(words);
     if !words.is_empty() {
-        cql.push(format!("AnyText LIKE '%{words}%'"));
+        names.push_str(r#" xmlns:csw="http://www.opengis.net/cat/csw/2.0.2""#);
+        // Found as written: a wildcard or an escape among them stands for itself.
+        let mut literal = String::new();
+        for c in words.chars() {
+            if matches!(c, '%' | '_' | '\\') {
+                literal.push('\\');
+            }
+            literal.push(c);
+        }
+        let literal = literal.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+        terms.push(format!(
+            r#"<ogc:PropertyIsLike wildCard="%" singleChar="_" escapeChar="\"><ogc:PropertyName>csw:AnyText</ogc:PropertyName><ogc:Literal>%{literal}%</ogc:Literal></ogc:PropertyIsLike>"#
+        ));
     }
     if let Some([w, s, e, n]) = bbox {
-        cql.push(format!("BBOX(ows:BoundingBox,{w},{s},{e},{n})"));
+        names.push_str(r#" xmlns:ows="http://www.opengis.net/ows" xmlns:gml="http://www.opengis.net/gml""#);
+        let crs = if named { r#" srsName="urn:ogc:def:crs:OGC:1.3:CRS84""# } else { "" };
+        terms.push(format!(
+            "<ogc:BBOX><ogc:PropertyName>ows:BoundingBox</ogc:PropertyName><gml:Envelope{crs}><gml:lowerCorner>{w} {s}</gml:lowerCorner><gml:upperCorner>{e} {n}</gml:upperCorner></gml:Envelope></ogc:BBOX>"
+        ));
     }
     let mut q = format!(
         "SERVICE=CSW&VERSION=2.0.2&REQUEST=GetRecords&typeNames=csw:Record&resultType=results&elementSetName=full&outputSchema={}&maxRecords={RECORDS_PAGE}&startPosition={}",
         encode("http://www.opengis.net/cat/csw/2.0.2"),
         start.max(1)
     );
-    if !cql.is_empty() {
-        q.push_str(&format!("&constraintLanguage=CQL_TEXT&constraint_language_version=1.1.0&constraint={}", encode(&cql.join(" AND "))));
+    if !terms.is_empty() {
+        let all = if terms.len() > 1 { format!("<ogc:And>{}</ogc:And>", terms.concat()) } else { terms.concat() };
+        let filter = format!("<ogc:Filter {names}>{all}</ogc:Filter>");
+        q.push_str(&format!("&constraintLanguage=FILTER&constraint_language_version=1.1.0&constraint={}", encode(&filter)));
     }
     with_query(&endpoint(endpoint_url), &q)
+}
+
+/// Whether a GetRecords answer is an exception: the catalogue refusing the request, rather than
+/// its records or something else's answer.
+pub fn records_refused(body: &[u8]) -> bool {
+    let text = std::str::from_utf8(body).unwrap_or_default();
+    xml(text, 2_000_000).is_ok_and(|doc| is_exception(local(&doc.root_element())))
+}
+
+/// Whether a document's root says it is a service's exception.
+fn is_exception(root: &str) -> bool {
+    matches!(root, "ServiceExceptionReport" | "ExceptionReport")
 }
 
 /// What a link's protocol (or, when it says nothing useful, its address) makes it.
@@ -2552,7 +2628,7 @@ pub fn parse_records(url: &str, body: &[u8]) -> Result<RecordPage, String> {
     let root = doc.root_element();
     match local(&root) {
         "GetRecordsResponse" => {}
-        "ServiceExceptionReport" | "ExceptionReport" => {
+        name if is_exception(name) => {
             return Err(format!("the catalogue answered with an error: {}", text_of(&root).chars().take(300).collect::<String>()));
         }
         other => return Err(format!("not a catalogue's (CSW) answer (<{other}>)")),
@@ -2728,6 +2804,7 @@ fn arcgis(url: &str, v: &serde_json::Value) -> Result<Service, String> {
                 time: None,
                 feature_info: None,
                 legends: Vec::new(),
+                legends_left_out: 0,
             });
             listed = true;
         }
@@ -2758,6 +2835,7 @@ fn arcgis(url: &str, v: &serde_json::Value) -> Result<Service, String> {
             time: None,
             feature_info: None,
             legends: Vec::new(),
+            legends_left_out: 0,
         });
         features(&mut service);
         // A dynamic map's layers, each drawn alone (`layers=show:<id>`): a national layer is
@@ -2780,6 +2858,7 @@ fn arcgis(url: &str, v: &serde_json::Value) -> Result<Service, String> {
                     time: None,
                     feature_info: None,
                     legends: Vec::new(),
+                    legends_left_out: 0,
                 });
             }
         }
@@ -2796,6 +2875,7 @@ fn arcgis(url: &str, v: &serde_json::Value) -> Result<Service, String> {
             time: None,
             feature_info: None,
             legends: Vec::new(),
+            legends_left_out: 0,
         });
     } else if lower.ends_with("/vectortileserver") {
         service.kind = "ArcGIS VectorTileServer".into();
@@ -2814,6 +2894,7 @@ fn arcgis(url: &str, v: &serde_json::Value) -> Result<Service, String> {
             time: None,
             feature_info: None,
             legends: Vec::new(),
+            legends_left_out: 0,
         });
     } else {
         if let Some((root, id)) = b.rsplit_once('/')
@@ -2923,6 +3004,7 @@ fn arcgis_directory(b: &str, v: &serde_json::Value) -> Service {
             time: None,
             feature_info: None,
             legends: Vec::new(),
+            legends_left_out: 0,
         });
     }
     for s in v.get("services").and_then(|s| s.as_array()).into_iter().flatten().take(MAX_LISTED_LAYERS) {
@@ -2949,6 +3031,7 @@ fn arcgis_directory(b: &str, v: &serde_json::Value) -> Service {
             time: None,
             feature_info: None,
             legends: Vec::new(),
+            legends_left_out: 0,
         });
     }
     if skipped > 0 {
@@ -3013,6 +3096,7 @@ fn ogc_api(url: &str, v: &serde_json::Value) -> Result<Service, String> {
                 time: None,
                 feature_info: None,
                 legends: Vec::new(),
+                legends_left_out: 0,
             });
         }
         if !service.layers.is_empty() || service.collections_url.is_some() || service.dataset.is_some() {
@@ -3083,6 +3167,7 @@ fn ogc_api(url: &str, v: &serde_json::Value) -> Result<Service, String> {
                 time: None,
                 feature_info: None,
                 legends: Vec::new(),
+                legends_left_out: 0,
             });
         }
         if let Some((t, list, withheld)) = &vector {
@@ -3097,6 +3182,7 @@ fn ogc_api(url: &str, v: &serde_json::Value) -> Result<Service, String> {
                 time: None,
                 feature_info: None,
                 legends: Vec::new(),
+                legends_left_out: 0,
             });
         }
         if map.is_some() || vector.is_some() {
@@ -3152,6 +3238,7 @@ fn ogc_api(url: &str, v: &serde_json::Value) -> Result<Service, String> {
             time: None,
             feature_info: None,
             legends: Vec::new(),
+            legends_left_out: 0,
         });
     }
     if unreadable > 0 {
@@ -4591,9 +4678,19 @@ impl Pages {
                 ds.crs = Some(asked);
                 let asked = asked.label();
                 if std::mem::take(&mut losses.no_crs) {
-                    report
-                        .messages
-                        .push(format!("the answer names no coordinate system; coordinates are read in {asked}, the system asked for"));
+                    report.messages.push(crate::loss::Note::loss(
+                        crate::loss::LossCode::AssumedCrs,
+                        format!("the answer names no coordinate system; coordinates are read in {asked}, the system asked for"),
+                    ));
+                }
+                if let Some(code) = losses.unusable_code.take() {
+                    report.messages.push(crate::loss::Note::loss(
+                        crate::loss::LossCode::AssumedCrs,
+                        format!(
+                            "coordinate system {code} can't be used{}; coordinates are read in {asked}, the system asked for",
+                            losses.others_said()
+                        ),
+                    ));
                 }
                 // One it names that RustGIS can't use (a code, a WKT): read as asked too (as a
                 // GeoJSON answer's is), and its message says so.
@@ -5162,6 +5259,16 @@ pub enum Assumed {
 }
 
 impl Assumed {
+    /// Its loss code: `assumed.crs` when the answer is read in a system it didn't name or named
+    /// otherwise. An answer that named none, read in the one asked for, and one read as it named,
+    /// assume nothing past the request.
+    pub fn loss(self) -> Option<crate::loss::LossCode> {
+        match self {
+            Assumed::Unnamed | Assumed::NotDegrees => None,
+            Assumed::Unread | Assumed::InDegrees | Assumed::InAsked | Assumed::DegreesUnnamed => Some(crate::loss::LossCode::AssumedCrs),
+        }
+    }
+
     /// Its notice, `{n}` the number of answers.
     pub fn template(self) -> &'static str {
         match self {
@@ -6363,7 +6470,8 @@ mod tests {
             report
                 .messages
                 .iter()
-                .any(|m| m == "coordinate system 999999 can't be used; coordinates are read in EPSG:2056, the system asked for"),
+                .any(|m| m.as_str() == "coordinate system 999999 can't be used; coordinates are read in EPSG:2056, the system asked for"
+                    && m.loss == Some(crate::loss::LossCode::AssumedCrs)),
             "{:?}",
             report.messages
         );
@@ -7032,7 +7140,7 @@ mod tests {
         let Step::Decoded(ds, report, Some(note)) = step else { panic!("{step:?}") };
         assert_eq!(ids(&ds), [0.0, 1.0, 2.0]);
         assert!(note.contains("first 3 features"), "{note}");
-        assert_eq!(report.messages, [crate::zm_note(Some(3))]);
+        assert_eq!(report.messages, [crate::loss::Note::loss(crate::loss::LossCode::DroppedZm, crate::zm_note(Some(3)))]);
 
         let fresh = || Pages {
             url: query.into(),
@@ -7127,7 +7235,7 @@ mod tests {
             pages = match pages.join_page(page) {
                 Step::Fetch(p) => *p,
                 Step::Decoded(_, report, None) => {
-                    assert_eq!(report.messages, ["5 polygon rings have no area and are left out"]);
+                    assert_eq!(report.messages.texts().collect::<Vec<_>>(), ["5 polygon rings have no area and are left out"]);
                     break;
                 }
                 other => panic!("{other:?}"),
@@ -7868,6 +7976,9 @@ mod tests {
         // A picture RustGIS doesn't show, or not on the web: the parent's, or none.
         assert_eq!(urls(&s, "only svg"), Vec::<String>::new());
         assert_eq!(urls(&s, "not on the web"), Vec::<String>::new());
+        // Those two lose their legend; a GIF passed over for a PNG loses none.
+        let lost = |s: &Service, name: &str| s.layers.iter().find(|l| l.name == name).unwrap().legends_left_out;
+        assert_eq!(["inherits", "own", "named default", "only svg", "not on the web"].map(|n| lost(&s, n)), [0, 0, 0, 1, 1]);
         assert!(s.layers.iter().flat_map(|l| &l.legends).all(|l| l.min_scale.is_none() && l.max_scale.is_none()));
         // With it (swisstopo's, in its SLD namespace): the service's legend first, the style's after.
         let glg = r#"<sld:GetLegendGraphic><Format>image/gif</Format><Format>image/png</Format><DCPType><HTTP><Get><OnlineResource xlink:href="https://maps.example.org/de/?"/></Get></HTTP></DCPType></sld:GetLegendGraphic>"#;
@@ -7885,6 +7996,8 @@ mod tests {
                 "https://maps.example.org/de/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetLegendGraphic&LAYER=only%20svg&FORMAT=image%2Fpng&SLD_VERSION=1.1.0"
             ]
         );
+        // The service draws its legend: none is lost.
+        assert!(s.layers.iter().all(|l| l.legends_left_out == 0));
         // WMS 1.1.1 (SLD 1.0): no SLD version; its own address, else GetMap's.
         let glg = r#"<GetLegendGraphic><Format>image/jpeg</Format></GetLegendGraphic>"#;
         let s = parse("https://maps.example.org/wms", caps("1.1.1", glg).as_bytes()).unwrap();
@@ -7923,6 +8036,15 @@ mod tests {
                 Legend { url: "https://t.example.org/1.0.0/far.jpg".into(), min_scale: Some(50_000.0), max_scale: None },
             ]
         );
+        // The SVG one can't be shown: lost.
+        assert_eq!(s.layers[0].legends_left_out, 1);
+        // Past the most it keeps, a picture it could show is lost too, and counted.
+        let many: String =
+            (0..=MAX_LEGENDS).map(|i| format!(r#"<LegendURL format="image/png" xlink:href="https://t.example.org/{i}.png"/>"#)).collect();
+        let crowded = xml
+            .replace(r#"<LegendURL format="image/png" xlink:href="https://t.example.org/near.png" maxScaleDenominator="50000"/>"#, &many);
+        let c = parse("https://t.example.org/1.0.0/WMTSCapabilities.xml", crowded.as_bytes()).unwrap();
+        assert_eq!((c.layers[0].legends.len(), c.layers[0].legends_left_out), (MAX_LEGENDS, 3));
         // The one for the map's scale: up to below the maximum, from the minimum.
         let at = |scale: f64| legends_at(legends, scale).map(|l| l.url.as_str()).collect::<Vec<_>>();
         assert_eq!(at(10_000.0), ["https://t.example.org/near.png"]);
@@ -9076,11 +9198,12 @@ mod tests {
             "https://cat.example.org/csw?SERVICE=CSW&REQUEST=GetCapabilities",
             "O'Brien\u{7}",
             Some([7.0, 46.0, 8.0, 47.0]),
+            true,
             21,
         );
         assert!(u.starts_with("https://cat.example.org/csw?SERVICE=CSW&VERSION=2.0.2&REQUEST=GetRecords&"), "{u}");
-        assert!(u.contains("&startPosition=21&") && u.contains("O%27%27Brien") && u.contains("BBOX%28ows:BoundingBox,7,46,8,47%29"), "{u}");
-        assert!(!records_url("https://cat.example.org/csw", " ", None, 0).contains("constraint="));
+        assert!(u.contains("&startPosition=21&") && u.contains("O%27Brien%25"), "{u}");
+        assert!(!records_url("https://cat.example.org/csw", " ", None, true, 0).contains("constraint"));
 
         let xml = r#"<csw:GetRecordsResponse xmlns:csw="http://www.opengis.net/cat/csw/2.0.2" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dct="http://purl.org/dc/terms/" xmlns:ows="http://www.opengis.net/ows">
             <csw:SearchResults numberOfRecordsMatched="45" numberOfRecordsReturned="2" nextRecord="3">
@@ -9124,6 +9247,67 @@ mod tests {
         assert!(parse_records("https://c.org/csw", deep.as_bytes()).unwrap_err().contains("deep"));
         let many = format!("<GetRecordsResponse>{}</GetRecordsResponse>", "<Record><title>t</title></Record>".repeat(1000));
         assert_eq!(parse_records("https://c.org/csw", many.as_bytes()).unwrap().records.len(), RECORDS_PAGE as usize * 5);
+    }
+
+    /// A search is a filter in XML which parses, with what was typed found as written (#2889): its
+    /// markup, and the wildcards and escape of the search, stand for themselves.
+    #[test]
+    fn a_catalogue_is_searched_by_a_filter_in_xml() {
+        // The constraint of a request, read back.
+        let filter = |words: &str, bbox: Option<[f64; 4]>, named: bool| {
+            let u = records_url("https://cat.example.org/csw?map=a", words, bbox, named, 1);
+            assert!(u.starts_with("https://cat.example.org/csw?map=a&SERVICE=CSW&"), "{u}");
+            let (head, constraint) = u.split_once("&constraint=").unwrap();
+            assert!(head.ends_with("&constraintLanguage=FILTER&constraint_language_version=1.1.0"), "{u}");
+            let mut bytes = Vec::new();
+            let mut rest = constraint.bytes();
+            while let Some(b) = rest.next() {
+                bytes.push(match b {
+                    b'%' => u8::from_str_radix(std::str::from_utf8(&[rest.next().unwrap(), rest.next().unwrap()]).unwrap(), 16).unwrap(),
+                    b => b,
+                });
+            }
+            String::from_utf8(bytes).unwrap()
+        };
+        let literal = |words: &str| {
+            let f = filter(words, None, true);
+            let doc = xml(&f, 1000).unwrap();
+            let name = doc.descendants().find(|n| local(n) == "PropertyName").unwrap();
+            assert_eq!((local(&name.parent().unwrap()), text_of(&name).as_str()), ("PropertyIsLike", "csw:AnyText"));
+            doc.descendants().find(|n| local(n) == "Literal").and_then(|n| n.text().map(String::from)).unwrap()
+        };
+        assert_eq!(literal(" solos "), "%solos%");
+        assert_eq!(literal("uso & <cobertura> ]]> \"d'água\""), "%uso & <cobertura> ]]> \"d'água\"%");
+        assert_eq!(literal(r"100%_a\b"), r"%100\%\_a\\b%");
+        assert_eq!(literal("a\u{7}b\u{FFFF}c"), "%abc%");
+        assert_eq!(literal(&"é".repeat(250)), format!("%{}%", "é".repeat(200)));
+        assert_eq!(search_words(" a\tb "), ("ab".to_string(), 1, 0));
+        assert_eq!(search_words(&"é".repeat(250)), ("é".repeat(200), 0, 50));
+        assert_eq!(search_words("solos"), ("solos".to_string(), 0, 0));
+
+        let area = Some([-43.5, -21.0, -42.0, -20.25]);
+        for named in [true, false] {
+            let f = filter("", area, named);
+            let doc = xml(&f, 1000).unwrap();
+            assert_eq!(local(&doc.root_element().first_child().unwrap()), "BBOX", "{f}");
+            let envelope = doc.descendants().find(|n| local(n) == "Envelope").unwrap();
+            assert_eq!(envelope.attribute("srsName"), named.then_some("urn:ogc:def:crs:OGC:1.3:CRS84"));
+            assert_eq!(child_text(&envelope, "lowerCorner").as_deref(), Some("-43.5 -21"));
+            assert_eq!(child_text(&envelope, "upperCorner").as_deref(), Some("-42 -20.25"));
+        }
+        // Both together.
+        let f = filter("solos", area, true);
+        let doc = xml(&f, 1000).unwrap();
+        let and = doc.root_element().first_child().unwrap();
+        assert_eq!(local(&and), "And", "{f}");
+        assert_eq!(and.children().map(|n| local(&n).to_string()).collect::<Vec<_>>(), ["PropertyIsLike", "BBOX"]);
+
+        // A refusal, told from records, a page that isn't a catalogue's and one that isn't XML.
+        assert!(records_refused(b"<ows:ExceptionReport xmlns:ows='o'>bad filter</ows:ExceptionReport>"));
+        assert!(records_refused(b"<?xml version='1.0'?>\n<ServiceExceptionReport/>"));
+        for other in [&b"<GetRecordsResponse/>"[..], b"<html/>", b"", b"\xff", b"<ExceptionReport>"] {
+            assert!(!records_refused(other), "{other:?}");
+        }
     }
 
     /// Every kind of document is read up to the limit, and what's past it is counted in a note.

@@ -18,6 +18,8 @@ struct CmdUniforms {
     /// Extrusions: the light's direction (map units) and how far a shadow falls per map unit
     /// of height.
     light: vec4f,
+    /// A tiled layer mesh's square, from its origin: least x and y, greatest x and y.
+    square: vec4f,
 };
 
 struct VOut {
@@ -62,6 +64,15 @@ fn vs_mesh(in: MeshIn) -> VOut {
     out.color = in.color;
     out.depth = vec2f(out.clip.w, dot(u_mesh.scene_depth, world));
     return out;
+}
+
+// A tiled layer mesh's square: marks the stencil (fs_tile_square draws nothing), so the tile's
+// mesh draws only inside it.
+@vertex
+fn vs_mesh_square(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
+    let s = u_mesh.square;
+    var corners = array<vec2f, 6>(vec2f(s.x, s.y), vec2f(s.z, s.y), vec2f(s.z, s.w), vec2f(s.x, s.y), vec2f(s.z, s.w), vec2f(s.x, s.w));
+    return u_mesh.view_proj * vec4f(corners[vi], 0.0, 1.0);
 }
 
 @fragment

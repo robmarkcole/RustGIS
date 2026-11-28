@@ -36,6 +36,7 @@ fn sample() -> Session {
     s
 }
 
+/// Deterministic provider defaults with a synthetic key and private routing enabled.
 fn cfg(provider: &str) -> Config {
     let p = preset(provider).unwrap_or(&PRESETS[0]);
     Config {
@@ -47,6 +48,7 @@ fn cfg(provider: &str) -> Config {
         client_id: String::new(),
         session: String::new(),
         reasoning: None,
+        openrouter_private: true,
         tool_output_token_limit: crate::tools::DEFAULT_OUTPUT_TOKENS,
     }
 }
@@ -115,6 +117,9 @@ fn first_keyed_provider_is_the_first_key_provider_and_never_a_sign_in() {
     // Opper comes after Requesty, so its key never takes the place of another provider's either.
     assert_eq!(first_keyed(keyed(&["opper", "requesty"])), Some("requesty"));
     assert_eq!(first_keyed(keyed(&["opper"])), Some("opper"));
+    // Mistral follows the existing keyed presets.
+    assert_eq!(first_keyed(keyed(&["mistral", "opper"])), Some("opper"));
+    assert_eq!(first_keyed(keyed(&["mistral"])), Some("mistral"));
     assert_eq!(first_keyed(keyed(&[])), None);
 }
 
@@ -1093,6 +1098,30 @@ fn always_allow_is_per_command_and_never_for_reserved_actions() {
     for n in [1, 2] {
         let _ = std::fs::remove_file(dir.join(format!("rustgis-assistant-test-{n}.geojson")));
     }
+}
+
+/// A call that turns the AI Assistant off, approved, ends its reply: a call after it that needs
+/// no approval isn't run, and says why.
+#[test]
+fn calls_after_one_turning_the_assistant_off_are_not_run() {
+    let mut s = sample();
+    let mut a = Agent::new(cfg("openai"), &s);
+    let Step::Send(_) = a.ask("x", &s) else { panic!("expected a request") };
+    let before = s.map().center_lonlat();
+    let run = |command: &str, params: Value| json!({"command": command, "params": params}).to_string();
+    let reply = json!({"choices": [{"message": {"role": "assistant", "content": null, "tool_calls": [
+        {"id": "c0", "type": "function", "function": {"name": "run_command", "arguments": run("extension.disable", json!({"id": "assistant"}))}},
+        {"id": "c1", "type": "function", "function": {"name": "run_command", "arguments": run("map.goToXY", json!({"lon": 2.35, "lat": 48.85, "scale": 5000000}))}}
+    ]}, "finish_reason": "tool_calls"}]});
+    assert_eq!(a.receive(a.generation(), ok(reply), &mut s), Step::Confirm);
+    assert!(a.pending(&s).is_some_and(|p| p.0.starts_with("extension.disable")));
+    // Nothing left to ask about or run: the results go back.
+    assert!(matches!(a.decide(true, false, &mut s), Step::Send(_)));
+    assert!(!s.extensions().is_on("assistant"));
+    let after = s.map().center_lonlat();
+    assert!((after.x - before.x).abs() < 1e-9 && (after.y - before.y).abs() < 1e-9, "the map moved to {after:?}");
+    let not_run = |e: &Entry| matches!(e, Entry::Tool { result, error: true, .. } if result.contains("turned the AI Assistant off"));
+    assert_eq!(a.transcript.iter().filter(|e| not_run(e)).count(), 1, "{:?}", a.transcript);
 }
 
 #[test]
@@ -3895,6 +3924,26 @@ fn the_assistant_hands_tasks_to_agent_threads_in_the_background() {
     assert_eq!(a.threads()[0].id, "claude-code-2", "thread ids aren't reused");
     a.clear();
     assert!(a.threads().is_empty() && a.take_delegations().is_empty());
+    // Suspended (the app turned the assistant off): a report waiting stays in the transcript and
+    // is never sent.
+    assert!(matches!(a.ask("once more", &s), Step::Send(_)));
+    let call = calls("delegate", json!({"task": "w", "agent": "claude-code"}));
+    assert!(matches!(a.receive(a.generation(), ok(call), &mut s), Step::Send(_)));
+    let thread = a.threads()[0].id.clone();
+    // A long report from a thread that failed: the transcript says it failed, and its cut counts
+    // what the thread wrote.
+    let long = "x".repeat(tools::MAX_RESULT + 100);
+    a.thread_report(&thread, long, true);
+    a.suspend();
+    assert!(!a.busy() && a.threads().is_empty() && a.take_delegations().is_empty());
+    assert!(a.deliver(&s).is_none(), "not sent to the model");
+    let said = format!("{thread} (Claude Code) failed: ");
+    let cut = format!("(cut: {} characters in all)", tools::MAX_RESULT + 100);
+    assert!(
+        a.transcript.iter().any(|e| matches!(e, Entry::Note(n) if n.to_string().starts_with(&said) && n.to_string().ends_with(&cut))),
+        "{:?}",
+        a.transcript.last()
+    );
     // The command line offers no agents: such a delegation is refused.
     let mut c = Agent::new(cfg("openai"), &s);
     let mut replies = VecDeque::from(vec![ok(calls("delegate", json!({"task": "z", "agent": "codex"}))), ok(say("Couldn't."))]);
@@ -5383,4 +5432,148 @@ fn a_message_joining_one_left_unanswered_takes_no_more_than_four_pictures() {
     assert!(text.contains("a1.jpg") && text.contains("no longer attached"), "{text}");
     let said = "A message takes at most 4 pictures: a1.jpg, a2.jpg, a3.jpg, a4.jpg left out.";
     assert!(a.transcript.iter().any(|e| matches!(e, Entry::Note(n) if n.to_string() == said)));
+}
+
+#[test]
+fn openrouter_private_routing_filters_only_openrouter_and_can_be_disabled() {
+    let mut c = cfg("openrouter");
+    let body = |c: &Config| -> Value { serde_json::from_str(&chat_request(c, "system", &[], &[]).body.unwrap()).unwrap() };
+    assert_eq!(body(&c)["provider"], json!({"data_collection":"deny"}));
+    c.openrouter_private = false;
+    assert!(body(&c).get("provider").is_none());
+    for p in PRESETS.iter().filter(|p| p.api == Api::OpenAi && p.id != "openrouter") {
+        assert!(body(&cfg(p.id)).get("provider").is_none(), "{}", p.id);
+    }
+}
+
+#[test]
+fn openrouter_data_policy_refusal_names_the_privacy_checkbox() {
+    let mut session = sample();
+    let mut a = Agent::new(cfg("openrouter"), &session);
+    assert!(matches!(a.ask("hello", &session), Step::Send(_)));
+    let response = HttpResponse {
+        status: 404,
+        headers: vec![],
+        body: br#"{"error":{"message":"No endpoints found matching your data policy"}}"#.to_vec(),
+    };
+    let generation = a.generation();
+    assert!(matches!(a.receive(generation, Ok(response), &mut session), Step::Done));
+    assert!(a.transcript.iter().any(|e| matches!(e, Entry::Note(n) if n.template.contains("Check Private routing"))));
+}
+
+#[test]
+fn mistral_rewrites_native_and_cross_provider_tool_call_ids_without_collisions() {
+    let turns = vec![
+        Turn::User("hello".into(), vec![]),
+        Turn::Assistant {
+            text: String::new(),
+            calls: vec![],
+            native: Some((
+                Api::OpenAi,
+                json!({
+                    "role":"assistant", "content":null, "tool_calls":[
+                        {"id":"call_from_another_provider", "type":"function", "function":{"name":"map_zoom", "arguments":"{}"}},
+                        {"id":"000000000", "type":"function", "function":{"name":"map_zoom", "arguments":"{}"}}
+                    ]
+                }),
+            )),
+        },
+        Turn::Results(vec![
+            ToolResult {
+                id: "call_from_another_provider".into(),
+                name: "map_zoom".into(),
+                content: "done".into(),
+                error: false,
+                images: vec![],
+            },
+            ToolResult { id: "000000000".into(), name: "map_zoom".into(), content: "done".into(), error: false, images: vec![] },
+        ]),
+    ];
+    let request = chat_request(&cfg("mistral"), "system", &turns, &[]);
+    let body: Value = serde_json::from_str(&request.body.unwrap()).unwrap();
+    assert_eq!(request.url, "https://api.mistral.ai/v1/chat/completions");
+    assert_eq!(body["messages"][2]["tool_calls"][0]["id"], "000000000");
+    assert_eq!(body["messages"][2]["tool_calls"][1]["id"], "000000001");
+    assert_eq!(body["messages"][3]["tool_call_id"], "000000000");
+    assert_eq!(body["messages"][4]["tool_call_id"], "000000001");
+    let original: Value = serde_json::from_str(&chat_request(&cfg("openai"), "system", &turns, &[]).body.unwrap()).unwrap();
+    assert_eq!(original["messages"][2]["tool_calls"][0]["id"], "call_from_another_provider");
+}
+
+#[test]
+fn mistral_lists_models_with_a_bearer_key() {
+    let req = models_request(&cfg("mistral"));
+    assert_eq!(req.url, "https://api.mistral.ai/v1/models");
+    assert!(req.headers.contains(&("Authorization".into(), "Bearer k".into())));
+}
+
+#[test]
+fn mistral_typed_stream_preserves_visible_text_thinking_and_signatures_for_replay() {
+    let thinking = json!({"type":"thinking", "thinking":[{"type":"text","text":"private thought"}], "signature":"signed"});
+    let chunks = [
+        json!({"choices":[{"delta":{"content":"Before "}}]}),
+        json!({"choices":[{"delta":{"content":[thinking.clone(), {"type":"text","text":"Hello"}]}}]}),
+        json!({"choices":[{"delta":{"content":" world"},"finish_reason":"stop"}]}),
+    ];
+    let response = streamed(&chunks);
+    let reply = parse_reply(Api::OpenAi, &response).unwrap();
+    assert_eq!(reply.text, "Before Hello world");
+    assert!(reply.notes.is_empty());
+    assert_eq!(reply.native["content"][1], thinking);
+    let replay = Turn::Assistant { text: reply.text.clone(), calls: vec![], native: Some((Api::OpenAi, reply.native.clone())) };
+    let request = chat_request(&cfg("openai"), "system", std::slice::from_ref(&replay), &[]);
+    let body: Value = serde_json::from_str(&request.body.unwrap()).unwrap();
+    assert_eq!(body["messages"][1]["content"], "Before Hello world");
+    let request = chat_request(&cfg("mistral"), "system", &[replay], &[]);
+    let body: Value = serde_json::from_str(&request.body.unwrap()).unwrap();
+    assert_eq!(body["messages"][1]["content"][1], thinking);
+
+    let mut preview = StreamPreview::new(Api::OpenAi);
+    preview.feed(&response.body);
+    assert_eq!(preview.text(), "Before Hello world");
+    let whole = HttpResponse {
+        status: 200,
+        headers: vec![],
+        body: json!({"choices":[{"message":reply.native, "finish_reason":"stop"}]}).to_string().into_bytes(),
+    };
+    assert_eq!(parse_reply(Api::OpenAi, &whole).unwrap().text, "Before Hello world");
+}
+
+#[test]
+fn typed_reply_notices_count_unsupported_parts_and_keep_the_native_content() {
+    let content = json!([
+        {"type":"text", "text":"Answer"},
+        {"type":"thinking", "thinking":[], "signature":"signed"},
+        {"type":"reference", "reference_ids":[0]},
+        {"type":"reference", "reference_ids":[1]}
+    ]);
+    let streamed = streamed(&[
+        json!({"choices":[{"delta":{"content":""}}]}),
+        json!({"choices":[{"delta":{"content":content.clone()}}]}),
+        json!({"choices":[{"delta":{"content":""}, "finish_reason":"stop"}]}),
+    ]);
+    let mut preview = StreamPreview::new(Api::OpenAi);
+    preview.feed(&streamed.body);
+    assert_eq!(preview.text(), "Answer");
+    let whole = HttpResponse {
+        status: 200,
+        headers: vec![],
+        body: json!({"choices":[{"message":{"role":"assistant", "content":content}, "finish_reason":"stop"}]}).to_string().into_bytes(),
+    };
+    for response in [streamed, whole] {
+        let mut session = sample();
+        let mut agent = Agent::new(cfg("mistral"), &session);
+        assert!(matches!(agent.ask("hello", &session), Step::Send(_)));
+        assert_eq!(agent.receive(agent.generation(), Ok(response), &mut session), Step::Done);
+        let notes: Vec<_> =
+            agent.transcript.iter().filter_map(|entry| if let Entry::Note(note) = entry { Some(note) } else { None }).collect();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].template, "The reply contains {count} content parts of type {kind} that aren't displayed.");
+        assert_eq!(notes[0].args, [("count", "2".to_string()), ("kind", "reference".to_string())]);
+        assert!(agent.transcript.iter().any(|entry| matches!(entry, Entry::Assistant(text) if text == "Answer")));
+        let Some(Turn::Assistant { native: Some((Api::OpenAi, native)), .. }) = agent.turns().last() else {
+            panic!("missing native reply")
+        };
+        assert_eq!(native["content"], content);
+    }
 }

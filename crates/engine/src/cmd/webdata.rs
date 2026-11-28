@@ -57,7 +57,7 @@ const fn nm(id: &'static str, category: &'static str, title: &'static str, url: 
 }
 
 /// The National Map's map services, by category (GeoLibre's catalog of them, less the Special
-/// Edition 250K Maps index, which the server no longer has).
+/// Edition 250K Maps index and the USGS Imagery Topo basemap, which the servers no longer have).
 const NATIONAL_MAP: &[NmService] = &[
     NmService {
         max_zoom: 16,
@@ -76,16 +76,6 @@ const NATIONAL_MAP: &[NmService] = &[
             "Basemaps",
             "USGS Imagery Only",
             "https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer",
-            Mode::Tile,
-        )
-    },
-    NmService {
-        max_zoom: 16,
-        ..nm(
-            "basemap/USGSImageryTopo",
-            "Basemaps",
-            "USGS Imagery Topo",
-            "https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryTopo/MapServer",
             Mode::Tile,
         )
     },
@@ -329,7 +319,7 @@ fn national_map_template(s: &NmService) -> String {
 }
 
 /// A query value with everything but letters, digits and `-_.~` percent-encoded.
-fn percent_encode(s: &str) -> String {
+pub(crate) fn percent_encode(s: &str) -> String {
     s.bytes()
         .map(|b| {
             if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
@@ -463,7 +453,7 @@ mod tests {
 
     #[test]
     fn national_map_catalog() {
-        assert_eq!(NATIONAL_MAP.len(), 31);
+        assert_eq!(NATIONAL_MAP.len(), 30);
         for s in NATIONAL_MAP {
             assert!(NATIONAL_MAP_CATEGORIES.contains(&s.category), "{}", s.id);
             assert!(s.url.starts_with("https://") && s.url.ends_with("Server"), "{}", s.id);

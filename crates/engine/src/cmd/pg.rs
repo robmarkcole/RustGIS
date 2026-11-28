@@ -169,10 +169,14 @@ fn save_edits(s: &mut Session, p: &Value) -> CmdResult {
             false,
         );
         if !saved.skipped_fields.is_empty() {
-            s.notify(format!("{name}: {table} has no column for {}, so it wasn't saved", saved.skipped_fields.join(", ")), false);
+            // Their values aren't in the table: lost from the save, as a GeoPackage save says.
+            s.say(rustgis_data::loss::Note::loss(
+                rustgis_data::loss::LossCode::DroppedValue,
+                format!("{name}: {table} has no column for {}, so it wasn't saved", saved.skipped_fields.join(", ")),
+            ));
         }
         for note in postgis::saved_dates_notes(&fields, &saved, &super::saved_target(&name, &table)) {
-            s.notify(note, false);
+            s.say(note);
         }
         s.retain_written_notices(written);
         Ok(json!({
@@ -229,7 +233,7 @@ fn discard_edits(s: &mut Session, p: &Value) -> CmdResult {
         }
         s.notify(format!("{name}: edits discarded; {n} rows loaded again from {}", edit.origin.table), false);
         if let Some(note) = unread {
-            s.notify(format!("{name}: {note}"), false);
+            s.say(note.prefixed(&name));
         }
         Ok(json!({"features": n, "matched": editable.matched}))
     }
@@ -412,7 +416,7 @@ fn add_layer(s: &mut Session, p: &Value) -> CmdResult {
                 );
             }
             if let Some(note) = rustgis_data::source::unread_dates_note(&info.fields, &editable.unread_dates) {
-                s.notify(format!("{layer_name}: {note}"), false);
+                s.say(note.prefixed(&layer_name));
             }
             if !editable.writable {
                 s.notify(format!("{layer_name}: this user can't insert, update or delete its rows, so edits can't be saved to it"), false);

@@ -232,8 +232,13 @@ fn new(s: &mut Session, p: &Value) -> CmdResult {
     for said in s.connections.redaction_notices_since(redactions) {
         s.warn(said);
     }
-    resolve_keys(s, &address_keys(&c.address));
-    resolve_origins(s, &[&c]);
+    // A copy running a command of its session's (#2476) only records the connection: resolving
+    // logins would set the process's database passwords from its own, empty, logins. Its session
+    // makes the connection again when the command lands, and resolves them then.
+    if !s.web_logins.is_borrowing() {
+        resolve_keys(s, &address_keys(&c.address));
+        resolve_origins(s, &[&c]);
+    }
     Ok(shown_stripped(s, &c, stripped, ps(p, "address").unwrap_or(""), key_hint.as_deref()))
 }
 
@@ -1266,7 +1271,8 @@ fn test(s: &mut Session, p: &Value) -> CmdResult {
     let c = tested(s, p)?;
     // An unsaved web service reads anonymously, whatever saved connection shares its origin.
     let anonymous = web::is_service(&c) && c.id.is_empty();
-    web::anonymously(s, anonymous, |s| test_connection(s, p, c)).unwrap_or_else(|_| Err("connection.test failed unexpectedly".into()))
+    web::anonymously(s, anonymous, |s| test_connection(s, p, c))
+        .unwrap_or_else(|payload| Err(crate::bug("Test Connection", payload.as_ref())))
 }
 
 fn test_connection(s: &mut Session, p: &Value, c: Connection) -> CmdResult {

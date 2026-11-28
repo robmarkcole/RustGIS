@@ -158,6 +158,71 @@ fn a_held_layer_has_the_same_extent_and_zoom() {
     assert!((a.x - b.x).abs() < 5.0 && (a.y - b.y).abs() < 5.0, "{a:?} vs {b:?}");
 }
 
+/// On a map in a layer's own system, Zoom To Layer, Zoom To Selection and Full Extent frame its
+/// features as they are held, in map coordinates, with nothing converted: the view is centred on
+/// the middle of their own box exactly (through longitude/latitude it is the centre of the drawn
+/// box of their longitude/latitude box, metres away on UTM's turned grid).
+#[test]
+fn zooming_on_a_map_in_the_layers_system_frames_its_own_box() {
+    let mut s = session(UTM);
+    s.view_size = (800.0, 600.0);
+    s.run("map.projection", &json!({"type": "EPSG:32632"})).unwrap();
+    let own = |s: &Session, rows: &[usize]| {
+        let ds = &s.map().layer_by_name("Parcels").unwrap().dataset;
+        rows.iter().filter_map(|r| ds.features[*r].geometry.as_ref()).fold(rustgis_geom::Extent::EMPTY, |e, g| e.union(&g.extent()))
+    };
+    let centred = |s: &Session, e: &rustgis_geom::Extent, what: &str| {
+        let c = s.map().camera.center;
+        assert!((c.x - e.center().x).abs() < 1e-6 && (c.y - e.center().y).abs() < 1e-6, "{what}: {c:?} vs {:?}", e.center());
+    };
+    s.run("layer.zoomTo", &json!({"layer": "Parcels"})).unwrap();
+    centred(&s, &own(&s, &(0..9).collect::<Vec<_>>()), "layer");
+    // The road runs at a slant: the drawn box of its longitude/latitude box is turned against
+    // UTM's grid and larger than its own, so the way through longitude/latitude centres elsewhere.
+    s.run("layer.zoomTo", &json!({"layer": "Roads"})).unwrap();
+    let road = s.map().layer_by_name("Roads").unwrap();
+    let road_own = road.dataset.extent();
+    centred(&s, &road_own, "road");
+    let via = s.map().flat().extent(&road.extent()).center();
+    assert!((via.x - road_own.center().x).hypot(via.y - road_own.center().y) > 1.0, "{via:?} vs {:?}", road_own.center());
+    s.run("select.rows", &json!({"layer": "Parcels", "rows": [0, 4]})).unwrap();
+    s.run("select.zoomTo", &json!({})).unwrap();
+    centred(&s, &own(&s, &[0, 4]), "selection");
+    // Full Extent: Wells, Roads and Parcels together, all held in UTM.
+    s.run("map.zoomFull", &json!({})).unwrap();
+    let full = ["Wells", "Roads", "Parcels"]
+        .iter()
+        .fold(rustgis_geom::Extent::EMPTY, |e, name| e.union(&s.map().layer_by_name(name).unwrap().dataset.extent()));
+    centred(&s, &full, "full extent");
+}
+
+/// A layer in the map's system with nothing to frame doesn't make another layer, which the map
+/// can't show, look empty: zooming to both says the map can't show it, as zooming to that layer
+/// alone does.
+#[test]
+fn zooming_to_an_empty_layer_in_the_maps_system_and_one_beyond_the_map_says_so() {
+    let mut s = Session::new(Project::default());
+    s.view_size = (800.0, 600.0);
+    let mut empty = Dataset::new("Empty", GeometryType::Point, vec![]);
+    empty.held_in = UTM;
+    s.map_mut().add_dataset(empty);
+    let mut far = Dataset::new("Far", GeometryType::Point, vec![]);
+    far.push(Some(Geometry::Point(Coord::new(50.0, 48.8))), vec![]);
+    s.map_mut().add_dataset(far);
+    s.run("map.projection", &json!({"type": "EPSG:32632"})).unwrap();
+    let alone = s.run("layer.zoomTo", &json!({"layer": "Far"}));
+    let mark = s.notice_mark();
+    let both = s.run("layer.zoomTo", &json!({"layer": ["Empty", "Far"]}));
+    assert_eq!(both.is_ok(), alone.is_ok(), "{both:?} vs {alone:?}");
+    if let Err(e) = &both {
+        assert!(!e.contains("no features"), "{e}");
+    }
+    let said: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+    // 50°E is some 3,000 km east of UTM 32N's central meridian, beyond what the map shows.
+    assert!(s.map().flat().forward_checked(Coord::new(50.0, 48.8)).is_none());
+    assert!(said.iter().any(|t| t == crate::BEYOND_PROJECTION), "{said:?}");
+}
+
 /// Selecting by a box, a point, a radius and a polygon picks the same features.
 #[test]
 fn a_held_layer_is_selected_alike() {
@@ -256,8 +321,8 @@ fn a_held_layer_is_analysed_alike() {
     }
 }
 
-/// A geometry set, a move in metres and an undo leave the same places, and a held layer keeps
-/// its system through them.
+/// A geometry set and an undo leave the same places, a move in metres steps along the held
+/// layer's grid, and a held layer keeps its system through them.
 #[test]
 fn a_held_layer_is_edited_alike() {
     let mut ss = both();
@@ -265,19 +330,15 @@ fn a_held_layer_is_edited_alike() {
     run_both(&mut ss, "edit.setGeometry", &json!({"layer": "Wells", "row": 0, "geometry": g}));
     assert_close(&lonlat(&ss[0], "Wells"), &lonlat(&ss[1], "Wells"), "setGeometry");
     run_both(&mut ss, "select.rows", &json!({"layer": "Parcels", "rows": [4]}));
+    let was = stored(&ss[1], "Parcels");
     run_both(&mut ss, "edit.move", &json!({"dx": 250.0, "dy": -100.0}));
-    let [a, b] = [lonlat(&ss[0], "Parcels"), lonlat(&ss[1], "Parcels")];
-    // A move in metres on the map: the two agree to well within a centimetre.
-    assert_eq!(a.len(), b.len(), "move: feature count");
-    for (p, q) in a.iter().zip(&b) {
-        assert_eq!(shape(p), shape(q), "move: shape");
-        let (mut ca, mut cb) = (Vec::new(), Vec::new());
-        p.as_ref().unwrap().for_each_coord(|c| ca.push(c));
-        q.as_ref().unwrap().for_each_coord(|c| cb.push(c));
-        for (p, q) in ca.iter().zip(&cb) {
-            assert!((p.x - q.x).abs() < 1e-7 && (p.y - q.y).abs() < 1e-7, "move: {p:?} vs {q:?}");
-        }
+    // A move in metres goes along the held layer's own grid (#2032 C2f-6): every stored
+    // coordinate of the moved parcel steps by exactly that, the rest stay as stored.
+    for (i, (p, q)) in stored(&ss[1], "Parcels").iter().zip(&was).enumerate() {
+        let want = if i == 4 { q.as_ref().unwrap().map_coords(&|c| Coord::new(c.x + 250.0, c.y - 100.0)) } else { q.clone().unwrap() };
+        assert_eq!(p.as_ref(), Some(&want), "move: parcel {i}");
     }
+    assert_eq!(shape(&lonlat(&ss[0], "Parcels")[4]), shape(&lonlat(&ss[1], "Parcels")[4]), "move: shape");
     run_both(&mut ss, "edit.undo", &Value::Null);
     assert_close(&lonlat(&ss[0], "Parcels"), &lonlat(&ss[1], "Parcels"), "undo");
     assert_eq!(ss[1].map().layer_by_name("Parcels").unwrap().dataset.coord_crs(), UTM);
@@ -844,6 +905,36 @@ fn a_held_offline_map_keeps_the_sources_later_edits() {
     assert_eq!(wells.coord_crs(), UTM);
 }
 
+/// A source feature with a place that can't be given in longitude/latitude, outside the offline
+/// area, doesn't stop the area's sync and stays as stored; one the area holds refuses the sync,
+/// naming it (#2032 C2f-4b-1c).
+#[test]
+fn a_sync_leaves_a_source_feature_it_cant_place_as_stored() {
+    let mut s = session(UTM);
+    s.run("offline.download", &json!({"name": "Field", "extent": [11.4, 48.6, 11.6, 48.8]})).unwrap();
+    s.run("offline.open", &json!({"name": "Field"})).unwrap();
+    s.run("edit.setValue", &json!({"layer": "Wells", "row": 1, "field": "n", "value": 99})).unwrap();
+    s.run("map.activate", &json!({"name": "Map"})).unwrap();
+    let far = Geometry::Point(Coord::new(1e12, 1e12));
+    let wells = &mut s.map_mut().layers.iter_mut().find(|l| l.name == "Wells").unwrap().dataset;
+    wells.push(Some(far.clone()), vec![]);
+    let far_row = wells.features.len() - 1;
+    let returned = s.project.maps.iter().find(|m| m.name == "Field (offline)").unwrap().clone();
+    let ai = s.project.offline_areas.iter().position(|a| a.name == "Field").unwrap();
+    crate::cmd::workspace::sync_area(&mut s, ai, &returned, "").unwrap();
+    let wells = &s.map().layer_by_name("Wells").unwrap().dataset;
+    assert_eq!(wells.value(1, wells.field_index("n").unwrap()), &Cell::Int(99));
+    assert_eq!(wells.features.row(far_row).and_then(|r| r.geometry().cloned()), Some(far.clone()), "kept as stored");
+    assert_eq!(wells.coord_crs(), UTM);
+    // A feature of the area moved in the source to such a place can't be compared: refused,
+    // naming it.
+    let id = wells.features.row(0).unwrap().id();
+    s.map_mut().layers.iter_mut().find(|l| l.name == "Wells").unwrap().dataset.features.set_geometry(0, Some(far));
+    let returned = s.project.maps.iter().find(|m| m.name == "Field (offline)").unwrap().clone();
+    let e = crate::cmd::workspace::sync_area(&mut s, ai, &returned, "").unwrap_err();
+    assert!(e.contains(&format!("feature {id} has a place in")) && e.contains("can't be compared"), "{e}");
+}
+
 /// A web scene leaves out, and says, a feature of a held layer with a place that can't be given
 /// in longitude/latitude, rather than failing the whole scene.
 #[test]
@@ -867,6 +958,13 @@ fn a_web_scene_leaves_out_what_it_cannot_place() {
     let said: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
     assert!(
         said.iter().any(|n| n.contains("1 feature(s) left out of the scene: a place can't be given in longitude/latitude")),
+        "{said:?}"
+    );
+    assert!(
+        s.notices_since(mark)
+            .iter()
+            .any(|n| n.text.contains("left out of the scene: a place can't")
+                && n.loss() == Some(rustgis_data::loss::LossCode::DroppedFeature)),
         "{said:?}"
     );
 }
@@ -1207,7 +1305,7 @@ fn edits_on_a_map_in_another_datums_system_land_on_what_it_draws() {
     assert_eq!(flat.direct_system(), Some(Crs::Epsg(25832)));
     let id = s.map().layer_by_name("Roads").unwrap().id;
     let stored = s.map().layer(id).unwrap().dataset.features[0].geometry.clone().unwrap();
-    let drawn = s.map_mut().layer_mut(id).unwrap().projected_in(&flat, "test")[0].clone().unwrap();
+    let drawn = s.map_mut().layer_mut(id).unwrap().projected_in(&flat, "test").get(0).cloned().unwrap();
     let (Geometry::Line(stored_parts), Geometry::Line(drawn_parts)) = (&stored, &drawn) else { panic!("a line") };
     let l = s.map().layer(id).unwrap();
     assert_eq!(l.dataset.shown_in, Some(Crs::Epsg(25832)), "the map told its layer its system");
@@ -1245,7 +1343,7 @@ fn a_moved_label_becomes_an_annotation_where_it_was_drawn() {
     let flat = s.map().flat();
     assert_eq!(flat.direct_system(), Some(Crs::Epsg(25832)));
     let id = s.map().layer_by_name("Wells").unwrap().id;
-    let drawn = s.map_mut().layer_mut(id).unwrap().projected_in(&flat, "test")[2].clone().unwrap();
+    let drawn = s.map_mut().layer_mut(id).unwrap().projected_in(&flat, "test").get(2).cloned().unwrap();
     let Geometry::Point(drawn) = drawn else { panic!("a point") };
     let l = s.map().layer(id).unwrap();
     let (moved, target) = (l.dataset.features[1].id, l.dataset.features[2].geometry.clone().unwrap());

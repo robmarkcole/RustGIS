@@ -18,17 +18,29 @@ import java.util.ArrayList;
  * is never called from here, so the library exports nothing but its entry point.
  *
  * An event is one string, its fields separated by tabs:
- *   picked    purpose  name  path    a chosen file, copied to the app's storage
+ *   picked    purpose  name  path  [document]
+ *                                    a chosen file, copied to the app's storage; a project file
+ *                                    RustGIS may write back to also gives its document's address
  *   ended     purpose               a request whose every file failed to be copied
  *   cancelled                        a picker closed without a choice
  *   saved     name                   an export written where the user chose
- *   project-saved        name        a project written where the user chose
+ *   project-document     document    the document a project save is about to report written,
+ *                                    which RustGIS may write back to later
+ *   project-saved        name        a project written where the user chose, or written back
+ *   write-back-failed    name  reason  [kept]
+ *                                    a project not written back: the document is as it was, or,
+ *                                    with kept, may be damaged and the project is kept there
  *   project-save-failed  reason      a project save that failed or was cancelled
  *   position  lon  lat  accuracy  time  elapsed   where the device is (accuracy in metres, or
  *                                        empty; time in milliseconds since 1970; elapsed in
  *                                        nanoseconds since boot, from getElapsedRealtimeNanos)
  *   stopped                          positioning ended without being asked to
+ *   low-memory                       Android is short of memory
  *   photo     name  path             a photo the camera took, in the app's photos folder
+ *   text      id  text               what a text field (enterText) holds now, its backslashes,
+ *                                    tabs and line breaks written \\, \t, \n and \r
+ *   text-closed  id  [reason]        a text field closed, or (with reason) couldn't be opened
+ *   copy-failed  reason              copied text that couldn't be put on Android's clipboard
  *   failed    text                   what went wrong, to show the user
  */
 public class MainActivity extends NativeActivity {
@@ -43,6 +55,11 @@ public class MainActivity extends NativeActivity {
      */
     private static final int MOST_EVENTS = 200_000;
     private static final int COPY_BUFFER = 1 << 16;
+    /**
+     * The least time between takeEvents' questions whether Android is low on memory: under the 5 s
+     * an idle window waits between its calls (src/android.rs), so each of those asks.
+     */
+    private static final long MEMORY_LOOK_MILLIS = 4_000;
     /** Shared by every activity/copy worker for this process, including activity recreation. */
     private static final String COPY_OWNER = java.util.UUID.randomUUID().toString();
 
@@ -68,6 +85,12 @@ public class MainActivity extends NativeActivity {
     /** Why TrackService couldn't run, until takeEvents says so. */
     private static final java.util.concurrent.atomic.AtomicReference<String> refusal =
             new java.util.concurrent.atomic.AtomicReference<>();
+    /** The callback Back comes to while the Rust side takes it (the main thread's alone). */
+    private Object backCallback;
+    /** Back came to backCallback and takeBack hasn't said so yet. */
+    private final java.util.concurrent.atomic.AtomicBoolean back = new java.util.concurrent.atomic.AtomicBoolean();
+    /** The window's surface while it has one (the main thread's alone): a frame is asked of it. */
+    private android.view.SurfaceHolder surface;
     /** The activity, while it is created: TrackService's refusal reaches it at once. */
     private static volatile MainActivity current;
     /** The listener positions arrive on, while they are asked for. */
@@ -77,7 +100,7 @@ public class MainActivity extends NativeActivity {
     /** The user is being asked for leave to use the location, and hasn't answered. */
     private boolean asking;
     /** The activity is in sight (between onStart and onStop). */
-    private boolean started;
+    private volatile boolean started;
     /** A picker for opening is shown and has not answered (written on the main thread). */
     private volatile boolean picking;
     /** The photo the camera app is writing, until it answers (the main thread's alone). */
@@ -85,11 +108,27 @@ public class MainActivity extends NativeActivity {
     private String saveName = "";
     private byte[] saveBytes;
     private boolean saveProject;
+    /** A project is being written back to its document (set on the main thread, cleared by its worker). */
+    private volatile boolean writing;
+    /** When takeEvents last asked whether Android is low on memory, and its answer (its thread's alone). */
+    private long memoryLooked;
+    private boolean memoryLow;
+    /** Whether the Rust side draws on a light ground (barsLight): the text field's colours follow it. */
+    private volatile boolean light = true;
+    /** The text field open over the app (enterText), while it is (the main thread's alone). */
+    private android.app.Dialog entry;
+    /**
+     * The latest "text" event of a text field and that field's id, until takeEvents or the field's
+     * closing hands it over (guarded by events): only the latest is kept, as each has all its text.
+     */
+    private String typedId;
+    private String typed;
 
     @Override
     protected void onCreate(android.os.Bundle saved) {
         super.onCreate(saved);
         current = this;
+        reportUnfinishedWriteBacks();
         // A photo being taken when Android ended the app (the camera app in front): its file.
         if (saved != null && saved.getString("photo") != null) {
             photo = new File(saved.getString("photo"));
@@ -112,6 +151,7 @@ public class MainActivity extends NativeActivity {
      * the Rust side says which whenever its theme changes.
      */
     public void barsLight(final boolean light) {
+        this.light = light;
         runOnUiThread(() -> {
             if (android.os.Build.VERSION.SDK_INT >= 30) {
                 android.view.WindowInsetsController bars = getWindow().getInsetsController();
@@ -127,6 +167,54 @@ public class MainActivity extends NativeActivity {
                 view.setSystemUiVisibility(light ? flags | both : flags & ~both);
             }
         });
+    }
+
+    /**
+     * Takes Back from the system while the Rust side has a sheet it lowers (on), or gives it
+     * back, so Back does what the system does with it. Needed from Android 16, which sends an
+     * app targeting it no Back key; older ones send the key, and the Rust side reads that.
+     */
+    public void takesBack(final boolean on) {
+        if (android.os.Build.VERSION.SDK_INT < 36) {
+            return;
+        }
+        runOnUiThread(() -> {
+            if (on && backCallback == null) {
+                android.window.OnBackInvokedCallback callback = () -> {
+                    back.set(true);
+                    // The Rust side draws only when something happens: ask it for a frame.
+                    if (surface != null) {
+                        surfaceRedrawNeeded(surface);
+                    }
+                };
+                getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
+                        android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT, callback);
+                backCallback = callback;
+            } else if (!on && backCallback != null) {
+                getOnBackInvokedDispatcher()
+                        .unregisterOnBackInvokedCallback((android.window.OnBackInvokedCallback) backCallback);
+                backCallback = null;
+                // One not read yet lowered nothing: it isn't kept for the next sheet.
+                back.set(false);
+            }
+        });
+    }
+
+    /** Whether Back came since this was last asked. */
+    public boolean takeBack() {
+        return back.getAndSet(false);
+    }
+
+    @Override
+    public void surfaceCreated(android.view.SurfaceHolder holder) {
+        super.surfaceCreated(holder);
+        surface = holder;
+    }
+
+    @Override
+    public void surfaceDestroyed(android.view.SurfaceHolder holder) {
+        surface = null;
+        super.surfaceDestroyed(holder);
     }
 
     /**
@@ -376,6 +464,9 @@ public class MainActivity extends NativeActivity {
         if (current == this) {
             current = null;
         }
+        if (entry != null) {
+            entry.dismiss();
+        }
         stopLocating();
         stopService(new Intent(this, TrackService.class));
         super.onDestroy();
@@ -425,6 +516,214 @@ public class MainActivity extends NativeActivity {
         });
     }
 
+    /**
+     * Opens a text field of Android's for a field the Rust side draws, docked above the soft
+     * keyboard, in a window of its own: NativeActivity hands its window's touches and keys to the
+     * Rust side, so a field there would get none. It gives Android's typing: paste, suggestions,
+     * glide typing, dictation, and a password manager for a "secret". What it holds is sent as a
+     * "text" event each time it changes, and "text-closed" when it closes (Done, Back, or a tap
+     * beside it, which goes no further). One opened while another is open replaces it. The kind
+     * is "plain", "lines", "secret" or "number"; done is the label of its button.
+     */
+    public void enterText(final String id, final String value, final String label, final String kind, final String done) {
+        // Counted until it closes: the Rust side keeps looking for what is typed meanwhile.
+        synchronized (events) {
+            asked++;
+        }
+        runOnUiThread(() -> {
+            // Its own close is said by its listener.
+            if (entry != null) {
+                entry.dismiss();
+            }
+            try {
+                entry = textEntry(id, value, label, kind, done);
+                entry.show();
+            } catch (RuntimeException e) {
+                entry = null;
+                String why = e.getMessage();
+                add("text-closed\t" + id + "\t" + oneField(why == null || why.isEmpty() ? e.getClass().getSimpleName() : why));
+                answered();
+            }
+        });
+    }
+
+    /** The window of a text field (enterText), not yet shown. */
+    private android.app.Dialog textEntry(final String id, String value, String label, String kind, String done) {
+        final android.app.Dialog dialog = new android.app.Dialog(this, light
+                ? android.R.style.Theme_DeviceDefault_Light_Dialog_NoActionBar
+                : android.R.style.Theme_DeviceDefault_Dialog_NoActionBar);
+        android.content.Context themed = dialog.getContext();
+        final int pad = Math.round(12 * getResources().getDisplayMetrics().density);
+        android.widget.LinearLayout panel = new android.widget.LinearLayout(themed);
+        panel.setOrientation(android.widget.LinearLayout.VERTICAL);
+        panel.setPadding(pad, pad, pad, pad);
+        android.widget.TextView title = new android.widget.TextView(themed);
+        title.setText(label);
+        panel.addView(title);
+        android.widget.LinearLayout row = new android.widget.LinearLayout(themed);
+        row.setOrientation(android.widget.LinearLayout.HORIZONTAL);
+        row.setGravity(android.view.Gravity.CENTER_VERTICAL);
+        android.widget.EditText field = new android.widget.EditText(themed);
+        int text = android.text.InputType.TYPE_CLASS_TEXT;
+        switch (kind) {
+            case "secret":
+                field.setInputType(text | android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);
+                field.setAutofillHints(android.view.View.AUTOFILL_HINT_PASSWORD);
+                field.setImportantForAutofill(android.view.View.IMPORTANT_FOR_AUTOFILL_YES);
+                break;
+            case "number":
+                // The keyboard for numbers, without the filter that would come with it: it drops
+                // what isn't a digit, sign or point (the "e" of a pasted 1e3 would leave 13). The
+                // Rust side reads the number and refuses one it can't.
+                field.setInputType(text);
+                field.setRawInputType(android.text.InputType.TYPE_CLASS_NUMBER
+                        | android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL | android.text.InputType.TYPE_NUMBER_FLAG_SIGNED);
+                break;
+            case "lines":
+                field.setInputType(text | android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE
+                        | android.text.InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
+                field.setMaxLines(6);
+                break;
+            default:
+                field.setInputType(text | android.text.InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
+        }
+        // A form's field isn't a sign-in: the password manager is offered for a secret alone.
+        if (!kind.equals("secret")) {
+            field.setImportantForAutofill(android.view.View.IMPORTANT_FOR_AUTOFILL_NO);
+        }
+        field.setText(value);
+        field.setSelection(field.length());
+        // The keyboard keeps to its own strip in landscape too, with the form in sight above it.
+        field.setImeOptions(android.view.inputmethod.EditorInfo.IME_ACTION_DONE
+                | android.view.inputmethod.EditorInfo.IME_FLAG_NO_FULLSCREEN);
+        field.setOnEditorActionListener((view, action, key) -> {
+            if (action == android.view.inputmethod.EditorInfo.IME_ACTION_DONE) {
+                dialog.dismiss();
+                return true;
+            }
+            return false;
+        });
+        field.addTextChangedListener(new android.text.TextWatcher() {
+            @Override
+            public void beforeTextChanged(CharSequence was, int start, int count, int after) {}
+
+            @Override
+            public void onTextChanged(CharSequence now, int start, int before, int count) {}
+
+            @Override
+            public void afterTextChanged(android.text.Editable now) {
+                typed(id, now.toString());
+            }
+        });
+        row.addView(field, new android.widget.LinearLayout.LayoutParams(0, android.view.ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        android.widget.Button finish = new android.widget.Button(themed);
+        finish.setText(done);
+        finish.setOnClickListener(view -> dialog.dismiss());
+        row.addView(finish);
+        panel.addView(row);
+        dialog.setContentView(panel);
+        dialog.setCanceledOnTouchOutside(true);
+        dialog.setOnDismissListener(closed -> {
+            if (entry == dialog) {
+                entry = null;
+            }
+            synchronized (events) {
+                if (typed != null && id.equals(typedId)) {
+                    events.add(typed);
+                    typed = null;
+                }
+                events.add("text-closed\t" + id);
+                asked--;
+            }
+        });
+        android.view.Window window = dialog.getWindow();
+        if (window != null) {
+            window.setGravity(android.view.Gravity.BOTTOM);
+            window.setLayout(android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.WRAP_CONTENT);
+            // The form stays in sight behind it, the value it shows changing as it is typed.
+            window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_DIM_BEHIND);
+            window.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE
+                    | android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
+            android.content.res.TypedArray colours = themed.obtainStyledAttributes(new int[] {android.R.attr.colorBackground});
+            window.setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(
+                    colours.getColor(0, light ? android.graphics.Color.WHITE : android.graphics.Color.BLACK)));
+            colours.recycle();
+        }
+        // Drawn edge to edge (Android 15 and later), it keeps above the keyboard and the
+        // navigation bar itself.
+        if (android.os.Build.VERSION.SDK_INT >= 30) {
+            panel.setOnApplyWindowInsetsListener((view, insets) -> {
+                android.graphics.Insets room = insets.getInsets(android.view.WindowInsets.Type.navigationBars()
+                        | android.view.WindowInsets.Type.displayCutout() | android.view.WindowInsets.Type.ime());
+                view.setPadding(pad + room.left, pad, pad + room.right, pad + room.bottom);
+                return insets;
+            });
+        }
+        field.requestFocus();
+        return dialog;
+    }
+
+    /** Keeps what the text field {@code id} holds now as its "text" event, the one before it of another field handed over first. */
+    private void typed(String id, String text) {
+        StringBuilder line = new StringBuilder("text\t").append(id).append('\t');
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            switch (c) {
+                case '\\': line.append("\\\\"); break;
+                case '\t': line.append("\\t"); break;
+                case '\n': line.append("\\n"); break;
+                case '\r': line.append("\\r"); break;
+                default: line.append(c);
+            }
+        }
+        synchronized (events) {
+            if (typed != null && !id.equals(typedId)) {
+                events.add(typed);
+            }
+            typedId = id;
+            typed = line.toString();
+        }
+    }
+
+    /** Puts text copied in the Rust side's window on Android's clipboard, for other apps. */
+    public void copyText(final String text) {
+        // Counted until it is done: the Rust side keeps looking until a failure has reached it.
+        synchronized (events) {
+            asked++;
+        }
+        runOnUiThread(() -> {
+            try {
+                android.content.ClipboardManager clipboard = (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+                if (clipboard == null) {
+                    add("copy-failed\tthis device has no clipboard service");
+                } else {
+                    clipboard.setPrimaryClip(ClipData.newPlainText("RustGIS", text));
+                }
+            } catch (RuntimeException e) {
+                // Too large for Android to pass on, say: the Rust side's own clipboard still has it.
+                add("copy-failed\t" + oneField(e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage()));
+            } finally {
+                answered();
+            }
+        });
+    }
+
+    /**
+     * The Rust side's secret store (src/secrets.rs), kept by SecretVault: called on any of its
+     * threads, each answering with a line ("ok", "none", "unavailable" or "failed").
+     */
+    public String loadSecret(String account) {
+        return SecretVault.load(this, account);
+    }
+
+    public String saveSecret(String account, String value) {
+        return SecretVault.save(this, account, value);
+    }
+
+    public String deleteSecret(String account) {
+        return SecretVault.delete(this, account);
+    }
+
     /** Asks the user for files with the system's picker; each arrives as a "picked" event. */
     public void pick(final String purpose) {
         runOnUiThread(() -> {
@@ -440,6 +739,10 @@ public class MainActivity extends NativeActivity {
             // Several files only where the front end takes several, as in the browser: two
             // projects would replace one another, and a dialog's options go with one file.
             intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, purpose.equals("data") || purpose.equals("shapefile"));
+            // A project is opened for writing too, for this session: Save writes it back.
+            if (purpose.equals("project")) {
+                intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+            }
             if (!start(intent, PICK)) {
                 picking = false;
             }
@@ -449,8 +752,13 @@ public class MainActivity extends NativeActivity {
     /** Asks where to write a file. Project saves return a distinct result to the save prompt. */
     public void save(final String name, final byte[] bytes, final boolean project) {
         runOnUiThread(() -> {
-            if (saveBytes != null || picking) {
-                saveFailed(project, name, "another file is being chosen.");
+            if (saveBytes != null || picking || writing) {
+                // A project's refusal is a code the Rust side words; an export's is as it was.
+                if (project) {
+                    add(writeBackFailed(name, new java.io.IOException(DocumentWrite.BUSY), null));
+                } else {
+                    saveFailed(false, name, writing ? "another file is being saved." : "another file is being chosen.");
+                }
                 return;
             }
             saveName = name;
@@ -471,19 +779,310 @@ public class MainActivity extends NativeActivity {
         });
     }
 
+    /**
+     * Writes a project back to the document it was opened from or last saved as, with no picker.
+     * A complete copy is written to the app's storage first: if the document can't be opened for
+     * writing, it is left as it was and the copy goes; if writing it fails partway, it may be
+     * damaged, and the copy is kept and named. The result is a project-saved or write-back-failed
+     * event (with the code DocumentWrite.BUSY when another save is under way).
+     */
+    public void writeBack(final String document, final String name, final byte[] bytes) {
+        // Counted before anything is posted: the Rust side keeps looking until the answer comes,
+        // as no picker will wake it.
+        synchronized (events) {
+            asked++;
+        }
+        runOnUiThread(() -> {
+            if (saveBytes != null || picking || writing) {
+                add(writeBackFailed(name, new java.io.IOException(DocumentWrite.BUSY), null));
+                answered();
+                return;
+            }
+            writing = true;
+            try {
+                new Thread(() -> {
+                    String result;
+                    // The copy kept when the document may be damaged, said with the result.
+                    File[] kept = new File[1];
+                    try {
+                        result = writeBackNow(Uri.parse(document), name, bytes, kept);
+                    } catch (Throwable e) {
+                        result = writeBackFailed(name, e, null);
+                    }
+                    // Free for the next save before it is told this one is done.
+                    writing = false;
+                    addKept(result, kept[0]);
+                    answered();
+                }).start();
+            } catch (Throwable e) {
+                writing = false;
+                add(writeBackFailed(name, e, null));
+                answered();
+            }
+        });
+    }
+
+    /** Writes the project back; returns the event that says how it went. */
+    private String writeBackNow(Uri uri, String name, byte[] bytes, File[] kept) {
+        // The complete copy, kept until the document holds the project.
+        File copy;
+        try {
+            File dir = new File(new File(getFilesDir(), "saved"), Long.toString(System.nanoTime()));
+            if (!dir.isDirectory() && !dir.mkdirs()) {
+                throw new java.io.IOException(DocumentWrite.STORAGE);
+            }
+            copy = new File(dir, displayName(uri));
+        } catch (Throwable e) {
+            return writeBackFailed(name, e, null);
+        }
+        // Written under a name of its own and given its name once whole: a later start never takes a
+        // half-written copy for the project as saved.
+        File part = new File(copy.getParentFile(), copy.getName() + DocumentWrite.PART);
+        try {
+            try (FileOutputStream out = new FileOutputStream(part)) {
+                out.write(bytes);
+                out.getFD().sync();
+            }
+            if (!part.renameTo(copy)) {
+                throw new java.io.IOException(DocumentWrite.STORAGE);
+            }
+        } catch (Throwable e) {
+            // Half a copy would only take room: nothing has touched the document yet.
+            part.delete();
+            removeWithFolder(copy);
+            return writeBackFailed(name, e, null);
+        }
+        android.os.ParcelFileDescriptor descriptor;
+        try {
+            // From here the document may be emptied: a later start says so if this doesn't finish.
+            new File(copy.getParentFile(), DocumentWrite.OPENED).createNewFile();
+            // "rwt": the mode Android documents as cut to nothing on opening, as some providers
+            // can't cut a file they have handed out; DocumentWrite cuts and checks it again.
+            descriptor = getContentResolver().openFileDescriptor(uri, "rwt");
+            if (descriptor == null) {
+                throw new java.io.IOException(DocumentWrite.UNWRITABLE);
+            }
+        } catch (Throwable e) {
+            // Nothing was written to it: it is as it was, and the copy isn't needed.
+            removeWithFolder(copy);
+            return writeBackFailed(name, e, null);
+        }
+        try {
+            // Not closed by the stream: a failure closes the descriptor with its error, below.
+            FileOutputStream out = new FileOutputStream(descriptor.getFileDescriptor());
+            DocumentWrite.overwrite(out.getChannel(), bytes);
+            // Closing hands the document back to its provider, which may store it only then (its
+            // size as the provider lists it can lag behind: the length was checked on the file).
+            descriptor.close();
+            descriptor = null;
+            removeWithFolder(copy);
+            return "project-saved\t" + name;
+        } catch (Throwable e) {
+            if (descriptor != null) {
+                // Its provider is told the write failed, so one that stores on close keeps the
+                // document it had.
+                try {
+                    descriptor.closeWithError(String.valueOf(e.getMessage()));
+                } catch (java.io.IOException closing) {
+                    // Said below: the write failed.
+                }
+            }
+            // Marked once the Rust side has taken the notice, so the next start doesn't say it again.
+            kept[0] = copy;
+            return writeBackFailed(name, e, copy);
+        }
+    }
+
+    /**
+     * A write-back-failed event: the document was left as it was ({@code kept} null), or may be
+     * damaged, with the complete project kept at {@code kept}. The Rust side words it: the
+     * reason is one of DocumentWrite's codes, or the system's own text.
+     */
+    private static String writeBackFailed(String name, Throwable e, File kept) {
+        String reason = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+        return "write-back-failed\t" + oneField(name) + "\t" + oneField(reason)
+                + (kept == null ? "" : "\t" + kept.getAbsolutePath());
+    }
+
+    /** Text that fits in one field of an event: no tab or line break. */
+    private static String oneField(String text) {
+        return text.replaceAll("[\\t\\r\\n]", " ");
+    }
+
+    /** Whether this process has looked for write-backs an earlier one didn't finish. */
+    private static boolean unfinishedLooked;
+
+    /**
+     * Says, once a process, each write-back an earlier process didn't finish (the app ended while
+     * it wrote): its complete copy is still in files/saved, unmarked, and the document may be
+     * damaged (opened "rwt", it was emptied first). Each is marked once said.
+     */
+    private void reportUnfinishedWriteBacks() {
+        if (unfinishedLooked) {
+            return;
+        }
+        unfinishedLooked = true;
+        File[] dirs = new File(getFilesDir(), "saved").listFiles();
+        if (dirs == null) {
+            return;
+        }
+        for (File dir : dirs) {
+            File copy = DocumentWrite.unfinished(dir);
+            if (copy != null) {
+                addKept(writeBackFailed(copy.getName(), new java.io.IOException(DocumentWrite.UNFINISHED), copy), copy);
+            }
+        }
+    }
+
+    /** Kept copies whose notice waits to be taken by the Rust side (guarded by events). */
+    private final ArrayList<File> toMark = new ArrayList<>();
+
+    /**
+     * Adds {@code event}, and with it, under the same lock, the kept copy it names (if any), to be
+     * marked as said once takeEvents has handed the event over: never before.
+     */
+    private void addKept(String event, File copy) {
+        synchronized (events) {
+            add(event);
+            if (copy != null) {
+                toMark.add(copy);
+            }
+        }
+    }
+
+    private static void markReported(File copy) {
+        File folder = copy.getParentFile();
+        if (folder != null) {
+            try {
+                new File(folder, DocumentWrite.REPORTED).createNewFile();
+            } catch (java.io.IOException e) {
+                // Said again on a later start at worst.
+            }
+        }
+    }
+
+    /** Removes a file and its folder, once that is empty. */
+    private static void removeWithFolder(File file) {
+        file.delete();
+        File folder = file.getParentFile();
+        if (folder != null) {
+            // A staging folder's mark goes with it.
+            new File(folder, DocumentWrite.OPENED).delete();
+            folder.delete();
+        }
+    }
+
+    /**
+     * The document's address when RustGIS may write a project back to it: a project file
+     * ({@code .rgis}), granted for writing ({@code grants}), whose provider writes it. The grant
+     * lasts for this session: after a restart, Save asks where. Null otherwise.
+     */
+    private String writable(Uri uri, String name, int grants) {
+        // A project file, as the Rust side's is_project_file has it (.rgis, or the older .rgisx).
+        String lower = name.toLowerCase(java.util.Locale.ROOT);
+        if (!(lower.endsWith(".rgis") || lower.endsWith(".rgisx")) || (grants & Intent.FLAG_GRANT_WRITE_URI_PERMISSION) == 0) {
+            return null;
+        }
+        try (Cursor cursor = getContentResolver().query(uri,
+                new String[] {android.provider.DocumentsContract.Document.COLUMN_FLAGS}, null, null, null)) {
+            if (cursor == null || !cursor.moveToFirst()
+                    || (cursor.getInt(0) & android.provider.DocumentsContract.Document.FLAG_SUPPORTS_WRITE) == 0) {
+                return null;
+            }
+        } catch (RuntimeException e) {
+            return null;
+        }
+        return uri.toString();
+    }
+
     private void saveFailed(boolean project, String name, String reason) {
         add((project ? "project-save-failed\t" : "failed\t") + name + " wasn't saved: " + reason);
     }
 
+    /**
+     * What Android allows, in bytes, as "total free": the memory it has (totalMem), and how much
+     * of it is free before it counts itself low and ends processes (availMem less threshold).
+     * Empty when it can't say. Called from any thread. (getMemoryClass isn't asked: it bounds the
+     * Java heap, and the engine's memory is native.)
+     */
+    public String memory() {
+        android.app.ActivityManager.MemoryInfo info = memoryInfo();
+        return info == null ? "" : info.totalMem + " " + Math.max(0, info.availMem - info.threshold);
+    }
+
+    private android.app.ActivityManager.MemoryInfo memoryInfo() {
+        android.app.ActivityManager manager = (android.app.ActivityManager) getSystemService(ACTIVITY_SERVICE);
+        if (manager == null) {
+            return null;
+        }
+        android.app.ActivityManager.MemoryInfo info = new android.app.ActivityManager.MemoryInfo();
+        manager.getMemoryInfo(info);
+        return info;
+    }
+
+    /**
+     * Android 14 and later tell an app in use nothing when memory runs short (no onLowMemory, no
+     * "running" trim level), so it is asked while the app is in sight, at most every
+     * MEMORY_LOOK_MILLIS: each time it is found to have turned low is a "low-memory" event.
+     */
+    private void lookAtMemory() {
+        long now = android.os.SystemClock.elapsedRealtime();
+        if (!started || now - memoryLooked < MEMORY_LOOK_MILLIS) {
+            return;
+        }
+        memoryLooked = now;
+        android.app.ActivityManager.MemoryInfo info = memoryInfo();
+        boolean low = info != null && info.lowMemory;
+        if (low && !memoryLow) {
+            add("low-memory");
+        }
+        memoryLow = low;
+    }
+
+    /**
+     * The warnings Android 13 and earlier give a running app, passed on while it is in sight. Out
+     * of sight (a track being recorded) it draws no frames to take them, and would drop what it
+     * is about to draw once back.
+     */
+    @Override
+    public void onTrimMemory(int level) {
+        super.onTrimMemory(level);
+        if (started && (level == TRIM_MEMORY_RUNNING_LOW || level == TRIM_MEMORY_RUNNING_CRITICAL)) {
+            add("low-memory");
+        }
+    }
+
+    /** The system as a whole is out of memory (Android 13 and earlier), said while in sight. */
+    @Override
+    public void onLowMemory() {
+        super.onLowMemory();
+        if (started) {
+            add("low-memory");
+        }
+    }
+
     /** What happened since the last call, oldest first, one event to a line. */
     public String takeEvents() {
+        lookAtMemory();
         String why = refusal.getAndSet(null);
         if (why != null) {
             keepLocatingRefused();
             add("failed\t" + why);
         }
         synchronized (events) {
-            return events.take();
+            if (typed != null) {
+                events.add(typed);
+                typed = null;
+            }
+            String taken = events.take();
+            // Every notice waiting has been handed over: the copies they name are said.
+            if (events.isEmpty()) {
+                for (File copy : toMark) {
+                    markReported(copy);
+                }
+                toMark.clear();
+            }
+            return taken;
         }
     }
 
@@ -618,6 +1217,7 @@ public class MainActivity extends NativeActivity {
                 return;
             }
             final String purpose = this.purpose;
+            final int grants = data == null ? 0 : data.getFlags();
             // Copied off the main thread: a document can be large, or come from the network.
             new Thread(() -> {
                 // One folder for what was picked together, and for nothing else, with a folder of
@@ -659,7 +1259,7 @@ public class MainActivity extends NativeActivity {
                             sources.add(source);
                             k = sources.size() - 1;
                         }
-                        if (copyIn(purpose, uri, new File(dir, Integer.toString(k)))) {
+                        if (copyIn(purpose, uri, new File(dir, Integer.toString(k)), grants)) {
                             copies++;
                         }
                     }
@@ -677,6 +1277,7 @@ public class MainActivity extends NativeActivity {
                 }
             }).start();
         } else if (request == SAVE) {
+            final int grants = data == null ? 0 : data.getFlags();
             final byte[] bytes = saveBytes;
             final String name = saveName;
             final boolean project = saveProject;
@@ -696,7 +1297,12 @@ public class MainActivity extends NativeActivity {
                         }
                         out.write(bytes);
                     }
-                    // Said once the file is closed: a failure to close is a failure to save.
+                    // Said once the file is closed: a failure to close is a failure to save. A project
+                    // saved where RustGIS may write it back names its document first.
+                    String document = project ? writable(uri, displayName(uri), grants) : null;
+                    if (document != null) {
+                        add("project-document\t" + document);
+                    }
                     add((project ? "project-saved\t" : "saved\t") + name);
                 } catch (Throwable e) {
                     saveFailed(project, name, e.getMessage());
@@ -735,7 +1341,7 @@ public class MainActivity extends NativeActivity {
      * Copies a picked document into the app's storage, where the Rust side can open it by path.
      * Returns whether it was copied.
      */
-    private boolean copyIn(String purpose, Uri uri, File dir) {
+    private boolean copyIn(String purpose, Uri uri, File dir, int grants) {
         String name = displayName(uri);
         File file = new File(dir, name);
         // Two documents of one name picked together (from two folders) both keep their bytes.
@@ -764,8 +1370,11 @@ public class MainActivity extends NativeActivity {
             if (!part.renameTo(file)) {
                 throw new java.io.IOException("the copy couldn't be given its name");
             }
-            // The copy's own name: a second document of one name is told from the first.
-            add("picked\t" + purpose + "\t" + file.getName() + "\t" + file.getAbsolutePath());
+            // The copy's own name: a second document of one name is told from the first. A project
+            // RustGIS may write back to names its document too.
+            String document = purpose.equals("project") ? writable(uri, name, grants) : null;
+            add("picked\t" + purpose + "\t" + file.getName() + "\t" + file.getAbsolutePath()
+                    + (document == null ? "" : "\t" + document));
             return true;
         } catch (Throwable e) {
             // Half a copy would only fill the storage: nothing reports its path to remove it later.

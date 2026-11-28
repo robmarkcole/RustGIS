@@ -10,7 +10,7 @@
 # for. .github/workflows/docker.yml builds each platform on a runner of its own.
 # Dependabot keeps the base images current.
 
-FROM rust:1.100.0-slim@sha256:6f14b2b4b278ec0d50aa1d69541c304ce0f95e0f6268487aa9924af1c2e9aebe AS build
+FROM rust:1.100.0-slim@sha256:3b199fd6db7d709274df56565b8f4003f9e30d7bfcff9d53148c86053b7855e2 AS build
 
 # crates/render/build.rs uses curl to fetch the Natural Earth sample data it embeds.
 RUN apt-get update \
@@ -29,7 +29,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 # The Debian release the rust image is built on, so the binary finds the C library it was linked
 # against.
-FROM debian:13.7-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
+FROM debian:13.8-slim@sha256:8aa5a7bf5a1955bddbe7d74fcdd0b91ab30e74362a8b73af672b0481b35b44a0
 
 # ca-certificates for HTTPS (web tiles, remote data, the AI Assistant's providers).
 RUN apt-get update \

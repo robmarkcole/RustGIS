@@ -20,7 +20,7 @@ pub enum Marker {
     Star,
     /// A character of a font, as QGIS's font markers draw one: the size is the font's em.
     Char(Glyph),
-    /// A PNG, JPEG or SVG image, as QGIS's raster image markers draw one: the size is its width,
+    /// A PNG, JPEG or SVG image, as QGIS's raster image and SVG markers draw one: the size is its width,
     /// its height as the image's proportions make it. Its fill and outline don't change it.
     Picture(Picture),
 }
@@ -1010,6 +1010,8 @@ pub struct LegendEntry {
     /// The Unique Values fallback row (`<all other values>`), told apart from a class whatever
     /// its label: a legend can leave it out without touching a class that bears the same name.
     pub fallback: bool,
+    /// The features its row stands for, in a legend that counts them (#3237).
+    pub count: Option<u64>,
 }
 
 impl LegendEntry {
@@ -1021,12 +1023,13 @@ impl LegendEntry {
             strokes: strokes.cloned().unwrap_or_default(),
             fills: fills.cloned().unwrap_or_default(),
             fallback: false,
+            count: None,
         }
     }
 
     /// A row with no stacked strokes or fills of its own.
     pub fn plain(label: String, symbol: Symbol) -> Self {
-        LegendEntry { label, symbol, strokes: Vec::new(), fills: Vec::new(), fallback: false }
+        LegendEntry { label, symbol, strokes: Vec::new(), fills: Vec::new(), fallback: false, count: None }
     }
 }
 
@@ -1343,6 +1346,33 @@ impl Renderer {
         Ok(Self::graduated_on(ds, fi, ClassMethod::Manual, ramp, base, breaks, OPEN_BELOW))
     }
 
+    /// [`Renderer::graduated_manual_open`] for a layer whose field's range `(lo, hi)` the file
+    /// states (GeoParquet column statistics): the classes close at it, as with the values at hand
+    /// ([`Renderer::graduated_manual`]). An open last bound among `breaks` (the layer's current
+    /// classes) gives way to `hi`; a first bound below `lo` keeps the first class open ("up to"),
+    /// so its range never reads backwards.
+    pub fn graduated_manual_within(
+        ds: &Dataset,
+        field: &str,
+        breaks: &[f64],
+        (lo, hi): (f64, f64),
+        ramp: Ramp,
+        base: Symbol,
+    ) -> Result<Renderer, String> {
+        let fi = numeric_field(ds, field)?;
+        if breaks.contains(&OPEN_BELOW) {
+            return Err(format!("manual breaks must be above {OPEN_BELOW:e}"));
+        }
+        // The open class alone is one class of every value.
+        let breaks = if !breaks.is_empty() && breaks.iter().all(|v| *v >= OPEN_ABOVE) {
+            vec![hi]
+        } else {
+            manual_bounds(breaks, |v| v.is_finite() && v < OPEN_ABOVE, Some(hi))?
+        };
+        let min = if breaks.first().is_some_and(|b| *b < lo) { OPEN_BELOW } else { lo };
+        Ok(Self::graduated_on(ds, fi, ClassMethod::Manual, ramp, base, breaks, min))
+    }
+
     /// Closed Graduated Colors classes made open, as [`Renderer::graduated_manual_open`] makes
     /// them: the open class takes the place of the bound that closed them, so every feature keeps
     /// its class. `None` for other renderers and for classes already open.
@@ -1359,6 +1389,27 @@ impl Renderer {
             *min = OPEN_BELOW;
         }
         Some(open)
+    }
+
+    /// These Graduated Colors classes with the ends of `other`'s, whose last bound closes them at
+    /// the field's largest value `hi` ([`Renderer::graduated_manual_within`]), when the bounds
+    /// between classes are the same: every feature keeps its class. `None` for other renderers,
+    /// for other inner bounds, and when either last bound is a typed one past `hi`; an open last
+    /// bound of these classes ([`OPEN_ABOVE`]) is taken as closed at `hi`.
+    pub fn with_ends_of(&self, other: &Renderer, hi: f64) -> Option<Renderer> {
+        let (Renderer::Graduated { breaks: ours, .. }, Renderer::Graduated { breaks: theirs, min: start, .. }) = (self, other) else {
+            return None;
+        };
+        let ((our_last, our_inner), (their_last, their_inner)) = (ours.split_last()?, theirs.split_last()?);
+        if our_inner != their_inner || *their_last != hi || (*our_last > hi && *our_last < OPEN_ABOVE) {
+            return None;
+        }
+        let mut same = self.clone();
+        if let Renderer::Graduated { breaks, min, .. } = &mut same {
+            breaks.clone_from(theirs);
+            *min = *start;
+        }
+        Some(same)
     }
 
     /// A graduated renderer on `field`, with the bounds `breaks` works out from the field's sorted
@@ -1724,7 +1775,6 @@ impl Renderer {
     /// Classes present among the kept rows at the drawing scale and page.
     pub fn legend_with(&self, ds: &Dataset, rows: &[bool], env: rustgis_data::query::Env) -> Vec<LegendEntry> {
         let Renderer::Unique {
-            field,
             classes,
             other,
             class_labels,
@@ -1739,32 +1789,72 @@ impl Renderer {
         else {
             return self.legend();
         };
-        // A fallback that draws nothing has nothing to stand for in a legend: its own symbol as
-        // `Symbol::draws` has it (as a web style does), else its stacked strokes (on lines and
-        // points) or stacked fills (on areas); a point of size 0 draws none of them.
-        let polygon = ds.geometry_type == GeometryType::Polygon;
-        let strokes = !polygon
-            && other_strokes.iter().any(|s| s.color.unwrap_or(other.stroke).a() > 0 && s.width.unwrap_or(other.stroke_width) > 0.0);
-        let fills = polygon && other_fills.iter().any(|f| f.draws(other.fill));
-        let sized = ds.geometry_type != GeometryType::Point || other.size > 0.0;
-        let visible = other.draws(ds.geometry_type) || (sized && (strokes || fills));
+        let visible = self.fallback_draws(ds);
         if expression.is_some() && ds.features.len().saturating_mul(classes.len().max(1)) > MAX_LEGEND_STEPS {
             let mut all = self.legend();
             all.retain(|e| visible || !e.fallback);
             return all;
         }
-        // A value matches its first class, as in `symbol_for`.
+        let mut used = vec![false; classes.len()];
+        let mut other_used = false;
+        // Distinct classes still unseen: once every class and "other" are in, the rest can't add any.
+        let mut unseen = classes.iter().map(|(k, _)| k.as_str()).collect::<std::collections::HashSet<_>>().len() + 1;
+        self.visit_unique(ds, rows, env, |class| {
+            let seen = match class.and_then(|i| used.get_mut(i)) {
+                Some(u) => std::mem::replace(u, true),
+                None => std::mem::replace(&mut other_used, true),
+            };
+            if !seen {
+                unseen -= 1;
+            }
+            unseen > 0
+        });
+        let mut v: Vec<LegendEntry> = self
+            .class_order()
+            .into_iter()
+            .filter(|i| used.get(*i).copied().unwrap_or(false))
+            .filter_map(|i| classes.get(i))
+            .map(|(k, s)| LegendEntry::class(unique_label(class_labels, k), *s, class_strokes.get(k), class_fills.get(k)))
+            .collect();
+        if other_used && visible {
+            v.push(LegendEntry {
+                label: other_label.clone().unwrap_or_else(|| OTHER_VALUES.into()),
+                symbol: *other,
+                strokes: other_strokes.clone(),
+                fills: other_fills.clone(),
+                fallback: true,
+                count: None,
+            });
+        }
+        v
+    }
+
+    /// Whether Unique Values' fallback draws something on `ds`; false for the other renderers.
+    /// One that draws nothing has nothing to stand for in a legend: its own symbol as
+    /// `Symbol::draws` has it (as a web style does), else its stacked strokes (on lines and
+    /// points) or stacked fills (on areas); a point of size 0 draws none of them.
+    fn fallback_draws(&self, ds: &Dataset) -> bool {
+        let Renderer::Unique { other, other_strokes, other_fills, .. } = self else { return false };
+        let polygon = ds.geometry_type == GeometryType::Polygon;
+        let strokes = !polygon
+            && other_strokes.iter().any(|s| s.color.unwrap_or(other.stroke).a() > 0 && s.width.unwrap_or(other.stroke_width) > 0.0);
+        let fills = polygon && other_fills.iter().any(|f| f.draws(other.fill));
+        let sized = ds.geometry_type != GeometryType::Point || other.size > 0.0;
+        other.draws(ds.geometry_type) || (sized && (strokes || fills))
+    }
+
+    /// Gives `visit` the class of each kept row of Unique Values, as an index into `classes`
+    /// (`None` for `<all other values>`), until it returns false. A value matches its first class,
+    /// as in `symbol_for`; by expression, each feature is classed as it is drawn. Nothing for the
+    /// other renderers.
+    fn visit_unique(&self, ds: &Dataset, rows: &[bool], env: rustgis_data::query::Env, mut visit: impl FnMut(Option<usize>) -> bool) {
+        let Renderer::Unique { field, classes, expression, .. } = self else { return };
         let mut index: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
         for (i, (k, _)) in classes.iter().enumerate() {
             index.entry(k.as_str()).or_insert(i);
         }
         let fi = ds.field_index(field);
-        // By expression: each feature classed as it is drawn.
         let classer = expression.as_ref().map(|_| self.classer_with(ds, env));
-        let mut used = vec![false; classes.len()];
-        let mut other_used = false;
-        // Distinct classes still unseen: once every class and "other" are in, the rest can't add any.
-        let mut unseen = index.len() + 1;
         // One buffer for every value's text, rather than a string per feature.
         let mut text = String::new();
         for r in (0..ds.features.len()).filter(|r| rows.get(*r).copied().unwrap_or(true)) {
@@ -1781,34 +1871,64 @@ impl Renderer {
                     index.get(text.as_str()).copied()
                 })
             };
-            let seen = match class.and_then(|i| used.get_mut(i)) {
-                Some(u) => std::mem::replace(u, true),
-                None => std::mem::replace(&mut other_used, true),
-            };
-            if !seen {
-                unseen -= 1;
-                if unseen == 0 {
-                    break;
-                }
+            if !visit(class) {
+                break;
             }
         }
-        let mut v: Vec<LegendEntry> = self
-            .class_order()
-            .into_iter()
-            .filter(|i| used.get(*i).copied().unwrap_or(false))
-            .filter_map(|i| classes.get(i))
-            .map(|(k, s)| LegendEntry::class(unique_label(class_labels, k), *s, class_strokes.get(k), class_fills.get(k)))
-            .collect();
-        if other_used && visible {
-            v.push(LegendEntry {
-                label: other_label.clone().unwrap_or_else(|| OTHER_VALUES.into()),
-                symbol: *other,
-                strokes: other_strokes.clone(),
-                fills: other_fills.clone(),
-                fallback: true,
-            });
+    }
+
+    /// The rows of a legend that counts features (#3237): those [`Renderer::legend_with`] lists of
+    /// the kept `rows` (with `all`, every row of [`Renderer::legend`]), each with the number of
+    /// those rows it stands for. No number for Proportional sizes, nor by an expression past
+    /// [`MAX_LEGEND_STEPS`], which is listed without classing its features.
+    pub fn legend_counted(&self, ds: &Dataset, rows: &[bool], env: rustgis_data::query::Env, all: bool) -> Vec<LegendEntry> {
+        let listed = || if all { self.legend() } else { self.legend_with(ds, rows, env.clone()) };
+        match self {
+            Renderer::Unique { classes, expression, .. } => {
+                if expression.is_some() && ds.features.len().saturating_mul(classes.len().max(1)) > MAX_LEGEND_STEPS {
+                    return listed();
+                }
+                let mut counts = vec![0u64; classes.len()];
+                let mut other = 0u64;
+                self.visit_unique(ds, rows, env, |class| {
+                    match class.and_then(|i| counts.get_mut(i)) {
+                        Some(n) => *n += 1,
+                        None => other += 1,
+                    }
+                    true
+                });
+                // `legend()` lists the classes in `class_order`, then the fallback: so do the counts.
+                let counts = self.class_order().into_iter().filter_map(|i| counts.get(i).copied());
+                let mut entries: Vec<LegendEntry> = self.legend();
+                for (e, n) in entries.iter_mut().zip(counts.chain([other])) {
+                    e.count = Some(n);
+                }
+                if !all {
+                    // As `legend_with` lists them: the classes with a feature, and the fallback
+                    // when it has one and draws something.
+                    let visible = self.fallback_draws(ds);
+                    entries.retain(|e| e.count != Some(0) && (!e.fallback || visible));
+                }
+                entries
+            }
+            Renderer::Graduated { breaks, .. } => {
+                let classer = self.classer_with(ds, env.clone());
+                let mut counts = vec![0u64; breaks.len()];
+                for r in (0..ds.features.len()).filter(|r| rows.get(*r).copied().unwrap_or(true)) {
+                    if let Some(Slot::Class(i)) = self.class_in(ds, r, &classer)
+                        && let Some(n) = counts.get_mut(i)
+                    {
+                        *n += 1;
+                    }
+                }
+                let mut entries = listed();
+                for (e, n) in entries.iter_mut().zip(counts) {
+                    e.count = Some(n);
+                }
+                entries
+            }
+            Renderer::Single(_) | Renderer::Proportional { .. } => listed(),
         }
-        v
     }
 
     /// The order `legend()` lists the Unique Values classes in: their indices in `classes`, by
@@ -1869,6 +1989,7 @@ impl Renderer {
                     strokes: other_strokes.clone(),
                     fills: other_fills.clone(),
                     fallback: true,
+                    count: None,
                 });
                 v
             }
@@ -2662,6 +2783,24 @@ pub struct LabelClass {
     /// Every label drawn, over the others where they crowd, rather than some left out.
     #[serde(default, deserialize_with = "de_flag", skip_serializing_if = "std::ops::Not::not")]
     pub show_all: bool,
+    /// Where labels compete for a place, the heavier class's wins, whatever its layer's place
+    /// (within [`LABEL_WEIGHT`], [`DEFAULT_LABEL_WEIGHT`] by default, as QGIS's label priority);
+    /// equal weights keep the layer above and the class listed first ahead.
+    #[serde(default = "default_label_weight", deserialize_with = "de_label_weight", skip_serializing_if = "is_default_label_weight")]
+    pub weight: u8,
+    /// The room (points, within [`LABEL_CLEARANCE`], [`DEFAULT_LABEL_CLEARANCE`] by default) its
+    /// labels' text keeps free of other labels; two labels keep both their clearances apart.
+    #[serde(
+        default = "default_label_clearance",
+        deserialize_with = "de_label_clearance",
+        skip_serializing_if = "is_default_label_clearance"
+    )]
+    pub clearance: f32,
+    /// Duplicates removed (#2847): within this many points (within [`LABEL_DUPLICATES`]) of a
+    /// label of another feature of its layer and class with the same text, a label is left out;
+    /// the one placed first stays. None keeps every label.
+    #[serde(default, deserialize_with = "de_label_duplicates", skip_serializing_if = "Option::is_none")]
+    pub remove_duplicates: Option<f32>,
     /// Callouts: a label crowded off its spot moves to a free one nearby, a line drawn from its
     /// feature to it at most this long (points, within [`CALLOUT_REACH`]), as QGIS's callouts;
     /// none keeps every label in its spot. Labels along lines aren't moved.
@@ -2986,6 +3125,72 @@ pub fn label_line_offset(v: f64) -> f32 {
 
 fn de_line_offset<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f32, D::Error> {
     Ok(lenient::<D, f64>(d)?.map_or(0.0, label_line_offset))
+}
+
+/// A label class's weight where labels compete (#2803): 0 to 10, as QGIS's label priority.
+pub const LABEL_WEIGHT: std::ops::RangeInclusive<f64> = 0.0..=10.0;
+
+/// The weight of a class that sets none, and of every label before weights.
+pub const DEFAULT_LABEL_WEIGHT: u8 = 5;
+
+/// A label's weight: rounded, within [`LABEL_WEIGHT`]; one that isn't a number is the default.
+pub fn label_weight(v: f64) -> u8 {
+    if v.is_finite() { v.round().clamp(*LABEL_WEIGHT.start(), *LABEL_WEIGHT.end()) as u8 } else { DEFAULT_LABEL_WEIGHT }
+}
+
+fn de_label_weight<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u8, D::Error> {
+    Ok(lenient::<D, f64>(d)?.map_or(DEFAULT_LABEL_WEIGHT, label_weight))
+}
+
+fn default_label_weight() -> u8 {
+    DEFAULT_LABEL_WEIGHT
+}
+
+fn is_default_label_weight(w: &u8) -> bool {
+    *w == DEFAULT_LABEL_WEIGHT
+}
+
+/// The room a label's text keeps free of other labels (#2828), in points.
+pub const LABEL_CLEARANCE: std::ops::RangeInclusive<f64> = 0.0..=100.0;
+
+/// The clearance of a class that sets none, and of every label before clearances: the padding
+/// every label kept.
+pub const DEFAULT_LABEL_CLEARANCE: f32 = 2.0;
+
+/// A label's clearance: within [`LABEL_CLEARANCE`]; one that isn't a number is the default.
+pub fn label_clearance(v: f64) -> f32 {
+    if v.is_finite() { v.clamp(*LABEL_CLEARANCE.start(), *LABEL_CLEARANCE.end()) as f32 } else { DEFAULT_LABEL_CLEARANCE }
+}
+
+fn de_label_clearance<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f32, D::Error> {
+    Ok(lenient::<D, f64>(d)?.map_or(DEFAULT_LABEL_CLEARANCE, label_clearance))
+}
+
+fn default_label_clearance() -> f32 {
+    DEFAULT_LABEL_CLEARANCE
+}
+
+fn is_default_label_clearance(c: &f32) -> bool {
+    *c == DEFAULT_LABEL_CLEARANCE
+}
+
+/// How far apart (points) two labels of one text must be for neither to be removed as the
+/// other's duplicate (#2847).
+pub const LABEL_DUPLICATES: std::ops::RangeInclusive<f64> = 1.0..=2000.0;
+
+/// The distance a class removes duplicates within when it is turned on in the Labeling pane.
+pub const DEFAULT_LABEL_DUPLICATES: f32 = 200.0;
+
+/// A distance to remove duplicates within: held to [`LABEL_DUPLICATES`]; NaN or infinity (which no
+/// JSON number holds) is [`DEFAULT_LABEL_DUPLICATES`]. A file's value that isn't a number at all
+/// turns it off before it gets here ([`de_label_duplicates`]).
+pub fn label_duplicates(v: f64) -> f32 {
+    if v.is_finite() { v.clamp(*LABEL_DUPLICATES.start(), *LABEL_DUPLICATES.end()) as f32 } else { DEFAULT_LABEL_DUPLICATES }
+}
+
+/// Off when it isn't a number (or is null).
+fn de_label_duplicates<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<f32>, D::Error> {
+    Ok(lenient::<D, f64>(d)?.map(label_duplicates))
 }
 
 fn is_no_offset(o: &[f32; 2]) -> bool {
@@ -3405,6 +3610,9 @@ impl LabelClass {
             repeat: None,
             line_offset: 0.0,
             show_all: false,
+            weight: DEFAULT_LABEL_WEIGHT,
+            clearance: DEFAULT_LABEL_CLEARANCE,
+            remove_duplicates: None,
             callout: None,
             square_to: None,
             guide: None,
@@ -3770,6 +3978,31 @@ mod tests {
         }
         let junk = read(serde_json::json!({"line_offset": "above"}));
         assert_eq!(junk.default.line_offset, 0.0);
+        assert_eq!(junk.default.field, "name");
+    }
+
+    /// A label saved before label weights weighs 5 and saves as before; a weight is kept, held
+    /// to 0–10 and rounded, and one that isn't a number is 5 (#2803).
+    #[test]
+    fn a_label_weight_is_kept_and_old_labels_save_as_before() {
+        let base = serde_json::json!({"enabled": true, "field": "name", "size": 9.0, "color": [0, 0, 0, 255], "halo": true, "bold": false});
+        let read = |extra: serde_json::Value| {
+            let mut v = base.clone();
+            if let (Some(o), Some(e)) = (v.as_object_mut(), extra.as_object()) {
+                o.extend(e.clone());
+            }
+            serde_json::from_value::<Labeling>(v).unwrap()
+        };
+        let old = read(serde_json::json!({}));
+        assert_eq!(old.default.weight, DEFAULT_LABEL_WEIGHT);
+        assert!(serde_json::to_value(&old).unwrap().get("weight").is_none(), "5 is left out");
+        for (given, kept) in [(7.0, 7), (0.0, 0), (10.0, 10), (99.0, 10), (-3.0, 0), (6.6, 7)] {
+            let l = read(serde_json::json!({"weight": given}));
+            assert_eq!(l.default.weight, kept, "{given}");
+            assert_eq!(serde_json::from_value::<Labeling>(serde_json::to_value(&l).unwrap()).unwrap(), l);
+        }
+        let junk = read(serde_json::json!({"weight": "high"}));
+        assert_eq!(junk.default.weight, DEFAULT_LABEL_WEIGHT);
         assert_eq!(junk.default.field, "name");
     }
 
@@ -4582,6 +4815,32 @@ mod tests {
         // No values is still refused.
         assert_eq!(manual(&heights(&[None]), &[4.0]).unwrap_err(), "'height' has no numeric values");
         assert_eq!(manual(&heights(&[]), &[4.0]).unwrap_err(), "'height' has no numeric values");
+    }
+
+    #[test]
+    fn manual_classes_within_the_file_range_close_at_it() {
+        let base = Symbol::default_for(GeometryType::Polygon, 0);
+        // No value at hand: the file's range closes the classes, the view's values set nothing.
+        let d = heights(&[Some(100.0)]);
+        let within = |b: &[f64]| Renderer::graduated_manual_within(&d, "height", b, (0.5, 60.0), Ramp::Ember, base);
+        let ends = |r: Renderer| match r {
+            Renderer::Graduated { breaks, min, .. } => (breaks, min),
+            r => panic!("{r:?}"),
+        };
+        assert_eq!(ends(within(&[25.0, 4.0, 7.0, 10.0, 15.0]).unwrap()), (vec![4.0, 7.0, 10.0, 15.0, 25.0, 60.0], 0.5));
+        let r = within(&[4.0, 25.0]).unwrap();
+        assert_eq!(labels_of(&r), ["0.50 – 4", "4 – 25", "25 – 60"]);
+        // A bound past the largest closes the classes itself; the open class gives way to it.
+        assert_eq!(ends(within(&[4.0, 80.0]).unwrap()).0, [4.0, 80.0]);
+        assert_eq!(ends(within(&[4.0, OPEN_ABOVE]).unwrap()).0, [4.0, 60.0]);
+        assert_eq!(ends(within(&[OPEN_ABOVE]).unwrap()).0, [60.0]);
+        // A first bound below the file's smallest value: the first class stays open.
+        let low = within(&[0.25, 4.0]).unwrap();
+        assert_eq!(ends(low.clone()), (vec![0.25, 4.0, 60.0], OPEN_BELOW));
+        assert_eq!(labels_of(&low), ["up to 0.25", "0.25 – 4", "4 – 60"]);
+        // Hostile bounds are refused as with no range.
+        assert!(within(&[]).is_err() && within(&[f64::NAN]).is_err() && within(&[OPEN_BELOW, 4.0]).is_err());
+        assert!(Renderer::graduated_manual_within(&d, "name", &[1.0], (0.0, 1.0), Ramp::Ember, base).is_err());
     }
 
     #[test]

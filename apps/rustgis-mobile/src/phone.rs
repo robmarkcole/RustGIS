@@ -1,20 +1,44 @@
-//! Android as a [`Platform`]: the system's file picker (the Storage Access Framework), asked for
-//! through the activity's Java half (`java/org/rustgis/mobile/MainActivity.java`).
+//! Android as a [`Platform`]: the system's file picker (the Storage Access Framework), its
+//! position, camera and text fields, asked for through the activity's Java half
+//! (`java/org/rustgis/mobile/MainActivity.java`).
 //!
 //! Rust calls Java and never the other way: what happened is collected with `takeEvents`, so the
 //! library exports nothing but `android_main`.
 
+use crate::shell;
 use jni::objects::{JObject, JString};
 use jni::refs::Global;
 use jni::{JValue, JavaVM, jni_sig, jni_str};
-use rustgis_engine::platform::{Event, Platform};
+use rustgis_engine::platform::{Event, Platform, TextEntry};
 use rustgis_ui_egui::i18n;
 use std::cell::RefCell;
+use std::sync::Arc;
 use winit::platform::android::activity::AndroidApp;
+
+/// A reference of RustGIS's own to the activity `android` runs, or why its Java side can't be
+/// reached.
+pub fn activity(android: &AndroidApp) -> Result<Global<JObject<'static>>, String> {
+    let raw = android.activity_as_ptr().cast();
+    JavaVM::singleton()
+        .and_then(|vm| {
+            vm.attach_current_thread(|env| {
+                // SAFETY: `android-activity` keeps this global reference to the activity alive
+                // for as long as `android_main` runs, and it is only borrowed here to make a
+                // global reference of our own.
+                #[expect(unsafe_code, reason = "see SAFETY above")]
+                let activity = unsafe { JObject::from_raw(env, raw) };
+                let held = env.new_global_ref(&activity);
+                // The borrowed reference is `android-activity`'s to delete, not ours.
+                let _ = activity.into_raw();
+                held
+            })
+        })
+        .map_err(|e| i18n::fmt("Android's Java side can't be reached: {error}", &[("error", &e.to_string())]))
+}
 
 /// The phone, through its activity.
 pub struct Phone {
-    activity: Global<JObject<'static>>,
+    activity: Arc<Global<JObject<'static>>>,
     /// Why the activity last couldn't be asked what happened, until it can be again: said once,
     /// not every frame.
     unreachable: RefCell<Option<String>>,
@@ -24,29 +48,26 @@ impl Phone {
     /// The phone `android` runs on, or why its Java half can't be reached (an APK built without
     /// it): the app then runs without a file picker and says so.
     pub fn new(android: &AndroidApp) -> Result<Phone, String> {
-        let raw = android.activity_as_ptr().cast();
-        let activity = JavaVM::singleton()
-            .and_then(|vm| {
-                vm.attach_current_thread(|env| {
-                    // SAFETY: `android-activity` keeps this global reference to the activity alive
-                    // for as long as `android_main` runs, and it is only borrowed here to make a
-                    // global reference of our own.
-                    #[expect(unsafe_code, reason = "see SAFETY above")]
-                    let activity = unsafe { JObject::from_raw(env, raw) };
-                    let held = env.new_global_ref(&activity);
-                    // The borrowed reference is `android-activity`'s to delete, not ours.
-                    let _ = activity.into_raw();
-                    held
-                })
-            })
-            .map_err(|e| i18n::fmt("Android's Java side can't be reached: {error}", &[("error", &e.to_string())]))?;
-        let phone = Phone { activity, unreachable: RefCell::new(None) };
+        let phone = Phone { activity: Arc::new(activity(android)?), unreachable: RefCell::new(None) };
         let owner = phone.java(|env, activity| {
             let token = env.call_method(activity, jni_str!("copyOwner"), jni_sig!(() -> JString), &[])?.l()?;
             env.cast_local::<JString>(token)?.try_to_string(env)
         })?;
         rustgis_ui_touch::set_copy_owner(owner)?;
         Ok(phone)
+    }
+
+    /// Tells the engine what Android allows (`rustgis_data::memory::set_phone`): the memory it
+    /// has, and, asked again each time a job plans, what is free of it. Where Android doesn't say
+    /// at start, [`shell::MEMORY_UNSAID`] stands in. Returns whether Android said.
+    pub fn plan_memory(&self) -> bool {
+        let activity = self.activity.clone();
+        let total = memory(&activity).map(|(total, _)| total).filter(|total| *total > 0);
+        let free = move || memory(&activity).map(|(_, free)| free);
+        if !rustgis_engine::data::memory::set_phone(total.unwrap_or(shell::MEMORY_UNSAID), free) {
+            log::warn!("the memory limits were read before Android's were set");
+        }
+        total.is_some()
     }
 
     /// Runs `call` with the Java environment and the activity, on this thread.
@@ -85,15 +106,59 @@ impl Phone {
         }
     }
 
+    /// Takes Android's Back from the system (`on`) or gives it up, where the system keeps it from
+    /// an app that doesn't ask (Android 16 on).
+    pub fn takes_back(&self, on: bool) {
+        let asked = self.java(|env, activity| {
+            env.call_method(activity, jni_str!("takesBack"), jni_sig!((on: boolean) -> void), &[JValue::Bool(on)])?.v()
+        });
+        if let Err(e) = asked {
+            log::warn!("{e}");
+        }
+    }
+
+    /// Whether Back, taken from the system, came since this was last asked. A refusal is logged,
+    /// as `takes_back`'s is, and counts as no Back.
+    pub fn take_back(&self) -> bool {
+        self.java(|env, activity| env.call_method(activity, jni_str!("takeBack"), jni_sig!(() -> boolean), &[])?.z())
+            .inspect_err(|e| log::warn!("{e}"))
+            .unwrap_or(false)
+    }
+
     /// Whether a picker for opening is on the screen and hasn't answered.
     pub fn picking(&self) -> bool {
         self.java(|env, activity| env.call_method(activity, jni_str!("picking"), jni_sig!(() -> boolean), &[])?.z()).unwrap_or(false)
+    }
+
+    /// Puts `text` on the system's clipboard. An error says why Android couldn't be asked (the
+    /// window's own clipboard still has the text); a refusal of Android's is reported later, as
+    /// `copy-failed`.
+    pub fn copy_text(&self, text: &str) -> Result<(), String> {
+        self.java(|env, activity| {
+            let text = env.new_string(text)?;
+            env.call_method(activity, jni_str!("copyText"), jni_sig!((text: JString) -> void), &[JValue::Object(&text)])?.v()
+        })
     }
 
     /// Whether something asked for is still to be reported: the window keeps asking while it is.
     pub fn busy(&self) -> bool {
         self.java(|env, activity| env.call_method(activity, jni_str!("busy"), jni_sig!(() -> boolean), &[])?.z()).unwrap_or(false)
     }
+}
+
+/// The memory Android has and what is free of it (`MainActivity.memory`), from any thread; `None`
+/// when it can't say.
+fn memory(activity: &JObject) -> Option<(u64, u64)> {
+    let text = JavaVM::singleton()
+        .and_then(|vm| {
+            vm.attach_current_thread(|env| -> jni::errors::Result<String> {
+                let said = env.call_method(activity, jni_str!("memory"), jni_sig!(() -> JString), &[])?.l()?;
+                env.cast_local::<JString>(said)?.try_to_string(env)
+            })
+        })
+        .ok()?;
+    let (total, free) = text.split_once(' ')?;
+    Some((total.parse().ok()?, free.parse().ok()?))
 }
 
 impl Platform for Phone {
@@ -118,6 +183,21 @@ impl Platform for Phone {
         })
     }
 
+    fn write_back(&self, document: &str, name: &str, bytes: Vec<u8>) -> Result<(), String> {
+        self.java(|env, activity| {
+            let document = env.new_string(document)?;
+            let name = env.new_string(name)?;
+            let bytes = env.byte_array_from_slice(&bytes)?;
+            env.call_method(
+                activity,
+                jni_str!("writeBack"),
+                jni_sig!((document: JString, name: JString, bytes: [jbyte]) -> void),
+                &[JValue::Object(&document), JValue::Object(&name), JValue::Object(&bytes)],
+            )?
+            .v()
+        })
+    }
+
     fn locate(&self, on: bool) -> Result<(), String> {
         self.java(|env, activity| env.call_method(activity, jni_str!("locate"), jni_sig!((on: boolean) -> void), &[JValue::Bool(on)])?.v())
     }
@@ -130,6 +210,27 @@ impl Platform for Phone {
 
     fn take_photo(&self) -> Result<(), String> {
         self.java(|env, activity| env.call_method(activity, jni_str!("takePhoto"), jni_sig!(() -> void), &[])?.v())
+    }
+
+    fn enters_text(&self) -> bool {
+        true
+    }
+
+    fn enter_text(&self, entry: &TextEntry) -> Result<(), String> {
+        self.java(|env, activity| {
+            let id = env.new_string(&entry.id)?;
+            let value = env.new_string(&entry.value)?;
+            let label = env.new_string(&entry.label)?;
+            let kind = env.new_string(entry.kind.word())?;
+            let done = env.new_string(&entry.done)?;
+            env.call_method(
+                activity,
+                jni_str!("enterText"),
+                jni_sig!((id: JString, value: JString, label: JString, kind: JString, done: JString) -> void),
+                &[JValue::Object(&id), JValue::Object(&value), JValue::Object(&label), JValue::Object(&kind), JValue::Object(&done)],
+            )?
+            .v()
+        })
     }
 
     fn take_events(&self) -> Vec<Event> {

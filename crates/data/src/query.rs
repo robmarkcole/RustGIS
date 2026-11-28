@@ -35,7 +35,10 @@ mod complete;
 #[cfg(test)]
 mod legacy;
 
-pub use complete::{Call, Completion, FieldValue, FieldValues, Place, VALUES_READ, complete_at, field_values, literal};
+pub use complete::{
+    Call, Completion, FieldValue, FieldValues, Follows, Place, VALUE_CHARS, VALUES_READ, brackets, complete_at, field_values, follows,
+    literal,
+};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
@@ -587,6 +590,8 @@ enum Tok {
     QuotedIdent(String),
     Str(String),
     Num(f64),
+    /// A whole-number literal (digits only) that an `i64` holds: exact, never via a float.
+    Int(i64),
     /// A comparison operator.
     Op(String),
     Arith(Arith),
@@ -649,6 +654,12 @@ struct Lexed {
 /// `@` or `$` that is the last character, ends it instead of being an error. Anything else that
 /// can't be read is an error either way.
 fn lex_spans(s: &str, tolerant: bool) -> Result<Lexed, String> {
+    lex_first(s, tolerant, usize::MAX)
+}
+
+/// As [`lex_spans`], reading no more than the first `most` tokens: what comes after them, which
+/// may not read (`'a'#`), isn't looked at.
+fn lex_first(s: &str, tolerant: bool, most: usize) -> Result<Lexed, String> {
     if s.chars().count() > MAX_LEN {
         return Err("the expression is too long".into());
     }
@@ -664,7 +675,9 @@ fn lex_spans(s: &str, tolerant: bool) -> Result<Lexed, String> {
         }
         cs.get(st..*i).map(|s| s.iter().collect()).unwrap_or_default()
     };
-    while let Some(&c) = cs.get(i) {
+    while let Some(&c) = cs.get(i)
+        && out.len() < most
+    {
         let start = i;
         let before = out.len();
         match c {
@@ -766,7 +779,7 @@ fn lex_spans(s: &str, tolerant: bool) -> Result<Lexed, String> {
                     }
                 }
                 let t: String = cs.get(st..i).map(|s| s.iter().collect()).unwrap_or_default();
-                out.push(Tok::Num(t.parse().map_err(|_| format!("bad number '{t}'"))?));
+                out.push(number_token(&t)?);
             }
             '@' | '$' => {
                 i += 1;
@@ -785,6 +798,88 @@ fn lex_spans(s: &str, tolerant: bool) -> Result<Lexed, String> {
         }
     }
     Ok(Lexed { toks: out, spans, open })
+}
+
+/// The token of a number literal, refusing one that can't be held exactly rather than rounding it.
+/// A literal of digits only is an exact `i64`; past `i64::MAX`, a decimal that holds it exactly, or
+/// refused. Any other literal is a
+/// decimal (`f64`), refused only when the decimal read would have other whole-number digits than
+/// written (`9007199254740993.0`, `1.2345678901234567891e19`, `2.99999999999999999`); its
+/// fraction digits round as any do. One that merely has no
+/// exact binary form (`0.1`) or many fraction digits (`0.12345678901234567891`) is read as the
+/// nearest decimal, as every number written in decimal is.
+fn number_token(t: &str) -> Result<Tok, String> {
+    if t.bytes().all(|b| b.is_ascii_digit()) {
+        if let Ok(i) = t.parse::<i64>() {
+            return Ok(Tok::Int(i));
+        }
+        // Past `i64::MAX`, a whole number is a decimal when one holds it exactly (2^63 does), and
+        // refused when it would be rounded.
+        if Value::Text(t.to_string()).rounds_as_double() {
+            return Err(format!("the whole number {t} has more digits than a number holds exactly, so it would be rounded"));
+        }
+        return t.parse().map(Tok::Num).map_err(|_| format!("bad number '{t}'"));
+    }
+    let n: f64 = t.parse().map_err(|_| format!("bad number '{t}'"))?;
+    // Refused when the decimal read has other whole-number digits than written: a decimal can't
+    // hold them, or the fraction rounds up into them (`2.99999999999999999` reads as 3). Its
+    // fraction digits read as the nearest decimal, as any fraction does.
+    if n.is_finite() && whole_digits_round(t) {
+        return Err(format!("the number {t} has more whole-number digits than a decimal number holds exactly, so it would be rounded"));
+    }
+    Ok(Tok::Num(n))
+}
+
+/// Whether a decimal literal's whole-number digits, its exponent applied, would be changed: digits
+/// written out (`9007199254740993.0`, `1.2345678901234567891e19`) must be read back as written,
+/// a fraction rounding up into them (`1000000000000000.99`) included; zeros an
+/// exponent adds past them (`1e307`) weren't written, so only the written digits need holding.
+/// `false` for one that isn't written in digits.
+pub(crate) fn whole_digits_round(t: &str) -> bool {
+    // An ordinary number, with at most 15 digits in all and no exponent, a decimal holds exactly,
+    // fraction included, so it can't round into the whole part.
+    if !t.contains(['e', 'E']) && t.trim_start_matches(['0', '.']).bytes().filter(u8::is_ascii_digit).count() <= 15 {
+        return false;
+    }
+    let (mantissa, exp) = match t.split_once(['e', 'E']) {
+        Some((m, e)) => match e.parse::<i64>() {
+            Ok(e) => (m, e),
+            Err(_) => return false,
+        },
+        None => (t, 0),
+    };
+    let (int, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if !int.bytes().chain(frac.bytes()).all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    let digits = format!("{int}{frac}");
+    // Where the point falls in `digits`, the exponent moving it.
+    let Some(point) = i64::try_from(int.len()).ok().and_then(|n| n.checked_add(exp)).and_then(|p| usize::try_from(p).ok()) else {
+        return false;
+    };
+    let written: String = digits.chars().take(point).collect();
+    let added = point.saturating_sub(digits.len());
+    if added == 0 {
+        // The whole part of the decimal read must be the one written: a decimal that can't hold
+        // those digits (`9007199254740993.0`) changes them, and so does a fraction that rounds up
+        // into them (`1000000000000000.99` reads as 1000000000000001).
+        let written = written.trim_start_matches('0');
+        let written = if written.is_empty() { "0" } else { written };
+        !t.parse::<f64>().is_ok_and(|x| x.is_finite() && format!("{:.0}", x.abs().trunc()) == written)
+    } else {
+        // Every digit written counts, trailing zeros too (`100000000000000000000000e1`): the decimal
+        // read, to as many significant digits, must give them back. The zeros the exponent adds
+        // weren't written, so `1e24` needs only its `1`.
+        let written = written.trim_start_matches('0');
+        if written.is_empty() {
+            return false;
+        }
+        let precision = written.len() - 1;
+        !t.parse::<f64>().is_ok_and(|x| {
+            let shown = format!("{:.*e}", precision, x.abs());
+            x.is_finite() && shown.split(['e', 'E']).next().is_some_and(|m| m.replace('.', "") == written)
+        })
+    }
 }
 
 /// A number literal: whole numbers are integers.
@@ -821,6 +916,11 @@ struct Probe {
     field: Option<usize>,
     /// Whether that value is a `LIKE` / `ILIKE` pattern (`name LIKE ▮`).
     pattern: bool,
+    /// Whether the value at the end is compared, whatever the left side is (`upper(name) = ▮`).
+    compared: bool,
+    /// Where the last compared value starts (a token), with `field` and `pattern` for it: a
+    /// bracket opened there compares the value just inside it too (`name = (▮`).
+    compared_from: Option<(usize, Option<usize>, bool)>,
 }
 
 /// How a token is written, for the symbols [`Probe`] notes.
@@ -864,17 +964,35 @@ impl Parser<'_> {
             what(&mut p);
         }
     }
-    /// Notes that a value at the end would be compared with `l`, when `l` is a field.
+    /// Notes that a value at the end would be compared with `l`, and with which field when `l` is
+    /// one.
     fn note_compared(&self, l: &Expr) {
         self.note_compared_as(l, false);
     }
     /// As [`note_compared`](Self::note_compared), the value a `LIKE` pattern when `pattern`.
     fn note_compared_as(&self, l: &Expr, pattern: bool) {
-        if let Expr::Field(f) = l {
-            self.note(self.pos, |p| {
-                p.field = Some(*f);
-                p.pattern = pattern;
-            });
+        let field = if let Expr::Field(f) = l { Some(*f) } else { None };
+        self.note_compared_at(self.pos, field, pattern);
+    }
+    /// Notes that the value starting at token `i` is compared, with `field` when one.
+    fn note_compared_at(&self, i: usize, field: Option<usize>, pattern: bool) {
+        if let Some(probe) = &self.probe {
+            probe.borrow_mut().compared_from = Some((i, field, pattern));
+        }
+        self.note(i, |p| {
+            p.compared = true;
+            p.field = field;
+            p.pattern = pattern;
+        });
+    }
+    /// Notes, for a bracket at token `open` where a compared value starts, that the value just
+    /// inside it is compared as well (`name = (▮`, `pop > ((▮`).
+    fn note_compared_within(&self, open: usize) {
+        let from = self.probe.as_ref().and_then(|p| p.borrow().compared_from);
+        if let Some((at, field, pattern)) = from
+            && at == open
+        {
+            self.note_compared_at(open + 1, field, pattern);
         }
     }
     fn probing(&self) -> bool {
@@ -1055,9 +1173,10 @@ impl Parser<'_> {
     /// `1 IN (1 IN (…))` meets the limit.
     fn item(&mut self) -> Result<Expr, String> {
         let sign = usize::from(matches!(self.toks.get(self.pos), Some(Tok::Arith(Arith::Add | Arith::Sub))));
-        let single =
-            matches!(self.toks.get(self.pos + sign), Some(Tok::Num(_) | Tok::Str(_) | Tok::Ident(_) | Tok::QuotedIdent(_) | Tok::Var(_)))
-                && matches!(self.toks.get(self.pos + sign + 1), Some(Tok::Comma | Tok::RParen));
+        let single = matches!(
+            self.toks.get(self.pos + sign),
+            Some(Tok::Num(_) | Tok::Int(_) | Tok::Str(_) | Tok::Ident(_) | Tok::QuotedIdent(_) | Tok::Var(_))
+        ) && matches!(self.toks.get(self.pos + sign + 1), Some(Tok::Comma | Tok::RParen));
         if single {
             return self.unary();
         }
@@ -1191,7 +1310,7 @@ impl Parser<'_> {
         };
         self.pos += 1;
         // A sign before a number is part of the literal and nests nothing.
-        let nests = !matches!(self.toks.get(self.pos), Some(Tok::Num(_)));
+        let nests = !matches!(self.toks.get(self.pos), Some(Tok::Num(_) | Tok::Int(_)));
         if nests {
             self.deeper()?;
         }
@@ -1254,6 +1373,7 @@ impl Parser<'_> {
         self.note(self.pos, |p| p.operand = true);
         match self.next() {
             Some(Tok::LParen) => {
+                self.note_compared_within(self.pos.saturating_sub(1));
                 let e = self.or()?;
                 self.note(self.pos, |p| p.symbols.push(")"));
                 if self.next() != Some(Tok::RParen) {
@@ -1264,6 +1384,7 @@ impl Parser<'_> {
             // A number too large to represent (`1e999`) would be infinity, which nothing reads.
             Some(Tok::Num(n)) if n.is_finite() => Ok(Expr::Lit(num(n))),
             Some(Tok::Num(_)) => Err("the number is too large".into()),
+            Some(Tok::Int(i)) => Ok(Expr::Lit(Value::Int(i))),
             Some(Tok::Str(s)) => Ok(Expr::Lit(Value::Text(s))),
             Some(Tok::QuotedIdent(s)) => self.field(&s),
             Some(Tok::Var(v)) => match VARS.iter().find(|s| s.names.iter().any(|n| n.eq_ignore_ascii_case(&v))).map(|s| s.var) {
@@ -1406,6 +1527,7 @@ fn show(t: Option<&Tok>) -> String {
         Some(Tok::QuotedIdent(s)) => format!("\"{s}\""),
         Some(Tok::Str(s)) => format!("'{s}'"),
         Some(Tok::Num(n)) => n.to_string(),
+        Some(Tok::Int(i)) => i.to_string(),
         Some(Tok::Op(o)) => format!("'{o}'"),
         Some(Tok::Arith(a)) => format!(
             "'{}'",
@@ -1616,10 +1738,24 @@ pub fn matches(e: &Expr, ds: &Dataset, row: usize, env: &Env) -> bool {
 
 /// Tests a row in a chunk whose first row has `offset` preceding rows in the source.
 pub(crate) fn eval_in_chunk(e: &Expr, ds: &Dataset, row: usize, offset: usize) -> bool {
-    let env = Env::default();
-    let mut eval = Eval::new(ds, row, &env);
+    matches_at(e, ds, row, &Env::default(), offset)
+}
+
+/// [`matches`] for a row of `ds` that has `offset` rows before `ds`'s first in its layer, so
+/// `@row_number` reads its place there: a chunk of a source, or a copy of one row (#2837).
+pub fn matches_at(e: &Expr, ds: &Dataset, row: usize, env: &Env, offset: usize) -> bool {
+    let mut eval = Eval::new(ds, row, env);
     eval.row_offset = offset;
     eval.cond(e) == Some(true)
+}
+
+/// [`value_or_fault`] at `offset`, as [`matches_at`] reads a row.
+pub fn value_or_fault_at(e: &Expr, ds: &Dataset, row: usize, env: &Env, offset: usize) -> (Value, Option<Fault>) {
+    let mut eval = Eval::new(ds, row, env);
+    eval.row_offset = offset;
+    let v = eval.value(e).into_owned();
+    let fault = if v.is_null() { eval.fault.get() } else { None };
+    (v, fault)
 }
 
 /// The expression's value for one row.
@@ -1632,10 +1768,7 @@ pub fn value(e: &Expr, ds: &Dataset, row: usize, env: &Env) -> Value {
 /// or `CASE` condition only picks the branch, so it isn't the result's. Where several errors
 /// reach the result, the first one met is given.
 pub fn value_or_fault(e: &Expr, ds: &Dataset, row: usize, env: &Env) -> (Value, Option<Fault>) {
-    let eval = Eval::new(ds, row, env);
-    let v = eval.value(e).into_owned();
-    let fault = if v.is_null() { eval.fault.get() } else { None };
-    (v, fault)
+    value_or_fault_at(e, ds, row, env, 0)
 }
 
 /// Whether a value counts as true: a non-zero number, non-empty text; null is unknown.

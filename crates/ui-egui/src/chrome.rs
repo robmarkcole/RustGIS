@@ -4,6 +4,7 @@
 use egui::{Align2, CornerRadius, Key, KeyboardShortcut, Modifiers, Rect, Sense, Stroke, Ui, pos2, vec2};
 use serde_json::{Value, json};
 
+use crate::inuse::{Late, Pane};
 use crate::mapview::Toast;
 use crate::theme::{Tokens, regular, semibold};
 use crate::widgets::{row_button, selectable_menu_row, small, text_w, why_disabled};
@@ -218,7 +219,9 @@ fn header_branding(ui: &mut Ui, app: &mut RustGisApp, right: f32, tokens: &Token
 
 /// Fits as many toolbar items as the header has room for. At the narrowest width, search joins the overflow.
 fn quick_access(ui: &mut Ui, app: &mut RustGisApp, right: f32, separate_search: bool) {
-    let pinned = app.ui.quick_access.clone();
+    // A pinned command of an extension that is off stays pinned, and isn't shown (#1752).
+    let mut pinned = app.ui.quick_access.clone();
+    pinned.retain(|id| !crate::extensionsui::hidden(app, id));
     let mut items = vec![
         ("project.new", "new", "New project"),
         ("ui.open", "open", "Open project"),
@@ -332,6 +335,14 @@ pub(crate) struct HistoryJump {
     total: usize,
     done: usize,
     cancel_pressed: bool,
+}
+
+impl HistoryJump {
+    /// `total` Undo steps from the history position `position`, as the Messages pane's Undo to
+    /// before this asks: a long jump has the same progress and Cancel as Undo History's.
+    pub(crate) fn undo(position: (u64, u64), total: usize) -> Self {
+        Self { command: "edit.undo", position, total, done: 0, cancel_pressed: false }
+    }
 }
 
 /// Advances a jump within the frame budget. Each step uses the UI's normal undo/redo cleanup.
@@ -464,6 +475,12 @@ pub fn status_bar(app: &mut RustGisApp, ui: &mut Ui) {
                 if resp.clicked() && !level {
                     let _ = app.run("map.resetNorth", json!({}));
                 }
+                // The pointer's coordinates and the map's coordinate system change on a click, so
+                // they are buttons, framed to look it. The two buttons' padding takes what the three
+                // narrower gaps give up, so the bar, full in a narrow window, stays about as wide.
+                let (gap, padding) = (ui.spacing().item_spacing.x, ui.spacing().button_padding.x);
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.spacing_mut().button_padding.x = 3.0;
                 sep(ui, &t);
                 // Pointer coordinates.
                 let format = app.map.coord_format;
@@ -472,12 +489,17 @@ pub fn status_bar(app: &mut RustGisApp, ui: &mut Ui) {
                 // dimmed then, to tell it from a live one.
                 let kept = app.map.kept_pointer_lonlat(app.session.map().instance_id(), app.session.opened);
                 let live = app.map.pointer_lonlat.is_some();
-                let resp = ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(format.readout(kept, earth, crate::coordreadout::MapSystem::of(app.session.map()).as_ref())).monospace().size(11.5).color(if live { t.text_dim } else { t.text_disabled }),
-                    )
-                    .sense(Sense::click()),
-                );
+                // Layer coordinates name their system, the active layer's, which the map's beside
+                // them isn't.
+                let system = format.system(app.session.map(), app.session.active_layer);
+                let mut text = format.readout(kept, earth, system.as_ref());
+                // Named only beside a position: with none yet, the dash stands alone.
+                if let Some(s) = system.as_ref().filter(|_| format == crate::CoordReadout::Layer && kept.is_some()) {
+                    text = format!("{text}  {}", s.name());
+                }
+                // Dimmed, not disabled: in its frame, disabled text would look like a button that is off.
+                let color = if live { t.text } else { t.text_dim };
+                let resp = ui.add(egui::Button::new(egui::RichText::new(text).monospace().size(11.5).color(color)).small());
                 if resp.on_hover_text(format.hover()).clicked() {
                     let _ = app.run("ui.coordinateFormat", Value::Null);
                 }
@@ -486,10 +508,12 @@ pub fn status_bar(app: &mut RustGisApp, ui: &mut Ui) {
                     rustgis_engine::map::Projection::WebMercator => tl!("WGS 84 / Web Mercator").to_string(),
                     p => tl!(p.label().as_str()).to_string(),
                 };
-                let resp = ui.add(egui::Label::new(egui::RichText::new(projection).size(11.0).color(t.text_dim)).sense(Sense::click()));
+                let resp = ui.add(egui::Button::new(egui::RichText::new(projection).size(11.0)).small());
                 if resp.on_hover_text(tl!("Change the map's coordinate system")).clicked() {
                     let _ = app.run("ui.dialog", json!({"name": "coordinateSystem"}));
                 }
+                ui.spacing_mut().item_spacing.x = gap;
+                ui.spacing_mut().button_padding.x = padding;
                 sep(ui, &t);
                 let n = app.session.map().selection_count();
                 ui.label(
@@ -520,6 +544,9 @@ pub fn status_bar(app: &mut RustGisApp, ui: &mut Ui) {
                 }
                 #[cfg(not(target_arch = "wasm32"))]
                 source_open_status(app, ui, &t);
+                // Data cubes' summaries plugin commands left to read off the frame (#3183).
+                #[cfg(not(target_arch = "wasm32"))]
+                summaries_status(app, ui, &t);
                 crate::geocodeui::status(app, ui);
                 // Downloads and windows being read off the frame, each with its Cancel.
                 if !app.ui.downloads.is_empty() || window_reads_under_way(app) {
@@ -629,6 +656,47 @@ pub fn status_bar(app: &mut RustGisApp, ui: &mut Ui) {
         });
 }
 
+/// How the strip of work running off the frame is drawn: in the desktop's status bar, or at a
+/// finger's size for a shell with its own interface ([`RustGisApp::chrome`]).
+#[derive(Clone, Copy)]
+pub(crate) struct StripSize {
+    /// The size of its words.
+    pub(crate) text: f32,
+    finger: bool,
+}
+
+impl StripSize {
+    pub(crate) fn of(app: &RustGisApp) -> StripSize {
+        let finger = app.chrome.is_some();
+        StripSize { text: if finger { 14.0 } else { 11.5 }, finger }
+    }
+
+    /// A job's progress bar, `fraction` of the way.
+    pub(crate) fn progress(self, ui: &mut Ui, fraction: f32) {
+        let height = if self.finger { 20.0 } else { 12.0 };
+        ui.add(egui::ProgressBar::new(fraction).show_percentage().desired_width(120.0).desired_height(height));
+    }
+
+    /// A job's Cancel where a finger's strip has it, before the job's words, so it is in sight
+    /// however long they are. Says whether it was tapped; nothing in the status bar.
+    pub(crate) fn cancel_first(self, ui: &mut Ui, enabled: bool) -> bool {
+        let size = vec2(FINGER_CANCEL, FINGER);
+        self.finger && ui.add_enabled(enabled, egui::Button::new(egui::RichText::new(tl!("Cancel")).size(16.0)).min_size(size)).clicked()
+    }
+
+    /// A job's Cancel where the status bar has it, after the job's words. Says whether it was
+    /// clicked; nothing in a finger's strip.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn cancel_last(self, ui: &mut Ui, enabled: bool) -> bool {
+        !self.finger && ui.add_enabled(enabled, egui::Button::new(tl!("Cancel")).small()).clicked()
+    }
+}
+
+/// The height of what a finger taps, in points (Android's guidance is 48).
+pub(crate) const FINGER: f32 = 48.0;
+/// The width of a finger's strip's Cancel.
+const FINGER_CANCEL: f32 = 88.0;
+
 /// Restored local FlatGeobuf layers classify dates off the frame, including hidden maps.
 /// This status keeps progress and Cancel available until those scans finish.
 #[cfg(not(target_arch = "wasm32"))]
@@ -645,15 +713,19 @@ fn source_open_status(app: &RustGisApp, ui: &mut Ui, t: &Tokens) {
     if sources.is_empty() {
         return;
     }
+    let size = StripSize::of(app);
+    let cancellable = sources.iter().any(|(_, (_, _, cancelled))| !cancelled);
     sep(ui, t);
     ui.spinner();
-    ui.label(egui::RichText::new(tl!("Reading dates…")).size(11.5).color(t.text_dim));
+    let mut cancel = size.cancel_first(ui, cancellable);
+    ui.label(egui::RichText::new(tl!("Reading dates…")).size(size.text).color(t.text_dim));
     let (done, total) =
         sources.iter().fold((0u64, 0u64), |(done, total), (_, (d, n, _))| (done.saturating_add(*d), total.saturating_add(*n)));
     if total > 0 && sources.iter().all(|(_, (_, n, _))| *n > 0) {
-        ui.add(egui::ProgressBar::new((done as f32 / total as f32).min(1.0)).show_percentage().desired_width(120.0).desired_height(12.0));
+        size.progress(ui, (done as f32 / total as f32).min(1.0));
     }
-    if ui.add_enabled(sources.iter().any(|(_, (_, _, cancelled))| !cancelled), egui::Button::new(tl!("Cancel")).small()).clicked() {
+    cancel |= size.cancel_last(ui, cancellable);
+    if cancel {
         for (source, _) in sources {
             source.cancel_opening();
         }
@@ -661,11 +733,42 @@ fn source_open_status(app: &RustGisApp, ui: &mut Ui, t: &Tokens) {
     ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
 }
 
+/// The data cubes' summaries plugin commands left to read off the frame (#3183), each naming its
+/// command, with its progress and Cancel: the command runs again once its summary has landed, or
+/// says it was cancelled.
+#[cfg(not(target_arch = "wasm32"))]
+fn summaries_status(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
+    let under_way = app.session.plugin_summaries();
+    if under_way.is_empty() {
+        return;
+    }
+    let size = StripSize::of(app);
+    let mut cancel = None;
+    for summary in &under_way {
+        sep(ui, t);
+        ui.spinner();
+        if size.cancel_first(ui, !summary.cancelled) {
+            cancel = Some(summary.id);
+        }
+        let reading = crate::i18n::fmt("Reading for {command}…", &[("command", &crate::pluginstart::title(app, &summary.command))]);
+        ui.label(egui::RichText::new(reading).size(size.text).color(t.text_dim));
+        size.progress(ui, summary.done as f32 / summary.total.max(1) as f32);
+        if size.cancel_last(ui, !summary.cancelled) {
+            cancel = Some(summary.id);
+        }
+    }
+    if let Some(id) = cancel {
+        app.session.cancel_plugin_summary(id);
+    }
+    // The bar moves while the slices are read on their thread.
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+}
+
 /// Whether work is running that the status bar shows with its progress and Cancel: an export, a
-/// file or a layer being read, a download.
+/// file or a layer being read, a download, a plugin command's summary.
 pub(crate) fn background_busy(app: &RustGisApp) -> bool {
     #[cfg(not(target_arch = "wasm32"))]
-    if app.export_job.is_some() || crate::readjob::showing(app) || sources_opening(app) {
+    if app.export_job.is_some() || crate::readjob::showing(app) || sources_opening(app) || !app.session.plugin_summaries().is_empty() {
         return true;
     }
     !app.ui.downloads.is_empty() || window_reads_under_way(app)
@@ -684,6 +787,8 @@ pub(crate) fn background_status(app: &mut RustGisApp, ui: &mut Ui) {
     }
     #[cfg(not(target_arch = "wasm32"))]
     source_open_status(app, ui, &t);
+    #[cfg(not(target_arch = "wasm32"))]
+    summaries_status(app, ui, &t);
     if !app.ui.downloads.is_empty() || window_reads_under_way(app) {
         downloads_status(app, ui, &t);
     }
@@ -710,16 +815,23 @@ fn window_reads_under_way(app: &RustGisApp) -> bool {
 /// (`RustGisApp::cancel_download`): one in the bar itself, several as a menu of them.
 fn downloads_status(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     let under_way = app.downloads_under_way();
+    let size = StripSize::of(app);
     let mut cancel = None;
     ui.spinner();
     match under_way.as_slice() {
         [] => {}
-        [one] => download_row(ui, t, one, &mut cancel),
+        [one] => download_row(ui, t, size, one, &mut cancel),
         many => {
-            ui.menu_button(crate::i18n::fmt("{n} downloads", &[("n", &many.len().to_string())]), |ui| {
-                for d in many {
-                    ui.horizontal(|ui| download_row(ui, t, d, &mut cancel));
+            ui.scope(|ui| {
+                // A finger opens the menu too; what the strip draws after it keeps its own size.
+                if size.finger {
+                    ui.spacing_mut().interact_size.y = FINGER;
                 }
+                ui.menu_button(crate::i18n::fmt("{n} downloads", &[("n", &many.len().to_string())]), |ui| {
+                    for d in many {
+                        ui.horizontal(|ui| download_row(ui, t, size, d, &mut cancel));
+                    }
+                });
             });
         }
     }
@@ -734,7 +846,11 @@ fn downloads_status(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
 /// progress and its Cancel. A file's whole download shows a bar once the server said its size and
 /// the megabytes read before; a window's read ("Reading…", as its start notice says) isn't
 /// counted, nor is a download in the browser.
-fn download_row(ui: &mut Ui, t: &Tokens, d: &crate::UnderWay, cancel: &mut Option<u64>) {
+fn download_row(ui: &mut Ui, t: &Tokens, size: StripSize, d: &crate::UnderWay, cancel: &mut Option<u64>) {
+    let hint = tl!("Stop this download; nothing is added");
+    if size.cancel_first(ui, true) {
+        *cancel = Some(d.id);
+    }
     let received = d.progress.as_ref().map_or(0, |p| p.received());
     let fraction = d.progress.as_ref().and_then(|p| p.fraction());
     let doing = match (&d.progress, fraction) {
@@ -744,14 +860,14 @@ fn download_row(ui: &mut Ui, t: &Tokens, d: &crate::UnderWay, cancel: &mut Optio
         }
         (Some(_), _) => tl!("Downloading…").to_string(),
     };
-    ui.label(egui::RichText::new(doing).size(11.5).color(t.text_dim));
+    ui.label(egui::RichText::new(doing).size(size.text).color(t.text_dim));
     let short: String =
         if d.shown.chars().count() > 48 { format!("{}…", d.shown.chars().take(47).collect::<String>()) } else { d.shown.clone() };
-    ui.label(egui::RichText::new(short).size(11.5)).on_hover_text(&d.shown);
+    ui.label(egui::RichText::new(short).size(size.text)).on_hover_text(&d.shown);
     if let Some(f) = fraction {
-        ui.add(egui::ProgressBar::new(f).show_percentage().desired_width(120.0).desired_height(12.0));
+        size.progress(ui, f);
     }
-    if ui.small_button(tl!("Cancel")).on_hover_text(tl!("Stop this download; nothing is added")).clicked() {
+    if !size.finger && ui.small_button(tl!("Cancel")).on_hover_text(hint).clicked() {
         *cancel = Some(d.id);
     }
 }
@@ -812,10 +928,22 @@ fn parse_scale(text: &str) -> Option<f64> {
 
 /// Global keyboard shortcuts.
 pub fn shortcuts(app: &mut RustGisApp, ctx: &egui::Context) {
-    // Behind a dialog (Save changes?, Recover unsaved work?, Command Search…) the keys are the
-    // dialog's: Escape answers it rather than switching tools, and Ctrl+N can't start what it
-    // asks about.
-    if crate::saveprompt::waiting(app) || ctx.memory(|m| m.top_modal_layer()).is_some() || app.ui.shortcut_editor.capturing() {
+    if behind_a_dialog(app, ctx) {
+        return;
+    }
+    // The repeat-use form is not modal: another pane or an unfinished sketch keeps Escape.
+    let point_dialog_owns_escape = app.dialogs.open == Some("createPointXY")
+        && match ctx.memory(|m| m.focused()) {
+            Some(id) => ctx.read_response(id).is_some_and(|r| r.layer_id.id == egui::Id::unique(("dialog", "createPointXY"))),
+            None => {
+                app.map.sketch_len() == 0
+                    && !app.session.map().view.first_person
+                    && !crate::boxedit::drawing(app)
+                    && !crate::circleedit::drawing(app)
+            }
+        };
+    if point_dialog_owns_escape && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+        app.dialogs.open = None;
         return;
     }
     if app.ui.history_jump.is_some()
@@ -826,20 +954,19 @@ pub fn shortcuts(app: &mut RustGisApp, ctx: &egui::Context) {
         app.ui.history_jump = None;
     }
     crate::modelbuilder::shortcuts(app, ctx);
-    // The search box (or a table cell) was typed in until egui took its focus away on Escape:
-    // that Escape clears the box (leaves the cell as it was), not the tool. An open list (a
-    // clause's Functions) keeps the same keys as a box, those without Ctrl (⌘): Escape closes it.
-    let pass = ctx.cumulative_pass_nr();
-    let typing = ctx.egui_wants_keyboard_input()
-        || crate::completion::menu_is_open(ctx)
-        || crate::crspicker::list_is_open(ctx)
-        || crate::searchbox::had_focus(&app.ui.search, pass)
-        || crate::table::had_focus(&app.table, pass);
+    let typing = typing(app, ctx);
     // A text field focused, not any widget (a button reached with Tab): it has an undo of its own.
     let text_field = ctx.text_edit_focused();
     // An element selected in the open layout, for the layout's own keys.
     let element = app.session.active_layout.is_some() && app.layout.selected.is_some();
-    let mut run: Vec<(String, Value)> = Vec::new();
+    // The pane the user last pressed or scrolled in: Delete and Rename act on it.
+    let pane = crate::inuse::pane(app);
+    // The arrows nudge that element, unless the attribute table is in use: they are its cells'.
+    let nudges = element && pane != Pane::Table;
+    // What to run now, each with the pane that was in use as its key went down, and what to run
+    // once the panes are drawn ([`late_keys`]).
+    let mut run: Vec<(String, Value, Pane)> = Vec::new();
+    let mut late: Vec<Late> = Vec::new();
     let keymap = &app.ui.keymap;
     ctx.input_mut(|i| {
         for b in keymap.match_order() {
@@ -847,14 +974,23 @@ pub fn shortcuts(app: &mut RustGisApp, ctx: &egui::Context) {
             // which type text, and undo and redo, whatever they're bound to (#685), as ModelBuilder
             // leaves them.
             // Pause unmodified shortcuts during first-person movement, retaining the existing Escape, Home and Delete controls.
-            if (typing && !b.chord.command)
-                || (text_field && b.chord.is_text_undo())
+            if text_takes(Some(b.chord), typing, text_field)
                 || (app.session.map().view.first_person
                     && !b.chord.command
                     && !b.chord.alt
                     && !b.chord.shift
                     && !matches!(b.chord.key, Key::Escape | Key::Home | Key::Delete))
             {
+                continue;
+            }
+            // The press that the shortcut takes, if it isn't only a held key's repeats, and the
+            // pane that was in use as it came.
+            let press = crate::inuse::press(app, b.chord.key, Some(b.chord.modifiers()));
+            let key_pane = press.map_or(pane, |press| press.pane);
+            // Select All is the text's while a text field has the focus, and is left alone where
+            // there are no features to select: in a layout, in ModelBuilder and in a standalone
+            // table's view.
+            if b.command == "select.all" && select_all_left_alone(app, key_pane, typing || text_field) {
                 continue;
             }
             // Duplicating needs a selected layout element, and not a text field being typed in;
@@ -864,45 +1000,183 @@ pub fn shortcuts(app: &mut RustGisApp, ctx: &egui::Context) {
             }
             // With a layout element selected, the arrows nudge it (below), whatever else they run;
             // the nudge never takes Ctrl (⌘), so a shortcut with it still runs.
-            if element && !b.chord.command && matches!(b.chord.key, Key::ArrowLeft | Key::ArrowRight | Key::ArrowUp | Key::ArrowDown) {
+            if nudges && !b.chord.command && matches!(b.chord.key, Key::ArrowLeft | Key::ArrowRight | Key::ArrowUp | Key::ArrowDown) {
                 continue;
             }
             if i.consume_shortcut(&KeyboardShortcut::new(b.chord.modifiers(), b.chord.key)) {
-                run.push((b.command.clone(), b.params.clone()));
+                let (id, params) = (b.command.clone(), b.params.clone());
+                match press {
+                    None if follows_click(&id) && repeat_stops(app, b.chord.key, pane) => {}
+                    None => run.push((id, params, pane)),
+                    // A key that acts on what a click picks waits for the click to be taken.
+                    Some(press) if press.after_click && follows_click(&id) => {
+                        late.push(Late { id, params, pane: press.pane, chord: Some(b.chord) });
+                    }
+                    Some(press) => run.push((id, params, press.pane)),
+                }
             }
         }
         if !typing {
-            // A Mac keyboard's delete key is Backspace: it deletes a layout element too.
-            if element && i.consume_key(Modifiers::NONE, Key::Backspace) {
-                run.push(("edit.delete".into(), Value::Null));
+            // A Mac keyboard's delete key is Backspace: it deletes a layout element too, and
+            // removes the layers picked in the layer list. There it is the key alone, pressed
+            // once: `consume_key` takes Shift and Alt with it, and a held key's repeats.
+            let press = crate::inuse::press(app, Key::Backspace, None);
+            let key_pane = press.map_or(pane, |press| press.pane);
+            // In the layer list only that press counts; for a layout's element, a repeat does too.
+            let takes = if key_pane == Pane::Layers { press.is_some() } else { element };
+            if takes && i.consume_key(Modifiers::NONE, Key::Backspace) {
+                let (id, params) = ("edit.delete".to_string(), Value::Null);
+                if press.is_some_and(|press| press.after_click) {
+                    late.push(Late { id, params, pane: key_pane, chord: None });
+                } else if press.is_some() || !repeat_stops(app, Key::Backspace, key_pane) {
+                    run.push((id, params, key_pane));
+                }
             }
             // Arrow keys nudge the selected layout element, further with Shift; held, it keeps
             // going. Shift first: a plain arrow's pattern takes Shift-arrows too.
-            if element {
+            if nudges {
                 use crate::layoutview::{NUDGE_FAST_MM, NUDGE_MM};
                 for (key, dx, dy) in
                     [(Key::ArrowLeft, -1.0, 0.0), (Key::ArrowRight, 1.0, 0.0), (Key::ArrowUp, 0.0, -1.0), (Key::ArrowDown, 0.0, 1.0)]
                 {
                     for (m, step) in [(Modifiers::SHIFT, NUDGE_FAST_MM), (Modifiers::NONE, NUDGE_MM)] {
                         for _ in 0..i.count_and_consume_key(m, key) {
-                            run.push(("ui.layoutNudge".into(), json!({"dx": dx * step, "dy": dy * step})));
+                            run.push(("ui.layoutNudge".into(), json!({"dx": dx * step, "dy": dy * step}), pane));
                         }
                     }
                 }
             }
-            // Clipboard keys arrive as events, not key presses.
+            // Clipboard keys arrive as events, not key presses. In the layer list they act on the
+            // layers a click picks, so one that came while a click was under way waits for the
+            // click to be taken, as Delete does.
+            let (mut nth, mut waits) = (0, false);
             for e in &i.events {
-                match e {
-                    egui::Event::Copy => run.push(("ui.copy".into(), Value::Null)),
-                    egui::Event::Cut => run.push(("ui.cut".into(), Value::Null)),
-                    egui::Event::Paste(text) => run.push(("edit.paste".into(), json!({"text": text}))),
-                    _ => {}
+                let (id, params) = match e {
+                    egui::Event::Copy => ("ui.copy", Value::Null),
+                    egui::Event::Cut => ("ui.cut", Value::Null),
+                    egui::Event::Paste(text) => ("edit.paste", json!({"text": text})),
+                    _ => continue,
+                };
+                let (key_pane, after_click) = crate::inuse::clipboard(app, nth).unwrap_or((pane, false));
+                nth += 1;
+                // Once one waits, those after it wait too, so they run in the order they came.
+                waits |= key_pane == Pane::Layers && after_click;
+                if waits {
+                    late.push(Late { id: id.into(), params, pane: key_pane, chord: None });
+                } else {
+                    run.push((id.into(), params, key_pane));
                 }
             }
         }
     });
-    for (id, p) in &run {
-        let (id, p) = (id.as_str(), p.clone());
+    // After the shortcuts, so a key the user bound to a command still runs it.
+    if !typing {
+        crate::table::take_keys(app, ctx);
+    }
+    let dialogs = dialogs_up(app);
+    crate::inuse::keep_late(app, late, dialogs);
+    run_keys(app, ctx, &run);
+}
+
+/// Whether the keys are a dialog's (Save changes?, Recover unsaved work?, Command Search…):
+/// Escape answers it rather than switching tools, and Ctrl+N can't start what it asks about.
+fn behind_a_dialog(app: &RustGisApp, ctx: &egui::Context) -> bool {
+    app.ui.command_search.is_some()
+        || crate::saveprompt::waiting(app)
+        || ctx.memory(|m| m.top_modal_layer()).is_some()
+        || app.ui.shortcut_editor.capturing()
+}
+
+/// The dialogs and questions that are up, whether the File menu's backstage covers the window, and
+/// the project, as one number: it differs once a click (or a key of the same frame) has opened or
+/// answered one, or another project has taken this one's place. (egui says a modal dialog is up
+/// only from the frame after it first shows.)
+fn dialogs_up(app: &RustGisApp) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let asked = (app.map.deleting.is_some(), app.mb.asking(), crate::saveprompt::waiting(app));
+    (app.dialogs.open, asked, app.ui.command_search.is_some(), app.ui.backstage, app.session.opened).hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Whether a held key's repeat of a command that acts on what a click picks ([`follows_click`])
+/// does nothing, with `pane` in use. In the layer list, each removal makes the next layer the
+/// active one, so a held Delete would take the list from there down. A key held since another
+/// pane was in use stays that pane's (Delete held in the layer list, then the wheel turned over
+/// the map, must not reach the map's features). And while a click is under way, the key's first
+/// press didn't act either.
+fn repeat_stops(app: &RustGisApp, key: Key, pane: Pane) -> bool {
+    pane == Pane::Layers || crate::inuse::clicking(app) || crate::inuse::held_in(app, key).is_some_and(|pressed_in| pressed_in != pane)
+}
+
+/// Whether text is being typed. The search box (or a table cell, or the Script pane's find bar)
+/// had the focus until egui took it away on Escape: that Escape clears the box (leaves the cell as
+/// it was, closes the bar), not the tool. An open list (a clause's Functions) keeps the same keys
+/// as a box, those without Ctrl (⌘): Escape closes it.
+fn typing(app: &RustGisApp, ctx: &egui::Context) -> bool {
+    let pass = ctx.cumulative_pass_nr();
+    ctx.egui_wants_keyboard_input()
+        || crate::completion::menu_is_open(ctx)
+        || crate::crspicker::list_is_open(ctx)
+        || crate::searchbox::had_focus(&app.ui.search, pass)
+        || crate::table::had_focus(&app.table, pass)
+        || app.workflow.script_find.had_focus(pass)
+}
+
+/// Whether a text field keeps a key for itself (`chord`: the shortcut, or `None` for a key that
+/// is none): while one has the focus it keeps the keys it acts on, those without Ctrl (⌘), which
+/// type text, and undo and redo, whatever they're bound to (#685), as ModelBuilder leaves them.
+fn text_takes(chord: Option<crate::keymap::Chord>, typing: bool, text_field: bool) -> bool {
+    match chord {
+        Some(chord) => (typing && !chord.command) || (text_field && chord.is_text_undo()),
+        None => typing,
+    }
+}
+
+/// Whether Select All's key is left alone, with `pane` in use: while text is typed or a text field
+/// has the focus (`in_text`: the key selects its text), and where there are no features to select
+/// (a layout, ModelBuilder, a standalone table's view).
+fn select_all_left_alone(app: &RustGisApp, pane: Pane, in_text: bool) -> bool {
+    in_text || app.session.active_layout.is_some() || app.mb.shown() || (pane == Pane::Table && app.session.table_layer.is_none())
+}
+
+/// Whether command `id` acts on what a click picks (the layer, the tab, the features). A frame
+/// reads its keys before it draws the panes, where a click is taken, so on a slow frame a layer
+/// clicked and Delete pressed would remove the layer picked before: the key of such a command,
+/// pressed while a click is under way, runs in [`late_keys`].
+fn follows_click(id: &str) -> bool {
+    matches!(id, "edit.delete" | "layer.rename" | "select.all")
+}
+
+/// Runs the keys [`shortcuts`] left for the end of the frame, now that the panes have taken its
+/// click and the dialogs it opened are up. A key pressed while a button is still down came
+/// before anyone could know what the click picks: it is dropped, as is one that a text field
+/// takes when the click put the cursor in one, and one whose click opened or answered a dialog
+/// (Delete Layout?), which the key was not for.
+pub fn late_keys(app: &mut RustGisApp, ctx: &egui::Context) {
+    let (late, dialogs) = crate::inuse::take_late(app);
+    if late.is_empty() || crate::inuse::down(app) || behind_a_dialog(app, ctx) || dialogs != dialogs_up(app) {
+        return;
+    }
+    let (typing, text_field) = (typing(app, ctx), ctx.text_edit_focused());
+    // Select All is judged again, now that the click may have put the cursor in a text field or
+    // brought a layout into view.
+    let dropped = |key: &Late| {
+        text_takes(key.chord, typing, text_field) || (key.id == "select.all" && select_all_left_alone(app, key.pane, typing || text_field))
+    };
+    let run: Vec<(String, Value, Pane)> = late.into_iter().filter(|key| !dropped(key)).map(|key| (key.id, key.params, key.pane)).collect();
+    // The panes and dialogs were drawn before these keys run: another frame shows what they did.
+    if !run.is_empty() {
+        ctx.request_repaint();
+    }
+    run_keys(app, ctx, &run);
+}
+
+/// Runs the commands of the keys pressed, each with the pane that was in use as its key went
+/// down: what a key does depends on the tool, the view and the pane.
+fn run_keys(app: &mut RustGisApp, ctx: &egui::Context, run: &[(String, Value, Pane)]) {
+    for (id, p, pane) in run {
+        let (id, p, pane) = (id.as_str(), p.clone(), *pane);
         if id == "tool.set" {
             app.map.cancel_sketch();
             app.layout.cancel_tool();
@@ -947,6 +1221,37 @@ pub fn shortcuts(app: &mut RustGisApp, ctx: &egui::Context) {
             crate::circleedit::cancel(app);
             continue;
         }
+        // In the layer list, Delete removes the layers picked there, never the features selected
+        // on the map, a layout's element or a vertex (#2945).
+        if id == "edit.delete" && pane == Pane::Layers {
+            remove_picked_layers(app);
+            continue;
+        }
+        // There, Copy, Cut and Paste are for the layers picked too, as the layer menu's Copy
+        // Layer and Paste Layer are (#2944).
+        if pane == Pane::Layers && layer_clipboard_key(app, id, &p) {
+            continue;
+        }
+        // In the attribute table, Select All is for the layer it shows, which needn't be the
+        // active one.
+        if id == "select.all"
+            && p.get("layer").is_none()
+            && pane == Pane::Table
+            && let Some(layer) = app.session.table_layer
+        {
+            let _ = app.run("select.all", json!({"layer": layer}));
+            continue;
+        }
+        // On the tabs, and in a layout, Rename (F2) is for the map or layout in view, as a
+        // double-click on its tab is; elsewhere it renames the active layer (below).
+        if id == "layer.rename"
+            && p.get("name").is_none()
+            && p.get("layer").is_none()
+            && let Some(dialog) = renames_view(app, pane)
+        {
+            let _ = app.run("ui.dialog", json!({"name": dialog}));
+            continue;
+        }
         // With Edit Vertices, Delete removes the chosen vertex rather than the feature.
         if id == "edit.delete"
             && app.session.active_layout.is_none()
@@ -965,23 +1270,20 @@ pub fn shortcuts(app: &mut RustGisApp, ctx: &egui::Context) {
                 .selected
                 .is_some_and(|el| app.session.project.layouts.get(li).is_some_and(|l| l.locked_in_removal(el).is_some()));
             if kept {
-                let text = crate::i18n::fmt(
-                    "{command}: {reason}",
-                    &[("command", tl_raw!("Delete Element")), ("reason", crate::layoutview::locked_delete())],
-                );
-                if !app.map.toasts.iter().any(|t| t.text == text) {
-                    app.session.notify(text, true);
-                }
+                cannot_run(app, tl_raw!("Delete Element"), crate::layoutview::locked_delete());
             } else if let Some(el) = app.layout.selected.take() {
                 let _ = app.run("layout.removeElement", json!({"layout": li, "element": el}));
+            } else {
+                cannot_run(app, tl_raw!("Delete Element"), tl_raw!("no element is selected"));
             }
             continue;
         }
-        if matches!(id, "edit.delete" | "ui.copy" | "ui.cut") && app.session.map().selection_count() == 0 {
+        // Copy and Cut with nothing selected do nothing. Delete says so (below).
+        if matches!(id, "ui.copy" | "ui.cut") && app.session.map().selection_count() == 0 {
             continue;
         }
         // Pasting text that isn't features (a stray copy from elsewhere) does nothing.
-        if id == "edit.paste" && !p.get("text").and_then(Value::as_str).is_some_and(|t| t.trim_start().starts_with('{')) {
+        if id == "edit.paste" && !pastes_features(&p) {
             continue;
         }
         // Exhausted undo/redo shortcuts are inert, like their disabled toolbar buttons.
@@ -995,11 +1297,7 @@ pub fn shortcuts(app: &mut RustGisApp, ctx: &egui::Context) {
             && let Some(why) = why_disabled(app, id)
         {
             let label = app.session.registry.get(id).map_or(id, |s| s.label);
-            let text = crate::i18n::fmt("{command}: {reason}", &[("command", tl_raw!(label)), ("reason", tl_raw!(why))]);
-            // Once while it shows: a held key repeats, and each repeat comes here.
-            if !app.map.toasts.iter().any(|t| t.text == text) {
-                app.session.notify(text, true);
-            }
+            cannot_run(app, tl_raw!(label), tl_raw!(why));
             continue;
         }
         // Rename with no name given (F2) opens the Rename dialog for the active layer, as Command
@@ -1010,6 +1308,81 @@ pub fn shortcuts(app: &mut RustGisApp, ctx: &egui::Context) {
             continue;
         }
         let _ = app.run_by_user(id, p);
+    }
+}
+
+/// Says why a key's command (`label`, translated, as `reason` is) can't run now. Once while the
+/// notice shows: a held key repeats, and each repeat comes here.
+fn cannot_run(app: &mut RustGisApp, label: &str, reason: &str) {
+    let text = crate::i18n::fmt("{command}: {reason}", &[("command", label), ("reason", reason)]);
+    if !app.map.toasts.iter().any(|t| t.text == text) {
+        app.session.notify(text, true);
+    }
+}
+
+/// Delete in the layer list: removes what is picked there, as its menu's Remove does (one Undo
+/// step, no question asked). That is the tile layer picked, else the layers picked together;
+/// with neither, it says so.
+fn remove_picked_layers(app: &mut RustGisApp) {
+    if let Some(i) = app.session.selected_tile() {
+        let _ = app.run("map.removeTiles", json!({"index": i}));
+    } else if let Some(why) = why_disabled(app, "layer.remove") {
+        cannot_run(app, tl_raw!("Remove"), tl_raw!(why));
+    } else {
+        let _ = app.run("layer.remove", Value::Null);
+    }
+}
+
+/// Copy, Cut and Paste in the layer list (`id`: `ui.copy`, `ui.cut`, `edit.paste` with the
+/// clipboard's text in `p`); false for one that isn't the list's to take.
+///
+/// Copy copies the layers picked, as the menu's Copy Layer does, and puts their names on the
+/// clipboard as text. Paste adds the copied layers above the active one while the clipboard still
+/// holds those names: anything copied since (features, text in another program) is the newer
+/// copy, and goes the way a paste goes anywhere else. Cut does nothing and says so: a held key
+/// repeats it, and each removal makes the next layer the active one, so it would take the list
+/// from there down. It must not cut the map's selected features either.
+fn layer_clipboard_key(app: &mut RustGisApp, id: &str, p: &Value) -> bool {
+    match id {
+        "ui.copy" => {
+            let picked = app.session.selected_layers();
+            if let Some(why) = why_disabled(app, "layer.remove") {
+                cannot_run(app, tl_raw!("Copy Layers"), tl_raw!(why));
+            } else {
+                crate::panes::copy_layers(app, json!({"layer": picked}));
+            }
+            true
+        }
+        "ui.cut" => {
+            cannot_run(app, tl_raw!("Cut"), tl_raw!("a layer isn't cut: copy it, then remove it with Delete"));
+            true
+        }
+        "edit.paste" if crate::panes::pastes_copied_layers(app, p.get("text").and_then(Value::as_str).unwrap_or_default()) => {
+            let at = app.session.active_layer.map_or(Value::Null, |layer| crate::panes::paste_above(app, layer));
+            let _ = app.run("layer.paste", at);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Whether a Paste's text is features (what Copy puts on the clipboard for them), not a stray
+/// copy from elsewhere.
+fn pastes_features(p: &Value) -> bool {
+    p.get("text").and_then(Value::as_str).is_some_and(|t| t.trim_start().starts_with('{'))
+}
+
+/// The dialog Rename (F2) opens for the map or layout in view, when `pane` is one where the key
+/// is about it rather than the active layer: the tabs, or a layout. `None` elsewhere, and with
+/// ModelBuilder in view (a model is named in its own toolbar).
+fn renames_view(app: &RustGisApp, pane: Pane) -> Option<&'static str> {
+    if app.mb.shown() {
+        return None;
+    }
+    match (pane, app.session.active_layout.is_some()) {
+        (Pane::Tabs | Pane::View, true) => Some("renameLayout"),
+        (Pane::Tabs, false) => Some("renameMap"),
+        _ => None,
     }
 }
 
@@ -1074,6 +1447,7 @@ pub(crate) const UI_COMMANDS: &[(&str, &str, &str)] = &[
     ("ui.traceEdges", "Trace", "Edit › Features"),
     ("ui.exportMap", "Export Map…", "Publish › Output"),
     ("ui.checkUpdate", "Check for Updates…", "Help › Help"),
+    ("ui.reportProblem", "Report a Problem", "Help › Help"),
     ("ui.touchInterface", "Use the Touch Interface", "View › Interface"),
 ];
 
@@ -1109,6 +1483,7 @@ fn search_action(id: &str) -> Option<SearchAction> {
         "project.coordinateSystem" => Dialog("projectProperties"),
         "map.rename" => Dialog("renameMap"),
         "map.goToXY" => Dialog("goToXY"),
+        "edit.addPoint" => Dialog("createPointXY"),
         "map.exportOrbit" => Dialog("exportOrbit"),
         "map.findPlace" => Dialog("findPlace"),
         "map.camera" | "map.setScale" => Dialog("camera"),
@@ -1184,6 +1559,7 @@ fn search_action(id: &str) -> Option<SearchAction> {
         "task.save" => SaveItem("task"),
         "share.exportMap" => Command("ui.exportMap"),
         "share.exportLayer" => Command("ui.exportLayer"),
+        "share.exportTable" => Command("ui.exportTable"),
         "share.exportRaster" => Command("ui.exportRaster"),
         "gp.run" => Command("ui.gp.open"),
         "gp.package" => SaveItem("gpPackage"),
@@ -1199,6 +1575,7 @@ fn search_action(id: &str) -> Option<SearchAction> {
         "raster.process" => Workflow("process"),
         "raster.editPixels" => Workflow("pixels"),
         "raster.measure" => Workflow("mensuration"),
+        "raster.mosaic" => Workflow("mosaic"),
         "analysis.suitability" => Workflow("suitability"),
         "analysis.viewshed" => Workflow("visibility"),
         "analysis.lineOfSight" => Workflow("lineOfSight"),
@@ -1258,6 +1635,9 @@ fn search_disabled(app: &RustGisApp, id: &str) -> Option<&'static str> {
     if let Some(reason) = search_platform_disabled(id, cfg!(target_arch = "wasm32")) {
         return Some(reason);
     }
+    if id == "share.exportTable" && app.session.project.tables.is_empty() {
+        return Some("the project has no standalone tables");
+    }
     why_disabled(app, id).or_else(|| {
         (search_action(id).is_none() && app.session.registry.get(id).is_some_and(rustgis_engine::CommandSpec::needs_input))
             .then_some("it needs input: open it from its pane or button, or run it from a script or the assistant")
@@ -1272,6 +1652,45 @@ fn command_matches(id: &str, label: &str, location: &str, ql: &str) -> bool {
         || location.to_lowercase().contains(ql)
         || tl_raw!(label).to_lowercase().contains(ql)
         || crate::i18n::location_raw(location).to_lowercase().contains(ql)
+}
+
+/// Keeps an Escape press owned by the palette until release, even after it closes.
+#[derive(Default)]
+struct CommandSearchEscape {
+    open: bool,
+    held: bool,
+    presses: Vec<(usize, egui::Event)>,
+}
+
+impl egui::Plugin for CommandSearchEscape {
+    fn debug_name(&self) -> &'static str {
+        "Command search Escape"
+    }
+
+    fn input_hook(&mut self, _ctx: &egui::Context, input: &mut egui::RawInput) {
+        // egui stops drags on Escape before the application draws. Give palette
+        // presses only to the palette, in order relative to its IME events.
+        self.presses.clear();
+        let mut position = 0;
+        input.events.retain(|event| {
+            match event {
+                egui::Event::Key { key: Key::Escape, pressed: true, repeat, .. } if self.open || self.held => {
+                    if !self.held && !repeat {
+                        self.presses.push((position, event.clone()));
+                        position += 1;
+                    }
+                    self.held = true;
+                    return false;
+                }
+                egui::Event::Key { key: Key::Escape, pressed: false, .. } | egui::Event::WindowFocused(false) => {
+                    self.held = false;
+                }
+                _ => {}
+            }
+            position += 1;
+            true
+        });
+    }
 }
 
 /// The row the arrow keys have picked in Command Search, kept between frames while the palette
@@ -1303,7 +1722,102 @@ pub(crate) const NUMBER_KEYS: [Key; 10] =
 /// The command palette: type to filter every command, Up and Down pick a row, Enter runs it, and
 /// Ctrl (⌘) with 1 … 9 and 0 runs one of the first ten.
 pub fn command_search(app: &mut RustGisApp, ctx: &egui::Context) {
-    let Some(mut q) = app.ui.command_search.take() else { return };
+    let Some(mut q) = app.ui.command_search.take() else {
+        app.ui.command_search_composing = false;
+        return;
+    };
+    if ctx.plugin_opt::<CommandSearchEscape>().is_none() {
+        ctx.add_plugin(CommandSearchEscape::default());
+    }
+    let edit_id = egui::Id::unique("command_search_input");
+    // Enter and Escape may arrive in the same frame that begins or ends a composition.
+    // Leave that frame's keys to the IME as well as keys during an ongoing preedit.
+    let focused = ctx.memory(|m| m.has_focus(edit_id));
+    app.ui.command_search_composing &= focused;
+    let escape_presses = ctx.with_plugin::<CommandSearchEscape, _>(|input| std::mem::take(&mut input.presses)).unwrap_or_default();
+    let (mut enter, mut escape, deleting_preedit, after_delete, ime_owns_keys) = ctx.input(|i| {
+        // Raw events preserve their positions even if another widget consumed a key.
+        let mut events = std::borrow::Cow::Borrowed(i.raw.events.as_slice());
+        for (position, event) in escape_presses {
+            let events = events.to_mut();
+            events.insert(position.min(events.len()), event);
+        }
+        let mut accept_keys = !app.ui.command_search_composing;
+        let mut ime_owns_frame = false;
+        let mut enter = false;
+        let mut escape = false;
+        let mut deleting_preedit = false;
+        let mut after_delete = (false, false);
+        for event in events.iter() {
+            match event {
+                egui::Event::Ime(egui::ImeEvent::Preedit { text, .. } | egui::ImeEvent::Commit(text))
+                    if focused && deleting_preedit && text.is_empty() =>
+                {
+                    // The IME can report the deletion itself before the next key arrives.
+                    deleting_preedit = false;
+                    after_delete = (false, false);
+                    ime_owns_frame = false;
+                    accept_keys = true;
+                    enter = false;
+                    escape = false;
+                    app.ui.command_search_composing = false;
+                }
+                egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }) if focused => {
+                    deleting_preedit = false;
+                    after_delete = (false, false);
+                    ime_owns_frame |= app.ui.command_search_composing || !text.is_empty();
+                    app.ui.command_search_composing = !text.is_empty();
+                }
+                egui::Event::Ime(egui::ImeEvent::Commit(_)) if focused => {
+                    deleting_preedit = false;
+                    after_delete = (false, false);
+                    // A standalone commit can carry ordinary text.
+                    ime_owns_frame |= app.ui.command_search_composing;
+                    app.ui.command_search_composing = false;
+                }
+                egui::Event::Paste(text) | egui::Event::Text(text)
+                    if focused
+                        && !text.is_empty()
+                        && !matches!(event, egui::Event::Text(text) if !app.ui.command_search_composing || text == "\n" || text == "\r") =>
+                {
+                    // TextEdit replaces the preedit. Keys after the replacement can act
+                    // on the replacement, even if the preedit started in this frame.
+                    if ime_owns_frame {
+                        enter = false;
+                        escape = false;
+                    }
+                    ime_owns_frame = false;
+                    app.ui.command_search_composing = false;
+                    accept_keys = true;
+                    deleting_preedit = false;
+                    after_delete = (false, false);
+                }
+                egui::Event::Cut if app.ui.command_search_composing => {
+                    deleting_preedit = true;
+                }
+                egui::Event::Key { key: Key::Backspace | Key::Delete, pressed: true, .. } if app.ui.command_search_composing => {
+                    deleting_preedit = true;
+                }
+                egui::Event::Key { key, pressed: true, repeat: false, .. } => {
+                    if accept_keys && !ime_owns_frame {
+                        enter |= *key == Key::Enter;
+                        escape |= *key == Key::Escape;
+                    } else if deleting_preedit {
+                        after_delete.0 |= *key == Key::Enter;
+                        after_delete.1 |= *key == Key::Escape;
+                    }
+                }
+                _ => {}
+            }
+        }
+        (
+            enter && !ime_owns_frame,
+            escape && !ime_owns_frame,
+            deleting_preedit,
+            after_delete,
+            ime_owns_frame || app.ui.command_search_composing,
+        )
+    });
     let t = Tokens::get(ctx);
     let mut keep = true;
     let mut chosen: Option<String> = None;
@@ -1311,9 +1825,14 @@ pub fn command_search(app: &mut RustGisApp, ctx: &egui::Context) {
     let pass = ctx.cumulative_pass_nr();
     let cursor: Option<SearchCursor> = ctx.data(|d| d.get_temp(cursor_id));
     // The arrows are the list's, taken before the text box sees them (it would move its caret).
-    let (down, up) = ctx.input_mut(|i| (i.consume_key(Modifiers::NONE, Key::ArrowDown), i.consume_key(Modifiers::NONE, Key::ArrowUp)));
+    let (down, up) = if ime_owns_keys {
+        (false, false)
+    } else {
+        ctx.input_mut(|i| (i.consume_key(Modifiers::NONE, Key::ArrowDown), i.consume_key(Modifiers::NONE, Key::ArrowUp)))
+    };
     // Ctrl (⌘) and a digit run one of the first ten rows that can run: 1 the first, 0 the tenth.
-    let jump = ctx.input_mut(|i| NUMBER_KEYS.iter().position(|&key| i.consume_key(Modifiers::COMMAND, key)));
+    let jump =
+        if ime_owns_keys { None } else { ctx.input_mut(|i| NUMBER_KEYS.iter().position(|&key| i.consume_key(Modifiers::COMMAND, key))) };
     // Fits small screens: never wider or taller than the window allows.
     let screen = ctx.content_rect();
     let width = (screen.width() - 48.0).clamp(220.0, 520.0);
@@ -1323,13 +1842,34 @@ pub fn command_search(app: &mut RustGisApp, ctx: &egui::Context) {
         ui.horizontal(|ui| {
             let (r, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
             icons::paint(ui.painter(), r, "search", t.text_dim, t.accent);
-            let te = ui.add(
-                egui::TextEdit::singleline(&mut q)
-                    .hint_text(tl!("Search commands — e.g. buffer, basemap, labels"))
-                    .desired_width(width - 56.0)
-                    .frame(egui::Frame::NONE),
-            );
-            te.request_focus();
+            let edit = egui::TextEdit::singleline(&mut q)
+                .id(edit_id)
+                .return_key(None)
+                .event_filter(egui::EventFilter { horizontal_arrows: true, vertical_arrows: true, escape: true, ..Default::default() })
+                .hint_text(tl!("Search commands — e.g. buffer, basemap, labels"))
+                .desired_width(width - 56.0)
+                .frame(egui::Frame::NONE)
+                .show(ui);
+            // A deletion may remove the preedit without a corresponding IME event.
+            // Cursor movement alone can also collapse the range, so require a text edit.
+            if deleting_preedit && edit.response.response.changed() && edit.state.cursor.char_range().is_some_and(|range| range.is_empty())
+            {
+                enter |= after_delete.0;
+                escape |= after_delete.1;
+                app.ui.command_search_composing = false;
+            }
+            let edit = edit.response.response;
+            // Clicking or dragging in TextEdit switches its cursor to a regular
+            // selection, even when no IME event arrives to clear the preedit.
+            if edit.clicked() || edit.dragged() || (edit.hovered() && ui.input(|i| i.pointer.any_pressed())) {
+                app.ui.command_search_composing = false;
+            }
+            // The modal starts with an invisible sizing pass. Request focus only when
+            // the edit is interactive and unfocused, since a request can interrupt IME.
+            if edit.enabled() && !ctx.memory(|m| m.has_focus(edit_id)) {
+                app.ui.command_search_composing = false;
+                edit.request_focus();
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let (r, resp) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::click());
                 if resp.hovered() {
@@ -1421,6 +1961,10 @@ pub fn command_search(app: &mut RustGisApp, ctx: &egui::Context) {
             if !command_available(id, cfg!(target_arch = "wasm32")) {
                 continue;
             }
+            // A pane of an extension that is off isn't offered (#1752).
+            if crate::extensionsui::hidden(app, id) {
+                continue;
+            }
             // Only a shell with a touch interface (a phone's) has one to go back to.
             if id == "ui.touchInterface" && app.touch.is_none() {
                 continue;
@@ -1449,10 +1993,8 @@ pub fn command_search(app: &mut RustGisApp, ctx: &egui::Context) {
         };
         let row = step_row(row, runnable, down, up);
         ui.ctx().data_mut(|d| d.insert_temp(cursor_id, SearchCursor { query: q.clone(), row, pass }));
-        // The modal's area starts from its last size, so after a short result list the scroll
-        // area would get only that room back (egui's 64 px floor): ask for the full height
-        // whenever the list scrolls. A few hits still shrink the palette to fit.
-        egui::ScrollArea::vertical().max_height(list_h).min_scrolled_height(list_h).show(ui, |ui| {
+        // Keep the search field and IME candidate anchor stable as results change.
+        egui::ScrollArea::vertical().max_height(list_h).min_scrolled_height(list_h).auto_shrink([true, false]).show(ui, |ui| {
             let row_w = ui.available_width();
             // The number keys' column: as wide as the widest, so the hints line up.
             let number_w = NUMBER_KEYS
@@ -1523,13 +2065,12 @@ pub fn command_search(app: &mut RustGisApp, ctx: &egui::Context) {
                     app.ui.shortcut_editor.filter = id.clone();
                     keep = false;
                 }
-                let enter = picked && ui.input(|i| i.key_pressed(Key::Enter));
-                if resp.clicked() || enter || jumped {
+                if resp.clicked() || (picked && enter) || jumped {
                     chosen = Some(id.clone());
                 }
             }
         });
-        if ui.input(|i| i.key_pressed(Key::Escape)) {
+        if escape {
             keep = false;
         }
     });
@@ -1562,8 +2103,12 @@ pub fn command_search(app: &mut RustGisApp, ctx: &egui::Context) {
             let _ = app.run_by_user(&id, Value::Null);
         }
     }
+    ctx.with_plugin::<CommandSearchEscape, _>(|input| input.open = keep);
     if keep {
         app.ui.command_search = Some(q);
+    } else {
+        ctx.memory_mut(|m| m.surrender_focus(edit_id));
+        app.ui.command_search_composing = false;
     }
 }
 
@@ -1650,6 +2195,7 @@ pub fn about(app: &mut RustGisApp, ctx: &egui::Context) {
                         .keymap
                         .grouped()
                         .into_iter()
+                        .filter(|(command, ..)| !crate::extensionsui::hidden(app, command))
                         .map(|(command, params, keys)| {
                             let keys: Vec<String> = keys.into_iter().map(|c| c.shown(ctx)).collect();
                             (keys.join(" / "), crate::keymap::label(app, command, params))
@@ -1721,17 +2267,30 @@ pub fn notices(app: &mut RustGisApp, ctx: &egui::Context) {
     let t = Tokens::get(ctx);
     let now = ctx.input(|i| i.time);
     toast_new_notices(app, now);
-    app.map.toasts.retain(|toast| now - toast.at < if toast.error { 6.0 } else { 3.0 });
+    app.map.toasts.retain(|toast| toast.live(now));
     if app.map.toasts.is_empty() {
         return;
     }
     ctx.request_repaint_after(std::time::Duration::from_millis(250));
     let screen = ctx.content_rect();
-    let mut y = screen.max.y - 40.0;
-    for toast in app.map.toasts.iter_mut().rev().take(3) {
+    // A shell with its own interface has its bars below the map, the work strip's Cancel among
+    // them: the toasts stand at the map's foot, clear of them, each on the one before by its own
+    // height, as many of the last three as the map above has room for (the newest always, at the
+    // top when a tall sheet leaves the map none).
+    let over_map = app.chrome.and(app.map.view_rect).map(|(map, _)| map.max.y);
+    let mut y = over_map.unwrap_or(screen.max.y).max(screen.min.y + 84.0) - 40.0;
+    for (i, toast) in app.map.toasts.iter_mut().rev().take(3).enumerate() {
         // Keyed by the notice, not the slot, so a selection stays with its text as toasts come and go.
-        let shown = egui::Area::new(egui::Id::unique(("toast", toast.id)))
-            .fixed_pos(pos2(screen.max.x - 380.0, y - 44.0))
+        let id = egui::Id::unique(("toast", toast.id));
+        // Its height when last drawn (a one-line toast's before it is measured): an older one that
+        // wouldn't fit below the top waits for room, as the window would push it down over the rest.
+        let height = egui::AreaState::load(ctx, id).and_then(|a| a.size).map_or(44.0, |s| s.y);
+        if i > 0 && y - height < screen.min.y {
+            break;
+        }
+        let shown = egui::Area::new(id)
+            .pivot(egui::Align2::LEFT_BOTTOM)
+            .fixed_pos(pos2(screen.max.x - 380.0, y))
             .order(egui::Order::Tooltip)
             .show(ctx, |ui| {
                 egui::Frame::NONE
@@ -1752,13 +2311,28 @@ pub fn notices(app: &mut RustGisApp, ctx: &egui::Context) {
         if shown.response.contains_pointer() {
             toast.at = now;
         }
-        y -= 52.0;
+        y = shown.response.rect.min.y - 8.0;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A command and the Workflows section it opens are one extension's or no extension's, so
+    /// Command Search never offers a command whose section is refused, nor hides one whose isn't.
+    #[test]
+    fn a_command_and_its_workflows_section_are_in_one_extension() {
+        let app = RustGisApp::with_sample();
+        let mut seen = 0;
+        for c in &app.session.registry.commands {
+            let Some(SearchAction::Workflow(section)) = search_action(c.id) else { continue };
+            let owner = rustgis_engine::extensions::owner(c.id).map(|e| e.id);
+            assert_eq!(owner, crate::analysispane::section_extension(section), "{} and {section}", c.id);
+            seen += 1;
+        }
+        assert!(seen > 20, "{seen}");
+    }
 
     #[test]
     fn command_search_matches_localized_labels_and_locations() {
@@ -1897,6 +2471,14 @@ mod tests {
         assert!(super::search_disabled(&app, "layer.definitionQuery").is_none(), "offered for a feature layer");
     }
 
+    /// Command Search's Mosaic Rasters opens its Workflows section (#2907) rather than being greyed
+    /// for the inputs it needs.
+    #[test]
+    fn mosaic_rasters_opens_its_section() {
+        assert!(matches!(search_action("raster.mosaic"), Some(SearchAction::Workflow("mosaic"))));
+        assert!(super::search_disabled(&RustGisApp::with_sample(), "raster.mosaic").is_none());
+    }
+
     /// Past the 200 notices the session keeps, each new notice it holds still makes one toast (#1755).
     #[test]
     fn each_kept_notice_makes_one_toast_past_the_200th() {
@@ -1919,6 +2501,17 @@ mod tests {
         let texts: Vec<&str> = app.map.toasts.iter().map(|t| t.text.as_str()).collect();
         assert_eq!(texts, ["batch 0", "batch 1", "batch 2"]);
         assert!(app.map.toasts.iter().all(|t| t.error));
+    }
+
+    /// Command Search runs Export Table through its dialog, once there is a table to export.
+    #[test]
+    fn command_search_offers_export_table_for_a_standalone_table() {
+        use rustgis_engine::data::{Dataset, GeometryType};
+        let mut app = crate::RustGisApp::with_sample();
+        assert!(matches!(search_action("share.exportTable"), Some(SearchAction::Command("ui.exportTable"))));
+        assert_eq!(super::search_disabled(&app, "share.exportTable"), Some("the project has no standalone tables"));
+        app.session.project.add_table(Dataset::new("totals", GeometryType::None, vec![]));
+        assert_eq!(super::search_disabled(&app, "share.exportTable"), None);
     }
 
     #[test]

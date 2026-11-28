@@ -283,6 +283,7 @@ impl DiagramSettings {
                     _ => Vec::new(),
                 },
                 fallback: false,
+                count: None,
             })
             .collect()
     }

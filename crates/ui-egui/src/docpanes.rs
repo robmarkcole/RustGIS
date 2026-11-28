@@ -280,9 +280,16 @@ fn preview(app: &mut RustGisApp, ui: &mut Ui, i: usize, t: &Tokens) {
         let drawn_at = rustgis_engine::render::rustgis_tiles::cache::generation();
         let (drawn, said) = rustgis_engine::render::shadows_said(|| {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rustgis_engine::cmd::presentation::draw_page(s, i, page, 30.0)))
-                .unwrap_or_else(|_| Err("the preview failed unexpectedly".into()))
+                .unwrap_or_else(|payload| Err(crate::bug("the preview", payload.as_ref())))
         });
         crate::layoutview::say_frame_shadows(app, &said);
+        // A bug's failure, said once as it's made (the pane draws it each frame), so Messages
+        // keeps its details.
+        if let Err(e) = &drawn
+            && rustgis_engine::data::incident::named(e).is_some()
+        {
+            app.session.notify(e.clone(), true);
+        }
         let tex = drawn.map(|pm| {
             let img = egui::ColorImage::from_rgba_premultiplied([pm.width() as usize, pm.height() as usize], pm.data());
             ui.ctx().load_texture("presentation_preview", img, egui::TextureOptions::LINEAR)

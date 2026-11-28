@@ -539,17 +539,22 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
                     continue;
                 }
                 let s = g.attribute("srsName").or_else(|| g.descendants().find_map(|d| d.attribute("srsName")));
+                // A system RustGIS doesn't know is said only for a geometry read in it.
+                let mut unknown = None;
                 if let Some(s) = s {
                     match srs(s) {
                         Some(found) => {
                             file_srs.get_or_insert(found);
                         }
-                        None => unknown_srs = Some(s.to_string()),
+                        None => unknown = Some(s.to_string()),
                     }
                 }
                 let (dims, lost) = (Cell::new(false), Cell::new(0));
                 match geometry(&g, &dims, &lost) {
                     Some(gm) => {
+                        if unknown.is_some() {
+                            unknown_srs = unknown;
+                        }
                         zm = dims.get();
                         rings_lost += lost.get();
                         geom = Some(gm);
@@ -620,10 +625,16 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
     }
     let mut report = ReadReport::default();
     if over > 0 {
-        report.messages.push(format!("{over} features of more than {MAX_LAYERS} feature types were left out"));
+        report.messages.push(crate::loss::Note::loss(
+            crate::loss::LossCode::DroppedOverLimit,
+            format!("{over} features of more than {MAX_LAYERS} feature types were left out"),
+        ));
     }
     if let Some(s) = &unknown_srs {
-        report.messages.push(format!("unknown coordinate system '{s}': coordinates are read as they are"));
+        report.messages.push(crate::loss::Note::loss(
+            crate::loss::LossCode::AssumedCrs,
+            format!("unknown coordinate system '{s}': coordinates are read as they are"),
+        ));
     }
     let transform = match file_srs {
         Some((c, swap)) => Some((if c == Crs::LonLat { None } else { Some(c.transformer().map_err(DataError::Format)?) }, swap)),
@@ -651,7 +662,7 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
         let unread_names = kind.unread_names.said();
         let (mut outside, mut null_text) = (false, Vec::new());
         // Features with a place the file's system can't give in longitude/latitude, kept missing.
-        let mut unplaced = 0usize;
+        let (mut unplaced, mut beyond) = (0usize, 0usize);
         // Held as the file holds its coordinates, in its own system (in the axis order RustGIS
         // gives every system's), when RustGIS converts it.
         if let Some((Some(_), _)) = &transform
@@ -664,9 +675,10 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
                 Some((_, true)) => g.map_coords(&|c| Coord::new(c.y, c.x)),
                 _ => g,
             });
-            // A place that can't be given in longitude/latitude is kept as a missing coordinate
-            // (NaN), as it was when the reader converted the file: the layer is drawn, saved and
-            // measured without it, as before. Its box in longitude/latitude from the rest.
+            // A place that can't be given in longitude/latitude is kept as the file holds it, and
+            // counted: its feature doesn't draw, and each step that needs longitude/latitude
+            // leaves it out and says so (#2032 C2f-4b). Its box in longitude/latitude from the
+            // rest.
             let mut e = rustgis_geom::Extent::EMPTY;
             let g = match (&transform, g) {
                 (Some((Some(t), _)), Some(g)) => {
@@ -682,11 +694,13 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
                         _ if !c.is_finite() => c,
                         _ => {
                             missing.set(true);
-                            Coord::new(f64::NAN, f64::NAN)
+                            c
                         }
                     });
                     unplaced += usize::from(missing.get());
                     e = lonlat.get();
+                    // Converted, but beyond longitude/latitude: it draws out of place.
+                    beyond += usize::from(!missing.get() && e.beyond_lonlat());
                     Some(kept)
                 }
                 (_, g) => {
@@ -721,81 +735,106 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
         rep.skipped = kind.skipped;
         if kind.skipped > 0 {
             let what = if kind.skipped == 1 { "feature" } else { "features" };
-            rep.messages.push(format!("{}: {} {what} had geometry that couldn't be read", ds.name, kind.skipped));
+            // Kept, without the geometry.
+            rep.messages.push(crate::loss::Note::loss(
+                crate::loss::LossCode::DroppedGeometry,
+                format!("{}: {} {what} had geometry that couldn't be read", ds.name, kind.skipped),
+            ));
         }
         if unplaced > 0 {
             let what = if unplaced == 1 { "feature has" } else { "features have" };
             let system = file_srs.map_or_else(String::new, |(c, _)| format!(" in {}", c.label()));
             rep.messages.push(format!(
-                "{}: {unplaced} {what} places{system} that can't be given in longitude/latitude; they are kept as missing coordinates and don't draw",
+                "{}: {unplaced} {what} places{system} that can't be given in longitude/latitude; they are kept as the file holds them, but don't draw",
                 ds.name
             ));
         }
+        if let Some((c, _)) = file_srs {
+            rep.messages.extend(crate::io::beyond_lonlat_note("features", beyond, c).map(|n| format!("{}: {n}", ds.name)));
+        }
         if file_srs.is_none() && outside {
-            rep.messages.push("the GML doesn't say its coordinate system (srsName) and its coordinates aren't longitude/latitude");
+            rep.messages.push(crate::loss::Note::loss(
+                crate::loss::LossCode::AssumedCrs,
+                "the GML doesn't say its coordinate system (srsName) and its coordinates aren't longitude/latitude",
+            ));
         }
         // Said with the layer it happened in, which may be the only one added.
         if kind.lost > 0 {
             let what =
                 if kind.lost == 1 { "ring or surface patch of a geometry was" } else { "rings or surface patches of geometries were" };
-            rep.messages.push(format!(
+            rep.messages.push(crate::loss::Note::loss(crate::loss::LossCode::DroppedRing, format!(
                 "{}: {} {what} left out: too few points, unreadable coordinates, a patch with no exterior ring or of a kind not read, or an exterior ring past the first",
                 ds.name, kind.lost
-            ));
+            )));
         }
         if zm > 0 {
             ds.zm_dropped = true;
-            rep.messages.push(format!("{}: {}", ds.name, crate::zm_note(Some(zm as u64))));
+            rep.messages.push(crate::loss::Note::loss(
+                crate::loss::LossCode::DroppedZm,
+                format!("{}: {}", ds.name, crate::zm_note(Some(zm as u64))),
+            ));
         }
         if let Some(n) = crate::source::null_text_note(&ds.fields, &null_text) {
-            rep.messages.push(format!("{}: {n}", ds.name));
+            rep.messages.push(n.prefixed(&ds.name));
         }
         if parts > 0 {
             let what = if parts == 1 { "part" } else { "parts" };
-            rep.messages.push(format!(
-                "{}: {parts} {what} of multi-geometries not read (a reference, too short, invalid coordinates, or of a kind not read)",
-                ds.name
+            rep.messages.push(crate::loss::Note::loss(
+                crate::loss::LossCode::DroppedGeometry,
+                format!(
+                    "{}: {parts} {what} of multi-geometries not read (a reference, too short, invalid coordinates, or of a kind not read)",
+                    ds.name
+                ),
             ));
         }
         if kind.approximated > 0 {
             let what = if kind.approximated == 1 { "feature" } else { "features" };
-            rep.messages.push(format!(
-                "{}: {} {what} had curve segments approximated by their control points ({})",
-                ds.name,
-                kind.approximated,
-                kind.approximated_names.said()
+            rep.messages.push(crate::loss::Note::loss(
+                crate::loss::LossCode::ApproximatedCurve,
+                format!(
+                    "{}: {} {what} had curve segments approximated by their control points ({})",
+                    ds.name,
+                    kind.approximated,
+                    kind.approximated_names.said()
+                ),
             ));
         }
         if kind.centred > 0 {
             let what = if kind.centred == 1 { "feature" } else { "features" };
-            rep.messages.push(format!(
+            rep.messages.push(crate::loss::Note::loss(crate::loss::LossCode::ApproximatedCurve, format!(
                 "{}: {} {what} had curve segments given by a centre point (ArcByCenterPoint or CircleByCenterPoint): the centre was read as a vertex, so the line doesn't follow the curve there",
                 ds.name, kind.centred
-            ));
+            )));
         }
         if unread > 0 {
             let what = if unread == 1 { "property" } else { "properties" };
-            rep.messages.push(format!(
-                "{}: {unread} {what} not read: nested records, other GML values or further shapes ({unread_names})",
-                ds.name
+            rep.messages.push(crate::loss::Note::loss(
+                crate::loss::LossCode::DroppedValue,
+                format!("{}: {unread} {what} not read: nested records, other GML values or further shapes ({unread_names})", ds.name),
             ));
         }
         if kind.repeated > 0 {
             let what = if kind.repeated == 1 { "value" } else { "values" };
-            rep.messages.push(format!(
-                "{}: {} {what} of repeated properties not read, only the last is kept ({})",
-                ds.name,
-                kind.repeated,
-                kind.repeated_names.said()
+            rep.messages.push(crate::loss::Note::loss(
+                crate::loss::LossCode::DroppedValue,
+                format!(
+                    "{}: {} {what} of repeated properties not read, only the last is kept ({})",
+                    ds.name,
+                    kind.repeated,
+                    kind.repeated_names.said()
+                ),
             ));
         }
         if kind.capped > 0 {
             let what = if kind.capped == 1 { "value" } else { "values" };
-            rep.messages.push(format!(
-                "{}: {} {what} of properties past the first {MAX_COLUMNS} names not read ({})",
-                ds.name,
-                kind.capped,
-                kind.capped_names.said()
+            rep.messages.push(crate::loss::Note::loss(
+                crate::loss::LossCode::DroppedOverLimit,
+                format!(
+                    "{}: {} {what} of properties past the first {MAX_COLUMNS} names not read ({})",
+                    ds.name,
+                    kind.capped,
+                    kind.capped_names.said()
+                ),
             ));
         }
         out.push((ds, rep));
@@ -872,17 +911,22 @@ mod tests {
         assert_eq!(ds.value(0, code), &Value::Text(" R-1".into()));
         assert_eq!(ds.value(1, code), &Value::Null);
         assert_eq!(ds.value(2, code), &Value::Text("Laid out".into()), "an indented value loses its layout");
-        assert!(report.messages.iter().any(|m| m == "s: 1 value written as Null was read as empty, in 'code'"), "{:?}", report.messages);
+        assert!(
+            report.messages.iter().any(|m| m.as_str() == "s: 1 value written as Null was read as empty, in 'code'"
+                && m.loss == Some(crate::loss::LossCode::AssumedNullMarker)),
+            "{:?}",
+            report.messages
+        );
         let clean = gml.replace("&lt;Null&gt;", "B-2");
         let layers = read("s.gml", clean.as_bytes()).unwrap();
         assert!(layers[0].1.messages.iter().all(|m| !m.contains("written as Null")), "no marker, no notice: {:?}", layers[0].1.messages);
     }
 
-    /// A place a file's system can't give in longitude/latitude is kept missing (NaN), as when the
-    /// reader converted the file, so the layer's places that convert are still read in
-    /// longitude/latitude; its other places keep the file's numbers.
+    /// A place a file's system can't give in longitude/latitude is kept as the file holds it, and
+    /// said: its feature doesn't draw, and a step in longitude/latitude leaves it out (#2032
+    /// C2f-4b).
     #[test]
-    fn a_place_with_no_longitude_latitude_is_kept_missing() {
+    fn a_place_with_no_longitude_latitude_is_kept_as_the_file_holds_it() {
         let gml = r#"<ogr:FeatureCollection xmlns:ogr="http://ogr.maptools.org/" xmlns:gml="http://www.opengis.net/gml">
 <gml:featureMember><ogr:roads fid="roads.0"><ogr:geometryProperty><gml:LineString srsName="EPSG:32633"><gml:coordinates>500000,4649776 1e15,4649776</gml:coordinates></gml:LineString></ogr:geometryProperty></ogr:roads></gml:featureMember>
 </ogr:FeatureCollection>"#;
@@ -891,10 +935,29 @@ mod tests {
         assert_eq!(ds.coord_crs(), Crs::Epsg(32633));
         let Some(Geometry::Line(parts)) = &ds.features[0].geometry else { panic!("a line") };
         assert_eq!(parts[0][0], Coord::new(500000.0, 4649776.0), "the file's numbers");
-        assert!(parts[0][1].x.is_nan() && parts[0][1].y.is_nan(), "{:?}", parts[0][1]);
+        assert_eq!(parts[0][1], Coord::new(1e15, 4649776.0), "the file's numbers");
         assert!(serde_json::to_string(ds).is_ok(), "saves");
-        assert!(layers[0].1.messages.iter().any(|m| m.contains("1 feature has places")), "{:?}", layers[0].1.messages);
-        assert!(ds.in_lonlat().is_ok());
+        let said = &layers[0].1.messages;
+        assert!(said.iter().any(|m| m.contains("1 feature has places") && m.contains("kept as the file holds them")), "{said:?}");
+        assert_eq!(ds.in_lonlat_leaving_out().unwrap().1, 1);
+    }
+
+    /// A place a file's system converts to beyond longitude/latitude (Web Mercator a billion
+    /// metres east) is kept and said with a count; one in its place says nothing (#2032 C2f-4b).
+    #[test]
+    fn a_place_beyond_longitude_latitude_is_said() {
+        let gml = |x: &str| {
+            format!(
+                r#"<ogr:FeatureCollection xmlns:ogr="http://ogr.maptools.org/" xmlns:gml="http://www.opengis.net/gml">
+<gml:featureMember><ogr:pts fid="pts.0"><ogr:geometryProperty><gml:Point srsName="EPSG:3857"><gml:coordinates>{x},6000000</gml:coordinates></gml:Point></ogr:geometryProperty></ogr:pts></gml:featureMember>
+</ogr:FeatureCollection>"#
+            )
+        };
+        let said = |x: &str| {
+            read("p.gml", gml(x).as_bytes()).unwrap()[0].1.messages.texts().any(|m| m.contains("come out beyond longitude/latitude"))
+        };
+        assert!(said("1e9"));
+        assert!(!said("1000000"));
     }
 
     #[test]
@@ -936,7 +999,10 @@ mod tests {
         // Its height is dropped, and said; so is the nested `member` property, not an attribute.
         assert!(ds.zm_dropped && rep.messages.iter().any(|m| m.contains("Z or M values")), "{:?}", rep.messages);
         assert!(
-            rep.messages.iter().any(|m| m == "n: 1 property not read: nested records, other GML values or further shapes (member)"),
+            rep.messages
+                .iter()
+                .any(|m| m.as_str() == "n: 1 property not read: nested records, other GML values or further shapes (member)"
+                    && m.loss == Some(crate::loss::LossCode::DroppedValue)),
             "{:?}",
             rep.messages
         );
@@ -951,11 +1017,8 @@ mod tests {
         assert!(!layers[0].0.zm_dropped, "{:?}", layers[0].1.messages);
         // The part left out is said.
         assert!(
-            layers[0]
-                .1
-                .messages
-                .iter()
-                .any(|m| m == "r: 1 part of multi-geometries not read (a reference, too short, invalid coordinates, or of a kind not read)"),
+            layers[0].1.messages.iter().any(|m| m.as_str()
+                == "r: 1 part of multi-geometries not read (a reference, too short, invalid coordinates, or of a kind not read)"),
             "{:?}",
             layers[0].1.messages
         );
@@ -1048,7 +1111,10 @@ mod tests {
         assert_eq!((ds.features.len(), rep.skipped), (2, 0));
         assert!(matches!(&ds.features[1].geometry, Some(Geometry::Line(l)) if l.len() == 2));
         let said: Vec<&crate::loss::Note> = rep.messages.iter().filter(|m| m.contains("multi-geometries")).collect();
-        assert_eq!(said, ["m: 1 part of multi-geometries not read (a reference, too short, invalid coordinates, or of a kind not read)"]);
+        assert_eq!(
+            said.iter().map(|n| n.as_str()).collect::<Vec<_>>(),
+            ["m: 1 part of multi-geometries not read (a reference, too short, invalid coordinates, or of a kind not read)"]
+        );
     }
 
     /// Properties that aren't attributes (a nested record, a time, a second shape) are said on
@@ -1069,9 +1135,8 @@ mod tests {
         // The first shape is the one kept; the second is said as not read.
         assert_eq!(ds.features[0].geometry, Some(Geometry::Point(Coord::new(10.0, 48.0))));
         assert!(
-            rep.messages
-                .iter()
-                .any(|m| m == "t parks: 3 properties not read: nested records, other GML values or further shapes (owner, built, entrance)"),
+            rep.messages.iter().any(|m| m.as_str()
+                == "t parks: 3 properties not read: nested records, other GML values or further shapes (owner, built, entrance)"),
             "{:?}",
             rep.messages
         );
@@ -1086,7 +1151,9 @@ mod tests {
         let (ds, rep) = &layers[0];
         assert_eq!((ds.features.len(), rep.skipped), (1, 0), "{:?}", rep.messages);
         assert!(
-            rep.messages.iter().any(|m| m == "d: 4 properties not read: nested records, other GML values or further shapes (a, b, c, …)"),
+            rep.messages
+                .iter()
+                .any(|m| m.as_str() == "d: 4 properties not read: nested records, other GML values or further shapes (a, b, c, …)"),
             "{:?}",
             rep.messages
         );
@@ -1370,6 +1437,31 @@ mod tests {
         assert!(!said(&lossy[0], "couldn't be read") && said(&lossy[1], "t parks: 1 feature had geometry that couldn't be read"));
         let clean = read("t.gml", two("<gml:Point><gml:pos>10 49</gml:pos></gml:Point>").as_bytes()).unwrap();
         assert!(clean.iter().all(|l| l.1.skipped == 0 && !said(l, "couldn't be read")));
+        // The feature is kept, without its geometry.
+        assert_eq!(lossy[1].0.features.len(), 1);
+        let note = lossy[1].1.messages.iter().find(|m| m.contains("couldn't be read")).unwrap();
+        assert_eq!(note.loss, Some(crate::loss::LossCode::DroppedGeometry));
+    }
+
+    /// A system RustGIS doesn't know is said, as assumed, only for a geometry read in it: one that
+    /// names it and can't be read places nothing there.
+    #[test]
+    fn an_unknown_system_is_said_only_for_a_geometry_read_in_it() {
+        let member = |g: &str| doc(&format!("<wfs:member><app:roads><app:g>{g}</app:g></app:roads></wfs:member>"));
+        let unknown = |layers: &[(Dataset, ReadReport)]| {
+            layers
+                .iter()
+                .flat_map(|l| l.1.messages.iter())
+                .filter(|m| m.contains("unknown coordinate system"))
+                .map(|m| m.loss)
+                .collect::<Vec<_>>()
+        };
+        let read_in_it =
+            read("t.gml", member(r#"<gml:Point srsName="urn:x-unknown:99"><gml:pos>10 48</gml:pos></gml:Point>"#).as_bytes()).unwrap();
+        assert_eq!(unknown(&read_in_it), [Some(crate::loss::LossCode::AssumedCrs)]);
+        let failed =
+            read("t.gml", member(r#"<gml:Point srsName="urn:x-unknown:99"><gml:pos>bad</gml:pos></gml:Point>"#).as_bytes()).unwrap();
+        assert!(unknown(&failed).is_empty(), "{:?}", failed[0].1.messages);
     }
 
     /// #1620: unread property names come in document order, and a `gml:description` value is no shape.

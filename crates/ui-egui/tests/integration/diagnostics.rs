@@ -82,3 +82,42 @@ fn diagnostics_preserves_closed_history_filters_copies_and_clears() {
     assert_eq!(h.state().ui.right, Some(RightPane::Diagnostics));
     h.get_by_label("Map draw");
 }
+
+/// Report a Problem shows the report before anything leaves the app; Copy copies it, and Report
+/// on GitHub copies it and opens the bug report form, sending nothing itself.
+#[test]
+fn report_a_problem_shows_copies_and_opens_the_bug_report_form() {
+    let mut app = RustGisApp::new(Session::new(Project::default()));
+    app.session.map_mut().tiles.clear();
+    app.session.diagnostics.clear();
+    app.last_run = rustgis_engine::problem_report::LastRun::Left("RustGIS didn't close normally last time, between commands.".into());
+    assert!(app.run("layer.addData", json!({"path":"/report-missing/absent.geojson"})).is_err());
+    app.run("ui.reportProblem", json!({})).unwrap();
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1366.0, 900.0)).with_step_dt(0.1).with_max_steps(64).build_ui_state(
+        |ui, app: &mut RustGisApp| {
+            let ctx = ui.ctx().clone();
+            app.logic(&ctx);
+            app.ui(ui);
+        },
+        app,
+    );
+    h.run_steps(3);
+    let text = h.state().ui.problem_report.as_ref().map(|w| w.text.clone()).expect("the window is open");
+    assert!(text.contains("Last run: RustGIS didn't close normally"), "{text}");
+    assert!(text.contains("layer.addData {\"path\":\"/report-missing/absent.geojson\"}"), "{text}");
+    let output = |h: &egui_kittest::Harness<'_, RustGisApp>| h.output().platform_output.commands.clone();
+    h.get_by_label("Copy").click();
+    h.step();
+    assert!(output(&h).iter().any(|c| matches!(c, egui::OutputCommand::CopyText(t) if *t == text)), "{:?}", output(&h));
+    h.get_by_label("Report on GitHub…").click();
+    h.step();
+    let opened = output(&h);
+    assert!(
+        opened.iter().any(|c| matches!(c, egui::OutputCommand::OpenUrl(u) if u.url.starts_with(rustgis_engine::problem_report::NEW_ISSUE))),
+        "{opened:?}"
+    );
+    // The report stays on the clipboard, out of the address.
+    assert!(!opened.iter().any(|c| matches!(c, egui::OutputCommand::OpenUrl(u) if u.url.contains("report-missing"))), "{opened:?}");
+    assert!(opened.iter().any(|c| matches!(c, egui::OutputCommand::CopyText(t) if t.contains("report-missing"))), "{opened:?}");
+    h.get_by_label_contains("Opened the bug report form");
+}

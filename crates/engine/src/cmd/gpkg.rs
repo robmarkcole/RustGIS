@@ -108,10 +108,13 @@ fn add_layer(s: &mut Session, p: &Value) -> CmdResult {
             );
         }
         if let Some(note) = rustgis_data::source::unread_dates_note(&info.fields, &editable.unread_dates) {
-            s.notify(format!("{name}: {note}; saving leaves them as they are unless they're edited"), false);
+            s.say(note.map_text(|note| format!("{name}: {note}; saving leaves them as they are unless they're edited")));
         }
         if let Some(note) = rustgis_data::source::rounded_dates_note(&info.fields, &editable.rounded_dates) {
-            s.notify(format!("{name}: {note}"), false);
+            s.say(note.prefixed(&name));
+        }
+        if let Some(note) = rustgis_data::source::not_utf8_note(&info.fields, &editable.not_utf8, rustgis_data::source::GEOPACKAGE_TEXT) {
+            s.say(note.prefixed(&name));
         }
         if !editable.writable {
             s.notify(format!("{name}: the file is read-only, so edits can't be saved to it"), false);
@@ -146,8 +149,10 @@ fn add_layer(s: &mut Session, p: &Value) -> CmdResult {
 /// with no table named) read it again, in every map: its rows were written, or (with `reopen`)
 /// the table was made anew, so its fields and system are read again too. Returns how many read
 /// it again, and the layers that couldn't reopen it with why (each also keeps its error).
+/// Replacement notes are reported immediately, including for callers without a frame loop.
 pub(crate) fn reset_sources(s: &mut Session, path: &std::path::Path, table: &str, reopen: bool) -> (usize, Vec<String>) {
     let (mut n, mut failed) = (0, Vec::new());
+    let mut notes = Vec::new();
     let canonical = std::fs::canonicalize(path).ok();
     for map in &mut s.project.maps {
         for l in map.layers.iter_mut() {
@@ -164,13 +169,21 @@ pub(crate) fn reset_sources(s: &mut Session, path: &std::path::Path, table: &str
                     source.reset();
                     n += 1;
                 } else {
-                    match source.reopen() {
+                    let reopened = l.refresh_replaced_source();
+                    if let Some(source) = &mut l.source {
+                        notes.extend(source.take_read_notes().into_iter().map(|note| note.prefixed(&l.name)));
+                    }
+                    match reopened {
                         Ok(()) => n += 1,
                         Err(e) => failed.push(format!("{} ({e})", l.name)),
                     }
                 }
             }
         }
+    }
+    // Replacement notes must land with the command, including in callers without a frame loop.
+    for note in notes {
+        s.say(note);
     }
     (n, failed)
 }
@@ -261,6 +274,7 @@ fn save_edits(s: &mut Session, p: &Value) -> CmdResult {
         let utc_dates = saved_rows.utc_dates;
         let fine_dates = saved_rows.fine_dates;
         let rounded_dates = saved_rows.rounded_dates;
+        let not_utf8 = saved_rows.not_utf8;
         let unread_dates = saved_rows.unread_dates;
         let mut stored: std::collections::HashMap<_, _> = saved_rows.features.into_iter().map(|f| (f.id, f)).collect();
         let versions = saved.versions.iter().copied().collect();
@@ -323,19 +337,26 @@ fn save_edits(s: &mut Session, p: &Value) -> CmdResult {
             false,
         );
         if !saved.skipped_fields.is_empty() {
-            s.notify(format!("{name}: {table} has no column for {}, so it wasn't saved", saved.skipped_fields.join(", ")), false);
+            // Their values aren't in the table: lost from the save.
+            s.say(rustgis_data::loss::Note::loss(
+                rustgis_data::loss::LossCode::DroppedValue,
+                format!("{name}: {table} has no column for {}, so it wasn't saved", saved.skipped_fields.join(", ")),
+            ));
         }
         if let Some(note) = rustgis_data::io::fine_dates_note(&fields, &fine_dates, &super::saved_target(&name, table)) {
-            s.notify(note, false);
+            s.say(note);
         }
         if let Some(note) = rustgis_data::source::unread_dates_note(&fields, &unread_dates) {
-            s.notify(format!("{}: {note}, when read back after the save", super::saved_target(&name, table)), false);
+            s.say(note.map_text(|note| format!("{}: {note}, when read back after the save", super::saved_target(&name, table))));
         }
         if let Some(note) = rustgis_data::source::rounded_dates_note(&fields, &rounded_dates) {
-            s.notify(format!("{}: {note}, when read back after the save", super::saved_target(&name, table)), false);
+            s.say(note.map_text(|note| format!("{}: {note}, when read back after the save", super::saved_target(&name, table))));
+        }
+        if let Some(note) = rustgis_data::source::not_utf8_note(&fields, &not_utf8, rustgis_data::source::GEOPACKAGE_TEXT) {
+            s.say(note.map_text(|note| format!("{}: {note}, when read back after the save", super::saved_target(&name, table))));
         }
         if let Some(note) = rustgis_data::io::utc_dates_note(&fields, &utc_dates, &super::saved_target(&name, table)) {
-            s.notify(note, false);
+            s.say(note);
         }
         s.retain_written_notices(written);
         Ok(json!({"saved": true, "inserted": saved.inserted.len(), "updated": saved.updated, "deleted": saved.deleted,
@@ -392,9 +413,12 @@ pub(super) fn read_candidate(name: &str, edit: &rustgis_map::source::GpkgEdit) -
         notes.push(format!("{} rows with a geometry RustGIS can't read weren't loaded; saving leaves them as they are", editable.skipped));
     }
     if let Some(note) = rustgis_data::source::unread_dates_note(&info.fields, &editable.unread_dates) {
-        notes.push(format!("{note}; saving leaves them as they are unless they're edited"));
+        notes.push(note.map_text(|note| format!("{note}; saving leaves them as they are unless they're edited")));
     }
     if let Some(note) = rustgis_data::source::rounded_dates_note(&info.fields, &editable.rounded_dates) {
+        notes.push(note);
+    }
+    if let Some(note) = rustgis_data::source::not_utf8_note(&info.fields, &editable.not_utf8, rustgis_data::source::GEOPACKAGE_TEXT) {
         notes.push(note);
     }
     if !editable.writable {

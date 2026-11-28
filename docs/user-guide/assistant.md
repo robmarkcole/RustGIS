@@ -46,6 +46,24 @@ controls.
 From the command line, `rustgis-cli ask` sends one request (see
 [Command Line](../cli.md#asking-the-ai-assistant)).
 
+## Turning the assistant off
+
+The AI Assistant is an [extension](index.md#extensions), on until you turn it off in
+**Plugins › Extensions** (on a phone, in the desktop interface). While it is off, its pane, its
+buttons and its entries in Command Search, the Keyboard Shortcuts editor, the Quick Access
+Toolbar and the macOS menu bar are gone, and `ui.pane.assistant` is refused, from a shortcut you
+gave it too. Turning it off stops a request that is running (what it had already done stays, with
+Undo as usual; a request already under way may still finish at the provider, a ChatGPT one after
+renewing its sign-in, and its reply is dropped), the agent threads it started and a ChatGPT
+sign-in under way, and says so in a notice. The
+conversation is kept until RustGIS closes and is there when you turn the extension on again. Its
+settings, saved keys and sign-in are kept too. The desktop and web apps remember the choice.
+
+It doesn't cover agents and requests of your own: `rustgis-cli ask`, the
+[MCP server](../mcp.md) (`rustgis-cli mcp`) and the desktop app's **MCP Relay** command run
+either way. If agents were allowed to control RustGIS they still can, as the status bar shows;
+click it there to stop them.
+
 ## Attaching pictures
 
 A picture can go with a message: a map whose style you want, a screenshot of something that
@@ -72,18 +90,31 @@ georeferencing with control points rather than asking the model where things are
 
 Click the model name or the gear to open the settings. The assistant works with:
 
-| Provider | Default model | Key |
-| --- | --- | --- |
-| Anthropic | `claude-opus-5-5` | [console.anthropic.com](https://console.anthropic.com/settings/keys), or `ANTHROPIC_API_KEY` |
-| OpenAI | `gpt-5.5` | [platform.openai.com](https://platform.openai.com/api-keys), or `OPENAI_API_KEY` |
-| ChatGPT (sign in) | the first model in your account’s current catalog | none: **Continue with ChatGPT** to use your ChatGPT plan (desktop app and command line) |
-| Google Gemini | `gemini-3.8-flash` | [aistudio.google.com](https://aistudio.google.com/apikey), or `GEMINI_API_KEY` / `GOOGLE_API_KEY` |
-| OpenRouter | `openrouter/auto` | [openrouter.ai](https://openrouter.ai/keys), or `OPENROUTER_API_KEY` |
-| Ollama (local) | `qwen3` | none; the server from `OLLAMA_BASE_URL` (default `http://localhost:11434`) |
-| OpenAI-compatible | — | LM Studio, vLLM, llama.cpp…: `OPENAI_COMPATIBLE_BASE_URL` (default `http://localhost:1234/v1`), with an optional `OPENAI_COMPATIBLE_API_KEY` |
-| Requesty | `anthropic/claude-sonnet-5-5` | [app.requesty.ai](https://app.requesty.ai/api-keys), or `REQUESTY_API_KEY`; for the EU, set the **Address** to `https://router.eu.requesty.ai/v1` |
-| TrustedRouter | `trustedrouter/auto` | [trustedrouter.com](https://trustedrouter.com), or `TRUSTEDROUTER_API_KEY` |
-| Opper | `claude-sonnet-5-5` | [platform.opper.ai](https://platform.opper.ai), or `OPPER_API_KEY` |
+| Provider | Description | Default model | Key |
+| --- | --- | --- | --- |
+| Anthropic | Anthropic's own API, from the makers of Claude. API requests aren't used for training; content may be kept for safety checks, with exceptions to the standard 30-day deletion period. | `claude-opus-5-5` | [console.anthropic.com](https://console.anthropic.com/settings/keys), or `ANTHROPIC_API_KEY` |
+| OpenAI | OpenAI's own API, from the makers of GPT. API requests aren't used for training by default; abuse monitoring logs may be kept up to 30 days, with legal and safety exceptions. | `gpt-5.5` | [platform.openai.com](https://platform.openai.com/api-keys), or `OPENAI_API_KEY` |
+| ChatGPT (sign in) | OpenAI's models, billed to your ChatGPT plan. On a personal plan, ChatGPT's "Improve the model" setting decides whether requests are used for training; Business, Enterprise and Edu plans aren't trained on by default. | the first model in your account’s current catalog | none: **Continue with ChatGPT** to use your ChatGPT plan (desktop app and command line) |
+| Google Gemini | Google's own API. With a free key, Google may use requests to improve its products and people may read them; a Cloud project with billing turns that off. In the EEA, Switzerland and the UK, paid-service data terms also cover free use. | `gemini-3.8-flash` | [aistudio.google.com](https://aistudio.google.com/apikey), or `GEMINI_API_KEY` / `GOOGLE_API_KEY` |
+| OpenRouter | A US gateway to hundreds of models. OpenRouter doesn't keep request content by default. With Private routing on (the default), RustGIS asks it to skip endpoints that may train on requests. | `openrouter/auto` | [openrouter.ai](https://openrouter.ai/keys), or `OPENROUTER_API_KEY` |
+| Ollama (local) | Models you run with Ollama on this computer or a server of your own. Requests go to the server at the chosen address; its models and configuration determine any onward use. | `qwen3` | none; the server from `OLLAMA_BASE_URL` (default `http://localhost:11434`) |
+| OpenAI-compatible | Any service or local server that speaks OpenAI's API. What happens to requests is up to the service at the chosen address. | — | LM Studio, vLLM, llama.cpp…: `OPENAI_COMPATIBLE_BASE_URL` (default `http://localhost:1234/v1`), with an optional `OPENAI_COMPATIBLE_API_KEY` |
+| Requesty | A UK gateway to hundreds of models, which can move to another service when one fails. It logs requests up to 30 days by default; you can turn that off for each key. Some upstreams train on requests on paid plans too; Requesty may also train on free-plan requests. | `anthropic/claude-sonnet-5-5` | [app.requesty.ai](https://app.requesty.ai/api-keys), or `REQUESTY_API_KEY`; for the EU, set the **Address** to `https://router.eu.requesty.ai/v1` |
+| TrustedRouter | A US gateway to models from many services, run on servers whose software can be checked independently. The gateway doesn't keep request content; each service behind it follows its own policy and may keep or train on requests. | `trustedrouter/auto` | [trustedrouter.com](https://trustedrouter.com), or `TRUSTEDROUTER_API_KEY` |
+| Opper | A Swedish gateway to hundreds of models, built for keeping data in the EU. It doesn't store request content by default, but a model name without a route prefix may run outside the EU. | `claude-sonnet-5-5` | [platform.opper.ai](https://platform.opper.ai), or `OPPER_API_KEY` |
+| Mistral | Mistral AI's own API, from France. Paid API requests aren't used for training by default; on a free account, turn training off under Privacy in the admin panel. Labs and Preview models may train regardless of that setting. | `mistral-small-2603` | [console.mistral.ai](https://console.mistral.ai/api-keys), or `MISTRAL_API_KEY`; for [EU inference](https://docs.mistral.ai/inference/regional-inference), set **Address** to `https://api.eu.mistral.ai/v1` (supported models only; 10% surcharge) |
+
+Last checked: November 2026. These descriptions apply to the presets' default addresses.
+If **Address** is changed, the chosen service's policy applies. These summaries aren't guarantees
+against retention required by law or safety investigations. Your account settings and upstream
+services can change them. Requests billed to a ChatGPT plan are assumed to follow ChatGPT's data controls,
+as OpenAI documents for Codex. See the providers' own policies: [Anthropic](https://privacy.claude.com/en/articles/7996866-how-long-do-you-store-my-organization-s-data),
+[OpenAI API](https://developers.openai.com/api/docs/guides/your-data),
+[ChatGPT/Codex](https://help.openai.com/en/articles/7730893-data-controls-in-chatgpt),
+[Gemini](https://ai.google.dev/gemini-api/terms), [OpenRouter](https://openrouter.ai/privacy),
+[Requesty privacy](https://www.requesty.ai/privacy) and [training terms](https://www.requesty.ai/terms), [TrustedRouter](https://trustedrouter.com/privacy),
+[Opper](https://opper.ai/security-overview), and
+[Mistral](https://legal.mistral.ai/terms/commercial-terms-of-service/).
 
 The ↻ button lists the provider's models. The provider and model you last chose in the settings
 are used at start. Until you choose one, `RUSTGIS_ASSISTANT_PROVIDER` and
@@ -93,6 +124,22 @@ only when you choose that provider. Saved settings win over the environment. The
 field changes the endpoint for providers other than ChatGPT; use the OpenAI-compatible API
 path (usually `/v1`) for local servers. Models that call tools well give the best results;
 small local models may stop early or skip steps.
+
+### OpenRouter private routing
+
+**Private routing** is on by default for OpenRouter. Every chat request, including summaries
+and subagent requests, sends `provider: {"data_collection": "deny"}` to exclude endpoints that
+collect request data. This uses [OpenRouter's routing policy](https://openrouter.ai/docs/guides/routing/provider-selection);
+it isn't a guarantee of upstream compliance or the separate zero data retention option.
+If no endpoint satisfies the policy, the refusal points to this checkbox. Turning it off
+allows more endpoints under your OpenRouter account settings; some may keep or train on requests.
+The model list is unchanged, so a listed model may have no eligible endpoint.
+
+Changing this setting stops the current run, including a delegated subagent, so subsequent
+requests use the new policy. A request already sent may still finish at the provider.
+The setting is saved for OpenRouter alone. On the command line, set
+`RUSTGIS_OPENROUTER_DATA_COLLECTION=allow` to turn the filter off; other values keep it on.
+Other providers' requests are unaffected.
 
 ### Signing in with ChatGPT
 
@@ -340,7 +387,8 @@ results such as rows the assistant reads, the pictures you attach to a message, 
 assistant calls `view_map`, a picture of the map, basemap tiles included. Local agents use their own providers and tools,
 with their own data handling. A key typed in the settings is used for the session only unless
 you tick **Remember the key on this computer**. On the desktop, this saves it in the system
-keychain (macOS Keychain, Windows Credential Manager, or the Secret Service on Linux). Clearing
+keychain (macOS Keychain, Windows Credential Manager, or the Secret Service on Linux); on
+Android, it is encrypted with a key the Android Keystore holds. Clearing
 the key or unticking **Remember** deletes the saved key; a failed deletion is shown in settings.
 Keys from the environment are never saved. If the keychain is unavailable, locked, or access
 is refused, a new key stays in memory for this session and the settings explain why it was not
@@ -376,7 +424,7 @@ can be used only once), and the keychain is read under the same lock.
 Plain HTTP is only used for servers on your computer or local network.
 
 In the web app, the browser calls the provider directly. Anthropic, OpenAI, Gemini,
-OpenRouter, Requesty, TrustedRouter and Opper accept that; a local Ollama server must allow the page's origin
+OpenRouter, Requesty, TrustedRouter, Opper and Mistral accept that; a local Ollama server must allow the page's origin
 (`OLLAMA_ORIGINS=https://web.rustgis.app ollama serve`).
 
 ## Retries and long conversations

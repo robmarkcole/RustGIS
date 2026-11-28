@@ -7,6 +7,8 @@ use std::collections::HashMap;
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 
+#[cfg(not(target_arch = "wasm32"))]
+use rustgis_data::loss::{LossCode, Note};
 use rustgis_data::raster::{self, Crs, zarr};
 use rustgis_map::raster::RasterLayer;
 #[cfg(not(target_arch = "wasm32"))]
@@ -131,6 +133,13 @@ fn fetch_items(root: &str, keys: &[(String, String)]) -> Result<(HashMap<String,
     let next = std::sync::atomic::AtomicUsize::new(0);
     let capture = rustgis_data::diagnostics::Capture::current();
     let still = crate::render::rustgis_tiles::cache::current_still();
+    // Each file is fetched within the store's reach: a store a document read from the internet
+    // named ([`crate::received::hold`]) is held there, and so are its files, whose own addresses
+    // the hold never saw.
+    let store = {
+        use crate::render::rustgis_tiles::cache::ceiling_for;
+        ceiling_for(root).min(ceiling_for(&format!("{root}/")))
+    };
     let work = || {
         crate::render::rustgis_tiles::cache::with_optional_still(still.clone(), || {
             let _diagnostic_scope = capture.enter();
@@ -142,7 +151,7 @@ fn fetch_items(root: &str, keys: &[(String, String)]) -> Result<(HashMap<String,
                 }
                 // A missing file is an expected answer here (see `is_absent`), not a failure:
                 // one omission note replaces its 404/403 diagnostics; real failures still say why.
-                let got = crate::render::rustgis_tiles::cache::download_blocking_omitting(&format!("{root}/{k}"), &[404, 403]);
+                let got = crate::render::rustgis_tiles::cache::download_blocking_omitting_at(&format!("{root}/{k}"), &[404, 403], store);
                 match got {
                     Ok(b) => {
                         let len = b.len() as u64;
@@ -239,6 +248,21 @@ mod transport_tests {
         assert!(result.unwrap_err().contains("cancelled"));
         assert_eq!(sends, 0);
         assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    /// The files of a store a document read from the internet named are fetched within the
+    /// store's hold, though the hold never saw their own addresses: one on this computer isn't
+    /// asked for.
+    #[test]
+    fn a_held_stores_files_are_held_too() {
+        use crate::render::rustgis_tiles::cache;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let root = format!("http://{}/held.zarr", listener.local_addr().unwrap());
+        cache::restrict_to_public(&root);
+        let result = super::fetch(&root, &["zarr.json".into()]);
+        assert_eq!(listener.accept().map(|_| ()).unwrap_err().kind(), std::io::ErrorKind::WouldBlock, "a file of the store was asked for");
+        assert!(result.is_err(), "{result:?}");
     }
 }
 
@@ -393,7 +417,7 @@ pub fn pick_variable(store: &zarr::Store, sel: &mut zarr::Selection) -> Result<(
 #[cfg(not(target_arch = "wasm32"))]
 fn crs_lost(r: &mut raster::Raster, text: Option<&str>, store: &zarr::Store, variable: &str) {
     if let Some(note) = text.and_then(|t| zarr::typed_crs_note(store, variable, r, t))
-        && !r.lost.contains(&note)
+        && !r.lost.says(&note)
     {
         r.lost.push(note);
     }
@@ -525,7 +549,7 @@ pub(crate) fn add(s: &mut Session, p: &Value) -> CmdResult {
             let mut layer = if sel.window.is_some() {
                 r.source = Some(full.clone());
                 let tif = zarr::write_project_slice(&r).map_err(|e| e.to_string())?;
-                let mut layer = RasterLayer::from_bytes(r, format!("{}.tif", store_name(&full)), tif);
+                let mut layer = RasterLayer::from_written(r, format!("{}.tif", store_name(&full)), tif);
                 layer.path = Some(full);
                 layer
             } else {
@@ -557,7 +581,7 @@ pub(crate) fn add(s: &mut Session, p: &Value) -> CmdResult {
             // The writer refuses systems its keys cannot preserve, as for a directory window or
             // a slice handed over by the UI.
             let tif = zarr::write_project_slice(&r).map_err(|e| e.to_string())?;
-            let mut layer = RasterLayer::from_bytes(r, format!("{}.tif", store_name(&u)), tif);
+            let mut layer = RasterLayer::from_written(r, format!("{}.tif", store_name(&u)), tif);
             layer.subdataset = Some(sel.label());
             // The coordinate system given for a store that doesn't say, kept as a folder's slice
             // keeps it, so a time series read from the layer finds it.
@@ -1029,7 +1053,7 @@ impl PendingRead {
         crate::render::rustgis_tiles::cache::with_optional_still(self.still.clone(), || {
             let _diagnostic_scope = self.capture.enter();
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read_step(&self.zt, self.step, self.key.clone())))
-                .unwrap_or_else(|_| Err(format!("{}: reading step {} failed unexpectedly", self.zt.store, self.step)))
+                .unwrap_or_else(|payload| Err(crate::bug(&format!("{}: reading step {}", self.zt.store, self.step), payload.as_ref())))
         })
     }
 
@@ -1589,7 +1613,7 @@ fn series(s: &mut Session, p: &Value) -> CmdResult {
         let mut notes = Vec::new();
         let series = series_start(s, p)?.read(&mut notes);
         for n in notes {
-            s.warn(n);
+            s.say_warning(n);
         }
         series
     }
@@ -1641,7 +1665,7 @@ impl SeriesRun {
     /// Reads the series under `control`: its count is the steps read of those asked, and Cancel
     /// stops it before its next batch of reads, with no series. Gives the series as `zarr.series`
     /// answers it, and what reading it said, which a read that fails said too.
-    pub fn run(&self, control: &std::sync::Arc<rustgis_analysis::control::Control>) -> (Result<Value, String>, Vec<String>) {
+    pub fn run(&self, control: &std::sync::Arc<rustgis_analysis::control::Control>) -> (Result<Value, String>, Vec<Note>) {
         let mut notes = Vec::new();
         let series = rustgis_analysis::run_under("Time Series at a Point", control, || self.read(&mut notes));
         (series, notes)
@@ -1649,7 +1673,7 @@ impl SeriesRun {
 
     /// Reads the series on this thread, looking at the run's Cancel (if any) between batches;
     /// what reading it says goes in `notes` as it is found, so an error after it doesn't lose it.
-    fn read(&self, notes: &mut Vec<String>) -> Result<Value, String> {
+    fn read(&self, notes: &mut Vec<Note>) -> Result<Value, String> {
         let (lon, lat) = (self.lon, self.lat);
         let mut src = self.src.clone();
         let check = &mut |_: usize| rustgis_data::progress::check().map_err(|_| "cancelled".to_string());
@@ -1693,7 +1717,7 @@ impl SeriesRun {
             // A typed system is only a fallback. Invalid text wasn't used on degree axes either.
             let typed = if given.is_none() { src.crs.as_deref().and_then(|text| Crs::parse(text).ok()) } else { None };
             if let Some(note) = zarr::lonlat_assumption(given.as_ref().map(|(c, _)| *c), typed) {
-                notes.push(format!("{var}: {note}"));
+                notes.push(Note::loss(LossCode::AssumedCrs, format!("{var}: {note}")));
             }
         }
         let crs = if lonlat {
@@ -1704,13 +1728,19 @@ impl SeriesRun {
             let text = src.crs.as_deref().ok_or("the store doesn't say its coordinate system; give \"crs\" (such as EPSG:3035)")?;
             // Read as `parse_crs` reads it, its note said with the series'.
             let crs = Crs::parse(text)?;
+            // Plain, as the raster read says it (`crs_lost`): it can join a formula chosen for
+            // compatibility with a shift not applied, so its count isn't one of losses only.
             if let Some(note) = raster::wkt::typed_crs_note(text, crs) {
-                notes.push(format!("crs: {note}"));
+                notes.push(Note::plain(format!("crs: {note}")));
             }
             crs
         };
-        if let Some((_, Some(note))) = given {
-            notes.push(format!("{var}: {note}"));
+        // Said only of the system the series reads in: a longitude/latitude grid declared in a
+        // projected system reads in WGS 84, which the note above says.
+        if let Some((c, Some(note))) = given
+            && (!lonlat || c.is_geographic())
+        {
+            notes.push(Note::plain(format!("{var}: {note}")));
         }
         let m = crs
             .transformer()?
@@ -1813,7 +1843,7 @@ impl ReduceRun {
         let mut unwritten = 0usize;
         // What reading the slices said (a shift the store's system doesn't apply, …), once each:
         // the summary is in their grid, so it is said of it too.
-        let mut lost: Vec<String> = Vec::new();
+        let mut lost: Vec<rustgis_data::loss::Note> = Vec::new();
         for &i in &self.steps {
             if cancel.load(Ordering::Relaxed) {
                 return Err("cancelled".into());
@@ -1882,7 +1912,7 @@ impl ReduceRun {
             raster::Raster::new(&self.name, first.0, first.1, vec![out], first.2, first.3, None, raster::ColorHint::Gray, "Float32")
                 .map_err(|e| e.to_string())?;
         r.source = Some(self.root.clone());
-        r.lost = lost;
+        r.lost = lost.into();
         Ok(r)
     }
 }
@@ -1893,8 +1923,8 @@ impl ReduceRun {
 pub fn reduce_start(s: &Session, p: &Value) -> Result<ReduceRun, String> {
     let stat = Stat::parse(p)?;
     // A variable of classes is summarised by cube.reduce, which reads its dates in order; so is a
-    // median, which holds every date's value, and first, which ranks them.
-    if stat.categorical() || matches!(stat, Stat::Median | Stat::First) {
+    // median, which holds every date's value, and first and firstDate, which rank them.
+    if stat.categorical() || matches!(stat, Stat::Median | Stat::First | Stat::FirstDate) {
         return Err(format!(
             "zarr.reduce takes mean, min, max, sum, std, count or countAbove: {} is cube.reduce's (give it this layer or store)",
             stat.code()
@@ -2003,7 +2033,7 @@ fn reduce(s: &mut Session, p: &Value) -> CmdResult {
         let run = reduce_start(s, p)?;
         let r = run.run(&std::sync::atomic::AtomicBool::new(false), &std::sync::atomic::AtomicUsize::new(0))?;
         let tif = zarr::write_project_slice(&r).map_err(|e| e.to_string())?;
-        let mut layer = RasterLayer::from_bytes(r, format!("{}.tif", store_name(&run.root)), tif);
+        let mut layer = RasterLayer::from_written(r, format!("{}.tif", store_name(&run.root)), tif);
         layer.subdataset = None;
         let mut out = super::raster::add_raster(s, &run.name, layer)?;
         out["steps"] = serde_json::json!(run.total());

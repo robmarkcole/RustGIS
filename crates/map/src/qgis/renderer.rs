@@ -16,6 +16,11 @@ use crate::symbology::{ClassMethod, LineStroke, Renderer, Symbol};
 /// The most classes a renderer is imported with: every feature is matched against them.
 pub(super) const MAX_CLASSES: usize = 4096;
 
+/// Renderer `r`'s reference scale (`referencescale`), QGIS's own, if it has one.
+pub(super) fn reference_scale(r: Node) -> Option<f64> {
+    r.attribute("referencescale").and_then(|v| v.trim().parse::<f64>().ok()).filter(|v| v.is_finite() && *v > 0.0)
+}
+
 /// Reads the renderer `r` into `style`: its renderer, a line layer's strokes, and its reference
 /// scale and symbol levels.
 pub(super) fn read(r: Node, layer: &str, style: &mut Style, report: &mut Report) {
@@ -24,7 +29,7 @@ pub(super) fn read(r: Node, layer: &str, style: &mut Style, report: &mut Report)
 
 fn read_depth(r: Node, layer: &str, style: &mut Style, report: &mut Report, depth: usize) {
     // QGIS's reference scale (its own scale, at 96 dpi): kept for sizes in map units.
-    let reference = r.attribute("referencescale").and_then(|v| v.trim().parse::<f64>().ok()).filter(|v| v.is_finite() && *v > 0.0);
+    let reference = reference_scale(r);
     if let Some(s) = reference {
         style.reference_scale = Some((s * QGIS_SCALE).clamp(1.0, 1e9));
     }

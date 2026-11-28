@@ -49,7 +49,7 @@ pub fn commands() -> Vec<C> {
         }).roles(&[]).effects(crate::policy::Effects::NONE)
         .params(r#"{"mode": "none"|"distance", "distance"?: metres from the view's centre}"#),
         C::new("map.terrain", "Terrain", "View › Scene", terrain).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network)).params(
-            r##"{"layer"?: a DEM raster layer (heights in metres; without layer or tiles, and no terrain yet, the active layer when it is a raster) | "tiles"?: elevation tile URL with {z}/{x}/{y}, "encoding"?: "terrarium"|"mapbox" (tiles; default terrarium), "exaggeration"?: 0 to 20 (default 1, or the terrain's), "block"?: a block diagram {"extent"?: "layer" (the DEM's extent, default) | [xmin, ymin, xmax, ymax] in map units (needed over tiles), "depth"?: metres from the lowest ground to the base (default half the relief, at least 100), "walls"?: "#RRGGBB" (default #C8B89A) | {"color"?: "#RRGGBB" (default #C8B89A), "layer"?: a polygon layer that holds all its features (not one read a view at a time; it may be hidden): its symbology colours the walls where its polygons meet the block's edge, and the walls are color off its polygons}, "shape"?: "box" (default) | "circle" (the largest circle in the box, its walls round it) | {"layer": a polygon layer, "where"?: sql (picks its polygons, as a definition query)} (the ground inside the polygons' outer rings, holes not cut, the box round them: no extent), "radius"?: a circle's radius in map units (default: the largest in the box), "water"?: the terrain's water shown in the walls' section {"depth"?: metres from the level to the floor, "field"?: a numeric field of the water layer holding each one's depth} (one of them needed), or false}, keys left out stay as the block had them and null puts one back to its default (a new block takes the defaults), and the block's "water" is given whole each time, replacing the old, or false to take it off (default: as it was), "water"?: water bodies drawn flat at their level {"layer": a polygon layer, "level"?: a numeric field of levels in metres (default: each polygon's lowest height along its shore), "glint"?: 0 to 1, how brightly a tilted view's water shines where it reflects the sun toward the eye (default 0.3; 0: none), "shore"?: 0 to 1, how dark the band along the water's shore is at the outline, fading a few pixels inside it (default 0.35; 0: none)}, or false to take it off (default: as it was), "off"?: true}"##,
+            r##"{"layer"?: a DEM raster layer (heights in metres; without layer or tiles, and no terrain yet, the active layer when it is a raster) | "tiles"?: elevation tile URL with {z}/{x}/{y}, "encoding"?: "terrarium"|"mapbox" (tiles; default terrarium), "exaggeration"?: 0 to 20 (default 1, or the terrain's), "block"?: a block diagram {"extent"?: "layer" (the DEM's extent, default) | [xmin, ymin, xmax, ymax] in map units (needed over tiles), "depth"?: metres from the lowest ground to the base (default half the relief, at least 100), "walls"?: "#RRGGBB" (default #C8B89A) | {"color"?: "#RRGGBB" (default #C8B89A), "layer"?: a polygon layer that holds all its features (not one read a view at a time; it may be hidden): its symbology colours the walls where its polygons meet the block's edge, and the walls are color off its polygons}, "shape"?: "box" (default) | "circle" (the largest circle in the box, its walls round it) | {"layer": a polygon layer, "where"?: sql (picks its polygons, as a definition query)} (the ground inside the polygons, each hole a well with its own walls and its floor at the base, the box round them: no extent), "radius"?: a circle's radius in map units (default: the largest in the box), "water"?: the terrain's water shown in the walls' section {"depth"?: metres from the level to the floor, "field"?: a numeric field of the water layer holding each one's depth, "bed"?: a raster layer of the bed's heights in metres on the DEM's datum (the floor where it has data, never above the level; elsewhere the field's depth or the depth)} (one of them needed), or false}, keys left out stay as the block had them and null puts one back to its default (a new block takes the defaults), and the block's "water" is given whole each time, replacing the old, or false to take it off (default: as it was), "water"?: water bodies drawn flat at their level {"layer": a polygon layer, "level"?: a numeric field of levels in metres (default: each polygon's lowest height along its shore), "glint"?: 0 to 1, how brightly a tilted view's water shines where it reflects the sun toward the eye (default 0.3; 0: none), "shore"?: 0 to 1, how dark the band along the water's shore is at the outline, fading a few pixels inside it (default 0.35; 0: none)}, or false to take it off (default: as it was), "off"?: true}"##,
         ),
         C::new("map.exportOrbit", "Export Orbit", "View › Scene", |s, p| super::exports::write_here(s, p, "map.exportOrbit")).inputs(orbit_inputs).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
             .view()
@@ -246,9 +246,9 @@ fn orbit_params(p: &Value) -> Result<Orbit, String> {
 /// the copy left out is said by the session's own landing check (`notice_landed_rasters`, after
 /// each command and on each frame of the app), not frame by frame here.
 pub(crate) fn orbit_work(s: &Session, p: &Value) -> Result<super::exports::Work, String> {
-    // Files are written by the desktop app; the browser's go through its services.
-    if cfg!(target_arch = "wasm32") {
-        return Err("exporting an orbit needs the desktop app".into());
+    // Refused where files are downloaded: the web app draws no animations ([`super::time::animate`]).
+    if s.downloads_files() {
+        return Err("the web app can't export an orbit; open the project in the desktop app and export it there".into());
     }
     let path = ps(p, "path").ok_or("path is required (a .gif, or a .zip of PNG frames)")?.to_string();
     let lower = path.to_ascii_lowercase();
@@ -367,8 +367,8 @@ fn terrain_block(
         None => base.and_then(|b| b.water.clone()),
         Some(Value::Null | Value::Bool(false)) => None,
         Some(Value::Object(w)) => {
-            if let Some(k) = w.keys().find(|k| !matches!(k.as_str(), "depth" | "field")) {
-                return Err(format!("block's water has no '{k}' (depth, field)"));
+            if let Some(k) = w.keys().find(|k| !matches!(k.as_str(), "depth" | "field" | "bed")) {
+                return Err(format!("block's water has no '{k}' (depth, field, bed)"));
             }
             let depth = match w.get("depth") {
                 None | Some(Value::Null) => None,
@@ -379,9 +379,15 @@ fn terrain_block(
                 Some(Value::String(f)) if !f.trim().is_empty() => Some(f.trim().to_string()),
                 Some(_) => return Err("block's water field is a numeric field of the water layer".into()),
             };
-            Some(rustgis_map::view::BlockWater { depth, field })
+            // A raster of the bed's heights (#2434), checked against the block's box in `terrain`.
+            let bed = match w.get("bed") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(n)) if !n.trim().is_empty() => Some(bed_layer(s, n)?),
+                Some(_) => return Err("block's water bed is a raster layer of the bed's heights".into()),
+            };
+            Some(rustgis_map::view::BlockWater { depth, field, bed })
         }
-        Some(_) => return Err("block's water is {\"depth\"?, \"field\"?}, or false".into()),
+        Some(_) => return Err("block's water is {\"depth\"?, \"field\"?, \"bed\"?}, or false".into()),
     };
     // The outline inside the box (#2318): the box itself, or the circle in it.
     // A round block's radius is kept, as the shape is, when the call gives neither.
@@ -428,6 +434,20 @@ fn terrain_block(
     Ok(block)
 }
 
+/// The name of the raster layer `name` a block's water reads its bed's heights from (#2434),
+/// checked: a raster layer of a name of its own.
+fn bed_layer(s: &Session, name: &str) -> Result<String, String> {
+    let name = name.trim();
+    let l = s.map().layer_by_name(name).ok_or_else(|| format!("no layer '{name}' (the block's water bed)"))?;
+    if l.raster.is_none() {
+        return Err(format!("'{name}' isn't a raster layer (the block's water bed: heights of the bed in metres)"));
+    }
+    if s.map().layers.iter().filter(|o| o.name.eq_ignore_ascii_case(name)).count() > 1 {
+        return Err(format!("more than one layer is called '{name}': give the block's water bed a name of its own, then try again"));
+    }
+    Ok(l.name.clone())
+}
+
 /// A block cut to polygons (#2318) from `"shape": {"layer", "where"?}`: a polygon layer as the
 /// water's ([`polygon_layer`]) and a `where` that reads and picks a polygon among the rows its
 /// definition query keeps.
@@ -458,31 +478,26 @@ fn block_polygons(s: &Session, o: &serde_json::Map<String, Value>) -> Result<rus
 
 /// What simplifying a polygon block's outline lost: rings narrower than the spacing, and corners
 /// past a third of the finest mesh cell or its smallest rings, to stay under 65 535 sides (said
-/// when it is set and when a project opens).
+/// when it is set and when a project opens), and holes left out as they lay outside their own
+/// polygon.
 pub(crate) fn outline_simplified(layer: &str, o: &rustgis_render::terrain::Outline) -> Option<String> {
     let (spacing, coarsened) = o.spacing();
     // Rings narrower than the spacing, with no area left once thinned (#2318).
     let narrow =
         (o.narrow() > 0).then(|| format!("{} ring(s) of '{layer}' narrower than {spacing:.0} m were left out of the block", o.narrow()));
-    let left = match o.dropped() {
-        0 if !coarsened => return narrow,
-        0 => String::new(),
-        n => format!(", and its {n} smallest ring(s) were left out"),
+    let stray = (o.stray() > 0)
+        .then(|| format!("{} hole(s) of '{layer}' lying outside their own polygon's outer ring were left out (not cut)", o.stray()));
+    let merged = match o.dropped() {
+        0 if !coarsened => None,
+        n => {
+            let left = if n == 0 { String::new() } else { format!(", and its {n} smallest ring(s) were left out") };
+            Some(format!(
+                "the outline of '{layer}' the block is cut to has too many corners: corners up to {spacing:.0} m apart were merged (less in smaller rings){left}, to stay under 65535 sides"
+            ))
+        }
     };
-    let said = format!(
-        "the outline of '{layer}' the block is cut to has too many corners: corners up to {spacing:.0} m apart were merged (less in smaller rings){left}, to stay under 65535 sides"
-    );
-    Some(match narrow {
-        Some(n) => format!("{said}; {n}"),
-        None => said,
-    })
-}
-
-/// The holes of a polygon block's polygons, which aren't cut: the ground inside them is drawn
-/// (said when it is set and when a project opens).
-pub(crate) fn outline_holes(layer: &str, o: &rustgis_render::terrain::Outline) -> Option<String> {
-    let n = o.holes();
-    (n > 0).then(|| format!("{n} hole(s) in the polygons of '{layer}' the block is cut to aren't cut: the ground inside them is drawn"))
+    let said: Vec<String> = [merged, narrow, stray].into_iter().flatten().collect();
+    (!said.is_empty()).then(|| said.join("; "))
 }
 
 /// The name of the polygon layer `name` for `what` (water, a block's walls), checked: a polygon
@@ -753,7 +768,7 @@ fn terrain(s: &mut Session, p: &Value) -> CmdResult {
     // A polygon block's outline as drawn: its sides and how near its corners were let lie.
     if let Some((_, o)) = &outline {
         let (spacing, coarsened) = o.spacing();
-        out["block"]["outline"] = json!({"sides": o.side_count(), "spacing": spacing, "coarsened": coarsened, "dropped": o.dropped(), "holes": o.holes(), "narrow": o.narrow()});
+        out["block"]["outline"] = json!({"sides": o.side_count(), "spacing": spacing, "coarsened": coarsened, "dropped": o.dropped(), "holes": o.holes(), "stray": o.stray(), "narrow": o.narrow()});
     }
     if matches!(t.source, TerrainSource::Layer(_)) && t.block.is_some() && dem_box.is_none() {
         out["block"]["pendingDem"] = json!(true);
@@ -797,6 +812,18 @@ fn terrain(s: &mut Session, p: &Value) -> CmdResult {
         }
         return Err(e);
     }
+    // And its water's bed (#2434): the map draws no bed with two layers of its name.
+    if let Some(l) = t.block.as_ref().and_then(|b| b.water.as_ref()).and_then(|w| w.bed.as_ref())
+        && m.layers.iter().filter(|o| o.name.eq_ignore_ascii_case(l)).count() > 1
+    {
+        let e = format!(
+            "more than one layer is called '{l}': give the block's water bed a name of its own, then try again (Terrain stays as it was)"
+        );
+        if let Some(old) = old_terrain {
+            m.view.terrain = Some(old);
+        }
+        return Err(e);
+    }
     // The water a block's walls cut (#2317), when this call sets the block or the terrain's water
     // (a block kept from before is checked against new water too): the terrain's water, and the
     // depth field a numeric field of its layer. How many of the polygons its definition query
@@ -821,6 +848,33 @@ fn terrain(s: &mut Session, p: &Value) -> CmdResult {
             let n = if bw.depth.is_some() { 0 } else { l.dataset.features.column(i).enumerate().filter(missing).count() };
             Ok((n > 0).then(|| (n, l.name.clone(), f.clone())))
         })();
+        // Its bed (#2434), when this call sets the block (its box can move off a bed it keeps):
+        // overlapping the block's box once the raster's data is there (a bed still being read
+        // gives no floor until it is, the walls showing the depth or field meanwhile). A bed kept
+        // from before whose layer went, or no longer is a raster, isn't refused: that was said,
+        // and a raster layer of that name brings it back.
+        let checked = checked.and_then(|n| {
+            let Some(bed) = bw.bed.as_deref().filter(|_| block.is_some()) else { return Ok(n) };
+            let layer = m.layer_by_name(bed);
+            if !given("water") && layer.is_none_or(|l| l.raster.is_none()) {
+                return Ok(n);
+            }
+            let l = layer.ok_or_else(|| format!("no layer '{bed}' (the block's water bed){kept}"))?;
+            let raster = l.raster.as_ref().ok_or_else(|| format!("'{bed}' isn't a raster layer (the block's water bed){kept}"))?;
+            let boxed = t.block.as_ref().and_then(|b| b.extent.or(own)).or_else(|| dem_box.as_ref().and_then(|d| d.1));
+            if let (Some(data), Some([x0, y0, x1, y1])) = (raster.data.as_ref(), boxed) {
+                let Some(f) = rustgis_render::terrain::raster_footprint(data) else {
+                    return Err(format!("'{bed}' can't be placed on the map (the block's water bed){kept}"));
+                };
+                if x1 <= f[0] || x0 >= f[2] || y1 <= f[1] || y0 >= f[3] {
+                    return Err(format!(
+                        "the block's water bed '{bed}' doesn't overlap the block's box: its footprint spans [{:.0}, {:.0}, {:.0}, {:.0}] in Web Mercator metres{kept}",
+                        f[0], f[1], f[2], f[3]
+                    ));
+                }
+            }
+            Ok(n)
+        });
         match checked {
             Ok(n) => no_depth = n,
             Err(e) => {
@@ -836,10 +890,11 @@ fn terrain(s: &mut Session, p: &Value) -> CmdResult {
         TerrainSource::Tiles { .. } => None,
     };
     let water_layer = t.water.as_ref().filter(|_| water.is_some()).map(|w| w.layer.clone());
+    let t_bed = t.block.as_ref().and_then(|b| b.water.as_ref()).and_then(|w| w.bed.clone());
     m.view.terrain = Some(t);
     // A polygon block's outline simplified past a third of the finest mesh cell, or short of its
     // smallest rings, to stay under 65 535 sides: said, with how far.
-    for said in outline.iter().flat_map(|(layer, o)| [outline_simplified(layer, o), outline_holes(layer, o)]).flatten() {
+    for said in outline.iter().flat_map(|(layer, o)| outline_simplified(layer, o)) {
         s.notify(format!("Terrain: {said}"), false);
     }
     if block_cut {
@@ -851,7 +906,11 @@ fn terrain(s: &mut Session, p: &Value) -> CmdResult {
     }
     if let Some((n, layer, field)) = no_depth {
         let (polygons, have) = if n == 1 { ("1 polygon".to_string(), "has") } else { (format!("{n} polygons"), "have") };
-        s.notify(format!("Block: {polygons} of '{layer}' {have} no depth in '{field}', so a wall crossing them shows no water"), false);
+        let shows = match t_bed.as_deref() {
+            Some(bed) => format!("shows water only where the bed '{bed}' has heights"),
+            None => "shows no water".to_string(),
+        };
+        s.notify(format!("Block: {polygons} of '{layer}' {have} no depth in '{field}', so a wall crossing them {shows}"), false);
     }
     // When the water is set, what its levels left out is said, with how many.
     if let Some(name) = water_layer {

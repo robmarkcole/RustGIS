@@ -137,6 +137,10 @@ struct ReadJob {
     slot: crate::Slot<Result<reads::Read, String>>,
     /// A reload's target and what its file held, looked at on its thread as the read started.
     seen: Option<(crate::diskwatch::Target, crate::Slot<crate::diskwatch::Seen>)>,
+    /// A QGIS project's import's first part under way: its file read and parsed, before the
+    /// import itself starts ([`scan`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    scan: Option<crate::Slot<Result<rustgis_engine::cmd::qgis::ImportScan, String>>>,
 }
 
 /// Runs Add Data, Load All, Repair/Reload Data, Convert To Annotation, archive reload/repair, model/script
@@ -241,15 +245,20 @@ fn run_presented(
         };
         params.insert("layer".into(), json!(id));
     }
-    let mut ahead = match reads::read_ahead(&mut app.session, command, &p) {
-        Ok(ahead) => ahead,
-        Err(error) => {
-            app.command_failed(command, &error, notice_mark);
-            not_run(app, then, error.clone());
-            return Err(error);
+    // A QGIS project's import is admitted once its file has been read, on a thread ([`scan`]).
+    let mut ahead = if command == "project.importQgis" && cfg!(not(target_arch = "wasm32")) {
+        None
+    } else {
+        match reads::read_ahead(&mut app.session, command, &p) {
+            Ok(ahead) => Some(ahead),
+            Err(error) => {
+                app.command_failed(command, &error, notice_mark);
+                not_run(app, then, error.clone());
+                return Err(error);
+            }
         }
     };
-    if let Some(dataset) = preview {
+    if let (Some(dataset), Some(ahead)) = (preview, ahead.as_mut()) {
         ahead.keep_preview(dataset);
     }
     // Load All asked again for a layer it is reading already.
@@ -292,7 +301,7 @@ fn run_presented(
     let asked = Asked {
         command,
         params: p,
-        ahead: Some(ahead),
+        ahead,
         what,
         opened: app.session.opened,
         map: app.session.map().instance_id(),
@@ -424,6 +433,7 @@ fn called<'a>(command: &str, what: &'a str) -> &'a str {
         (true, "data.similar") => tl_raw!("Find Similar"),
         (true, "layer.sizeBy") => tl_raw!("Size by Field"),
         (true, "style.importQgis") => tl_raw!("Import QGIS Style"),
+        (true, "project.importQgis") => tl_raw!("Import QGIS Project"),
         (true, "service.add") => tl_raw!("Add Service Layer"),
         (true, "service.layers") => tl_raw!("List Service Layers"),
         (true, "edit.previewShapeConversion") => tl_raw!("Preview Shape Conversion"),
@@ -477,7 +487,8 @@ fn placed(app: &RustGisApp, asked: &Asked) -> Result<Value, Gone> {
     if app.session.opened != asked.opened {
         return Err(Gone::Project);
     }
-    if app.session.map().instance_id() != asked.map {
+    // A project's import makes a map of its own: it needs none of the maps open to stay active.
+    if asked.command != "project.importQgis" && app.session.map().instance_id() != asked.map {
         return Err(Gone::Map);
     }
     if let Some((i, original)) = &asked.archive
@@ -501,6 +512,10 @@ fn placed(app: &RustGisApp, asked: &Asked) -> Result<Value, Gone> {
 /// Starts `asked`'s read with `p`, or runs it here when it reads nothing ahead (or its thread
 /// can't start).
 fn start(app: &mut RustGisApp, mut asked: Asked, p: Value) -> Result<Value, String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    if asked.command == "project.importQgis" && asked.ahead.is_none() {
+        return scan(app, asked, p);
+    }
     let Some(ahead) = asked.ahead.take() else {
         return complete_here(app, asked, p, Err(tl!("This read was already started").to_string()));
     };
@@ -553,6 +568,7 @@ fn start(app: &mut RustGisApp, mut asked: Asked, p: Value) -> Result<Value, Stri
             asked.command,
             "map.reloadTiles"
                 | "map.repairTiles"
+                | "project.importQgis"
                 | "service.add"
                 | "service.layers"
                 | "script.run"
@@ -581,8 +597,94 @@ fn start(app: &mut RustGisApp, mut asked: Asked, p: Value) -> Result<Value, Stri
         return complete_here(app, asked, p, read);
     }
     let seen = watched.map(|(target, _)| (target, looked));
-    app.reads.job = Some(ReadJob { asked, gone: None, name, control, cancel_waiting: true, slot, seen });
+    app.reads.job = Some(ReadJob {
+        asked,
+        gone: None,
+        name,
+        control,
+        cancel_waiting: true,
+        slot,
+        seen,
+        #[cfg(not(target_arch = "wasm32"))]
+        scan: None,
+    });
     Ok(json!({"started": name}))
+}
+
+/// The first part of a QGIS project's import (#3120): its file read and parsed on a thread of its
+/// own, with Cancel, for the web addresses its layers name. When it is done, [`land`] opens their
+/// logins here and starts the import itself, which takes the project as parsed ([`scanned`]).
+#[cfg(not(target_arch = "wasm32"))]
+fn scan(app: &mut RustGisApp, asked: Asked, p: Value) -> Result<Value, String> {
+    let name = called(asked.command, "");
+    let control = Control::stoppable();
+    let (ctl, slot) = (control.clone(), crate::Slot::default());
+    let out = slot.clone();
+    let params = p;
+    let log_inputs = app.session.log.on();
+    let diagnostics = app.session.diagnostics.capture();
+    let spawn = || {
+        std::thread::Builder::new().name(name.into()).spawn(move || {
+            let _diagnostics = diagnostics.enter();
+            let scanned = reads::scan_import(&params, &ctl, log_inputs);
+            *out.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(scanned);
+        })
+    };
+    #[cfg(test)]
+    let spawn = || if app.reads.fail_spawn { Err(std::io::Error::other("worker start refused for test")) } else { spawn() };
+    if let Err(e) = spawn() {
+        let why = crate::i18n::fmt("The background worker could not start ({error}). Retry the command.", &[("error", &e.to_string())]);
+        app.session.notify(why.clone(), true);
+        not_run_asked(app, &asked, why.clone());
+        return Err(why);
+    }
+    app.reads.job = Some(ReadJob {
+        asked,
+        gone: None,
+        name: "Import QGIS Project",
+        control,
+        cancel_waiting: true,
+        slot: crate::Slot::default(),
+        seen: None,
+        scan: Some(slot),
+    });
+    Ok(json!({"started": name}))
+}
+
+/// A QGIS project's import whose file has been read ([`scan`]): admitted now, its logins opened,
+/// it starts on a thread of its own, and `true`. One cancelled, left or failed meanwhile has its
+/// outcome put in its slot for [`land`] to say, and `false`.
+#[cfg(not(target_arch = "wasm32"))]
+fn scanned(app: &mut RustGisApp) -> bool {
+    let ready = app.reads.job.as_ref().and_then(|job| job.scan.as_ref()?.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take());
+    let Some(found) = ready else { return false };
+    let Some(mut job) = app.reads.job.take() else { return false };
+    job.scan = None;
+    let found = if job.gone.is_some() || job.control.is_cancelled() {
+        Err(tl!("cancelled").to_string())
+    } else {
+        found.and_then(|found| match placed(app, &job.asked) {
+            Ok(p) => Ok((p, found)),
+            Err(why) => {
+                job.gone = Some(why);
+                Err(why.to_string())
+            }
+        })
+    };
+    let failed = match found {
+        Ok((p, found)) => match reads::read_ahead_scanned(&mut app.session, &p, found) {
+            Ok(ahead) => {
+                job.asked.ahead = Some(ahead);
+                let _ = start(app, job.asked, p);
+                return true;
+            }
+            Err(e) => e,
+        },
+        Err(e) => e,
+    };
+    *job.slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Err(failed));
+    app.reads.job = Some(job);
+    false
 }
 
 /// Completes the admitted read, then calls its callback with the actual outcome.
@@ -655,6 +757,10 @@ pub fn land(app: &mut RustGisApp) -> bool {
     if let (Some(why), Some(job)) = (gone, app.reads.job.as_mut()) {
         job.control.cancel();
         job.gone = Some(why);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    if scanned(app) {
+        return true;
     }
     if let Some(job) = &app.reads.job {
         let done = job.slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
@@ -742,7 +848,12 @@ pub fn stop(app: &mut RustGisApp, wait: std::time::Duration) {
     if let Some(job) = job {
         job.control.cancel();
         let end = std::time::Instant::now() + wait;
-        while job.slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_none() && std::time::Instant::now() < end {
+        // A QGIS import's first part ends in a slot of its own.
+        #[cfg(not(target_arch = "wasm32"))]
+        let ended = || job.scan.as_ref().is_some_and(|scan| scan.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some());
+        #[cfg(target_arch = "wasm32")]
+        let ended = || false;
+        while job.slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_none() && !ended() && std::time::Instant::now() < end {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         abandon_asked(app, &job.asked, why.clone());
@@ -777,6 +888,15 @@ impl Reads {
     }
 }
 
+/// The read or table edit under way, by its name, while one runs or waits: an export started now
+/// would read the data before it lands.
+pub(crate) fn under_way(app: &RustGisApp) -> Option<&'static str> {
+    match &app.reads.job {
+        Some(job) => Some(job.name),
+        None => (!app.reads.waiting.is_empty()).then(|| crate::tl_raw!("A read")),
+    }
+}
+
 /// Whether the status bar shows a read.
 pub fn showing(app: &RustGisApp) -> bool {
     app.reads.job.is_some()
@@ -785,19 +905,23 @@ pub fn showing(app: &RustGisApp) -> bool {
 /// The read under way in the status bar: its name, progress, how many wait, and Cancel.
 pub fn status(app: &RustGisApp, ui: &mut Ui, t: &Tokens) {
     let Some(job) = &app.reads.job else { return };
+    let size = crate::chrome::StripSize::of(app);
+    let cancellable = !job.control.is_cancelled();
     ui.spinner();
+    let mut cancel = size.cancel_first(ui, cancellable);
     // Two labels, not one sentence put together from translated pieces.
-    ui.label(egui::RichText::new(tl!("Running…")).size(11.5).color(t.text_dim));
-    ui.label(egui::RichText::new(tl!(job.name)).size(11.5).strong());
+    ui.label(egui::RichText::new(tl!("Running…")).size(size.text).color(t.text_dim));
+    ui.label(egui::RichText::new(tl!(job.name)).size(size.text).strong());
     // How far its current step has come, when its reader counts.
     if let Some((done, total)) = job.control.progress() {
-        ui.add(egui::ProgressBar::new(done as f32 / total.max(1) as f32).show_percentage().desired_width(120.0).desired_height(12.0));
+        size.progress(ui, done as f32 / total.max(1) as f32);
     }
     let n = app.reads.waiting.len();
     if n > 0 {
-        ui.label(egui::RichText::new(crate::i18n::fmt("{n} waiting", &[("n", &n.to_string())])).size(11.5).color(t.text_dim));
+        ui.label(egui::RichText::new(crate::i18n::fmt("{n} waiting", &[("n", &n.to_string())])).size(size.text).color(t.text_dim));
     }
-    if ui.add_enabled(!job.control.is_cancelled(), egui::Button::new(tl!("Cancel")).small()).clicked() {
+    cancel |= size.cancel_last(ui, cancellable);
+    if cancel {
         job.control.cancel();
     }
 }
@@ -1421,7 +1545,8 @@ mod tests {
         let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
         app.reads_off_frame = true;
         app.run("project.coordinateSystem", json!({"fromFirstLayer": true})).unwrap();
-        assert_eq!(crate::layerchooser::add_file(&mut app, &path.display().to_string()).unwrap()["started"], "Add Data");
+        // Added as Add Data adds it once Copy or Link is answered (a Shapefile asks, #2350).
+        assert_eq!(crate::readjob::run(&mut app, "layer.addData", json!({"path": path})).unwrap()["started"], "Add Data");
         landed(&mut app, 60);
         assert_eq!(app.session.map().layers.len(), 1);
         assert_eq!(app.session.project.coordinate_system, Some(rustgis_engine::data::raster::Crs::Epsg(2056)));
@@ -1778,7 +1903,114 @@ mod tests {
         assert_eq!(step.params["layer"], json!("towns"));
     }
 
-    /// Import QGIS Style reads its file and its raster image markers' images on a thread first
+    /// Import QGIS Project runs on a copy of the session on a thread of its own (#2476): the map it
+    /// made comes in when it lands, in one Undo step, with what the import says.
+    #[test]
+    fn a_qgis_project_is_imported_on_a_thread_before_it_lands() {
+        let dir = tempfile::tempdir().unwrap();
+        let towns = json!({"type": "FeatureCollection", "features": [
+            {"type": "Feature", "properties": {"name": "A"}, "geometry": {"type": "Point", "coordinates": [8.5, 47.4]}}]});
+        std::fs::write(dir.path().join("towns.geojson"), towns.to_string()).unwrap();
+        let path = dir.path().join("towns.qgs");
+        std::fs::write(
+            &path,
+            r#"<qgis version="4.2.3"><title>Towns</title><layer-tree-group><layer-tree-layer id="Towns" checked="Qt::Checked"/>
+            <layer-tree-layer id="Gone" checked="Qt::Checked"/></layer-tree-group><projectlayers>
+            <maplayer type="vector"><id>Towns</id><datasource>./towns.geojson</datasource><layername>Towns</layername><provider>ogr</provider></maplayer>
+            <maplayer type="vector"><id>Gone</id><datasource>./gone.geojson</datasource><layername>Gone</layername><provider>ogr</provider></maplayer>
+            </projectlayers></qgis>"#,
+        )
+        .unwrap();
+        let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        let maps = app.session.project.maps.len();
+        app.reads_off_frame = true;
+        let params = json!({"path": path.display().to_string()});
+        assert_eq!(app.run_by_user("project.importQgis", params).unwrap()["started"], "Import QGIS Project");
+        assert_eq!(app.session.project.maps.len(), maps, "a map only once it has been imported");
+        let said = |app: &RustGisApp| app.session.notices.iter().filter(|n| n.text.contains("Imported 1 of 2 QGIS layers")).count();
+        assert_eq!(said(&app), 0);
+        landed(&mut app, 60);
+        assert_eq!(app.session.project.maps.len(), maps + 1);
+        assert_eq!(app.session.map().name, "Towns");
+        assert!(app.session.map().layer_by_name("Towns").is_some());
+        assert_eq!(said(&app), 1, "said once, when it lands");
+        app.run("edit.undo", Value::Null).unwrap();
+        assert_eq!(app.session.project.maps.len(), maps);
+    }
+
+    /// A project written for the import tests below, with one GeoJSON layer.
+    fn towns_project(dir: &std::path::Path) -> Value {
+        let towns = json!({"type": "FeatureCollection", "features": [
+            {"type": "Feature", "properties": {"name": "A"}, "geometry": {"type": "Point", "coordinates": [8.5, 47.4]}}]});
+        std::fs::write(dir.join("towns.geojson"), towns.to_string()).unwrap();
+        let path = dir.join("towns.qgs");
+        std::fs::write(
+            &path,
+            r#"<qgis version="4.2.3"><title>Towns</title><layer-tree-group><layer-tree-layer id="Towns" checked="Qt::Checked"/>
+            </layer-tree-group><projectlayers>
+            <maplayer type="vector"><id>Towns</id><datasource>./towns.geojson</datasource><layername>Towns</layername><provider>ogr</provider></maplayer>
+            </projectlayers></qgis>"#,
+        )
+        .unwrap();
+        json!({"path": path.display().to_string()})
+    }
+
+    /// A project's import makes a map of its own (#3120): another map made active while it reads,
+    /// or the map an import before it made, leaves it to land.
+    #[test]
+    fn a_qgis_import_lands_whichever_map_is_active() {
+        let dir = tempfile::tempdir().unwrap();
+        let params = towns_project(dir.path());
+        let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        app.run("map.new", json!({"name": "Other"})).unwrap();
+        app.session.project.active_map = 0;
+        let maps = app.session.project.maps.len();
+        app.reads_off_frame = true;
+        assert_eq!(app.run_by_user("project.importQgis", params.clone()).unwrap()["started"], "Import QGIS Project");
+        // The second waits behind the first, whose map is active when it starts.
+        app.run_by_user("project.importQgis", params).unwrap();
+        app.session.project.active_map = 1;
+        landed(&mut app, 60);
+        let names: Vec<_> = app.session.project.maps.iter().map(|m| m.name.as_str()).collect();
+        let said: Vec<_> = app.session.notices.iter().map(|n| n.text.as_str()).collect();
+        assert_eq!(names[maps..], ["Towns", "Towns2"], "{names:?} {said:?}");
+        assert!(!app.session.notices.iter().any(|n| n.text.contains("was left")), "{:?}", app.session.notices);
+    }
+
+    /// A QGIS import cancelled while its file is read (its first part, on a thread of its own)
+    /// adds nothing and says so; the next one lands.
+    #[test]
+    fn a_qgis_import_cancelled_while_its_file_is_read_adds_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let params = towns_project(dir.path());
+        let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        let maps = app.session.project.maps.len();
+        app.reads_off_frame = true;
+        assert_eq!(app.run_by_user("project.importQgis", params.clone()).unwrap()["started"], "Import QGIS Project");
+        app.reads.cancel_for_tests();
+        landed(&mut app, 60);
+        assert_eq!(app.session.project.maps.len(), maps);
+        assert!(app.session.notices.iter().any(|n| n.text.contains("cancelled")), "{:?}", app.session.notices);
+        app.run_by_user("project.importQgis", params).unwrap();
+        landed(&mut app, 60);
+        assert_eq!(app.session.project.maps.len(), maps + 1);
+    }
+
+    /// A QGIS import whose thread the system refuses is refused with it, not run on the window.
+    #[test]
+    fn a_qgis_import_whose_thread_wont_start_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let params = towns_project(dir.path());
+        let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        let maps = app.session.project.maps.len();
+        app.reads_off_frame = true;
+        app.reads.fail_spawn = true;
+        let error = app.run_by_user("project.importQgis", params).unwrap_err();
+        assert!(error.contains("worker could not start"), "{error}");
+        assert_eq!(app.session.project.maps.len(), maps);
+    }
+
+    /// Import QGIS Style reads its file and its raster image and SVG markers' images on a thread first
     /// (#2620): the layer is styled when they have been read, with the notes the command gives.
     #[test]
     fn a_qgis_style_is_read_on_a_thread_before_it_lands() {

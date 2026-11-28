@@ -76,8 +76,9 @@ same files. New and changed code follows these rules; not every existing reader 
   writes it.
 - A project, map or layer file, a model or a web tool lists in `requires` each capability it needs
   that an older reader would lose or misread: a reader refuses one it doesn't know, naming it.
-  Task, presentation and notebook readers, and models inside a task's steps, don't check
-  `requires` yet. A release reads
+  A task file does too (#2818): `task.save` lists what its steps need, a `model.run` step's inline
+  graph included, and `task.import` refuses one it doesn't know. Presentation and notebook readers
+  don't check `requires` yet. A release reads
   `.rgis` format 2 before any writes it (`READ_FORMAT` and `CAPABILITIES` in
   `crates/engine/src/project.rs`), so what is added to format 2 after that comes with a capability
   name, added to `CAPABILITIES` where it is read.
@@ -106,15 +107,18 @@ The `released_projects_and_preferences_still_open` test discovers
 the files by version and checks that the current reader still opens them correctly. Record a skip
 in the fixtures' README and in the test's `SKIPS` when a release has no such file format.
 
-New project saves and map/layer exports write format 2. Their `requires` header names only
+New project saves, map/layer exports and layout files write format 2. Their `requires` header names only
 features present in the saved payload: `terrain-block`, `terrain-block-shape` (a block
 diagram cut to a circle or to polygons), `terrain-block-polygon` (one cut to polygons),
 `terrain-water`,
 `terrain-water-shore` (a terrain water's shore band other than the default),
 `terrain-block-water` (water in a block diagram's walls),
+`terrain-block-water-bed` (that water's floor read from a bed raster),
 `terrain-block-walls-layer` (the layer a block diagram's walls are coloured by),
 `shaded-relief-effects` (cast shadows, sky visibility, fill light or rock colour),
 `shaded-relief-light` (a Shaded Relief's ambient or balanced light),
+`shaded-relief-shadow-softness` (a softness stored for a Shaded Relief's cast shadows, or set by a saved step;
+`raster.symbology` stores the default as none),
 `blank-paper` (a blank basemap's paper colour) and
 `normalized-legend-urls` for normalized legend addresses. Project
 requirements include offline map snapshots. `table-export-order` protects saved task commands,
@@ -127,7 +131,9 @@ Projects, map files and layer files whose symbology draws an image as a marker (
 a symbol's, a stacked stroke's or a dot fill's, saved styles included), or whose replayable
 commands set one (an `image` in `layer.marker`, a `layer.lineStrokes` stroke's markers or a
 `layer.fillLayers` fill), require `picture-markers`:
-an older reader must refuse them rather than fail on the marker or lose it.
+an older reader must refuse them rather than fail on the marker or lose it. Where such an image
+is an SVG, they also require `svg-markers`: a reader of PNG and JPEG markers only would draw it
+as a circle and refuse the command that sets it.
 
 Projects, model files and web tools that save a percent-slope function require `slope-percent`:
 an older reader must refuse them rather than run the saved function in degrees. Project
@@ -143,13 +149,23 @@ The same containers require `dggs-system` when Generate Tessellation or Aggregat
 reader would make A5 cells, warning only that it ignored the key. A blank `system`, `A5` or none
 needs nothing.
 
+Every capability a saved command can need, except `table-export-order` (no tool node runs
+`share.exportTable`), also reads a `model.run` whose `graph` is given inline, in a saved task step,
+script line, notebook cell or history entry: each of the graph's tool nodes needs what the same
+tool as a step needs.
+
+`report.existingTemplate` imports a layout file as `layout.import` does. Wherever this section says
+a saved `layout.import` whose `text` has something requires a capability, so does a saved
+`report.existingTemplate` step that passes it as `text` or as base64 `data`.
+
 Projects with a background on a layout element, or a saved task step, script, notebook command
 cell or history entry that gives one (`layout.addElement` or `layout.update` with a
 `background` other than `null`), require `layout-element-background`, so an older reader
 refuses them instead of opening the layout and saving it again, or running the command,
-without the background. Layout files (`.rgislayout`) carry no format header yet and are not
-covered. `layout.import` already reads one, ahead of the release that writes it: it refuses a
-newer format or an unknown `requires` entry by name (#2277).
+without the background. Layout files (`.rgislayout`) carry a header of their own, as map files
+do, and require what their elements use, as the project does;
+`layout.import` refuses a newer format or an unknown `requires` entry by name, and reads a file
+without a header as a legacy layout (#2277).
 
 Projects, map files and layer files with a window of a Zarr variable that follows the time slider
 (`layer.addZarr` with `"time": true` and `"cells"` or `"bbox"`) require `zarr-window`, so an older
@@ -161,21 +177,51 @@ Projects, map files and layer files with a label class curved along a guide line
 of placing those labels as without it and saving them again without the guide. A saved
 `labels.placement` command with a guide needs nothing: an older RustGIS refuses the key when it runs.
 
+Projects, map files and layer files with a label class weighing other than 5 (`labels.placement`
+with a `weight`) require `label-weight`, so an older reader refuses them instead of placing their
+labels as without it and saving them again without the weights. So do projects with such a class in
+a saved style, or a saved `labels.placement` step (in a task, a model or a script) with a weight
+other than 5: an older reader would apply the style, or run the step, without the weight, saying
+nothing.
+
+Likewise a label class keeping other than 2 points free round its labels (`labels.placement` with a
+`clearance`) requires `label-clearance`, in a layer, a saved style or a saved `labels.placement`
+step: an older reader would place the labels 2 points apart and save them again without the
+clearances, or run the step without it.
+
+A label class removing duplicates (`labels.placement` with a `removeDuplicates` distance) requires
+`label-duplicates`, in a layer, a saved style or a saved `labels.placement` step: an older reader
+would place and save every label, or run the step without it.
+
+Projects and map files with a tile layer drawn nearest (`map.setTiles` with `"resampling":
+"nearest"`) require `tile-resampling`, so an older reader refuses them instead of drawing the layer
+blended and saving it again without the setting. So do projects with a saved `map.addTiles` or
+`map.setTiles` step (in a task, a model or a script) that sets it: an older reader would run the
+step without it, saying nothing.
+
 Projects with an ink on a legend, colorbar, table or chart (`color` on those elements) require
 `layout-element-ink`, so an older reader refuses them instead of drawing those elements in dark
 grey and saving them again without it. Saved `layout.addElement` and `layout.update` commands
 that set one need nothing: an older reader refuses `color` on those elements, so the command
 fails there instead of losing the ink. A saved `layout.import` whose `text` gives an element an
 ink requires `layout-element-ink`, and one whose `text` gives an element a background requires
-`layout-element-background`, since an older reader would read that layout without them. Layout
-files are not covered, as for backgrounds (#2277).
+`layout-element-background`, since an older reader would read that layout without them.
 
 Projects with a layout text that wraps to its box (`wrap` on a text element) require
 `layout-element-wrap`, so an older reader refuses them instead of drawing the text on its own
 line breaks and saving it again without the option. Saved `layout.addElement` and `layout.update`
 commands with `"wrap": true` require it too, since an older reader warns that it ignores the key
 and adds the text unwrapped; `"wrap": false` needs nothing. A saved `layout.import` whose `text`
-has a wrapped text requires it as well. Layout files are not covered, as for backgrounds (#2277).
+has a wrapped text requires it as well.
+
+Projects with a layout text placed in the middle or at the bottom of its box, with a line spacing
+other than 1, or drawn in upper or lower case (`valign`, `line_spacing`, `case` on a text element)
+require `layout-text-block`, so an older reader refuses them instead of drawing the text at the
+top, at the usual spacing and as typed, and saving it again without them. Saved
+`layout.addElement` and `layout.update` commands that set one require it too, since an older
+reader ignores the keys; giving the defaults (`"top"`, `1`, `"none"`, as the commands read them:
+`"1"` too) or `null` needs nothing. A saved `layout.import` whose `text` has such a text once read
+into range requires it as well, and a layout file (`.rgislayout`) with one lists it in its header.
 
 Projects with a layout chart grouped by a field, or with a statistic, an order or a number of bars
 other than the defaults, or with an Other bar (`group`, `statistic`, `order`, `bars`, `other` on a
@@ -185,7 +231,7 @@ grouped or not: one kept while a chart is ungrouped would be lost too. Saved `la
 and `layout.update` commands that set one of them require it too, and so does a `layout.update`
 that gives a chart's `label` (`""` too), which an older reader's update doesn't take; giving the
 defaults, or `"group": ""`, needs nothing. A saved `layout.import` whose `text` has such a chart
-requires it as well. Layout files are not covered, as for backgrounds (#2277).
+requires it as well.
 
 Projects with a layout chart drawn as columns, with its values or their decimals, its own title
 or none, a bar colour or labels against its bars (`orientation`, `values`, `decimals`, `title`,
@@ -195,15 +241,16 @@ chart is given, and saving it again without them. Saved `layout.addElement` comm
 that set one of them require it too. A saved `layout.update` requires it for `values`,
 `decimals`, `barColor` and `labelAlign` only: its `title` and `orientation` may be a legend's or
 a colorbar's, which the command alone doesn't tell, and the project the update ran on requires it
-for its chart anyway. Giving the defaults needs nothing. A saved `layout.import` whose `text` has
-such a chart requires it as well. Layout files are not covered, as for backgrounds (#2277).
+for its chart anyway (`decimals` may also be a scale bar's, so such an update requires
+`layout-scale-bar-details` as well). Giving the defaults needs nothing. A saved `layout.import`
+whose `text` has such a chart requires it as well.
 
 Projects with a layout chart coloured by its layer's classes (`classes` on a chart element)
 require `layout-chart-classes`, so an older reader refuses them instead of drawing every bar in
 the chart's bar colour and saving it again without. Saved `layout.addElement` commands for a
 chart and `layout.update` commands that set `"classes": true` require it too (only a chart takes
 the key); `false` needs nothing. A saved `layout.import` whose `text` has such a chart requires it
-as well. Layout files are not covered, as for backgrounds (#2277).
+as well.
 
 Projects with a layout chart stacked by a second field (`stack` on a chart element) require
 `layout-chart-stack`, so an older reader refuses them instead of drawing each bar whole and
@@ -211,8 +258,26 @@ saving it again without the field. It is required whenever the field is stored, 
 chart doesn't draw it stacked (ungrouped, or not summing or counting, which commands refuse or
 let go). Saved `layout.addElement` commands for a chart and `layout.update` commands that set a
 `stack` field require it too (only a chart takes the key); `""` needs nothing. A saved
-`layout.import` whose `text` has such a chart requires it as well. Layout files are not covered,
-as for backgrounds (#2277).
+`layout.import` whose `text` has such a chart requires it as well.
+
+Projects with a layout chart that faces another (`mirror`, a `max` or `hide_labels` on a chart
+element; a `max` not above 0, only in a hand-edited file, is let go on read and said as a value out
+of range) require `layout-chart-facing`, so an older reader refuses them instead of drawing
+the chart the usual way round, on its bars' own scale and labelled, and saving it again without
+(#2487 part 4). Saved `layout.addElement` commands for a chart and `layout.update` commands that
+set `"mirror": true`, a `max` above 0 or `"hideLabels": true` require it too (only a chart takes
+the keys); `false`, `null` and `"auto"` need nothing. A saved `layout.import` whose `text` has
+such a chart requires it as well.
+
+Projects with a layout chart that draws a line round its bars (`bar_outline` with a width above 0
+on a chart element) require `layout-chart-outline`, so an older reader refuses them instead of
+drawing the bars without and saving the chart again without (#2487 part 4b). In a hand-edited
+file, a width past 5 is held to 5 and one below 0 let go on read, both said as values out of
+range; a width of 0 draws none and is let go. Saved
+`layout.addElement` commands for a chart and `layout.update` commands that give a `barOutline`
+object without a width or with one above 0 require it too (only a chart takes the key); `null` and
+a width of 0 need nothing. A saved `layout.import` whose `text` has such a chart requires it as
+well.
 
 Projects with a map frame whose border isn't the default dark grey 0.8 pt line (`border_color`,
 `border_width` on a map frame, a width of 0 drawing none) require `layout-frame-border`, so an
@@ -220,7 +285,12 @@ older reader refuses them instead of drawing the default border and saving the f
 without its own (#2557). A saved `layout.update` that gives a frame a `border` object requires it
 too, since an older reader warns that it ignores the key; `"border": null` only gives the default
 back and needs nothing. A saved `layout.import` whose `text` has such a frame requires it as well.
-Layout files are not covered, as for backgrounds (#2277).
+
+Projects with section lines on a map frame (`sections`) require `layout-section`, so an older
+reader refuses them instead of drawing the frame without them and saving it again so (#2863). A
+saved `layout.addElement` of a section requires it too, and so does a `layout.update` with a
+`section` object, which an older reader warns that it ignores. A saved `layout.import` whose `text`
+has such a frame requires it as well.
 
 Projects with a legend, a scale bar or a grid whose text isn't its default size (`text_size` on
 a legend, 9 points by default, or on a scale bar, 8; `label_size` on a frame's grid, 8) require
@@ -230,7 +300,67 @@ a scale bar `textSize`, or a grid `labelSize`, of another size requires it too, 
 `layout.update` with `"grid": {"labelSize": …}` of another size; `null` or the default need
 nothing. A saved `layout.update` isn't told which element it changes, so any `textSize` but
 `null` requires it there. A saved `layout.import` whose `text` has such an element requires it
-as well. Layout files are not covered, as for backgrounds (#2277).
+as well.
+
+Projects with a legend that fits its box by shrinking its text or adding columns, that leaves its
+layer names off, or that has more than three columns (`fit`, `show_layer_names`, `columns` on a
+legend element) require `layout-legend-fit`, so an older reader refuses them instead of drawing
+the legend at its size, its names shown and in three columns, and saving it again without them.
+Saved `layout.addElement` and `layout.update` commands that set one require it too;
+`"fit": "manual"`, `"showLayerNames": true`, three columns or fewer, `null`, and a scale bar's own
+`fit` values need nothing. A saved `layout.import` whose `text` has such a legend requires it as
+well, and a layout file (`.rgislayout`) with one lists it in its header.
+
+Projects with a legend that gives a class its own text (`class_labels` on a legend element)
+require `layout-legend-class-labels`, so an older reader refuses them instead of drawing the
+layer's labels and saving the legend again without its own (#3187). Saved `layout.addElement` and
+`layout.update` commands whose `classLabels` give a text require it too; `null`, a blank text and
+an empty object need nothing. A saved `layout.import` whose `text` has such a legend requires it as
+well, and a layout file (`.rgislayout`) with one lists it in its header.
+
+Projects with a legend that shows feature counts (`show_counts` on a legend element) require
+`layout-legend-counts`, so an older reader refuses them instead of drawing no numbers and saving
+the legend again without the setting (#3237). Saved `layout.addElement` and `layout.update`
+commands with `"showCounts": true` require it too; `false` and `null` need nothing. A saved
+`layout.import` or `report.existingTemplate` carrying such a legend requires it as well, and a
+layout file (`.rgislayout`) with one lists it in its header.
+
+Projects with a scale bar that has subdivisions, divisions before zero, labels below, a unit
+label of its own or placed elsewhere, decimals or a fit other than the defaults
+(`subdivisions`, `divisions_before_zero`, `label_position`, `unit_label`, `unit_label_position`,
+`decimals`, `fit` on a scale bar element) require `layout-scale-bar-details`, so
+an older reader refuses them instead of drawing a plain bar and saving it again without them.
+Saved `layout.addElement` and `layout.update` commands that set one require it too, since an
+older reader ignores the keys; giving the defaults, `"decimals": "auto"` or `"unitLabel": null`,
+needs nothing. Decimals fixed at any number, 0 included, are a detail. A chart takes `decimals`
+too: a saved `layout.update` can't tell whose they are, so a number there requires both this and
+`layout-chart-look`, while a `layout.addElement` says which kind it adds. A saved
+`layout.import` whose `text` has such a bar requires it as well, and a layout file
+(`.rgislayout`) with such a bar lists it in its header, so an older reader refuses the file too.
+A scale bar's text size isn't one of its details: it requires `layout-text-size`, as above.
+
+Projects with a layout whose page isn't white (`paper` on the layout, #2855) require
+`layout-page-color`, so an older reader refuses them instead of opening the page white and saving
+it again without its colour. A saved `layout.page` that gives a `color` other than white requires
+it too; `null` or `"#FFFFFF"` need nothing. A saved `layout.import` whose `text` has a coloured
+page requires it as well. A translucent page colour, which only a hand-edited file holds, is read
+as it looks on white paper (a clear one is the white page) and counted with the page settings the
+project says it repaired.
+
+Projects with a layout text that holds a layer statistic (`{count:Layer}`, `{sum:Layer:field}`,
+`{mean:…}`, `{min:…}` or `{max:…}`, #2853) require `layout-text-statistics`, so an older reader
+refuses them by name instead of printing the token as written. A saved `layout.addElement` or
+`layout.update` whose `text` holds one requires it too, as does a saved `layout.publication` whose
+`title`, `subtitle`, `note`, `sources`, `reference`, `author` or `headings` do, and a saved
+`layout.import` whose `text` has such a text, or a saved `report.existingTemplate` that reads one.
+A presentation's map page draws its title over its map frame, where a statistic is filled in, so a
+saved presentation with one in a map page's title requires it too, and so does a saved
+`presentation.mapPage` or `presentation.updatePage` whose `title` holds one, or a saved
+`presentation.import` whose `text` has such a map page (a blank page's text is drawn with no map
+frame, so no figure fills in there). Other braces (`{scale}`, `{foo}`, `{count:}`) need nothing.
+Files read by `path` are not looked into, as for every other layout capability, and a
+presentation file (`.rgispres`) has no header to list a capability in, so an older reader opens one
+with the token printed as written.
 
 Projects, map files and layer files with a layer or table held in a coordinate system of its own
 (`Dataset::held_in`: a file's system, kept since #2580) save its features in that system, exactly,
@@ -247,6 +377,17 @@ files require `crs-wkt` when a saved system's definition doesn't place points as
 transformation the definition can't hold, or no definition. An older reader refuses those
 instead of misplacing the layer. Others need nothing: an older reader opens them by the
 definition and, saving them again, drops only the WKT.
+
+A saved `layout.publication` that leaves out or sets up a part of the sheet (`grid` or
+`scaleBar` as `"none"` or an object that gives something, or `northArrow` as any object, #3094)
+requires `layout-publication-parts`, so an older reader refuses it instead of making the default
+sheet or failing on the object. `null`, a `grid` or `scaleBar` of `{}`, and the north arrow given
+as the text `"auto"`, `"always"` or `"none"` need nothing.
+
+A saved `layout.publication` that leaves out or sets up its legend (`legend` as `"none"` or an
+object that gives something, #3095) requires `layout-publication-legend`, so an older reader
+refuses it instead of making the default legend. `null`, a `legend` of `{}`, a blank `title` and
+an empty `exclude` need nothing.
 
 ## New dependencies
 

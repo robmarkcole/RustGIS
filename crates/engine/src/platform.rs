@@ -1,5 +1,5 @@
 //! What a phone provides that a computer's window doesn't: the system's file picker, the device's
-//! position and the camera. A mobile shell implements [`Platform`] for its system; a front end
+//! position, the camera and its own text fields. A mobile shell implements [`Platform`] for its system; a front end
 //! asks through it and collects what happened with [`Platform::take_events`], as nothing here
 //! waits for the user.
 
@@ -13,6 +13,12 @@ pub struct SaveSnapshot {
 }
 
 impl crate::Session {
+    /// The project's identity as a file: changed when another project replaces it, and put back
+    /// with it by Undo. A phone keeps where to save a project by it.
+    pub fn file_identity(&self) -> u64 {
+        self.file_identity
+    }
+
     /// Captures which project and undo state the native saver was given.
     pub fn save_snapshot(&self) -> SaveSnapshot {
         SaveSnapshot { project: self.file_identity, state: self.state(), unsaved_marks: self.unsaved_marks }
@@ -49,6 +55,92 @@ pub struct Fix {
     pub elapsed_realtime_nanos: Option<u64>,
 }
 
+/// How a system's text field takes what is typed into it ([`Platform::enter_text`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextKind {
+    /// A line of text.
+    Plain,
+    /// Text of several lines: the keyboard's Return starts a new one.
+    Lines,
+    /// A password or key: hidden as it is typed, and offered to the system's password manager.
+    Secret,
+    /// A number, with the keyboard for numbers.
+    Number,
+}
+
+impl TextKind {
+    /// The word a shell's own half reads it by (`plain`, `lines`, `secret`, `number`).
+    pub fn word(self) -> &'static str {
+        match self {
+            TextKind::Plain => "plain",
+            TextKind::Lines => "lines",
+            TextKind::Secret => "secret",
+            TextKind::Number => "number",
+        }
+    }
+}
+
+/// A text field of the system's, asked for by a front end that draws its own field as a box
+/// showing the value ([`Platform::enter_text`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextEntry {
+    /// The front end's own name for the field, returned with what is typed.
+    pub id: String,
+    /// What the field holds as it opens.
+    pub value: String,
+    /// What the field is for, shown with it.
+    pub label: String,
+    /// How it takes text.
+    pub kind: TextKind,
+    /// The label of the button that closes it, in the user's language.
+    pub done: String,
+}
+
+/// What a system's text field sent back ([`Platform::enter_text`]).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Typed {
+    /// The field `id` holds `text` now: sent as it changes, so nothing typed is lost however
+    /// the field closes.
+    Text {
+        /// The [`TextEntry::id`] it was opened with.
+        id: String,
+        /// All of its text.
+        text: String,
+    },
+    /// The field `id` closed (Done, Back, a tap beside it); its last text came before this.
+    Closed {
+        /// The [`TextEntry::id`] it was opened with.
+        id: String,
+        /// Why it closed without opening, as the system said; `None` when it was open.
+        failed: Option<String>,
+    },
+}
+
+/// Reads a field's text as a shell writes it on one line: a backslash, a tab and a line break
+/// written `\\`, `\t`, `\n` and `\r`. A backslash before anything else is kept as it is.
+fn unescape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('\\') => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
 /// What the system did since the front end last asked.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {
@@ -60,6 +152,9 @@ pub enum Event {
         name: String,
         /// Where its copy is.
         path: PathBuf,
+        /// The picked document itself, when the system lets RustGIS write it back
+        /// ([`Platform::write_back`]): a project file opened for reading and writing.
+        document: Option<String>,
     },
     /// A picker closed without a choice.
     Cancelled,
@@ -78,6 +173,20 @@ pub enum Event {
     },
     /// The outcome of a project save, including a picker that closed without saving.
     ProjectSave(Result<String, String>),
+    /// The document a project save is about to report written ([`Event::ProjectSave`] follows),
+    /// when the system lets RustGIS write it back later ([`Platform::write_back`]).
+    ProjectDocument(String),
+    /// A project couldn't be written back to its document ([`Platform::write_back`]): it answers
+    /// the save as a failed [`Event::ProjectSave`] does.
+    WriteBackFailed {
+        /// The project's file name.
+        name: String,
+        /// Why, as the system said.
+        reason: String,
+        /// Where the complete project was kept, when the write failed partway and the document
+        /// may be damaged; `None` when the document was left as it was.
+        kept: Option<PathBuf>,
+    },
     /// A photo the camera took ([`Platform::take_photo`]), written where it can be opened by path.
     Photo {
         /// The photo's file name.
@@ -90,26 +199,56 @@ pub enum Event {
     /// Positioning ended without [`Platform::locate`] turning it off (leave refused or taken
     /// away, no way to find a position): the reason comes as an [`Event::Failed`].
     Stopped,
+    /// The system is short of memory: what can be made again is to be dropped.
+    LowMemory,
+    /// A system's text field sent back what it holds, or closed ([`Platform::enter_text`]).
+    Typed(Typed),
+    /// Text copied in the window couldn't be put on the system's clipboard, for the reason given.
+    CopyFailed(String),
     /// Something went wrong: the text is for the user.
     Failed(String),
 }
 
 impl Event {
     /// Reads an event a shell passed as one line of tab-separated fields (`picked`, `cancelled`,
-    /// `ended`, `saved`, `project-saved`, `project-save-failed`, `photo`, `position`, `stopped`,
-    /// `failed`). Unrecognized lines become failures that quote the line. A position is
+    /// `ended`, `saved`, `project-saved`, `project-save-failed`, `project-document`,
+    /// `write-back-failed`, `photo`, `position`, `stopped`, `low-memory`, `text`, `text-closed`,
+    /// `copy-failed`, `failed`). A `picked` line may end with the document it can write back to. A
+    /// `text` line is the field's id, then its text with its backslashes, tabs and line breaks
+    /// escaped (`\\`, `\t`, `\n`, `\r`); a `text-closed` line may end with why the field didn't
+    /// open. Unrecognized lines become failures that quote the line. A position is
     /// `position`, longitude, latitude, accuracy (empty when unknown), optionally its time in
     /// milliseconds since 1970, then optionally the monotonic fix time in nanoseconds since boot.
     pub fn parse(line: &str) -> Event {
         let fields: Vec<&str> = line.split('\t').collect();
         match fields.as_slice() {
             ["picked", purpose, name, path] => {
-                Event::Picked { purpose: purpose.to_string(), name: name.to_string(), path: PathBuf::from(path) }
+                Event::Picked { purpose: purpose.to_string(), name: name.to_string(), path: PathBuf::from(path), document: None }
+            }
+            ["picked", purpose, name, path, document] => Event::Picked {
+                purpose: purpose.to_string(),
+                name: name.to_string(),
+                path: PathBuf::from(path),
+                document: (!document.is_empty()).then(|| document.to_string()),
+            },
+            ["project-document", document] if !document.is_empty() => Event::ProjectDocument(document.to_string()),
+            ["write-back-failed", name, reason] => {
+                Event::WriteBackFailed { name: name.to_string(), reason: reason.to_string(), kept: None }
+            }
+            ["write-back-failed", name, reason, kept] if !kept.is_empty() => {
+                Event::WriteBackFailed { name: name.to_string(), reason: reason.to_string(), kept: Some(PathBuf::from(kept)) }
             }
             ["cancelled"] => Event::Cancelled,
             ["ended", purpose] => Event::Ended { purpose: purpose.to_string() },
             ["photo", name, path] if !path.is_empty() => Event::Photo { name: name.to_string(), path: PathBuf::from(path) },
             ["stopped"] => Event::Stopped,
+            ["low-memory"] => Event::LowMemory,
+            ["text", id, text] if !id.is_empty() => Event::Typed(Typed::Text { id: id.to_string(), text: unescape(text) }),
+            ["text-closed", id] if !id.is_empty() => Event::Typed(Typed::Closed { id: id.to_string(), failed: None }),
+            ["text-closed", id, why @ ..] if !id.is_empty() && !why.concat().is_empty() => {
+                Event::Typed(Typed::Closed { id: id.to_string(), failed: Some(why.join("\t")) })
+            }
+            ["copy-failed", why @ ..] if !why.is_empty() => Event::CopyFailed(why.join("\t")),
             // A name is the user's own text and may hold a tab: the rest of the line is the name.
             ["saved", name @ ..] if !name.is_empty() => Event::Saved { name: name.join("\t") },
             ["project-saved", name @ ..] if !name.is_empty() => Event::ProjectSave(Ok(name.join("\t"))),
@@ -165,6 +304,16 @@ pub trait Platform {
     /// Other requests answer with [`Event::Saved`] or [`Event::Failed`].
     fn save_file(&self, name: &str, bytes: Vec<u8>, project: bool) -> Result<(), String>;
 
+    /// Writes the project `bytes` back to `document`, one the system said RustGIS may write
+    /// ([`Event::Picked`]'s or [`Event::ProjectDocument`]'s), with no picker. `Ok` means the
+    /// request was accepted; it answers with [`Event::ProjectSave`], or [`Event::WriteBackFailed`]
+    /// saying whether the document may be damaged and where the project as saved is kept then. A
+    /// system that can't write back refuses.
+    fn write_back(&self, document: &str, name: &str, bytes: Vec<u8>) -> Result<(), String> {
+        let _ = (document, name, bytes);
+        Err("this system can't write a project back where it was opened".into())
+    }
+
     /// Starts (`on`) or stops reporting the device's position: each fix arrives as an
     /// [`Event::Position`]. Starting asks the user for leave where the system wants it. A refusal,
     /// like any other end to positioning that wasn't asked for, arrives as an [`Event::Failed`]
@@ -183,6 +332,22 @@ pub trait Platform {
     /// took none, or it couldn't be kept). `Ok` means the camera was asked, not that a photo was
     /// taken.
     fn take_photo(&self) -> Result<(), String>;
+
+    /// Whether [`Platform::enter_text`] opens a text field of the system's. Where it doesn't, the
+    /// front end types into its own fields.
+    fn enters_text(&self) -> bool {
+        false
+    }
+
+    /// Opens a text field of the system's for `entry`, docked above the soft keyboard: what it
+    /// holds arrives as [`Typed::Text`] each time it changes, then [`Typed::Closed`] when it
+    /// closes. It gives the system's typing (paste, suggestions, dictation, a password manager
+    /// for a [`TextKind::Secret`]), which a field drawn by the front end may not get. One opened
+    /// while another is open replaces it, which closes first. `Ok` means it was asked for.
+    fn enter_text(&self, entry: &TextEntry) -> Result<(), String> {
+        let _ = entry;
+        Err("this system has no text field for RustGIS to open".into())
+    }
 
     /// What happened since the last call, oldest first.
     fn take_events(&self) -> Vec<Event>;
@@ -220,7 +385,34 @@ mod tests {
     fn events_are_read_from_their_lines() {
         assert_eq!(
             Event::parse("picked\tdata\tparcels.gpkg\t/data/picked/1/parcels.gpkg"),
-            Event::Picked { purpose: "data".into(), name: "parcels.gpkg".into(), path: PathBuf::from("/data/picked/1/parcels.gpkg") }
+            Event::Picked {
+                purpose: "data".into(),
+                name: "parcels.gpkg".into(),
+                path: PathBuf::from("/data/picked/1/parcels.gpkg"),
+                document: None
+            }
+        );
+        assert_eq!(
+            Event::parse("picked\tproject\tsite.rgis\t/data/picked/2/site.rgis\tcontent://docs/document/primary%3Asite.rgis"),
+            Event::Picked {
+                purpose: "project".into(),
+                name: "site.rgis".into(),
+                path: PathBuf::from("/data/picked/2/site.rgis"),
+                document: Some("content://docs/document/primary%3Asite.rgis".into())
+            }
+        );
+        assert_eq!(Event::parse("project-document\tcontent://docs/document/7"), Event::ProjectDocument("content://docs/document/7".into()));
+        assert_eq!(
+            Event::parse("write-back-failed\tsite.rgis\tread-only"),
+            Event::WriteBackFailed { name: "site.rgis".into(), reason: "read-only".into(), kept: None }
+        );
+        assert_eq!(
+            Event::parse("write-back-failed\tsite.rgis\tno room\t/data/saved/1/site.rgis"),
+            Event::WriteBackFailed {
+                name: "site.rgis".into(),
+                reason: "no room".into(),
+                kept: Some(PathBuf::from("/data/saved/1/site.rgis"))
+            }
         );
         assert_eq!(Event::parse("cancelled"), Event::Cancelled);
         assert_eq!(Event::parse("ended\tdxf:3"), Event::Ended { purpose: "dxf:3".into() });
@@ -229,6 +421,7 @@ mod tests {
             Event::Photo { name: "photo-1.jpg".into(), path: PathBuf::from("/data/photos/photo-1.jpg") }
         );
         assert_eq!(Event::parse("stopped"), Event::Stopped);
+        assert_eq!(Event::parse("low-memory"), Event::LowMemory);
         assert_eq!(
             Event::parse("position\t-83.92\t35.96\t4.5"),
             Event::Position(Fix { lon: -83.92, lat: 35.96, accuracy: Some(4.5), time: None, elapsed_realtime_nanos: None })
@@ -247,6 +440,18 @@ mod tests {
         assert_eq!(Event::parse("saved\tmy\tmap.png"), Event::Saved { name: "my\tmap.png".into() });
         assert_eq!(Event::parse("project-saved\tmy\tproject.rgis"), Event::ProjectSave(Ok("my\tproject.rgis".into())));
         assert_eq!(Event::parse("project-save-failed\tPicker cancelled"), Event::ProjectSave(Err("Picker cancelled".into())));
+        // A text field's text, its tabs, line breaks and backslashes escaped on the line.
+        assert_eq!(
+            Event::parse("text\tcapture:1:name\tTwo\\nlines\\tand a tab, C:\\\\x, \\q kept"),
+            Event::Typed(Typed::Text { id: "capture:1:name".into(), text: "Two\nlines\tand a tab, C:\\x, \\q kept".into() })
+        );
+        assert_eq!(Event::parse("text\tkey\t"), Event::Typed(Typed::Text { id: "key".into(), text: String::new() }));
+        assert_eq!(Event::parse("text-closed\tkey"), Event::Typed(Typed::Closed { id: "key".into(), failed: None }));
+        assert_eq!(
+            Event::parse("text-closed\tkey\tno window"),
+            Event::Typed(Typed::Closed { id: "key".into(), failed: Some("no window".into()) })
+        );
+        assert_eq!(Event::parse("copy-failed\ttoo large"), Event::CopyFailed("too large".into()));
         // A failure's text is kept whole, tabs and all.
         assert_eq!(Event::parse("failed\ta.gpkg wasn't opened:\tno room"), Event::Failed("a.gpkg wasn't opened:\tno room".into()));
     }
@@ -259,6 +464,10 @@ mod tests {
             "ended",
             "moved\tx",
             "saved",
+            "project-document",
+            "project-document\t",
+            "write-back-failed\tsite.rgis",
+            "write-back-failed\tsite.rgis\tno room\t",
             "photo\ta.jpg",
             "photo\ta.jpg\t",
             "position\t200\t20\t5",
@@ -271,6 +480,13 @@ mod tests {
             "position\t10\t20\t3\t-5",
             "position\t10\t20\t3\t1\t-2",
             "position\t10\t20\t3\t1\t2\t3",
+            "text\tkey",
+            "text\t\tvalue",
+            "text\tkey\ta\tb",
+            "text-closed",
+            "text-closed\t",
+            "text-closed\tkey\t",
+            "copy-failed",
         ] {
             match Event::parse(line) {
                 Event::Failed(text) => assert!(text.ends_with(line), "{text}"),

@@ -1,0 +1,28 @@
+{
+  "format": 2,
+  "name": "Section lines",
+  "requires": ["layout-section"],
+  "active_map": 0,
+  "maps": [
+    {
+      "name": "Map",
+      "layers": [],
+      "basemap": "Paper",
+      "camera": {"center": {"x": 0, "y": 0}, "res": 30000}
+    }
+  ],
+  "layouts": [
+    {
+      "name": "Sections",
+      "width": 200,
+      "height": 100,
+      "elements": [
+        {"id": 1, "name": "None", "x": 5, "y": 5, "w": 60, "h": 90, "kind": {"MapFrame": {"map": "Map", "center": {"x": 0, "y": 0}, "scale": 1000000}}},
+        {"id": 2, "name": "Two", "x": 70, "y": 5, "w": 60, "h": 90, "kind": {"MapFrame": {"map": "Map", "center": {"x": 0, "y": 0}, "scale": 1000000, "sections": [
+          {"name": "A", "line": {"Horizontal": {"x": 0.05, "y": 0.1}}, "color": [168, 67, 31, 255], "width": 1.5},
+          {"name": "B", "line": {"Vertical": {"x": -0.1, "y": 0}}, "color": [31, 92, 132, 255], "width": 1, "dash": [6, 3]}
+        ]}}}
+      ]
+    }
+  ]
+}

@@ -209,7 +209,9 @@ impl Original {
 /// run is cancelled (before the last part is placed, which puts the old file back). Reading the
 /// file into memory and back, and comparing the shapes, table and rows (one pass each, without
 /// a check), are steps that run to their end before Cancel is seen. Hashing the prepared bytes
-/// and writing/syncing each staged part likewise run as single steps.
+/// and writing/syncing each staged part likewise run as single steps. Retaining numeric cells
+/// adds four streaming geometry-serialization traversals (source and output for both proofs),
+/// checking Cancel between features; serializing one geometry runs to its end.
 pub fn shapefile(ds: &Dataset, path: &Path, synced: &Synced) -> Result<Published> {
     let _lock = source_lock(path)?;
     let unchanged = |when: &str| -> Result<()> {
@@ -241,7 +243,7 @@ pub fn shapefile(ds: &Dataset, path: &Path, synced: &Synced) -> Result<Published
             format!("{} of its records are marked deleted, and writing it again would remove them from the file", table.deleted),
         ));
     }
-    let mut encoding_notes = Vec::new();
+    let mut encoding_notes = crate::loss::Notes::new();
     let ldid = original.dbf.get(29).copied().unwrap_or(0);
     let style = DbfStyle {
         encoding: crate::dbf::encoding(original.cpg.as_ref().map(|(_, b)| b.as_slice()), ldid, &mut encoding_notes),
@@ -251,7 +253,7 @@ pub fn shapefile(ds: &Dataset, path: &Path, synced: &Synced) -> Result<Published
     // A code page RustGIS can't write (one it reads as UTF-8 for want of a decoder): edited text
     // would be written in UTF-8 under the file's language driver.
     if let Some(note) = encoding_notes.first() {
-        return Err(refused(path, format!("{note}, so its text can't be written in its own code page")));
+        return Err(refused(path, format!("{}, so its text can't be written in its own code page", note.as_str())));
     }
 
     // 1. It reads as the layer was read: in the layer's system, and in the file's own
@@ -277,7 +279,10 @@ pub fn shapefile(ds: &Dataset, path: &Path, synced: &Synced) -> Result<Published
 
     // 2. The file as read, written again, is the file.
     crate::progress::begin(as_read.features.len());
-    let (again, _, _) = crate::io::shapefile_parts_styled(&*in_file(&as_read, crs, as_held)?, written_crs, Some(&style))?;
+    let file_read = in_file(&as_read, crs, as_held)?;
+    let (mut again, _, _) = crate::io::shapefile_parts_styled(&file_read, written_crs, Some(&style))?;
+    retain_source_numbers(&mut again, &table, raw.as_ref().unwrap_or(&as_read), &file_read)?;
+    drop(file_read);
     let part = |parts: &[(&str, Vec<u8>)], ext: &str| parts.iter().find(|(e, _)| *e == ext).map(|(_, b)| b.clone()).unwrap_or_default();
     if let Some(why) = same_shapes(&original.shp, &part(&again, "shp"), 0.0) {
         return Err(refused(path, format!("written again, its shapes wouldn't be the same: {why}")));
@@ -288,16 +293,19 @@ pub fn shapefile(ds: &Dataset, path: &Path, synced: &Synced) -> Result<Published
 
     // 3. The layer, written, reads back as the layer.
     if let Some(note) = crate::io::shapefile_names_note(&ds.fields, &name) {
-        return Err(refused(path, note));
+        return Err(refused(path, note.text));
     }
     crate::progress::begin(ds.features.len());
-    let (mut parts, left_out, widened) = crate::io::shapefile_parts_styled(&*in_file(ds, crs, as_held)?, written_crs, Some(&style))?;
+    let file_layer = in_file(ds, crs, as_held)?;
+    let (mut parts, left_out, widened) = crate::io::shapefile_parts_styled(&file_layer, written_crs, Some(&style))?;
     if left_out > 0 {
         return Err(refused(
             path,
             format!("{left_out} of the layer's features have no shape a Shapefile of its kind holds (none, or one of another kind)"),
         ));
     }
+    retain_source_numbers(&mut parts, &table, raw.as_ref().unwrap_or(&as_read), &file_layer)?;
+    drop(file_layer);
     let back = ShapefileParts {
         shp: part(&parts, "shp"),
         shx: Some(part(&parts, "shx")),
@@ -426,16 +434,18 @@ pub fn shapefile(ds: &Dataset, path: &Path, synced: &Synced) -> Result<Published
 /// holds its coordinates in ([`Dataset::coord_crs`]). Given the file as read and in its own
 /// coordinates (`as_held`, the same rows), a feature of a layer held in longitude/latitude whose
 /// shape is the one read takes the file's coordinates as they are; any other is projected. A native
-/// shape that failed conversion is refused: missing geometry cannot identify its source shape.
+/// shape the read left without geometry is refused: missing geometry cannot identify its source
+/// shape.
 fn in_file<'a>(ds: &'a Dataset, crs: Option<Crs>, as_held: Option<(&Dataset, &Dataset)>) -> Result<std::borrow::Cow<'a, Dataset>> {
-    // A native shape the read couldn't place (left without geometry) can't be told apart from a
-    // feature without one, whatever system the layer holds its coordinates in.
+    // A native shape the read left without geometry (a coordinate that isn't a number; one with
+    // no place in longitude/latitude is kept, #2032 C2f-4b) can't be told apart from a feature
+    // without one, whatever system the layer holds its coordinates in.
     if let Some((read, raw)) = as_held {
         for (i, (f, r)) in read.features.iter().zip(raw.features.iter()).enumerate() {
             crate::progress::check()?;
             if f.geometry.is_none() && r.geometry.is_some() {
                 return Err(DataError::Format(format!(
-                    "source shape {} couldn't be converted from the source projection when it was read, so its native geometry can't be matched safely; check the source projection and add the file again; nothing was written",
+                    "source shape {} was read without its geometry (a coordinate that isn't a number), so its native geometry can't be matched safely; add the file again; nothing was written",
                     i + 1
                 )));
             }
@@ -490,6 +500,87 @@ fn in_file<'a>(ds: &'a Dataset, crs: Option<Crs>, as_held: Option<(&Dataset, &Da
     out.features = rows.into();
     out.held_in = c;
     Ok(std::borrow::Cow::Owned(out))
+}
+
+/// A bounded geometry key without retaining a second serialized copy of source coordinates.
+/// Hash collisions and duplicate geometry keys are treated as ambiguous, never as a match.
+fn number_geometry_key(geometry: &Option<Geometry>) -> Result<u64> {
+    use std::hash::Hasher;
+    struct Key(std::collections::hash_map::DefaultHasher);
+    impl std::io::Write for Key {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.write(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut key = Key(std::collections::hash_map::DefaultHasher::new());
+    serde_json::to_writer(&mut key, geometry).map_err(|e| DataError::Format(e.to_string()))?;
+    Ok(key.0.finish())
+}
+
+/// Restores a source number's bytes only for an unchanged, exactly representable decimal in
+/// an unambiguously matched source shape and an unchanged physical column. Edited cells use
+/// the ordinary writer. Unknown/overflow markers and numbers a read rounded remain subject to
+/// the existing loss refusal. Matching by geometry survives reordered, deleted and renumbered
+/// rows; it retains one small key per source row, not another geometry or attribute copy.
+fn retain_source_numbers(parts: &mut [(&str, Vec<u8>)], original: &RawTable<'_>, source: &Dataset, written: &Dataset) -> Result<()> {
+    if source.features.len() != original.records.len() {
+        return Ok(());
+    }
+    let Some((_, bytes)) = parts.iter_mut().find(|(ext, _)| *ext == "dbf") else { return Ok(()) };
+    let columns = {
+        let Some(table) = crate::dbf::raw_table(bytes) else { return Ok(()) };
+        if table.records.len() != written.features.len() {
+            return Ok(());
+        }
+        table.columns
+    };
+    let le16 = |at| bytes.get(at..at + 2).and_then(|v| <[u8; 2]>::try_from(v).ok()).map(u16::from_le_bytes).map(usize::from);
+    let (Some(header), Some(stride)) = (le16(8), le16(10)) else { return Ok(()) };
+    let mut by_shape = std::collections::HashMap::<u64, Option<usize>>::new();
+    for (i, row) in source.features.iter().enumerate() {
+        crate::progress::check()?;
+        by_shape.entry(number_geometry_key(&row.geometry)?).and_modify(|entry| *entry = None).or_insert(Some(i));
+    }
+    for (row_index, row) in written.features.iter().enumerate() {
+        crate::progress::check()?;
+        let Some(Some(index)) = by_shape.get(&number_geometry_key(&row.geometry)?) else { continue };
+        let Some(before) = source.features.get(*index).filter(|before| before.geometry == row.geometry) else { continue };
+        let Some(record) = original.records.get(*index) else { continue };
+        let mut offset = 1usize;
+        for (column_index, column) in columns.iter().enumerate() {
+            let start = header.checked_add(row_index.saturating_mul(stride)).and_then(|v| v.checked_add(offset));
+            offset = offset.saturating_add(usize::from(column.len));
+            if !matches!(column.ty, b'N' | b'F') {
+                continue;
+            }
+            let Some(source_column) = original.columns.iter().position(|old| old == column) else { continue };
+            let Some(old) = before.attrs.get(source_column) else { continue };
+            let Some(current) = row.attrs.get(column_index) else { continue };
+            if old != current || !matches!(old, Value::Int(_) | Value::Float(_)) {
+                continue;
+            }
+            let Some(cell_bytes) = record.get(source_column) else { continue };
+            // Do not hide an earlier read loss: only canonical decimal digits that this value
+            // represents are eligible. Padding and redundant trailing zeroes are harmless.
+            let text = match old {
+                Value::Float(value) => value.to_string(),
+                Value::Int(value) => value.to_string(),
+                _ => continue,
+            };
+            let stored = cell(column.ty, cell_bytes);
+            if !matches!(stored, Cell::Number(..)) || stored != cell(column.ty, text.as_bytes()) {
+                continue;
+            }
+            if let Some(destination) = start.and_then(|at| bytes.get_mut(at..at.saturating_add(cell_bytes.len()))) {
+                destination.copy_from_slice(cell_bytes);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The first few names, quoted, and how many more.
@@ -892,6 +983,45 @@ mod tests {
         // Only the reusable lock sidecar remains; no staged or backup parts.
         let names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
         assert!(names.iter().all(|n| !n.starts_with('.') || n == ".parcels.shp.rustgis-lock"), "{names:?}");
+    }
+
+    /// A shortest decimal padded with zeros must not acquire binary floating-point digits
+    /// when another attribute changes; source record identity survives deletion and reordering.
+    #[test]
+    fn publish_keeps_untouched_decimal_cells_after_edits_and_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parcels.shp");
+        crate::io::write_path(&parcels(), &path).unwrap();
+        let mut dbf = std::fs::read(path.with_extension("dbf")).unwrap();
+        let table = crate::dbf::raw_table(&dbf).unwrap();
+        let (width, owner) = (usize::from(table.columns[1].len), usize::from(table.columns[0].len));
+        let header = usize::from(u16::from_le_bytes([dbf[8], dbf[9]]));
+        let stride = usize::from(u16::from_le_bytes([dbf[10], dbf[11]]));
+        let literals = ["4643007.423513590000000", "1.250000000000000"].map(|s| format!("{s:>width$}").into_bytes());
+        assert!(literals.iter().all(|literal| literal.len() == width));
+        for (row, literal) in literals.iter().enumerate() {
+            let at = header + row * stride + 1 + owner;
+            dbf[at..at + width].copy_from_slice(literal);
+        }
+        std::fs::write(path.with_extension("dbf"), &dbf).unwrap();
+        let (mut ds, sync) = read(&path);
+        let mut rows: Vec<_> = ds.features.iter().cloned().collect();
+        rows.reverse();
+        rows[0].attrs[0] = Value::Text("Jonas".into());
+        ds.features = rows.into();
+        let published = shapefile(&ds, &path, &sync).unwrap();
+        let after = std::fs::read(path.with_extension("dbf")).unwrap();
+        let raw = crate::dbf::raw_table(&after).unwrap();
+        assert_eq!(raw.records[0][1], literals[1]);
+        assert_eq!(raw.records[1][1], literals[0]);
+        assert_eq!(published.read.features.value(0, 0), &Value::Text("Jonas".into()));
+        let (mut ds, sync) = read(&path);
+        ds.features = ds.features.iter().skip(1).cloned().collect::<Vec<_>>().into();
+        shapefile(&ds, &path, &sync).unwrap();
+        let after = std::fs::read(path.with_extension("dbf")).unwrap();
+        let raw = crate::dbf::raw_table(&after).unwrap();
+        assert_eq!(raw.records.len(), 1);
+        assert_eq!(raw.records[0][1], literals[0]);
     }
 
     /// A table named in upper case (`parcels.DBF`) is written back under that name, and an edit
@@ -1517,9 +1647,10 @@ mod tests {
         }
     }
 
-    /// An unconverted source shape cannot supply geometry to a new geometry-less feature.
+    /// A source shape with no place in longitude/latitude is read as the file holds it (#2032
+    /// C2f-4b), so a publish of an attribute edit writes it back unchanged, to the bit.
     #[test]
-    fn an_unconverted_shape_cannot_be_copied_to_a_geometryless_feature() {
+    fn a_shape_with_no_longitude_latitude_place_is_written_back_unchanged() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("parcels.shp");
         let mut native = Dataset::new("parcels", GeometryType::Point, vec![Field::new("OWNER", FieldType::Text)]);
@@ -1529,11 +1660,15 @@ mod tests {
         let crs = Crs::parse("EPSG:32616").unwrap();
         std::fs::write(path.with_extension("prj"), crate::raster::wkt::to_wkt(crs).unwrap()).unwrap();
         let (mut ds, sync) = read(&path);
-        assert_eq!(ds.features.iter().filter(|f| f.geometry.is_none()).count(), 1);
-        ds.push(None, vec![Value::Text("new".into())]);
-        let error = shapefile(&ds, &path, &sync).err().expect("unconverted shapes must not be assigned to new features").to_string();
-        assert!(error.contains("source shape 1") && error.contains("converted") && error.contains("nothing was written"), "{error}");
-        assert!(sync.files.changed(&path).unwrap().is_empty());
+        assert_eq!(ds.features.iter().filter(|f| f.geometry.is_none()).count(), 0);
+        let mut rows: Vec<_> = ds.features.iter().cloned().collect();
+        rows[1].attrs[0] = Value::Text("edited".into());
+        ds.features = rows.into();
+        shapefile(&ds, &path, &sync).unwrap();
+        let (back, _) = read(&path);
+        let shapes: Vec<Option<Geometry>> = back.features.iter().map(|f| f.geometry.clone()).collect();
+        assert_eq!(shapes, [Some(Geometry::Point(Coord::new(1e30, 1e30))), Some(Geometry::Point(Coord::new(500_000.0, 0.0)))]);
+        assert_eq!(back.features.row(1).unwrap().value(0), &Value::Text("edited".into()));
     }
 
     /// After deletion, persistent layer ids differ from file row numbers. An attribute-only

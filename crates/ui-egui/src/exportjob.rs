@@ -39,12 +39,21 @@ pub(crate) fn writing(app: &RustGisApp) -> Option<&str> {
     app.export_job.as_ref()?.writes.as_deref()
 }
 
-/// Refuses another export while one runs, whichever way it would run (one at a time).
+/// Refuses an export while another runs, whichever way it would run (one at a time), or while a
+/// read or table edit is still to land.
 pub fn idle(app: &RustGisApp) -> Result<(), String> {
-    match &app.export_job {
-        Some(job) => Err(crate::i18n::fmt("{tool} is still running: wait for it, or cancel it.", &[("tool", tl_raw!(job.name))])),
-        None => Ok(()),
+    if let Some(job) = &app.export_job {
+        return Err(crate::i18n::fmt("{tool} is still running: wait for it, or cancel it.", &[("tool", tl_raw!(job.name))]));
     }
+    // A read or table edit on its own thread changes the data only when it lands: an export now
+    // would write the data without it.
+    if let Some(read) = crate::readjob::under_way(app) {
+        return Err(crate::i18n::fmt(
+            "{read} is still running: wait for it, or cancel it, then export, so the file holds what it changes.",
+            &[("read", tl_raw!(read))],
+        ));
+    }
+    Ok(())
 }
 
 /// Starts `command` ([`exports::runs_in_background`]) with `p` on a thread of its own. One at a
@@ -126,15 +135,19 @@ pub fn stop(app: &mut RustGisApp, wait: std::time::Duration) {
 /// The export under way in the status bar: its name, progress and Cancel.
 pub fn status(app: &RustGisApp, ui: &mut Ui, t: &Tokens) {
     let Some(job) = &app.export_job else { return };
+    let size = crate::chrome::StripSize::of(app);
+    let cancellable = !job.control.is_cancelled();
     ui.spinner();
+    let mut cancel = size.cancel_first(ui, cancellable);
     // Two labels, not one sentence put together from translated pieces.
-    ui.label(egui::RichText::new(tl!("Running…")).size(11.5).color(t.text_dim));
-    ui.label(egui::RichText::new(tl!(job.name)).size(11.5).strong());
+    ui.label(egui::RichText::new(tl!("Running…")).size(size.text).color(t.text_dim));
+    ui.label(egui::RichText::new(tl!(job.name)).size(size.text).strong());
     // How far its current step has come, when its writer counts.
     if let Some((done, total)) = job.control.progress() {
-        ui.add(egui::ProgressBar::new(done as f32 / total.max(1) as f32).show_percentage().desired_width(120.0).desired_height(12.0));
+        size.progress(ui, done as f32 / total.max(1) as f32);
     }
-    if ui.add_enabled(!job.control.is_cancelled(), egui::Button::new(tl!("Cancel")).small()).clicked() {
+    cancel |= size.cancel_last(ui, cancellable);
+    if cancel {
         job.control.cancel();
     }
 }
@@ -181,6 +194,34 @@ mod tests {
         assert_eq!(steps.len(), 2);
         assert_eq!(steps[1].command, "share.exportTable");
         assert_eq!(steps[1].params, again);
+    }
+
+    /// A table edit still on the reads worker would be missing from the file: the export is
+    /// refused, naming it, until the edit lands, and then holds it.
+    #[test]
+    fn an_export_waits_for_a_table_edit_under_way() {
+        let mut app = RustGisApp::with_sample();
+        app.run("layer.addDataText", json!({"fileName": "ranks.csv", "text": "name,score\na,1\n"})).unwrap();
+        app.reads_off_frame = true;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ranks.csv");
+        let export = json!({"table": "ranks", "path": path});
+        app.run("edit.setValue", json!({"table": "ranks", "row": 0, "field": "score", "value": 5})).unwrap();
+        assert_eq!(crate::readjob::under_way(&app), Some("Edit Attribute"), "the edit runs on the reads worker");
+        let refused = app.run("share.exportTable", export.clone()).unwrap_err();
+        assert!(refused.starts_with("Edit Attribute is still running"), "{refused}");
+        assert!(app.export_job.is_none() && !path.exists());
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while crate::readjob::land(&mut app) {
+            assert!(std::time::Instant::now() < end, "the edit never landed");
+            std::thread::sleep(std::time::Duration::from_millis(5)); // test-wait: the reads worker publishes its result to the frame's polled slot
+        }
+        assert_eq!(app.run("share.exportTable", export).unwrap()["started"], "Export Table");
+        while land(&mut app) {
+            assert!(std::time::Instant::now() < end, "the export never landed");
+            std::thread::sleep(std::time::Duration::from_millis(5)); // test-wait: export workers publish completion to the frame's polled slot
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "name,score\na,5\n");
     }
 
     /// Delivers actual failed and cancelled export runs without a thread timing race. Neither

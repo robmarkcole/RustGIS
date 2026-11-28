@@ -115,6 +115,11 @@ impl ModelBuilder {
         self.open && self.active
     }
 
+    /// Whether a question about unsaved changes is up, or about to be drawn.
+    pub fn asking(&self) -> bool {
+        self.confirm.is_some()
+    }
+
     /// Whether the canvas has changes not saved to the project.
     pub fn dirty(&self) -> bool {
         self.graph != self.saved || self.saved_as.as_deref().is_some_and(|s| s != self.name.trim())
@@ -587,19 +592,29 @@ fn request(app: &mut RustGisApp, p: Pending) {
 }
 
 /// ModelBuilder's keys, before the app's own: Delete (or Backspace) deletes the selection,
-/// Ctrl+D duplicates the selected node, Ctrl+Z and Ctrl+Y undo and redo canvas edits.
+/// Ctrl+D duplicates the selected node, Ctrl+Z and Ctrl+Y undo and redo canvas edits. With the
+/// layer list in use, Delete and Backspace are left for it.
 pub fn shortcuts(app: &mut RustGisApp, ctx: &egui::Context) {
     if !app.mb.shown() || ctx.egui_wants_keyboard_input() {
         return;
     }
     let cmd = egui::Modifiers::COMMAND;
+    // The pane in use as the key went down: the wheel turned over the canvas after it doesn't
+    // make the key the canvas's, on the same frame or while the key is held (its repeats are the
+    // pane's it was pressed in, as in `chrome::shortcuts`).
+    let layers = |key| {
+        let pressed_in = crate::inuse::press(app, key, None).map(|press| press.pane).or_else(|| crate::inuse::held_in(app, key));
+        pressed_in.unwrap_or_else(|| crate::inuse::pane(app)) == crate::inuse::Pane::Layers
+    };
     let (mut del, mut dup, mut undo, mut redo) = (false, false, false, false);
     ctx.input_mut(|i| {
         undo = i.consume_shortcut(&egui::KeyboardShortcut::new(cmd, egui::Key::Z));
         redo = i.consume_shortcut(&egui::KeyboardShortcut::new(cmd | egui::Modifiers::SHIFT, egui::Key::Z))
             || i.consume_shortcut(&egui::KeyboardShortcut::new(cmd, egui::Key::Y));
-        if app.mb.selected.is_some() || app.mb.selected_edge.is_some() {
-            del = i.consume_key(egui::Modifiers::NONE, egui::Key::Delete) || i.consume_key(egui::Modifiers::NONE, egui::Key::Backspace);
+        // Nothing is deleted while a mouse button is down, as with the app's own Delete.
+        if (app.mb.selected.is_some() || app.mb.selected_edge.is_some()) && !crate::inuse::down(app) {
+            del =
+                [egui::Key::Delete, egui::Key::Backspace].into_iter().any(|key| !layers(key) && i.consume_key(egui::Modifiers::NONE, key));
         }
         if app.mb.selected.is_some() {
             dup = i.consume_shortcut(&egui::KeyboardShortcut::new(cmd, egui::Key::D));
@@ -624,7 +639,9 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
     let full = ui.available_rect_before_wrap();
     ui.painter().rect_filled(full, 0.0, t.pane);
-    let bar = Rect::from_min_size(full.min, vec2(full.width(), 40.0));
+    // A shell with its own interface puts a finger-sized Back to the map in the toolbar.
+    let bar_h = if app.chrome.is_some() { crate::chrome::FINGER + 12.0 } else { 40.0 };
+    let bar = Rect::from_min_size(full.min, vec2(full.width(), bar_h));
     let body = Rect::from_min_max(pos2(full.min.x, bar.max.y), full.max);
     let narrow = body.width() < 760.0;
     let palette_w = if narrow { 0.0 } else { PALETTE_W };
@@ -661,6 +678,17 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
 
 fn toolbar(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens, problems: &[model::Problem]) {
     ui.horizontal_centered(|ui| {
+        // A shell with its own interface has no view tabs, and on a phone the buttons at the far
+        // end are past the window's edge: the way back to the map comes first.
+        let back = egui::Button::new(tl!("Back to the map")).min_size(vec2(0.0, crate::chrome::FINGER));
+        if app.chrome.is_some() && ui.add(back).clicked() {
+            app.mb.active = false;
+            // Opened over a layout, the layout would show in its place. A close that fails is
+            // said by `run`, as any command's failure is.
+            if app.session.active_layout.is_some() {
+                let _ = app.run("layout.close", serde_json::Value::Null);
+            }
+        }
         let (r, _) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
         icons::paint(ui.painter(), r, "modelbuilder", t.icon, t.accent);
         ui.add(egui::TextEdit::singleline(&mut app.mb.name).hint_text(tl!("Untitled model")).desired_width(170.0).font(semibold(13.0)));
@@ -764,7 +792,8 @@ fn palette_ui(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens, canvas: Rect) {
             (Add::Output, tl!("+ Output"), tl!("A result the model keeps, under a name")),
         ] {
             let resp = ui.add(egui::Button::new(label).sense(Sense::click_and_drag()));
-            drag_source(ui, &resp, &what, label);
+            // Outside the list, so a finger drags these at once: nothing here scrolls.
+            drag_source(ui, resp.drag_started(), &what, label);
             if resp.on_hover_text(tip).clicked() {
                 add = Some(what);
             }
@@ -800,7 +829,7 @@ fn palette_ui(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens, canvas: Rect) {
         let top = tool.toolbox.split(" › ").nth(1).unwrap_or("Other");
         push(format!("GeoLibre › {}", crate::i18n::location(top)), !q.is_empty(), tool);
     }
-    egui::ScrollArea::vertical().id_salt("mb_palette").auto_shrink([false, false]).show(ui, |ui| {
+    let area = egui::ScrollArea::vertical().id_salt("mb_palette").auto_shrink([false, false]).show(ui, |ui| {
         if groups.is_empty() {
             ui.label(egui::RichText::new(tl!("No tools match your search.")).size(11.5).color(t.text_dim));
         }
@@ -811,7 +840,8 @@ fn palette_ui(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens, canvas: Rect) {
                 .show(ui, |ui| {
                     for tool in tools {
                         let resp = {
-                            let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click_and_drag());
+                            let (r, resp) =
+                                ui.allocate_exact_size(vec2(ui.available_width(), 26.0), crate::widgets::reorder_sense(ui, true));
                             resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, tl!(tool.name)));
                             if resp.hovered() {
                                 ui.painter().rect_filled(r, CornerRadius::same(5), t.hover);
@@ -827,7 +857,10 @@ fn palette_ui(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens, canvas: Rect) {
                             ui.painter().text(pos2(r.min.x + 26.0, r.center().y), Align2::LEFT_CENTER, name, regular(12.0), t.text);
                             resp
                         };
-                        drag_source(ui, &resp, &Add::Tool(tool.id), tl!(tool.name));
+                        // The rule of the rows that reorder (#2958), here to drag onto the canvas:
+                        // a finger swipes the list, and drags a tool only after a long press.
+                        let start = crate::widgets::reorder_drag(ui, &resp, true);
+                        drag_source(ui, start, &Add::Tool(tool.id), tl!(tool.name));
                         let resp = resp.on_hover_text(format!("{}\n{}", tl!(tool.name), tl!(tool.summary)));
                         if resp.clicked() {
                             add = Some(Add::Tool(tool.id));
@@ -836,6 +869,7 @@ fn palette_ui(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens, canvas: Rect) {
                 });
         }
     });
+    crate::widgets::yield_touch_drag(ui.ctx(), area.id);
     if let Some(what) = add {
         // Clicked: to the right of the last node, or at the top left of the view.
         let zoom = app.mb.zoom.max(0.1);
@@ -848,13 +882,14 @@ fn palette_ui(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens, canvas: Rect) {
     }
 }
 
-/// Makes a palette item draggable onto the canvas: the payload set when its drag starts, and
-/// its name following the pointer meanwhile.
-fn drag_source(ui: &Ui, resp: &egui::Response, what: &Add, label: &str) {
-    if resp.drag_started() {
+/// Makes a palette item draggable onto the canvas: the payload set when its drag `start`s, and
+/// its name following the pointer while it is carried. The payload says so, not `resp.dragged()`:
+/// after a long press egui has let go of the row's own drag.
+fn drag_source(ui: &Ui, start: bool, what: &Add, label: &str) {
+    if start {
         egui::DragAndDrop::set_payload(ui.ctx(), what.clone());
     }
-    if resp.dragged()
+    if egui::DragAndDrop::payload::<Add>(ui.ctx()).is_some_and(|d| *d == *what)
         && let Some(p) = ui.ctx().pointer_latest_pos()
     {
         let t = Tokens::get(ui.ctx());
@@ -1941,6 +1976,123 @@ mod tests {
         assert_eq!(m.steps.len(), 2);
     }
 
+    /// ModelBuilder over the sample project, settled, with its palette on the left.
+    fn palette_harness() -> egui_kittest::Harness<'static, RustGisApp> {
+        let mut app = RustGisApp::with_sample();
+        app.run("ui.modelBuilder", Value::Null).unwrap();
+        let mut h = harness(app);
+        h.run_steps(6);
+        h
+    }
+
+    fn tools(h: &egui_kittest::Harness<'_, RustGisApp>) -> Vec<(String, f32, f32)> {
+        h.state().mb.graph.nodes.iter().map(|n| (n.tool.clone().unwrap_or_default(), n.x, n.y)).collect()
+    }
+
+    /// #3034: a swipe of a finger over the tool rows scrolls the palette; it drags no tool.
+    #[test]
+    fn a_swipe_over_the_palette_scrolls_and_adds_no_tool() {
+        use egui_kittest::kittest::Queryable;
+        let mut h = palette_harness();
+        let row = h.get_by_label("Buffer").rect();
+        let from = row.center();
+        // Onto the canvas, so a row that took the swipe would drop its tool there.
+        crate::panes::tests::touch_drag(&mut h, from, pos2(700.0, from.y - 3.0 * row.height()), 0);
+        h.run_steps(3);
+        assert!(tools(&h).is_empty(), "{:?}", tools(&h));
+        assert!(h.get_by_label("Buffer").rect().center().y < from.y - 1.0, "the swipe did not scroll the palette");
+    }
+
+    /// #3034: a tap of a finger on a tool row still adds the tool.
+    #[test]
+    fn a_tap_on_a_palette_tool_adds_it() {
+        use egui::{PointerButton, TouchDeviceId, TouchId, TouchPhase};
+        use egui_kittest::kittest::Queryable;
+        let mut h = palette_harness();
+        let at = h.get_by_label("Buffer").rect().center();
+        let touch = |phase| Event::Touch { device_id: TouchDeviceId(1), id: TouchId(1), phase, pos: at, force: None };
+        let button = |pressed| Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        h.input_mut().events.extend([Event::PointerMoved(at), touch(TouchPhase::Start), button(true)]);
+        h.step();
+        h.input_mut().events.extend([touch(TouchPhase::End), button(false), Event::PointerGone]);
+        h.step();
+        h.run_steps(3);
+        assert_eq!(tools(&h).iter().map(|t| t.0.as_str()).collect::<Vec<_>>(), ["buffer"]);
+    }
+
+    /// #3034: a finger held on a tool row adds nothing until it moves; moved to the canvas and
+    /// let go, it drops the tool where a mouse drag drops it.
+    #[test]
+    fn a_long_press_then_a_move_drops_a_tool_on_the_canvas() {
+        use egui_kittest::kittest::Queryable;
+        let to = pos2(700.0, 400.0);
+        let mut mouse = palette_harness();
+        let from = mouse.get_by_label("Buffer").rect().center();
+        crate::panes::tests::drag_layer(&mut mouse, from, to);
+        mouse.run_steps(3);
+        assert_eq!(tools(&mouse).len(), 1, "the mouse drag drops the tool");
+
+        let mut held = palette_harness();
+        crate::panes::tests::touch_drag(&mut held, from, from, 6);
+        held.run_steps(3);
+        assert!(tools(&held).is_empty(), "a long press alone added {:?}", tools(&held));
+
+        // Held and then moved up, the tool is carried: the list stays where it was.
+        let mut up = palette_harness();
+        crate::panes::tests::touch_drag(&mut up, from, from - vec2(0.0, 80.0), 6);
+        up.run_steps(10);
+        assert!((up.get_by_label("Buffer").rect().center().y - from.y).abs() < 0.5, "the palette scrolled");
+
+        let mut secondary = palette_harness();
+        let button =
+            |pos, pressed| Event::PointerButton { pos, button: egui::PointerButton::Secondary, pressed, modifiers: Modifiers::NONE };
+        for event in [Event::PointerMoved(from), button(from, true), Event::PointerMoved(to), button(to, false)] {
+            secondary.event(event);
+            secondary.step();
+        }
+        secondary.run_steps(3);
+        assert!(tools(&secondary).is_empty(), "the secondary button added {:?}", tools(&secondary));
+
+        let mut h = palette_harness();
+        crate::panes::tests::touch_drag(&mut h, from, to, 6);
+        h.run_steps(3);
+        assert_eq!(tools(&h), tools(&mouse));
+    }
+
+    /// #3034: `+ Input` and `+ Output`, above the list, are dragged onto the canvas at once by
+    /// the mouse and by a finger, their name following the pointer meanwhile.
+    #[test]
+    fn the_input_and_output_buttons_drag_onto_the_canvas() {
+        use egui_kittest::kittest::Queryable;
+        let to = pos2(700.0, 400.0);
+        // How many times `label` is drawn: the button, and the ghost while it is carried.
+        let drawn = |h: &egui_kittest::Harness<'_, RustGisApp>, label: &str| {
+            h.output().shapes.iter().filter(|s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.text() == label)).count()
+        };
+        for (label, kind) in [("+ Input", ModelNodeKind::Input), ("+ Output", ModelNodeKind::Output)] {
+            let kinds = |h: &egui_kittest::Harness<'_, RustGisApp>| h.state().mb.graph.nodes.iter().map(|n| n.kind).collect::<Vec<_>>();
+            let mut h = palette_harness();
+            let from = h.get_by_label(label).rect().center();
+            assert_eq!(drawn(&h, label), 1);
+            let button =
+                |pos, pressed| Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+            for event in [Event::PointerMoved(from), button(from, true), Event::PointerMoved(to)] {
+                h.event(event);
+                h.step();
+            }
+            assert_eq!(drawn(&h, label), 2, "no ghost of {label} mid-drag");
+            h.event(button(to, false));
+            h.run_steps(3);
+            assert_eq!(kinds(&h), [kind]);
+            assert_eq!(drawn(&h, label), 1, "the ghost of {label} stayed");
+
+            let mut finger = palette_harness();
+            crate::panes::tests::touch_drag(&mut finger, from, to, 0);
+            finger.run_steps(3);
+            assert_eq!(kinds(&finger), [kind], "a finger on {label}");
+        }
+    }
+
     /// Delete removes the selected node with its wires, Ctrl+Z brings both back, Ctrl+D copies
     /// it; a map tab clicked (or a map activated) hides ModelBuilder, its tab shows it again.
     #[test]
@@ -1981,6 +2133,55 @@ mod tests {
         h.run_steps(2);
         assert!(h.state().mb.shown());
         assert_eq!(h.state().mb.graph.nodes.len(), 3, "the canvas is kept");
+    }
+
+    /// A layer clicked in the list with a node selected on the canvas: Delete is the list's. It
+    /// removes that layer and leaves the node (#2945).
+    #[test]
+    fn delete_is_the_layer_lists_while_it_is_in_use() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = RustGisApp::with_sample();
+        app.ui.right_open.clear();
+        app.ui.right = None;
+        app.run("ui.modelBuilder", Value::Null).unwrap();
+        let node = app.mb.add(&Add::Input, pos2(0.0, 0.0));
+        app.mb.selected = Some(node);
+        let layers = app.session.map().layers.len();
+        // The whole window: the layer list beside the canvas.
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1300.0, 900.0)).with_max_steps(64).build_ui_state(
+            |ui, app: &mut RustGisApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            app,
+        );
+        h.run_steps(6);
+        assert!(h.state().mb.shown());
+        h.get_by_label("Rivers").click();
+        h.run_steps(2);
+        h.event(Event::Key { key: Key::Delete, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE });
+        h.run_steps(2);
+        assert_eq!(h.state().mb.graph.nodes.len(), 1, "the node stays");
+        assert_eq!(h.state().session.map().layers.len(), layers - 1);
+        assert!(h.state().session.map().layer_by_name("Rivers").is_none(), "Delete removed the layer clicked in the list");
+        // The key still held, and the wheel turned over the canvas: its repeats stay the layer
+        // list's, and the node stays.
+        let canvas = pos2(800.0, 500.0);
+        h.event(Event::PointerMoved(canvas));
+        h.step();
+        h.event(Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: vec2(0.0, 1.0),
+            modifiers: Modifiers::NONE,
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Wheel,
+        });
+        h.run_steps(2);
+        h.event(Event::Key { key: Key::Delete, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE });
+        h.run_steps(2);
+        assert_eq!(h.state().mb.graph.nodes.len(), 1, "a held Delete's repeat on the canvas leaves the node");
+        assert_eq!(h.state().session.map().layers.len(), layers - 1);
     }
 
     /// Closing with unsaved changes asks first; Discard closes, Cancel keeps the model open.

@@ -42,7 +42,8 @@ pub(super) fn long_commands(boundaries: bool) {
             layer.touch_geometry();
         }
     }
-    s.run("layer.addDataBytes", &json!({"fileName": "dem.tif", "data": if boundaries { tiny_raster(false) } else { dem_b64() }})).unwrap();
+    let data = if boundaries { tiny_raster(false) } else { dem_b64() };
+    s.run("layer.addDataBytes", &json!({"fileName": "dem.tif", "data": data})).unwrap();
     let dem = s.map().layers.iter().find(|l| l.is_raster()).unwrap().name.clone();
     // What some of them read: a later DEM, a slope, training squares, an imagery workspace, a
     // two-class scene with its training polygons, and a layout.
@@ -87,6 +88,7 @@ pub(super) fn long_commands(boundaries: bool) {
         ("raster.process", json!({"layer": dem, "operation": "resample", "factor": 4})),
         ("imagery.mosaic", json!({"name": "Valley"})),
         ("raster.rasterize", json!({"layer": "Squares", "field": "name", "cellSize": 0.0005, "path": out("burned.tif")})),
+        ("raster.mosaic", json!({"inputs": ["dem_later", out("tile.tif"), dem], "path": out("mosaic.tif")})),
         (
             "dl.classify",
             json!({"layer": "scene", "training": "training", "classField": "class", "bands": [1, 2], "epochs": if boundaries { 2 } else { 30 }, "model": "landcover"}),
@@ -114,6 +116,12 @@ pub(super) fn long_commands(boundaries: bool) {
                 "index": "ndvi", "bbox": [10.0, 45.0, 10.02, 45.02]}),
         ),
     ];
+    // A mosaic's input read from a file, and a file where it writes its own: Cancel keeps both.
+    {
+        use base64::Engine;
+        std::fs::write(out("tile.tif"), base64::engine::general_purpose::STANDARD.decode(&data).unwrap()).unwrap();
+        std::fs::write(out("mosaic.tif"), b"before").unwrap();
+    }
     // Every command that runs in the background is here, and only those.
     /// Keeps the shared fixture list in step with the production registry.
     fn listed<'a>(l: &[(&'a str, Value)]) -> std::collections::BTreeSet<&'a str> {
@@ -296,6 +304,19 @@ pub(super) fn long_commands(boundaries: bool) {
         </symbol></symbols></renderer-v2></qgis>"#;
     std::fs::write(out("pin.qml"), marker).unwrap();
     read(&s, "style.importQgis", &json!({"layer": "Cities", "path": out("pin.qml")}));
+    // A QGIS project: imported on a copy of the session, Cancel looked at between its layers and
+    // within each layer's read (#2476).
+    let place = json!({"type": "FeatureCollection", "features": [
+        {"type": "Feature", "properties": {"name": "A"}, "geometry": {"type": "Point", "coordinates": [10.01, 45.01]}}]});
+    std::fs::write(out("place.geojson"), place.to_string()).unwrap();
+    std::fs::write(out("place.csv"), "name,x,y\nB,10.02,45.02\n").unwrap();
+    let project = r#"<qgis version="4.2.3"><title>Imported</title><layer-tree-group>
+        <layer-tree-layer id="Place" checked="Qt::Checked"/><layer-tree-layer id="Table" checked="Qt::Checked"/></layer-tree-group><projectlayers>
+        <maplayer type="vector"><id>Place</id><datasource>./place.geojson</datasource><layername>Place</layername><provider>ogr</provider></maplayer>
+        <maplayer type="vector"><id>Table</id><datasource>file:./place.csv?type=csv&amp;xField=x&amp;yField=y</datasource><layername>Table</layername><provider>delimitedtext</provider></maplayer>
+        </projectlayers></qgis>"#;
+    std::fs::write(out("import.qgs"), project).unwrap();
+    read(&s, "project.importQgis", &json!({"path": out("import.qgs")}));
 
     s.run("layer.addDataText", &json!({"fileName": "calc.csv", "text": "n,day\n1,01/02/2024\n2,02/03/2024\n"})).unwrap();
     s.run("edit.enable", &json!({"on": true})).unwrap();
@@ -370,6 +391,12 @@ pub(super) fn long_commands(boundaries: bool) {
         ("a5Grid", json!({"system": "Hexagon", "resolution": 3, "area": "Input Layer", "input": "Countries"})),
         ("a5Aggregate", json!({"system": "H3", "input": "Cities", "resolution": 3})),
         ("a5Grid", json!({"system": "H3", "resolution": 3, "area": "Input Layer", "input": "Countries"})),
+        ("joinField", json!({"target": "Cities", "joinTable": "ranks", "targetField": "name", "joinField": "name"})),
+        ("merge", json!({"inputs": ["Countries", "Squares"], "attributes": true})),
+        ("polygonToLine", json!({"input": "Countries"})),
+        ("featureEnvelopeToPolygon", json!({"input": "Countries"})),
+        ("splitLineAtVertices", json!({"input": "Rivers"})),
+        ("unsplitLine", json!({"input": "Rivers"})),
     ];
     for (tool, params) in &tools {
         exercise(&s, tool, params, Kind::Tool, &dir.0, boundaries);

@@ -219,7 +219,10 @@ pub fn with_entry(p: &Value) -> Result<Cow<'_, Value>, String> {
         match &e.source {
             Source::Stac { collection, asset } => {
                 o.insert("collection".into(), json!(collection));
-                o.insert("asset".into(), json!(asset));
+                // Its band, unless the call reads several of the collection's own ("assets").
+                if p.get("assets").is_none_or(Value::is_null) {
+                    o.insert("asset".into(), json!(asset));
+                }
                 for (k, v) in [("cellSize", e.cell_size), ("maxCloud", e.max_cloud)] {
                     if let Some(v) = v.filter(|_| o.get(k).is_none_or(Value::is_null)) {
                         o.insert(k.into(), json!(v));

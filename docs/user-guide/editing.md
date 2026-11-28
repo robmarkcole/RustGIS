@@ -2,6 +2,24 @@
 
 ## Creating features
 
+**Edit › Features › Create ▾ › Point by Coordinates…** creates points from known X/Y coordinates.
+Turn editing on (also offered in the dialog), enter X and Y, optionally a name, and click
+**Add Point** or press ++enter++. Leave the coordinate system blank for longitude/latitude
+in decimal degrees or degrees, minutes and seconds, or enter a system such as `EPSG:3857`
+for numeric eastings and northings. Enter `map` to use the map's current flat projection,
+or a layer's name to use that layer's coordinate system. Otherwise, changing the map's
+display projection does not change the entered coordinates' meaning.
+The dialog stays open and clears X, Y and Name after success; ++esc++ closes it when
+its fields have focus or no other work owns the key. On the map, Escape still cancels a sketch.
+
+Points join the selected loaded point layer. Otherwise, a new **Points** layer is created
+in the project using the existing point-layer template and the project's coordinate system;
+a layer read in place must first be loaded to receive edits. A name uses a
+text field named `name` (ignoring case); new Points layers include it. Leave Name blank if
+an existing layer has no such field. Each addition, including a new layer, is one Undo step.
+The same operation is available through Command Search and `edit.addPoint`, for example:
+`edit.addPoint {"x":14.3,"y":-41.2,"name":"Survey"}`.
+
 **Edit › Create** draws new points, lines and polygons into the layer selected in Layers:
 click once for a point, or click each vertex and double-click to finish a line or polygon
 (++esc++ cancels). **Delete** (++delete++) removes the selected features across the map's layers.
@@ -11,7 +29,9 @@ field from an expression; **Calculate Geometry** (in the attribute table's toolb
 existing numeric field with each feature's area, perimeter, length or X/Y coordinate, in the units
 you choose, for all features or the selected ones. Length and perimeter include feet and miles;
 area includes square feet (`ft2`), acres (`ac`) and square miles (`mi2`). An unrecognized
-`edit.calculateGeometry` unit is refused with the valid unit keys for the chosen property.
+`edit.calculateGeometry` unit is refused with the valid unit keys for the chosen property. A feature
+with a place that can't be given in longitude/latitude (one far past where its layer's own system
+reaches) is left empty, and a notice counts them.
 Every edit is one undo step. Areas, perimeters and lengths measure on the WGS 84 ellipsoid, the same measure as the network tools and the Measure panel (Spatial Join still
 measures on the sphere). A ring with a full-turn edge, -180° to 180° along a parallel that the
 ring reaches down one meridian and leaves back up the other (a globe-wide band, or a cap closed
@@ -66,6 +86,25 @@ you edit the value or choose units; click **Apply elevation** to apply the new i
   and flip line direction. A single point turns and scales on itself, so Rotate and Scale leave
   points (text graphics included) as they are: with only points selected they change nothing,
   say so, and add no undo step. Edit › Tools lists every editing tool.
+  In a layer held in a projected system (UTM, a national grid; not Web Mercator, another world
+  projection or a geographic system), Move, Rotate and Scale work in the layer's own coordinates,
+  as the analysis tools do: Move steps the distances east and north along its grid, measured flat
+  in its unit (so in UTM a kilometre on the grid is between about 0.999 and 1.0004 km on the
+  ground, and its north is grid north; Ground to grid below corrects ground distances and
+  directions to it), following the system's axes when they point west, south or north first; Rotate turns clockwise
+  with grid north up, and Scale scales, about the middle of the feature's extent there. A Move
+  whose selection spans layers in more than one system (or some in one and some in
+  longitude/latitude; graphics don't count) moves them all as below, so places they share stay
+  together, and says so. Rotate and Scale turn each feature about its own middle anyway, so
+  they take each layer's own grid even then. The rest of this paragraph, about Web Mercator and
+  the ground, is for the other layers.
+  A selected feature with a place that can't be given in longitude/latitude (one far past where
+  its layer's own system reaches) is left as it is by Move, Rotate and Scale, Split and Cut
+  Polygon (in a layer edited in its own grid, each of these changes it with the rest), and a
+  notice counts them by layer; Flip Line flips it in the layer's own coordinates. An edit of that
+  one feature (a vertex, a shape conversion; Reshape, Trace or Merge with it, outside a layer
+  edited in its own grid) is refused, naming the layer and the feature; Set Geometry gives it a
+  new shape, and Delete removes it.
   Beyond 85.05°, where Web Mercator stops, Move, Rotate and Scale work on the ground: a feature
   that reaches beyond it, or that the edit would take beyond it, moves rigidly, together with the
   selected features sharing a vertex with it (their center goes the distance and direction asked,
@@ -97,6 +136,14 @@ you edit the value or choose units; click **Apply elevation** to apply the new i
   ground (once a split has worked out a million distances along segments near the point, a
   segment counts as near as the nearest point found on it so far, its nearer end at first, and the
   split says how many lines it cut that way, or left whole when that point was an end).
+- **On a layer's own segments:** in a layer held in a projected system (as for Move above),
+  Cut Polygon, Reshape, Split, Merge and Trace work on its segments as they run straight in its
+  own coordinates. The line drawn (or the point Split is given) is converted into them, a point
+  snapped to a place of a layer in that system being that place as stored; the points a cut, a
+  reshape or a split makes lie on the layer's segments there, every other place stays as
+  stored, and Merge unions the shapes as stored, converting nothing. Their distances (a
+  centimetre at a line's end, Trace's `fromOffM` and `toOffM`) are metres of its grid. Other
+  layers are edited in Web Mercator, as below.
 - **Cut Polygon** (Edit › Tools, or the Editing pane): select polygons, then click a line across
   them and double-click to finish. Each polygon the line crosses from edge to edge is cut into
   pieces; a zigzag line can make several. The pieces keep the original's attributes. The
@@ -122,15 +169,23 @@ you edit the value or choose units; click **Apply elevation** to apply the new i
   `edit.trace={"from": [lon, lat], "to": [lon, lat]}` returns the path along the nearest edge
   passing within the snapping tolerance of both points (`"layer"` keeps the search to one layer;
   add `"row"` to trace a given feature), and how far each point was from the edge (`fromOffM`, `toOffM`, in Web Mercator metres, which
-  run longer than ground metres away from the equator).
+  run longer than ground metres away from the equator; for a layer held in a projected system,
+  in metres of its grid).
 - **Edit Vertices** (Edit › Features): reshape the selected features on the map. Their vertices
   show as square handles and each edge has a round midpoint handle. Drag a vertex to move it;
   drag a midpoint, or click an edge, to insert a vertex; click a vertex and press ++delete++ to
-  remove it (a line keeps at least two vertices, a polygon ring three). Clicking elsewhere
+  remove it (a line keeps at least two vertices, a polygon ring three). The handles sit where
+  the map draws the vertices. On a map in the layer's own coordinate system they are its stored
+  coordinates: a vertex you drag is written where you let go, in the layer's coordinates, and
+  every other vertex stays exactly as stored. On another map, a selected feature with a place
+  that can't be given in longitude/latitude (see [Places with no longitude/latitude](data-formats.md#places-with-no-longitudelatitude))
+  gets no handles, and a notice says so once, naming it or counting them; on a map in its
+  layer's own system it gets its handles. Clicking elsewhere
   selects the feature there (++shift++ adds it). Multipart features and polygon holes work the
   same way, dragged vertices snap when snapping is on, and each move, insertion or deletion is
   one undo step. ++esc++ finishes. From scripts and the command line, `edit.vertex` does the
-  same to one vertex and `edit.setGeometry` (Set Geometry) replaces a feature's whole shape.
+  same to one vertex, given in longitude/latitude (`lon`, `lat`) or in the layer's own
+  coordinates (`x`, `y`), and `edit.setGeometry` (Set Geometry) replaces a feature's whole shape.
 - **Feature templates**: named default values for new features, made from a selected feature;
   the Create tool uses the chosen template.
 - **Snapping** (**Edit › Snapping**): new and dragged vertices snap to nearby vertices, edges and
@@ -150,7 +205,10 @@ you edit the value or choose units; click **Apply elevation** to apply the new i
   between the two systems; this is not a change to its geometry's coordinates. An edit whose
   label point the surface's system can't give is refused.
 - **Ground to grid**: a scale factor and rotation applied to entered distances and directions
-  (Move, and `edit.traverse`, which draws a line or polygon from distances and bearings).
+  (Move, and `edit.traverse`, which draws a line or polygon from distances and bearings). Into a
+  layer held in a projected system, a traverse starts at the given longitude/latitude converted
+  into that system and steps each leg on its grid, flat in its unit from grid north, as Move does;
+  into any other layer, each leg goes east and north in Web Mercator stretched to the latitude.
 - **Topology**: rules (must not overlap, must not have gaps, must not self-intersect, must not
   have dangles, must be covered by); Validate lists the errors, and clicking one zooms to it.
   Primary rows follow the layer's definition query, independently of selection, time windows
@@ -163,8 +221,13 @@ you edit the value or choose units; click **Apply elevation** to apply the new i
   where a check in longitude/latitude takes them. A rule whose covering layer that system can't
   hold is checked in longitude/latitude instead, and says so. A layer in Web Mercator, another
   world projection or a geographic system is checked in longitude/latitude, its dangle tolerance
-  on the ground. An error at a place that can't be given in longitude/latitude, where the Error
-  Inspector would zoom, refuses the check, naming the layer and feature.
+  on the ground; there, a feature with a place that can't be given in longitude/latitude (one
+  far past where its layer's own system reaches) is left out of the check, and a notice names
+  the rules and counts them. An error at a place that can't be given in longitude/latitude is
+  listed with its features but has no place for the Error Inspector to zoom to (in
+  `topology.validate`'s answer, `located` is false and `lon` and `lat` are null), and a notice
+  counts them. A rule that left a feature out is said to be checked incompletely, since its
+  neighbours' issues there (a gap where it lay, a dangle where it joined) may not be real.
   On the desktop the check runs in the background, so the map stays in use: the status bar
   shows **Error Inspector** with its progress and **Cancel**, and a check that can be cancelled
   takes any amount of work (a gaps rule first joins all its polygons in one step, which
@@ -193,13 +256,19 @@ image coordinates may appear elliptical on the map; a rectangle may appear skewe
 not resampled by this choice, and shapes are not clipped to its boundary.
 
 Choose **Web Mercator grid metres** explicitly to draw in map coordinates instead; those are not
-ground-distance metres. Choosing **No image** restores that grid. Under Edit, the same choices
+ground-distance metres. Choosing **No image** restores that grid. When the target layer is held
+in a projected system with an EPSG code (UTM, a national grid; not Web Mercator, another world
+projection or a geographic system), that choice is the **Layer's own grid** instead: one grid
+unit per unit of the layer's system, y down (a grid x is the system's x and a grid y minus its y,
+whichever way its axes point), and a shape built
+in it is written in the layer's own coordinates as built, with no conversion. Web Mercator grid
+metres are then not offered for new shapes; a command takes them with `"frame": {"epsg": 3857}`. Under Edit, the same choices
 are in Editing → New shape grid when a circle or rotated box tool is active. Grid changes affect
 new shapes; existing shapes retain their own construction grid when moved, resized or rotated.
 Undo/Redo retain those constructions within the session.
 
 On desktop, header reads run in the background with progress and Cancel. Changing images,
-switching to Web Mercator or using **Cancel Grid Read** stops only that lookup and preserves
+switching to Web Mercator (or the layer's own grid) or using **Cancel Grid Read** stops only that lookup and preserves
 unrelated queued work. The status-bar Cancel retains its queue-wide behaviour. Pixel-based
 drawing waits for a valid grid; a failed or cancelled read never silently substitutes map metres.
 After changing a source file externally, reload the image layer first, then use **Reload Grid**.
@@ -209,13 +278,13 @@ download remote originals first. In the browser, upload the original GeoTIFF. Ot
 (including PNG, JPEG, ASCII grids and GDAL-converted images) are refused with guidance to export
 the image as a GeoTIFF and add that file; reloading the unsupported source cannot supply its grid.
 Construction grids require a supported EPSG coordinate system. Unsupported or custom systems
-are refused during the grid read; choose a supported image or **Web Mercator grid metres**.
+are refused during the grid read; choose a supported image or **Web Mercator grid metres** (the **Layer's own grid** on a layer that has one).
 Changing projects or maps clears the old image binding, keeps pixel mode selected and reports a
 warning. Drawing stays blocked until you choose an image again or explicitly choose Web Mercator
-grid metres; opening the pane does not clear the warning.
+grid metres (or the layer's own grid); opening the pane does not clear the warning.
 An image removed from the map keeps its last name as **Unavailable image**. Pixel drawing stays
 blocked and **Reload Grid** is disabled until the image is restored or another image is chosen.
-Choose **No image** to return explicitly to Web Mercator grid metres.
+Choose **No image** to return explicitly to Web Mercator grid metres (or the layer's own grid).
 **Original Image Grid** in Command Search reports the active image's original dimensions and
 EPSG coordinate system in a notice, while keeping the Annotate pane open.
 
@@ -345,8 +414,11 @@ rules continue to apply. Box tools do not create annotation or class fields.
   completed move, resize, rotation or deletion is undoable. ++esc++ cancels a held gesture;
   press it again to leave the tool.
 
-The interactive tool starts in Web Mercator grid metres, **not ground metres**; angles run
-clockwise from grid east. Activating the interactive tool, including through `tool.set`, requires
+The interactive tool starts in the layer's own grid when it has one (see
+[Annotating an image](#annotating-an-image)), and otherwise in Web Mercator grid metres, **not
+ground metres**; angles run clockwise from grid east. `edit.addBox` without `box.frame` uses
+Web Mercator grid metres, as before; `"frame": {"epsg": 32632}` builds in that system's own grid
+(the layer's own when it is held in it). Activating the interactive tool, including through `tool.set`, requires
 an untilted, non-globe Earth view. The geometry commands (`edit.addBox`, `edit.updateBox` and
 `edit.deleteBox`) work independently of the map's projection and pitch, using the construction
 grid on an Earth map. Boxes crossing the antimeridian, the polar editing limit, and unsupported
@@ -404,7 +476,8 @@ The existing **Editing** pane opens with centre X/Y, radius and polygon toleranc
   leaves the tool. Templates, ordinary attributes and edit rules work as for other features.
 
 The interactive tool uses the same flat Earth view and frozen construction grids as Rotated
-Box. Its default radius is in **Web Mercator grid metres, not ground metres**. Scripts may
+Box: the layer's own grid when it has one, else **Web Mercator grid metres, not ground
+metres**; `edit.addCircle` without `circle.frame` uses Web Mercator grid metres, as before. Scripts may
 supply `circle.frame` from an original GeoTIFF grid via `box_edit::Frame::from_grid`; centre,
 radius and tolerance then use original image pixels, including rotated or skewed grids.
 A pixel circle may look elliptical on the map. Geometry commands remain view-independent.
@@ -457,7 +530,8 @@ The command uses row positions and the same vertex addresses as `edit.vertex`:
 {"layer":"Parcels","row":0,"part":0,"ring":0,"index":3,"lon":12.5,"lat":41.9}
 ```
 
-Run these parameters with `edit.moveSharedVertex`. It returns the source `part`, `ring` and
+Run these parameters with `edit.moveSharedVertex`. In place of `lon` and `lat`, `x` and `y` give
+the place in the layer's own coordinates, written as given. It returns the source `part`, `ring` and
 `index`, plus `modified`: the number of features whose geometry or attributes actually changed.
 Every matched feature runs through attribute rules and archiving in one transaction; a rejection
 rolls back the whole edit. A successful command is one undo step. As with `edit.vertex`, a direct
@@ -502,8 +576,9 @@ attribute edits, Calculate Field):
 Copy (++ctrl+c++) and Cut (++ctrl+x++) take selected features from one layer: the active layer
 if it has a selection, otherwise the first layer with selected features. Paste (++ctrl+v++)
 adds them to the layer selected in Layers, matching fields by name and converting values to the
-destination field types; unmatched fields stay empty. Geometry types must match. **Paste Special**
-adds them as a new layer instead. Copied features also go on the system clipboard as GeoJSON, so
+destination field types; unmatched fields stay empty. Geometry types must match. A feature with a
+place the destination layer's coordinate system can't hold is left out, and a notice counts them.
+**Paste Special** adds them as a new layer instead. Copied features also go on the system clipboard as GeoJSON, so
 they can be pasted into another RustGIS window or a text editor, and GeoJSON copied elsewhere
 pastes into RustGIS. **Copy Path** copies the selected layer's data source path.
 
@@ -598,8 +673,10 @@ clear the selection on empty space, ready to draw another shape. Drawing and mea
 keep their current selection when opening the map menu.
 
 1. Choose Circle or Rotated Box and a construction grid. The shape defaults to the active
-   Circle or Rotated Box tool when opening conversion; other tools default to Circle. The default is **Web Mercator grid
-   metres**, not ground metres. Choose an open GeoTIFF to fit in its **original image pixels**,
+   Circle or Rotated Box tool when opening conversion; other tools default to Circle. The default is the layer's own grid when
+   it has one (as for drawing), else **Web Mercator grid metres**, not ground metres, also for
+   `edit.previewShapeConversion` without `frame` (`"frame": {"epsg": 3857}` asks for Web
+   Mercator there). Choose an open GeoTIFF to fit in its **original image pixels**,
    preserving the source affine transform, including rotation and shear, rather than using a
    display overview. Local GeoTIFFs and embedded/browser-uploaded GeoTIFFs are supported; remote
    original grids must be downloaded and added first. An unreadable or unsupported source gives

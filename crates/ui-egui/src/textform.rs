@@ -1,11 +1,14 @@
 //! The text form shared by a text graphic (Add Text) and a layout's text (the Format pane, #516):
 //! its text, dynamic text, size, colour, boldness, italic, alignment and letter spacing (#535),
 //! laid out and limited the same in both, so the same text can look the same on the map and on
-//! the page; a layout's text also has its font family (#517). It edits the values it is lent
-//! and says what was settled; each caller runs its own command.
+//! the page; a layout's text also has its font family (#517), and where its block of lines sits
+//! down its box, its line spacing and its case. It edits the values it is lent and says what was
+//! settled; each caller runs its own command.
 
 use egui::{Color32, Ui, vec2};
-use rustgis_engine::map::layout::{FontFamily, MAX_LETTER_SPACING, MIN_LETTER_SPACING, TextAlign};
+use rustgis_engine::map::layout::{
+    FontFamily, MAX_LETTER_SPACING, MAX_LINE_SPACING, MIN_LETTER_SPACING, MIN_LINE_SPACING, TextAlign, TextCase, TextVAlign,
+};
 use rustgis_engine::render::families;
 
 use crate::widgets::Dragged;
@@ -13,6 +16,96 @@ use crate::widgets::Dragged;
 /// The most installed families the Font list shows at once, as the Labeling pane's; the rest are
 /// found by typing part of a name.
 const MAX_FONTS_SHOWN: usize = 200;
+
+/// A layer a layout text can show a figure of (#3036): its name and its numeric fields, which the
+/// Dynamic Text menu offers as tokens (`{count:Name}`, `{sum:Name:field}`…).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StatLayer {
+    pub name: String,
+    pub fields: Vec<String>,
+}
+
+impl StatLayer {
+    /// The layers a text of `layout` can show figures of: those [`Self::of_map`] lists for the map
+    /// its first frame shows (as the page reads them).
+    pub fn of(layout: &rustgis_engine::map::layout::Layout, maps: &[rustgis_engine::map::Map]) -> Vec<StatLayer> {
+        use rustgis_engine::map::layout::ElementKind;
+        let Some(ElementKind::MapFrame { map, .. }) = layout.first_frame().and_then(|f| layout.element(f)).map(|e| &e.kind) else {
+            return Vec::new();
+        };
+        maps.iter().find(|m| m.name.eq_ignore_ascii_case(map)).map_or_else(Vec::new, Self::of_map)
+    }
+
+    /// The layers of `map` a text can show figures of, without a raster's or a graphics layer's,
+    /// each with its numeric fields. A name a token can't hold (`{`, `}`, or a field's `:`) is left
+    /// out, and so is a layer under another of its name, and a field after another of its name (case
+    /// aside), which no token reads.
+    pub fn of_map(map: &rustgis_engine::map::Map) -> Vec<StatLayer> {
+        Self::readable(map)
+            .map(|l| StatLayer {
+                name: l.name.clone(),
+                fields: l
+                    .dataset
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, f)| f.ty.is_numeric() && holds(&f.name, true) && l.dataset.field_index(&f.name) == Some(*i))
+                    .map(|(_, f)| f.name.clone())
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// Whether [`Self::of_map`] lists any layer, without reading their fields.
+    pub fn any(map: &rustgis_engine::map::Map) -> bool {
+        Self::readable(map).next().is_some()
+    }
+
+    fn readable(map: &rustgis_engine::map::Map) -> impl Iterator<Item = &rustgis_engine::map::Layer> {
+        map.layers
+            .iter()
+            .filter(|l| !l.graphics && l.raster.is_none() && holds(&l.name, false))
+            .filter(|l| map.layer_by_name(&l.name).is_some_and(|first| first.id == l.id))
+    }
+}
+
+/// Whether a statistic token can hold `name` (a field's takes no `:` either).
+fn holds(name: &str, colon: bool) -> bool {
+    !name.is_empty() && !name.contains(['{', '}']) && !(colon && name.contains(':'))
+}
+
+/// The "Layer statistic" section of a Dynamic Text menu (#3036), the Format pane's and the
+/// ribbon's: [`stat_layers`] under that name. `pick` takes the token chosen; with no layers there
+/// is no section.
+pub fn stat_menu(ui: &mut Ui, layers: &[StatLayer], mut pick: impl FnMut(String)) {
+    if layers.is_empty() {
+        return;
+    }
+    ui.separator();
+    crate::widgets::submenu(ui, tl!("Layer statistic"), |ui| stat_layers(ui, layers, &mut pick));
+}
+
+/// A submenu per layer: a count and, for each numeric field, its sum, mean, least and greatest.
+pub fn stat_layers(ui: &mut Ui, layers: &[StatLayer], pick: &mut impl FnMut(String)) {
+    for layer in layers {
+        crate::widgets::submenu(ui, &layer.name, |ui| {
+            let mut add = |ui: &mut Ui, what: &str, token: String| {
+                if ui.button(format!("{what}  {token}")).clicked() {
+                    pick(token);
+                    ui.close();
+                }
+            };
+            add(ui, tl!("Count"), format!("{{count:{}}}", layer.name));
+            for field in &layer.fields {
+                crate::widgets::submenu(ui, field, |ui| {
+                    for (code, what) in [("sum", tl!("Sum")), ("mean", tl!("Mean")), ("min", tl!("Least")), ("max", tl!("Greatest"))] {
+                        add(ui, what, format!("{{{code}:{}:{field}}}", layer.name));
+                    }
+                });
+            }
+        });
+    }
+}
 
 /// What the form edits. A style is left out where the text doesn't have it.
 pub struct Fields<'a> {
@@ -28,6 +121,12 @@ pub struct Fields<'a> {
     /// What is lost of a layout text, said under its wrap row in the warning colour: its lines
     /// that don't fit its box (#2346).
     pub warning: Option<String>,
+    /// Where a layout text's lines sit down its box: top, middle or bottom.
+    pub valign: Option<&'a mut TextVAlign>,
+    /// The distance between a layout text's lines, a multiple of the usual, from 0.5 to 3.
+    pub line_spacing: Option<&'a mut f64>,
+    /// A layout text drawn in upper or lower case, or as typed.
+    pub case: Option<&'a mut TextCase>,
     /// Points between letters, from −5 (tighter) to 50.
     pub letter_spacing: Option<&'a mut f64>,
     /// Sans-serif or serif: a layout text's (a text graphic is drawn in the map's sans); with
@@ -57,6 +156,12 @@ pub struct Settled {
     pub italic: bool,
     pub align: bool,
     pub wrap: bool,
+    /// Another vertical alignment was picked.
+    pub valign: bool,
+    /// The line spacing changed and was let go, as the size.
+    pub line_spacing: bool,
+    /// Another case was picked.
+    pub case: bool,
     /// The letter spacing changed and was let go, as the size.
     pub letter_spacing: bool,
     /// Another family was picked.
@@ -75,8 +180,16 @@ pub fn section<R>(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui) -> R) -> O
 pub const LABEL_W: f32 = 96.0;
 
 /// The form, its fields told apart by `id` (an element, a dialog). `tokens` are the dynamic text
-/// lists the text expands where it is shown, each a section of the Dynamic Text menu.
-pub fn show(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, tokens: &[&[(&str, &str)]], f: Fields<'_>) -> Settled {
+/// lists the text expands where it is shown, each a section of the Dynamic Text menu; `layers`
+/// gives the layers whose figures it can show, a section of their own (none for a text graphic),
+/// and is asked only while the menu is open.
+pub fn show(
+    ui: &mut Ui,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    tokens: &[&[(&str, &str)]],
+    layers: impl FnOnce() -> Vec<StatLayer>,
+    f: Fields<'_>,
+) -> Settled {
     let id = egui::Id::unique(id);
     let mut out = Settled::default();
     let hint = tl!("Shift+Enter starts a new line.");
@@ -110,6 +223,10 @@ pub fn show(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, tokens: &[&
                 }
             }
         }
+        stat_menu(ui, &layers(), |token| {
+            f.text.push_str(&token);
+            out.text = true;
+        });
     });
     out.typing = r.has_focus() && !out.text;
     egui::Grid::new(id.with("style")).num_columns(2).min_col_width(LABEL_W).spacing(vec2(8.0, 6.0)).show(ui, |ui| {
@@ -184,6 +301,60 @@ pub fn show(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, tokens: &[&
         if let Some(w) = f.warning {
             ui.label("");
             ui.colored_label(ui.visuals().warn_fg_color, w);
+            ui.end_row();
+        }
+        if let Some(a) = f.valign {
+            let input_label = ui.label(tl!("Vertical alignment"));
+            egui::ComboBox::from_id_salt(id.with("valign"))
+                .selected_text(tl!(a.label()))
+                .show_ui(ui, |ui| {
+                    for v in TextVAlign::ALL {
+                        if ui.selectable_label(*a == v, tl!(v.label())).clicked() && *a != v {
+                            *a = v;
+                            out.valign = true;
+                        }
+                    }
+                })
+                .response
+                .labelled_by(input_label.id)
+                .on_hover_text(tl!("Where the lines sit down the box; a text taller than its box starts at its top"));
+            ui.end_row();
+        }
+        if let Some(ls) = f.line_spacing {
+            let input_label = ui.label(tl!("Line spacing"));
+            let saved = *ls;
+            let drag = Dragged::lend(ui, id.with("line_spacing"), ls);
+            let r = ui
+                .add(
+                    egui::DragValue::new(ls)
+                        .update_while_editing(false)
+                        .range(MIN_LINE_SPACING..=MAX_LINE_SPACING)
+                        .speed(0.01)
+                        .max_decimals(2)
+                        .suffix("×"),
+                )
+                .labelled_by(input_label.id)
+                .on_hover_text(tl!("The distance between lines, as a multiple of the usual"));
+            let now = *ls;
+            r.widget_info(|| egui::WidgetInfo { label: Some(tl!("Line spacing").to_string()), ..egui::WidgetInfo::drag_value(true, now) });
+            out.line_spacing = drag.settled(ui, &r, ls) && (*ls - saved).abs() > 1e-6;
+            ui.end_row();
+        }
+        if let Some(c) = f.case {
+            let input_label = ui.label(tl!("Case"));
+            egui::ComboBox::from_id_salt(id.with("case"))
+                .selected_text(tl!(c.label()))
+                .show_ui(ui, |ui| {
+                    for v in TextCase::ALL {
+                        if ui.selectable_label(*c == v, tl!(v.label())).clicked() && *c != v {
+                            *c = v;
+                            out.case = true;
+                        }
+                    }
+                })
+                .response
+                .labelled_by(input_label.id)
+                .on_hover_text(tl!("Drawn in upper or lower case once its dynamic text is filled in; the text is kept as typed"));
             ui.end_row();
         }
         if let Some(ls) = f.letter_spacing {
@@ -336,6 +507,14 @@ mod tests {
         wrap: bool,
         /// Whether wrapping is offered, as a layout text's form offers it.
         wraps: bool,
+        valign: TextVAlign,
+        line_spacing: f64,
+        case: TextCase,
+        /// Whether the vertical alignment, line spacing and case are offered, as a layout text's
+        /// form offers them.
+        blocks: bool,
+        /// The layers whose figures the text can show.
+        layers: Vec<StatLayer>,
         settled: Vec<&'static str>,
     }
 
@@ -343,11 +522,12 @@ mod tests {
         egui_kittest::Harness::builder().build_ui_state(
             |ui, f: &mut Form| {
                 // The numbers are lent saved and kept only once settled, as the pane's callers do.
-                let (mut size, mut spacing) = (f.size, f.letter_spacing);
+                let (mut size, mut spacing, mut lines) = (f.size, f.letter_spacing, f.line_spacing);
                 let s = show(
                     ui,
                     "form",
                     &[rustgis_engine::map::graphics::TOKENS, rustgis_engine::map::layout::PAGE_TOKENS],
+                    || f.layers.clone(),
                     Fields {
                         text: &mut f.text,
                         size: &mut size,
@@ -357,6 +537,9 @@ mod tests {
                         align: f.styled.then_some(&mut f.align),
                         wrap: f.wraps.then_some(&mut f.wrap),
                         warning: None,
+                        valign: f.blocks.then_some(&mut f.valign),
+                        line_spacing: f.blocks.then_some(&mut lines),
+                        case: f.blocks.then_some(&mut f.case),
                         letter_spacing: f.styled.then_some(&mut spacing),
                         font: None,
                         font_name: None,
@@ -372,6 +555,9 @@ mod tests {
                     (s.italic, "italic"),
                     (s.align, "align"),
                     (s.wrap, "wrap"),
+                    (s.valign, "valign"),
+                    (s.line_spacing, "lineSpacing"),
+                    (s.case, "case"),
                     (s.letter_spacing, "letterSpacing"),
                 ] {
                     if on {
@@ -383,6 +569,9 @@ mod tests {
                 }
                 if s.letter_spacing {
                     f.letter_spacing = spacing;
+                }
+                if s.line_spacing {
+                    f.line_spacing = lines;
                 }
             },
             form,
@@ -404,6 +593,85 @@ mod tests {
         }
         assert_eq!(h.state().settled, ["text", "text"]);
         assert!(h.query_by_label("Page number  {page}").is_none(), "the menu closes");
+    }
+
+    /// The layers offered are those of the first frame's map, with their numeric fields; a raster
+    /// layer, a graphics layer and a name a token can't hold are left out (#3036).
+    #[test]
+    fn the_layers_offered_are_the_first_frames_with_their_numeric_fields() {
+        use rustgis_engine::data::{Dataset, Field, FieldType, GeometryType};
+        use rustgis_engine::map::{
+            Map,
+            layout::{ElementKind, Layout},
+        };
+        let layer = |name: &str, fields: Vec<(&str, FieldType)>| {
+            Dataset::new(name, GeometryType::None, fields.into_iter().map(|(n, t)| Field::new(n, t)).collect())
+        };
+        let mut map = Map::new("Main");
+        // A token reads the first layer of a name, case aside, so one under it is not offered
+        // (a layer is added above the others).
+        map.add_dataset(layer("Under", vec![("other", FieldType::Double)]));
+        map.add_dataset(layer(
+            "Cities",
+            vec![
+                ("pop", FieldType::Double),
+                ("name", FieldType::Text),
+                ("a:b", FieldType::Double),
+                // A token reads the first field of a name, case aside: neither of these is offered.
+                ("Pop", FieldType::Double),
+                ("Name", FieldType::Double),
+            ],
+        ));
+        map.add_dataset(layer("Bad {name}", vec![("x", FieldType::Double)]));
+        map.layers.iter_mut().find(|l| l.name == "Under").unwrap_or_else(|| panic!("a layer")).name = "cities".into();
+        let mut other = Map::new("Other");
+        other.add_dataset(layer("Rivers", vec![("km", FieldType::Double)]));
+        let mut layout = Layout::new("L", 100.0, 100.0);
+        assert_eq!(StatLayer::of(&layout, &[map.clone(), other.clone()]), Vec::new(), "no frame, no layers");
+        let frame = |m: &str| -> ElementKind {
+            serde_json::from_value(serde_json::json!({"MapFrame": {"map": m, "center": {"x": 0, "y": 0}, "scale": 1000000}}))
+                .unwrap_or_else(|e| panic!("{e}"))
+        };
+        layout.add("Frame", (0.0, 0.0, 50.0, 50.0), frame("main"));
+        assert_eq!(
+            StatLayer::of(&layout, &[map.clone(), other.clone()]),
+            [StatLayer { name: "Cities".into(), fields: vec!["pop".into()] }]
+        );
+        assert_eq!(StatLayer::of_map(&map), StatLayer::of(&layout, std::slice::from_ref(&map)), "a map's own");
+        let mut second = Layout::new("L2", 100.0, 100.0);
+        second.add("Frame", (0.0, 0.0, 50.0, 50.0), frame("Other"));
+        assert_eq!(StatLayer::of(&second, &[map, other]), [StatLayer { name: "Rivers".into(), fields: vec!["km".into()] }]);
+    }
+
+    /// A layer statistic is added from a submenu per layer, a count and the four figures of each
+    /// numeric field (#3036); a text with no layers to read has no such section.
+    #[test]
+    fn a_layer_statistic_is_added_from_its_layers_submenu() {
+        let cities = StatLayer { name: "Cities".into(), fields: vec!["pop".into(), "area".into()] };
+        let mut h = harness(Form { text: "".into(), size: 12.0, layers: vec![cities], ..Form::default() });
+        h.run();
+        for (path, text) in [
+            (&["Cities", "Count  {count:Cities}"][..], "{count:Cities}"),
+            (&["Cities", "pop", "Sum  {sum:Cities:pop}"][..], "{count:Cities}{sum:Cities:pop}"),
+            (&["Cities", "area", "Greatest  {max:Cities:area}"][..], "{count:Cities}{sum:Cities:pop}{max:Cities:area}"),
+        ] {
+            h.get_by_label("Insert Dynamic Text").click();
+            h.run();
+            h.get_by_label("Layer statistic").click();
+            h.run();
+            for step in path {
+                h.get_by_label(step).click();
+                h.run();
+            }
+            assert_eq!(h.state().text, text);
+        }
+        assert_eq!(h.state().settled, ["text", "text", "text"]);
+        assert!(h.query_by_label("Layer statistic").is_none(), "the menu closes");
+        let mut none = harness(Form { text: "T".into(), size: 12.0, ..Form::default() });
+        none.run();
+        none.get_by_label("Insert Dynamic Text").click();
+        none.run();
+        assert!(none.query_by_label("Layer statistic").is_none(), "no layers, no section");
     }
 
     /// Colour and boldness show only where the text has them; the size stays in the one range
@@ -459,11 +727,40 @@ mod tests {
         assert_eq!(h.state().settled, ["italic"]);
     }
 
+    /// A layout text's Vertical alignment, Line spacing and Case show only where they are lent (not
+    /// on a text graphic); picking another item settles it, picking the current one doesn't.
+    #[test]
+    fn block_rows_show_only_when_lent_and_are_settled() {
+        let mut h = harness(Form { text: "T".into(), size: 12.0, styled: true, line_spacing: 1.0, ..Form::default() });
+        h.run();
+        for name in ["Vertical alignment", "Line spacing", "Case"] {
+            assert!(h.query_by_label(name).is_none(), "{name} offered unlent");
+        }
+        let mut h = harness(Form { text: "T".into(), size: 12.0, styled: true, blocks: true, line_spacing: 1.0, ..Form::default() });
+        h.run();
+        h.get_by_role_and_label(Role::ComboBox, "Vertical alignment").click();
+        h.run();
+        h.get_by_label("Top").click();
+        h.run();
+        assert!(h.state().settled.is_empty(), "the current item settles nothing");
+        h.get_by_role_and_label(Role::ComboBox, "Vertical alignment").click();
+        h.run();
+        h.get_by_label("Bottom").click();
+        h.run();
+        h.get_by_role_and_label(Role::ComboBox, "Case").click();
+        h.run();
+        h.get_by_label("Upper case").click();
+        h.run();
+        assert_eq!((h.state().valign, h.state().case), (TextVAlign::Bottom, TextCase::Upper));
+        assert_eq!(h.state().settled, ["valign", "case"]);
+        assert!(h.query_by_role_and_label(Role::SpinButton, "Line spacing").is_some());
+    }
+
     /// A number dragged and let go keeps the dragged value, though the caller lends the saved one
     /// each frame and egui forgets the dragged one on release (it used to end where it started).
     #[test]
     fn a_dragged_number_is_kept_when_let_go() {
-        let mut h = harness(Form { text: "T".into(), size: 12.0, styled: true, ..Form::default() });
+        let mut h = harness(Form { text: "T".into(), size: 12.0, styled: true, blocks: true, line_spacing: 1.0, ..Form::default() });
         h.run();
         let button = |pos, pressed| egui::Event::PointerButton {
             pos,
@@ -471,7 +768,7 @@ mod tests {
             pressed,
             modifiers: egui::Modifiers::NONE,
         };
-        for (name, what) in [("Letter spacing", "letterSpacing"), ("Size", "size")] {
+        for (name, what) in [("Letter spacing", "letterSpacing"), ("Line spacing", "lineSpacing"), ("Size", "size")] {
             let at = h.get_by_role_and_label(Role::SpinButton, name).rect().center();
             h.event(egui::Event::PointerMoved(at));
             h.step();
@@ -487,7 +784,7 @@ mod tests {
             h.run();
             assert_eq!(h.state().settled.iter().filter(|s| **s == what).count(), 1, "{name}: settled {:?}", h.state().settled);
         }
-        let (spacing, size) = (h.state().letter_spacing, h.state().size);
-        assert!(spacing > 1.0 && size > 14.0, "kept: spacing {spacing}, size {size}");
+        let (spacing, lines, size) = (h.state().letter_spacing, h.state().line_spacing, h.state().size);
+        assert!(spacing > 1.0 && lines > 1.1 && size > 14.0, "kept: spacing {spacing}, line spacing {lines}, size {size}");
     }
 }

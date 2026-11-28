@@ -1,5 +1,7 @@
 //! Analyze tab: run geoprocessing tools and keep their history.
 
+use std::sync::Arc;
+
 use rustgis_analysis::{Inputs, Output, OutputLayer, RasterInput};
 use rustgis_data::Dataset;
 use rustgis_data::loss::{LossCode, LossMessage};
@@ -395,7 +397,15 @@ pub fn external_start(s: &mut Session, tool: &str, params: &Value) -> Result<Ext
             return Err(format!("no GeoLibre tool '{tool}'"));
         }
         let params = params.clone();
-        let job = preparing(&continuation, || pin.prepare_suite(&map_inputs(s, Some(spec), &params)?, &params))?;
+        let (job, said, lost) = preparing(&continuation, || {
+            let inputs = map_inputs(s, Some(spec), &params, Tiled::ByPath)?;
+            Ok((pin.prepare_suite(&inputs, &params)?, inputs.messages.clone(), inputs.losses.clone()))
+        })?;
+        // What reading its inputs approximated or lost, said now, as a plugin tool's are.
+        if !said.is_empty() {
+            s.notify(format!("{}: {}", spec.name, said.join("; ")), false);
+        }
+        say_input_losses(s, spec.name, lost);
         s.next_pending = s.next_pending.wrapping_add(1);
         let id = s.next_pending;
         let run = ExternalRun {
@@ -479,8 +489,11 @@ impl PluginRun {
     pub fn run(&self, control: &rustgis_plugins::tools::Control) -> Result<rustgis_analysis::ToolResult, String> {
         self.continuation.check()?;
         // A bug in a tool must not take the app down.
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.job.run(control)))
-            .unwrap_or_else(|_| Err(format!("{} failed unexpectedly", self.job.name())))
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.job.run(control))).unwrap_or_else(|payload| {
+            // A bug in a tool run in the background: said as one, with its reference.
+            let incident = rustgis_data::incident::caught(payload.as_ref());
+            Err(rustgis_data::incident::message(self.job.name(), false, &incident.id))
+        })
     }
 }
 
@@ -534,14 +547,21 @@ pub fn plugin_start(s: &mut Session, tool: &str, params: &Value) -> Result<Plugi
     let spec = pin.spec();
     let plugin = pin.plugin().ok_or_else(|| format!("no plugin tool '{tool}'"))?;
     let (_, tid) = rustgis_plugins::split_id(spec.id).ok_or("invalid plugin tool id")?;
-    let (job, full_ids) = preparing(&continuation, || {
-        let inputs = map_inputs(s, Some(spec), resolved)?;
+    let (job, full_ids, said, lost) = preparing(&continuation, || {
+        let inputs = map_inputs(s, Some(spec), resolved, Tiled::Overview)?;
         let job = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             rustgis_plugins::tools::prepare_pinned(plugin.plugin(), tid, &inputs, resolved)
         }))
-        .unwrap_or_else(|_| Err(format!("{} failed unexpectedly", spec.name)))?;
-        Ok((job, full_ids(&inputs.loaded)))
+        .unwrap_or_else(|payload| Err(crate::bug(spec.name, payload.as_ref())))?;
+        Ok((job, full_ids(&inputs.loaded), inputs.messages.clone(), inputs.losses.clone()))
     })?;
+    // What reading its inputs approximated (a raster's overview read for a file read in place),
+    // said now: the run's result is the plugin's own.
+    if !said.is_empty() {
+        s.notify(format!("{}: {}", spec.name, said.join("; ")), false);
+    }
+    // What reading its inputs lost (a layer's rows or geometry left out), as a loss with its code.
+    say_input_losses(s, spec.name, lost);
     let read = read_layers(s, spec, resolved);
     s.next_pending = s.next_pending.wrapping_add(1);
     let id = s.next_pending;
@@ -710,7 +730,7 @@ impl ToolRun {
         // A bug in reading the inputs, like one in a tool, must not take the app down.
         let mut done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             crate::render::rustgis_tiles::cache::with_still(still, || {
-                let inputs = match inputs_of(snap, Some(spec), &params) {
+                let inputs = match inputs_of(snap, Some(spec), &params, tiled_for(&pin)) {
                     Ok(inputs) => inputs,
                     // A Cancel while the inputs are read names the tool, as one while it runs does.
                     Err(_) if control.is_cancelled() => {
@@ -730,9 +750,9 @@ impl ToolRun {
                 ToolDone { inputs: Vec::new(), result, full_ids: full_ids(&inputs.loaded) }
             })
         }))
-        .unwrap_or_else(|_| ToolDone {
+        .unwrap_or_else(|payload| ToolDone {
             inputs: Vec::new(),
-            result: Err(format!("{name} failed unexpectedly")),
+            result: Err(crate::bug(name, payload.as_ref())),
             full_ids: FullIds::new(),
         });
         done.inputs = captured.as_ref().map_or_else(Vec::new, rustgis_data::provenance::Capture::inputs);
@@ -1312,6 +1332,10 @@ struct MapInputs<'a> {
     /// Streamed layers the tool reads, loaded whole, and copies of layers in another system than
     /// the one it works in, converted ([`work_inputs`]), by lowercase name.
     loaded: std::collections::HashMap<String, Dataset>,
+    /// The layers read whole for the run (streamed ones) with features read without their
+    /// geometry, a place of theirs having none in longitude/latitude: an update of one is refused,
+    /// as the map holds only its window, where such a feature's stored geometry may not be.
+    left_out_whole: std::collections::HashSet<String>,
     /// The system the tool works in ([`work_system`]): the one its inputs are given in and its
     /// outputs are made in.
     work: Crs,
@@ -1321,6 +1345,11 @@ struct MapInputs<'a> {
     /// Import warnings from local file inputs, kept in the tool result and history.
     messages: Vec<String>,
     losses: Vec<LossMessage>,
+    /// Raster layers read in place from a file on this computer, read again from it for the run
+    /// ([`tiled_inputs`]), by lowercase name.
+    rasters: std::collections::HashMap<String, std::sync::Arc<rustgis_data::raster::Raster>>,
+    /// [`MapInputs::rasters`] counted as held while the run holds them (kept only to be dropped).
+    _held: Vec<std::sync::Arc<rustgis_data::memory::Holding>>,
     /// The flat map's projection (its name, the projection and its unit in metres), built the
     /// first time a tool asks for it (Tissot's indicatrix does), once for the run; `None` on the
     /// globe.
@@ -1339,6 +1368,15 @@ impl MapInputs<'_> {
     /// the project is; one with a place it can't hold stays in longitude/latitude, said. Tables
     /// have no coordinates to hold.
     fn hold_results(&self, result: &mut rustgis_analysis::ToolResult) -> Result<(), String> {
+        // An update writes back into the window the map holds of a streamed layer, which may not
+        // have the stored geometry of a feature read without it: refused, rather than lost.
+        if let Output::Update { layer, .. } = &result.output
+            && self.left_out_whole.contains(&layer.to_ascii_lowercase())
+        {
+            return Err(format!(
+                "{layer} is read in place and has features with a place that can't be given in longitude/latitude, which an update would lose: Load All Features (layer.loadAll) before a tool updates it"
+            ));
+        }
         // A geocentric system holds no map coordinates: outputs stay in longitude/latitude then.
         let project = self.snap.project.filter(|c| *c != Crs::LonLat && !c.is_geocentric());
         if self.work == Crs::LonLat && project.is_none() {
@@ -1414,14 +1452,50 @@ impl MapInputs<'_> {
     }
 }
 
-fn map_inputs<'a>(s: &'a Session, spec: Option<&rustgis_analysis::ToolSpec>, params: &Value) -> Result<MapInputs<'a>, String> {
-    inputs_of(Snapshot::of(s), spec, params)
+/// How a tool's inputs read a raster layer read in place from a file on this computer
+/// ([`rustgis_map::raster::RasterLayer::tiled`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tiled {
+    /// From the file, at the finest level the run can hold ([`tiled_inputs`]): a built-in tool's
+    /// run, on its own thread or where the caller waits.
+    File,
+    /// The overview the layer holds, said: a plugin's run, whose inputs are read on the app's
+    /// thread.
+    Overview,
+    /// By its path: a suite tool stages the file itself.
+    ByPath,
+}
+
+/// How a run of `pin` reads a raster read in place from a file ([`Tiled`]): a plugin reads the
+/// overview the layer holds, a suite tool stages the file by its path, a built-in tool reads it.
+fn tiled_for(pin: &crate::policy::ToolPin) -> Tiled {
+    #[cfg(feature = "geolibre")]
+    if pin.resolved().source() == Some(rustgis_geolibre::SOURCE) {
+        return Tiled::ByPath;
+    }
+    if pin.plugin().is_some() { Tiled::Overview } else { Tiled::File }
+}
+
+/// [`inputs_of`] from the session as it is; `tiled` as there.
+fn map_inputs<'a>(
+    s: &'a Session,
+    spec: Option<&rustgis_analysis::ToolSpec>,
+    params: &Value,
+    tiled: Tiled,
+) -> Result<MapInputs<'a>, String> {
+    inputs_of(Snapshot::of(s), spec, params, tiled)
 }
 
 /// A tool's inputs from what it read of the session: the streamed layers and files it names read
 /// whole, and the rows of each layer it runs on. It reads, so a background run does this on its
-/// thread.
-fn inputs_of<'a>(snap: Snapshot<'a>, spec: Option<&rustgis_analysis::ToolSpec>, params: &Value) -> Result<MapInputs<'a>, String> {
+/// thread. `tiled` says how the raster layers it reads that are read in place from a file on this
+/// computer are read ([`Tiled`]).
+fn inputs_of<'a>(
+    snap: Snapshot<'a>,
+    spec: Option<&rustgis_analysis::ToolSpec>,
+    params: &Value,
+    tiled: Tiled,
+) -> Result<MapInputs<'a>, String> {
     let (full, said) = streamed_inputs(&snap.map, spec, params)?;
     let (mut messages, mut losses) = (Vec::new(), Vec::new());
     for m in said {
@@ -1448,21 +1522,364 @@ fn inputs_of<'a>(snap: Snapshot<'a>, spec: Option<&rustgis_analysis::ToolSpec>, 
             }
         }
     }
-    let work = work_inputs(&snap.map, &snap.tables, spec, params, &mut full, &mut messages)?;
+    let mut left_out_whole = std::collections::HashSet::new();
+    let work = work_inputs(&snap.map, &snap.tables, spec, params, &mut full, &mut messages, &mut losses, &mut left_out_whole)?;
     let mut rows = env_inputs(&snap.map, &full, &snap.env, params)?;
     narrow_to_queries(&snap.map, spec, params, &full, &mut rows, &mut messages)?;
     let unread = if work == Crs::LonLat { std::collections::HashSet::new() } else { attributes_only(spec, params) };
+    #[cfg(not(target_arch = "wasm32"))]
+    let mut held = Vec::new();
+    #[cfg(not(target_arch = "wasm32"))]
+    let rasters = tiled_inputs(&snap.map, spec, params, tiled, &mut messages, &mut held)?;
+    #[cfg(target_arch = "wasm32")]
+    let (rasters, held) = {
+        let _ = tiled;
+        (std::collections::HashMap::new(), Vec::new())
+    };
     Ok(MapInputs {
         snap,
         rows,
         loaded: full,
         work,
+        left_out_whole,
         unread,
         messages,
         losses,
+        rasters,
+        _held: held,
         flat: std::cell::OnceCell::new(),
         view: std::cell::OnceCell::new(),
     })
+}
+
+/// The raster layers `spec`'s parameters name that are read in place from a file on this
+/// computer ([`rustgis_map::raster::RasterLayer::tiled`]), each read again from the file for the
+/// run, by lowercase name: such a layer holds only the small overview the map draws from zoomed
+/// out, and a tool reads the finest level of the file it can hold, the full image when it fits
+/// (#2761). Read on the run's thread; one read from an overview is said. The GeoTIFF reader looks
+/// at Cancel between its chunks through the progress probe, which a run from [`tool_start`]
+/// installs before reading its inputs; a run made where the caller waits stops there only when
+/// the caller installed one, else after the read.
+/// Read only for [`Tiled::File`]: for [`Tiled::Overview`] each such layer's held overview is said,
+/// and for [`Tiled::ByPath`] nothing is read or said, but a file no longer there is refused.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn tiled_inputs(
+    map: &rustgis_map::Map,
+    spec: Option<&rustgis_analysis::ToolSpec>,
+    params: &Value,
+    tiled: Tiled,
+    messages: &mut Vec<String>,
+    held: &mut Vec<std::sync::Arc<rustgis_data::memory::Holding>>,
+) -> Result<std::collections::HashMap<String, std::sync::Arc<rustgis_data::raster::Raster>>, String> {
+    use rustgis_analysis::ParamKind;
+    let mut read = std::collections::HashMap::new();
+    // Raster to PMTiles draws its input as the map does, in place at each zoom's level, and
+    // reads no pixels through the run's inputs.
+    let Some(spec) = spec.filter(|t| t.id != "rasterToPmtiles") else { return Ok(read) };
+    let mut seen = std::collections::HashSet::new();
+    let (mut said, mut held_overviews) = (Vec::new(), Vec::new());
+    for parameter in spec.params {
+        let value = params.get(parameter.name).unwrap_or(&Value::Null);
+        let names: Vec<&str> = match parameter.kind {
+            // A name, or (as a suite tool may take it) an array of names.
+            ParamKind::RasterLayer => match value {
+                Value::Array(v) => v.iter().filter_map(Value::as_str).collect(),
+                v => v.as_str().into_iter().collect(),
+            },
+            ParamKind::RasterLayers => rustgis_analysis::layer_list(value).unwrap_or_default(),
+            // A suite tool stages any input layer or path a parameter names, not what it writes.
+            ParamKind::Layer
+            | ParamKind::PolygonLayer
+            | ParamKind::PointLayer
+            | ParamKind::VectorLayer
+            | ParamKind::VectorLayers
+            | ParamKind::Path
+                if tiled == Tiled::ByPath =>
+            {
+                match value {
+                    Value::String(t) => t.split(';').map(str::trim).collect(),
+                    Value::Array(v) => v.iter().filter_map(Value::as_str).collect(),
+                    _ => continue,
+                }
+            }
+            _ => continue,
+        };
+        for name in names {
+            let Some(l) = map.layer_by_name(name) else { continue };
+            let key = l.name.to_ascii_lowercase();
+            let Some(path) = l.raster.as_ref().filter(|rl| rl.tiled).and_then(|rl| rl.path.as_deref()) else { continue };
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            // A suite tool stages the file by its path: one no longer there would have it stage
+            // the overview the layer holds instead, so it is refused.
+            if tiled == Tiled::ByPath {
+                if !std::path::Path::new(path).is_file() {
+                    return Err(format!("{}: its file {path} is no longer there: Reload Data or Repair Data Source first", l.name));
+                }
+                continue;
+            }
+            if tiled == Tiled::Overview {
+                if let Some(held) = l.raster.as_ref().and_then(|rl| rl.data.as_ref())
+                    && let Some((fw, fh)) = held.overview
+                {
+                    held_overviews
+                        .push(format!("{} at the {} × {} overview of the {fw} × {fh} raster it holds", l.name, held.width, held.height));
+                }
+                continue;
+            }
+            let (r, count) = read_tiled(&l.name, path)?;
+            held.push(count);
+            said.push(ReadNote::of(&l.name, &r));
+            read.insert(key, r);
+        }
+    }
+    // Said once for the run, every raster named.
+    if !held_overviews.is_empty() {
+        messages.push(format!(
+            "read as the layer holds it, as plugin tools don't read a raster read in place from its file: {}",
+            held_overviews.join("; ")
+        ));
+    }
+    messages.extend(tiled_read_notes(&said, "the tool's"));
+    Ok(read)
+}
+
+/// `part` of the raster file read in place at `path` (layer `name`'s, which holds `held`), read
+/// from the file at the finest level whose part fits `1 / share` of what a run can hold, in its
+/// turn ([`tiled_turn`]), with its count in [`rustgis_data::memory::held`]; `None` when the file
+/// can't be read by part, or is no longer the revision `held` was read from (read it whole with
+/// [`read_tiled`]). Never kept for a batch: another item's part is another part.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn read_tiled_part(
+    name: &str,
+    path: &str,
+    part: rustgis_data::raster::Part,
+    share: usize,
+    held: &rustgis_data::raster::Raster,
+) -> Result<Option<(rustgis_data::raster::PartRead, std::sync::Arc<rustgis_data::memory::Holding>)>, String> {
+    let _turn = tiled_turn().map_err(|e| format!("{name}: {e}"))?;
+    // Planned in its turn, with what the reads before it hold counted.
+    let max = rustgis_data::raster::max_samples() / share.max(1);
+    #[cfg(test)]
+    let max = PART_SAMPLES.with(std::cell::Cell::get).unwrap_or(max);
+    let read =
+        rustgis_data::raster::read_path_part(std::path::Path::new(path), part, max, Some(held)).map_err(|e| format!("{name}: {e}"))?;
+    let Some(read) = read else { return Ok(None) };
+    let bytes: usize = read.raster.bands.iter().map(|b| b.data.len().saturating_mul(4)).sum();
+    Ok(Some((read, std::sync::Arc::new(rustgis_data::memory::Holding::of(bytes as u64)))))
+}
+
+/// What a run says of a raster file read in place it read again from its file ([`read_tiled`]):
+/// its layer's name, how many of its values were rounded as it was read, and, read coarser than
+/// the file, the level's size and the file's, and for a part of the file
+/// ([`read_tiled_part`]) the part's size at that level.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone)]
+pub(crate) struct ReadNote {
+    name: String,
+    rounded: u64,
+    overview: Option<((u32, u32), (u32, u32))>,
+    part: Option<(u32, u32)>,
+    /// The count of values rounded is at most `rounded`: some were read twice or more.
+    at_most: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl ReadNote {
+    pub(crate) fn of(name: &str, r: &rustgis_data::raster::Raster) -> ReadNote {
+        let overview = r.overview.map(|full| ((r.width, r.height), full));
+        ReadNote { name: name.to_string(), rounded: r.rounded.iter().sum(), overview, part: None, at_most: false }
+    }
+
+    /// Of a part of a file ([`read_tiled_part`]): read from a level `level` pixels in size of the
+    /// file's `full` image.
+    pub(crate) fn of_part(name: &str, r: &rustgis_data::raster::Raster, level: (u32, u32), full: (u32, u32)) -> ReadNote {
+        let overview = r.overview.map(|_| (level, full));
+        ReadNote { name: name.to_string(), rounded: r.rounded.iter().sum(), overview, part: Some((r.width, r.height)), at_most: false }
+    }
+
+    /// Of a file read at its full size in pieces, `rounded` of its values rounded as they were.
+    pub(crate) fn rounded(name: &str, rounded: u64) -> ReadNote {
+        ReadNote { name: name.to_string(), rounded, overview: None, part: None, at_most: false }
+    }
+
+    /// Its count of values rounded is at most the one said when `at_most`: a block read with a
+    /// margin reads some values twice.
+    pub(crate) fn at_most(mut self, at_most: bool) -> ReadNote {
+        self.at_most = at_most;
+        self
+    }
+}
+
+/// What a run says of the raster files read in place it read again from their file
+/// ([`read_tiled`]): one notice of each kind, naming each raster. `whose` says whose results are
+/// built on values rounded as they were read.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn tiled_read_notes(read: &[ReadNote], whose: &str) -> Vec<String> {
+    let (mut rounded, mut overviews) = (Vec::new(), Vec::new());
+    for ReadNote { name, rounded: n, overview, part, at_most } in read {
+        if *n > 0 {
+            rounded.push(if *at_most { format!("{name} at most {n}") } else { format!("{name} {n}") });
+        }
+        if let Some(((w, h), (fw, fh))) = overview {
+            let part = part.map_or_else(String::new, |(pw, ph)| format!(", a {pw} × {ph} part of it"));
+            overviews.push(format!("{name} at its {w} × {h} overview of the {fw} × {fh} raster{part}"));
+        }
+    }
+    let mut notes = Vec::new();
+    if !rounded.is_empty() {
+        notes.push(format!(
+            "values rounded to 32-bit floats as the file was read for the run, {whose} results built on them: {}",
+            rounded.join("; ")
+        ));
+    }
+    if !overviews.is_empty() {
+        notes.push(format!("read at the finest level each can hold: {}", overviews.join("; ")));
+    }
+    notes
+}
+
+/// The raster file read in place at `path` (layer `name`'s), read again from the file at the
+/// finest level the run can hold, with its count in [`rustgis_data::memory::held`]: a batch's
+/// read of it while the file is unchanged ([`BATCH_READS`]), else read now, in its turn
+/// ([`tiled_turn`]). The GeoTIFF reader looks at Cancel between its chunks through the progress
+/// probe the run installed.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn read_tiled(
+    name: &str,
+    path: &str,
+) -> Result<(std::sync::Arc<rustgis_data::raster::Raster>, std::sync::Arc<rustgis_data::memory::Holding>), String> {
+    // A batch's read is used again only while the file is the revision it was read at.
+    let revision = file_revisions(std::path::Path::new(path));
+    let kept = BATCH_READS.with(|b| b.borrow().as_ref().and_then(|reads| reads.get(path).cloned()));
+    let (r, count) = match kept.filter(|(.., at)| revision.is_some() && *at == revision) {
+        Some((r, count, _)) => (r, count),
+        None => {
+            #[cfg(test)]
+            TILED_READS.with(|n| n.set(n.get() + 1));
+            // The last file a batch read alone: let go before another is read, so a batch over
+            // several files holds one, and doesn't hold it uncounted while the next is planned.
+            BATCH_READS.with(|b| {
+                if let Some(reads) = b.borrow_mut().as_mut() {
+                    reads.clear();
+                }
+            });
+            let _turn = tiled_turn().map_err(|e| format!("{name}: {e}"))?;
+            let r = std::sync::Arc::new(
+                rustgis_data::raster::read_path_with(std::path::Path::new(path), None, None).map_err(|e| format!("{name}: {e}"))?,
+            );
+            // Counted as held from before the next run's turn, for as long as anything (this
+            // run, the batch) holds it.
+            let bytes: usize = r.bands.iter().map(|b| b.data.len().saturating_mul(4)).sum();
+            let count = std::sync::Arc::new(rustgis_data::memory::Holding::of(bytes as u64));
+            BATCH_READS.with(|b| {
+                if let Some(reads) = b.borrow_mut().as_mut() {
+                    reads.insert(path.to_string(), (r.clone(), count.clone(), revision.clone()));
+                }
+            });
+            (r, count)
+        }
+    };
+    Ok((r, count))
+}
+
+/// A raster file read in place for a run, its count in [`rustgis_data::memory::held`], which lasts
+/// as long as anything holds it, and the revision of the file taken before it was read (a batch
+/// uses it again only while the file is still that revision).
+#[cfg(not(target_arch = "wasm32"))]
+type CountedRead = (
+    std::sync::Arc<rustgis_data::raster::Raster>,
+    std::sync::Arc<rustgis_data::memory::Holding>,
+    Option<[Option<rustgis_data::raster::FileRevision>; 3]>,
+);
+
+/// The revisions of a raster file and of the sidecars its whole-file read applies (its
+/// `.aux.xml`, a world file): a batch's read of it is used again only while none has changed, or
+/// been added or removed. `None` when the file's own can't be read.
+#[cfg(not(target_arch = "wasm32"))]
+fn file_revisions(path: &std::path::Path) -> Option<[Option<rustgis_data::raster::FileRevision>; 3]> {
+    use rustgis_data::raster::{FileRevision, world};
+    let own = FileRevision::of(path)?;
+    let mut aux = path.as_os_str().to_owned();
+    aux.push(".aux.xml");
+    let world = world::beside(path).and_then(|(p, _)| FileRevision::of(&p));
+    Some([Some(own), FileRevision::of(std::path::Path::new(&aux)), world])
+}
+
+/// Taken by each read of a raster file read in place for a run ([`tiled_inputs`]): such reads
+/// run one at a time across runs, so each plans its size with the ones before it held.
+#[cfg(not(target_arch = "wasm32"))]
+static TILED_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// [`TILED_TURN`], waited for while another run reads, looking at the run's Cancel every 50 ms
+/// (through the progress probe it installed).
+#[cfg(not(target_arch = "wasm32"))]
+fn tiled_turn() -> rustgis_data::Result<std::sync::MutexGuard<'static, ()>> {
+    loop {
+        match TILED_TURN.try_lock() {
+            Ok(turn) => return Ok(turn),
+            Err(std::sync::TryLockError::Poisoned(e)) => return Ok(e.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                rustgis_data::progress::check()?;
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+thread_local! {
+    /// The raster file read in place that a batch's items last read ([`tiled_inputs`]), by path,
+    /// kept while the batch runs on this thread ([`BatchReads`]): items reading the same file read
+    /// it once, not once an item, and a batch over several files holds one at a time. `None`
+    /// outside a batch, where nothing is kept past the run.
+    static BATCH_READS: std::cell::RefCell<Option<std::collections::HashMap<String, CountedRead>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+thread_local! {
+    /// How many raster files read in place [`tiled_inputs`] has read from their file on this
+    /// thread, under test.
+    pub(crate) static TILED_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The most samples [`read_tiled_part`] reads of a part on this thread, under test: no small
+    /// fixture reaches the real limit.
+    pub(crate) static PART_SAMPLES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether a batch's reads are kept on this thread now ([`BATCH_READS`]), under test.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) fn batch_reads_kept() -> bool {
+    BATCH_READS.with(|b| b.borrow().is_some())
+}
+
+/// Keeps [`BATCH_READS`] while it lives: the outermost batch on this thread starts it and lets
+/// it go, so a file it read is held only as long as the batch runs.
+#[cfg(not(target_arch = "wasm32"))]
+struct BatchReads(bool);
+
+#[cfg(not(target_arch = "wasm32"))]
+impl BatchReads {
+    fn start() -> BatchReads {
+        BatchReads(BATCH_READS.with(|b| {
+            let mut b = b.borrow_mut();
+            let outer = b.is_none();
+            if outer {
+                *b = Some(std::collections::HashMap::new());
+            }
+            outer
+        }))
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for BatchReads {
+    fn drop(&mut self) {
+        if self.0 {
+            BATCH_READS.with(|b| *b.borrow_mut() = None);
+        }
+    }
 }
 
 /// Narrows the rows a tool reads of each layer to the features its definition query keeps, as the
@@ -1645,7 +2062,8 @@ fn attributes_only(spec: Option<&rustgis_analysis::ToolSpec>, params: &Value) ->
 /// its first input's own for a tool that works in it, every other input converted into it; else
 /// longitude/latitude. An input with a place that system can't hold has the run work in
 /// longitude/latitude instead, and a message says so (the conversions made for the first attempt
-/// are dropped then, and the inputs read again in longitude/latitude). Returns the system.
+/// are dropped then, and the inputs read again in longitude/latitude, a feature with a place
+/// that has none there either read without its geometry, [`inputs_in`]). Returns the system.
 fn work_inputs(
     map: &rustgis_map::Map,
     tables: &[crate::project::Table],
@@ -1653,31 +2071,45 @@ fn work_inputs(
     params: &Value,
     full: &mut std::collections::HashMap<String, Dataset>,
     messages: &mut Vec<String>,
+    losses: &mut Vec<LossMessage>,
+    left_out_whole: &mut std::collections::HashSet<String>,
 ) -> Result<Crs, String> {
+    // A loss with its code; the rest as messages.
+    let mut say = |said: Vec<rustgis_data::loss::Note>| {
+        for note in said {
+            match note.loss {
+                Some(code) => losses.push(LossMessage { code, text: note.text }),
+                None => messages.push(note.text),
+            }
+        }
+    };
     let work = work_system(map, spec, params, full);
     if work != Crs::LonLat {
-        match inputs_in(map, tables, spec, params, full, work) {
+        match inputs_in(map, tables, spec, params, full, work, left_out_whole) {
             Ok((converted, said)) => {
                 full.extend(converted);
-                messages.extend(said);
+                say(said);
                 return Ok(work);
             }
             Err(e) => {
                 // A Cancel isn't a place that can't be held.
                 rustgis_data::progress::check().map_err(|e| e.to_string())?;
                 let name = spec.map_or("The tool", |t| t.name);
-                messages.push(format!("{name} worked in longitude/latitude, not {}: {e}", work.label()));
+                say(vec![rustgis_data::loss::Note::plain(format!("{name} worked in longitude/latitude, not {}: {e}", work.label()))]);
             }
         }
     }
-    let (converted, _) = inputs_in(map, tables, spec, params, full, Crs::LonLat)?;
+    let (converted, said) = inputs_in(map, tables, spec, params, full, Crs::LonLat, left_out_whole)?;
     full.extend(converted);
+    say(said);
     Ok(Crs::LonLat)
 }
 
 /// Copies of the layers a tool reads converted into `work`, by lowercase name: those read whole
 /// (streamed layers, files) and each other layer or standalone table with geometry it names whose
-/// coordinates are in another system. Nothing is copied for a layer already in `work`.
+/// coordinates are in another system. Nothing is copied for a layer already in `work`. In
+/// longitude/latitude, a feature with a place that can't be given there is read without its
+/// geometry, and one notice says how many of each layer were.
 fn inputs_in(
     map: &rustgis_map::Map,
     tables: &[crate::project::Table],
@@ -1685,7 +2117,8 @@ fn inputs_in(
     params: &Value,
     full: &std::collections::HashMap<String, Dataset>,
     work: Crs,
-) -> Result<(std::collections::HashMap<String, Dataset>, Vec<String>), String> {
+    left_out_whole: &mut std::collections::HashSet<String>,
+) -> Result<(std::collections::HashMap<String, Dataset>, Vec<rustgis_data::loss::Note>), String> {
     let mut converted = std::collections::HashMap::new();
     // The converted inputs with edges that bend ([`bent_edges`]): name, how many, how far.
     let mut bent: Vec<(String, usize, f64)> = Vec::new();
@@ -1699,6 +2132,27 @@ fn inputs_in(
         }
         Ok(())
     };
+    // The inputs with features read without their geometry, a place of theirs having none in
+    // longitude/latitude: name, how many. In `work`, another system, such a place sends the run
+    // to longitude/latitude instead ([`work_inputs`]), where the feature is read without it,
+    // rather than the run refused.
+    let mut unplaced: Vec<(String, usize)> = Vec::new();
+    let mut convert = |ds: &'_ Dataset| -> Result<Option<Dataset>, String> {
+        if work != Crs::LonLat {
+            return Ok(match ds.in_crs(work)? {
+                std::borrow::Cow::Owned(c) => Some(c),
+                std::borrow::Cow::Borrowed(_) => None,
+            });
+        }
+        let (c, n) = ds.in_lonlat_leaving_out()?;
+        if n > 0 {
+            unplaced.push((ds.name.clone(), n));
+        }
+        Ok(match c {
+            std::borrow::Cow::Owned(c) => Some(c),
+            std::borrow::Cow::Borrowed(_) => None,
+        })
+    };
     // Read only for its attributes in a run in its first input's system: as it is. (The first
     // input, if it is named there too, is in that system already.)
     let unread = if work == Crs::LonLat { std::collections::HashSet::new() } else { attributes_only(spec, params) };
@@ -1706,7 +2160,7 @@ fn inputs_in(
         if unread.contains(&key.to_ascii_lowercase()) {
             continue;
         }
-        if let std::borrow::Cow::Owned(c) = ds.in_crs(work)? {
+        if let Some(c) = convert(ds)? {
             say(ds, &c)?;
             converted.insert(key.clone(), c);
         }
@@ -1737,7 +2191,7 @@ fn inputs_in(
             .filter(|i| !matches!(i, ProjectInput::Layer(l) if l.is_raster()))
             .map(|i| i.dataset())
             .filter(|d| d.geometry_type != rustgis_data::GeometryType::None)
-            && let std::borrow::Cow::Owned(c) = ds.in_crs(work)?
+            && let Some(c) = convert(ds)?
         {
             say(ds, &c)?;
             converted.insert(key, c);
@@ -1766,22 +2220,38 @@ fn inputs_in(
         if t.dataset.geometry_type == rustgis_data::GeometryType::None {
             continue;
         }
-        if let std::borrow::Cow::Owned(c) = t.dataset.in_crs(work)? {
+        if let Some(c) = convert(&t.dataset)? {
             say(&t.dataset, &c)?;
             converted.insert(table_key(t.id), c);
         }
     }
     // One notice for them all, naming each layer.
     let mut said = Vec::new();
+    // The layers read whole (streamed ones, files) with features read without their geometry.
+    for (key, ds) in full {
+        if unplaced.iter().any(|(name, _)| *name == ds.name) {
+            left_out_whole.insert(key.to_ascii_lowercase());
+        }
+    }
+    if !unplaced.is_empty() {
+        let name = spec.map_or("The tool", |t| t.name);
+        let n: usize = unplaced.iter().map(|(_, n)| n).sum();
+        let layers = unplaced.iter().map(|(layer, n)| format!("'{layer}' ({n})")).collect::<Vec<_>>().join(", ");
+        // Counted over each whole layer, before the run's rows are narrowed to a selection: some may
+        // be rows the tool doesn't read, so it isn't a coded loss.
+        said.push(rustgis_data::loss::Note::plain(format!(
+            "{name}: {n} feature(s) of {layers} have a place that can't be given in longitude/latitude, so the tool reads them without their geometry"
+        )));
+    }
     if !bent.is_empty() {
         let name = spec.map_or("The tool", |t| t.name);
         let n: usize = bent.iter().map(|(_, n, _)| n).sum();
         let far = bent.iter().map(|(.., far)| *far).fold(0.0, f64::max);
         let layers = bent.iter().map(|(layer, n, _)| format!("'{layer}' ({n})")).collect::<Vec<_>>().join(", ");
-        said.push(format!(
+        said.push(rustgis_data::loss::Note::plain(format!(
             "{name}: {n} edge(s) of {layers}, converted into {}, are taken straight there, up to {far:.0} m from where a run in longitude/latitude takes them (straight on a Web Mercator map); their vertices are where they were",
             work.label()
-        ));
+        )));
     }
     Ok((converted, said))
 }
@@ -2054,9 +2524,11 @@ impl Inputs for MapInputs<'_> {
         *self.view.get_or_init(|| view_extent(&self.snap))
     }
     fn raster(&self, layer: &str) -> Option<RasterInput<'_>> {
-        let rl = self.snap.map.layer_by_name(layer)?.raster.as_ref()?;
+        let l = self.snap.map.layer_by_name(layer)?;
+        let rl = l.raster.as_ref()?;
+        let read = self.rasters.get(&l.name.to_ascii_lowercase()).map(std::sync::Arc::as_ref);
         Some(RasterInput {
-            raster: rl.data.as_deref()?,
+            raster: read.or(rl.data.as_deref())?,
             path: rl.path.as_deref(),
             embedded: rl.embedded.as_deref().map(|b| (rl.file_name.as_deref().unwrap_or("raster.tif"), b.as_slice())),
         })
@@ -2102,6 +2574,9 @@ fn batch(s: &mut Session, p: &Value) -> CmdResult {
 
 /// Runs a geoprocessing tool in batch across multiple layers or files with cancellation and progress reporting.
 pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustgis_analysis::control::Control>) -> CmdResult {
+    // A raster file read in place is read once for the batch, not once an item.
+    #[cfg(not(target_arch = "wasm32"))]
+    let _reads = BatchReads::start();
     let tool_name = ps(p, "tool").ok_or("tool is required")?;
     let tool_id = tool_id(tool_name).ok_or_else(|| format!("no tool '{tool_name}'"))?;
     let spec = rustgis_analysis::tool(tool_id).ok_or_else(|| format!("no tool '{tool_name}'"))?;
@@ -2844,25 +3319,27 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
 
     #[cfg(not(target_arch = "wasm32"))]
     if !reader_warnings.is_empty() {
-        let mut aggregated: Vec<(&str, Option<LossCode>, Vec<&str>)> = Vec::new();
+        // Each warning with its distinct inputs, and how many reads gave it: an input named twice
+        // is read twice.
+        let mut aggregated: Vec<(&str, Option<LossCode>, Vec<&str>, usize)> = Vec::new();
         for (target, msg, code) in &reader_warnings {
-            if let Some((_, _, inputs)) = aggregated.iter_mut().find(|(m, c, _)| *m == msg.as_str() && c == code) {
+            if let Some((_, _, inputs, reads)) = aggregated.iter_mut().find(|(m, c, _, _)| *m == msg.as_str() && c == code) {
+                *reads += 1;
                 if !inputs.contains(&target.as_str()) {
                     inputs.push(target.as_str());
                 }
             } else {
-                aggregated.push((msg.as_str(), *code, vec![target.as_str()]));
+                aggregated.push((msg.as_str(), *code, vec![target.as_str()], 1));
             }
         }
-        for (msg, code, inputs) in aggregated {
+        for (msg, code, inputs, reads) in aggregated {
             let count = inputs.len();
             let inputs_list = inputs.join(", ");
             let label = if count == 1 { "input" } else { "inputs" };
-            let text = format!("gp.batch: {count} {label} ({inputs_list}): {msg}");
-            if let Some(code) = code {
-                losses.add(code, &text, count);
-            } else {
-                s.notify(text, false);
+            match code {
+                // Its inputs are named in the example, which the batch's loss notice prefixes.
+                Some(code) => losses.add_stated(code, &format!("{count} {label} ({inputs_list}): {msg}"), reads),
+                None => s.notify(format!("gp.batch: {count} {label} ({inputs_list}): {msg}"), false),
             }
         }
     }
@@ -3164,7 +3641,13 @@ pub(crate) fn execute(
             }
             #[cfg(not(target_arch = "wasm32"))]
             let read = recording.then(|| Snapshot::owned(s));
-            let inputs = match map_inputs(s, Some(spec), params) {
+            // Reading the inputs stops on Cancel too, as a run the app starts on a thread does.
+            #[cfg(not(target_arch = "wasm32"))]
+            let _probe = rustgis_analysis::control::install_progress(Some(control.clone()));
+            // A built-in tool run here (the command line, a script on its own thread) reads a
+            // raster file read in place, as one the app starts on a thread does.
+            let tiled = tiled_for(pin);
+            let inputs = match map_inputs(s, Some(spec), params, tiled) {
                 Ok(inputs) => inputs,
                 // A batch item that can't read its input is kept in the history as a failed run.
                 Err(e) if opts.record.is_some() => return apply_with(s, run_of(t0), kept(), Err(e), now_ms().saturating_sub(t0), opts),
@@ -3260,10 +3743,16 @@ struct BatchLoss {
 impl BatchLosses {
     /// Counts every report, even when its text is beyond the sample.
     fn add(&mut self, code: LossCode, text: &str, count: usize) {
+        self.add_stated(code, &batch_message(text, count), count);
+    }
+
+    /// [`BatchLosses::add`] for a message that already says how many it covers (`count`):
+    /// counted, without a repetition count added to it.
+    fn add_stated(&mut self, code: LossCode, text: &str, count: usize) {
         let entry = self.0.entry(code.spec().id).or_insert_with(|| BatchLoss { code, reports: 0, examples: Vec::new(), omitted: 0 });
         entry.reports = entry.reports.saturating_add(count);
         if entry.examples.len() < 3 {
-            entry.examples.push(batch_message(text, count));
+            entry.examples.push(text.to_string());
         } else {
             entry.omitted += 1;
         }
@@ -3323,16 +3812,34 @@ pub fn writes_files(spec: &rustgis_analysis::ToolSpec) -> bool {
     spec.params.iter().any(|p| matches!(p.kind, rustgis_analysis::ParamKind::SaveFile { .. }))
 }
 
-/// A browser file export waiting for delivery, without a success record until acknowledged.
+/// A browser file waiting for delivery: a tool's output, without a success record until
+/// acknowledged, or an export's file, which says what it wrote only then.
 pub(crate) struct PendingFile {
     pub(crate) continuation: crate::policy::Continuation,
     pub(crate) id: u64,
     pub(crate) file_name: String,
-    pub(crate) bytes: Option<Vec<u8>>,
-    record: GpRecord,
-    losses: Vec<LossMessage>,
+    /// Shared with whatever else holds the file (a raster layer its own), until handed over.
+    pub(crate) bytes: Option<Arc<Vec<u8>>>,
+    from: Delivery,
 }
 
+impl PendingFile {
+    /// Whether an export command made it ([`queue_export`]).
+    pub(crate) fn is_export(&self) -> bool {
+        matches!(self.from, Delivery::Export(_))
+    }
+}
+
+/// What a pending file's acknowledgment completes.
+enum Delivery {
+    #[cfg_attr(not(any(target_arch = "wasm32", test)), expect(dead_code, reason = "the desktop writes a tool's file output itself"))]
+    Tool { record: Box<GpRecord>, losses: Vec<LossMessage> },
+    /// What the export says and does once its file is out, its bytes moved to the queue.
+    Export(Box<super::exports::Wrote>),
+}
+
+/// Queues a tool's file output for download under the name its `output` parameter gives (a name,
+/// not a path), else the tool's own.
 #[cfg(any(target_arch = "wasm32", test))]
 fn queue_file(s: &mut Session, file_name: String, bytes: Vec<u8>, record: GpRecord, losses: Vec<LossMessage>) -> CmdResult {
     let file_name =
@@ -3340,26 +3847,79 @@ fn queue_file(s: &mut Session, file_name: String, bytes: Vec<u8>, record: GpReco
     if file_name.is_empty() || file_name.contains(['/', '\\']) {
         return Err("output must be a file name, not a path, in the browser".into());
     }
-    const MAX_PENDING_BYTES: usize = 256 * 1024 * 1024;
-    let held = s.file_outputs.iter().filter_map(|f| f.bytes.as_ref()).map(Vec::len).sum::<usize>();
-    if s.file_outputs.len() >= 8 || bytes.len() > MAX_PENDING_BYTES.saturating_sub(held) {
-        return Err("file export queue limit reached (8 files or 256 MiB); split the task, model, or script into smaller runs".into());
+    queue(s, file_name, Arc::new(bytes), Delivery::Tool { record: Box::new(record), losses })
+}
+
+/// Queues an export's file for download under its name (`written_path`). The answer says it is
+/// pending, with what the file will say, for a caller that reads no notices later.
+pub(super) fn queue_export(s: &mut Session, mut wrote: super::exports::Wrote) -> CmdResult {
+    let (Some(bytes), Some(file_name)) = (wrote.download.take(), wrote.written_path.clone()) else {
+        return Err("this export made no file to download".into());
+    };
+    // Not exported until the download is taken: the claim goes from the pending answer, and what
+    // follows it (what the file leaves out) stays, under the file's name.
+    let exported = format!("Exported {file_name}");
+    let messages: Vec<String> = wrote
+        .completion_notes()
+        .into_iter()
+        .filter_map(|message| match message.strip_prefix(&exported) {
+            Some("") => None,
+            Some(note) if note.starts_with([' ', ';']) => Some(format!("{file_name}{note}")),
+            _ => Some(message),
+        })
+        .collect();
+    let mut out = queue(s, file_name, bytes, Delivery::Export(Box::new(wrote)))?;
+    out["messages"] = json!(messages);
+    Ok(out)
+}
+
+/// Why no more can wait for download, of the `cap` bytes that waiting files may hold in all.
+pub(crate) fn queue_full(cap: usize) -> String {
+    format!(
+        "file export queue limit reached ({} files or {} MiB); split the task, model, or script into smaller runs",
+        super::exports::MAX_DOWNLOADS,
+        super::exports::mib(cap)
+    )
+}
+
+/// Holds `bytes` for the front end to offer as the download `file_name` and acknowledge with
+/// `gp.fileDelivered`, within what the queue holds.
+fn queue(s: &mut Session, file_name: String, bytes: Arc<Vec<u8>>, from: Delivery) -> CmdResult {
+    use super::exports::{MAX_DOWNLOADS, mib};
+    // A file held only here gives back its spare room first: an encoder's buffer can be twice
+    // its length. One shared (a raster layer's own file) counts whole.
+    let bytes = match Arc::try_unwrap(bytes) {
+        Ok(mut file) => {
+            file.shrink_to_fit();
+            Arc::new(file)
+        }
+        Err(shared) => shared,
+    };
+    let cap = s.download_cap();
+    let held = s.waiting_download_bytes();
+    // An export whose writer takes a limit was stopped at it; this is what holds the others (a
+    // picture, an SVG, a PDF past its pages, the file a raster layer holds) to it.
+    // Measured as the queue counts what waits: by what the file holds, its spare room included.
+    let size = bytes.capacity();
+    if matches!(from, Delivery::Export(_)) && size > cap {
+        return Err(format!(
+            "{file_name}: {} MiB, more than the {} MiB a command can download in the browser; export less (a selection of features, a smaller size or fewer pages), use the Export buttons, or use the desktop app",
+            mib(size),
+            mib(cap)
+        ));
+    }
+    if s.waiting_download_count() >= MAX_DOWNLOADS || size > cap.saturating_sub(held) {
+        return Err(queue_full(cap));
     }
     s.next_pending = s.next_pending.wrapping_add(1);
     let id = s.next_pending;
-    s.file_outputs.push(PendingFile {
-        id,
-        file_name: file_name.clone(),
-        bytes: Some(bytes),
-        record,
-        losses,
-        continuation: s.continuation()?,
-    });
+    s.file_outputs.push(PendingFile { id, file_name: file_name.clone(), bytes: Some(bytes), from, continuation: s.continuation()? });
     s.request_only = true;
     Ok(json!({"pending": true, "download": id, "file": file_name}))
 }
 
-/// Records a completed file delivery through the generated-message history seam.
+/// Records a completed file delivery: a tool's through the generated-message history seam, an
+/// export's by saying what it wrote.
 fn file_delivered(s: &mut Session, p: &Value) -> CmdResult {
     let id = p.get("id").and_then(Value::as_u64).ok_or("id is required")?;
     let i = s.file_outputs.iter().position(|f| f.id == id).ok_or("no pending file with that id")?;
@@ -3367,32 +3927,49 @@ fn file_delivered(s: &mut Session, p: &Value) -> CmdResult {
     if s.file_outputs[i].bytes.is_some() {
         return Err("the file has not been handed to the download service".into());
     }
-    let mut file = s.file_outputs.remove(i);
+    let file = s.file_outputs.remove(i);
     let error = p.get("error").and_then(Value::as_str);
-    file.record.ok = error.is_none();
-    if let Some(error) = error {
-        file.record.messages.push(error.to_string());
-    }
     if let Some(report) = &mut s.model_run {
         report.file_delivered(id, error);
     }
-    for message in &file.record.messages {
-        if file.record.ok {
+    let (mut record, losses) = match file.from {
+        Delivery::Tool { record, losses } => (*record, losses),
+        Delivery::Export(wrote) => {
+            // An export leaves the project as it is: no Undo step for finishing one.
+            s.request_only = true;
+            let mut out = match error {
+                None => super::exports::said(s, *wrote)?,
+                Some(error) => {
+                    s.notify(error.to_string(), true);
+                    json!({"messages": [error]})
+                }
+            };
+            out["file"] = json!(file.file_name);
+            out["delivered"] = json!(error.is_none());
+            return Ok(out);
+        }
+    };
+    record.ok = error.is_none();
+    if let Some(error) = error {
+        record.messages.push(error.to_string());
+    }
+    for message in &record.messages {
+        if record.ok {
             s.notify_written(message.clone());
         } else {
             s.notify(message.clone(), true);
         }
     }
-    for loss in file.losses {
-        if file.record.ok {
+    for loss in losses {
+        if record.ok {
             publish_tool_loss(s, loss.code, &loss.text, true);
         } else {
             s.notify(loss.text.clone(), true);
         }
-        file.record.messages.push(loss.text);
+        record.messages.push(loss.text);
     }
-    let out = json!({"file": file.file_name, "delivered": file.record.ok, "messages": file.record.messages});
-    s.push_gp_record(file.record);
+    let out = json!({"file": file.file_name, "delivered": record.ok, "messages": record.messages});
+    s.push_gp_record(record);
     if s.project.gp_history.len() > 500 {
         s.project.gp_history.remove(0);
     }
@@ -3602,8 +4179,13 @@ fn apply_with(
             let l = s.map_mut().layers.iter_mut().find(|l| l.name.eq_ignore_ascii_case(&layer)).ok_or("the input layer disappeared")?;
             // Made in the system the tool worked in ([`MapInputs::hold_results`]): taken as made
             // when that is the layer's own, else written back in its own coordinates from
-            // longitude/latitude.
-            l.dataset = if dataset.coord_crs() == l.dataset.coord_crs() {
+            // longitude/latitude. (A streamed layer whose whole read left a feature out is refused
+            // before this: [`MapInputs::hold_results`].)
+            // A streamed layer's window may be in another system than its source (longitude/latitude
+            // unless the map is in the source's own), while the tool read the whole source: a
+            // result in the source's own system is taken as made too, the layer then holding it.
+            let own = l.source.as_ref().map(|src| src.coord_crs());
+            l.dataset = if dataset.coord_crs() == l.dataset.coord_crs() || Some(dataset.coord_crs()) == own {
                 dataset
             } else {
                 let lonlat = if dataset.coord_crs() == Crs::LonLat { dataset } else { dataset.in_lonlat()?.into_owned() };
@@ -3691,6 +4273,13 @@ fn apply_with(
     Ok((out, messages))
 }
 
+/// Says what reading a plugin tool's inputs lost, each as a loss with its code, under the tool's name.
+fn say_input_losses(s: &mut Session, tool: &str, lost: Vec<LossMessage>) {
+    for loss in lost {
+        publish_tool_loss(s, loss.code, &format!("{tool}: {}", loss.text), false);
+    }
+}
+
 /// Publishes a typed loss, retaining it through rollback when a file has already been delivered.
 fn publish_tool_loss(s: &mut Session, code: LossCode, text: &str, written: bool) {
     let mark = s.notice_mark();
@@ -3703,6 +4292,27 @@ fn publish_tool_loss(s: &mut Session, code: LossCode, text: &str, written: bool)
 #[cfg(test)]
 mod file_tests {
     use super::*;
+
+    #[test]
+    fn a_plugin_tools_input_losses_are_said_with_their_codes() {
+        let mut s = Session::new(crate::Project::default());
+        let mark = s.notice_mark();
+        say_input_losses(&mut s, "Make Points", Vec::new());
+        assert!(s.notices_since(mark).is_empty(), "a clean read says nothing");
+        let lost = vec![
+            LossMessage { code: LossCode::DroppedFeature, text: "Sites: 2 rows couldn't be read and were left out".into() },
+            LossMessage { code: LossCode::DroppedValue, text: "Sites: 1 value isn't a date and was read as empty, in 'day'".into() },
+        ];
+        say_input_losses(&mut s, "Make Points", lost);
+        let said: Vec<_> = s.notices_since(mark).iter().map(|n| (n.loss(), n.text.clone())).collect();
+        assert_eq!(
+            said,
+            [
+                (Some(LossCode::DroppedFeature), "Make Points: Sites: 2 rows couldn't be read and were left out".to_string()),
+                (Some(LossCode::DroppedValue), "Make Points: Sites: 1 value isn't a date and was read as empty, in 'day'".to_string()),
+            ]
+        );
+    }
 
     #[test]
     fn raster_to_pmtiles_queues_the_archive_without_changing_the_map() {
@@ -3736,7 +4346,7 @@ mod file_tests {
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].1, "Elevation.pmtiles");
         assert!(files[0].2.starts_with(b"PMTiles\x03"));
-        assert_eq!(files[0].2, expected, "layer and group transparency are both applied");
+        assert_eq!(*files[0].2, expected, "layer and group transparency are both applied");
         assert_eq!(s.map().layers.len(), 1);
         assert!(
             s.run("gp.run", &json!({"tool": "rasterToPmtiles", "params": {"input": "Elevation", "minZoom": 2, "maxZoom": 1}})).is_err()
@@ -3760,6 +4370,21 @@ mod file_tests {
             }));
         }
         s.run("test.queueFile", &json!({"name":name,"bytes":bytes,"record":record}))
+    }
+
+    /// A file queued with spare room (an encoder's buffer) gives it back before it is admitted,
+    /// so what waits never passes the limit the queue counts it against.
+    #[test]
+    fn a_queued_file_is_held_to_the_limit_by_what_it_holds() {
+        let mut s = Session::new(crate::Project::default());
+        s.download_cap = Some(50);
+        s.registry.commands.push(C::new("test.queueRoomy", "File export", "Test", |s, _| {
+            let mut file = Vec::with_capacity(100);
+            file.extend_from_slice(&[7; 10]);
+            super::queue_file(s, "roomy.bin".into(), file, record(), Vec::new())
+        }));
+        assert_eq!(s.run("test.queueRoomy", &Value::Null).unwrap()["pending"], true);
+        assert_eq!(s.waiting_download_bytes(), 10);
     }
 
     fn record() -> GpRecord {
@@ -3955,7 +4580,7 @@ mod file_tests {
         assert!(s.project.gp_history.is_empty());
         assert!(s.run("gp.fileDelivered", &json!({"id": id})).is_err());
         assert!(s.project.gp_history.is_empty());
-        assert_eq!(s.take_gp_files(), vec![(id, "cities.pmtiles".into(), vec![1, 2, 3])]);
+        assert_eq!(s.take_gp_files(), vec![(id, "cities.pmtiles".into(), std::sync::Arc::new(vec![1, 2, 3]))]);
         assert!(s.take_gp_files().is_empty(), "bytes are handed over once");
         let out = s.run("gp.fileDelivered", &json!({"id": id, "error": "browser rejected download"})).unwrap();
         assert_eq!(out["delivered"], false);
@@ -7307,8 +7932,11 @@ mod batch_tests {
         }
 
         // Notices aggregated into a single notice per warning kind without truncating later files
+        // A Z/M loss has its code, so it is said as one loss notice for the batch.
         let notice = s.notices_since(mark).iter().find(|n| n.text.contains("Z or M")).unwrap();
-        assert!(notice.text.starts_with("gp.batch: 4 inputs ("));
+        assert_eq!(notice.loss(), Some(rustgis_data::loss::LossCode::DroppedZm));
+        assert!(notice.text.starts_with("gp.batch: 4 loss report(s) (4 inputs ("), "{}", notice.text);
+        assert!(!notice.text.contains("(×"), "{}", notice.text);
         assert!(notice.text.contains("file_1.geojson"));
         assert!(notice.text.contains("file_2.geojson"));
         assert!(notice.text.contains("file_3.geojson"));
@@ -7321,6 +7949,12 @@ mod batch_tests {
             assert!(record.ok);
             assert!(record.messages.iter().any(|m| m.contains("Z or M")));
         }
+
+        // An input named twice is read, and its loss counted, twice.
+        let mark = s.notice_mark();
+        s.run("gp.batch", &json!({"tool": "buffer", "inputs": [&files[0], &files[0]], "params": {"distance": 5}})).unwrap();
+        let twice = s.notices_since(mark).iter().find(|n| n.text.contains("Z or M")).unwrap().text.clone();
+        assert!(twice.starts_with("gp.batch: 2 loss report(s) (1 input ("), "{twice}");
 
         let _ = std::fs::remove_dir_all(root);
     }

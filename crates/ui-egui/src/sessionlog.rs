@@ -37,7 +37,7 @@ struct Row {
 impl Row {
     fn of(e: LogEntry, registry: &rustgis_engine::Registry) -> Row {
         let scriptable = registry.get(&e.command).is_some() && !rustgis_engine::cmd::workflows::refused_in_script(&e.command);
-        let params = params_text(&e);
+        let params = e.params_text();
         // One line in the list; the whole of it (up to the log's 4 KB) on hover.
         let mut line: String = params.chars().take(120).collect();
         if line.len() < params.len() {
@@ -204,27 +204,6 @@ pub fn pane(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     });
 }
 
-/// An entry's parameters as one line of JSON: none for no parameters.
-fn params_text(e: &LogEntry) -> String {
-    match &e.params {
-        Value::Null => String::new(),
-        Value::Object(m) if m.is_empty() => String::new(),
-        p => p.to_string(),
-    }
-}
-
-/// A Script pane line for entry `e`: its command and parameters, as History's Copy as Command
-/// writes one. Undo and redo alone: what the log keeps of them is the step's label, not a
-/// parameter.
-fn command_line(e: &LogEntry) -> String {
-    let params = params_text(e);
-    if params.is_empty() || matches!(e.command.as_str(), "edit.undo" | "edit.redo") {
-        e.command.clone()
-    } else {
-        format!("{} {params}", e.command)
-    }
-}
-
 /// The script a `script.run` entry ran, as the log kept it.
 fn script_of(e: &LogEntry) -> Option<&str> {
     if e.command == "script.run" { e.params.get("script").and_then(Value::as_str) } else { None }
@@ -302,7 +281,7 @@ fn row(ui: &mut Ui, item: &Row, t: &Tokens, running: bool) -> Option<Picked> {
         } else {
             let copy = ui.add_enabled(item.scriptable, egui::Button::new(tl!("Copy Command")));
             if copy.on_hover_text(tl!("A line for the Script pane")).on_disabled_hover_text(tl!("It can't run in a script")).clicked() {
-                ui.ctx().copy_text(command_line(e));
+                ui.ctx().copy_text(e.script_line());
                 picked = e.partial.then_some(Picked::CopiedPartial);
                 ui.close();
             }
@@ -579,7 +558,7 @@ mod tests {
         let got = std::rc::Rc::new(std::cell::RefCell::new(None));
         let sink = got.clone();
         app.services.download = Some(Box::new(move |name, bytes| {
-            *sink.borrow_mut() = Some((name.to_string(), String::from_utf8(bytes).unwrap()));
+            *sink.borrow_mut() = Some((name.to_string(), String::from_utf8(bytes.to_vec()).unwrap()));
             Ok(())
         }));
         save(&mut app);

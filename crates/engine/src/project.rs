@@ -7,12 +7,15 @@ use rustgis_map::Map;
 use serde::{Deserialize, Serialize};
 
 use crate::GpRecord;
+use crate::received::Named;
+use crate::render::rustgis_tiles::address::Reach;
 
 #[path = "project_capabilities.rs"]
 mod capabilities;
 #[path = "project_label_losses.rs"]
 pub(crate) mod label_losses;
-pub(crate) use capabilities::{layer_file_bytes, map_file_bytes, model_capabilities};
+pub use capabilities::layout_file_bytes;
+pub(crate) use capabilities::{layer_file_bytes, map_file_bytes, model_capabilities, task_capabilities};
 
 /// A map export cannot keep runtime-only download reservations, even in a larger project.
 pub(crate) fn ensure_map_imports_complete(map: &Map) -> Result<(), String> {
@@ -77,6 +80,7 @@ pub const CAPABILITIES: &[&str] = &[
     "terrain-water",
     "terrain-water-shore",
     "terrain-block-water",
+    "terrain-block-water-bed",
     "terrain-block-walls-layer",
     "shaded-relief-effects",
     "normalized-legend-urls",
@@ -94,10 +98,13 @@ pub const CAPABILITIES: &[&str] = &[
     "graticule-color",
     "layout-element-ink",
     "layout-element-wrap",
+    "layout-text-block",
     "layout-chart-data",
     "layout-chart-look",
     "layout-chart-classes",
     "layout-chart-stack",
+    "layout-chart-facing",
+    "layout-chart-outline",
     "field-generation",
     "field-package",
     FIELD_CONFLICTS,
@@ -106,11 +113,26 @@ pub const CAPABILITIES: &[&str] = &[
     "zarr-window",
     "blank-paper",
     "layout-frame-border",
+    "layout-section",
     NATIVE_COORDINATES,
     "layout-text-size",
+    "layout-legend-fit",
+    "layout-legend-class-labels",
+    "layout-legend-counts",
+    "layout-scale-bar-details",
     "label-guide",
+    "label-weight",
     PROJECT_CRS,
     "dggs-system",
+    "label-clearance",
+    "svg-markers",
+    "label-duplicates",
+    "tile-resampling",
+    "layout-page-color",
+    "layout-text-statistics",
+    "layout-publication-parts",
+    "layout-publication-legend",
+    "shaded-relief-shadow-softness",
 ];
 /// An offline area keeping the versions that lost a sync or a Bring Back
 /// (`OfflineArea::conflicts`, #2468): an older reader would save it again without them.
@@ -1211,8 +1233,10 @@ fn capability_said(name: &str) -> String {
 /// rewrite through RustGIS's types. For a kind whose reader looks at `requires` and reads format 2
 /// (`reads_format_2`: projects and maps): of a format past [`READ_FORMAT`], or requiring anything,
 /// as the typed copy wouldn't keep the list, even of capabilities it knows. For the others (tasks,
-/// presentations, notebooks, models), whose typed copies drop what they don't know: of a format
-/// past [`FORMAT`]. A list (a legacy style file), or text whose `format` isn't a number, isn't one.
+/// presentations, notebooks, models): of a format past [`FORMAT`], which the reader refuses; a
+/// task's and a model's cleaned copy keeps `requires` itself (`roles::task_document`,
+/// `roles::model_document`). A list (a legacy style file), or text whose `format` isn't a number,
+/// isn't one.
 pub(crate) fn kept_as_written(text: &str, reads_format_2: bool) -> bool {
     if text.trim_start().starts_with('[') {
         return false;
@@ -1516,9 +1540,14 @@ impl Project {
     /// those `map.addTiles` adds) as raster layers read in place: as the project opens only. A
     /// later repair (a layer file added, maps imported) leaves a tile layer added this session
     /// as it is. Returns a notice for each kind of change that removed, cut or renamed
-    /// something, with the part of the project it is about.
+    /// something, and one for the presentation pages whose map the project doesn't have, each
+    /// with the part of the project it is about.
     pub(crate) fn normalize_opened(&mut self) -> Vec<(ReadPart, NoticeText)> {
-        self.repair(true, "while opening the project")
+        let mut notices = self.repair(true, "while opening the project");
+        // Pages naming a map the project doesn't have are drawn over the active map (#3191).
+        use crate::cmd::presentation::{PagesOf, pages_without_their_map};
+        notices.extend(pages_without_their_map(self, PagesOf::All).map(|notice| (ReadPart::Items, notice)));
+        notices
     }
 
     /// Reports removed or shortened content, renamed items and repaired group display settings
@@ -1900,28 +1929,69 @@ impl Project {
 
     /// Reads a project from its JSON text (a browser upload).
     pub fn from_json(text: &str) -> Result<Project, String> {
-        Self::read_json(text, true, None, true, None)
+        Self::read_json(text, true, None, true, None, None).map(|(p, _)| p)
+    }
+
+    /// [`Project::from_json`] for a file whose addresses reach no wider than `reach`
+    /// ([`crate::Session::file_reach`]), held so before anything it names is read.
+    pub(crate) fn from_json_within(text: &str, reach: Reach) -> Result<(Project, Named), String> {
+        Self::read_json(text, true, None, true, None, Some(reach))
     }
 
     /// Reads imported JSON (including package contents) without restoring a saved file's secrets.
+    /// A command reads through [`Project::from_import_json_within`], which holds what it names.
+    #[cfg(test)]
     pub(crate) fn from_import_json(text: &str, dir: Option<&Path>) -> Result<Project, String> {
-        Self::read_json(text, false, dir, true, None)
+        Self::read_json(text, false, dir, true, None, None).map(|(p, _)| p)
+    }
+
+    /// Whether imported JSON reads as a project, refused as [`Project::from_import_json`] refuses
+    /// it, without its repair: nothing it names is read.
+    pub(crate) fn check_import_json(text: &str, dir: Option<&Path>) -> Result<(), String> {
+        Self::read_json(text, false, dir, false, None, None).map(|_| ())
+    }
+
+    /// [`Project::from_import_json`] within `reach`, as [`Project::from_json_within`].
+    pub(crate) fn from_import_json_within(text: &str, dir: Option<&Path>, reach: Reach) -> Result<(Project, Named), String> {
+        Self::read_json(text, false, dir, true, None, Some(reach))
     }
 
     /// Repairs only the maps the import will retain, so excluded maps produce no notices.
+    #[cfg(test)]
     pub(crate) fn from_import_maps_json(text: &str, dir: Option<&Path>, limit: usize) -> Result<Project, String> {
-        Self::read_json(text, false, dir, true, Some(limit))
+        Self::read_json(text, false, dir, true, Some(limit), None).map(|(p, _)| p)
+    }
+
+    /// Repairs only the maps the import will retain, so excluded maps produce no notices, holding
+    /// their addresses within `reach`, as [`Project::from_json_within`].
+    pub(crate) fn from_import_maps_json_within(
+        text: &str,
+        dir: Option<&Path>,
+        limit: usize,
+        reach: Reach,
+    ) -> Result<(Project, Named), String> {
+        Self::read_json(text, false, dir, true, Some(limit), Some(reach))
     }
 
     /// Peer census must precede normalization: duplicate ids cannot become proof of a unique
     /// matching slot after the normalizer renumbers or drops them. Saved-text restore is absent.
     pub(crate) fn from_peer_raw(text: &str) -> Result<Project, String> {
-        Self::read_json(text, false, None, false, None)
+        Self::read_json(text, false, None, false, None, None).map(|(p, _)| p)
     }
 
     /// Validates compatibility before typed decoding. Saved files may restore exact fields;
     /// peer input stays unnormalized until its slot census has rejected ambiguous identities.
-    fn read_json(text: &str, restore: bool, dir: Option<&Path>, normalize: bool, map_limit: Option<usize>) -> Result<Project, String> {
+    /// With `held`, every address the project keeps is held within that reach
+    /// ([`crate::received::hold`]) before its repair reads anything it names (rasters read in
+    /// place, streamed sources).
+    fn read_json(
+        text: &str,
+        restore: bool,
+        dir: Option<&Path>,
+        normalize: bool,
+        map_limit: Option<usize>,
+        held: Option<Reach>,
+    ) -> Result<(Project, Named), String> {
         check_format(text, "project")?;
         let refused = |e: serde_json::Error| {
             let msg = e.to_string();
@@ -1977,6 +2047,7 @@ impl Project {
         if let Some(limit) = map_limit {
             p.maps.truncate(limit);
         }
+        let named = held.map(|reach| crate::received::hold(p.addresses_mut(), reach)).unwrap_or_default();
         // Maps imported from a project are read as it opens, and said as imported.
         let repair_notices = match (normalize, map_limit) {
             (false, _) => Vec::new(),
@@ -2048,12 +2119,18 @@ impl Project {
             ));
         }
         p.read_notices.extend(unknown.notices(map_limit));
-        Ok(p)
+        Ok((p, named))
     }
 
     /// Opens a project file (a regular file within [`max_bytes`]; see `read_file`), resolving
     /// its relative paths against its folder.
     pub fn load(path: &Path) -> Result<Project, String> {
+        Self::load_within(path, None).map(|(p, _)| p)
+    }
+
+    /// [`Project::load`], holding what the file names within `held`, as
+    /// [`Project::from_json_within`].
+    pub(crate) fn load_within(path: &Path, held: Option<Reach>) -> Result<(Project, Named), String> {
         let max = max_bytes();
         // Past the limit: said with its size and the limit here, before anything is read.
         if let Ok(meta) = std::fs::metadata(path)
@@ -2084,7 +2161,7 @@ impl Project {
         let bytes = read_file(path, max)?;
         let text = String::from_utf8(bytes).map_err(|_| format!("{} isn't a RustGIS project", path.display()))?;
         let dir = std::path::absolute(path).ok().and_then(|p| p.parent().map(Path::to_path_buf));
-        Self::read_json(&text, true, dir.as_deref(), true, None)
+        Self::read_json(&text, true, dir.as_deref(), true, None, held)
     }
 }
 
@@ -2179,10 +2256,16 @@ pub(crate) fn picture_notices_by<'a>(
         *seen.borrow_mut().entry(p).or_insert_with(|| check(p))
     };
     // The names with an image refused so, by each refusal in `WHY`, in the order their notices go.
-    const WHY: [MarkerRefusal; 5] = [
+    const WHY: [MarkerRefusal; 11] = [
         MarkerRefusal::NotAnImage,
+        MarkerRefusal::TooManyBytes,
         MarkerRefusal::TooManyPixels,
         MarkerRefusal::TooMuchToDraw,
+        MarkerRefusal::SvgTooMuchToRead,
+        MarkerRefusal::SvgTooNested,
+        MarkerRefusal::SvgUnknownRadius,
+        MarkerRefusal::SvgTooSmall,
+        MarkerRefusal::SvgNotUtf8,
         MarkerRefusal::SvgUndrawn,
         MarkerRefusal::PastRunPixels,
     ];
@@ -2227,11 +2310,18 @@ pub(crate) fn picture_notices_by<'a>(
             ],
         ));
     }
-    let [not_images, too_large, too_much, filtered, past_run] = &bad;
+    let [not_images, too_long, too_large, too_much, too_much_to_read, too_nested, unknown_radius, too_small, not_utf8, filtered, past_run] =
+        &bad;
     if !not_images.is_empty() {
         notices.push(NoticeText::format(
             "Image markers in {names} aren't PNG, JPEG or SVG images and are drawn as circles",
             [("names", picture_names(not_images))],
+        ));
+    }
+    if !too_long.is_empty() {
+        notices.push(NoticeText::format(
+            "Image markers in {names} are longer than {mib} MiB as base64 and are drawn as circles",
+            [("names", picture_names(too_long)), ("mib", (MAX_PICTURE_BYTES >> 20).to_string().into())],
         ));
     }
     if !too_large.is_empty() {
@@ -2245,6 +2335,27 @@ pub(crate) fn picture_notices_by<'a>(
             "Image markers in {names} are SVGs with more to draw than a {side} × {side} image and are drawn as circles",
             [("names", picture_names(too_much)), ("side", rustgis_render::MARKER_PIXELS_SIDE.to_string().into())],
         ));
+    }
+    // Each SVG's own cause (#2713), its figures as the renderer's phrase gives them.
+    for (names, what) in [
+        (
+            too_much_to_read,
+            "Image markers in {names} are SVGs whose style sheets, element attributes, namespaces or entities take more to read than RustGIS allows and are drawn as circles",
+        ),
+        (
+            too_nested,
+            "Image markers in {names} are SVGs with more than 40,000 XML nodes or nested deeper than 64 levels and are drawn as circles",
+        ),
+        (
+            unknown_radius,
+            "Image markers in {names} are SVGs with a radius whose size RustGIS can't know (in em or ex, or in % of a size in em or ex, or of a nested size in % over 100%), and are drawn as circles",
+        ),
+        (too_small, "Image markers in {names} are SVGs too small to draw and are drawn as circles"),
+        (not_utf8, "Image markers in {names} are SVGs that aren't UTF-8 text and are drawn as circles"),
+    ] {
+        if !names.is_empty() {
+            notices.push(NoticeText::format(what, [("names", picture_names(names))]));
+        }
     }
     if !filtered.is_empty() {
         notices.push(NoticeText::format(
@@ -2692,7 +2803,7 @@ pub(crate) fn layout_notices(
     let cut = total(|r| r.elements_cut);
     if cut > 0 {
         notices.push(format!(
-            "{name}: {cut} layout element(s) with a name, text, polygon points, legend exclusions or legend labels cut to their limits {when} (in {})",
+            "{name}: {cut} layout element(s) with a name, text, polygon points, section lines, legend exclusions, scale bar unit labels or legend labels cut to their limits {when} (in {})",
             layout_names(repairs, |r| r.elements_cut)
         ));
     }
@@ -2706,7 +2817,7 @@ pub(crate) fn layout_notices(
     let pages = total(|r| r.page_adjusted);
     if pages > 0 {
         notices.push(format!(
-            "{name}: the page size, guides or map series margin of {pages} layout(s) adjusted {when} (in {})",
+            "{name}: the page size, guides, page colour or map series margin of {pages} layout(s) adjusted {when} (in {})",
             layout_names(repairs, |r| r.page_adjusted)
         ));
     }

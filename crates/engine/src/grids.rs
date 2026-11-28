@@ -548,7 +548,7 @@ fn fetch_now(grid: &MissingGrid) {
         let bytes = download(&grid.url, MAX_GRID, DOWNLOAD_TIMEOUT)?;
         keep(&grid.name, &bytes).map(|()| bytes.len())
     })
-    .unwrap_or_else(|_| Err("the download stopped unexpectedly".into()));
+    .unwrap_or_else(|payload| Err(crate::bug("the download", payload.as_ref())));
     finish(&grid.name, got);
 }
 

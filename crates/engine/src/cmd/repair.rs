@@ -269,8 +269,7 @@ fn replace_linked(
         && let Some(origin) = &new.duckdb
         && let Some(info) = new.info()
         && info.count == Some(0)
-        && let Some(note) =
-            info.notes.iter().find(|note| note.starts_with("DuckDB: ") && note.ends_with(" rows of another geometry type were left out"))
+        && let Some(note) = other_family_only(&info.notes)
     {
         return Err(format!(
             "{path}: the replacement table contains no {}; {}. The layer was not changed",
@@ -279,6 +278,19 @@ fn replace_linked(
         ));
     }
     install(s, prepared)
+}
+
+/// The note saying DuckDB left out rows of another geometry type, found by what it counts, not
+/// its words: for a replacement that holds none of the layer's own, it is why Repair refuses.
+#[cfg(not(target_arch = "wasm32"))]
+fn other_family_only(notes: &rustgis_data::loss::Notes) -> Option<&rustgis_data::loss::Note> {
+    use rustgis_data::loss::{Counted, Finder};
+    notes.iter().find(|note| {
+        // A definite count: one that is unknown says only that rows may have been left out.
+        note.tally
+            .as_ref()
+            .is_some_and(|t| t.by == Finder::Duckdb && t.counted == Counted::OtherGeometryType && t.count.is_some_and(|n| n > 0))
+    })
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -681,5 +693,21 @@ fn reload_tiles(s: &mut Session, p: &Value) -> CmdResult {
         }
         s.notify(message, false);
         Ok(json!({"index": i, "path": path}))
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use rustgis_data::loss::{Counted, Finder, Note, Notes, Tally};
+
+    #[test]
+    fn a_replacement_of_another_geometry_type_is_found_by_its_tally_not_its_words() {
+        let left_out = |n| Note::tallied(None, Tally::new(Finder::Duckdb, Counted::OtherGeometryType, Some(n)));
+        let notes: Notes = [Note::plain("a plain note"), left_out(2).map_text(|_| "reworded".into())].into_iter().collect();
+        assert_eq!(super::other_family_only(&notes).map(|n| n.text.as_str()), Some("reworded"));
+        let words_only: Notes = ["DuckDB: 2 rows of another geometry type were left out"].into_iter().collect();
+        assert!(super::other_family_only(&words_only).is_none(), "the words alone decide nothing");
+        let gdal: Notes = [Note::tallied(None, Tally::new(Finder::Gdal, Counted::OtherGeometryType, Some(2)))].into_iter().collect();
+        assert!(super::other_family_only(&gdal).is_none());
     }
 }

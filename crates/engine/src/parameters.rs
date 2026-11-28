@@ -19,6 +19,28 @@ pub fn params_envelope(params: Option<&Value>) -> Result<Value, String> {
     }
 }
 
+/// A script line's command id and the text after it: the id ends at the first space or `=`,
+/// which no command id holds, so `id {json}`, `id= {json}` and `id={json}` (the command line's
+/// form) all name `id` (#2794). The rest starts after that space or `=`. The Script pane colours
+/// and completes a line by the same rule.
+pub fn split_script_id(line: &str) -> (&str, &str) {
+    match line.char_indices().find(|&(_, c)| c.is_whitespace() || c == '=') {
+        Some((i, c)) => (&line[..i], &line[i + c.len_utf8()..]),
+        None => (line, ""),
+    }
+}
+
+/// A script line's command id and its JSON text, trimmed as [`script_line`] reads them, and where
+/// that text starts in `line`, in bytes (for a column in the line, as an error's).
+pub(crate) fn script_parts(line: &str) -> (&str, &str, usize) {
+    let trimmed = line.trim();
+    let (id, rest) = split_script_id(trimmed);
+    let json = rest.trim_start();
+    // `trimmed` ends where `line`'s text does; the JSON ends where `trimmed` does.
+    let start = (line.len() - line.trim_start().len()) + (trimmed.len() - json.len());
+    (id, json, start)
+}
+
 /// One executable script line, preserving the executor's `id[=] {json}` grammar. Unlike an
 /// adapter envelope, a script's JSON value is passed as written; no parameters means null.
 /// Blank and comment lines have no command. Errors are annotated with line numbers by callers.
@@ -27,12 +49,11 @@ pub fn script_line(line: &str) -> Option<Result<(String, Value), String>> {
     if line.is_empty() || line.starts_with('#') {
         return None;
     }
-    let (id, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
-    let id = id.trim_end_matches('=');
-    let params = if rest.trim().is_empty() {
+    let (id, json, _) = script_parts(line);
+    let params = if json.is_empty() {
         Value::Null
     } else {
-        match serde_json::from_str(rest.trim()) {
+        match serde_json::from_str(json) {
             Ok(value) => value,
             Err(e) => return Some(Err(e.to_string())),
         }
@@ -64,6 +85,23 @@ mod tests {
         assert_eq!(script_line("map.zoomIn []").unwrap().unwrap().1, json!([]));
         assert!(script_line("map.zoomIn {bad").unwrap().is_err());
         assert!(script_line("script.run {}").unwrap().is_err());
+    }
+
+    /// A command id ends at its first space or `=`, so `id={json}`, the command line's form and
+    /// the one the user guide writes, runs as `id {json}` does (#2794).
+    #[test]
+    fn a_command_id_ends_at_a_space_or_an_equals_sign() {
+        let read = |line: &str| script_line(line).unwrap();
+        assert_eq!(
+            read(r#"layer.ramp={"ramp": "Phosphor Frostfire"}"#).unwrap(),
+            ("layer.ramp".into(), json!({"ramp": "Phosphor Frostfire"}))
+        );
+        assert_eq!(read(r#"gp.threads={"threads":8}"#).unwrap(), ("gp.threads".into(), json!({"threads": 8})));
+        assert_eq!(read("map.zoomIn=").unwrap(), ("map.zoomIn".into(), Value::Null));
+        assert!(read("map.zoomIn={bad").is_err(), "not JSON");
+        assert!(read("script.run={}").is_err_and(|e| e.contains("can't run in a script")), "refused by its id");
+        // A space before the `=` leaves it in the parameters, as before.
+        assert!(read("map.zoomIn = {}").is_err());
     }
 
     /// A landing page with collections retains the constructed map-template fallback. Supplied
@@ -131,7 +169,9 @@ mod tests {
             s.notify("Deleted 3 features", false);
             panic!("synthetic loss rollback");
         });
-        assert_eq!(result.unwrap_err(), "Loss rollback failed unexpectedly; the project was restored");
+        let error = result.unwrap_err();
+        assert!(error.starts_with("Loss rollback failed unexpectedly, a bug in RustGIS (incident "), "{error}");
+        assert!(error.contains("the project is as it was before"), "{error}");
         assert_eq!(session.project.name, name);
         let notices = session.notices_since(mark);
         assert_eq!(notices.iter().filter(|n| !n.error).count(), 1);

@@ -185,25 +185,16 @@ impl SourceInfo {
     pub(crate) fn drop_zm(&mut self, features: Option<u64>) {
         if !self.zm_dropped && features != Some(0) {
             self.zm_dropped = true;
-            self.notes.push(crate::zm_note(features));
+            self.notes.push(crate::loss::Note::loss(crate::loss::LossCode::DroppedZm, crate::zm_note(features)));
         }
     }
 
-    /// Notes what happened to some columns in one note, counting them and naming the first 12
-    /// with their kind ("price (decimal)"): `what` says it for one column, then for several.
-    /// Nothing when there are none.
+    /// Notes what happened to some columns in one note ([`columns_note`]). Nothing when there are
+    /// none.
     pub(crate) fn note_columns(&mut self, cols: &[(String, String)], what: [&str; 2]) {
-        const NAMED: usize = 12;
-        let [one, several] = what;
-        let n = cols.len();
-        let what = match n {
-            0 => return,
-            1 => one,
-            _ => several,
-        };
-        let named: Vec<String> = cols.iter().take(NAMED).map(|(name, kind)| format!("{name} ({kind})")).collect();
-        let more = if n > NAMED { format!(" and {} more", n - NAMED) } else { String::new() };
-        self.notes.push(format!("{n} column{} {what}: {}{more}", if n == 1 { "" } else { "s" }, named.join(", ")));
+        if let Some(note) = columns_note(cols, what) {
+            self.notes.push(note);
+        }
     }
 
     /// The source's coordinate system, when it isn't longitude/latitude: one known by its EPSG
@@ -211,6 +202,23 @@ impl SourceInfo {
     pub fn coordinate_system(&self) -> Option<Crs> {
         Crs::parse(&self.crs).ok().filter(|c| *c != Crs::LonLat)
     }
+}
+
+/// The note of some columns a reader left out, counting them and naming the first 12 with their
+/// kind ("photo (binary)"): `what` says it for one column, then for several. `None` when there
+/// are none.
+pub(crate) fn columns_note(cols: &[(String, String)], what: [&str; 2]) -> Option<String> {
+    const NAMED: usize = 12;
+    let [one, several] = what;
+    let n = cols.len();
+    let what = match n {
+        0 => return None,
+        1 => one,
+        _ => several,
+    };
+    let named: Vec<String> = cols.iter().take(NAMED).map(|(name, kind)| format!("{name} ({kind})")).collect();
+    let more = if n > NAMED { format!(" and {} more", n - NAMED) } else { String::new() };
+    Some(format!("{n} column{} {what}: {}{more}", if n == 1 { "" } else { "s" }, named.join(", ")))
 }
 
 /// A read: the features intersecting `extent` (longitude/latitude; `None` = all), at most `limit`.
@@ -233,6 +241,12 @@ impl Request {
     }
 }
 
+/// A box over the whole plane: as [`Request::own`], every feature in the source's own system,
+/// those longitude/latitude can't place included (a map in that system draws them as they are).
+pub fn whole_plane() -> Extent {
+    Extent::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::INFINITY)
+}
+
 /// Refuses an unknown count rather than reporting an unbounded view as empty. A zero-limit
 /// request does not start the full geometry scan needed to determine its matches.
 pub(crate) fn unbounded_count() -> DataError {
@@ -251,8 +265,9 @@ pub struct Batch {
     pub complete: bool,
     /// Rows that couldn't be read.
     pub skipped: usize,
-    /// Values in date fields that weren't dates and are read as null, counted for each field by
-    /// its position; empty when there were none. Said by [`unread_dates_note`].
+    /// Values in date fields that weren't dates, and text in yes/no fields that was neither yes nor
+    /// no ([`yes_no_text`]), read as null, counted for each field by its position; empty when there
+    /// were none. Said by [`unread_dates_note`].
     pub unread_dates: Vec<usize>,
     /// Date-times of date fields that had digits past the microsecond, rounded to it, counted for
     /// each field by its position. Said by [`rounded_dates_note`].
@@ -275,13 +290,87 @@ pub(crate) fn unread_date(counts: &mut Vec<usize>, k: usize) {
     unread_dates_by(counts, k, 1);
 }
 
+/// The value of the yes/no field at `k` from a file's text ([`crate::Value::yes_no`]): text that
+/// is neither yes nor no is null, counted in `counts` ([`Batch::unread_dates`]), which says it as a
+/// value that isn't yes or no ([`unread_dates_note`]). Empty text and `<Null>` are null, uncounted.
+pub(crate) fn yes_no_text(text: &str, counts: &mut Vec<usize>, k: usize) -> crate::Value {
+    let v = crate::Value::parse(text, crate::FieldType::Boolean);
+    if v.is_null() && !text.trim().is_empty() && !crate::Value::is_null_marker(text) {
+        unread_date(counts, k);
+    }
+    v
+}
+
+/// The value of the number field at `k` (`ty` Integer or Double) from a file's text
+/// ([`crate::Value::parse_source`]): text that isn't a number is null, counted in `counts`
+/// ([`Batch::unread_dates`]), which says it as a value that isn't a number ([`unread_dates_note`]).
+/// Empty text and `<Null>` are null, uncounted.
+pub(crate) fn number_text(
+    text: &str,
+    ty: crate::FieldType,
+    counts: &mut Vec<usize>,
+    rounded: Option<&mut Vec<usize>>,
+    k: usize,
+) -> crate::Value {
+    // `NaN` and `inf` written as words are kept as they are (a field holds them, and a save writes
+    // them back); a number in digits past a decimal's range (`1e400`) would be infinity, which it
+    // isn't: empty, and said as text that isn't a number.
+    let words = |t: &str| matches!(t.trim().trim_start_matches(['-', '+']).to_ascii_lowercase().as_str(), "nan" | "inf" | "infinity");
+    let v = match crate::Value::parse_source(text, ty) {
+        crate::Value::Float(f) if !f.is_finite() && !words(text) => crate::Value::Null,
+        v => v,
+    };
+    if v.is_null() && !text.trim().is_empty() && !crate::Value::is_null_marker(text) {
+        unread_date(counts, k);
+    }
+    // A number whose whole-number digits a decimal can't hold (`9007199254740993`) is rounded:
+    // counted in `rounded` ([`Batch::rounded_dates`]), as a whole number stored past 2^53 is. A
+    // fraction past what a decimal holds reads as the nearest decimal, as a stored one does.
+    let trimmed = text.trim().trim_start_matches(['-', '+']);
+    // Text past a decimal's range reads as infinity: an overflow, not a rounding.
+    if let (crate::Value::Float(f), Some(rounded)) = (&v, rounded)
+        && f.is_finite()
+        && crate::query::whole_digits_round(trimmed)
+    {
+        unread_date(rounded, k);
+    }
+    v
+}
+
+/// The text encoding a GeoPackage reader gives ([`FeatureSource::text_encoding`]): UTF-8, which the
+/// standard requires, so [`not_utf8_note`] says why without a `.cpg` to point to.
+pub const GEOPACKAGE_TEXT: &str = "UTF-8 (GeoPackage)";
+
+/// A text field's value from bytes SQLite holds as text or as a blob: the text, or, when they
+/// aren't valid UTF-8, the text with U+FFFD in place of what isn't, counted in `not_utf8`
+/// ([`Batch::not_utf8`], said by [`not_utf8_note`]).
+pub(crate) fn utf8_text(bytes: &[u8], not_utf8: &mut Vec<usize>, k: usize) -> crate::Value {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => crate::Value::Text(text.to_string()),
+        Err(_) => {
+            not_utf8_at(not_utf8, k);
+            crate::Value::Text(String::from_utf8_lossy(bytes).into_owned())
+        }
+    }
+}
+
+/// The decimal value of a whole number stored in a Double field at `k`: counted in `rounded`
+/// ([`Batch::rounded_dates`]) when a decimal can't hold it exactly (past 2^53).
+pub(crate) fn int_as_double(i: i64, rounded: Option<&mut Vec<usize>>, k: usize) -> crate::Value {
+    if let Some(rounded) = rounded
+        && crate::Value::Int(i).rounds_as_double()
+    {
+        unread_date(rounded, k);
+    }
+    crate::Value::Float(i as f64)
+}
+
 /// Counts one more text value `<Null>` read as null in the field at `k` ([`Batch::null_text`]).
 pub(crate) fn null_text_at(counts: &mut Vec<usize>, k: usize) {
     unread_dates_by(counts, k, 1);
 }
 
 /// Counts one more text value that isn't valid in its encoding in the field at `k` ([`Batch::not_utf8`]).
-#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn not_utf8_at(counts: &mut Vec<usize>, k: usize) {
     unread_dates_by(counts, k, 1);
 }
@@ -321,56 +410,116 @@ pub fn add_unread_dates(counts: &mut Vec<usize>, more: &[usize]) {
 
 /// What a read says of values in date fields that weren't dates ([`Batch::unread_dates`]), naming
 /// the first five fields. `None` when there were none.
-pub fn unread_dates_note(fields: &[crate::Field], counts: &[usize]) -> Option<String> {
+pub fn unread_dates_note(fields: &[crate::Field], counts: &[usize]) -> Option<crate::loss::Note> {
     let total: usize = counts.iter().sum();
     if total == 0 {
         return None;
     }
-    let what = if total == 1 { "1 value isn't a date and was".to_string() } else { format!("{total} values aren't dates and were") };
-    Some(format!("{what} read as empty, in {}", crate::io::named_fields(fields, counts)))
+    // Fields of other types count values too: text that isn't yes or no ([`yes_no_text`]), text or a
+    // blob that isn't a number ([`number_text`]), a blob.
+    let mut kinds: Vec<&str> = Vec::new();
+    for (f, _) in fields.iter().zip(counts).filter(|(_, n)| **n > 0) {
+        let kind = match f.ty {
+            crate::FieldType::Boolean => "yes/no values",
+            crate::FieldType::Integer | crate::FieldType::Double => "numbers",
+            // A text field counts dates a mixed column held ([`crate::sheets`]).
+            crate::FieldType::Text | crate::FieldType::Date | crate::FieldType::DateTime => "dates",
+        };
+        if !kinds.contains(&kind) {
+            kinds.push(kind);
+        }
+    }
+    // Dates first, as a read of dates alone always said, then the rest in a fixed order.
+    kinds.sort_by_key(|k| ["dates", "yes/no values", "numbers"].iter().position(|n| n == k));
+    let what = match (kinds.as_slice(), total == 1) {
+        ([], true) | (["dates"], true) => "1 value isn't a date and was".to_string(),
+        ([], false) | (["dates"], false) => format!("{total} values aren't dates and were"),
+        (["yes/no values"], true) => "1 value isn't yes or no and was".to_string(),
+        (["yes/no values"], false) => format!("{total} values aren't yes or no and were"),
+        (["numbers"], true) => "1 value isn't a number and was".to_string(),
+        (["numbers"], false) => format!("{total} values aren't numbers and were"),
+        (kinds, _) => {
+            let (last, first) = kinds.split_last().map_or(("", &[][..]), |(l, f)| (*l, f));
+            let list = if first.is_empty() { last.to_string() } else { format!("{} or {last}", first.join(", ")) };
+            format!("{total} values aren't {list} and were")
+        }
+    };
+    let text = format!("{what} read as empty, in {}", crate::io::named_fields(fields, counts));
+    Some(crate::loss::Note::loss(crate::loss::LossCode::DroppedValue, text))
 }
 
 /// What a read says of text values `<Null>` it read as null ([`crate::Value::is_null_marker`],
 /// [`Batch::null_text`]), naming the first five fields. `None` when there were none. It names the
 /// marker as `Null`, without its brackets: notices are redacted, which takes `<Null>` for a tag.
-pub fn null_text_note(fields: &[crate::Field], counts: &[usize]) -> Option<String> {
+pub fn null_text_note(fields: &[crate::Field], counts: &[usize]) -> Option<crate::loss::Note> {
     let total: usize = counts.iter().sum();
     if total == 0 {
         return None;
     }
     let what = if total == 1 { "1 value written as Null was".to_string() } else { format!("{total} values written as Null were") };
-    Some(format!("{what} read as empty, in {}", crate::io::named_fields(fields, counts)))
+    let text = format!("{what} read as empty, in {}", crate::io::named_fields(fields, counts));
+    Some(crate::loss::Note::loss(crate::loss::LossCode::AssumedNullMarker, text))
 }
 
 /// What a read says of a `.dbf`'s text values that aren't valid in the `encoding` they were read in
 /// ([`Batch::not_utf8`], [`FeatureSource::text_encoding`]): how many, in which fields (the first five
 /// named), and why they were read in it. `None` when there were none.
-pub fn not_utf8_note(fields: &[crate::Field], counts: &[usize], encoding: &str) -> Option<String> {
+pub fn not_utf8_note(fields: &[crate::Field], counts: &[usize], encoding: &str) -> Option<crate::loss::Note> {
     let total: usize = counts.iter().sum();
     if total == 0 {
         return None;
     }
+    // A GeoPackage's text is UTF-8 by its standard: no file chooses another.
+    let (encoding, cause) = if encoding == GEOPACKAGE_TEXT {
+        ("UTF-8", "a GeoPackage holds its text in UTF-8".to_string())
+    } else {
+        (encoding, crate::dbf::cause(encoding))
+    };
     let what = if total == 1 {
         format!("1 text value isn't valid {encoding} and was")
     } else {
         format!("{total} text values aren't valid {encoding} and were")
     };
-    Some(format!(
+    let text = format!(
         "{what} read with U+FFFD in place of the bytes that can't be read, in {}; {}",
         crate::io::named_fields(fields, counts),
-        crate::dbf::cause(encoding)
-    ))
+        cause
+    );
+    Some(crate::loss::Note::loss(crate::loss::LossCode::ChangedEncoding, text))
 }
 
-/// What a read says of date-times it rounded to the microsecond ([`Batch::rounded_dates`]), naming
-/// the first five fields. `None` when there were none.
-pub fn rounded_dates_note(fields: &[crate::Field], counts: &[usize]) -> Option<String> {
+/// What a read says of values it rounded ([`Batch::rounded_dates`]): date-times to the microsecond,
+/// whole numbers past 2^53 to the nearest decimal number a Double field holds. Names the first five
+/// fields. `None` when there were none.
+pub fn rounded_dates_note(fields: &[crate::Field], counts: &[usize]) -> Option<crate::loss::Note> {
     let total: usize = counts.iter().sum();
     if total == 0 {
         return None;
     }
-    let what = if total == 1 { "1 date-time was".to_string() } else { format!("{total} date-times were") };
-    Some(format!("{what} rounded to the microsecond, as more digits than that aren't kept, in {}", crate::io::named_fields(fields, counts)))
+    let number = |f: &crate::Field| matches!(f.ty, crate::FieldType::Integer | crate::FieldType::Double);
+    let counted = |numbers: bool| fields.iter().zip(counts).any(|(f, n)| *n > 0 && number(f) == numbers);
+    let (numbers, dates) = (counted(true), counted(false));
+    let text = match (numbers, dates) {
+        (true, true) => format!(
+            "{total} values were rounded, date-times to the microsecond and numbers to the nearest decimal number, as more digits than that aren't kept, in {}",
+            crate::io::named_fields(fields, counts)
+        ),
+        (true, false) => {
+            let what = if total == 1 { "1 number was".to_string() } else { format!("{total} numbers were") };
+            format!(
+                "{what} rounded to the nearest decimal number, changing digits before the point, as a decimal field doesn't keep more than 15 or 16 digits, in {}",
+                crate::io::named_fields(fields, counts)
+            )
+        }
+        _ => {
+            let what = if total == 1 { "1 date-time was".to_string() } else { format!("{total} date-times were") };
+            format!(
+                "{what} rounded to the microsecond, as more digits than that aren't kept, in {}",
+                crate::io::named_fields(fields, counts)
+            )
+        }
+    };
+    Some(crate::loss::Note::loss(crate::loss::LossCode::ChangedRounded, text))
 }
 
 /// A vector data source read in place.
@@ -419,6 +568,27 @@ pub trait FeatureSource: Send + Sync {
     fn visit_chunks(&self, _extent: Option<Extent>, _bytes: usize, _visit: &mut dyn FnMut(Vec<Feature>) -> Result<()>) -> Result<Batch> {
         Err(DataError::Unsupported("a source that can't be read a chunk at a time".into()))
     }
+    /// Whether [`FeatureSource::visit_ids_chunks`] is available.
+    fn visits_ids(&self) -> bool {
+        false
+    }
+    /// The features with these ids ([`Feature::id`], in order), visited a chunk at a time in
+    /// source order, as [`FeatureSource::visit_chunks`] visits them: for a read of features
+    /// someone already knows by id. Ids the source doesn't hold are left out.
+    fn visit_ids_chunks(&self, _ids: &[u64], _bytes: usize, _visit: &mut dyn FnMut(Vec<Feature>) -> Result<()>) -> Result<Batch> {
+        Err(DataError::Unsupported("a source that can't be read by feature id".into()))
+    }
+    /// [`FeatureSource::visit_chunks`] for a whole request, its box in the source's own system
+    /// ([`Request::own`]) too (one over the whole plane, [`whole_plane`], reads every feature as a
+    /// map in that system draws them): a source that reads one this way tests each feature's own box
+    /// against it, converting nothing. One that doesn't visits every feature when given a box in
+    /// its own system, never fewer than it holds (its extent, in longitude/latitude, may hold
+    /// less), and reads the extent otherwise (no box, or one in another system).
+    fn visit_request_chunks(&self, req: &Request, bytes: usize, visit: &mut dyn FnMut(Vec<Feature>) -> Result<()>) -> Result<Batch> {
+        // A box in another system is read as if absent, as `Request::own` has it.
+        let in_own = req.own.is_some_and(|(crs, _)| crs == self.coord_crs());
+        self.visit_chunks(if in_own { None } else { req.extent }, bytes, visit)
+    }
     fn info(&self) -> &SourceInfo;
     /// The coordinate system of the features it gives: a file read in place gives them as the file
     /// holds them, in its own system (Shapefile, GeoPackage, FlatGeobuf, GeoParquet, GeoJSON); a
@@ -429,9 +599,10 @@ pub trait FeatureSource: Send + Sync {
         crate::raster::Crs::LonLat
     }
 
-    /// Whether a read given its box in the source's own system ([`Request::own`]) tests its
-    /// features against that box (a file read in place, PostGIS), so a map in that system keeps
-    /// its window in map units for it. A source that reads by the longitude/latitude extent
+    /// Whether a read ([`FeatureSource::read`]) given its box in the source's own system
+    /// ([`Request::own`]) tests its features against that box (a file read in place, PostGIS), so
+    /// a map in that system keeps its window in map units for it. A complete visit does so only
+    /// where the source says so through [`FeatureSource::visit_request_chunks`]. A source that reads by the longitude/latitude extent
     /// whatever it is given (another database, a service, a converted copy) says no: its window is
     /// kept in longitude/latitude, as it reads.
     fn reads_own_box(&self) -> bool {
@@ -451,6 +622,18 @@ pub trait FeatureSource: Send + Sync {
     /// whole read's `ReadReport::skipped` to count with what reads skip.
     fn skipped_at_open(&self) -> usize {
         0
+    }
+    /// The smallest and largest value of a numeric field across the whole source, when the source
+    /// states them without being read (GeoParquet column statistics); `None` when any part of it
+    /// doesn't, or the field has no value.
+    fn field_range(&self, _field: &str) -> Option<(f64, f64)> {
+        None
+    }
+    /// Whether the source's notes ([`SourceInfo::notes`]) already count the features it keeps
+    /// with a place that can't be given in longitude/latitude, so a whole read doesn't count them
+    /// again.
+    fn says_unplaced_at_open(&self) -> bool {
+        false
     }
     /// Reads the features a request asks for. A source read by its web address fails with
     /// [`remote::NEED`] until the bytes the read needs are fetched: run it with
@@ -715,6 +898,14 @@ impl FeatureSource for Fetching {
         self.0.skipped_at_open()
     }
 
+    fn field_range(&self, field: &str) -> Option<(f64, f64)> {
+        self.0.field_range(field)
+    }
+
+    fn says_unplaced_at_open(&self) -> bool {
+        self.0.says_unplaced_at_open()
+    }
+
     fn read(&self, req: &Request) -> Result<Batch> {
         read_blocking(&self.0, req)
     }
@@ -733,19 +924,55 @@ pub fn layers(path: &Path) -> Result<Vec<String>> {
 /// source can, otherwise in one read up to [`MAX_LIMIT`]. A larger source, or an incomplete read,
 /// is refused.
 pub fn materialize(src: &dyn FeatureSource) -> Result<(Dataset, ReadReport)> {
-    materialize_within(src, MAX_READ_BYTES)
+    materialize_within(src, MAX_READ_BYTES, None)
 }
 
-/// [`materialize`], with `budget` bytes for a source read a chunk at a time.
-fn materialize_within(src: &dyn FeatureSource, budget: u64) -> Result<(Dataset, ReadReport)> {
+/// [`materialize`] for a caller that can hold only `budget` bytes of features: a larger source is
+/// refused with the error `refusal`. It is refused before it is read when the count it gives says
+/// its rows and their values alone are larger. A source that can be walked whole a chunk at a time
+/// ([`FeatureSource::visits_extent_chunks`], a GeoJSON read in place too) is refused as soon as
+/// what is read passes the budget, having held no more than a chunk, or one larger feature, past
+/// it. A file by its web address that can't be walked is refused before it is read, as neither its
+/// count nor its size says what its geometry and text decode to. Any other source read at once
+/// can't be stopped partway: it is measured once read.
+pub fn materialize_up_to(src: &dyn FeatureSource, budget: u64, refusal: &str) -> Result<(Dataset, ReadReport)> {
     let info = src.info();
-    let batch = if src.visits_chunks() { read_chunks(src, budget)? } else { read_at_once(src)? };
+    let row = std::mem::size_of::<Feature>().saturating_add(info.fields.len().saturating_mul(std::mem::size_of::<crate::Value>()));
+    if info.count.is_some_and(|n| n.saturating_mul(row as u64) > budget) {
+        return Err(DataError::Format(refusal.to_string()));
+    }
+    if src.remote().is_some() && !src.visits_extent_chunks() {
+        return Err(DataError::Format(format!(
+            "{}: a file read by its web address can't be read whole within a memory limit: download it and add the file, or use the desktop app",
+            info.name
+        )));
+    }
+    materialize_within(src, budget, Some(refusal))
+}
+
+/// [`materialize`], with `budget` bytes for a source read a chunk at a time. `refusal`, given by a
+/// caller held to the budget, is the error for a source over it: then a source that can only be
+/// walked by extent is walked too, and one read at once is measured against the budget.
+fn materialize_within(src: &dyn FeatureSource, budget: u64, refusal: Option<&str>) -> Result<(Dataset, ReadReport)> {
+    let info = src.info();
+    let batch = if src.visits_chunks() || (refusal.is_some() && src.visits_extent_chunks()) {
+        read_chunks(src, budget, refusal)?
+    } else {
+        let batch = read_at_once(src)?;
+        if let Some(refusal) = refusal
+            && chunk_memory::features_bytes(&batch.features) as u64 > budget
+        {
+            return Err(DataError::Format(refusal.to_string()));
+        }
+        batch
+    };
     let Batch { features, skipped, unread_dates, rounded_dates, null_text, notes, not_utf8, .. } = batch;
     let mut ds = Dataset::new(info.name.clone(), info.geometry_type, info.fields.clone());
     ds.crs = info.coordinate_system();
-    // A streamed Shapefile skips unconvertible shapes rather than retaining empty geometry.
-    // Once materialized, it must still direct CRS repairs back to the original file.
-    ds.crs_incomplete = (info.format == "Shapefile" && skipped > 0) || src.lost_to_crs();
+    // A shape with no place in longitude/latitude is kept as the source holds it
+    // ([`Reproject::place`]), so only a source that says it lost features to its system leaves
+    // Define Projection unable to place them.
+    ds.crs_incomplete = src.lost_to_crs();
     ds.zm_dropped = info.zm_dropped;
     ds.features = features.into();
     // Held as the source gives its features, in its own system.
@@ -759,16 +986,23 @@ fn materialize_within(src: &dyn FeatureSource, budget: u64) -> Result<(Dataset, 
         unread_dates: unread_dates.clone(),
         rounded_dates: rounded.clone(),
         extrusion: None,
+        columns_lacking: None,
     };
     let null_text = null_text_note(&info.fields, &null_text);
     let not_utf8 = not_utf8_note(&info.fields, &not_utf8, src.text_encoding());
-    report.messages.extend(unread_dates.into_iter().chain(rounded).chain(null_text).map(|n| format!("{}: {n}", info.name)));
+    report.messages.extend(unread_dates.into_iter().chain(rounded).chain(null_text).map(|n| n.prefixed(&info.name)));
     report.messages.extend(notes.prefixed(&info.name));
-    report.messages.extend(not_utf8.into_iter().map(|n| format!("{}: {n}", info.name)));
+    report.messages.extend(not_utf8.into_iter().map(|n| n.prefixed(&info.name)));
     if ds.geometry_type == GeometryType::None
         && let Some(g) = ds.features.iter().find_map(|f| f.geometry.as_ref())
     {
         ds.geometry_type = g.kind();
+    }
+    // The features kept with a place that can't be given in longitude/latitude, said once, as a
+    // file read whole says them; a source that said them when it was opened isn't counted again.
+    if !src.says_unplaced_at_open() {
+        let notes = ds.kept_unplaced_notes().map_err(DataError::of_conversion)?;
+        report.messages.extend(notes.into_iter().map(|n| format!("{}: {n}", info.name)));
     }
     Ok((ds, report))
 }
@@ -802,16 +1036,18 @@ fn read_at_once(src: &dyn FeatureSource) -> Result<Batch> {
 }
 
 /// Every feature of a source that can be read a chunk at a time, with the rows it skipped and the
-/// values it counted, refusing the source once its features would hold more than `budget` bytes.
-fn read_chunks(src: &dyn FeatureSource, budget: u64) -> Result<Batch> {
+/// values it counted, refusing the source once its features would hold more than `budget` bytes,
+/// with the error `refusal` when given.
+fn read_chunks(src: &dyn FeatureSource, budget: u64, refusal: Option<&str>) -> Result<Batch> {
     let info = src.info();
     let row_bytes = std::mem::size_of::<Feature>() as u64;
     let too_large = || {
-        DataError::Format(format!(
-            "{}: the layer needs more than the {} MiB a whole read may hold: clip or filter it first",
-            info.name,
-            budget >> 20
-        ))
+        DataError::Format(match refusal {
+            Some(refusal) => refusal.to_string(),
+            None => {
+                format!("{}: the layer needs more than the {} MiB a whole read may hold: clip or filter it first", info.name, budget >> 20)
+            }
+        })
     };
     let no_memory = || DataError::Format(format!("{}: not enough memory to read the whole layer", info.name));
     // A count that alone is too many rows is refused before reading. It isn't trusted to size the
@@ -888,7 +1124,7 @@ impl Reproject {
         authority: Option<&str>,
         code: Option<i64>,
         wkt: Option<&str>,
-        notes: &mut Vec<String>,
+        notes: &mut crate::loss::Notes,
     ) -> Option<Result<Reproject>> {
         use crate::raster::planetary::{Declared, declared};
         Some(match declared(authority, code, wkt)? {
@@ -901,7 +1137,7 @@ impl Reproject {
     }
 
     /// From an EPSG code; an unknown or missing code is taken as longitude/latitude, with a note.
-    pub(crate) fn from_epsg(code: Option<u32>, notes: &mut Vec<String>) -> Reproject {
+    pub(crate) fn from_epsg(code: Option<u32>, notes: &mut crate::loss::Notes) -> Reproject {
         let crs = match code {
             None | Some(0) => Crs::LonLat,
             Some(c) => match Crs::from_epsg(c) {
@@ -909,7 +1145,10 @@ impl Reproject {
                 None => {
                     // Unknown, or one only the desktop app can use (an azimuthal equidistant one in
                     // the web app), which it says.
-                    notes.push(format!("{}; read as longitude/latitude", crate::raster::crs::unusable_epsg(c)));
+                    notes.push(crate::loss::Note::loss(
+                        crate::loss::LossCode::AssumedCrs,
+                        format!("{}; read as longitude/latitude", crate::raster::crs::unusable_epsg(c)),
+                    ));
                     Crs::LonLat
                 }
             },
@@ -919,13 +1158,13 @@ impl Reproject {
 
     /// From a coordinate system; one that can't be converted is taken as longitude/latitude, with
     /// a note.
-    pub(crate) fn from_crs(crs: Crs, notes: &mut Vec<String>) -> Reproject {
+    pub(crate) fn from_crs(crs: Crs, notes: &mut crate::loss::Notes) -> Reproject {
         let t = match crs {
             Crs::LonLat => None,
             other => match other.transformer() {
                 Ok(t) => Some(t),
                 Err(e) => {
-                    notes.push(format!("{e}; read as longitude/latitude"));
+                    notes.push(crate::loss::Note::loss(crate::loss::LossCode::AssumedCrs, format!("{e}; read as longitude/latitude")));
                     None
                 }
             },
@@ -982,31 +1221,42 @@ impl Reproject {
         ok.then_some(out)
     }
 
-    /// A geometry as the file holds it, kept in the source's own coordinates
-    /// ([`Reproject::crs`]), with its box in longitude/latitude for a request's extent to test
-    /// ([`Reproject::place`]); `None` when a coordinate can't be converted to longitude/latitude,
-    /// as a feature that can't be placed is left out. Each coordinate is converted to be checked,
-    /// none is kept converted.
+    /// A geometry as the source holds it, kept in its own coordinates ([`Reproject::crs`]), with
+    /// its box in longitude/latitude for a request's extent to test, for a source read by its
+    /// rows (MySQL, SQL Server). A geometry with a place that can't be given in
+    /// longitude/latitude is kept as well, with no box (#2032 C2f-4b): within a read with no
+    /// extent (a whole read) and outside any extent, as [`Reproject::place`] keeps it. For a
+    /// source in another system than longitude/latitude, `None` for one with a coordinate that
+    /// isn't a number, which the reader leaves out and counts. Each coordinate is converted to be
+    /// checked, none is kept converted.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn read(&self, g: Geometry) -> Option<Placed> {
         let Some(t) = &self.t else {
-            let lonlat = g.extent();
+            let lonlat = Some(g.extent());
             return Some(Placed { geometry: g, lonlat });
         };
-        let mut ok = true;
-        let mut lonlat = Extent::EMPTY;
-        g.for_each_coord(|c| match t.to_lonlat(c).filter(|l| l.is_finite()) {
-            Some(l) => lonlat.expand(l),
-            None => ok = false,
-        });
-        ok.then_some(Placed { geometry: g, lonlat })
+        if !g.is_finite() {
+            return None;
+        }
+        let lonlat = crate::io::places_lonlat_extent(&g, t);
+        Some(Placed { geometry: g, lonlat })
+    }
+
+    /// Whether a geometry read with its box ([`Placed::lonlat`]) is within a request's extent: a
+    /// read with no extent holds every one, one with no place in longitude/latitude none with an
+    /// extent.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn within(lonlat: Option<&Extent>, extent: Option<&Extent>) -> bool {
+        extent.is_none_or(|e| lonlat.is_some_and(|l| l.intersects(e)))
     }
 
     /// A geometry as the file holds it, kept in the source's own coordinates, and whether it is
-    /// within `req`. Given the request's box in those coordinates ([`Request::own`]), its own box
-    /// is tested against it, converting nothing, so a geometry with no place in
-    /// longitude/latitude is kept too (`None` for one with a coordinate that isn't a number).
-    /// Otherwise as [`Reproject::read`]: `None` when a coordinate can't be converted to
-    /// longitude/latitude, and its box there tested against the extent.
+    /// within `req`; `None` for one with a coordinate that isn't a number, for the reader to
+    /// count. Given the request's box in those coordinates ([`Request::own`]), its own box is
+    /// tested against it, converting nothing. Otherwise its box in longitude/latitude
+    /// ([`Reproject::read`]) is tested against the extent; a geometry with a place that can't be
+    /// given there is kept as well (#2032 C2f-4b), within a read with no extent (a whole read)
+    /// and outside any extent.
     pub(crate) fn place(&self, g: Geometry, req: &Request) -> Option<Fitted> {
         if let Some(own) = self.own_box(req) {
             // A coordinate that isn't a number has no place here either: left out, as `read`
@@ -1014,12 +1264,27 @@ impl Reproject {
             if !g.is_finite() {
                 return None;
             }
-            let inside = g.extent().intersects(&own);
+            // A box over the whole plane holds every shape, one with no place (an empty part) too.
+            let inside = own == whole_plane() || g.extent().intersects(&own);
             return Some(Fitted { geometry: g, inside });
         }
-        let Placed { geometry, lonlat } = self.read(g)?;
-        let inside = req.extent.is_none_or(|e| lonlat.intersects(&e));
-        Some(Fitted { geometry, inside })
+        if !g.is_finite() {
+            return None;
+        }
+        let Some(e) = req.extent else { return Some(Fitted { geometry: g, inside: true }) };
+        let lonlat = match &self.t {
+            None => Some(g.extent()),
+            Some(t) => {
+                let mut box_ = Some(Extent::EMPTY);
+                g.for_each_coord(|c| match (t.to_lonlat(c).filter(|l| l.is_finite()), &mut box_) {
+                    (Some(l), Some(b)) => b.expand(l),
+                    _ => box_ = None,
+                });
+                box_
+            }
+        };
+        let inside = lonlat.is_some_and(|l| l.intersects(&e));
+        Some(Fitted { geometry: g, inside })
     }
 
     /// The request's box in the source's own coordinates, when the asker gave it there
@@ -1107,7 +1372,7 @@ pub(crate) struct GpkgSrs {
 /// extension) takes priority over its `definition`, as OGC 12-128r19 F.10 says. With no row for
 /// `srs_id`, it is taken as an EPSG code only for WGS 84 and Web Mercator, the ids writers commonly
 /// use without defining.
-pub(crate) fn gpkg_reproject(srs_id: i64, row: Option<GpkgSrs>, notes: &mut Vec<String>) -> Result<Reproject> {
+pub(crate) fn gpkg_reproject(srs_id: i64, row: Option<GpkgSrs>, notes: &mut crate::loss::Notes) -> Result<Reproject> {
     let wkt2 = row.as_ref().and_then(|r| defined(r.definition_12_063.as_deref()));
     let wkt1 = row.as_ref().and_then(|r| defined(r.definition.as_deref()));
     // An EPSG code: the row's when its organization is EPSG (a table-local id such as 100001
@@ -1138,7 +1403,10 @@ pub(crate) fn gpkg_reproject(srs_id: i64, row: Option<GpkgSrs>, notes: &mut Vec<
     // Longitude/latitude is what WGS 84 and the spec's "undefined geographic" id 0 mean; any other
     // id, the "undefined cartesian" -1 too, is assumed to be it.
     if srs_id != 0 && srs_id != 4326 {
-        notes.push(format!("{what} has no EPSG code; read as longitude/latitude"));
+        notes.push(crate::loss::Note::loss(
+            crate::loss::LossCode::AssumedCrs,
+            format!("{what} has no EPSG code; read as longitude/latitude"),
+        ));
     }
     Ok(Reproject::from_crs(Crs::LonLat, notes))
 }
@@ -1174,7 +1442,7 @@ pub(crate) struct DeclaredCrs<'a> {
 /// as longitude/latitude. An Earth definition beside another body's IAU code is read, and said.
 /// `None` when there is nothing to read it by: no EPSG code, no definition and no other body's
 /// code; the format then says what its coordinates are taken as.
-pub(crate) fn declared_reproject(declared: DeclaredCrs, notes: &mut Vec<String>) -> Option<Result<Reproject>> {
+pub(crate) fn declared_reproject(declared: DeclaredCrs, notes: &mut crate::loss::Notes) -> Option<Result<Reproject>> {
     let DeclaredCrs { what, organization, code: declared_code, epsg, wkt1, wkt2 } = declared;
     let definition = wkt2.or(wkt1);
     if let Some(code) = epsg
@@ -1223,8 +1491,9 @@ pub(crate) fn declared_reproject(declared: DeclaredCrs, notes: &mut Vec<String>)
     // its organization and code (an IAU one). Its longitude/latitude are read with a notice. Other
     // coordinates are refused, because they would land in the wrong place. A planetary definition
     // that `read_wkt` reads is converted like any other, with its own notice.
-    let other_body =
-        |definition: Option<&str>, notes: &mut Vec<String>| Reproject::planetary(what, organization, declared_code, definition, notes);
+    let other_body = |definition: Option<&str>, notes: &mut crate::loss::Notes| {
+        Reproject::planetary(what, organization, declared_code, definition, notes)
+    };
     // Else the WKT it is defined with: a custom system, or a code this build doesn't know.
     if let Some(mut definition) = definition {
         // The definition read is the WKT2 whenever there is one.
@@ -1239,7 +1508,7 @@ pub(crate) fn declared_reproject(declared: DeclaredCrs, notes: &mut Vec<String>)
             // Unless the WKT2 is another body's system that is refused: it is the one that counts.
             // (One the WKT2 can't tell the coordinates of, as when it can't be parsed, gives way,
             // so the code isn't asked here: an IAU projected code would refuse a WKT1 that reads.)
-            if let Some(Err(refused)) = Reproject::planetary(what, None, None, Some(definition), &mut Vec::new()) {
+            if let Some(Err(refused)) = Reproject::planetary(what, None, None, Some(definition), &mut crate::loss::Notes::new()) {
                 return Some(Err(refused));
             }
             notes.push(format!("{what}: its WKT2 definition can't be read ({e}), so its WKT1 definition is used"));
@@ -1266,7 +1535,10 @@ pub(crate) fn declared_reproject(declared: DeclaredCrs, notes: &mut Vec<String>)
                 if let Some(reproject) = wkt2.into_iter().chain([definition]).find_map(|d| other_body(Some(d), notes)) {
                     return Some(reproject);
                 }
-                notes.push(format!("{what} can't be read ({e}); read as longitude/latitude"));
+                notes.push(crate::loss::Note::loss(
+                    crate::loss::LossCode::AssumedCrs,
+                    format!("{what} can't be read ({e}); read as longitude/latitude"),
+                ));
                 Crs::LonLat
             }
         };
@@ -1374,10 +1646,11 @@ pub(crate) fn in_request(g: &Geometry, req: &Request) -> bool {
 }
 
 /// A geometry a source read, in its own coordinates, and its box in longitude/latitude
-/// ([`Reproject::read`]).
+/// ([`Reproject::read`]): `None` when a place of it can't be given there.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) struct Placed {
     pub(crate) geometry: Geometry,
-    pub(crate) lonlat: Extent,
+    pub(crate) lonlat: Option<Extent>,
 }
 
 /// A geometry a source read for a request, in its own coordinates, and whether it is within the

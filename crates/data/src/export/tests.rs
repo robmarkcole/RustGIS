@@ -182,8 +182,11 @@ fn a_streamed_web_mercator_export_counts_what_it_writes_at_85_degrees() {
         }
     }
     assert_eq!(
-        crate::web_mercator_moved_note("polar.gpkg", "polar", 3).as_deref(),
-        Some("polar.gpkg: 3 vertices of polar are beyond 85.05° north or south, and written at 85.05°, where Web Mercator ends")
+        crate::web_mercator_moved_note("polar.gpkg", "polar", 3),
+        Some(crate::loss::Note::loss(
+            crate::loss::LossCode::ChangedPosition,
+            "polar.gpkg: 3 vertices of polar are beyond 85.05° north or south, and written at 85.05°, where Web Mercator ends"
+        ))
     );
     assert_eq!(crate::web_mercator_moved_note("polar.gpkg", "polar", 0), None);
     let _ = std::fs::remove_dir_all(d);
@@ -242,7 +245,7 @@ fn a_streamed_export_writes_what_a_whole_export_writes() {
                     rounded_dates: Vec::new(),
                     null_text: Vec::new(),
                     not_utf8: Vec::new(),
-                    not_utf8_in: "UTF-8",
+                    not_utf8_in: src.text_encoding(),
                     utc_dates,
                     fine_dates: if ext == "gpkg" { crate::io::fine_dates(whole.features.iter(), &whole.fields) } else { Vec::new() },
                     written_values: if ext == "fgb" { crate::io::written_values(whole.features.iter(), &whole.fields) } else { Vec::new() },
@@ -521,10 +524,11 @@ fn geoparquet_counts_values_written_as_null() {
     assert_eq!(streamed.unfit, vec![0, 2, 1, 1]);
     let note = crate::source::parquet::unfit_note(&layer.fields, &streamed.unfit, "lossy.parquet").unwrap();
     assert_eq!(
-        note,
+        note.as_str(),
         "lossy.parquet: 4 values couldn't be written as their columns' types and were written as null, in 'count', 'share', 'open'"
     );
-    assert_eq!(crate::source::parquet::values_note(&ds, "lossy.parquet").as_deref(), Some(note.as_str()));
+    assert_eq!(note.loss, Some(crate::loss::LossCode::DroppedValue));
+    assert_eq!(crate::source::parquet::values_note(&ds, "lossy.parquet").as_ref().map(crate::loss::Note::as_str), Some(note.as_str()));
     let back = read_back(&d.join("lossy.parquet"));
     assert_eq!((&back.features[1].attrs[1], &back.features[3].attrs[3]), (&Value::Null, &Value::Null));
 
@@ -540,7 +544,7 @@ fn geoparquet_counts_values_written_as_null() {
     let fields = vec![Field::new("a\u{202E}b\nc", FieldType::Integer), Field::new("x".repeat(60), FieldType::Integer)];
     let note = crate::source::parquet::unfit_note(&fields, &[1, 1], "out\u{2028}.parquet").unwrap();
     let want = "out .parquet: 2 values couldn't be written as their columns' types and were written as null, in 'a b c'";
-    assert_eq!(note, format!("{want}, '{}…'", "x".repeat(40)));
+    assert_eq!(note.as_str(), format!("{want}, '{}…'", "x".repeat(40)));
     let _ = std::fs::remove_dir_all(d);
 }
 

@@ -9,7 +9,7 @@
 //! Losses no reader says yet are listed as [`Expect::Silent`] with what is lost. They are the
 //! roadmap's known silent losses (ROADMAP.md › Correct results); a reader that starts saying one
 //! fails here until the case is moved to [`Expect::Said`], so the list only shrinks. Exports have
-//! their own test, `never_silent_roundtrip.rs`.
+//! their own test, `never_silent_roundtrip.rs`; `read_routes.rs` reads these files by every route.
 //!
 //! The table includes text, CityJSON, CityGML, KMZ, GeoPackage, FlatGeobuf, GeoParquet, FileGDB,
 //! Shapefile, XLSX, ODS, XLS, XLSB, OSM PBF and feature-service PBF. More formats and loss kinds remain to add (ROADMAP.md); one loss
@@ -25,8 +25,8 @@ enum Expect {
     Said(&'static str),
     /// Imports the layer and says the loss in a notice; refusing this valid fixture is a failure.
     Imported(&'static str),
-    /// Imports successfully and identifies the loss with a code.
-    Classified(LossCode),
+    /// Imports successfully and identifies the loss with a code, in a notice holding these words.
+    Classified(LossCode, &'static str),
     /// Loses it without a notice today, still adding a layer: what is lost.
     Silent(&'static str),
 }
@@ -80,15 +80,15 @@ fn check_csv_extra(ds: &rustgis_engine::data::Dataset) -> std::io::Result<()> {
 }
 
 /// A clean file and the same file with a loss in it.
-struct Case {
+pub(super) struct Case {
     /// The reader and the loss, to name a failure.
-    name: &'static str,
+    pub(super) name: &'static str,
     /// The file name, whose extension picks the reader.
-    file: &'static str,
-    clean: Vec<u8>,
-    lossy: Vec<u8>,
+    pub(super) file: &'static str,
+    pub(super) clean: Vec<u8>,
+    pub(super) lossy: Vec<u8>,
     /// Files beside the clean and lossy inputs (binary indexes can differ).
-    beside: [Vec<(&'static str, Vec<u8>)>; 2],
+    pub(super) beside: [Vec<(&'static str, Vec<u8>)>; 2],
     expect: Expect,
     /// Additional exact notices for this case's lossy input, in report order before its primary notice.
     extra_notices: &'static [&'static str],
@@ -186,7 +186,7 @@ fn shapefile_zip(name: &[u8]) -> Vec<u8> {
 }
 
 /// Builds paired inputs, keeping sidecars specific to each input when their binary layout differs.
-fn cases(fixture_dir: &std::path::Path) -> Vec<Case> {
+pub(super) fn cases(fixture_dir: &std::path::Path) -> Vec<Case> {
     let point = r#"{"type":"Point","coordinates":[1,2]}"#;
     let topo_line = |arcs: &str| format!(r#"{{"type":"Topology","objects":{{"o":{{"type":"LineString","arcs":[0]}}}},"arcs":[{arcs}]}}"#);
     // Quantized and delta-encoded.
@@ -220,7 +220,13 @@ fn cases(fixture_dir: &std::path::Path) -> Vec<Case> {
 
     let mut out = vec![
         // GeoJSON.
-        case("GeoJSON: a height", "a.geojson", geojson(&[point]), geojson(&[r#"{"type":"Point","coordinates":[1,2,3]}"#]), Said("Z or M")),
+        case(
+            "GeoJSON: a height",
+            "a.geojson",
+            geojson(&[point]),
+            geojson(&[r#"{"type":"Point","coordinates":[1,2,3]}"#]),
+            Expect::Classified(LossCode::DroppedZm, "Z or M"),
+        ),
         case(
             "GeoJSON: an unreadable geometry",
             "a.geojson",
@@ -229,7 +235,13 @@ fn cases(fixture_dir: &std::path::Path) -> Vec<Case> {
             Said("unreadable geometry"),
         ),
         // TopoJSON.
-        case("TopoJSON: a height", "a.topojson", topo_line("[[0,0],[1,1]]"), topo_line("[[0,0,5],[1,1,6]]"), Said("Z or M")),
+        case(
+            "TopoJSON: a height",
+            "a.topojson",
+            topo_line("[[0,0],[1,1]]"),
+            topo_line("[[0,0,5],[1,1,6]]"),
+            Expect::Classified(LossCode::DroppedZm, "Z or M"),
+        ),
         case(
             "TopoJSON: an arc index the file doesn't hold",
             "a.topojson",
@@ -259,7 +271,13 @@ fn cases(fixture_dir: &std::path::Path) -> Vec<Case> {
             "wkt,id\n\"POINT(1 2)\",1\n\"POINT(3\",2\n",
             Said("isn't readable WKT"),
         ),
-        case("CSV: a height in WKT", "a.csv", "wkt,id\n\"POINT(1 2)\",1\n", "wkt,id\n\"POINT Z(1 2 3)\",1\n", Said("Z or M")),
+        case(
+            "CSV: a height in WKT",
+            "a.csv",
+            "wkt,id\n\"POINT(1 2)\",1\n",
+            "wkt,id\n\"POINT Z(1 2 3)\",1\n",
+            Expect::Classified(LossCode::DroppedZm, "Z or M"),
+        ),
         case(
             "CSV: an unreadable coordinate",
             "a.csv",
@@ -294,7 +312,7 @@ fn cases(fixture_dir: &std::path::Path) -> Vec<Case> {
             "a.kml",
             kml(&["<Point><coordinates>1,2</coordinates></Point>"]),
             kml(&["<Point><coordinates>1,2,30</coordinates></Point>"]),
-            Said("Z or M"),
+            Expect::Classified(LossCode::DroppedZm, "Z or M"),
         ),
         case(
             "KML: a placemark without geometry",
@@ -432,7 +450,7 @@ fn cases(fixture_dir: &std::path::Path) -> Vec<Case> {
             gml(
                 r#"<gml:LineString srsName="urn:ogc:def:crs:EPSG::4326"><gml:posList srsDimension="3">48 10 5 49 11 6</gml:posList></gml:LineString>"#,
             ),
-            Said("Z or M"),
+            Expect::Classified(LossCode::DroppedZm, "Z or M"),
         ),
         // GeoRSS.
         case(
@@ -447,7 +465,7 @@ fn cases(fixture_dir: &std::path::Path) -> Vec<Case> {
             "a.rss",
             georss(&[&georss_polygon("1 1 1 2 2 2 1 1")]),
             georss(&[&georss_polygon("1 x")]),
-            Expect::Classified(LossCode::DroppedRing),
+            Expect::Classified(LossCode::DroppedRing, "hole"),
         ),
         case(
             "GeoRSS: a point with more than one pair",
@@ -484,7 +502,7 @@ fn cases(fixture_dir: &std::path::Path) -> Vec<Case> {
             "a.xml",
             landxml(&cg_points("1 1")),
             landxml(&cg_points("x y")),
-            Said("couldn't be read and were left out"),
+            Expect::Classified(LossCode::DroppedFeature, "couldn't be read and was left out"),
         ),
         case(
             "LandXML: a parcel without geometry",
@@ -629,9 +647,15 @@ fn cases(fixture_dir: &std::path::Path) -> Vec<Case> {
         .collect::<Vec<_>>();
     out.extend(kmz);
     out.extend([
-        case("CityJSON: varying line heights", "a.city.json", cityjson(0), cityjson(5), Said("Z or M")),
-        case("CityGML: varying line heights", "a.gml", citygml(0), citygml(5), Said("Z or M")),
-        case("GeoPackage: a height", "a.gpkg", gpkg(fixture_dir, false), gpkg(fixture_dir, true), Said("Z or M")),
+        case("CityJSON: varying line heights", "a.city.json", cityjson(0), cityjson(5), Expect::Classified(LossCode::DroppedZm, "Z or M")),
+        case("CityGML: varying line heights", "a.gml", citygml(0), citygml(5), Expect::Classified(LossCode::DroppedZm, "Z or M")),
+        case(
+            "GeoPackage: a height",
+            "a.gpkg",
+            gpkg(fixture_dir, false),
+            gpkg(fixture_dir, true),
+            Expect::Classified(LossCode::DroppedZm, "Z or M"),
+        ),
         case(
             "FlatGeobuf: a height",
             "a.fgb",
@@ -923,7 +947,8 @@ fn read(dir: &std::path::Path, file: &str, content: &[u8], beside: &[(&str, Vec<
             || native.features[0].geometry != Some(rustgis_engine::data::Geometry::Point(rustgis_engine::geom::Coord::new(1.0, 2.0)))
             || native.features[0].attrs != [rustgis_engine::data::Value::Int(1)]
             || report.skipped != 0
-            || report.messages != if collection { vec![collection_note] } else { vec![] }
+            || report.messages.texts().collect::<Vec<_>>() != if collection { vec![collection_note] } else { vec![] }
+            || report.messages.iter().any(|m| m.loss != Some(LossCode::DroppedGeometry))
         {
             return Err(std::io::Error::other(format!("CSV collection retained data or notice differs: {native:?}, {report:?}")));
         }
@@ -942,7 +967,9 @@ fn read(dir: &std::path::Path, file: &str, content: &[u8], beside: &[(&str, Vec<
             check_dbf_date(&native, dbf_invalid)?;
         }
         let expected = if csv_extra { &extra_messages } else { &dbf_messages };
-        if report.skipped != 0 || &report.messages != expected {
+        let code = if csv_extra { LossCode::DroppedExtraAttributes } else { LossCode::DroppedValue };
+        let coded = report.messages.iter().all(|m| m.loss == Some(code));
+        if report.skipped != 0 || report.messages.texts().collect::<Vec<_>>() != *expected || !coded {
             return Err(std::io::Error::other(format!("tabular native report: {report:?}")));
         }
     }
@@ -967,10 +994,16 @@ fn read(dir: &std::path::Path, file: &str, content: &[u8], beside: &[(&str, Vec<
             || content == include_bytes!("../../testdata/reading-losses/book-z.xls")
             || content == include_bytes!("../../testdata/reading-losses/book-z.xlsb");
         let errors = content == include_bytes!("../../testdata/reading-losses/book-error.xlsx");
-        if collection && report.messages != [collection_note] {
+        if collection
+            && (report.messages.texts().collect::<Vec<_>>() != [collection_note]
+                || report.messages[0].loss != Some(LossCode::DroppedGeometry))
+        {
             return Err(std::io::Error::other(format!("native spreadsheet collection notice: {report:?}")));
         }
-        if errors && report.messages != ["1 spreadsheet error cell was read as empty, in 'note'"] {
+        if errors
+            && (report.messages.texts().collect::<Vec<_>>() != ["1 spreadsheet error cell was read as empty, in 'note'"]
+                || report.messages[0].loss != Some(LossCode::DroppedValue))
+        {
             return Err(std::io::Error::other(format!("native spreadsheet error notice: {report:?}")));
         }
         if report.skipped != 0
@@ -990,7 +1023,10 @@ fn read(dir: &std::path::Path, file: &str, content: &[u8], beside: &[(&str, Vec<
     if feature_pbf {
         let (native, report) = rustgis_engine::data::esripbf::read(content, "a").map_err(std::io::Error::other)?;
         check_feature_pbf(&native, pbf_lossy)?;
-        if report.skipped != 0 || report.messages != pbf_messages {
+        // Coded `dropped.zm`, as the notice the command gives.
+        let coded: Vec<rustgis_engine::data::loss::Note> =
+            pbf_messages.iter().map(|text| rustgis_engine::data::loss::Note::loss(LossCode::DroppedZm, text.clone())).collect();
+        if report.skipped != 0 || report.messages != coded {
             return Err(std::io::Error::other(format!("feature-service PBF has the wrong native report: {report:?}")));
         }
     }
@@ -1006,7 +1042,7 @@ fn read(dir: &std::path::Path, file: &str, content: &[u8], beside: &[(&str, Vec<
     }
     if dxf_vertex {
         let native = rustgis_engine::data::dxf::read(file, content, &Default::default()).map_err(std::io::Error::other)?;
-        if native.len() != 1 || native[0].1.skipped != 0 || native[0].1.messages != dxf_messages {
+        if native.len() != 1 || native[0].1.skipped != 0 || native[0].1.messages.texts().collect::<Vec<_>>() != dxf_messages {
             return Err(std::io::Error::other(format!("DXF vertex native report: {native:?}")));
         }
         check_dxf_vertex(&native[0].0, dxf_vertex_lossy)?;
@@ -1016,7 +1052,12 @@ fn read(dir: &std::path::Path, file: &str, content: &[u8], beside: &[(&str, Vec<
     }
     if dxf_height {
         let native = rustgis_engine::data::dxf::read(file, content, &Default::default()).map_err(std::io::Error::other)?;
-        if native.len() != 1 || native[0].1.skipped != 0 || native[0].1.messages != dxf_messages {
+        let expected: Vec<Option<LossCode>> = dxf_messages.iter().map(|m| dxf_code(m)).collect();
+        if native.len() != 1
+            || native[0].1.skipped != 0
+            || native[0].1.messages.texts().collect::<Vec<_>>() != dxf_messages
+            || native[0].1.messages.iter().map(|m| m.loss).collect::<Vec<_>>() != expected
+        {
             return Err(std::io::Error::other(format!("DXF height native report: {native:?}")));
         }
         check_dxf_height(&native[0].0)?;
@@ -1093,7 +1134,9 @@ fn read(dir: &std::path::Path, file: &str, content: &[u8], beside: &[(&str, Vec<
         check_feature_pbf(&s.map().layers[0].dataset, pbf_lossy)?;
         let notices = s.notices_since(mark);
         // Require the exact loss count and subject, and no additional notice.
-        if notices.iter().map(|n| n.text.clone()).collect::<Vec<_>>() != pbf_messages {
+        if notices.iter().map(|n| n.text.clone()).collect::<Vec<_>>() != pbf_messages
+            || notices.iter().any(|n| n.loss() != Some(LossCode::DroppedZm))
+        {
             return Err(std::io::Error::other(format!("feature-service PBF has the wrong command notices: {notices:?}")));
         }
     }
@@ -1113,7 +1156,9 @@ fn read(dir: &std::path::Path, file: &str, content: &[u8], beside: &[(&str, Vec<
         }
         check_dxf_height(&s.map().layers[0].dataset)?;
         let said: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
-        if said != dxf_messages {
+        let codes: Vec<Option<LossCode>> = s.notices_since(mark).iter().map(|n| n.loss()).collect();
+        let expected: Vec<Option<LossCode>> = dxf_messages.iter().map(|m| dxf_code(m)).collect();
+        if said != dxf_messages || codes != expected {
             return Err(std::io::Error::other(format!("DXF height command notices: {said:?}")));
         }
     }
@@ -1157,8 +1202,9 @@ fn a_reading_that_loses_something_says_so() {
             Ok(Err(e)) => (vec![(e, None)], false),
             Ok(Ok((said, added))) => (said.into_iter().filter(|n| !clean.contains(n)).collect(), added),
         };
-        if let Expect::Classified(code) = c.expect {
+        if let Expect::Classified(code, words) = c.expect {
             if !added
+                || new.iter().filter(|(text, loss)| *loss == Some(code) && text.contains(words)).count() != 1
                 || new.iter().filter(|(_, loss)| *loss == Some(code)).count() != 1
                 || clean.iter().any(|(_, loss)| *loss == Some(code))
             {
@@ -1249,4 +1295,16 @@ fn xml_losses_keep_data_and_reach_command() {
     }
     assert_eq!(checked, 17, "ten logical cases, seventeen rows with the KMZ twins");
     let _ = std::fs::remove_dir_all(root);
+}
+
+/// The code a DXF fixture's notice carries: `dropped.zm` for the varying heights lost and
+/// `assumed.crs` for the system the drawing doesn't say; nothing else is coded.
+fn dxf_code(message: &str) -> Option<LossCode> {
+    if message.contains("varying Z") {
+        Some(LossCode::DroppedZm)
+    } else if message.contains("doesn't say its coordinate system") {
+        Some(LossCode::AssumedCrs)
+    } else {
+        None
+    }
 }

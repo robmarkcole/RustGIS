@@ -30,8 +30,10 @@ pub mod shape_conversion;
 pub use peer::Peer;
 pub(crate) use roles::{Document, ParamRole, Role};
 mod parameters;
+pub mod problem_report;
 pub mod project_log;
-pub use parameters::{params_envelope, script_line};
+mod received;
+pub use parameters::{params_envelope, script_line, split_script_id};
 pub use project_log::{LogCopy, log_identifier, log_params};
 pub mod s3_connections;
 pub mod s3_keys;
@@ -421,13 +423,21 @@ fn names_said(names: &[String]) -> String {
 }
 
 /// What a raster layer read in place holds for its statistics and tools, when it holds an
-/// overview of the image the map draws.
-pub(crate) fn in_place_overview(d: &rustgis_data::raster::Raster) -> Option<String> {
+/// overview of the image the map draws. A file on this computer (`tools_read_file`) is read again
+/// by each geoprocessing tool and each command that makes a raster in the background, at the
+/// finest level it can hold ([`crate::cmd::gp`], [`crate::cmd::workflows::Input`]).
+pub(crate) fn in_place_overview(d: &rustgis_data::raster::Raster, tools_read_file: bool) -> Option<String> {
     let (fw, fh) = d.overview?;
-    Some(format!(
-        "read in place: the map draws its {fw} × {fh} pixels as it needs them, while statistics, histograms and raster tools read a {} × {} overview",
-        d.width, d.height
-    ))
+    let (w, h) = (d.width, d.height);
+    Some(if tools_read_file {
+        format!(
+            "read in place: the map draws its {fw} × {fh} pixels as it needs them, and geoprocessing tools and the commands that make a raster read the file (at the finest level they can hold, GeoLibre tools whole), while statistics, histograms, plugin tools, Build Mosaic, Train Deep Learning Model and other raster commands read a {w} × {h} overview"
+        )
+    } else {
+        format!(
+            "read in place: the map draws its {fw} × {fh} pixels as it needs them, while statistics, histograms and raster tools read a {w} × {h} overview"
+        )
+    })
 }
 
 pub struct Registry {
@@ -677,6 +687,29 @@ impl RoomMade {
     }
 }
 
+/// What a bug RustGIS caught while doing `what` says ([`rustgis_data::incident::message`]), with its
+/// incident's reference: the panic `payload` is told apart from a refusal, and its details kept.
+pub(crate) fn bug(what: &str, payload: &(dyn std::any::Any + Send)) -> String {
+    rustgis_data::incident::bug(what, payload)
+}
+
+/// What a command run worked on, as its parameters name it, for the messages it says: a layer, a
+/// table or an input by name, cut short. File paths are left out, as they can hold a login.
+fn run_target(params: &Value) -> Option<String> {
+    let name = ["layer", "table", "input", "map"].iter().find_map(|key| params.get(*key).and_then(Value::as_str))?;
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    // As a message is: addresses, credentials and the values of the logins in use masked.
+    let name = Session::redacted(name).into_string();
+    let mut cut: String = name.chars().take(80).collect();
+    if cut.len() < name.len() {
+        cut.push('…');
+    }
+    Some(cut)
+}
+
 /// An undo or redo step: the project before it, the layout open then, its label, who made it,
 /// which state of the project it is ([`Session::dirty`]), and the identities of its feature
 /// allocations for memory accounting. File origins accompany changes made by the command only:
@@ -741,6 +774,7 @@ struct PutAside {
     plugin_runs: Vec<cmd::gp::StartedRun>,
     downloading: Vec<u64>,
     downloaded: Vec<(u64, Vec<u8>)>,
+    downloaded_reach: Vec<(u64, render::rustgis_tiles::address::Reach)>,
     url_requests: Vec<UrlRequest>,
     policy_work: policy::downloads::Work,
     landed_reads: Vec<(u64, LandedRead)>,
@@ -1031,6 +1065,12 @@ pub struct Session {
     pub(crate) depth: u32,
     /// Only the command's registered id, never its parameters. Nested commands restore this.
     pub(crate) diagnostic_source: Option<&'static str>,
+    /// The top-level command running, as the messages it says remember it, and how many have run.
+    run: Option<rustgis_data::diagnostics::Run>,
+    runs: u64,
+    /// Told of each top-level command run as it starts, and with `None` as it ends: the desktop app
+    /// notes it in its run marker, so a run that ends without closing can say what it was doing.
+    pub on_run: Option<Box<dyn FnMut(Option<&rustgis_data::diagnostics::Run>) + Send>>,
     /// How many of the commands running now restore the project if they fail: a replacement is
     /// put aside only under one of them, as only then can it be rolled back.
     restorable: u32,
@@ -1054,6 +1094,9 @@ pub struct Session {
     /// Exercises the browser delivery path with real tools in native engine tests.
     #[cfg(test)]
     queue_gp_files: bool,
+    /// A smaller limit than [`cmd::exports::MAX_DOWNLOAD_BYTES`] for a test to reach.
+    #[cfg(test)]
+    pub(crate) download_cap: Option<usize>,
     /// Asynchronous runs started and not yet complete: (id, job, resolved params, start time).
     #[cfg(feature = "geolibre")]
     pub(crate) started: Vec<(u64, rustgis_geolibre::Job, serde_json::Value, u64, policy::Continuation)>,
@@ -1073,6 +1116,8 @@ pub struct Session {
     downloading: Vec<u64>,
     /// Downloads that landed, waiting for `layer.addDownload`.
     pub(crate) downloaded: Vec<(u64, Vec<u8>)>,
+    /// Where downloads connected, as the front end saw it ([`Session::download_read_at`]).
+    pub(crate) downloaded_reach: Vec<(u64, render::rustgis_tiles::address::Reach)>,
     /// Downloads that landed already read (an ArcGIS layer's protocol buffer pages, joined),
     /// waiting for `layer.addDownload` too.
     pub(crate) landed_reads: Vec<(u64, LandedRead)>,
@@ -1092,6 +1137,8 @@ pub struct Session {
     /// Set by [`Session::request_url`] for [`Session::guarded`]: the command running changed
     /// nothing, it only left a request (a plugin's own answer can't claim that). Also set by a move
     /// that left everything where it was (`layout.arrange`, `layer.move`): no step to undo.
+    /// Each command has its own: [`Session::guarded`] clears it on entry and puts the enclosing
+    /// command's back on exit.
     request_only: bool,
     /// What the commands run as steps of the transaction running now did ([`Session::shared_step`]):
     /// the one account scripts, tasks and plugins decide their undo step from.
@@ -1099,6 +1146,10 @@ pub struct Session {
     /// Set by [`Session::run_leaving_downloads`]: `layer.addUrl` leaves what it would wait for
     /// to the front end ([`Session::request_url`]), as in the browser.
     leave_downloads: bool,
+    /// Set by [`Session::receiving`]: the files the commands run now open were downloaded from an
+    /// address reached at this reach, which what they name is held within
+    /// ([`Session::file_reach`]).
+    received: Option<crate::render::rustgis_tiles::address::Reach>,
     /// Set by [`prefs::opt_in`]: the command line and Python read the remembered Earthdata token
     /// for a command that names a data host, before it binds its accounts.
     saved_secrets_opted_in: bool,
@@ -1112,6 +1163,9 @@ pub struct Session {
     /// The download requests of the plugin call running now (none outside one): each one's
     /// number, and what was asked.
     pub(crate) call_requests: Option<Vec<(u64, serde_json::Value)>>,
+    /// The data cube summaries the plugin call running now left to read off the frame (#3183),
+    /// until the call is kept to run again.
+    pub(crate) call_summaries: Vec<cmd::plugins::summary::Left>,
     /// While a plugin command runs again for its downloads: what each one asked for, and what
     /// adding it answered, for its `layer.addUrl` to answer once.
     pub(crate) rerun_landed: Vec<(serde_json::Value, CmdResult, cmd::plugins::fetch::Added)>,
@@ -1183,6 +1237,13 @@ pub struct Session {
     /// there. Its notices stay its own: the run there says them.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) requests_into: Option<rustgis_data::diagnostics::Capture>,
+    /// A QGIS project's import prepared for the read about to run it on a copy, its logins opened
+    /// before the read recorded the accounts (#2476): taken at once by that read.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) import_opened: Option<crate::cmd::qgis::ImportOpened>,
+    /// The project an import's first part read for it ([`cmd::reads::scan_import`]), while its read starts.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) import_scanned: Option<crate::cmd::qgis::ImportScan>,
     /// The tools run ahead that a model's run took, for the tests.
     #[cfg(test)]
     pub(crate) tools_taken: usize,
@@ -1228,10 +1289,12 @@ fn strip_windows(p: &mut Project) {
 }
 
 /// The first streamed layer whose features or fields differ between two versions of a project
-/// for a reason other than a read of its source.
+/// for a reason other than a read of its source. Each map is compared with its own earlier
+/// version, wherever it now is among the maps (`map.move`, #2802).
 fn edited_streamed(before: &Project, after: &Project) -> Option<String> {
     let schema = |l: &rustgis_map::Layer| l.dataset.fields.iter().map(|f| (f.name.clone(), f.ty)).collect::<Vec<_>>();
-    for (mb, ma) in before.maps.iter().zip(&after.maps) {
+    let earlier = |ma: &rustgis_map::Map| before.maps.iter().find(|mb| mb.instance_id() == ma.instance_id());
+    for (mb, ma) in after.maps.iter().filter_map(|ma| Some((earlier(ma)?, ma))) {
         for la in ma.layers.iter().filter(|l| l.is_streamed()) {
             let Some(lb) = mb.layers.iter().find(|l| l.id == la.id && l.is_streamed()) else { continue };
             let reads = |l: &rustgis_map::Layer| l.source.as_ref().map(|s| s.reads);
@@ -1249,8 +1312,10 @@ fn edited_streamed(before: &Project, after: &Project) -> Option<String> {
 /// the command (their versions replaced) are left alone. Session-only constructions follow the
 /// final ID; a full destination cache shard rejects the command through the usual rollback.
 fn fresh_source_ids(before: &Project, after: &mut Project, constructions: &mut construction::Cache) -> Result<(), String> {
-    for (mb, ma) in before.maps.iter().zip(after.maps.iter_mut()) {
+    // Each map with its own earlier version, wherever it now is (`map.move`, #2802).
+    for ma in after.maps.iter_mut() {
         let map = ma.instance_id();
+        let Some(mb) = before.maps.iter().find(|mb| mb.instance_id() == map) else { continue };
         for la in ma.layers.iter_mut() {
             let Some(versions) = la.edit_versions() else { continue };
             let Some(lb) = mb.layers.iter().find(|l| l.id == la.id) else { continue };
@@ -1404,6 +1469,9 @@ impl Session {
     /// Starts an independent session with fresh runtime selection intent and request order.
     /// Prepared script copies explicitly share request order with their originating session.
     pub fn new(mut project: Project) -> Self {
+        // Every panic an incident with a reference, whatever embeds the session (the apps, Python,
+        // MCP): installed once, before the hook that was there (a crash log) runs.
+        rustgis_data::incident::install();
         // The engine's tests never add Shapefile indexes to the user's cache (#1230).
         #[cfg(all(test, not(target_arch = "wasm32")))]
         rustgis_data::source::shp::use_temporary_index_dir();
@@ -1416,6 +1484,9 @@ impl Session {
         // cloud-optimised GeoTIFFs' overviews for raster layers read in place.
         render::rustgis_tiles::remote::install();
         map::raster::set_in_place_reader(render::rustgis_tiles::cog::raster::overview);
+        // A large tiled GeoTIFF on this computer is read in place too, on the desktop (#2761).
+        #[cfg(not(target_arch = "wasm32"))]
+        map::raster::set_tiled_probe(crate::cmd::raster::tiled_in_place);
         rustgis_data::diagnostics::set_clock(|| {
             web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
         });
@@ -1521,6 +1592,9 @@ impl Session {
             put_aside: None,
             depth: 0,
             diagnostic_source: None,
+            run: None,
+            runs: 0,
+            on_run: None,
             restorable: 0,
             published_syncs: Vec::new(),
             actor: None,
@@ -1538,6 +1612,7 @@ impl Session {
             plugin_watch: Default::default(),
             downloading: Vec::new(),
             downloaded: Vec::new(),
+            downloaded_reach: Vec::new(),
             landed_reads: Vec::new(),
             #[cfg(not(target_arch = "wasm32"))]
             landed_windows: Vec::new(),
@@ -1548,14 +1623,18 @@ impl Session {
             file_outputs: Vec::new(),
             #[cfg(test)]
             queue_gp_files: false,
+            #[cfg(test)]
+            download_cap: None,
             request_only: false,
             shared_steps: StepTally::default(),
             leave_downloads: false,
+            received: None,
             saved_secrets_opted_in: false,
             plugin_retries: Vec::new(),
             url_waits: cmd::plugins::fetch::UrlWaits::default(),
             next_request: 0,
             call_requests: None,
+            call_summaries: Vec::new(),
             rerun_landed: Vec::new(),
             rerun_told: Vec::new(),
             rerun_said: Vec::new(),
@@ -1585,6 +1664,10 @@ impl Session {
             zones_ahead: None,
             #[cfg(not(target_arch = "wasm32"))]
             requests_into: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            import_opened: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            import_scanned: None,
             #[cfg(test)]
             tools_taken: 0,
             #[cfg(test)]
@@ -1636,6 +1719,20 @@ impl Session {
             self.downloaded.push((id, bytes));
         }
         landed
+    }
+
+    /// Says where a download under way connected (`cache::Fetched::origin`), before its bytes are
+    /// handed over: a GeoLibre project downloaded so is read within that reach
+    /// (`layer.addDownload`), and one handed over without it reaches only the internet.
+    pub fn download_read_at(&mut self, id: u64, reach: render::rustgis_tiles::address::Reach) {
+        if !self.downloading.contains(&id) {
+            return;
+        }
+        // As many as downloads under way can be: past that, the oldest are forgotten.
+        if self.downloaded_reach.len() >= 64 {
+            self.downloaded_reach.remove(0);
+        }
+        self.downloaded_reach.push((id, reach));
     }
 
     /// Hands over a download read already (an ArcGIS layer's protocol buffer pages, joined, see
@@ -1746,10 +1843,87 @@ impl Session {
         r
     }
 
-    /// Takes tool files awaiting download. Metadata stays until `gp.fileDelivered` acknowledges
-    /// delivery, so producing bytes alone never records a successful run. Another caller's
-    /// queued files stay untouched until their owner or the native host takes them.
-    pub fn take_gp_files(&mut self) -> Vec<(u64, String, Vec<u8>)> {
+    /// Whether the files commands make reach the user as downloads: the browser has no filesystem
+    /// to write a path in, so a tool's file output and an export queue their bytes for the front
+    /// end ([`Session::take_gp_files`]).
+    pub(crate) fn downloads_files(&self) -> bool {
+        #[cfg(test)]
+        if self.queue_gp_files {
+            return true;
+        }
+        cfg!(target_arch = "wasm32")
+    }
+
+    /// The most bytes the files waiting for download may hold in all.
+    pub(crate) fn download_cap(&self) -> usize {
+        #[cfg(test)]
+        if let Some(cap) = self.download_cap {
+            return cap;
+        }
+        cmd::exports::MAX_DOWNLOAD_BYTES
+    }
+
+    /// Where files are downloaded, the room for one more; `None` where they are written. Refused
+    /// when no more can wait, before any of it is made.
+    pub(crate) fn download_room(&self) -> Result<Option<cmd::exports::Room>, String> {
+        if !self.downloads_files() {
+            return Ok(None);
+        }
+        let waiting = self.waiting_download_bytes();
+        let bytes = self.download_cap().saturating_sub(waiting);
+        if self.waiting_download_count() >= cmd::exports::MAX_DOWNLOADS || bytes == 0 {
+            return Err(cmd::gp::queue_full(self.download_cap()));
+        }
+        Ok(Some(cmd::exports::Room { bytes, waiting }))
+    }
+
+    /// The files waiting for download: this project's, and those of a project a command replaced,
+    /// kept until the command ends in case it gives that project back.
+    fn waiting_downloads(&self) -> impl Iterator<Item = &cmd::gp::PendingFile> {
+        self.file_outputs.iter().chain(self.put_aside.iter().flat_map(|aside| aside.file_outputs.iter()))
+    }
+
+    /// How many files wait for download, those put aside with a replaced project included.
+    pub(crate) fn waiting_download_count(&self) -> usize {
+        self.waiting_downloads().count()
+    }
+
+    /// The bytes the files waiting for download hold, those put aside included.
+    pub(crate) fn waiting_download_bytes(&self) -> usize {
+        self.waiting_downloads().filter_map(|f| f.bytes.as_ref()).map(|bytes| bytes.capacity()).sum()
+    }
+
+    /// Whether pending download `id` is an export's: no geoprocessing run records it.
+    pub fn is_export_file(&self, id: u64) -> bool {
+        self.file_outputs.iter().any(|file| file.id == id && file.is_export())
+    }
+
+    /// Says which queued downloads among `files` are dropped, and `why`: the exports in one
+    /// notice (the desktop would have written their files by now), the tools' file outputs in
+    /// another (a run is recorded only once its file is delivered, so these go unrecorded).
+    fn say_dropped_downloads<'a>(&mut self, files: impl IntoIterator<Item = &'a cmd::gp::PendingFile>, why: &str) {
+        let (exports, tools): (Vec<_>, Vec<_>) = files.into_iter().partition(|file| file.is_export());
+        let names = |files: Vec<&cmd::gp::PendingFile>| files.iter().map(|file| file.file_name.clone()).collect::<Vec<_>>();
+        let (exports, tools) = (names(exports), names(tools));
+        if !exports.is_empty() {
+            self.notify(format!("{} export(s) not downloaded, {why}: {}", exports.len(), listed(&exports)), true);
+        }
+        if !tools.is_empty() {
+            self.notify(
+                format!(
+                    "{} tool output file(s) not downloaded, {why}, so their runs aren't in the geoprocessing history: {}",
+                    tools.len(),
+                    listed(&tools)
+                ),
+                true,
+            );
+        }
+    }
+
+    /// Takes tool and export files awaiting download. Metadata stays until `gp.fileDelivered`
+    /// acknowledges delivery, so producing bytes alone never records a successful run. Another
+    /// caller's queued files stay untouched until their owner or the native host takes them.
+    pub fn take_gp_files(&mut self) -> Vec<(u64, String, std::sync::Arc<Vec<u8>>)> {
         let mut live = Vec::new();
         let mut refused: Vec<(String, Vec<String>)> = Vec::new();
         for mut file in std::mem::take(&mut self.file_outputs) {
@@ -1798,6 +1972,17 @@ impl Session {
     }
     pub fn map_mut(&mut self) -> &mut Map {
         self.project.map_mut()
+    }
+
+    /// Drops what is kept only to draw again sooner, for a system short of memory (a phone says
+    /// so): the tile and drawing caches ([`render::release_memory`]), and the drawing copies of
+    /// the layers switched off. Each is made or fetched again when next wanted; layers, results
+    /// and Undo history are kept.
+    pub fn release_memory(&mut self) {
+        crate::render::release_memory();
+        for layer in self.project.maps.iter_mut().flat_map(|map| &mut map.layers).filter(|layer| !layer.visible) {
+            layer.clear_cache();
+        }
     }
 
     /// Whether a Zarr layer on the active map that follows the time slider is waiting for its
@@ -1849,6 +2034,12 @@ impl Session {
             // A command may change a map's projection, or add layers to it.
             if s.depth == 0 {
                 s.note_shown_systems();
+                if !ui_owns_cjk_scan_notice()
+                    && let Some(summary) = take_cjk_scan_summary_for_session()
+                    && let Some(msg) = summary.notice()
+                {
+                    s.notify(msg, false);
+                }
             }
             // Native sessions without a drawing loop recover their own failed overviews.
             // Named callers and sealed completions do not initiate unrelated maintenance.
@@ -1872,6 +2063,25 @@ impl Session {
         // Restored on every path, including panics outside `guarded`, so a later notice is not
         // attributed to an aborted command. Mirrors the capture scope's restore-on-drop.
         let previous = std::mem::replace(&mut self.diagnostic_source, source);
+        // A run of its own for a top-level command: its messages are grouped by it, and the pane can
+        // undo back to before it.
+        let previous_run = outermost.then(|| {
+            self.runs = self.runs.wrapping_add(1);
+            let run = rustgis_data::diagnostics::Run {
+                id: self.runs,
+                // The registered command's own id, never the text asked for: an unknown one could
+                // hold anything, a login included.
+                command: source.unwrap_or("unknown command").to_string(),
+                before: self.state,
+                after: None,
+                target: run_target(params),
+            };
+            let previous = self.run.replace(run);
+            if let Some(on_run) = self.on_run.as_mut() {
+                on_run(self.run.as_ref());
+            }
+            previous
+        });
         let history_deferred = std::mem::replace(&mut self.undo_memory.deferred, true);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let notice_mark = self.notice_mark();
@@ -1917,6 +2127,7 @@ impl Session {
             // And the coordinate systems that needed a missing datum grid, after every command.
             self.say_grid_notes();
             self.say_unplaced();
+            self.say_public_only_full();
             // A plugin's command waiting for its fetches answers `pending` and runs again when they
             // land: logged then, once. (Another command's `pending`, a download the web app makes, is
             // logged as it is asked for: nothing runs it again.)
@@ -1957,6 +2168,17 @@ impl Session {
             res
         }));
         self.diagnostic_source = previous;
+        if let Some(run) = previous_run {
+            // Undo makes no step of its own: it moves back one, so "before" it isn't a step to take
+            // back. Redo's step is its own, and undoing it returns to before it.
+            if let Some(ended) = self.run.as_ref().filter(|_| id != "edit.undo") {
+                self.diagnostics.finish_run(ended.id, self.state);
+            }
+            self.run = run;
+            if let Some(on_run) = self.on_run.as_mut() {
+                on_run(None);
+            }
+        }
         self.undo_memory.deferred = history_deferred;
         // Every top-level invocation consumes its key, even a refusal or panic before guarded.
         if outermost {
@@ -2266,9 +2488,15 @@ impl Session {
     /// failed to start, or their worker failed): only the session still holds it. It goes back
     /// while nothing else changed the project since, newest set aside first so the oldest ends
     /// in front, and is freed and said otherwise. Run before each command run by itself, and by
-    /// the desktop as its background jobs end, so Undo sees it.
+    /// the desktop as its background jobs end, so Undo sees it. Logins opened for an import that
+    /// ended without landing end again here too ([`service_logins::reclaim_held`]).
     pub fn reclaim_rooms(&mut self) {
-        if self.depth > 0 || self.rooms.is_empty() {
+        if self.depth > 0 {
+            return;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        service_logins::reclaim_held(self);
+        if self.rooms.is_empty() {
             return;
         }
         let (ended, running): (Vec<_>, Vec<_>) =
@@ -2356,7 +2584,8 @@ impl Session {
         self.restorable += u32::from(mutates);
         // Edit counts roll back with the project when a command fails part way.
         let counts = mutates.then(|| self.edit_counts.clone());
-        self.request_only = false;
+        // Its flag is its own: the enclosing command's comes back after it, whatever it left.
+        let outer_request_only = std::mem::take(&mut self.request_only);
         // Its steps' account is its own: an enclosing command's comes back after it.
         let outer_steps = std::mem::take(&mut self.shared_steps);
         self.quiet_failure = false;
@@ -2365,8 +2594,11 @@ impl Session {
         let retry_state = (self.plugin_retries.clone(), self.url_waits.clone());
         let file_outputs: Vec<_> = self.file_outputs.iter().map(|file| file.id).collect();
         let said = self.notices_given;
-        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)))
-            .unwrap_or_else(|_| Err(format!("{label} failed unexpectedly; the project was restored")));
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self))).unwrap_or_else(|payload| {
+            // A bug in RustGIS: said as one, with a reference to its details in Messages.
+            let incident = rustgis_data::incident::caught(payload.as_ref());
+            Err(rustgis_data::incident::message(label, mutates, &incident.id))
+        });
         self.shared_steps = outer_steps;
         self.depth = self.depth.saturating_sub(1);
         self.restorable = self.restorable.saturating_sub(u32::from(mutates));
@@ -2380,6 +2612,8 @@ impl Session {
             },
             _ => res,
         };
+        // Queued for download in a project the command opened, then gave up for the one before.
+        let mut opened_files = Vec::new();
         match (&res, snapshot) {
             // A command that only left a request for the front end (a download in the browser,
             // [`Session::request_url`]) changed nothing: no undo step, nothing to save yet. The
@@ -2461,7 +2695,7 @@ impl Session {
                 // Replaced during the command: what it held beside itself (its undo history, its
                 // trust, its unsaved state) comes back with it.
                 if self.opened != opened {
-                    self.give_back(opened);
+                    opened_files = self.give_back(opened);
                 }
                 if let Some(files) = files {
                     self.file_identity = files.identity;
@@ -2513,11 +2747,18 @@ impl Session {
             }
             _ => {}
         }
+        self.request_only = outer_request_only;
         if res.is_err() {
             self.restore_url_request_checkpoint(requests);
+            // The summaries it started stop: those before it are kept, and nothing waits for the others.
+            self.url_waits.stop_summaries_beside(&retry_state.1);
             (self.plugin_retries, self.url_waits) = retry_state;
             // Keep only still-present old identities: drained bytes and terminal refusals stay consumed.
-            self.file_outputs.retain(|file| file_outputs.contains(&file.id));
+            let (kept, mut dropped): (Vec<_>, Vec<_>) =
+                std::mem::take(&mut self.file_outputs).into_iter().partition(|file| file_outputs.contains(&file.id));
+            self.file_outputs = kept;
+            dropped.append(&mut opened_files);
+            self.say_dropped_downloads(&dropped, "as the command that made them failed");
         }
         let quiet = std::mem::take(&mut self.quiet_failure);
         if let Err(e) = &res
@@ -2527,7 +2768,11 @@ impl Session {
         }
         // The command, and those it ran, are done: a replaced project stays replaced.
         if self.depth == 0 {
-            self.put_aside = None;
+            if let Some(replaced) = self.put_aside.take() {
+                self.say_dropped_downloads(&replaced.file_outputs, "as another project replaced theirs first");
+                // Its summaries being read for plugin commands stop: their project won't come back.
+                replaced.url_waits.stop_every_summary();
+            }
             self.published_syncs.clear();
             // Frame maintenance and some policy adapters run a guard without command dispatch.
             // Otherwise the command epilogue trims once, after any maintenance steps.
@@ -2598,6 +2843,7 @@ impl Session {
             plugin_runs: take(&mut self.plugin_runs),
             downloading: take(&mut self.downloading),
             downloaded: take(&mut self.downloaded),
+            downloaded_reach: take(&mut self.downloaded_reach),
             landed_reads: take(&mut self.landed_reads),
             #[cfg(not(target_arch = "wasm32"))]
             landed_windows: take(&mut self.landed_windows),
@@ -2618,9 +2864,10 @@ impl Session {
     }
 
     /// Gives back what project `opened` held beside itself, when it is restored. Every field is
-    /// named (no `..`): one added to [`PutAside`] and not given back doesn't compile.
-    fn give_back(&mut self, opened: u64) {
-        let Some(a) = self.put_aside.take_if(|a| a.opened == opened) else { return };
+    /// named (no `..`): one added to [`PutAside`] and not given back doesn't compile. Returns the
+    /// files waiting for download that those given back take the place of.
+    fn give_back(&mut self, opened: u64) -> Vec<cmd::gp::PendingFile> {
+        let Some(a) = self.put_aside.take_if(|a| a.opened == opened) else { return Vec::new() };
         let PutAside {
             constructions,
             opened: _,
@@ -2656,6 +2903,7 @@ impl Session {
             plugin_runs,
             downloading,
             downloaded,
+            downloaded_reach,
             landed_reads,
             #[cfg(not(target_arch = "wasm32"))]
             landed_windows,
@@ -2685,9 +2933,12 @@ impl Session {
         (self.path, self.model_run, self.style_view) = (path, model_run, style_view);
         self.opened_package = opened_package;
         self.file_identity = file_identity;
+        // The replacement's summaries being read for plugin commands stop: its project is gone.
+        self.url_waits.stop_every_summary();
         (self.pending, self.plugin_runs, self.plugin_retries, self.url_waits) = (pending, plugin_runs, plugin_retries, url_waits);
-        self.file_outputs = file_outputs;
+        let replaced = std::mem::replace(&mut self.file_outputs, file_outputs);
         (self.downloading, self.downloaded, self.url_requests) = (downloading, downloaded, url_requests);
+        self.downloaded_reach = downloaded_reach;
         self.restore_policy_work(policy_work);
         self.landed_reads = landed_reads;
         #[cfg(not(target_arch = "wasm32"))]
@@ -2704,6 +2955,7 @@ impl Session {
         {
             self.sql_results = sql_results;
         }
+        replaced
     }
 
     /// Says what reading raster layers' pixels lost when it wasn't said as each was added (pixels
@@ -2777,28 +3029,35 @@ impl Session {
                 // Values in date fields that weren't dates, once for a layer read in place.
                 let (unread, rounded) = layer.source.as_mut().map(|source| source.take_unread_dates()).unwrap_or_default();
                 if let Some(note) = unread {
-                    dates.push(rustgis_data::loss::Note::plain(format!(
-                        "{}: some values in its date fields aren't dates and show as empty (Load All Features counts them all); so far, {note}",
-                        layer.name
-                    )));
+                    dates.push(note.map_text(|note| {
+                        format!(
+                            "{}: some values in its date fields aren't dates and show as empty (Load All Features counts them all); so far, {note}",
+                            layer.name
+                        )
+                    }));
                 }
                 if let Some(note) = rounded {
-                    dates.push(rustgis_data::loss::Note::plain(format!(
-                        "{}: some date-times in it have digits past the microsecond and are rounded (Load All Features counts them all); so far, {note}",
-                        layer.name
-                    )));
+                    dates.push(note.map_text(|note| {
+                        format!(
+                            "{}: some date-times in it have digits past the microsecond and are rounded (Load All Features counts them all); so far, {note}",
+                            layer.name
+                        )
+                    }));
                 }
                 if let Some(note) = layer.source.as_mut().and_then(|source| source.take_null_text()) {
-                    dates.push(rustgis_data::loss::Note::plain(format!(
-                        "{}: some text values written as Null in it show as empty (Load All Features counts them all); so far, {note}",
-                        layer.name
-                    )));
+                    dates.push(note.map_text(|note| {
+                        format!(
+                            "{}: some text values written as Null in it show as empty (Load All Features counts them all); so far, {note}",
+                            layer.name
+                        )
+                    }));
                 }
                 if let Some(note) = layer.source.as_mut().and_then(|source| source.take_not_utf8()) {
-                    not_utf8.push(notice_text::NoticeText::format(
+                    let text = notice_text::NoticeText::format(
                         "{name}: so far, {note} (Load All Features counts them all)",
-                        [("name", layer.name.clone().into()), ("note", note.into())],
-                    ));
+                        [("name", layer.name.clone().into()), ("note", note.text.into())],
+                    );
+                    not_utf8.push((note.loss, text));
                 }
                 // What else the map's reads of it lost or assumed, each kind once for its opening.
                 for note in layer.source.as_mut().map(|source| source.take_read_notes()).unwrap_or_default() {
@@ -2815,8 +3074,11 @@ impl Session {
         for note in dates {
             self.say(note);
         }
-        for note in not_utf8 {
-            self.notify_text(note, false);
+        for (loss, note) in not_utf8 {
+            match loss {
+                Some(code) => self.notify_loss(code, note),
+                None => self.notify_text(note, false),
+            }
         }
         if let Some(message) = notice_text::NoticeText::source_errors(source_error_count, source_errors, source_error_count) {
             self.notify_text(message, true);
@@ -2832,10 +3094,10 @@ impl Session {
                 if !dropped_here.is_empty() {
                     dropped.push((l.name.clone(), dropped_here));
                 }
-                let in_place = rl.in_place;
+                let (in_place, tiled) = (rl.reads_in_place(), rl.tiled);
                 lost.extend(rl.lost_unsaid().into_iter().map(|what| (l.name.clone(), what)));
                 let Some(d) = rl.pixels_unsaid() else { continue };
-                if let Some(what) = in_place.then(|| in_place_overview(&d)).flatten() {
+                if let Some(what) = in_place.then(|| in_place_overview(&d, tiled)).flatten() {
                     held.push((l.name.clone(), what));
                 }
             }
@@ -2977,7 +3239,7 @@ impl Session {
             .filter_map(|l| {
                 let name = l.name.clone();
                 let rl = l.raster.as_mut()?;
-                rl.in_place.then_some((name, rl))
+                rl.reads_in_place().then_some((name, rl))
             })
             .collect();
         let mut layers: Vec<&mut rustgis_map::raster::RasterLayer> = named.iter_mut().map(|(_, rl)| &mut **rl).collect();
@@ -3267,6 +3529,7 @@ impl Session {
             self.grid_notes_checked = Some(web_time::Instant::now());
             self.say_grid_notes();
             self.say_unplaced();
+            self.say_public_only_full();
         }
     }
 
@@ -3276,6 +3539,24 @@ impl Session {
     pub fn note_shown_systems(&mut self) {
         for m in &mut self.project.maps {
             m.note_shown_system();
+        }
+    }
+
+    /// Says once that the table of web addresses held to the internet is full
+    /// ([`render::rustgis_tiles::cache::take_public_only_full`]): from then on, until RustGIS
+    /// restarts, an address it has no record of is read only from the internet, so the user's own
+    /// on this computer or the local network is refused.
+    fn say_public_only_full(&mut self) {
+        // A copy run ahead (`requests_into`, desktop only) leaves it for the session that takes
+        // its results.
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.requests_into.is_some() {
+            return;
+        }
+        if render::rustgis_tiles::cache::take_public_only_full() {
+            self.warn(
+                "web addresses: RustGIS has recorded as many addresses that may reach only the internet as it can hold, so until it restarts an address it hasn't seen before is read only from the internet, not this computer or the local network",
+            );
         }
     }
 
@@ -3353,6 +3634,15 @@ impl Session {
         match note.loss {
             Some(code) => self.notify_loss(code, note.text.into()),
             None => self.notify(note.text, false),
+        }
+    }
+
+    /// [`Session::say`] for a read that always warned: a note that reports a loss as that loss, with
+    /// its code, any other as a warning ([`Session::warn`]), not information.
+    pub fn say_warning(&mut self, note: rustgis_data::loss::Note) {
+        match note.loss {
+            Some(code) => self.notify_loss(code, note.text.into()),
+            None => self.warn(note.text),
         }
     }
 
@@ -3503,7 +3793,14 @@ impl Session {
         if severity == rustgis_data::diagnostics::Severity::Error && self.rerun_said.iter().any(|said| said == text.as_str()) {
             return;
         }
-        self.diagnostics.push_redacted(severity, source.unwrap_or("Application"), &text);
+        let record = self.diagnostics.push_redacted(severity, source.unwrap_or("Application"), &text, loss, self.run.clone());
+        // A bug's failure keeps its details (the panic's message and place) under it, for a report,
+        // scrubbed as a message is, logins in use included.
+        if severity == rustgis_data::diagnostics::Severity::Error
+            && let Some(incident) = rustgis_data::incident::named(text.as_str())
+        {
+            self.diagnostics.detail(record, Self::redacted(&incident.details()).as_str());
+        }
         self.notices.push(Notice {
             text: text.into_string(),
             error: severity == rustgis_data::diagnostics::Severity::Error,
@@ -3583,6 +3880,23 @@ impl Session {
         self.redo.iter().rev().map(|step| step.2)
     }
 
+    /// How many Undo steps take back the change of a run that went from the state `before` to
+    /// `after` (a message's [`Run`](rustgis_data::diagnostics::Run)), with the changes made since:
+    /// `None` when the history no longer holds that change as a step of its own. A change makes a
+    /// state no other has, so an edit made after undoing it, from the same state before, isn't taken
+    /// for it; and the step Undo lands on must be `before`, so a run whose step was merged into an
+    /// earlier one, or that made no step, isn't taken back past that earlier command.
+    pub fn undo_steps_back_past(&self, before: u64, after: u64) -> Option<usize> {
+        let steps = if self.state == after {
+            1
+        } else {
+            // The step after the change keeps the state the change left.
+            self.undo.len() - self.undo.iter().rposition(|step| step.4 == after)? + 1
+        };
+        let landing = self.undo.len().checked_sub(steps)?;
+        (self.undo.get(landing)?.4 == before).then_some(steps)
+    }
+
     /// Identifies the current position and the history it belongs to. Editing and then undoing
     /// the edit returns to the same state with a different redo stack.
     pub fn history_position(&self) -> (u64, u64) {
@@ -3600,7 +3914,10 @@ impl Session {
     /// Forgets undo/redo and extent history and marks the project clean (after new/open, or a
     /// front end setting up how the project starts): what [`PutAside`] holds, dropped.
     pub fn clear_history(&mut self) {
-        drop(self.take_project_state());
+        let replaced = self.take_project_state();
+        self.say_dropped_downloads(&replaced.file_outputs, "as another project replaced theirs first");
+        // Its summaries being read for plugin commands stop with it.
+        replaced.url_waits.stop_every_summary();
         self.undo_memory.clear();
         self.project_starts = self.project_starts.wrapping_add(1);
         // A state of its own: undo back past a replacement made within a command (a task's step)
@@ -4154,6 +4471,47 @@ impl Session {
         true
     }
 
+    /// Fits the camera to the layers `ids` ([`rustgis_map::ExtentOf`] says which of their
+    /// features): on a flat map in a coordinate system that holds one of them in its own
+    /// coordinates ([`rustgis_map::Layer::in_map_units`]), around their places in map coordinates,
+    /// those layers' exactly as held, with nothing converted; else as [`Session::zoom_to`] does,
+    /// around their longitude/latitude extent. `None` when they have nothing to zoom to; else
+    /// whether it did.
+    pub fn zoom_to_layers(&mut self, ids: &[u32], of: rustgis_map::ExtentOf) -> Option<bool> {
+        let m = self.map();
+        let layers: Vec<&rustgis_map::Layer> = ids.iter().filter_map(|id| m.layer(*id)).collect();
+        // In map coordinates first, where a layer's are its own: its longitude/latitude extent,
+        // which converts every place, isn't worked out for it then.
+        if !m.projection.is_globe() {
+            let flat = m.flat();
+            if layers.iter().any(|l| l.in_map_units(&flat)) {
+                let boxed = layers.iter().fold(rustgis_geom::Extent::EMPTY, |e, l| e.union(&l.extent_on(&flat, of)));
+                // None of it on this map (a layer in its system with nothing to frame, another
+                // wholly beyond the map), or a single point, which has no size to fit: framed in
+                // longitude/latitude, which says when the map can't show it.
+                if boxed.width() > 0.0 || boxed.height() > 0.0 {
+                    let (w, h) = self.view_size;
+                    if !self.map_mut().fit_map_extent(&boxed, w, h) {
+                        return Some(false);
+                    }
+                    self.record_extent();
+                    return Some(true);
+                }
+            }
+        }
+        let lonlat = layers.iter().fold(rustgis_geom::Extent::EMPTY, |e, l| e.union(&l.extent_of(of)));
+        if lonlat.is_empty() {
+            return None;
+        }
+        Some(self.zoom_to(&lonlat))
+    }
+
+    /// The layers on the active map it shows, by id, top first: what Full Extent zooms to.
+    pub fn shown_layer_ids(&self) -> Vec<u32> {
+        let m = self.map();
+        m.layers.iter().filter(|l| m.shows(l)).map(|l| l.id).collect()
+    }
+
     pub fn title(&self) -> String {
         self.project.name.clone()
     }
@@ -4196,4 +4554,43 @@ impl Session {
         }
         self.project.gp_history.push(record);
     }
+}
+
+/// Process-wide ownership of the one-shot CJK font-folder scan summary. Set by a UI front end so
+/// neither the live session nor any temporary `Session::new` copy consumes the summary inside
+/// [`Session::run`] before the UI can translate and emit it.
+static UI_OWNS_CJK_SCAN_NOTICE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Marks this process as having a UI front end that takes and translates the one-shot CJK
+/// font-folder scan summary itself, leaving it untouched in [`Session::run`].
+pub fn claim_ui_cjk_scan_notice() {
+    UI_OWNS_CJK_SCAN_NOTICE.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Whether a UI front end owns taking and translating the process-wide CJK scan summary.
+pub fn ui_owns_cjk_scan_notice() -> bool {
+    #[cfg(test)]
+    if let Some(overridden) = TEST_UI_OWNS_CJK_SCAN_NOTICE.get() {
+        return overridden;
+    }
+    UI_OWNS_CJK_SCAN_NOTICE.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Thread-local override for [`take_cjk_scan_summary_for_session`] so tests can exercise
+    /// `Session::run`'s CJK scan notice wiring in parallel without mutating the global font cache.
+    static TEST_CJK_SCAN_SUMMARY: std::cell::RefCell<Option<Option<rustgis_render::fonts::CjkRootScanSummary>>> =
+        const { std::cell::RefCell::new(None) };
+    /// Thread-local override for [`ui_owns_cjk_scan_notice`] so parallel unit tests can cover
+    /// headless sessions even after another test claims UI ownership.
+    static TEST_UI_OWNS_CJK_SCAN_NOTICE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+fn take_cjk_scan_summary_for_session() -> Option<rustgis_render::fonts::CjkRootScanSummary> {
+    #[cfg(test)]
+    if let Some(summary) = TEST_CJK_SCAN_SUMMARY.with_borrow_mut(|slot| slot.as_mut().map(Option::take)) {
+        return summary;
+    }
+    rustgis_render::fonts::take_cjk_scan_summary()
 }

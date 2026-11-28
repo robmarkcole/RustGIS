@@ -68,6 +68,20 @@ pub fn commands() -> Vec<C> {
             if let Some(cut) = cut {
                 s.notify(cut, false);
             }
+            say_pages_without_their_map(s, PagesOf::Presentation(i));
+            // Pages often share a title's figure: each warning once, with its count of pages.
+            let mut said: Vec<(String, usize)> = Vec::new();
+            for k in 0..s.project.presentations[i].pages.len() {
+                for w in title_statistic_notices(s, i, k) {
+                    match said.iter_mut().find(|(text, _)| *text == w) {
+                        Some((_, pages)) => *pages += 1,
+                        None => said.push((w, 1)),
+                    }
+                }
+            }
+            for (w, pages) in said {
+                s.warn(if pages > 1 { format!("{w} (in {pages} map pages)") } else { w });
+            }
             Ok(json!({"presentation": i, "name": name}))
         }).roles(&[crate::ParamRole { key: "text", role: crate::Role::Document(crate::Document::Presentation) }]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
         .params(r#"{"path"?: "*.rgispres", "text"?: presentation JSON, "data"?: base64 file}"#),
@@ -95,10 +109,14 @@ pub fn commands() -> Vec<C> {
             let center = Coord::new(f(p, "lon").unwrap_or(c.x).clamp(-180.0, 180.0), f(p, "lat").unwrap_or(c.y).clamp(-85.0, 85.0));
             let width_m = f(p, "widthM").unwrap_or(s.view_size.0 * map.ground_res()).clamp(10.0, 4e7);
             let title = page_title(ps(p, "title").unwrap_or(&name))?;
-            add_page(s, p, title, PageKind::Map { map: name, center, width_m })
+            let added = add_page(s, p, title, PageKind::Map { map: name, center, width_m })?;
+            if let (Some(i), Some(k)) = (added["presentation"].as_u64(), added["page"].as_u64()) {
+                say_title_statistics(s, i as usize, k as usize);
+            }
+            Ok(added)
         }).inputs(map_page_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
         .when(need_presentation)
-        .params(r#"{"presentation"?, "map"?: name (default: the active map, at its current view), "lon"?, "lat"?, "widthM"?: ground width shown (m), "title"?, "at"?: page index}"#),
+        .params(r#"{"presentation"?, "map"?: name (default: the active map, at its current view), "lon"?, "lat"?, "widthM"?: ground width shown (m), "title"? (a layer's figure may be written in it: {count:Layer}, {sum:Layer:field}, {mean:…}, {min:…}, {max:…}, filled in when the page is drawn; one with no figure is drawn as written, with a warning), "at"?: page index}"#),
         C::new("presentation.blankPage", "Blank Page", "Publish › Page", |s, p| {
             let background = super::layout::color(p, "background", Rgba::rgb(0xFF, 0xFF, 0xFF))?;
             let text = super::within("text", "a page's text", ps(p, "text").unwrap_or(""), MAX_TEXT)?;
@@ -138,7 +156,7 @@ pub fn commands() -> Vec<C> {
         .when(need_presentation)
         .params(r#"{"presentation"?, "source": video file or URL, "poster"?: PNG/JPEG file, "posterImage"?: base64, "title"?, "caption"?, "at"?}"#),
         C::new("presentation.updatePage", "Page Properties", "Presentation", update_page).inputs(page_inputs).roles(&[]).effects(crate::policy::Effects::NONE).when(need_presentation).params(
-            r##"{"presentation"?, "page": index, "title"?, "text"?, "caption"?, "notes"?, "seconds"?, "background"?: "#RRGGBB"|"#RRGGBBAA", "moveTo"?: index}"##,
+            r##"{"presentation"?, "page": index, "title"? (a map page's title may hold a layer's figure, as mapPage's), "text"?, "caption"?, "notes"?, "seconds"?, "background"?: "#RRGGBB"|"#RRGGBBAA", "moveTo"?: index}"##,
         ),
         C::new("presentation.removePage", "Delete Page", "Presentation", |s, p| {
             let (i, k) = page_of(s, p)?;
@@ -280,6 +298,7 @@ fn update_page(s: &mut Session, p: &Value) -> CmdResult {
     let new_notes = checked("notes", "a page's notes", MAX_TEXT)?;
     let new_text = checked("text", "a page's text", MAX_TEXT)?;
     let new_caption = checked("caption", "a page's caption", MAX_CAPTION)?;
+    let titled = new_title.is_some();
     let pres = s.project.presentations.get_mut(i).ok_or("no presentation")?;
     let n = pres.pages.len();
     let page = pres.pages.get_mut(k).ok_or("no page")?;
@@ -314,7 +333,27 @@ fn update_page(s: &mut Session, p: &Value) -> CmdResult {
         let page = pres.pages.remove(k);
         pres.pages.insert(at, page);
     }
+    if titled {
+        say_title_statistics(s, i, at);
+    }
     Ok(json!({"page": at}))
+}
+
+/// Which layer statistics (#2853) in the title of the page `k` of the presentation `i` are drawn
+/// as written, and what each misses: only a map page fills them in, from the map [`page_layout`]
+/// draws it over. One pass over each layer the title names, as a layout text's notices make, so an
+/// import makes one per map page that holds a figure.
+fn title_statistic_notices(s: &Session, i: usize, k: usize) -> Vec<String> {
+    let Some(page) = s.project.presentations.get(i).and_then(|p| p.pages.get(k)) else { return Vec::new() };
+    let PageKind::Map { map, .. } = &page.kind else { return Vec::new() };
+    rustgis_render::layout::map_statistic_notices(page_map(s, map), "the page's map", &page.title)
+}
+
+/// Warns with each of [`title_statistic_notices`] for one page.
+fn say_title_statistics(s: &mut Session, i: usize, k: usize) {
+    for w in title_statistic_notices(s, i, k) {
+        s.warn(w);
+    }
 }
 
 /// A presentation file.
@@ -370,6 +409,7 @@ pub fn page_layout(s: &Session, pres: &Presentation, page: &Page) -> Layout {
                     scale,
                     shape: FrameShape::Rectangle,
                     grid: None,
+                    sections: Vec::new(),
                     extent_of: None,
                     extent_color: rustgis_map::layout::INDICATOR_COLOR,
                     extent_width: rustgis_map::layout::INDICATOR_WIDTH,
@@ -592,6 +632,110 @@ fn page_map<'a>(input: &'a impl super::InputSource, name: &str) -> &'a rustgis_m
     let s = &context;
     s.project.maps.iter().find(|m| m.name.eq_ignore_ascii_case(name)).unwrap_or_else(|| s.map())
 }
+
+/// Most map names, presentations and page numbers [`pages_without_their_map`] lists: an
+/// imported file may hold hundreds of pages, each naming another map.
+const MISSING_MAPS_NAMED: usize = 3;
+const PRESENTATIONS_LISTED: usize = 3;
+const PAGES_LISTED: usize = 5;
+
+/// The map pages [`pages_without_their_map`] looks at.
+pub(crate) enum PagesOf<'a> {
+    /// Every one: the project has just been opened.
+    All,
+    /// Those naming this map, in every presentation: it has just gone.
+    Map(&'a str),
+    /// Those of the presentation at this index, whatever they name: it has just come in.
+    Presentation(usize),
+}
+
+/// Says [`pages_without_their_map`], if there is anything to say.
+pub(crate) fn say_pages_without_their_map(s: &mut Session, which: PagesOf<'_>) {
+    if let Some(notice) = pages_without_their_map(&s.project, which) {
+        s.notify_text(notice, false);
+    }
+}
+
+/// One notice of which of the map pages `which` name a map the project doesn't have, which
+/// [`page_map`] draws over the active map (#3047). Pages are numbered from 1, as the Presentation
+/// pane shows them. The pages keep the name.
+pub(crate) fn pages_without_their_map(project: &crate::Project, which: PagesOf<'_>) -> Option<crate::notice_text::NoticeText> {
+    use crate::notice_text::NoticeText;
+
+    /// A presentation listed: where it is, its name, its first pages and how many it has.
+    struct Place<'a> {
+        at: usize,
+        name: &'a str,
+        numbers: Vec<String>,
+        pages: usize,
+    }
+
+    let (mut pages, mut places) = (0usize, Vec::<Place<'_>>::new());
+    let (mut named, mut more_maps, mut more_places) = (Vec::<&str>::new(), false, false);
+    for (i, pres) in project.presentations.iter().enumerate() {
+        for (k, page) in pres.pages.iter().enumerate() {
+            let PageKind::Map { map, .. } = &page.kind else { continue };
+            let looked_at = match which {
+                PagesOf::All => true,
+                PagesOf::Map(gone) => map.eq_ignore_ascii_case(gone),
+                PagesOf::Presentation(own) => i == own,
+            };
+            if !looked_at || project.maps.iter().any(|m| m.name.eq_ignore_ascii_case(map)) {
+                continue;
+            }
+            pages += 1;
+            if !named.iter().any(|n| n.eq_ignore_ascii_case(map)) {
+                if named.len() < MISSING_MAPS_NAMED {
+                    named.push(map);
+                } else {
+                    more_maps = true;
+                }
+            }
+            if places.last().is_none_or(|place| place.at != i) {
+                if places.len() == PRESENTATIONS_LISTED {
+                    more_places = true;
+                    continue;
+                }
+                places.push(Place { at: i, name: &pres.name, numbers: Vec::new(), pages: 0 });
+            }
+            if let Some(place) = places.last_mut() {
+                place.pages += 1;
+                if place.numbers.len() < PAGES_LISTED {
+                    place.numbers.push((k + 1).to_string());
+                }
+            }
+        }
+    }
+    let listed = places.into_iter().map(|place| {
+        let key = if place.pages == 1 { "presentation '{name}', page {numbers}" } else { "presentation '{name}', pages {numbers}" };
+        let mut numbers = place.numbers.join(", ");
+        if place.pages > PAGES_LISTED {
+            numbers.push_str(", …");
+        }
+        NoticeText::format(key, [("name", place.name.to_string().into()), ("numbers", numbers.into())])
+    });
+    let mut places = listed.reduce(|first, next| NoticeText::format("{first}; {next}", [("first", first), ("next", next)]))?;
+    if more_places {
+        places = NoticeText::format("{first}; {next}", [("first", places), ("next", "…".to_string().into())]);
+    }
+    let key = match (pages, named.len()) {
+        (1, _) => {
+            "{count} map page shows {names}, which the project doesn't have, so it is drawn over the active map until a map of that name comes back: {places}"
+        }
+        (_, 1) => {
+            "{count} map pages show {names}, which the project doesn't have, so they are drawn over the active map until a map of that name comes back: {places}"
+        }
+        _ => {
+            "{count} map pages show {names}, which the project doesn't have, so they are drawn over the active map until maps of those names come back: {places}"
+        }
+    };
+    let mut names = named.iter().map(|n| format!("'{n}'")).collect::<Vec<_>>().join(", ");
+    if more_maps {
+        names.push_str(", …");
+    }
+    Some(NoticeText::format(key, [("count", pages.to_string().into()), ("names", names.into()), ("places", places)]))
+}
+
 /// Binds the map whose current view initializes the page.
 fn map_page_inputs(input: &super::InputContext<'_>, p: &Value) -> Result<super::Inputs, String> {
     let map = map_page_source(input, p)?;

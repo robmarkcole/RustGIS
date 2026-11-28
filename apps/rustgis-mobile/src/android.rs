@@ -1,7 +1,8 @@
-//! The Android app: a `NativeActivity` whose Java half ([`Phone`]) shows the system's pickers,
-//! finds the device's position and asks the camera.
+//! The Android app: a `NativeActivity` whose Java half ([`Phone`]) shows the system's pickers
+//! and text fields, finds the device's position, asks the camera and keeps secrets ([`Vault`]).
 
-use crate::phone::Phone;
+use crate::phone::{self, Phone};
+use crate::secrets::Vault;
 use crate::shell;
 use eframe::egui;
 use eframe::wgpu;
@@ -26,6 +27,23 @@ impl shell::Phone for Phone {
     fn picking(&self) -> bool {
         Phone::picking(self)
     }
+
+    /// The activity looks at Android's memory when asked what happened, so an idle window asks.
+    fn idle_look(&self) -> Option<u64> {
+        Some(5000)
+    }
+
+    fn copy_text(&self, text: &str) -> Result<(), String> {
+        Phone::copy_text(self, text)
+    }
+
+    fn takes_back(&self, on: bool) {
+        Phone::takes_back(self, on);
+    }
+
+    fn take_back(&self) -> bool {
+        Phone::take_back(self)
+    }
 }
 
 /// Points the app's folders (`rustgis_data::dirs`) at the app's own storage: Android has no
@@ -44,8 +62,23 @@ fn set_folders(app: &AndroidApp) -> Option<std::path::PathBuf> {
 fn android_main(android: AndroidApp) {
     android_logger::init_once(android_logger::Config::default().with_max_level(log::LevelFilter::Info).with_tag("rustgis"));
     let folders = set_folders(&android);
-    let mut app = shell::front_end(folders.as_deref());
+    // The keystore's secrets, when the activity can be reached (else said below, by the phone).
+    let secrets = phone::activity(&android).ok().map(|activity| std::sync::Arc::new(Vault::new(activity)) as _);
     let phone = Phone::new(&android);
+    // Before anything plans a job: the limits follow what Android allows, with the browser's
+    // floors. Without the activity's Java half nothing says what that is, and the stand-in
+    // figure keeps this a phone.
+    let said = match &phone {
+        Ok(phone) => phone.plan_memory(),
+        Err(_) => {
+            rustgis_engine::data::memory::set_phone(shell::MEMORY_UNSAID, || None);
+            false
+        }
+    };
+    let mut app = shell::front_end(folders.as_deref(), secrets);
+    if !said {
+        shell::say_memory_unsaid(&mut app);
+    }
     // The app's external files folder (`/sdcard/Android/data/org.rustgis.mobile/files`), where
     // `adb push` can put files.
     let pushed = shell::pushed(android.external_data_path(), &mut app);

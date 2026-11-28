@@ -74,9 +74,9 @@ pub struct Import {
     /// The saved web-service connection to record on imported layers, not a group-plan parameter.
     connection: Option<Value>,
     token: u64,
-    /// The originating map: its index and name (names are unique among a project's maps), so a
-    /// deleted or replaced map at that index cancels the import.
-    map: (usize, String),
+    /// The project and map it started on (`dialogs::MapOwner`), so another project, or a deleted,
+    /// replaced or renamed map, cancels the import and a moved one doesn't.
+    owner: crate::dialogs::MapOwner,
     slot: Slot<Result<Vec<u8>, String>>,
     document: Option<String>,
     current: Option<String>,
@@ -237,8 +237,8 @@ pub(crate) fn add_layer_from(
             cache::restrict_to_public(&describe);
         }
         // Recorded if read from the internet: the GetCoverage request built from it goes there too.
-        let slot = fetch_document_into(&describe);
-        app.ui.service_steps.push(crate::ServiceStep::Coverage { params: p, slot, dialog, origin, opened: app.session.opened });
+        let slot = crate::fetch_document_reaching(&describe);
+        app.ui.service_steps.push(crate::ServiceStep::Coverage { params: p, describe, slot, dialog, origin, opened: app.session.opened });
         return Ok(describing(&title));
     }
     let mut p = json!({"url": src.url, "layer": name, "text": src.text, "documents": src.documents, "source_url": l.get("source_url")});
@@ -271,7 +271,7 @@ pub(crate) fn add_layer_from(
                 cache::restrict_to_public(&list);
             }
             // (Recording one read from the internet: what it names is fetched only from there.)
-            let slot = crate::fetch_document_into(&list);
+            let slot = crate::fetch_document_reaching(&list);
             let resolve = crate::TilesResolve {
                 params: p,
                 list: list.clone(),
@@ -342,7 +342,7 @@ pub fn start(app: &mut RustGisApp, p: &Value, refresh: bool) -> Result<(), Strin
         refresh,
         connection,
         token: app.session.download_started(),
-        map: active_map(app),
+        owner: crate::dialogs::MapOwner::of(&app.session),
         slot: Slot::default(),
         document: None,
         current: None,
@@ -382,8 +382,12 @@ impl Import {
         }
         let base = self.params.get("url").and_then(Value::as_str).unwrap_or_default();
         // The plan already resolved this exact destination and its login (or absence).
-        // Re-selecting from the original saved connection would undo a foreign hop.
-        rustgis_engine::render::rustgis_tiles::address::check(url, Some(base)).map_err(|e| crate::connectionui::translated(&e))?;
+        // Re-selecting from the original saved connection would undo a foreign hop. The plan
+        // judged it by where the document naming it was read, and recorded one read from the
+        // internet, so it is checked within that record, never by how the service's address is
+        // spelled (a public-looking name may connect on the local network).
+        let ceiling = cache::ceiling_for(base).min(cache::ceiling_for(url));
+        rustgis_engine::render::rustgis_tiles::address::check_reach(url, ceiling).map_err(|e| crate::connectionui::translated(&e))?;
         Ok(url.to_string())
     }
 
@@ -460,15 +464,18 @@ impl Import {
     }
 }
 
-fn active_map(app: &RustGisApp) -> (usize, String) {
-    let i = app.session.project.active_map;
-    (i, app.session.project.maps.get(i).map(|m| m.name.clone()).unwrap_or_default())
-}
-
 pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
     let Some(mut task) = app.ui.service_import.take() else { return };
-    if !app.session.download_is_pending(task.token) || active_map(app) != task.map {
+    let pending = app.session.download_is_pending(task.token);
+    let moved = !task.owner.holds(&app.session);
+    if !pending || moved {
         app.session.download_failed(task.token);
+        // Said unless the download was already over before the map moved (it failed elsewhere,
+        // say). Opening another project drops or puts aside its downloads, so they are never
+        // pending here.
+        if moved && (pending || !task.owner.in_project(&app.session)) {
+            app.session.notify(tl!("The service import was cancelled because the map or project in view changed.").to_string(), false);
+        }
         return;
     }
     let landed = task.slot.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -569,22 +576,6 @@ fn drawn(app: &mut RustGisApp, landed: &mut Landed, step: &mut Step) {
     }
 }
 
-/// A bounded description or feature page fetched off the frame. Native downloads end at the
-/// timeout, if it has one; the browser's late answer is discarded by the polling read. It connects
-/// no wider than `ceiling`, and lands with the reach it was read at, which the next page is
-/// fetched within ([`go_on`]). Nothing is recorded for a page's address, so a long read adds
-/// nothing to the restricted addresses ([`cache::restrict_to_public`]).
-fn fetch_page(url: &str, max: usize, timeout: Option<std::time::Duration>, ceiling: Reach) -> Slot<Result<(Vec<u8>, Reach), String>> {
-    let slot: Slot<Result<(Vec<u8>, Reach), String>> = Slot::default();
-    let land = slot.clone();
-    let done: cache::FetchedDone = Box::new(move |r| {
-        let r = r.map(|fetched| (fetched.bytes, fetched.origin.reach()));
-        *land.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
-    });
-    cache::download_limited_reaching_with_origin(url, max, timeout, ceiling, done);
-    slot
-}
-
 /// Hands each page that landed to its read, and adds the layers whose features are all read. A
 /// read whose project was closed meanwhile is dropped.
 pub fn poll_pages(app: &mut RustGisApp, ctx: &egui::Context) {
@@ -671,9 +662,9 @@ pub(crate) fn go_on(app: &mut RustGisApp, mut landed: Landed, left: usize, reach
                 let slot = match next {
                     // A layer's description: small, and soon given up on.
                     Ok(url) if pages.describing() => {
-                        fetch_page(&url, left.min(ogc::DESCRIPTION_MAX), Some(ogc::DESCRIPTION_TIMEOUT), reach)
+                        crate::fetch_within(&url, left.min(ogc::DESCRIPTION_MAX), Some(ogc::DESCRIPTION_TIMEOUT), reach)
                     }
-                    Ok(url) => fetch_page(&url, left, pages.page_timeout(), reach),
+                    Ok(url) => crate::fetch_within(&url, left, pages.page_timeout(), reach),
                     Err(e) => Slot::new(std::sync::Mutex::new(Some(Err(e)))),
                 };
                 app.ui.service_pages.push(PageRead { landed, pages, left, reach, slot, asked: web_time::Instant::now() });
@@ -698,6 +689,114 @@ fn noted(app: &mut RustGisApp, landed: &Landed, note: Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An import in flight that is given up because the map in view changed says so, once; one whose
+    /// download is already over says nothing (#2987).
+    #[test]
+    fn an_import_given_up_for_another_map_says_so() {
+        let mut app = RustGisApp::with_sample();
+        let first = app.session.map().name.clone();
+        let task = |app: &mut RustGisApp| Import {
+            params: json!({}),
+            refresh: false,
+            connection: None,
+            token: app.session.download_started(),
+            owner: crate::dialogs::MapOwner::of(&app.session),
+            slot: Slot::default(),
+            document: Some("https://example.test/capabilities".into()),
+            current: None,
+            remaining: VecDeque::new(),
+            responses: Vec::new(),
+            bytes: 0,
+        };
+        let ctx = egui::Context::default();
+        let said = |app: &RustGisApp, mark: u64| {
+            app.session.notices_since(mark).iter().filter(|n| n.text.contains("service import was cancelled")).count()
+        };
+        // Another map in view: said once.
+        let mark = app.session.notice_mark();
+        let import = task(&mut app);
+        app.ui.service_import = Some(import);
+        app.run("map.new", json!({"name": "Second"})).unwrap();
+        poll(&mut app, &ctx);
+        assert_eq!(said(&app, mark), 1);
+        assert!(app.ui.service_import.is_none());
+        // Its map renamed: the name is part of what it finds its map by.
+        app.run("map.activate", json!({"name": first})).unwrap();
+        let mark = app.session.notice_mark();
+        let import = task(&mut app);
+        app.ui.service_import = Some(import);
+        app.run("map.rename", json!({"name": "Renamed"})).unwrap();
+        poll(&mut app, &ctx);
+        assert_eq!(said(&app, mark), 1);
+        // A download already over (failed elsewhere, say): nothing more to say.
+        let mark = app.session.notice_mark();
+        let import = task(&mut app);
+        app.session.download_failed(import.token);
+        app.ui.service_import = Some(import);
+        app.run("map.activate", json!({"name": "Second"})).unwrap();
+        poll(&mut app, &ctx);
+        assert_eq!(said(&app, mark), 0);
+        // Another project opened: its download is put aside with the project, so it is no longer
+        // pending here, and that is said all the same.
+        app.run("map.activate", json!({"name": "Second"})).unwrap();
+        let mark = app.session.notice_mark();
+        let import = task(&mut app);
+        app.ui.service_import = Some(import);
+        app.run("project.new", json!({})).unwrap();
+        poll(&mut app, &ctx);
+        assert_eq!(said(&app, mark), 1);
+    }
+
+    /// An import in flight goes on when its map moves among the maps, and is given up when another
+    /// map is in view (#2959).
+    #[test]
+    fn an_import_in_flight_goes_on_when_its_map_moves() {
+        let mut app = RustGisApp::with_sample();
+        let first = app.session.map().name.clone();
+        let token = app.session.download_started();
+        app.ui.service_import = Some(Import {
+            params: json!({}),
+            refresh: false,
+            connection: None,
+            token,
+            owner: crate::dialogs::MapOwner::of(&app.session),
+            slot: Slot::default(),
+            document: Some("https://example.test/capabilities".into()),
+            current: None,
+            remaining: VecDeque::new(),
+            responses: Vec::new(),
+            bytes: 0,
+        });
+        let ctx = egui::Context::default();
+        app.run("map.new", json!({"name": "Second"})).unwrap();
+        app.run("map.activate", json!({"name": first})).unwrap();
+        app.run("map.move", json!({"name": first, "to": 1})).unwrap();
+        assert_eq!(app.session.project.active_map, 1, "the map in view moved to the end");
+        poll(&mut app, &ctx);
+        assert!(app.ui.service_import.is_some() && app.session.download_is_pending(token), "the same map, moved");
+        app.run("map.activate", json!({"name": "Second"})).unwrap();
+        poll(&mut app, &ctx);
+        assert!(app.ui.service_import.is_none() && !app.session.download_is_pending(token), "another map is in view");
+    }
+
+    /// The map an import started on is told by what it is, not by its place among the maps: the same
+    /// map moved is the same, another map (even a copy under its place) isn't (#2959).
+    #[test]
+    fn an_import_follows_its_map_when_it_moves() {
+        let mut app = RustGisApp::with_sample();
+        let first = app.session.map().name.clone();
+        app.run("map.new", json!({"name": "Second"})).unwrap();
+        let second = crate::dialogs::map_key(&app.session);
+        app.run("map.activate", json!({"name": first})).unwrap();
+        let before = crate::dialogs::map_key(&app.session);
+        assert_ne!(before, second);
+        app.run("map.move", json!({"name": first, "to": 1})).unwrap();
+        assert_eq!(app.session.project.active_map, 1, "the map in view moved to the end");
+        assert_eq!(crate::dialogs::map_key(&app.session), before, "the same map, moved");
+        app.run("map.activate", json!({"name": "Second"})).unwrap();
+        assert_eq!(crate::dialogs::map_key(&app.session), second, "the other map, now first");
+    }
 
     /// Add From Service records a document it read from the internet: the document it links to
     /// is fetched only from there, and a layer listed there is added restricted to it, however
@@ -917,6 +1016,128 @@ mod tests {
         }
     }
 
+    /// A tile set list at a public-looking name read on the local network leads to the tile set it
+    /// names on a private address: it is judged by where the list was read, not by how its name is
+    /// spelled. The same list read from the internet has that tile set refused, naming it and why,
+    /// and nothing more is fetched.
+    #[test]
+    fn a_tile_set_list_read_on_the_local_network_leads_to_its_local_tile_set() {
+        use rustgis_engine::render::rustgis_tiles::address::{Origin, Reach};
+        for (n, observed) in [(1, Reach::Local), (2, Reach::Public)] {
+            let _turn = crate::fetching::turn();
+            let root = format!("https://tileset-root-{n}.example/ogc");
+            let list = format!("https://tileset-list-{n}.corp-looks-public.example/collections/relief/map/tiles");
+            let tileset = format!("http://10.0.{n}.7/tiles/WebMercatorQuad");
+            let template = format!("http://10.0.{n}.7/relief/{{tileMatrix}}/{{tileRow}}/{{tileCol}}.png");
+            let collections = json!({"collections":[{"id":"relief","title":"Relief","links":[{"rel":"tilesets-map","href":list}]}]});
+            let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let log = asked.clone();
+            let (list_at, tileset_body) = (list.clone(), json!({"links":[{"rel":"item","type":"image/png","href":template}]}));
+            let list_body = json!({"tilesets":[{"tileMatrixSetId":"WebMercatorQuad","links":[{"rel":"self","href":tileset}]}]});
+            cache::set_fetcher_with_origin(move |url, ceiling, done, _| {
+                let clean = cache::split_download_limit(&url).0.to_string();
+                log.lock().unwrap().push((clean.clone(), ceiling));
+                let body = if clean.starts_with(&list_at) { &list_body } else { &tileset_body };
+                let origin = Origin::with_observed_reach(&clean, observed.min(ceiling)).unwrap();
+                done(Ok(cache::Fetched { bytes: body.to_string().into_bytes(), origin }));
+            });
+            let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+            let text = collections.to_string();
+            let listing = app.session.run("service.layers", &json!({"url": root, "type": "ogcapi", "text": text})).unwrap();
+            let layer = listing["layers"].as_array().and_then(|l| l.iter().find(|l| l.get("tilesets").is_some())).unwrap().clone();
+            let src = ServiceSource { url: root.clone(), kind: "ogcapi", text, documents: Vec::new() };
+            add_layer_from(&mut app, &src, &layer, "", None, false, None, None).unwrap();
+            app.poll_service_steps();
+            app.poll_service_steps();
+            let asked = asked.lock().unwrap().clone();
+            if observed == Reach::Local {
+                assert_eq!(asked.len(), 2, "{asked:?}");
+                assert_eq!(asked[1], (format!("{tileset}?f=json"), Reach::Local), "{asked:?}");
+                let added = app.session.map().tiles.last().map(|t| t.url.clone()).unwrap_or_default();
+                assert!(added.starts_with(&format!("http://10.0.{n}.7/relief/")), "{added} {:?}", app.dialogs.error);
+            } else {
+                assert_eq!(asked.len(), 1, "the tile set is not fetched: {asked:?}");
+                let told: Vec<_> = app.session.notices_since(0).iter().map(|n| n.text.clone()).collect();
+                assert!(told.iter().any(|t| t.contains(&tileset) && t.contains("local network")), "{told:?}");
+            }
+        }
+    }
+
+    /// A grouped import's next document is judged by the plan's record of where the document
+    /// naming it was read, not by how the service's address is spelled: under a service at a
+    /// public-looking name read on the local network, a document on a private address is asked
+    /// for; under one recorded as read from the internet, it is refused, naming it and why.
+    #[test]
+    fn a_grouped_import_judges_its_next_document_by_where_the_service_was_read() {
+        use rustgis_engine::render::rustgis_tiles::address::Reach;
+        for (n, observed) in [(3, Reach::Local), (4, Reach::Public)] {
+            let _turn = crate::fetching::turn();
+            let base = format!("https://import-{n}.corp-looks-public.example/ogc");
+            let next = format!("http://10.0.{n}.8/collections");
+            // The plan records a document it names after one read from the internet.
+            if observed == Reach::Public {
+                cache::restrict_to_public(&next);
+            }
+            let task = Import {
+                params: json!({"url": base}),
+                refresh: false,
+                connection: None,
+                token: 0,
+                owner: crate::dialogs::MapOwner::of(&rustgis_engine::Session::new(rustgis_engine::Project::default())),
+                slot: Slot::default(),
+                document: None,
+                current: None,
+                remaining: VecDeque::new(),
+                responses: Vec::new(),
+                bytes: 0,
+            };
+            match task.request(&next) {
+                Ok(asked) => {
+                    assert_eq!(observed, Reach::Local);
+                    assert_eq!(asked, next);
+                }
+                Err(e) => {
+                    assert_eq!(observed, Reach::Public, "{e}");
+                    assert!(e.contains(&next) && e.contains("local network"), "{e}");
+                }
+            }
+        }
+    }
+
+    /// A service a document read from the internet named (`fromDocument`: a catalogue's or a
+    /// portal's entry) is read only from there: its capabilities and what they list. One whose
+    /// address points into the local network is refused, naming it and why. Without it the
+    /// address is the user's, as before.
+    #[test]
+    fn a_service_a_document_named_is_read_only_from_the_internet() {
+        use rustgis_engine::render::rustgis_tiles::address::{Origin, Reach};
+        for public in [true, false] {
+            let _turn = crate::fetching::turn();
+            let url = format!("https://named-{public}.example/wms");
+            let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let log = asked.clone();
+            cache::set_fetcher_with_origin(move |url, ceiling, done, _| {
+                let clean = cache::split_download_limit(&url).0.to_string();
+                log.lock().unwrap().push((clean.clone(), ceiling));
+                let origin = Origin::with_observed_reach(&clean, ceiling).unwrap();
+                done(Ok(cache::Fetched { bytes: b"<WMS_Capabilities version=\"1.3.0\"/>".to_vec(), origin }));
+            });
+            let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+            app.run("ui.addService", json!({"url": url, "type": "wms", "fromDocument": public})).unwrap();
+            let caps = rustgis_engine::data::ogc::capabilities_url(&url, Some("wms"));
+            let want = if public { Reach::Public } else { Reach::Local };
+            assert_eq!(asked.lock().unwrap().clone(), [(caps.clone(), want)]);
+            assert_eq!(cache::ceiling_for(&caps), want);
+            if public {
+                app.dialogs.open = None;
+                let e = app.run("ui.addService", json!({"url": "http://10.0.5.9/wms", "type": "wms", "fromDocument": true})).unwrap_err();
+                assert!(e.contains("10.0.5.9") && e.contains("local network"), "{e}");
+                assert_eq!(asked.lock().unwrap().len(), 1, "a refused service is not asked");
+                assert_eq!(app.dialogs.open, None, "nothing opens for a refused service");
+            }
+        }
+    }
+
     /// Discovery's anonymous provenance survives both deferred protocols and their final params.
     #[test]
     fn anonymous_service_offers_keep_descriptions_and_tiles_unbound() {
@@ -962,12 +1183,12 @@ mod tests {
                 }
                 let params = match &app.ui.service_steps[0] {
                     crate::ServiceStep::Coverage { params, slot, .. } => {
-                        *slot.lock().unwrap() = Some(Ok(describe.to_vec()));
+                        *slot.lock().unwrap() = Some(Ok((describe.to_vec(), Reach::Local)));
                         params
                     }
                     crate::ServiceStep::Tiles { resolve, .. } => {
                         assert_eq!(resolve.crossed_origin, anonymous);
-                        *resolve.slot.lock().unwrap() = Some(Ok(br#"{"links":[{"rel":"item","type":"image/png","href":"https://anonymous-offer.invalid/{tileMatrix}/{tileRow}/{tileCol}"}]}"#.to_vec()));
+                        *resolve.slot.lock().unwrap() = Some(Ok((br#"{"links":[{"rel":"item","type":"image/png","href":"https://anonymous-offer.invalid/{tileMatrix}/{tileRow}/{tileCol}"}]}"#.to_vec(), Reach::Local)));
                         &resolve.params
                     }
                 };

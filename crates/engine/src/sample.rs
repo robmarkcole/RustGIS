@@ -170,7 +170,7 @@ pub(crate) fn fetch_with(
             if let Some((work, done)) = mine.lock().ok().and_then(|mut g| g.take()) {
                 // A panic (a parser on hostile bytes) is the download's error, not a silent stall.
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
-                    .unwrap_or_else(|_| Err("the download stopped unexpectedly".to_string()));
+                    .unwrap_or_else(|payload| Err(crate::bug("the download", payload.as_ref())));
                 done(r);
             }
         });

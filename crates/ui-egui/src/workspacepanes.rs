@@ -491,7 +491,7 @@ pub struct Reducing {
     pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub done: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// The summary as a GeoTIFF, and what reading its slices said, which the GeoTIFF doesn't carry.
-    pub result: std::sync::Arc<std::sync::Mutex<Option<Result<(Vec<u8>, Vec<String>), String>>>>,
+    pub result: std::sync::Arc<std::sync::Mutex<Option<Result<(Vec<u8>, rustgis_engine::data::loss::Notes), String>>>>,
 }
 
 /// A point's series read on a thread of its own (opengeos/RustGIS#2282): the steps read and
@@ -508,7 +508,7 @@ pub struct SeriesReading {
 /// A series read on its thread, as `zarr.series` answers it, and what reading it said (a read
 /// that fails said it too).
 #[cfg(not(target_arch = "wasm32"))]
-pub type SeriesResult = (Result<Value, String>, Vec<String>);
+pub type SeriesResult = (Result<Value, String>, Vec<rustgis_engine::data::loss::Note>);
 
 /// Starts reading the series at `at` under the Time Series pane's layer on a thread of its own: a
 /// wrong request is said at once, and the read lands through [`land_series`].
@@ -566,7 +566,7 @@ pub fn land_series(app: &mut RustGisApp) -> bool {
     // What reading it said, though it then failed; not for a read that was cancelled.
     if !cancelled {
         for n in notes {
-            app.session.warn(n);
+            app.session.say_warning(n);
         }
     }
     match res {
@@ -646,8 +646,9 @@ pub fn land_summary(app: &mut RustGisApp) -> bool {
                 // layer's read notices are said: its GeoTIFF doesn't carry it.
                 if added.is_some() {
                     let layer = app.session.active_layer.and_then(|id| app.session.map().layer(id)).map_or(name, |l| l.name.clone());
+                    // Each with its code, as a layer's read notices are said.
                     for loss in lost {
-                        app.session.notify(crate::i18n::fmt("{layer}: {notice}", &[("layer", &layer), ("notice", &loss)]), false);
+                        app.session.say(loss.map_text(|t| crate::i18n::fmt("{layer}: {notice}", &[("layer", &layer), ("notice", &t)])));
                     }
                 }
             } else {

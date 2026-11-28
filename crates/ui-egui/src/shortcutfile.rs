@@ -208,7 +208,7 @@ pub fn run(app: &mut RustGisApp, id: &str, p: &Value) -> Result<Value, String> {
                 }
             } else if !p.get("text").and_then(Value::as_bool).unwrap_or(false) {
                 if let Some(download) = &app.services.download {
-                    download("rustgis-shortcuts.json", text.as_bytes().to_vec())?;
+                    download("rustgis-shortcuts.json", std::sync::Arc::new(text.as_bytes().to_vec()))?;
                 } else if let Some(path) = dialogs::pick_save("rustgis-shortcuts.json", &["json"], tl!("Keyboard shortcuts")) {
                     rustgis_engine::data::io::write_atomic(std::path::Path::new(&path), text.as_bytes()).map_err(|e| e.to_string())?;
                 }

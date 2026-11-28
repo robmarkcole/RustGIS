@@ -1021,8 +1021,8 @@ pub fn pages(s: &Session, i: usize) -> Result<(Doc, Vec<rustgis_render::report::
 /// app's runs on a thread of its own ([`export_work`]).
 pub fn report_bytes(s: &mut Session, i: usize, dpi: f64, pdf: bool) -> Result<(Vec<u8>, usize), String> {
     let name = s.project.reports.get(i).map(|r| r.name.clone()).unwrap_or_default();
-    let (bytes, mut copy) = whole_bytes(detached(&s.project), s.path.clone(), i, dpi, pdf);
-    super::exports::say(s, super::exports::copy_notices(&mut copy, &name));
+    let (bytes, mut copy) = whole_bytes(detached(&s.project), s.path.clone(), i, dpi, pdf, None);
+    super::exports::say_coded(s, super::exports::copy_notices_coded(&mut copy, &name));
     bytes
 }
 
@@ -1038,17 +1038,21 @@ pub(crate) fn export_work(s: &Session, p: &Value) -> Result<super::exports::Work
         return Err("export to a .pdf or .png file".into());
     }
     let (project, folder) = (detached(&s.project), s.path.clone());
+    let download = s.download_room()?;
     Ok(Box::new(move || {
-        let (bytes, mut copy) = whole_bytes(project, folder, i, dpi, pdf);
+        let (bytes, mut copy) = whole_bytes(project, folder, i, dpi, pdf, download.map(|room| (room, path.as_str())));
+        let mut held = None;
         let written = bytes.and_then(|(bytes, pages)| {
             rustgis_data::progress::check().map_err(|e| e.to_string())?;
-            rustgis_data::io::write_atomic(Path::new(&path), &bytes).map_err(|e| format!("{path}: {e}"))?;
-            Ok(json!({"path": path, "pages": pages, "bytes": bytes.len()}))
+            let len = bytes.len();
+            held = super::exports::place(download.is_some(), &path, bytes)?;
+            Ok(json!({"path": path, "pages": pages, "bytes": len}))
         });
         // The layers it lists are read whole; a layout drawn in it draws the others' views, and
         // one whose source fails there is said, as Export Layout says it.
-        let said = super::exports::copy_notices(&mut copy, &path);
-        super::exports::drawn(&copy.project.maps, said, written, path)
+        // What reading the layers lost keeps its code: said with the export's notes.
+        let wrote = super::exports::drawn_on(&mut copy, written, path)?;
+        Ok(super::exports::Wrote { download: held, ..wrote })
     }))
 }
 
@@ -1070,10 +1074,11 @@ fn whole_bytes(
     i: usize,
     dpi: f64,
     pdf: bool,
+    download: Option<(super::exports::Room, &str)>,
 ) -> (Result<(Vec<u8>, usize), String>, Session) {
     let mut copy = Session::new(project);
     copy.path = path;
-    let bytes = whole_copy(&mut copy, i).and_then(|()| drawn_bytes(&mut copy, i, dpi, pdf));
+    let bytes = whole_copy(&mut copy, i).and_then(|()| drawn_bytes(&mut copy, i, dpi, pdf, download));
     (bytes, copy)
 }
 
@@ -1138,7 +1143,13 @@ pub(crate) fn reported_layers(input: &impl super::InputSource, i: usize) -> Vec<
 
 /// The report as a PDF (every page) or a PNG (the first page), and its page count, drawn from
 /// the features `s`'s layers hold.
-fn drawn_bytes(s: &mut Session, i: usize, dpi: f64, pdf: bool) -> Result<(Vec<u8>, usize), String> {
+fn drawn_bytes(
+    s: &mut Session,
+    i: usize,
+    dpi: f64,
+    pdf: bool,
+    download: Option<(super::exports::Room, &str)>,
+) -> Result<(Vec<u8>, usize), String> {
     let (doc, pages) = pages(s, i)?;
     let revision = |s: &Session| {
         pages
@@ -1152,7 +1163,7 @@ fn drawn_bytes(s: &mut Session, i: usize, dpi: f64, pdf: bool) -> Result<(Vec<u8
             .unwrap_or_default()
     };
     let before = revision(s);
-    let result = super::share::saying_shadows(s, "The report", |s| report_pages_bytes(s, &doc, &pages, dpi, pdf));
+    let result = super::share::saying_shadows(s, "The report", |s| report_pages_bytes(s, &doc, &pages, dpi, pdf, download));
     before.finish_revision(revision(s), Some(result), "could not draw the report")?
 }
 
@@ -1162,36 +1173,160 @@ fn report_pages_bytes(
     pages: &[rustgis_render::report::Page],
     dpi: f64,
     pdf: bool,
+    download: Option<(super::exports::Room, &str)>,
 ) -> Result<(Vec<u8>, usize), String> {
     let n = if pdf { pages.len() } else { 1 };
     let mut out = Vec::new();
     let mut held = 0usize;
     let (mut frames_pictured, mut pages_pictured) = (Vec::new(), Vec::new());
+    // The legends its layouts' pages drew under a fit still cut, and the charts they drew, by
+    // layout ([`keep_drawn`]).
+    let (mut unfitted, mut charts) = (Vec::new(), Vec::new());
+    // The texts cut off on its layouts' pages, by layout and element.
+    let mut clipped = ClippedTexts::new();
     // Counted, and stopped on Cancel, a page at a time.
     rustgis_data::progress::begin(n);
     for k in 0..n {
         rustgis_data::progress::step(1).map_err(|e| e.to_string())?;
+        let page_layout = match pages.get(k) {
+            Some(rustgis_render::report::Page::Layout(li)) => Some(*li),
+            _ => None,
+        };
+        if let Some(li) = page_layout
+            && let Some(layout) = s.project.layouts.get(li)
+        {
+            // The page's own number, as the page draws it: a text that shows it may only be cut
+            // off on some pages.
+            let info = rustgis_render::layout::PageInfo { page: k + 1, pages: pages.len(), page_name: String::new() };
+            let cut = rustgis_render::layout::clipped_text(layout, &s.project.maps, dpi, &info);
+            if !cut.is_empty() {
+                clipped.entry(li).or_default().extend(cut);
+            }
+        }
         if !pdf {
-            let (img, ..) = rustgis_render::report::draw_page(doc, pages, k, dpi, &s.project.layouts, &mut s.project.maps)?;
+            let (drawn, listed, shown) =
+                listing(|| rustgis_render::report::draw_page(doc, pages, k, dpi, &s.project.layouts, &mut s.project.maps));
+            let (img, ..) = drawn?;
+            keep_drawn(&mut unfitted, page_layout, listed);
+            keep_drawn(&mut charts, page_layout, shown);
+            say_report_unfitted(s, &unfitted);
+            say_report_charts(s, &charts);
+            say_report_clipped(s, &clipped);
+            say_sections_not_drawn(s, pages, 1);
             return Ok((img.encode_png().map_err(|e| e.to_string())?, pages.len()));
         }
-        let (page, pictured) = rustgis_render::report::pdf_page(doc, pages, k, dpi, &s.project.layouts, &mut s.project.maps)?;
+        let (drawn, listed, shown) =
+            listing(|| rustgis_render::report::pdf_page(doc, pages, k, dpi, &s.project.layouts, &mut s.project.maps));
+        let (page, pictured) = drawn?;
+        keep_drawn(&mut unfitted, page_layout, listed);
+        keep_drawn(&mut charts, page_layout, shown);
         if page.overflowed() {
             // Too large for vectors all the same: the page as one picture.
             pages_pictured.push(k + 1);
-            let (img, w, h) = rustgis_render::report::draw_page(doc, pages, k, dpi, &s.project.layouts, &mut s.project.maps)?;
+            let (drawn, listed, shown) =
+                listing(|| rustgis_render::report::draw_page(doc, pages, k, dpi, &s.project.layouts, &mut s.project.maps));
+            let (img, w, h) = drawn?;
+            keep_drawn(&mut unfitted, page_layout, listed);
+            keep_drawn(&mut charts, page_layout, shown);
             out.push(rustgis_render::pdf::Page::new(&img, w, h));
         } else {
             frames_pictured.extend(pictured);
             out.push(page);
         }
         held += out.last().map_or(0, rustgis_render::pdf::Page::len);
+        // Where the file is downloaded, its pages are held to the room it has too.
+        if let Some((room, path)) = download
+            && held > room.bytes
+        {
+            return Err(room.refusal(path));
+        }
         if held > PDF_BUDGET {
             return Err(format!("the PDF passed {} MB at page {}; export at a lower dpi", PDF_BUDGET >> 20, k + 1));
         }
     }
+    say_report_unfitted(s, &unfitted);
+    say_report_charts(s, &charts);
+    say_report_clipped(s, &clipped);
     super::layout::pictured_notices(s, &frames_pictured, &pages_pictured);
+    say_sections_not_drawn(s, pages, n);
     Ok((rustgis_render::pdf::write(&out, &doc.title), pages.len()))
+}
+
+/// Says the section lines (#2863) the layouts of the first `n` of `pages` don't draw, as the
+/// layout's own export says them: in one notice however many layouts leave one out, each line named
+/// with its layout, and a layout on several pages counted once.
+fn say_sections_not_drawn(s: &mut Session, pages: &[rustgis_render::report::Page], n: usize) {
+    let mut seen = Vec::new();
+    let mut gaps = std::collections::BTreeMap::new();
+    for page in pages.iter().take(n) {
+        let rustgis_render::report::Page::Layout(li) = page else { continue };
+        if seen.contains(li) {
+            continue;
+        }
+        seen.push(*li);
+        let Some(layout) = s.project.layouts.get(*li) else { continue };
+        for mut gap in rustgis_render::layout::sections_not_drawn(layout, &s.project.maps) {
+            gap.frame_name = format!("{} in layout '{}'", gap.frame_name, layout.name);
+            gaps.insert(gap, 1);
+        }
+    }
+    if let Some(note) = rustgis_render::layout::sections_notice(&gaps, 1) {
+        s.warn(format!("The report: {note}"));
+    }
+}
+
+/// Runs `f`, and returns its result with the legends it drew under a fit still cut and the charts
+/// it drew.
+fn listing<T>(f: impl FnOnce() -> T) -> (T, Vec<rustgis_render::layout::UnfittedLegend>, Vec<rustgis_render::layout::DrawnChart>) {
+    let ((drawn, legends), charts) = rustgis_render::layout::drawn_charts(|| rustgis_render::layout::unfitted_legends(f));
+    (drawn, legends, charts)
+}
+
+/// Keeps what a page that draws the layout `layout` (by its index) `listed`, a legend cut under
+/// its fit or a chart drawn, each with that layout: the ids are a layout's own, so two layouts'
+/// elements sharing one are two. Only an exact repeat (the same element of the same layout, cut
+/// the same way or drawn with the same data) is dropped: the page drawn again as a picture, or
+/// the layout on another page of the report. A page that draws no layout lists nothing.
+fn keep_drawn<T: PartialEq>(kept: &mut Vec<(usize, T)>, layout: Option<usize>, listed: Vec<T>) {
+    let Some(li) = layout else { return };
+    for l in listed {
+        let item = (li, l);
+        if !kept.contains(&item) {
+            kept.push(item);
+        }
+    }
+}
+
+/// Says the legends [`keep_drawn`] kept, each named with its layout, as a layout's export
+/// says its own ([`super::layout::say_unfitted_legends_in`]).
+fn say_report_unfitted(s: &mut Session, kept: &[(usize, rustgis_render::layout::UnfittedLegend)]) {
+    let named: Vec<_> =
+        kept.iter().map(|(li, l)| (s.project.layouts.get(*li).map(|layout| (*li, layout.name.clone())), l.clone())).collect();
+    super::layout::say_unfitted_legends_in(s, &named);
+}
+
+/// Says what the charts [`keep_drawn`] kept leave out, each named with its layout, as a layout's
+/// export says its own ([`super::layout::chart_notice_lines_in`]).
+fn say_report_charts(s: &mut Session, kept: &[(usize, rustgis_render::layout::DrawnChart)]) {
+    let drawn = kept.iter().filter_map(|(li, chart)| Some((Some(*li), s.project.layouts.get(*li)?, chart)));
+    for note in super::layout::chart_notice_lines_in(drawn) {
+        s.warn(note);
+    }
+}
+
+/// The texts cut off on a report's layout pages: each layout's (by its index) elements, by id.
+type ClippedTexts = std::collections::BTreeMap<usize, std::collections::BTreeMap<u32, String>>;
+
+/// Says the texts cut off on the report's layout pages as each layout's export says them, one
+/// notice a layout, which it names: the advice depends on that layout's elements.
+fn say_report_clipped(s: &mut Session, clipped: &ClippedTexts) {
+    for (li, texts) in clipped {
+        let Some(layout) = s.project.layouts.get(*li) else { continue };
+        let texts: Vec<_> = texts.clone().into_iter().collect();
+        let Some(note) = rustgis_render::layout::clipped_text_notice(layout, &texts) else { continue };
+        let name = crate::project::short_name(&layout.name);
+        s.warn(format!("The report, layout \"{name}\": {note}"));
+    }
 }
 
 /// Resolves the report creator's string-name or active/default layer convention.
@@ -1426,4 +1561,33 @@ pub fn index(s: &Session, p: &Value) -> Result<usize, String> {
 /// The live report layer, using the same active-first resolver as approval.
 pub fn layer_of(s: &Session, i: usize) -> Result<&Layer, String> {
     layer_of_input(s, i)
+}
+
+#[cfg(test)]
+mod tests {
+    use rustgis_map::layout::LegendFit;
+    use rustgis_render::layout::UnfittedLegend;
+
+    /// A page drawn again as a picture, or a layout shown on two pages, lists its legends again:
+    /// kept once. Two layouts' legends sharing an id, or one legend cut otherwise, are kept apart;
+    /// a page that draws no layout keeps nothing.
+    #[test]
+    fn a_reports_cut_legends_are_kept_once_by_layout() {
+        let cut = |columns: usize| UnfittedLegend {
+            id: 3,
+            name: "Key".into(),
+            fit: LegendFit::AdjustColumns,
+            columns,
+            too_wide: false,
+            too_tall: true,
+        };
+        let mut kept = Vec::new();
+        super::keep_drawn(&mut kept, Some(0), vec![cut(1)]);
+        // The vector page, then the same page drawn as a picture.
+        super::keep_drawn(&mut kept, Some(0), vec![cut(1)]);
+        super::keep_drawn(&mut kept, Some(1), vec![cut(1)]);
+        super::keep_drawn(&mut kept, Some(0), vec![cut(2)]);
+        super::keep_drawn(&mut kept, None, vec![cut(3)]);
+        assert_eq!(kept, [(0, cut(1)), (1, cut(1)), (0, cut(2))]);
+    }
 }

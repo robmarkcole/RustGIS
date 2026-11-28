@@ -65,6 +65,7 @@ mod desktop {
     use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    use rustgis_data::loss::{LossCode, Note};
     use rustgis_data::raster::Raster;
     use rustgis_map::{Ramp, RasterLayer, RasterRenderer, Stretch};
     use serde_json::{Value, json};
@@ -223,7 +224,7 @@ mod desktop {
             rustgis_data::progress::check().map_err(|e| e.to_string())?;
             let bytes = rustgis_data::raster::geotiff::write_all(&raster).map_err(|e| e.to_string())?;
             let layer_name = raster.name.clone();
-            let mut layer = RasterLayer::from_bytes(raster, format!("{layer_name}.tif"), bytes);
+            let mut layer = RasterLayer::from_written(raster, format!("{layer_name}.tif"), bytes);
             // Drawn in colour over the range the index means something in, not grey over this window's own.
             let (ramp, min, max) = index_look(id);
             layer.style.renderer = RasterRenderer::Stretch { band: 0, ramp, invert: false };
@@ -335,12 +336,12 @@ mod desktop {
                         // Taken as references and values, so the reader thread owns what it uses.
                         let (stop_r, cause_r, diagnostics_r, still_r) = (&stop, &cause, &diagnostics, &still);
                         let (signed_s, bands_n) = (signed.as_str(), *bands);
-                        let message = format!("{href}: the read failed unexpectedly");
+                        let what = format!("{href}: the read");
                         let reader = std::thread::Builder::new().name("STAC band window".into()).spawn_scoped(scope, move || {
                             let _diagnostics = diagnostics_r.enter();
                             rustgis_data::source::remote::with_optional_still(still_r.clone(), || {
                                 // A reader that panics stops the run too (the guard, unless it is disarmed on return).
-                                let mut guard = PanicStop { stop: stop_r, cause: cause_r, message, armed: true };
+                                let mut guard = PanicStop { stop: stop_r, cause: cause_r, what, armed: true };
                                 let read = read_one(signed_s, bbox, cell, bands_n, stop_r);
                                 guard.armed = false;
                                 // A file that failed stops the reads beside it: they would only finish to be dropped.
@@ -362,7 +363,7 @@ mod desktop {
                 started
                     .into_iter()
                     .map(|(href, signed, bands, reader)| match reader {
-                        Ok(r) => r.join().unwrap_or_else(|_| Err(format!("{href}: the read failed unexpectedly"))),
+                        Ok(r) => r.join().unwrap_or_else(|payload| Err(crate::bug(&format!("{href}: the read"), payload.as_ref()))),
                         Err(_) => {
                             // Looked at before it starts: once started, this read runs to its end.
                             rustgis_data::progress::check().map_err(|e| e.to_string())?;
@@ -391,14 +392,21 @@ mod desktop {
     pub(super) struct PanicStop<'a> {
         pub(super) stop: &'a AtomicBool,
         pub(super) cause: &'a std::sync::Mutex<Option<String>>,
-        pub(super) message: String,
+        /// What was being done (`a.tif: the read`): what failed, in the message.
+        pub(super) what: String,
         pub(super) armed: bool,
     }
 
     impl Drop for PanicStop<'_> {
+        /// Said as a bug, with the reference the panic hook gave this thread's panic, when it gave
+        /// one ([`rustgis_data::incident`]).
         fn drop(&mut self) {
             if self.armed {
-                note_failure(self.stop, self.cause, &self.message);
+                let message = match rustgis_data::incident::last_id() {
+                    Some(id) => rustgis_data::incident::message(&self.what, false, &id),
+                    None => format!("{} failed unexpectedly", self.what),
+                };
+                note_failure(self.stop, self.cause, &message);
             }
         }
     }
@@ -429,24 +437,25 @@ mod desktop {
     /// naming every band of the files it is for and how many files. The notes of a kind differ by a
     /// number or an edge name from file to file, so they are matched by [`note_kind`], and each file's
     /// own wording is kept; a file counts once for a kind, however many of its notes are of it.
-    pub(super) fn merge_notes(files: &[(Vec<String>, Vec<String>)]) -> Vec<String> {
-        let mut merged: Vec<(String, Vec<String>, Vec<String>, usize)> = Vec::new();
+    pub(super) fn merge_notes(files: &[(Vec<String>, Vec<Note>)]) -> Vec<Note> {
+        // A notice's kind, and the code it has: a coded note is never merged with a plain one.
+        let mut merged: Vec<((String, Option<LossCode>), Vec<String>, Vec<String>, usize)> = Vec::new();
         for (whos, notes) in files {
-            let mut counted: Vec<String> = Vec::new();
+            let mut counted: Vec<(String, Option<LossCode>)> = Vec::new();
             for n in notes {
-                let kind = note_kind(n);
+                let kind = (note_kind(&n.text), n.loss);
                 let first = !counted.contains(&kind);
                 match merged.iter_mut().find(|(k, ..)| *k == kind) {
                     Some((_, texts, bands, files)) => {
-                        if !texts.contains(n) {
-                            texts.push(n.clone());
+                        if !texts.contains(&n.text) {
+                            texts.push(n.text.clone());
                         }
                         if first {
                             bands.extend(whos.iter().cloned());
                             *files += 1;
                         }
                     }
-                    None => merged.push((kind.clone(), vec![n.clone()], whos.clone(), 1)),
+                    None => merged.push((kind.clone(), vec![n.text.clone()], whos.clone(), 1)),
                 }
                 if first {
                     counted.push(kind);
@@ -455,8 +464,10 @@ mod desktop {
         }
         merged
             .into_iter()
-            .map(|(_, texts, bands, files)| {
-                format!("{} ({files} file{}): {}", bands.join(", "), if files == 1 { "" } else { "s" }, texts.join("; "))
+            .map(|((_, loss), texts, bands, files)| Note {
+                text: format!("{} ({files} file{}): {}", bands.join(", "), if files == 1 { "" } else { "s" }, texts.join("; ")),
+                loss,
+                tally: None,
             })
             .collect()
     }
@@ -469,7 +480,7 @@ mod desktop {
         hrefs: &[String],
         bbox: [f64; 4],
         cell: (f64, bool),
-    ) -> Result<(Raster, Vec<String>), String> {
+    ) -> Result<(Raster, Vec<Note>), String> {
         // One read for a file, whichever of its bands are wanted (the first to want it sets the count), and
         // every band of the file is read, so the count asked is the file's, not the band's place.
         // The cost grows with the file's band count (a 13-band file is about 13 times the bytes
@@ -485,7 +496,7 @@ mod desktop {
         let read = read_windows(&files, bbox, cell)?;
         // What each file's read said, merged into one notice for a kind (see [`merge_notes`]).
         let mut windows: Vec<(String, WindowRaster)> = Vec::new();
-        let mut said: Vec<(Vec<String>, Vec<String>)> = Vec::new();
+        let mut said: Vec<(Vec<String>, Vec<Note>)> = Vec::new();
         for ((href, _), w) in files.into_iter().zip(read) {
             let whos: Vec<String> =
                 picked.iter().zip(channels).zip(hrefs).filter(|(_, h)| **h == href).map(|((_, c), _)| c.clone()).collect();
@@ -535,7 +546,7 @@ mod desktop {
     /// the catalog's scale and offset applied. A cell with no value in any is no data in all. The rows
     /// are worked one after another on this thread (about 4 million cell transforms a band at the
     /// default window, which is brief), looking at Cancel and counting progress on each.
-    pub(super) fn stack(name: &str, channels: &[String], sources: &[(&Raster, &sb::Band)]) -> Result<(Raster, Vec<String>), String> {
+    pub(super) fn stack(name: &str, channels: &[String], sources: &[(&Raster, &sb::Band)]) -> Result<(Raster, Vec<Note>), String> {
         let (Some((first, _)), true) = (sources.first(), sources.len() >= 2) else { return Err("a stack needs at least two bands".into()) };
         if sources.iter().any(|(r, _)| r.crs != first.crs) {
             return Err("the bands are in different coordinate systems: they can't be put on one grid".into());
@@ -598,7 +609,7 @@ mod desktop {
                 channels.join(", ")
             ));
         }
-        let mut notes = Vec::new();
+        let mut notes: Vec<Note> = Vec::new();
         // The window reader rounds whole numbers past 2^24 and doubles to 32-bit floats: said once, by band.
         let rounded: Vec<&str> = sources
             .iter()
@@ -607,9 +618,12 @@ mod desktop {
             .map(|(_, c)| c.as_str())
             .collect();
         if !rounded.is_empty() {
-            notes.push(format!(
-                "{} read with values rounded to 32-bit floats (whole numbers past 16,777,216, or more digits than a 32-bit float holds): the stacked values are the rounded ones",
-                rounded.join(", ")
+            notes.push(Note::loss(
+                LossCode::ChangedRounded,
+                format!(
+                    "{} read with values rounded to 32-bit floats (whole numbers past 16,777,216, or more digits than a 32-bit float holds): the stacked values are the rounded ones",
+                    rounded.join(", ")
+                ),
             ));
         }
         // A band taken from a colour image (the item has no file of its own for it) is not in the
@@ -623,11 +637,11 @@ mod desktop {
             .map(|((_, b), who)| format!("{who} (band {} of {})", b.index, b.asset))
             .collect();
         if !from_colour.is_empty() && !one_image {
-            notes.push(format!(
+            notes.push(Note::plain(format!(
                 "{} {} taken from a file of several bands, as the item has no file of its own: the values may not be in the units of the other bands (a colour image's are 8-bit)",
                 from_colour.join(", "),
                 if from_colour.len() == 1 { "is" } else { "are" }
-            ));
+            )));
         }
         // Integer files the catalog gives no scale for are used as stored: not reflectance, which the
         // indices' constants and a colour mixed with scaled bands assume. One notice, naming them.
@@ -638,10 +652,10 @@ mod desktop {
             .map(|((r, _), who)| format!("{who} ({})", r.data_type))
             .collect();
         if !unscaled.is_empty() {
-            notes.push(format!(
+            notes.push(Note::plain(format!(
                 "{} have no scale in the catalog, so their integer values are used as stored, not as reflectance: an index, or a colour mixing them with scaled bands, will be off",
                 unscaled.join(", ")
-            ));
+            )));
         }
         let size = finest.transform.pixel_width.abs();
         let resampled: Vec<&str> = sources
@@ -651,14 +665,14 @@ mod desktop {
             .map(|(_, c)| c.as_str())
             .collect();
         if !resampled.is_empty() {
-            notes.push(format!(
+            notes.push(Note::plain(format!(
                 "{} read on a coarser grid than the finest of the bands, and put on it by nearest cell",
                 resampled.join(", ")
-            ));
+            )));
         }
         if left > 0 {
             let share = left as f64 * 100.0 / (w * h).max(1) as f64;
-            notes.push(format!("{left} cells ({share:.1}%) have no value in at least one band (no data, or outside a band's window) and are no data in every band"));
+            notes.push(Note::plain(format!("{left} cells ({share:.1}%) have no value in at least one band (no data, or outside a band's window) and are no data in every band")));
         }
         let mut raster = rustgis_analysis::rasterops::derive(finest, name, bands)?;
         for (b, c) in raster.bands.iter_mut().zip(channels) {
@@ -669,24 +683,24 @@ mod desktop {
 
     /// The made raster, kept as a GeoTIFF and drawn as red, green and blue, with what to say of it
     /// once it is added (by its name on the map) and what the command answers besides.
-    fn made_saying(raster: Raster, notes: Vec<String>, extra: Value) -> Result<Made, String> {
+    fn made_saying(raster: Raster, notes: Vec<Note>, extra: Value) -> Result<Made, String> {
         // The encode is one step with no look inside it: Cancel is looked at before it.
         rustgis_data::progress::check().map_err(|e| e.to_string())?;
         let bytes = rustgis_data::raster::geotiff::write_all(&raster).map_err(|e| e.to_string())?;
         let name = raster.name.clone();
-        let mut layer = RasterLayer::from_bytes(raster, format!("{name}.tif"), bytes);
+        let mut layer = RasterLayer::from_written(raster, format!("{name}.tif"), bytes);
         layer.style.renderer = RasterRenderer::Rgb { red: 0, green: 1, blue: 2 };
         let then = noted(name.clone(), notes);
         Ok(super::super::workflows::made_layer(name, layer, Some(extra), Some(then)))
     }
 
     /// What to say of a made layer once it is added: each note, by the layer's name on the map.
-    fn noted(name: String, notes: Vec<String>) -> Then {
+    fn noted(name: String, notes: Vec<Note>) -> Then {
         Box::new(move |s: &mut Session, v: &mut Value| {
             let id = v.get("layer").and_then(Value::as_u64).and_then(|i| u32::try_from(i).ok());
             let added = id.and_then(|id| s.map().layer(id)).map_or(name, |l| l.name.clone());
             for note in notes {
-                s.notify(format!("{added}: {note}"), false);
+                s.say(note.prefixed(&added));
             }
         })
     }
@@ -698,6 +712,7 @@ mod desktop {
 mod tests {
     use super::desktop::{auto_cell, index_look, note_kind, read_windows, stack};
     use crate::render::rustgis_tiles::stac::bands::Band;
+    use rustgis_data::loss::{LossCode, Note};
     use rustgis_data::raster::{ColorHint, GeoTransform, Raster, crs::Crs};
     use serde_json::json;
 
@@ -897,7 +912,7 @@ mod tests {
         // Two bands from colour images are one notice naming both; all from one image (the units agree) say nothing.
         let three: Vec<String> = vec!["nir".into(), "red".into(), "green".into()];
         let (_, notes) = stack("s", &three, &[(&a, &band(1.0, 0.0)), (&a, &colour(1)), (&a, &colour(1))]).unwrap();
-        let said: Vec<&String> = notes.iter().filter(|n| n.contains("several bands")).collect();
+        let said: Vec<&Note> = notes.iter().filter(|n| n.contains("several bands")).collect();
         assert!(said.len() == 1 && said[0].contains("red (band 1 of visual), green (band 1 of visual) are taken"), "{notes:?}");
         let (_, same) = stack("s", &names, &[(&a, &colour(1)), (&a, &colour(1))]).unwrap();
         assert!(!same.iter().any(|n| n.contains("several bands")), "one image: {same:?}");
@@ -1133,17 +1148,19 @@ mod tests {
         // A reader that panics (the guard dropped while unwinding, still armed) stops the others.
         let panicked = std::thread::scope(|s| {
             s.spawn(|| {
-                let _guard = PanicStop { stop: &stop, cause: &cause, message: "a.tif: the read failed unexpectedly".into(), armed: true };
+                let _guard = PanicStop { stop: &stop, cause: &cause, what: "a.tif: the read".into(), armed: true };
                 panic!("a reader panics");
             })
             .join()
         });
         assert!(panicked.is_err());
         assert!(stop.load(Ordering::Relaxed));
-        assert_eq!(cause.lock().unwrap().as_deref(), Some("a.tif: the read failed unexpectedly"));
+        // Said as a bug: with the incident's reference when the panic hook is in.
+        let said = cause.lock().unwrap().clone().unwrap_or_default();
+        assert!(said.starts_with("a.tif: the read failed unexpectedly"), "{said}");
         // One that returned (disarmed) leaves the run alone.
         let (stop, cause) = (AtomicBool::new(false), Mutex::new(None));
-        drop(PanicStop { stop: &stop, cause: &cause, message: "x".into(), armed: false });
+        drop(PanicStop { stop: &stop, cause: &cause, what: "x".into(), armed: false });
         assert!(!stop.load(Ordering::Relaxed) && cause.lock().unwrap().is_none());
     }
 
@@ -1172,8 +1189,9 @@ mod tests {
         let mut lossy = grid(2, 2, 0.0001, vec![1000.0; 4]);
         lossy.rounded = vec![3];
         let (_, notes) = stack("s", &names, &[(&clean, &band(1.0, 0.0)), (&lossy, &band(1.0, 0.0))]).unwrap();
-        let said: Vec<&String> = notes.iter().filter(|n| n.contains("rounded")).collect();
+        let said: Vec<&Note> = notes.iter().filter(|n| n.contains("rounded")).collect();
         assert!(said.len() == 1 && said[0].starts_with("red read with values rounded"), "{notes:?}");
+        assert_eq!(said[0].loss, Some(LossCode::ChangedRounded));
         let (_, none) = stack("s", &names, &[(&clean, &band(1.0, 0.0)), (&clean, &band(1.0, 0.0))]).unwrap();
         assert!(!none.iter().any(|n| n.contains("rounded")), "{none:?}");
     }
@@ -1181,14 +1199,15 @@ mod tests {
     #[test]
     fn the_notes_of_the_files_are_one_notice_for_a_kind_counting_each_file_once() {
         use super::desktop::merge_notes;
-        let edges = |e: &str| format!("the box reaches past the file's {e} edge(s): the window is cut to the file");
+        let edges = |e: &str| Note::plain(format!("the box reaches past the file's {e} edge(s): the window is cut to the file"));
         let pieces =
-            "3 piece(s) of the box's edges not followed to a quarter of a pixel: the window may fall short of a bent edge".to_string();
+            Note::plain("3 piece(s) of the box's edges not followed to a quarter of a pixel: the window may fall short of a bent edge");
         let w = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
         // Two files whose edge notes name different edges: one notice, two files, both wordings kept.
         let two = merge_notes(&[(w(&["red"]), vec![edges("north")]), (w(&["green", "blue"]), vec![edges("south")])]);
         assert_eq!(two.len(), 1, "{two:?}");
-        assert!(two[0].starts_with("red, green, blue (2 files): ") && two[0].contains("north") && two[0].contains("south"), "{two:?}");
+        assert!(two[0].text.starts_with("red, green, blue (2 files): ") && two[0].contains("north") && two[0].contains("south"), "{two:?}");
+        assert_eq!(two[0].loss, None);
         // A file with two notes of one kind counts once, its bands listed once.
         let once = merge_notes(&[(w(&["red"]), vec![edges("north"), edges("east")])]);
         assert_eq!(once.len(), 1);
@@ -1196,6 +1215,18 @@ mod tests {
         // Different kinds stay apart; a clean run says nothing.
         assert_eq!(merge_notes(&[(w(&["red"]), vec![edges("north"), pieces])]).len(), 2);
         assert!(merge_notes(&[(w(&["red"]), Vec::new()), (w(&["green"]), Vec::new())]).is_empty());
+        // The same words as a coded and as a plain note are two notices, each keeping its code.
+        let rounded = |code: Option<LossCode>| Note { text: "values rounded to 32-bit floats".into(), loss: code, tally: None };
+        let split = merge_notes(&[
+            (w(&["red"]), vec![rounded(Some(LossCode::ChangedRounded))]),
+            (w(&["green"]), vec![rounded(None)]),
+            (w(&["blue"]), vec![rounded(Some(LossCode::ChangedRounded))]),
+        ]);
+        assert_eq!(split.len(), 2, "{split:?}");
+        let coded = split.iter().find(|n| n.loss == Some(LossCode::ChangedRounded)).unwrap();
+        assert!(coded.starts_with("red, blue (2 files): "), "{split:?}");
+        let plain = split.iter().find(|n| n.loss.is_none()).unwrap();
+        assert!(plain.starts_with("green (1 file): "), "{split:?}");
     }
 
     #[test]

@@ -151,96 +151,58 @@ pub(crate) fn reset_to(s: &mut Session, p: Project) {
     reset(s, p);
 }
 
-/// A provider loss diagnostic beginning with a definite or explicitly unknown item count.
-/// The provider is empty for a note with no `provider: ` prefix ("3 rows could not be read…").
-fn counted_conversion_loss(note: &str) -> Option<(&str, Option<u128>, &str)> {
-    note.split_once(": ").and_then(|(provider, body)| counted_body(provider, body)).or_else(|| counted_body("", note))
-}
-
-fn counted_body<'a>(provider: &'a str, body: &'a str) -> Option<(&'a str, Option<u128>, &'a str)> {
-    if let Some(tail) = body.strip_prefix("an unknown number of ") {
-        return Some((provider, None, tail));
-    }
-    let (count, tail) = body.split_once(' ')?;
-    if count.is_empty() || !count.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    Some((provider, Some(count.parse().ok()?), tail))
-}
-
-/// Whether a note states an amount: a leading count, "on N source feature(s)", or a GDAL
-/// "(N occurrence(s))" suffix. A note with none needs no per-layer qualifier.
-fn shows_count(note: &str) -> bool {
-    let digits_before = |marker: &str| {
-        note.split(marker)
-            .next()
-            .and_then(|head| head.rsplit([' ', '(']).next())
-            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
-            && note.contains(marker)
-    };
-    note.split_whitespace().next().is_some_and(|w| w.bytes().all(|b| b.is_ascii_digit()))
-        || counted_conversion_loss(note).is_some()
-        || digits_before(" source feature")
-        || digits_before(" occurrence(s))")
-}
-
+/// One kind of loss on opening, gathered over the layers that said it.
 struct ConversionLoss {
     layers: usize,
     first: String,
-    note: String,
-    total: Option<u128>,
-    unknown: bool,
-    /// The note whose wording the grouped notice uses: the first unknown one once any count is
-    /// unknown, so a definite "were left out" isn't claimed for layers that may have lost none.
-    wording: String,
+    /// The first layer's note, said as it is when no other note joins it.
+    note: rustgis_data::loss::Note,
+    /// The notes' total, or `None` once any count is unknown or the total too large to hold; for
+    /// notes without a tally, unused.
+    total: Option<u64>,
+    /// Whether the first layer gave several notes of this kind (GDAL's integer overflows, one
+    /// per value), so its note alone doesn't say its count.
+    merged: bool,
+    /// The code the group says: any of its notes' (a definite count is coded where an unknown
+    /// one of the same kind isn't, and the group still holds that loss).
+    loss: Option<rustgis_data::loss::LossCode>,
 }
 
 impl ConversionLoss {
-    fn new(first: &str, note: String) -> Self {
-        let total = counted_conversion_loss(&note).and_then(|(_, count, _)| count);
-        let unknown = note.contains("an unknown number of");
-        Self { layers: 1, first: first.into(), wording: note.clone(), note, total, unknown }
+    fn new(first: &str, note: rustgis_data::loss::Note, total: Option<u64>, merged: bool) -> Self {
+        let loss = note.loss;
+        Self { layers: 1, first: first.into(), note, total, merged, loss }
     }
 
-    fn add(&mut self, note: &str) {
+    fn add(&mut self, amount: Option<u64>, loss: Option<rustgis_data::loss::LossCode>) {
         self.layers += 1;
-        let amount = counted_conversion_loss(note).and_then(|(_, count, _)| count);
+        self.loss = self.loss.or(loss);
         self.total = self.total.zip(amount).and_then(|(total, amount)| total.checked_add(amount));
-        if note.contains("an unknown number of") && !self.unknown {
-            self.unknown = true;
-            self.wording = note.into();
-        }
     }
 
-    fn notice(self) -> String {
-        let Self { layers, first, note, total, unknown, wording } = self;
-        if layers == 1 {
-            return format!("{first}: {note}");
+    /// What is said: the first layer's note for one layer; for several, or for one whose notes of
+    /// the kind were joined, the tally's words with the total, or, for notes that count nothing,
+    /// the note they all said.
+    fn notice(self) -> rustgis_data::loss::Note {
+        let Self { layers, first, note, total, merged, loss } = self;
+        if layers == 1 && !merged {
+            return note.prefixed(&first);
         }
-        let note = if let Some((provider, _, tail)) = counted_conversion_loss(if unknown { &wording } else { &note })
-            && (total.is_some() || unknown)
-        {
-            let count = total.filter(|_| !unknown).map_or_else(|| "an unknown number of".into(), |n| n.to_string());
-            if provider.is_empty() { format!("{count} {tail}") } else { format!("{provider}: {count} {tail}") }
-        } else if unknown {
-            format!("{note} (count shown is {first}'s; the total is unknown)")
-        } else if shows_count(&note) {
-            format!("{note} (count shown is {first}'s)")
-        } else {
-            note
-        };
-        format!("{layers} layers: {note}; first: {first}")
+        let tally = note.tally.map(|tally| Box::new(rustgis_data::loss::Tally { count: total, ..*tally }));
+        let text = tally.as_deref().map_or(note.text, rustgis_data::loss::Tally::text);
+        let text = if layers == 1 { format!("{first}: {text}") } else { format!("{layers} layers: {text}; first: {first}") };
+        rustgis_data::loss::Note { text, loss, tally }
     }
 }
 
-/// Says fresh opening losses once per kind, summing leading provider counts only when all are
-/// known, and saved-conversion fallbacks once with the layer count and first failure. Ordinary
-/// source notes are not opening conversion diagnostics.
+/// Says fresh opening losses once per kind, adding up their counts only when all are known, and
+/// saved-conversion fallbacks once with the layer count and first failure. Notes are grouped by
+/// what they count ([`rustgis_data::loss::Tally`]) and their code, never by their words; notes
+/// that count nothing are grouped only with the same note. Ordinary source notes are not opening
+/// conversion diagnostics.
 pub(crate) fn say_conversion_fallbacks(s: &mut Session) {
-    use rustgis_data::loss::LossCode;
     let mut fallback: Option<(usize, String, String)> = None;
-    // By provider and kind, and by the loss code the notes carry, which the summary keeps.
-    let mut losses = std::collections::BTreeMap::<(String, String, Option<&'static str>), (ConversionLoss, Option<LossCode>)>::new();
+    let mut said = Vec::new();
     for l in s.project.maps.iter_mut().flat_map(|m| &mut m.layers) {
         let Some(source) = l.source.as_mut() else { continue };
         if let Some(note) = source.take_conversion_fallback() {
@@ -249,29 +211,9 @@ pub(crate) fn say_conversion_fallbacks(s: &mut Session) {
                 None => fallback = Some((1, l.name.clone(), note)),
             }
         }
-        let mut seen = std::collections::BTreeSet::new();
-        for note in source.take_conversion_notes() {
-            let code = note.loss;
-            let note = note.text;
-            // Source layer names and feature counts vary within a loss kind. Count affected
-            // layers once each and total leading feature/row counts across those layers.
-            let kind = [
-                "Z or M coordinates",
-                "another geometry type",
-                "rows without a geometry",
-                "no declared coordinate system",
-                "rows could not be read while checking the replacement",
-                "Integer overflow",
-            ]
-            .into_iter()
-            .find(|kind| note.contains(*kind))
-            // An unlisted GDAL warning, without its per-layer occurrence count.
-            .unwrap_or_else(|| note.rsplit_once(" (").filter(|(_, tail)| tail.ends_with("occurrence(s))")).map_or(&note, |(base, _)| base));
-            let provider = note.split_once(": ").map_or("", |(provider, _)| provider);
-            let key = (provider.to_owned(), kind.to_owned(), code.map(|c| c.spec().id));
-            if seen.insert(key.clone()) {
-                losses.entry(key).and_modify(|(loss, _)| loss.add(&note)).or_insert_with(|| (ConversionLoss::new(&l.name, note), code));
-            }
+        let notes = source.take_conversion_notes();
+        if !notes.is_empty() {
+            said.push((l.name.clone(), notes));
         }
     }
     if let Some((count, name, note)) = fallback {
@@ -282,9 +224,51 @@ pub(crate) fn say_conversion_fallbacks(s: &mut Session) {
         };
         s.notify(text, false);
     }
-    for (loss, code) in losses.into_values() {
-        s.say(rustgis_data::loss::Note { text: loss.notice(), loss: code });
+    for note in conversion_notices(said) {
+        s.say(note);
     }
+}
+
+/// The notices for each layer's opening notes: one per kind of loss, a layer counted once for
+/// each.
+fn conversion_notices(layers: Vec<(String, rustgis_data::loss::Notes)>) -> Vec<rustgis_data::loss::Note> {
+    use rustgis_data::loss::{Counted, Finder};
+    type Key = (Option<(Finder, Counted)>, Option<String>, Option<&'static str>);
+    let mut losses = std::collections::BTreeMap::<Key, ConversionLoss>::new();
+    for (name, notes) in layers {
+        // A layer's notes of one kind are added up first, so the layer joins its kind once.
+        let mut mine = std::collections::BTreeMap::<Key, (rustgis_data::loss::Note, Option<u64>, bool)>::new();
+        for note in notes {
+            // A tallied note by what it counts alone: a known count and an unknown one of the
+            // same kind are one loss, its total unknown.
+            let key: Key = match &note.tally {
+                Some(t) => (Some((t.by, t.counted.clone())), None, None),
+                None => (None, Some(note.text.clone()), note.loss.map(|c| c.spec().id)),
+            };
+            let amount = note.tally.as_ref().and_then(|t| t.count);
+            match mine.get_mut(&key) {
+                // The same words, said twice, are one note.
+                Some(_) if key.1.is_some() => {}
+                Some((first, total, merged)) => {
+                    *total = total.zip(amount).and_then(|(total, amount)| total.checked_add(amount));
+                    *merged = true;
+                    first.loss = first.loss.or(note.loss);
+                }
+                None => {
+                    mine.insert(key, (note, amount, false));
+                }
+            }
+        }
+        for (key, (note, amount, merged)) in mine {
+            match losses.get_mut(&key) {
+                Some(loss) => loss.add(amount, note.loss),
+                None => {
+                    losses.insert(key, ConversionLoss::new(&name, note, amount, merged));
+                }
+            }
+        }
+    }
+    losses.into_values().map(ConversionLoss::notice).collect()
 }
 
 /// Why a block with `extent` can't be drawn on the DEM `dem` (its name, its box and its footprint,
@@ -344,7 +328,7 @@ fn reset(s: &mut Session, p: Project) {
     s.wait_in_place_reads();
     // What reading a raster left out (a colour table, names, a sidecar's scale) is said again as
     // the project opens, as when it was added. One still read in the background isn't here yet.
-    let mut lost: Vec<(String, String)> = Vec::new();
+    let mut lost: Vec<(String, rustgis_data::loss::Note)> = Vec::new();
     for l in s.project.maps.iter_mut().flat_map(|m| &mut m.layers) {
         if let Some(rl) = &mut l.raster {
             lost.extend(rl.lost_unsaid().into_iter().map(|what| (l.name.clone(), what)));
@@ -417,9 +401,9 @@ fn reset(s: &mut Session, p: Project) {
         .collect();
     // A block cut to polygons (#2318) whose layer is missing or picks no polygon with an area
     // isn't drawn: said, and kept, so a polygon layer of that name, or an edit, brings it back.
-    // One whose outline was simplified to stay under 65 535 sides, or whose polygons have holes
-    // (not cut), is said as `map.terrain` says it. Each outline is read once.
-    let (mut uncut, mut simplified, mut holed) = (Vec::new(), Vec::new(), Vec::new());
+    // One whose outline was simplified to stay under 65 535 sides is said as `map.terrain` says
+    // it. Each outline is read once.
+    let (mut uncut, mut simplified) = (Vec::new(), Vec::new());
     for m in &s.project.maps {
         let Some(rustgis_map::view::BlockShape::Polygon { layer, filter }) =
             m.view.terrain.as_ref().and_then(|t| t.block.as_ref()).map(|b| &b.shape)
@@ -431,7 +415,6 @@ fn reset(s: &mut Session, p: Project) {
             continue;
         };
         simplified.extend(super::view::outline_simplified(layer, &o).map(|said| format!("{}: {said}", m.name)));
-        holed.extend(super::view::outline_holes(layer, &o).map(|said| format!("{}: {said}", m.name)));
     }
     match simplified.as_slice() {
         [] => {}
@@ -440,9 +423,6 @@ fn reset(s: &mut Session, p: Project) {
             format!("{} block diagrams cut to polygons have simplified outlines: {}", simplified.len(), simplified.join("; ")),
             false,
         ),
-    }
-    if !holed.is_empty() {
-        s.notify(holed.join("; "), false);
     }
     if !uncut.is_empty() {
         s.notify(
@@ -467,6 +447,35 @@ fn reset(s: &mut Session, p: Project) {
                 "{} block diagrams have a walls layer that is missing, isn't a polygon layer, holds its features only a view at a time, or shares its name with another layer, so their walls are one colour: {}",
                 plain.len(),
                 plain.join(", ")
+            ),
+            false,
+        ),
+    }
+    // A block's water bed (#2434) that is missing, isn't a raster layer or shares its name with
+    // another layer gives no floor (`block::water_runs` reads it as the terrain command takes it):
+    // said, and kept, so a raster layer of that name brings it back.
+    let unread: Vec<String> = s
+        .project
+        .maps
+        .iter()
+        .filter_map(|m| {
+            let bed = m.view.terrain.as_ref()?.block.as_ref()?.water.as_ref()?.bed.as_ref()?;
+            let mut named = m.layers.iter().filter(|l| l.name.eq_ignore_ascii_case(bed));
+            let read = named.next().filter(|l| l.raster.is_some()).is_some() && named.next().is_none();
+            (!read).then(|| format!("{} ('{bed}')", m.name))
+        })
+        .collect();
+    match unread.as_slice() {
+        [] => {}
+        [one] => s.notify(
+            format!("{one}: the block's water bed is missing, isn't a raster layer, or shares its name with another layer, so its walls show the water down to its depth or field (none without either)"),
+            false,
+        ),
+        _ => s.notify(
+            format!(
+                "{} block diagrams have a water bed that is missing, isn't a raster layer, or shares its name with another layer, so their walls show the water down to its depth or field (none without either): {}",
+                unread.len(),
+                unread.join(", ")
             ),
             false,
         ),
@@ -514,8 +523,12 @@ fn reset(s: &mut Session, p: Project) {
         let Some(l) = m.layer_by_name(&w.layer) else { continue };
         let numeric = |f: &str| l.dataset.field_index(f).and_then(|i| l.dataset.fields.get(i)).is_some_and(|f| f.ty.is_numeric());
         let level = w.level.clone().filter(|f| !numeric(f));
-        let depth =
-            t.block.as_ref().and_then(|b| b.water.as_ref()).and_then(|bw| bw.field.clone().filter(|f| !numeric(f)).map(|f| (f, bw.depth)));
+        // The block's own depth, or its bed (#2434), takes the field's place; else no water.
+        let depth = t
+            .block
+            .as_ref()
+            .and_then(|b| b.water.as_ref())
+            .and_then(|bw| bw.field.clone().filter(|f| !numeric(f)).map(|f| (f, bw.depth, bw.bed.clone())));
         let layer = l.name.clone();
         let Some(t) = m.view.terrain.as_mut() else { continue };
         if let Some(field) = level {
@@ -524,18 +537,17 @@ fn reset(s: &mut Session, p: Project) {
             }
             levels.push((m.name.clone(), field, layer.clone()));
         }
-        if let Some((field, d)) = depth {
+        if let Some((field, d, bed)) = depth {
             if let Some(b) = t.block.as_mut() {
-                match d {
-                    Some(_) => {
-                        if let Some(bw) = b.water.as_mut() {
-                            bw.field = None;
-                        }
+                if d.is_some() || bed.is_some() {
+                    if let Some(bw) = b.water.as_mut() {
+                        bw.field = None;
                     }
-                    None => b.water = None,
+                } else {
+                    b.water = None;
                 }
             }
-            depths.push((m.name.clone(), field, layer, d));
+            depths.push((m.name.clone(), field, layer, d, bed));
         }
     }
     let lit = |s: &String| -> NoticeText { s.clone().into() };
@@ -563,13 +575,21 @@ fn reset(s: &mut Session, p: Project) {
     }
     match depths.as_slice() {
         [] => {}
-        [(map, field, layer, d)] => {
-            let (key, mut args) = match d {
-                Some(d) => (
+        [(map, field, layer, d, bed)] => {
+            let (key, mut args) = match (d, bed) {
+                (Some(d), Some(bed)) => (
+                    "{map}: the block's water depth field '{field}' isn't a numeric field of '{layer}', so its walls show the bed '{bed}' where it has heights and the water {depth} m deep elsewhere",
+                    vec![("bed", lit(bed)), ("depth", d.to_string().into())],
+                ),
+                (Some(d), None) => (
                     "{map}: the block's water depth field '{field}' isn't a numeric field of '{layer}', so its walls show all the water {depth} m deep",
                     vec![("depth", d.to_string().into())],
                 ),
-                None => (
+                (None, Some(bed)) => (
+                    "{map}: the block's water depth field '{field}' isn't a numeric field of '{layer}', so its walls show water only where the bed '{bed}' has heights",
+                    vec![("bed", lit(bed))],
+                ),
+                (None, None) => (
                     "{map}: the block's water depth field '{field}' isn't a numeric field of '{layer}', so its walls show no water",
                     vec![],
                 ),
@@ -578,14 +598,22 @@ fn reset(s: &mut Session, p: Project) {
             s.notify_text(NoticeText::format(key, args), false);
         }
         _ => {
-            let maps = NoticeText::list(depths.iter().map(|(map, field, layer, d)| {
+            let maps = NoticeText::list(depths.iter().map(|(map, field, layer, d, bed)| {
                 let args = [("map", lit(map)), ("field", lit(field)), ("layer", lit(layer))];
-                match d {
-                    Some(d) => NoticeText::format(
+                match (d, bed) {
+                    (Some(d), Some(bed)) => NoticeText::format(
+                        "{map} ('{field}' of '{layer}', its walls showing the bed '{bed}' where it has heights and the water {depth} m deep elsewhere)",
+                        args.into_iter().chain([("bed", lit(bed)), ("depth", d.to_string().into())]),
+                    ),
+                    (Some(d), None) => NoticeText::format(
                         "{map} ('{field}' of '{layer}', its walls showing all the water {depth} m deep)",
                         args.into_iter().chain([("depth", d.to_string().into())]),
                     ),
-                    None => NoticeText::format("{map} ('{field}' of '{layer}', its walls showing no water)", args),
+                    (None, Some(bed)) => NoticeText::format(
+                        "{map} ('{field}' of '{layer}', its walls showing water only where the bed '{bed}' has heights)",
+                        args.into_iter().chain([("bed", lit(bed))]),
+                    ),
+                    (None, None) => NoticeText::format("{map} ('{field}' of '{layer}', its walls showing no water)", args),
                 }
             }));
             s.notify_text(
@@ -663,20 +691,25 @@ fn open(s: &mut Session, p: &Value) -> CmdResult {
     let origin = if is_package { path.canonicalize() } else { std::path::absolute(&path) }
         .map_err(|error| format!("{}: {error}", path.display()))?;
     super::connections::clear_active();
+    // What it names is held within this as it is read, before anything it names is read.
+    let reach = s.file_reach(p);
     let proj = (|| -> Result<_, String> {
         if is_field {
             let bytes = crate::project::read_file(&path, MAX_PACKAGE)?;
             let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
             let (dir, text, notes) = super::field::unpack(&bytes, &stem)?;
-            Ok((super::field::project_in(&text, &dir)?, notes))
+            let (proj, named) = super::field::project_in_within(&text, &dir, reach)?;
+            Ok((proj, named, notes))
         } else if is_package {
             let bytes = crate::project::read_file(&path, MAX_PACKAGE)?;
-            Ok((Project::from_import_json(&super::items::package_text(&bytes)?, None)?, Vec::new()))
+            let (proj, named) = Project::from_import_json_within(&super::items::package_text(&bytes)?, None, reach)?;
+            Ok((proj, named, Vec::new()))
         } else {
-            Ok((Project::load(&path)?, Vec::new()))
+            let (proj, named) = Project::load_within(&path, Some(reach))?;
+            Ok((proj, named, Vec::new()))
         }
     })();
-    let (proj, notes) = match proj {
+    let (proj, named, notes) = match proj {
         Ok(proj) => proj,
         Err(error) => {
             super::connections::restore_active(s);
@@ -709,6 +742,7 @@ fn open(s: &mut Session, p: &Value) -> CmdResult {
         s.path = Some(origin);
     }
     s.notify(format!("Opened {}", s.project.name), false);
+    named.say(s, &format!("the project '{}'", s.project.name));
     for note in notes {
         s.warn(note);
     }
@@ -747,8 +781,10 @@ fn open_text(s: &mut Session, p: &Value) -> CmdResult {
     let text = super::ps(p, "text").ok_or("text is required")?;
     let package = super::b(p, "package").unwrap_or(false);
     super::connections::clear_active();
-    let proj = if package { Project::from_import_json(text, None) } else { Project::from_json(text) };
-    let proj = match proj {
+    // What it names is held within this as it is read, before anything it names is read.
+    let reach = s.file_reach(p);
+    let proj = if package { Project::from_import_json_within(text, None, reach) } else { Project::from_json_within(text, reach) };
+    let (proj, named) = match proj {
         Ok(proj) => proj,
         Err(error) => {
             super::connections::restore_active(s);
@@ -764,6 +800,7 @@ fn open_text(s: &mut Session, p: &Value) -> CmdResult {
     }
     s.path = None;
     s.notify(format!("Opened {}", s.project.name), false);
+    named.say(s, &format!("the project '{}'", s.project.name));
     super::connections::resolve_project(s);
     super::connections::note_waiting(s);
     Ok(Value::Null)
@@ -798,7 +835,7 @@ fn write(s: &mut Session, path: PathBuf) -> CmdResult {
     s.notify_written(format!("Saved {}", path.display()));
     crate::durable::notify(s, &report);
     for note in construction_notes {
-        s.notify(note, false);
+        s.say(note);
     }
     s.retain_written_notices(written);
     s.path = Some(destination);
@@ -1203,46 +1240,114 @@ fn save_as_inputs(input: &super::InputContext<'_>, p: &Value) -> Result<super::I
 #[cfg(test)]
 mod conversion_loss_tests {
     use super::*;
+    use rustgis_data::loss::{Counted, Finder, LossCode, Note, Notes, Tally};
 
-    #[test]
-    fn grouped_counts_sum_without_a_provider_and_uncounted_notes_take_no_qualifier() {
-        let mut loss = ConversionLoss::new("First", "3 rows could not be read while checking the replacement".into());
-        loss.add("4 rows could not be read while checking the replacement");
-        assert_eq!(loss.notice(), "2 layers: 7 rows could not be read while checking the replacement; first: First");
+    fn other(count: Option<u64>) -> Note {
+        let code = count.map(|_| LossCode::DroppedFeature);
+        Note::tallied(code, Tally::new(Finder::Gdal, Counted::OtherGeometryType, count))
+    }
 
-        let note = "GDAL: 'a' has no declared coordinate system; its coordinates were left unprojected";
-        let mut loss = ConversionLoss::new("First", note.into());
-        loss.add("GDAL: 'b' has no declared coordinate system; its coordinates were left unprojected");
-        assert_eq!(loss.notice(), format!("2 layers: {note}; first: First"));
+    fn zm(layer: &str, count: u64) -> Note {
+        Note::loss(LossCode::DroppedZm, format!("GDAL: '{layer}' contains Z or M coordinates on {count} source feature(s)"))
+            .with_tally(Tally::new(Finder::Gdal, Counted::ZmDropped, Some(count)))
+    }
 
-        let note = "GDAL: 'a' declares Z or M coordinates on 3 source feature(s); conversion keeps only XY coordinates";
-        let mut loss = ConversionLoss::new("First", note.into());
-        loss.add("GDAL: 'b' declares Z or M coordinates on 5 source feature(s); conversion keeps only XY coordinates");
-        assert_eq!(loss.notice(), format!("2 layers: {note} (count shown is First's); first: First"));
+    fn texts(notes: &[Note]) -> Vec<&str> {
+        notes.iter().map(|n| n.text.as_str()).collect()
     }
 
     #[test]
-    fn grouped_conversion_losses_keep_unknown_totals_in_either_order() {
-        let definite = "GDAL: 3 features of another geometry type were left out";
-        let unknown = "GDAL: an unknown number of features of another geometry type may have been left out";
-        for notes in [[definite, unknown], [unknown, definite]] {
-            let mut loss = ConversionLoss::new("First", notes[0].into());
-            loss.add(notes[1]);
-            let notice = loss.notice();
-            assert!(notice.starts_with("2 layers: GDAL: an unknown number of features of another geometry type"), "{notice}");
-            assert!(!notice.contains("GDAL: 3 "), "{notice}");
-            assert!(notice.contains("may have been left out") && !notice.contains("were left out"), "{notice}");
+    fn grouped_counts_sum_and_a_single_layer_keeps_its_note() {
+        let unread = |n| Note::tallied(None, Tally::new(Finder::Rustgis, Counted::UnreadableRows, Some(n)));
+        let mut loss = ConversionLoss::new("First", unread(3), Some(3), false);
+        loss.add(Some(4), None);
+        assert_eq!(loss.notice().text, "2 layers: 7 rows could not be read while checking the replacement; first: First");
+
+        let mut loss = ConversionLoss::new("First", other(Some(3)), Some(3), false);
+        loss.add(Some(4), Some(LossCode::DroppedFeature));
+        let notice = loss.notice();
+        assert_eq!(notice.text, "2 layers: GDAL: 7 features of another geometry type were left out; first: First");
+        assert_eq!(notice.loss, Some(LossCode::DroppedFeature));
+        assert_eq!(
+            ConversionLoss::new("First", other(Some(3)), Some(3), false).notice().text,
+            "First: GDAL: 3 features of another geometry type were left out"
+        );
+
+        let mut loss = ConversionLoss::new("First", zm("a", 3), Some(3), false);
+        loss.add(Some(5), Some(LossCode::DroppedZm));
+        assert_eq!(
+            loss.notice().text,
+            "2 layers: GDAL: 8 source feature(s) had Z or M coordinates; conversion keeps only XY coordinates; first: First"
+        );
+    }
+
+    #[test]
+    fn a_known_and_an_unknown_count_of_one_kind_are_one_notice_in_either_order() {
+        for counts in [[Some(3), None], [None, Some(3)]] {
+            let notices = conversion_notices(vec![
+                ("First".into(), Notes::from(vec![other(counts[0])])),
+                ("Second".into(), Notes::from(vec![other(counts[1])])),
+            ]);
+            assert_eq!(
+                texts(&notices),
+                ["2 layers: GDAL: an unknown number of features of another geometry type may have been left out; first: First"]
+            );
+            // The known count's loss is still in the group, so it keeps its code.
+            assert_eq!(notices[0].loss, Some(LossCode::DroppedFeature));
         }
     }
 
     #[test]
-    fn grouped_known_conversion_counts_sum_and_single_layers_stay_unchanged() {
-        let note = "GDAL: 3 features of another geometry type were left out";
-        let mut loss = ConversionLoss::new("First", note.into());
-        loss.add("GDAL: 4 features of another geometry type were left out");
-        assert_eq!(loss.notice(), "2 layers: GDAL: 7 features of another geometry type were left out; first: First");
+    fn notes_that_count_nothing_group_only_with_the_same_note() {
+        let notices = conversion_notices(vec![
+            ("A".into(), Notes::from(vec!["the same note", "only A's"])),
+            ("B".into(), Notes::from(vec!["the same note"])),
+        ]);
+        assert_eq!(texts(&notices), ["A: only A's", "2 layers: the same note; first: A"]);
+    }
 
-        let single = ConversionLoss::new("First", note.into());
-        assert_eq!(single.notice(), format!("First: {note}"));
+    #[test]
+    fn a_layers_notes_of_one_kind_add_up_before_it_joins_the_others() {
+        let overflow = |line: &str, n| {
+            Note::plain(format!("GDAL: {line} ({n} occurrence(s))")).with_tally(Tally::new(Finder::Gdal, Counted::IntegerOverflow, Some(n)))
+        };
+        let a = || Notes::from(vec![overflow("Integer overflow on 3000000000", 2), overflow("Integer overflow on 4000000000", 3)]);
+        assert_eq!(texts(&conversion_notices(vec![("A".into(), a())])), ["A: GDAL: 5 integer overflow warning(s)"]);
+        let notices =
+            conversion_notices(vec![("A".into(), a()), ("B".into(), Notes::from(vec![overflow("Integer overflow on 5000000000", 4)]))]);
+        assert_eq!(texts(&notices), ["2 layers: GDAL: 9 integer overflow warning(s); first: A"]);
+        // One line alone is said in GDAL's words.
+        let one = conversion_notices(vec![("B".into(), Notes::from(vec![overflow("Integer overflow on 5000000000", 4)]))]);
+        assert_eq!(texts(&one), ["B: GDAL: Integer overflow on 5000000000 (4 occurrence(s))"]);
+    }
+
+    /// The acceptance test of #2371: rewording or translating a note changes how many notices are
+    /// said, their codes and their totals not at all.
+    #[test]
+    fn rewording_the_notes_changes_no_grouping_code_or_total() {
+        let layers =
+            |reword: bool| {
+                let reworded = |n: Note| if reword { n.map_text(|t| format!("reworded: {}", t.len())) } else { n };
+                let crs =
+                    |layer: &str| {
+                        Note::loss(LossCode::AssumedCrs, format!("GDAL: '{layer}' has no declared coordinate system"))
+                            .with_tally(Tally::new(Finder::Gdal, Counted::NoDeclaredCrs, Some(1)))
+                    };
+                let duckdb = |n| Note::tallied(None, Tally::new(Finder::Duckdb, Counted::OtherGeometryType, Some(n)));
+                ["A", "B", "C"]
+                    .into_iter()
+                    .zip(1u64..)
+                    .map(|(name, n)| {
+                        let notes: Notes = [other(Some(n)), zm(name, n * 10), crs(name), duckdb(n)].into_iter().map(reworded).collect();
+                        (name.to_string(), notes)
+                    })
+                    .collect::<Vec<_>>()
+            };
+        let said = conversion_notices(layers(false));
+        let reworded = conversion_notices(layers(true));
+        assert_eq!(said.len(), 4, "{:?}", texts(&said));
+        assert_eq!(said, reworded, "grouped notices are said from their tallies");
+        assert!(texts(&said).contains(&"3 layers: GDAL: 6 features of another geometry type were left out; first: A"));
+        assert!(texts(&said).contains(&"3 layers: DuckDB: 6 rows of another geometry type were left out; first: A"));
     }
 }

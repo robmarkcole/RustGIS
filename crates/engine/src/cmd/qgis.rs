@@ -3,6 +3,7 @@
 //! `style.importQgis` gives a layer a `.qml` style. Both say what they couldn't carry over
 //! (`rustgis_map::qgis::Report`).
 
+use rustgis_data::loss::LossCode;
 use rustgis_geom::{Coord, Extent};
 use rustgis_map::qgis::{self, NoteKind, Report, Source, listed};
 use serde_json::{Value, json};
@@ -48,6 +49,28 @@ fn qgis_text(p: &Value) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|_| "not a QGIS file (it isn't text)".to_string())
 }
 
+/// The folder a project's relative paths start from: `dir` (a blank one is none, so they don't
+/// start from the working directory), else the file's own (`.` for a file named without one).
+fn project_dir(p: &Value) -> Option<String> {
+    ps(p, "dir").filter(|d| !d.trim().is_empty()).map(str::to_string).or_else(|| file_dir(p))
+}
+
+/// A project read and parsed, with what its parse noted (its markers' images read).
+struct Parsed {
+    project: qgis::Project,
+    report: Report,
+}
+
+/// Reads and parses the project `p` names: one read of its file (at most [`MAX_FILE`] bytes, a
+/// `.qgz` unzipped) and one parse of its XML (within [`MAX_XML`]), its markers' images read.
+fn parse(p: &Value) -> Result<Parsed, String> {
+    let text = qgis_text(p)?;
+    let dir = project_dir(p);
+    let mut report = Report::default();
+    let project = qgis::read_project(&text, dir.as_deref().unwrap_or_default(), &mut marker_images(), &mut report)?;
+    Ok(Parsed { project, report })
+}
+
 /// The folder of the file `path` names (`.` for a file named without one), which its relative
 /// paths start from.
 fn file_dir(p: &Value) -> Option<String> {
@@ -57,40 +80,48 @@ fn file_dir(p: &Value) -> Option<String> {
     })
 }
 
-/// The most bytes of base64 of raster marker images one import reads: what a run keeps
+/// The most bytes of base64 of raster and SVG marker images one import reads: what a run keeps
 /// (`MAX_PICTURES_BYTES`), counting those that turn out not to draw too, so a project naming many
 /// files that aren't images reads no more than one of images (in tests, a few small images').
 const MARKER_READ_BYTES: usize = if cfg!(test) { 1 << 10 } else { rustgis_map::symbology::MAX_PICTURES_BYTES };
 
-/// The importer's reader of raster image markers' images ([`qgis::ReadImage`]): [`marker_image`]
+/// The importer's reader of raster image and SVG markers' images ([`qgis::ReadImage`]): [`marker_image`]
 /// within [`MARKER_READ_BYTES`] for the import. On the import's thread, as the rest of it is
 /// (`import_project` says why; `import_style` reads on a thread of its own in the desktop app,
 /// [`style_ahead`]): each read is one file of at most 1.5 MiB, only a regular file is opened (a
 /// pipe or a device would wait for a writer), and the bound caps them all. Each looks at Cancel.
-fn marker_images() -> impl FnMut(&str) -> Result<(String, f32), &'static str> {
+fn marker_images() -> impl FnMut(&str, Option<&qgis::SvgColours>) -> Result<(String, f32, bool), (&'static str, bool)> {
     let mut read = 0;
-    move |source| {
+    move |source, colours| {
         // Under a Cancel (a style read on a thread of its own, a project imported by a script or model)
         // a Cancel stops the images here; the import notes each as skipped, so its caller looks at
         // Cancel again once the parse is done and gives the cancelled error. With none, nothing is asked.
         if rustgis_data::progress::check().is_err() {
-            return Err("cancelled");
+            return Err(("cancelled", false));
         }
         if read >= MARKER_READ_BYTES {
-            return Err("past the bytes of images an import reads");
+            return Err(("past the bytes of images an import reads", false));
         }
-        marker_image(source, &mut read)
+        let mut own = false;
+        marker_image(source, colours, &mut read, &mut own).map_err(|why| (why, own))
     }
 }
 
-/// Reads a raster image marker's image for the importer: its `base64:` text, or its file's,
-/// within what a picture marker keeps (`symbology::MAX_PICTURE_BYTES` of base64, 2 MiB), checked
-/// as `layer.marker` checks an image; with its height over its width. Its base64's length is added
+/// Reads a raster image or SVG marker's image for the importer: its `base64:` text, or its file's,
+/// within what a picture marker keeps (`symbology::MAX_PICTURE_BYTES` of base64, 2 MiB), an SVG
+/// marker's `param(…)` values set from `colours`, then checked as `layer.marker` checks an image.
+/// With it, its height over its width and whether any value was set; `own_refusal` is set when a
+/// refusal is those colours' alone. Its base64's length is added
 /// to `read`, or for a file that doesn't read (past the limit, or failing part way) what was read
 /// of it, so the import's bound overshoots by one file at most. Checking it decodes it, within
 /// `render::MARKER_PIXELS` and what the run has left of `render::RUN_MARKER_PIXELS`, as
 /// `layer.marker` does.
-fn marker_image(source: &str, read: &mut usize) -> Result<(String, f32), &'static str> {
+fn marker_image(
+    source: &str,
+    colours: Option<&qgis::SvgColours>,
+    read: &mut usize,
+    own_refusal: &mut bool,
+) -> Result<(String, f32, bool), &'static str> {
     use base64::Engine;
     use rustgis_map::symbology::MAX_PICTURE_BYTES as MARKER_PICTURE_BYTES;
     const TOO_LARGE: &str = "whose image is past 2 MiB of base64";
@@ -112,7 +143,7 @@ fn marker_image(source: &str, read: &mut usize) -> Result<(String, f32), &'stati
                 // doesn't open).
                 *read += e.read().div_ceil(3) * 4;
                 return Err(match e {
-                    PictureFileError::Unopened(_) => "whose image file doesn't open",
+                    PictureFileError::Unopened(_) => qgis::IMAGE_UNOPENED,
                     PictureFileError::TooLarge(_) => TOO_LARGE,
                     PictureFileError::Unread(..) => "whose image file fails as it is read",
                 });
@@ -126,9 +157,22 @@ fn marker_image(source: &str, read: &mut usize) -> Result<(String, f32), &'stati
     if b64.len() > MARKER_PICTURE_BYTES {
         return Err(TOO_LARGE);
     }
+    // An SVG marker's colours go in before the check, so what is checked is what is kept.
+    let set = match colours {
+        Some(colours) => rustgis_render::picture_marker_with_params(&b64, colours).map_err(rustgis_render::MarkerRefusal::whose)?,
+        None => None,
+    };
+    let painted = set.is_some();
+    let b64 = set.unwrap_or(b64);
     // As `layer.marker` checks one, decoded once for the run, where drawing it finds it.
-    let aspect = rustgis_render::picture_marker_check(&b64).map_err(rustgis_render::MarkerRefusal::whose)?;
-    Ok((b64, aspect))
+    let aspect = rustgis_render::picture_marker_check(&b64).map_err(|why| {
+        // A wider outline is more to draw, past the cap or past what the run has left: that
+        // refusal is these colours' alone.
+        use rustgis_render::MarkerRefusal::{PastRunPixels, TooMuchToDraw};
+        *own_refusal = painted && matches!(why, TooMuchToDraw | PastRunPixels);
+        why.whose()
+    })?;
+    Ok((b64, aspect, painted))
 }
 
 /// The most bytes of a QGIS file read (a `.qgz` can carry data files beside its project).
@@ -142,35 +186,47 @@ fn read_file(path: &str) -> Result<Vec<u8>, String> {
     crate::project::read_file(std::path::Path::new(path), MAX_FILE)
 }
 
-/// Imports a QGIS project as a new map. On the thread that runs it, as opening a project is,
-/// because it changes the session as it goes and RustGIS has no background path yet for a command
-/// that runs other commands on the session (the import as a whole off the window, with progress
-/// and Cancel, would be that path): it adds layers one after another, each through the command
-/// that adds its kind, and later layers, groups and relations read those added before. (A tile
+/// Imports a QGIS project as a new map. It adds layers one after another, each through the command
+/// that adds its kind, and later layers, groups and relations read those added before. In the
+/// desktop app its file is first read and parsed on a thread of its own, with Cancel ([`scan`]),
+/// the logins its services need are opened, and it then runs on a copy of the session, on a
+/// thread of its own, with progress (layers done of the project's) and Cancel ([`import_ahead`]),
+/// taking the project as parsed; the map it made is taken here. Run
+/// anywhere else (the command line, a script, the browser) it runs here, on the thread that runs
+/// it, looking at Cancel between layers (a script's or a model's). (A tile
 /// archive goes through that command's add itself, `tiles::add_with_metadata_wait`, with no
 /// wait for its metadata, as Add Data adds one.) Its work is bounded by the project: at most
 /// [`qgis::MAX_LAYERS`] layers, each read once by the command that adds it (a file's layers, and
 /// a virtual layer on one, each read their file), archives added without waiting for their
-/// metadata, annotation pictures within [`MAX_PICTURE_BYTES`], raster image markers' images within
+/// metadata, annotation pictures within [`MAX_PICTURE_BYTES`], raster image and SVG markers' images within
 /// [`MARKER_READ_BYTES`] (each file once, at most 1,024 of them, before any layer is added: see
 /// [`marker_images`]). A local archive's file is looked
 /// for on this thread (`is_file`), which a slow network share can hold up, and a web service's
 /// layer (WMS, WMTS, WFS, OGC API, ArcGIS, WCS) asks its service on this thread, through
 /// `service.add`: its capabilities, then a WFS, OGC API or ArcGIS layer's features (each page
-/// within the read limits) or a WCS coverage over the project's saved view. No step looks at
-/// Cancel.
+/// within the read limits) or a WCS coverage over the project's saved view. Cancel is looked at
+/// between layers and by the reads within one (between a service's documents, a file's rows): one
+/// document's download, one file's open, isn't.
 fn import_project(s: &mut Session, p: &Value) -> CmdResult {
-    let text = qgis_text(p)?;
-    // The folder relative paths start from: `dir` (a blank one is none, so they don't start
-    // from the working directory), else the file's own (`.` for a file named without one).
-    let dir = ps(p, "dir").filter(|d| !d.trim().is_empty()).map(str::to_string).or_else(|| file_dir(p));
-    let mut report = Report::default();
-    let project = qgis::read_project(&text, dir.as_deref().unwrap_or_default(), &mut marker_images(), &mut report)?;
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(ahead) = super::reads::take::<ImportAhead>(s, IMPORT_AHEAD) {
+        return land_import(s, ahead);
+    }
+    let dir = project_dir(p);
+    // Read and parsed already on the copy's way ([`scan`]), or here.
+    #[cfg(not(target_arch = "wasm32"))]
+    let parsed = super::reads::take::<Parsed>(s, PARSED);
+    #[cfg(target_arch = "wasm32")]
+    let parsed: Option<Parsed> = None;
+    let Parsed { project, mut report } = match parsed {
+        Some(parsed) => parsed,
+        None => parse(p)?,
+    };
     // A script or model runs this under its Cancel: one that came during the images was noted as a
     // skipped image, and no layer is added for a cancelled run.
     rustgis_data::progress::check().map_err(|e| e.to_string())?;
     // A map of its own, named as the project.
-    let name = if project.title.is_empty() { "QGIS project" } else { project.title.as_str() };
+    let name = map_name(&project);
     s.run_part("map.new", &json!({"name": name}))?;
     // QGIS draws a project on its canvas alone: no basemap, no graticule.
     let m = s.map_mut();
@@ -224,18 +280,29 @@ fn import_project(s: &mut Session, p: &Value) -> CmdResult {
     // when the map couldn't take the project's coordinate system, which the view is in).
     let view = if projected { coverage_view(s, &project, degrees) } else { None };
     let tree_layers = project.layers.iter().enumerate().rev().map(|(i, l)| (Some(i), l));
+    // Layers done of the project's: what each layer's add reads counts nothing of its own.
+    rustgis_data::progress::begin(project.layers.len() + usize::from(project.main_annotations.is_some()));
     for (index, layer) in tree_layers.chain(project.main_annotations.iter().map(|l| (None, l))) {
+        rustgis_data::progress::check().map_err(|e| e.to_string())?;
         let before: std::collections::HashSet<u32> = s.map().layers.iter().map(|l| l.id).collect();
         let tiles = s.map().tiles.len();
         // The tiles a web tile layer landed on the map as, when it is one.
         let mut landed_on = None;
-        let result = if layer.kind == "annotation" {
-            add_annotations(s, layer, crs, canvas.as_ref(), dir.is_some(), &mut pictures, &mut report)
-                .map(|(name, d)| Some((name, Some(d))))
-        } else {
-            add_layer(s, layer, dir.is_some(), view, &mut landed_on, &mut connections, &mut report)
-                .map(|name| name.map(|name| (name, None)))
-        };
+        let result = rustgis_data::progress::without_counting(|| {
+            if layer.kind == "annotation" {
+                add_annotations(s, layer, crs, canvas.as_ref(), dir.is_some(), &mut pictures, &mut report)
+                    .map(|(name, d)| Some((name, Some(d))))
+            } else {
+                add_layer(s, layer, dir.is_some(), view, &mut landed_on, &mut connections, &mut report)
+                    .map(|name| name.map(|name| (name, None)))
+            }
+        });
+        // A layer whose read was cancelled ends the import: what it added goes with it.
+        if let Err(e) = &result
+            && e.contains(&rustgis_data::DataError::Cancelled.to_string())
+        {
+            rustgis_data::progress::check().map_err(|e| e.to_string())?;
+        }
         match result {
             Ok(Some((name, d))) => {
                 drawn.push((layer.name.clone(), layer.visible, d));
@@ -268,8 +335,12 @@ fn import_project(s: &mut Session, p: &Value) -> CmdResult {
                 }
             }
             Ok(None) => {}
-            Err(e) => report.skipped(&layer.name, format!("the layer: {e}")),
+            // A layer whose data wasn't read is data the import left out; an annotation layer is
+            // drawing only.
+            Err(e) if layer.kind == "annotation" => report.skipped(&layer.name, format!("the layer: {e}")),
+            Err(e) => report.lost(&layer.name, NoteKind::Skipped, LossCode::DroppedFeature, format!("the layer: {e}")),
         }
+        rustgis_data::progress::step(1).map_err(|e| e.to_string())?;
     }
     note_texts_under_layers_above(&drawn, &mut report);
     add_groups(s, &project, &came_in, &mut report);
@@ -427,12 +498,22 @@ fn add_layer(
     let name = layer.name.as_str();
     if let Source::File { path, .. } | Source::Csv { path, .. } | Source::Archive { path, .. } = &layer.source {
         if !has_dir && qgis::is_relative(path) {
-            report.skipped(name, format!("the file {path}, relative to the project's folder, which the import wasn't given (pass dir)"));
+            report.lost(
+                name,
+                NoteKind::Skipped,
+                LossCode::DroppedFeature,
+                format!("the file {path}, relative to the project's folder, which the import wasn't given (pass dir)"),
+            );
             return Ok(None);
         }
         // `C:roads.gpkg`: relative to the working directory on drive C, which no folder fixes.
         if qgis::is_drive_relative(path) {
-            report.skipped(name, format!("the file {path}, relative to a drive's working directory (give a full path in QGIS)"));
+            report.lost(
+                name,
+                NoteKind::Skipped,
+                LossCode::DroppedFeature,
+                format!("the file {path}, relative to a drive's working directory (give a full path in QGIS)"),
+            );
             return Ok(None);
         }
     }
@@ -487,8 +568,10 @@ fn add_layer(
             let share = path.starts_with("file://") || path.starts_with("\\\\") || path.starts_with("//");
             if share || (*kind == "mbtiles" && path.contains("://")) {
                 let at = if share { "on a network share" } else { "at a web address" };
-                report.skipped(
+                report.lost(
                     name,
+                    NoteKind::Skipped,
+                    LossCode::DroppedFeature,
                     format!(
                         "the tile archive {at}: RustGIS reads MBTiles files on this computer, and PMTiles archives there or on the web"
                     ),
@@ -499,13 +582,17 @@ fn add_layer(
             // no file by its path.
             #[cfg(not(target_arch = "wasm32"))]
             if !path.contains("://") && !std::path::Path::new(path).is_file() {
-                report.skipped(name, format!("the tile archive {path}: no file there"));
+                report.lost(name, NoteKind::Skipped, LossCode::DroppedFeature, format!("the tile archive {path}: no file there"));
                 return Ok(None);
             }
             #[cfg(target_arch = "wasm32")]
             if !path.contains("://") {
-                report
-                    .skipped(name, format!("the tile archive {path}, a file the browser doesn't read by its path (add it with Add Data)"));
+                report.lost(
+                    name,
+                    NoteKind::Skipped,
+                    LossCode::DroppedFeature,
+                    format!("the tile archive {path}, a file the browser doesn't read by its path (add it with Add Data)"),
+                );
                 return Ok(None);
             }
             let before = s.active_layer;
@@ -539,7 +626,8 @@ fn add_layer(
             return Ok(Some(name.to_string()));
         }
         Source::Memory { geometry, crs, fields, as_text: (as_text, texts), cut, unnamed, taken, zm, curved, unknown_geometry } => {
-            // QGIS keeps none of a memory layer's features: it opens empty, with its fields.
+            // QGIS keeps none of a memory layer's features: it opens empty, with its fields, so
+            // what these notes leave out held no data, and they stay plain.
             let mut ds = rustgis_data::Dataset::new(name, *geometry, fields.clone());
             if let Some(c) = layer.crs.as_deref().or(crs.as_deref()) {
                 match rustgis_data::raster::crs::Crs::parse(c) {
@@ -589,7 +677,7 @@ fn add_layer(
                 }
                 None => "RustGIS reads one that selects every column of one layer, with or without a WHERE clause, as that layer".into(),
             };
-            report.skipped(name, format!("the virtual layer `{shown}{more}`: {why}"));
+            report.lost(name, NoteKind::Skipped, LossCode::DroppedFeature, format!("the virtual layer `{shown}{more}`: {why}"));
             return Ok(None);
         }
         Source::Wms { url, layer: wms, wmts, options, .. } => {
@@ -709,7 +797,13 @@ fn add_layer(
         Source::Other { provider } => {
             // A layer of no provider (an annotation layer, a group layer) is told by its kind.
             let what = if provider.is_empty() { format!("{} layers", layer.kind) } else { format!("{provider} sources") };
-            report.skipped(name, format!("the layer: RustGIS doesn't read QGIS's {what}"));
+            // An annotation or group layer holds no data; any other layer's data is left out,
+            // with or without a provider named.
+            if matches!(layer.kind.as_str(), "annotation" | "group") {
+                report.skipped(name, format!("the layer: RustGIS doesn't read QGIS's {what}"));
+            } else {
+                report.lost(name, NoteKind::Skipped, LossCode::DroppedFeature, format!("the layer: RustGIS doesn't read QGIS's {what}"));
+            }
             return Ok(None);
         }
     }
@@ -841,7 +935,7 @@ fn database_note(
             format!("the {what} table {table} ({connection}): connect to the database to add it{refused}{}", left("the connection text"))
         }
     };
-    report.skipped(name, text);
+    report.lost(name, NoteKind::Skipped, LossCode::DroppedFeature, text);
 }
 
 /// The name of the saved connection to the database `connection` names (QGIS's `key=value`
@@ -1931,7 +2025,11 @@ impl Geographic {
 }
 
 fn note_json(n: &qgis::Note) -> Value {
-    json!({"layer": n.layer, "kind": n.kind, "text": n.text, "count": n.count})
+    let mut note = json!({"layer": n.layer, "kind": n.kind, "text": n.text, "count": n.count});
+    if let (Some(code), Some(note)) = (n.loss, note.as_object_mut()) {
+        note.insert("loss".into(), json!(code.spec().id));
+    }
+    note
 }
 
 /// The returned report serves CLI and Python callers; the app also needs every coalesced
@@ -1945,15 +2043,33 @@ fn notify_report(s: &mut Session, report: &Report) {
         }
         text
     };
+    // A notice is about one kind of note and one loss code, so a note that reports a loss never
+    // shares a notice with a plain one (or with another code's): plain notes first, then each
+    // code in the order its first note came.
+    let mut groups: Vec<(NoteKind, Option<LossCode>)> = Vec::new();
     for kind in [NoteKind::Approximated, NoteKind::Skipped] {
-        let notes: Vec<_> = report.notes.iter().filter(|note| note.kind == kind).collect();
+        for note in report.notes.iter().filter(|note| note.kind == kind) {
+            if !groups.contains(&(kind, note.loss)) {
+                groups.push((kind, note.loss));
+            }
+        }
+    }
+    groups.sort_by_key(|(kind, loss)| (*kind == NoteKind::Skipped, loss.is_some()));
+    let say = |s: &mut Session, loss: Option<LossCode>, text: crate::notice_text::NoticeText| match loss {
+        Some(code) => s.notify_loss(code, text),
+        None => s.notify_text(text, false),
+    };
+    for (kind, loss) in groups {
+        let notes: Vec<_> = report.notes.iter().filter(|note| note.kind == kind && note.loss == loss).collect();
         let Some(first) = notes.first() else { continue };
         if notes.len() == 1 {
             let template = match kind {
                 NoteKind::Approximated => "QGIS import, {layer}: {detail} (drawn differently; count {count})",
                 NoteKind::Skipped => "QGIS import, {layer}: {detail} (left out; count {count})",
             };
-            s.notify_text(
+            say(
+                s,
+                loss,
                 crate::notice_text::NoticeText::format(
                     template,
                     [
@@ -1962,7 +2078,6 @@ fn notify_report(s: &mut Session, report: &Report) {
                         ("count", first.count.to_string().into()),
                     ],
                 ),
-                false,
             );
             continue;
         }
@@ -1990,12 +2105,13 @@ fn notify_report(s: &mut Session, report: &Report) {
             NoteKind::Approximated => "QGIS import: {count} approximations; affected layers: {layers}. {samples}",
             NoteKind::Skipped => "QGIS import: {count} omissions; affected layers: {layers}. {samples}",
         };
-        s.notify_text(
+        say(
+            s,
+            loss,
             crate::notice_text::NoticeText::format(
                 template,
                 [("count", count.to_string().into()), ("layers", layers.to_string().into()), ("samples", samples.into())],
             ),
-            false,
         );
     }
 }
@@ -2004,7 +2120,7 @@ fn notify_report(s: &mut Session, report: &Report) {
 type StyleRead = Result<(qgis::Style, Report), String>;
 
 /// Reads and parses the style file `p` names (or gives) for the layer called `layer`: its raster
-/// image markers' relative files start from the style file's folder.
+/// and SVG image markers' relative files start from the style file's folder.
 fn read_style_file(p: &Value, layer: &str) -> StyleRead {
     let text = qgis_text(p)?;
     rustgis_data::progress::check().map_err(|e| e.to_string())?;
@@ -2026,6 +2142,274 @@ fn ahead_key(id: u32) -> String {
     format!("style.importQgis:{id}")
 }
 
+/// What an import read ahead is taken by.
+#[cfg(not(target_arch = "wasm32"))]
+const IMPORT_AHEAD: &str = "project.importQgis";
+
+/// A project imported on a copy of the session ([`import_ahead`]), for `project.importQgis` to
+/// take: what the copy made, or why it stopped, and what it said either way.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) struct ImportAhead {
+    result: Result<Imported, String>,
+    notices: Vec<crate::Notice>,
+    losses: Vec<crate::LossNotice>,
+    /// The saved connections when the copy was made: the ones it made are made again here only
+    /// while these are as they were.
+    connections: Vec<crate::connections::Connection>,
+    /// Keeps the logins opened for it pending ([`crate::service_logins::borrow_for`]).
+    held: std::sync::Arc<()>,
+}
+
+/// What an import on a copy made: its map, its tables, the layer it left active, the saved
+/// connections it made (kind, address and name) and its answer.
+#[cfg(not(target_arch = "wasm32"))]
+struct Imported {
+    map: rustgis_map::Map,
+    /// What the map is named for: the project's title, or "QGIS project".
+    base: String,
+    /// The standalone tables it added (data without geometry), in the order it added them.
+    tables: Vec<rustgis_data::Dataset>,
+    active_layer: Option<u32>,
+    /// A tile archive's framing still waiting for its bounds, on the map made.
+    style_view: Option<(rustgis_map::TileLayer, rustgis_map::Camera, u64)>,
+    made: Vec<(String, String, String)>,
+    answer: Value,
+}
+
+/// A project's import prepared for its run on a copy ([`open_import_logins`]): the request it is
+/// for, the project as parsed, what its map is named for, and the logins the copy borrows.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) struct ImportOpened {
+    params: Value,
+    parsed: Parsed,
+    base: String,
+    logins: crate::service_logins::SessionLogins,
+    held: std::sync::Arc<()>,
+    /// The files its scan read, logged as the import's inputs.
+    inputs: Vec<rustgis_data::provenance::Fingerprint>,
+}
+
+/// The key a project parsed ahead is given to the copy's import under ([`import_project`]).
+#[cfg(not(target_arch = "wasm32"))]
+const PARSED: &str = "project.importQgis/parsed";
+
+/// A project read and parsed for its import before the import starts ([`scan`]), on a thread of
+/// its own in the desktop app: with the web addresses its layers name, whose logins are opened
+/// before the import is approved ([`open_import_logins`]).
+#[cfg(not(target_arch = "wasm32"))]
+pub struct ImportScan {
+    params: Value,
+    parsed: Parsed,
+    addresses: Vec<String>,
+    /// The files read for it, for the processing log ([`super::reads::scan_import`]).
+    inputs: Vec<rustgis_data::provenance::Fingerprint>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl ImportScan {
+    pub(crate) fn with_inputs(mut self, inputs: Vec<rustgis_data::provenance::Fingerprint>) -> Self {
+        self.inputs = inputs;
+        self
+    }
+}
+
+/// Reads and parses the project an import of `p` imports, and finds the web addresses its layers
+/// name: the import's first part, which the desktop app runs on a thread of its own, with Cancel,
+/// before it opens their logins and starts the import ([`super::reads::scan_import`]). One read of
+/// the file and one parse, its markers' images read between them looking at Cancel; the import
+/// then reads its layers from the project as parsed here, without parsing it again.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn scan(p: &Value) -> Result<ImportScan, String> {
+    let parsed = parse(p)?;
+    let addresses = parsed.project.layers.iter().filter_map(|l| web_address(&l.source)).map(str::to_string).collect();
+    Ok(ImportScan { params: p.clone(), parsed, addresses, inputs: Vec::new() })
+}
+
+/// Opens, for an import about to run on a copy ([`import_ahead`]), the login of each web address
+/// the project's layers name, as a request to it would open it (a saved login read, a choice of
+/// connection asked for): before the read records the session's accounts, which an import that
+/// opened one later would find changed when it lands. `None` for a project that doesn't read: the
+/// import, run here, says why.
+///
+/// It takes the project scanned for `p` on a thread of its own ([`scan`]; the desktop app's
+/// way), which leaves it nothing to read. A caller that scanned none (a test) is scanned here,
+/// on the thread that asks.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn open_import_logins(s: &mut Session, p: &Value) -> Option<ImportOpened> {
+    let scanned = s.import_scanned.take().filter(|scan| scan.params == *p);
+    let ImportScan { parsed, addresses, inputs, .. } = match scanned {
+        Some(scan) => scan,
+        None => scan(p).ok()?,
+    };
+    let (logins, held) = crate::service_logins::borrow_for(s, addresses.iter().map(String::as_str));
+    let base = map_name(&parsed.project).to_string();
+    Some(ImportOpened { params: p.clone(), parsed, base, logins, held, inputs })
+}
+
+/// What an imported project's map is named for: its title, or "QGIS project".
+fn map_name(project: &qgis::Project) -> &str {
+    if project.title.is_empty() { "QGIS project" } else { project.title.as_str() }
+}
+
+/// The import `project.importQgis` makes in the desktop app, on a copy of the session on a
+/// thread of its own, with progress and Cancel: the map it makes, its layers read from their files
+/// and services, is taken by the command, which adds it as a map of this session's
+/// ([`land_import`]); a cancelled or failed one leaves the session as it was. The logins its
+/// services need were opened before ([`open_import_logins`]); the copy borrows them and opens none
+/// of its own ([`crate::service_logins::borrow_for`]). Only for the user's own dispatch
+/// (`native`): anything else runs the import as it always has, and so does a project that
+/// couldn't be read, to say why.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn import_ahead(s: &mut Session, p: &Value, native: bool) -> Option<super::reads::ReadWork> {
+    // Opened for this very request before its accounts were recorded ([`open_import_logins`]).
+    let opened = s.import_opened.take().filter(|o| native && o.params == *p)?;
+    let ImportOpened { params: q, parsed, logins, base, held, inputs } = opened;
+    let selections: Vec<(String, String)> =
+        s.database_logins.web_selections().into_iter().map(|(origin, id)| (origin.to_string(), id.to_string())).collect();
+    let (project, connections, extensions) = (s.project.clone(), s.connections.clone(), s.extensions().clone());
+    let (view_size, active_layer, opened) = (s.view_size, s.active_layer, s.opened);
+    // The desktop's own settings, so what the copy adds is what an import here adds.
+    let (in_place_wait, raster_defaults, grids, auto_cache) =
+        (s.in_place_wait, s.raster_defaults.clone(), s.offers_grid_downloads, s.auto_cache);
+    let readers = s.undo_memory.readers();
+    // Rows the copy shares stay counted while it holds them, should this session let them go.
+    let retained = readers.retain(crate::undo_memory::allocations(&project));
+    // What it asks of servers and files goes in this session's Diagnostics, as when it runs here.
+    let requests = s.diagnostics.capture();
+    Some(super::reads::ahead("Import QGIS Project", IMPORT_AHEAD.into(), move || {
+        // Held until the copy, made after it, is gone.
+        let _retained = retained;
+        let before = connections.connections.clone();
+        let mut copy = Session::new(project);
+        copy.requests_into = Some(requests);
+        copy.set_extensions(extensions);
+        copy.connections = connections;
+        copy.web_logins = logins;
+        for (origin, id) in &selections {
+            copy.database_logins.select(crate::connections::WEB, origin, id);
+        }
+        (copy.view_size, copy.active_layer, copy.opened) = (view_size, active_layer, opened);
+        (copy.in_place_wait, copy.raster_defaults, copy.offers_grid_downloads, copy.auto_cache) =
+            (in_place_wait, raster_defaults, grids, auto_cache);
+        // The copy shares this session's rows, which this session already counts (#2431).
+        copy.undo_memory.memory = None;
+        copy.undo_memory.use_readers(readers);
+        copy.sync_policy_generation();
+        let maps = copy.project.maps.len();
+        let tables: Vec<u32> = copy.project.tables.iter().map(|t| t.id).collect();
+        // The copy imports the project as parsed already, reading nothing of it again: the files
+        // read for it are its inputs too.
+        rustgis_data::provenance::record(inputs);
+        let result = super::reads::taking(&mut copy, PARSED, parsed, |copy| copy.run("project.importQgis", &q)).and_then(|answer| {
+            // The map it made, the last: one more than the copy had.
+            if copy.project.maps.len() != maps + 1 {
+                return Err("the import made no map".to_string());
+            }
+            let map = copy.project.maps.pop().ok_or("the import made no map")?;
+            let made = copy
+                .connections
+                .connections
+                .iter()
+                .filter(|c| !before.iter().any(|b| b.id == c.id))
+                .map(|c| (c.kind.clone(), c.address.clone(), c.name.clone()))
+                .collect();
+            let added = copy.project.tables.iter().filter(|t| !tables.contains(&t.id)).map(|t| t.dataset.clone()).collect();
+            let style_view = copy.style_view.take().filter(|(_, _, on)| *on == map.instance_id());
+            Ok(Imported { map, base: base.clone(), tables: added, active_layer: copy.active_layer, style_view, made, answer })
+        });
+        let losses = std::mem::take(&mut copy.loss_notices);
+        ImportAhead { result, notices: std::mem::take(&mut copy.notices), losses, connections: before, held }
+    }))
+}
+
+/// A web address a project layer's source names, which a login may be needed for.
+#[cfg(not(target_arch = "wasm32"))]
+fn web_address(source: &Source) -> Option<&str> {
+    match source {
+        Source::Wms { url, .. }
+        | Source::Wfs { url, .. }
+        | Source::ArcGis { url, .. }
+        | Source::Wcs { url, .. }
+        | Source::Xyz { url, .. } => Some(url),
+        Source::Archive { path, .. } | Source::File { path, .. } | Source::Csv { path, .. } => Some(path).filter(|p| p.contains("://")),
+        _ => None,
+    }
+    .map(String::as_str)
+}
+
+/// Takes a project imported on a copy ([`import_ahead`]): says what the copy said, makes the saved
+/// connections it made (while the saved ones are as they were when it started; otherwise it is
+/// refused, to be imported again), and adds its map as the active map, as `map.new` adds one.
+#[cfg(not(target_arch = "wasm32"))]
+fn land_import(s: &mut Session, ahead: ImportAhead) -> CmdResult {
+    let say = |s: &mut Session, losses: Vec<crate::LossNotice>, notices: Vec<crate::Notice>| {
+        for loss in losses {
+            s.notify_counted(loss.code, loss.template, loss.count);
+        }
+        for notice in notices {
+            s.relay_notice(notice);
+        }
+    };
+    let imported = match ahead.result {
+        Ok(imported) => imported,
+        Err(e) => {
+            say(s, ahead.losses, ahead.notices);
+            return Err(e);
+        }
+    };
+    // (Refused, it says nothing of an import that added nothing.)
+    if s.connections.connections != ahead.connections && !imported.made.is_empty() {
+        return Err("the saved connections changed while the QGIS project was read: import it again".into());
+    }
+    // Each tried first on a copy of the saved connections, so that none is saved unless all are,
+    // with the names the import gave them.
+    let changed = || "the saved connections changed while the QGIS project was read: import it again".to_string();
+    let mut trial = s.connections.clone();
+    for (kind, address, name) in &imported.made {
+        let c = crate::connections::Connection { kind: kind.clone(), address: address.clone(), ..Default::default() };
+        if trial.add(c, false)?.0.name != *name {
+            return Err(changed());
+        }
+    }
+    let saved = s.connections.clone();
+    for (kind, address, name) in &imported.made {
+        let made = match s.run_part("connection.new", &json!({"kind": kind, "address": address})) {
+            Ok(made) if made.get("name").and_then(Value::as_str) == Some(name.as_str()) => Ok(()),
+            Ok(_) => Err(changed()),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = made {
+            s.connections = saved;
+            return Err(e);
+        }
+    }
+    say(s, ahead.losses, ahead.notices);
+    for table in imported.tables {
+        s.project.add_table(table);
+    }
+    let mut map = imported.map;
+    // Named as `map.new` names one here: for the project, unless a map has that name.
+    let mut name = imported.base.clone();
+    let mut i = 1;
+    while s.project.maps.iter().any(|m| m.name.eq_ignore_ascii_case(&name)) {
+        i += 1;
+        name = format!("{}{i}", imported.base);
+    }
+    map.name.clone_from(&name);
+    s.project.maps.push(map);
+    s.project.active_map = s.project.maps.len() - 1;
+    s.active_layer = imported.active_layer;
+    s.table_layer = None;
+    if imported.style_view.is_some() {
+        s.style_view = imported.style_view;
+    }
+    // The logins opened for it are this session's now: they rebind the layers already using them.
+    crate::service_logins::release_held(s, &ahead.held);
+    let mut answer = imported.answer;
+    answer["map"] = json!(name);
+    Ok(answer)
+}
+
 /// The read `style.importQgis` makes before it runs in the desktop app: on a thread of its own, with
 /// Cancel. A request that is wrong gives nothing, or its error: the command says why. It holds a
 /// copy of the command's own `text` or `data` (at most [`MAX_XML`] bytes or their base64) while it
@@ -2042,7 +2426,7 @@ pub(crate) fn style_ahead(s: &Session, p: &Value) -> Option<super::reads::ReadWo
 /// the style is applied only when they are done, so a cancelled import leaves the layer as it was);
 /// run anywhere else (the command line, a script, the browser) it reads here, on the thread that
 /// runs it. Its work is bounded by the style: one file of at most [`MAX_FILE`] bytes, its XML
-/// parsed within [`MAX_XML`], and its raster image markers' images within [`MARKER_READ_BYTES`],
+/// parsed within [`MAX_XML`], and its raster image and SVG markers' images within [`MARKER_READ_BYTES`],
 /// each file read once and decoded once to check it (see [`marker_images`] and [`marker_image`]).
 /// Cancel is looked at before each image: the file's one read and the XML's one parse don't.
 fn import_style(s: &mut Session, p: &Value) -> CmdResult {

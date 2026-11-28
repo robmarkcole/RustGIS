@@ -16,13 +16,15 @@ pub fn commands() -> Vec<C> {
     vec![
         C::new("edit.previewShapeConversion", "Preview Shape Conversion", "Edit › Features", crate::shape_conversion::preview).inputs(crate::shape_conversion::preview_inputs)
             .roles(&[crate::ParamRole {key:"frame",role:crate::Role::Opaque}]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).view()
-            .when(crate::cmd::design::need_editable).params(r#"{"layer"?:name|id,"row":number,"featureId"?:number,"kind":"circle|rotatedBox","request"?:number (preview correlation only),"image"?:GeoTIFF layer name|id,"frame"?:construction grid as edit.addBox.box.frame (otherwise Web Mercator)}"#),
+            .when(crate::cmd::design::need_editable).params(r#"{"layer"?:name|id,"row":number,"featureId"?:number,"kind":"circle|rotatedBox","request"?:number (preview correlation only),"image"?:GeoTIFF layer name|id,"frame"?:construction grid as edit.addBox.box.frame (otherwise the layer's own grid when it is held in a projected EPSG system, else Web Mercator; give {"epsg":3857} for Web Mercator)}"#),
         C::new("edit.applyShapeConversion", "Apply Shape Conversion", "Edit › Features", crate::shape_conversion::apply).inputs(crate::shape_conversion::apply_inputs)
             .roles(&[crate::ParamRole {key:"preview",role:crate::Role::Opaque}]).effects(crate::policy::Effects::NONE).atomic()
             .when(crate::shape_conversion::need_editing).params(r#"{"preview":result of edit.previewShapeConversion,"confirm":true}"#),
         C::new("edit.calculateGeometry", "Calculate Geometry", "Attribute Table", crate::geometry_calc::run).roles(&[]).effects(crate::policy::Effects::NONE)
             .when(super::design::need_editable)
             .params(r#"{"layer"?, "field": string, "create": bool, "overwrite": bool, "property": string, "unit": string, "epsg"?: number, "scope": "all"|"selected"}"#),
+        C::new("edit.addPoint", "Create Point by Coordinates", "Edit › Features", add_point).inputs(point_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
+            .params(r#"{"x": number or degrees text, "y": number or degrees text, "crs"?: coordinate system|"map"|layer name (omitted: longitude/latitude, including degrees text), "layer"?: name|id (otherwise the active loaded point layer, or a new Points layer), "name"?: text (requires a text field named name in an existing layer)}"#),
         C::new("edit.addFeature", "Create Feature", "Edit › Features", add_feature).inputs(super::design::new_feature_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
             .when(super::design::need_editable_or_table)
             .params(r#"{"layer"?, "table"?: name|id (a standalone table: adds a row, without geometry or template), "geometry": GeoJSON geometry (lon/lat; left out for a table), "attributes"?: {field: value}, "template"?: feature template}"#),
@@ -59,6 +61,107 @@ pub fn commands() -> Vec<C> {
         C::new("edit.circleInfo", "Circle Construction", "Edit › Features", crate::circle_edit::info).roles(&[]).effects(crate::policy::Effects::NONE).view()
             .params(r#"{"layer"?:name|id,"row":number}"#),
     ]
+}
+
+/// Whether this layer can receive a coordinate point without loading a streamed source.
+pub fn accepts_coordinate_point(l: &rustgis_map::Layer) -> bool {
+    !l.is_raster() && !l.graphics && !l.dataset.windowed && l.geometry_type() == GeometryType::Point
+}
+
+/// A loaded point layer can accept a single point without reading or materializing a source.
+fn point_target(input: &impl super::InputSource, p: &Json) -> Result<Option<u32>, String> {
+    let s = input.input_context();
+    let explicit = match p.get("layer") {
+        None | Some(Json::Null) => false,
+        Some(Json::String(_) | Json::Number(_)) => true,
+        _ => return Err("layer must be a name or id".into()),
+    };
+    let id = if explicit { Some(s.layer_id(p)?) } else { s.active_layer };
+    let usable = id.filter(|id| s.map().layer(*id).is_some_and(accepts_coordinate_point));
+    if explicit && usable.is_none() {
+        return Err("choose a loaded point layer".into());
+    }
+    Ok(usable)
+}
+
+/// Declare the actual target and the elevation surface, including for a new layer.
+fn point_inputs(input: &super::InputContext<'_>, p: &Json) -> Result<super::Inputs, String> {
+    let target = point_target(input, p)?;
+    let mut inputs = super::Inputs::layers(target.and_then(|id| input.map().layer(id)).map(|l| (input.map(), l)));
+    inputs.uses_default = p.get("layer").is_none_or(Json::is_null);
+    super::design::include_new_feature_surface(input, &mut inputs);
+    // Match typed_place's resolution order: map, a layer name, then a literal system.
+    // The planner already binds private selector state to the displayed approval.
+    if let Some(name) = ps(p, "crs").map(str::trim) {
+        if name.eq_ignore_ascii_case("map") {
+            inputs.state = json!({"feature":inputs.state,"projection":input.map().projection});
+        } else if let Some(layer) = input.map().layer_by_name(name) {
+            let key = (input.map().instance_id(), layer.id);
+            if !inputs.layers.contains(&key) {
+                inputs.layers.push(key);
+            }
+            inputs.state = json!({"feature":inputs.state,"crs":super::navigate::layer_coordinates_system(layer).unwrap_or(rustgis_data::raster::Crs::LonLat)});
+        }
+    }
+    Ok(inputs)
+}
+
+/// Creates a point through ordinary edit rules in one Undo step, including a fallback
+/// layer. Like other feature creation, editing must be on. Runs inline like `edit.addFeature`;
+/// snapping to stored places in a projected layer can search its existing features.
+fn add_point(s: &mut Session, p: &Json) -> CmdResult {
+    editing_on(s)?;
+    // Keep this command's ingress to the documented X/Y pair; the shared parser also serves
+    // commands accepting a combined position, which this form does not offer.
+    if ["position", "lon", "lat"].iter().any(|key| p.get(key).is_some_and(|v| !v.is_null())) {
+        return Err("use x and y for a coordinate point".into());
+    }
+    for key in ["x", "y"] {
+        if p.get(key).is_none_or(Json::is_null) {
+            return Err(format!("{key} is required"));
+        }
+    }
+    // Combined positions are rejected above; the X/Y path produces no approximation notice.
+    let (at, _) = super::navigate::typed_place(s.map(), p, false)?;
+    let target = point_target(s, p)?;
+    let name = match p.get("name") {
+        None | Some(Json::Null) => "",
+        Some(Json::String(t)) => t.trim(),
+        _ => return Err("name must be text".into()),
+    };
+    let field = if let Some(id) = target {
+        let l = s.map().layer(id).ok_or("no layer")?;
+        l.dataset.fields.iter().find(|f| f.name.eq_ignore_ascii_case("name") && f.ty == FieldType::Text).map(|f| f.name.clone())
+    } else {
+        Some("name".into())
+    };
+    if !name.is_empty() && field.is_none() {
+        return Err("this layer has no text field named name; leave Name blank or choose another point layer".into());
+    }
+    let create = |s: &mut Session| {
+        let id = match target {
+            Some(id) => id,
+            None => {
+                super::items::layer_template(s, &json!({"template":"points"}))?;
+                s.active_layer.ok_or("the point layer was not created")?
+            }
+        };
+        let mut attributes = serde_json::Map::new();
+        if !name.is_empty()
+            && let Some(field) = field
+        {
+            attributes.insert(field, json!(name));
+        }
+        let result = add_geometry(s, id, &json!({"attributes":attributes}), Geometry::Point(at))?;
+        if target.is_none() {
+            // The UI explains the fallback before submission; non-UI callers need it too.
+            s.notify("Created a Points layer because no loaded point layer was selected", false);
+        }
+        Ok(json!({"layer":id,"row":result.get("row")}))
+    };
+    // Existing-layer refusals are rolled back by add_geometry without a row snapshot.
+    // Fallback also restores the layer it created if a plugin handles the error.
+    if target.is_none() { s.savepoint("Create Point by Coordinates", create) } else { create(s) }
 }
 
 /// What an edit command changes: a layer, or a standalone table (by its position among the
@@ -143,19 +246,36 @@ pub(crate) fn add_feature(s: &mut Session, p: &Json) -> CmdResult {
     add_geometry(s, id, p, g)
 }
 
+/// [`add_feature`] with `g` in layer `id`'s own coordinates, written as it is: for a shape made
+/// in its own grid (a traverse, #2032 C2f-6).
+pub(crate) fn add_feature_own(s: &mut Session, id: u32, p: &Json, g: Geometry) -> CmdResult {
+    fits(s, id, &g)?;
+    insert(s, id, p, g)
+}
+
+/// Refuses `g` where layer `id` can't take it: of another kind, or too few vertices.
+fn fits(s: &Session, id: u32, g: &Geometry) -> Result<(), String> {
+    let want = s.map().layer(id).ok_or("no layer")?.geometry_type();
+    if want != g.kind() && want != GeometryType::None {
+        return Err(format!("{} can't go in a {} layer", g.kind().label(), want.label()));
+    }
+    validate(g)
+}
+
 /// Inserts an already validated construction through the same attributes, templates and rules.
 pub(crate) fn add_geometry(s: &mut Session, id: u32, p: &Json, g: Geometry) -> CmdResult {
     // A place snapped to a stored one stays as stored.
     let held = super::design::held_places(s, id, &[], &[&g]);
-    let l = s.map_mut().layer_mut(id).ok_or("no layer")?;
-    let want = l.geometry_type();
-    let ok = want == g.kind() || want == GeometryType::None;
-    if !ok {
-        return Err(format!("{} can't go in a {} layer", g.kind().label(), want.label()));
-    }
-    validate(&g)?;
+    fits(s, id, &g)?;
     // Given in longitude/latitude, written in the layer's own coordinates.
-    let g = l.dataset.edit_from_lonlat(g, &held)?;
+    let g = s.map().layer(id).ok_or("no layer")?.dataset.edit_from_lonlat(g, &held)?;
+    insert(s, id, p, g)
+}
+
+/// Inserts `g`, in layer `id`'s own coordinates, with a feature template's defaults and the given
+/// attributes, as one edit.
+fn insert(s: &mut Session, id: u32, p: &Json, g: Geometry) -> CmdResult {
+    let l = s.map_mut().layer_mut(id).ok_or("no layer")?;
     // A feature template's defaults, then the given attributes.
     let template = match ps(p, "template") {
         Some(t) => {
@@ -166,11 +286,24 @@ pub(crate) fn add_geometry(s: &mut Session, id: u32, p: &Json, g: Geometry) -> C
     let layer = l.dataset.name.clone();
     let defaults = template.as_ref().map_or(&[][..], |t| &t.defaults[..]);
     let (attrs, losses, left_out) = new_row(&l.dataset.fields, p, defaults)?;
+    let row = l.dataset.features.len();
+    let fields = l.dataset.fields.len();
     l.dataset.push(Some(g), attrs);
+    if let Err(error) = super::design::apply(s, id, vec![super::design::Change { before: None, row: Some(row) }]) {
+        // Design only writes the new row, apart from appending an elevation column of nulls
+        // to older rows. Remove both on refusal without retaining another full row vector.
+        if let Some(l) = s.map_mut().layer_mut(id) {
+            l.dataset.features.truncate_rows(row);
+            for field in (fields..l.dataset.fields.len()).rev() {
+                l.dataset.features.remove_column(field);
+            }
+            l.dataset.fields.truncate(fields);
+        }
+        return Err(error);
+    }
+    let l = s.map_mut().layer_mut(id).ok_or("no layer")?;
     l.touch_geometry();
-    let row = l.dataset.features.len() - 1;
     l.selection = vec![row];
-    super::design::apply(s, id, vec![super::design::Change { before: None, row: Some(row) }])?;
     for (field, key) in losses {
         notify_loss(s, key, &layer, field, row);
     }
@@ -256,8 +389,11 @@ fn notify_left_out(s: &mut Session, name: &str, left: &LeftOut) {
     }
 }
 
-/// What writing a value took from it, by field: a notice key ([`notify_loss`]).
-type Losses = Vec<(String, &'static str)>;
+/// What writing a value took from it: a notice key ([`notify_loss`]) and the loss's code.
+type CellLoss = (&'static str, LossCode);
+
+/// What writing a row's values took from them, by field.
+type Losses = Vec<(String, CellLoss)>;
 
 /// A new row's values for `fields`: those given (`"attributes"`, [`given_attributes`]), else
 /// `defaults` (a feature template's), each as its field holds it, with what that took from each
@@ -286,13 +422,19 @@ fn new_row(fields: &[Field], p: &Json, defaults: &[(String, Value)]) -> Result<(
             }
             // A date-time (a native caller's template default) keeps only its day in a date field.
             if matches!(value, Value::DateTime(t) if f.ty == FieldType::Date && !t.is_date()) {
-                losses.push((f.name.clone(), "{layer}, field '{field}', row {row}: 1 attribute value kept only its day"));
+                losses.push((
+                    f.name.clone(),
+                    ("{layer}, field '{field}', row {row}: 1 attribute value kept only its day", LossCode::DroppedTime),
+                ));
             }
             // A date (a native caller's template default) is no yes/no value: null, and said.
             if f.ty == FieldType::Boolean && coerced.is_null() && !value.asks_null() {
                 losses.push((
                     f.name.clone(),
-                    "{layer}, field '{field}', row {row}: 1 attribute value was written as null because it isn't a yes/no value",
+                    (
+                        "{layer}, field '{field}', row {row}: 1 attribute value was written as null because it isn't a yes/no value",
+                        LossCode::DroppedValue,
+                    ),
                 ));
             }
             Ok(coerced)
@@ -302,13 +444,13 @@ fn new_row(fields: &[Field], p: &Json, defaults: &[(String, Value)]) -> Result<(
 }
 
 /// Says what writing a value of `field`, in row `row` of layer or table `name`, took from it.
-fn notify_loss(s: &mut Session, key: &'static str, name: &str, field: String, row: usize) {
-    s.notify_text(
+fn notify_loss(s: &mut Session, (key, code): CellLoss, name: &str, field: String, row: usize) {
+    s.notify_loss(
+        code,
         crate::notice_text::NoticeText::format(
             key,
             [("layer", name.to_string().into()), ("field", field.into()), ("row", row.saturating_add(1).to_string().into())],
         ),
-        false,
     );
 }
 
@@ -346,13 +488,13 @@ pub(crate) fn validate(g: &Geometry) -> Result<(), String> {
     }
 }
 
-/// `v` as a value of a `ty` field. A date-time into a date field is the day it shows. A number goes into a number field as it is, not through the
-/// text it shows (which rounds a decimal to six places); a decimal, or text written as one, into a
+/// `v` as a value of a `ty` field. A date-time into a date field is the day it shows. A number
+/// goes into a number field as it is, not through the text it shows (which rounds a decimal to six
+/// places); a decimal, or text written as one, into a
 /// whole-number field loses its fraction (toward zero); a whole number past 2^53 into a decimal
 /// field is the nearest decimal. Not a number, and an infinity in a whole-number field, are null.
-/// Other values go through their text (a
-/// decimal into a text field as it's shown, to six places), and what the field can't hold is
-/// null. A number past the 64-bit range is held at the range's end, as it was; [`coerce_cut`], for
+/// A decimal goes into a text field in full, as a file writes it. Other values go through their
+/// text, and what the field can't hold is null. A number past the 64-bit range is held at the range's end, as it was; [`coerce_cut`], for
 /// callers that say what was cut, makes it null instead.
 pub(crate) fn coerce(v: Value, ty: FieldType) -> Value {
     match convert(v, ty) {
@@ -378,6 +520,10 @@ pub(crate) enum Cut {
     NotFinite,
     /// A date-time's time of day or zone: a date field keeps its day.
     Time,
+    /// Digits past those a decimal holds: a whole number past 2^53 in a decimal field, or text
+    /// with more significant digits than the decimal it is read through
+    /// ([`Value::rounds_as_double`], [`double_holds`](rustgis_data::io::double_holds)).
+    Rounded,
 }
 
 /// How many of a field's results [`coerce_cut`] cut, of each kind, for one notice per kind.
@@ -388,6 +534,7 @@ pub(crate) struct Cuts {
     not_numbers: usize,
     not_finite: usize,
     times: usize,
+    rounded: usize,
 }
 
 impl Cuts {
@@ -399,17 +546,19 @@ impl Cuts {
             Cut::NotANumber => self.not_numbers += 1,
             Cut::NotFinite => self.not_finite += 1,
             Cut::Time => self.times += 1,
+            Cut::Rounded => self.rounded += 1,
         }
     }
 
     /// The notices for what writing the whole-number or date field `field` cut, each starting with `by`
     /// (the command or rule that wrote it). Empty when nothing was cut.
+    #[cfg(test)]
     pub(crate) fn notices(&self, by: &str, field: &str) -> Vec<String> {
         self.classified(by, field).into_iter().map(|(_, text)| text).collect()
     }
 
     /// Pairs each coercion message with its cause at the point the loss is counted.
-    fn classified(&self, by: &str, field: &str) -> Vec<(LossCode, String)> {
+    pub(crate) fn classified(&self, by: &str, field: &str) -> Vec<(LossCode, String)> {
         let results = |n: usize| if n == 1 { "1 result".to_string() } else { format!("{n} results") };
         let mut out = Vec::new();
         if self.fractions > 0 {
@@ -433,6 +582,10 @@ impl Cuts {
         if self.times > 0 {
             let their = if self.times == 1 { "its" } else { "their" };
             out.push((LossCode::DroppedTime, format!("{by}: '{field}' holds dates, so {} kept only {their} day", results(self.times))));
+        }
+        if self.rounded > 0 {
+            let were = if self.rounded == 1 { "was" } else { "were" };
+            out.push((LossCode::ChangedRounded, format!("{by}: {} {were} rounded to the digits '{field}' holds", results(self.rounded))));
         }
         out
     }
@@ -466,6 +619,64 @@ enum Loss {
     Error(rustgis_data::query::Fault),
 }
 
+impl Loss {
+    /// The loss as a preview names it; `None` for a cut that took nothing.
+    fn previewed(self) -> Option<PreviewLoss> {
+        Some(match self {
+            Loss::Cut(Cut::None) => return None,
+            Loss::Cut(Cut::Fraction) => PreviewLoss::Fraction,
+            Loss::Cut(Cut::Range) => PreviewLoss::Range,
+            Loss::Cut(Cut::NotANumber) => PreviewLoss::NotANumber,
+            Loss::Cut(Cut::NotFinite) => PreviewLoss::NotFinite,
+            Loss::Cut(Cut::Time) => PreviewLoss::Time,
+            Loss::Cut(Cut::Rounded) => PreviewLoss::Rounded,
+            Loss::Unread => PreviewLoss::Unheld,
+            Loss::Error(fault) => PreviewLoss::Error(fault),
+        })
+    }
+}
+
+/// What writing a row's result into its field loses, as a Calculate Field preview says it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreviewLoss {
+    /// A whole-number field drops the fraction.
+    Fraction,
+    /// A number past the 64-bit integer range is null.
+    Range,
+    /// Not a number (NaN), or a word read as one, is null.
+    NotANumber,
+    /// An infinity is null.
+    NotFinite,
+    /// A date field keeps a date-time's day.
+    Time,
+    /// Digits past those the field holds are rounded.
+    Rounded,
+    /// A result the field can't hold (text that isn't a number or a date) is null.
+    Unheld,
+    /// The expression's error made it null.
+    Error(rustgis_data::query::Fault),
+}
+
+/// A result as a field holds it, with what holding it lost.
+struct Held {
+    value: Value,
+    /// What the coercion to the field's type took.
+    cut: Option<Loss>,
+    /// The error that made it null or, for a null nobody asked for, the value not read.
+    other: Option<Loss>,
+}
+
+/// A result and the error that made it null, if one did, as a `ty` field holds it.
+fn held((v, fault): (Value, Option<rustgis_data::query::Fault>), ty: FieldType) -> Held {
+    let asked_null = v.asks_null();
+    let (value, cut) = coerce_cut(v, ty);
+    let other = match fault.filter(|_| value.is_null()) {
+        Some(fault) => Some(Loss::Error(fault)),
+        None => (!asked_null && value.is_null() && cut == Cut::None).then_some(Loss::Unread),
+    };
+    Held { value, cut: (cut != Cut::None).then_some(Loss::Cut(cut)), other }
+}
+
 impl WriteLosses {
     /// A tally for an edit that may write the same row more than once, counting each kind of
     /// loss once per row: a later write that loses something else is still counted.
@@ -480,29 +691,48 @@ impl WriteLosses {
 
     /// Row `row`'s result and the error that made it null, if one did, as a `ty` field holds it,
     /// counting what that lost.
-    pub(crate) fn write(&mut self, row: usize, (v, fault): (Value, Option<rustgis_data::query::Fault>), ty: FieldType) -> Value {
-        let asked_null = v.asks_null();
-        let (v, cut) = coerce_cut(v, ty);
-        if cut != Cut::None && self.first(row, Loss::Cut(cut)) {
-            self.cuts.add(cut);
-        }
-        if let Some(fault) = fault.filter(|_| v.is_null()) {
-            if !self.first(row, Loss::Error(fault)) {
-                return v;
+    pub(crate) fn write(&mut self, row: usize, result: (Value, Option<rustgis_data::query::Fault>), ty: FieldType) -> Value {
+        let Held { value, cut, other } = held(result, ty);
+        for loss in [cut, other].into_iter().flatten() {
+            if !self.first(row, loss) {
+                continue;
             }
-            match self.errors.iter_mut().find(|(f, ..)| *f == fault) {
-                Some((_, n, rows)) => {
-                    *n += 1;
-                    if rows.len() < LISTED_ROWS {
-                        rows.push(row);
+            match loss {
+                Loss::Cut(cut) => self.cuts.add(cut),
+                Loss::Unread => self.unread += 1,
+                Loss::Error(fault) => match self.errors.iter_mut().find(|(f, ..)| *f == fault) {
+                    Some((_, n, rows)) => {
+                        *n += 1;
+                        if rows.len() < LISTED_ROWS {
+                            rows.push(row);
+                        }
                     }
-                }
-                None => self.errors.push((fault, 1, vec![row])),
+                    None => self.errors.push((fault, 1, vec![row])),
+                },
             }
-        } else if !asked_null && v.is_null() && cut == Cut::None && self.first(row, Loss::Unread) {
-            self.unread += 1;
         }
-        v
+        value
+    }
+
+    /// What a tally of one row's write says, as a preview names it, in the order [`held`] gives
+    /// them: the error that made it null, a result the field couldn't hold, then what a cut took.
+    /// `None` for a clean write.
+    pub(crate) fn previewed(&self) -> Option<PreviewLoss> {
+        let cuts = &self.cuts;
+        if let Some((fault, ..)) = self.errors.first() {
+            return Some(PreviewLoss::Error(*fault));
+        }
+        [
+            (self.unread, PreviewLoss::Unheld),
+            (cuts.fractions, PreviewLoss::Fraction),
+            (cuts.past, PreviewLoss::Range),
+            (cuts.not_numbers, PreviewLoss::NotANumber),
+            (cuts.not_finite, PreviewLoss::NotFinite),
+            (cuts.times, PreviewLoss::Time),
+            (cuts.rounded, PreviewLoss::Rounded),
+        ]
+        .into_iter()
+        .find_map(|(n, loss)| (n > 0).then_some(loss))
     }
 
     /// The notices for what writing `field`, of type `ty`, lost, each starting with `by` (the
@@ -564,6 +794,26 @@ pub(crate) fn non_finite_input(value: &Value, ty: FieldType) -> bool {
         }
 }
 
+/// A value set once for a field and used again (a template's or subtype's default, a domain's
+/// code, a contingent combination) as a `ty` field holds it, refused when holding it would lose
+/// any of it: one that isn't finite or isn't a value of the field's type, or that the field would
+/// cut, clamp or round. It is checked when it is set, as no later edit could say what was lost.
+pub(crate) fn held_default(field: &str, value: &Value, ty: FieldType) -> Result<Value, String> {
+    if non_finite_input(value, ty) {
+        return Err(format!("field '{field}' requires a finite number"));
+    }
+    let coerced = coerce(value.clone(), ty);
+    // Named as given, not as shown (which rounds a decimal to six places).
+    let given = value.to_file_text();
+    if coerced.is_null() && !value.asks_null() {
+        return Err(format!("field '{field}': '{given}' isn't a {} value", ty.label()));
+    }
+    if numeric_loss(value, &coerced, ty).is_some() || matches!(value, Value::DateTime(t) if ty == FieldType::Date && !t.is_date()) {
+        return Err(format!("field '{field}': a {} field can't hold '{given}' as given", ty.label()));
+    }
+    Ok(coerced)
+}
+
 /// Whether a number, or a number written as text, is an infinity (not NaN).
 fn infinite(value: &Value) -> bool {
     match value {
@@ -581,7 +831,9 @@ fn convert(v: Value, ty: FieldType) -> (Value, Cut, Option<f64>) {
         (Value::Float(f), FieldType::Integer) if f.is_infinite() => (Value::Null, Cut::NotFinite, None),
         (Value::Float(f), FieldType::Integer) => whole(f),
         (Value::Float(f), FieldType::Double) => (Value::Float(f), Cut::None, None),
-        (Value::Int(i), FieldType::Double) => (Value::Float(i as f64), Cut::None, None),
+        (Value::Int(i), FieldType::Double) => {
+            (Value::Float(i as f64), if Value::Int(i).rounds_as_double() { Cut::Rounded } else { Cut::None }, None)
+        }
         // A date-time into a date field is the day it shows, and said so when it had a time or zone.
         (Value::DateTime(t), FieldType::Date) => (Value::Date(t.date()), if t.is_date() { Cut::None } else { Cut::Time }, None),
         // A date is no number or yes/no: null (and said by the caller), not read as false.
@@ -596,11 +848,29 @@ fn convert(v: Value, ty: FieldType) -> (Value, Cut, Option<f64>) {
                 (Some((v, cut)), Ok(f)) => (v, cut, Some(f)),
                 // A word the decimal reader takes ("inf", "NaN") isn't a number written as text:
                 // null, and said so, as not a number.
-                (None, Ok(f)) if f.is_finite() || t.bytes().any(|b| b.is_ascii_digit()) => whole(f),
+                // A fraction the decimal rounded away (`2.0000000000000000001e0`) is still one.
+                // A fraction the decimal rounded away (`2.0000000000000000001e0`) is still one, and
+                // digits past those it holds (`9007199254740993e0`) are rounded.
+                (None, Ok(f)) if f.is_finite() || t.bytes().any(|b| b.is_ascii_digit()) => match whole(f) {
+                    (v @ Value::Int(_), Cut::None, x) if Value::text_has_fraction(&t) => (v, Cut::Fraction, x),
+                    (v @ Value::Int(_), Cut::None, x) if !rustgis_data::io::double_holds(t.trim()) => (v, Cut::Rounded, x),
+                    held => held,
+                },
                 (None, Ok(f)) if f.is_infinite() => (Value::Null, Cut::NotFinite, None),
                 (None, Ok(_)) => (Value::Null, Cut::NotANumber, None),
                 _ => (Value::parse(&t, ty), Cut::None, None),
             },
+        },
+        // A decimal goes into a text field in full, not as the six places it's shown to.
+        (Value::Float(f), FieldType::Text) if f.is_finite() => (Value::Text(Value::Float(f).to_file_text()), Cut::None, None),
+        // A whole number is yes when it isn't 0, as a shapefile writes it.
+        (Value::Int(i), FieldType::Boolean) => (Value::Bool(i != 0), Cut::None, None),
+        (Value::Float(f), FieldType::Boolean) if f.fract() == 0.0 => (Value::Bool(f != 0.0), Cut::None, None),
+        // A fraction is no yes/no value: null, not the text it's shown as (`0.0000001` shows `0`).
+        (Value::Float(_), FieldType::Boolean) => (Value::Null, Cut::None, None),
+        (Value::Text(t), FieldType::Double) => match Value::parse_source(&t, ty) {
+            v @ Value::Float(_) if Value::Text(t).rounds_as_double() => (v, Cut::Rounded, None),
+            v => (v, Cut::None, None),
         },
         // Uncounted coercion retains source numbers until output can explain any loss.
         (Value::Text(t), _) => (Value::parse_source(&t, ty), Cut::None, None),
@@ -670,17 +940,31 @@ fn delete(s: &mut Session, _: &Json) -> CmdResult {
 }
 
 /// A numeric conversion's loss, shared by edits and feature creation. Null entered explicitly is quiet.
-fn numeric_loss(input: &Value, v: &Value, ty: FieldType) -> Option<&'static str> {
+fn numeric_loss(input: &Value, v: &Value, ty: FieldType) -> Option<CellLoss> {
     if ty.is_numeric() && v.is_null() && !input.asks_null() {
-        Some("{layer}, field '{field}', row {row}: 1 attribute value was written as null because it isn't a number")
+        Some((
+            "{layer}, field '{field}', row {row}: 1 attribute value was written as null because it isn't a number",
+            LossCode::DroppedValue,
+        ))
     } else if ty == FieldType::Integer {
         let (exact, cut) = coerce_cut(input.clone(), ty);
         match cut {
-            Cut::Fraction => Some("{layer}, field '{field}', row {row}: 1 attribute value lost its fraction"),
-            Cut::Range => Some("{layer}, field '{field}', row {row}: 1 attribute value was clamped to the 64-bit integer range"),
-            Cut::None if &exact != v => Some("{layer}, field '{field}', row {row}: 1 attribute value lost integer precision"),
+            Cut::Fraction => Some(("{layer}, field '{field}', row {row}: 1 attribute value lost its fraction", LossCode::ChangedTruncated)),
+            // The value given is gone: the range's limit stands in its place.
+            Cut::Range => Some((
+                "{layer}, field '{field}', row {row}: 1 attribute value was clamped to the 64-bit integer range",
+                LossCode::DroppedValue,
+            )),
+            Cut::Rounded => {
+                Some(("{layer}, field '{field}', row {row}: 1 attribute value lost integer precision", LossCode::ChangedRounded))
+            }
+            Cut::None if &exact != v => {
+                Some(("{layer}, field '{field}', row {row}: 1 attribute value lost integer precision", LossCode::ChangedRounded))
+            }
             _ => None,
         }
+    } else if ty == FieldType::Double && matches!(v, Value::Float(_)) && coerce_cut(input.clone(), ty).1 == Cut::Rounded {
+        Some(("{layer}, field '{field}', row {row}: 1 attribute value was rounded to the digits a decimal holds", LossCode::ChangedRounded))
     } else {
         None
     }
@@ -757,8 +1041,8 @@ fn set_value(s: &mut Session, p: &Json) -> CmdResult {
     Ok(Json::Null)
 }
 
-/// `raw` (an `edit.setValue` value) as a value of a `ty` field. A number that isn't finite, and a
-/// value a date field can't hold, are refused.
+/// `raw` (an `edit.setValue` value) as a value of a `ty` field. A number that isn't finite, a
+/// value a date field can't hold, and text that isn't a yes/no word in a yes/no field, are refused.
 fn typed(raw: Json, ty: FieldType) -> Result<Value, String> {
     Ok(match raw {
         // A number that isn't finite (NaN, infinity) is no value a number field holds, nor one a
@@ -766,16 +1050,20 @@ fn typed(raw: Json, ty: FieldType) -> Result<Value, String> {
         Json::String(t) if ty.is_numeric() && t.trim().parse::<f64>().is_ok_and(|f| !f.is_finite()) => {
             return Err(format!("'{}' isn't a finite number, which a {} field holds", t.trim(), ty.label()));
         }
-        // Text a date field can't hold (`soon`) is refused, not stored as null.
+        // Text a date or yes/no field can't hold (`soon`, `maybe`) is refused, not stored as null.
         Json::String(t) => match Value::parse(&t, ty) {
-            Value::Null if ty.is_temporal() && !t.trim().is_empty() && !t.trim().eq_ignore_ascii_case("<null>") => {
+            Value::Null
+                if (ty.is_temporal() || ty == FieldType::Boolean) && !t.trim().is_empty() && !t.trim().eq_ignore_ascii_case("<null>") =>
+            {
                 return Err(format!("'{}' isn't a {} value", t.trim(), ty.label()));
             }
             v => v,
         },
-        // So is any other value a date field can't hold (`20260305`).
+        // So is any other value a date or yes/no field can't hold (`20260305`, `0.5`).
         other => match coerce(Value::from_json(&other), ty) {
-            Value::Null if ty.is_temporal() && !other.is_null() => return Err(format!("'{other}' isn't a {} value", ty.label())),
+            Value::Null if (ty.is_temporal() || ty == FieldType::Boolean) && !other.is_null() => {
+                return Err(format!("'{other}' isn't a {} value", ty.label()));
+            }
             v => v,
         },
     })
@@ -812,12 +1100,8 @@ fn add_field(s: &mut Session, p: &Json) -> CmdResult {
     }
     ds.fields.push(Field::new(name, ty));
     rustgis_data::progress::begin(ds.features.len());
-    for row in &mut ds.features {
-        rustgis_data::progress::step(1).map_err(|e| e.to_string())?;
-        // Adding one column to shared rows should not double every row's attribute capacity.
-        row.attrs.reserve_exact(1);
-        row.attrs.push(Value::Null);
-    }
+    // Shared rows are copied once, each at its new length, and Cancel is checked before each row.
+    ds.features.try_add_columns(1, Value::Null, || rustgis_data::progress::step(1).map_err(|e| e.to_string()))?;
     Ok(Json::Null)
 }
 
@@ -868,14 +1152,18 @@ fn convert_field(s: &mut Session, p: &Json) -> CmdResult {
     let (kind, one) = if ty == FieldType::Date { ("dates", "a date") } else { ("date-times", "a date-time") };
     if nulled > 0 {
         let rows = if nulled == 1 { "1 row".to_string() } else { format!("{nulled} rows") };
-        s.notify(
+        // Text that asks for null isn't counted (`to_dates`): only text that isn't a date.
+        s.say(rustgis_data::loss::Note::loss(
+            LossCode::DroppedValue,
             format!("Convert Field: '{name}' holds {kind} now, and is null in {rows} whose text isn't {one}: {}", examples.join(", ")),
-            false,
-        );
+        ));
     }
     if rounded > 0 {
         let values = if rounded == 1 { "1 value was".to_string() } else { format!("{rounded} values were") };
-        s.notify(format!("Convert Field: {values} rounded to the microsecond in '{name}', as more digits than that aren't kept"), false);
+        s.say(rustgis_data::loss::Note::loss(
+            LossCode::ChangedRounded,
+            format!("Convert Field: {values} rounded to the microsecond in '{name}', as more digits than that aren't kept"),
+        ));
     }
     Ok(json!({"converted": converted, "null": nulled}))
 }
@@ -1160,15 +1448,29 @@ fn delete_field(s: &mut Session, p: &Json) -> CmdResult {
     }
     d.contingent.retain(|c| !c.fields.iter().any(|f| f.eq_ignore_ascii_case(&removed)));
     let ds = rustgis_data::Dataset::new(l.dataset.name.clone(), l.dataset.geometry_type, l.dataset.fields.clone());
-    let before = d.rules.len();
+    // The rules that no longer read without the field are removed, by name, and said below.
+    let mut dropped: Vec<String> = Vec::new();
     d.rules.retain(|r| {
-        !r.field.eq_ignore_ascii_case(&removed)
+        let reads = !r.field.eq_ignore_ascii_case(&removed)
             && match r.kind {
                 rustgis_map::design::RuleKind::Calculation => Calculation::parse(&r.expression, &ds).is_ok(),
                 rustgis_map::design::RuleKind::Constraint => rustgis_data::query::parse_fields(&r.expression, &ds).is_ok(),
-            }
+            };
+        if !reads {
+            dropped.push(r.name.clone());
+        }
+        reads
     });
-    let removed_rules = before - d.rules.len();
+    let removed_rules = dropped.len();
+    let rules_note = (!dropped.is_empty()).then(|| {
+        dropped.sort();
+        format!(
+            "{}: deleting field {removed} removed {} attribute rule(s) that used it or no longer read: {}",
+            l.dataset.name,
+            removed_rules,
+            dropped.join(", ")
+        )
+    });
     // Nor its diagram: the field's slice or bar goes, the range of sums a scaled size grows over is
     // measured again without it, and a diagram left with no field goes too. Said once.
     let mut diagram_note = None;
@@ -1263,23 +1565,39 @@ fn delete_field(s: &mut Session, p: &Json) -> CmdResult {
         );
     }
     // Nor a block's walls, when the depths of that water came from the field (#2317): the block's
-    // depth for all of it if it has one, else no water in the walls, said.
+    // depth for all of it if it has one, else its bed where it has heights (#2434), else no water
+    // in the walls, said.
     if let Some(t) = s.map_mut().view.terrain.as_mut()
         && t.water.as_ref().is_some_and(|w| w.layer.eq_ignore_ascii_case(&layer_name))
         && let Some(b) = t.block.as_mut()
         && let Some(bw) = b.water.as_mut()
         && bw.field.as_deref().is_some_and(|f| f.eq_ignore_ascii_case(&removed))
     {
-        let note = match bw.depth {
-            Some(d) => {
+        let note = match (bw.depth, bw.bed.clone()) {
+            (Some(d), Some(bed)) => {
+                bw.field = None;
+                format!(
+                    "Block: its water's depths came from the deleted field {removed}, so its walls show the bed '{bed}' where it has heights and the water {d} m deep elsewhere"
+                )
+            }
+            (Some(d), None) => {
                 bw.field = None;
                 format!("Block: its water's depths came from the deleted field {removed}, so its walls show all of it {d} m deep")
             }
-            None => {
+            (None, Some(bed)) => {
+                bw.field = None;
+                format!(
+                    "Block: its water's depths came from the deleted field {removed}, so its walls show water only where the bed '{bed}' has heights"
+                )
+            }
+            (None, None) => {
                 b.water = None;
                 format!("Block: its water's depths came from the deleted field {removed}, so its walls show no water")
             }
         };
+        s.notify(note, false);
+    }
+    if let Some(note) = rules_note {
         s.notify(note, false);
     }
     Ok(json!({"rulesRemoved": removed_rules}))
@@ -1482,8 +1800,9 @@ fn land_layer_schema(s: &mut Session, p: &Json, command: &str) -> Option<CmdResu
         }
         let layer = s.map_mut().layer_mut(id).ok_or("no layer")?;
         (layer.dataset.fields, layer.dataset.features) = (output.fields, output.features);
+        // Each with its code, as a table's edit lands.
         for notice in notices {
-            s.notify(notice.text, notice.error);
+            s.relay_notice(notice);
         }
         Ok(answer)
     })())
@@ -1607,6 +1926,91 @@ pub fn check_calculation(expr: &str, ds: &rustgis_data::Dataset) -> Result<(), S
     Calculation::parse(expr, ds).map(|_| ())
 }
 
+/// One row of a Calculate Field preview: the value the field would hold, what writing it loses,
+/// the kind the run's notices count, and the layer's check that would refuse the edit (#2837).
+/// A calculation rule that writes the field overwrites the expression's result on the run, so the
+/// value is the last such rule's result, as the field holds it, with what that write loses (#2884).
+#[derive(Clone, Debug, PartialEq)]
+pub struct CalculationPreview {
+    pub row: usize,
+    pub value: Value,
+    pub lost: Option<PreviewLoss>,
+    /// What the run would refuse the edit with, when the layer's checks refuse this row: its
+    /// error, word for word, for the checks the preview runs. An edit whose area reads are
+    /// ambiguous is refused before them, with that error instead, which the preview doesn't give.
+    pub refused: Option<String>,
+}
+
+/// What Calculate Field would write with `expr` into field `field` of `rows` (rows past the end
+/// left out), parsed once as [`check_calculation`] reads it: the error is the same. With a
+/// layer's `design`, each row is run as an edit runs it (`apply_with`, in `design`) on a copy of
+/// that row alone, its value written, which reads `@row_number` as the layer's row: the layer's
+/// calculation rules first, in order, so a rule that writes `field` gives the value and what
+/// writing it loses (the later of two rules wins; what Calculate's own result lost, which the run
+/// says in its notices, isn't shown then), then each row says which of its domains, allowed
+/// combinations and constraint rules would refuse it. The copy holds that row alone, with the
+/// layer's fields and coordinate system: nothing else of the layer is copied. Not previewed: an
+/// edit refused because an area it reads is ambiguous, which needs the whole edit's geometry, and
+/// a rule that no longer reads, which the run skips and says.
+pub fn preview_calculation(
+    expr: &str,
+    ds: &rustgis_data::Dataset,
+    field: usize,
+    rows: &[usize],
+    design: Option<&rustgis_map::design::Design>,
+) -> Result<Vec<CalculationPreview>, String> {
+    use rustgis_map::design::RuleKind;
+    let calc = Calculation::parse(expr, ds)?;
+    let ty = ds.fields.get(field).map(|f| f.ty).ok_or("no field")?;
+    // The dialog asks every frame, so the one-row copy and the rules are skipped unless they
+    // change the answer: the layer has a check (a domain, an allowed combination or a constraint
+    // rule, which any calculation rule's result may feed), or a calculation rule writes `field`.
+    // A layer with only calculation rules on other fields gets the expression's value, as it
+    // would from running them.
+    let ruled = design.filter(|d| {
+        !d.domains.is_empty()
+            || !d.contingent.is_empty()
+            || d.rules.iter().any(|r| match r.kind {
+                RuleKind::Constraint => true,
+                RuleKind::Calculation => ds.field_index(&r.field) == Some(field),
+            })
+    });
+    // The layer's fields, which its rules are read against, and its constraint rules.
+    let prepared = ruled.map(|d| {
+        let metadata = rustgis_data::Dataset::new(ds.name.clone(), ds.geometry_type, ds.fields.clone());
+        let constraints = super::design::constraint_rules(d, &metadata);
+        (d, metadata, constraints)
+    });
+    // What the layer's rules leave in `field` of `row` with `value` written (the value and what
+    // the last rule writing it lost, when one does), and what its checks would refuse the edit with.
+    let ruled_row = |row: usize, value: &Value| {
+        let (d, metadata, constraints) = prepared.as_ref()?;
+        let before = ds.features.row(row)?.to_feature();
+        // Shares the layer's rows (an `Arc`) until `one.features` is replaced on the next line, so
+        // no row of the layer is copied: keep that replacement before any change to `one`.
+        let mut one = ds.clone();
+        one.features = vec![before.clone()].into();
+        one.features.set_value(0, field, value.clone());
+        let (cuts, _) = super::design::calculation_rules(d, &mut one, metadata, &[0], row);
+        let written = cuts.iter().rfind(|(_, name, ..)| ds.field_index(name) == Some(field)).map(|(.., losses, _)| losses.previewed());
+        let refusal = super::design::refusal(d, &one, constraints, 0, Some(&before), row);
+        Some((written.map(|lost| (one.value(0, field).clone(), lost)), refusal))
+    };
+    Ok(rows
+        .iter()
+        .filter(|r| **r < ds.features.len())
+        .map(|&row| {
+            let Held { value, cut, other } = held(calc.eval_or_fault(ds, row), ty);
+            let (written, refused) = ruled_row(row, &value).unwrap_or((None, None));
+            // The error is why the value is null; a cut alone says what it took.
+            let own = other.or(cut).and_then(Loss::previewed);
+            // A rule's write replaces the expression's: its value, and what it lost.
+            let (value, lost) = written.unwrap_or((value, own));
+            CalculationPreview { row, value, lost, refused }
+        })
+        .collect())
+}
+
 /// A Calculate Field expression: the expression language, or, for text it doesn't read, the
 /// earlier calculator's `a op b` (whose bare field names may hold spaces: `Pop Est * 2`).
 pub(crate) enum Calculation {
@@ -1617,6 +2021,11 @@ pub(crate) enum Calculation {
 impl Calculation {
     /// Parses `expr`; when neither reads it, the error is the expression language's.
     pub(crate) fn parse(expr: &str, ds: &rustgis_data::Dataset) -> Result<Calculation, String> {
+        // The language's length limit holds for the earlier calculator too, which both routes to it
+        // below would otherwise skip: a rule or Calculate Field reads no longer text than a query.
+        if expr.chars().count() > rustgis_data::query::MAX_LEN {
+            return Err("the expression is too long".into());
+        }
         // A field named like a literal was read as the field (`null + 1`), so what the earlier
         // calculator reads with such a field keeps its meaning (quoted text needn't).
         // A date field in arithmetic, which the language refuses, isn't the earlier calculator's
@@ -1657,8 +2066,20 @@ impl Calculation {
 
     /// Row `r`'s result, with the error that made it null, if one did.
     pub(crate) fn eval_or_fault(&self, ds: &rustgis_data::Dataset, r: usize) -> (Value, Option<rustgis_data::query::Fault>) {
+        self.eval_or_fault_at(ds, r, 0)
+    }
+
+    /// [`Calculation::eval_or_fault`] for a row with `offset` rows before `ds`'s first in its
+    /// layer ([`rustgis_data::query::value_or_fault_at`]). `Calc` reads no row number, so it takes
+    /// no offset.
+    pub(crate) fn eval_or_fault_at(
+        &self,
+        ds: &rustgis_data::Dataset,
+        r: usize,
+        offset: usize,
+    ) -> (Value, Option<rustgis_data::query::Fault>) {
         match self {
-            Calculation::Expr(e) => rustgis_data::query::value_or_fault(e, ds, r, &rustgis_data::query::Env::default()),
+            Calculation::Expr(e) => rustgis_data::query::value_or_fault_at(e, ds, r, &rustgis_data::query::Env::default(), offset),
             Calculation::Calc(c) => c.eval_or_fault(ds, r),
         }
     }
@@ -1769,6 +2190,38 @@ fn split_op(e: &str) -> (&str, Option<char>, Option<&str>) {
 mod tests {
     use super::*;
     use rustgis_data::{Dataset, Field};
+
+    /// What a tally of one write says in a preview (`WriteLosses::previewed`) is what the preview
+    /// says of the same result when it holds it (`held`, then `Loss::previewed`): the two readings
+    /// of a loss don't drift apart.
+    #[test]
+    fn a_losses_tally_previews_as_the_result_it_counts() {
+        use rustgis_data::query::Fault;
+        let at = Value::parse("2026-11-23T10:30:00", FieldType::DateTime);
+        let cases: Vec<(Value, Option<Fault>, FieldType, Option<PreviewLoss>)> = vec![
+            (Value::Float(1e300), None, FieldType::Integer, Some(PreviewLoss::Range)),
+            (Value::Float(2.5), None, FieldType::Integer, Some(PreviewLoss::Fraction)),
+            (Value::Float(f64::NAN), None, FieldType::Double, Some(PreviewLoss::NotANumber)),
+            (Value::Float(f64::INFINITY), None, FieldType::Double, Some(PreviewLoss::NotFinite)),
+            (Value::Text("n/a".into()), None, FieldType::Integer, Some(PreviewLoss::Unheld)),
+            (at, None, FieldType::Date, Some(PreviewLoss::Time)),
+            (Value::Null, Some(Fault::DivisionByZero), FieldType::Double, Some(PreviewLoss::Error(Fault::DivisionByZero))),
+            (Value::Float(2.0), None, FieldType::Integer, None),
+            (Value::Null, None, FieldType::Double, None),
+        ];
+        for (value, fault, ty, expected) in cases {
+            let result = (value.clone(), fault);
+            let held = held(result.clone(), ty);
+            let by_held = held.other.or(held.cut).and_then(Loss::previewed);
+            let by_tally = {
+                let mut losses = WriteLosses::default();
+                losses.write(0, result, ty);
+                losses.previewed()
+            };
+            assert_eq!(by_held, expected, "{value:?} into {ty:?}");
+            assert_eq!(by_tally, by_held, "{value:?} into {ty:?}");
+        }
+    }
 
     /// A null an expression's error wrote says so, by kind with its count and first rows, on a
     /// layer and a table, from the language and from the earlier calculator; a clean run, and
@@ -2002,5 +2455,252 @@ mod tests {
         // Text that doesn't read the field means what it does elsewhere.
         assert_eq!(v("'it''s'"), Value::Text("it's".into()));
         assert_eq!(v("'a' || 'b'"), Value::Text("ab".into()));
+    }
+
+    /// Calculate Field's preview (#2817) is what the run writes in each row, as the field holds
+    /// it, with what writing it loses; the expression's error is the check's.
+    #[test]
+    fn a_calculation_preview_is_what_the_run_writes() {
+        let fields = vec![
+            Field::new("n", FieldType::Double),
+            Field::new("whole", FieldType::Integer),
+            Field::new("name", FieldType::Text),
+            Field::new("day", FieldType::Date),
+            Field::new("at", FieldType::DateTime),
+        ];
+        let mut ds = Dataset::new("t", GeometryType::None, fields);
+        for (n, name) in [(2.5, "a"), (1e300, "b"), (-1.5, "c"), (4.0, "d")] {
+            let at = Value::parse("2026-11-23T10:30:00", FieldType::DateTime);
+            ds.push(None, vec![Value::Float(n), Value::Int(0), Value::Text(name.into()), Value::Null, at]);
+        }
+        let (n, whole, day) = (0, 1, 3);
+        let preview = |e: &str, field: usize, rows: &[usize]| -> Vec<(usize, Value, Option<PreviewLoss>)> {
+            let previewed = preview_calculation(e, &ds, field, rows, None).unwrap_or_else(|e| panic!("{e}"));
+            previewed.into_iter().map(|p| (p.row, p.value, p.lost)).collect()
+        };
+        // The rows asked for, in their order; a clean result loses nothing.
+        assert_eq!(preview("n * 2", n, &[0, 3]), vec![(0, Value::Float(5.0), None), (3, Value::Float(8.0), None)]);
+        // As the field holds it: a fraction into whole numbers, a number past their range.
+        assert_eq!(
+            preview("n", whole, &[0, 2]),
+            vec![(0, Value::Int(2), Some(PreviewLoss::Fraction)), (2, Value::Int(-1), Some(PreviewLoss::Fraction))]
+        );
+        assert_eq!(preview("n", whole, &[1]), vec![(1, Value::Null, Some(PreviewLoss::Range))]);
+        // Text that isn't a number, an expression's error, a date-time into a date.
+        assert_eq!(preview("name", whole, &[0]), vec![(0, Value::Null, Some(PreviewLoss::Unheld))]);
+        assert_eq!(preview("n / 0", n, &[0]), vec![(0, Value::Null, Some(PreviewLoss::Error(rustgis_data::query::Fault::DivisionByZero)))]);
+        let at = preview("at", day, &[0]);
+        assert_eq!((at[0].0, at[0].2), (0, Some(PreviewLoss::Time)));
+        assert!(matches!(at[0].1, Value::Date(_)), "{:?}", at[0].1);
+        // A null asked for loses nothing.
+        assert_eq!(preview("null", n, &[0]), vec![(0, Value::Null, None)]);
+        // No rows, or rows past the end: nothing previewed.
+        assert_eq!(preview("n", n, &[]), vec![]);
+        assert_eq!(preview("n", n, &[3, 4, 99]), vec![(3, Value::Float(4.0), None)]);
+        // An expression that doesn't read: the check's error.
+        assert_eq!(preview_calculation("nosuch * 2", &ds, n, &[0], None), Err(check_calculation("nosuch * 2", &ds).unwrap_err()));
+        assert!(preview_calculation("n", &ds, 9, &[0], None).is_err(), "no such field");
+    }
+
+    /// The run's notices still count each loss as before the preview shared their reading: a
+    /// fraction, a value not read, an error, once each.
+    #[test]
+    fn calculate_field_notices_count_what_the_preview_reads() {
+        let mut ds = Dataset::new("t", GeometryType::None, vec![Field::new("n", FieldType::Double), Field::new("name", FieldType::Text)]);
+        for (n, name) in [(2.5, "a"), (0.0, "b"), (3.0, "7")] {
+            ds.push(None, vec![Value::Float(n), Value::Text(name.into())]);
+        }
+        let mut losses = WriteLosses::default();
+        let calc = Calculation::parse("if(n = 0, 1 / n, n)", &ds).unwrap();
+        let written: Vec<Value> = (0..3).map(|r| losses.write(r, calc.eval_or_fault(&ds, r), FieldType::Integer)).collect();
+        assert_eq!(written, vec![Value::Int(2), Value::Null, Value::Int(3)]);
+        let calc = Calculation::parse("name", &ds).unwrap();
+        assert_eq!(losses.write(0, calc.eval_or_fault(&ds, 0), FieldType::Integer), Value::Null);
+        let notices: Vec<String> =
+            losses.notices(NoticeText::term("Calculate Field"), "n", FieldType::Integer).into_iter().map(|(_, t)| t.english()).collect();
+        assert_eq!(notices.len(), 3, "{notices:?}");
+        assert!(notices[0].contains("1 result lost its fraction"), "{notices:?}");
+        assert!(notices[1].contains("is null in 1 row, whose result isn't"), "{notices:?}");
+        assert!(notices[2].contains("because of a division by zero (row 2)"), "{notices:?}");
+    }
+
+    /// A calculation past the expression language's length limit is refused, however the earlier
+    /// calculator would read it: as quoted text, or with a field named like a literal (#2783).
+    #[test]
+    fn a_calculation_longer_than_the_limit_is_refused() {
+        use rustgis_data::query::MAX_LEN;
+        let mut ds = Dataset::new("t", GeometryType::None, vec![Field::new("null", FieldType::Integer)]);
+        ds.push(None, vec![Value::Int(4)]);
+        // Counted in characters, as the language counts them: `é` is two bytes.
+        for (prefix, at) in [("", "quoted"), ("null + ", "joined to a field named null")] {
+            let expr = |chars: usize| format!("{prefix}'{}'", "é".repeat(chars - prefix.len() - 2));
+            assert!(Calculation::parse(&expr(MAX_LEN), &ds).is_ok(), "{at}, at the limit");
+            let refused = Calculation::parse(&expr(MAX_LEN + 1), &ds).err();
+            assert_eq!(refused.as_deref(), Some("the expression is too long"), "{at}, one past it");
+        }
+    }
+}
+
+#[cfg(test)]
+mod point_tests {
+    use super::*;
+
+    /// A caller that handles a command error must not keep a point refused by its surface.
+    #[test]
+    fn coordinate_point_surface_refusal_does_not_append_in_a_shared_call() {
+        use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster};
+        let mut s = Session::new(crate::Project::default());
+        s.run("edit.enable", &json!({"on":true})).unwrap();
+        s.run("layer.template", &json!({"template":"points"})).unwrap();
+        let id = s.active_layer.unwrap();
+        s.run("edit.addPoint", &json!({"x":1,"y":1})).unwrap();
+        let kept = s.map().layer(id).unwrap().dataset.clone();
+        let selection = s.map().layer(id).unwrap().selection.clone();
+        let counts = s.edit_counts.clone();
+        let raster = Raster::new(
+            "south",
+            1,
+            1,
+            vec![vec![12.0]],
+            GeoTransform { origin_x: -1.0, origin_y: 1.0, pixel_width: 2.0, pixel_height: -2.0 },
+            Crs::Epsg(3031),
+            None,
+            ColorHint::Gray,
+            "Float32",
+        )
+        .unwrap();
+        s.map_mut().add_raster("south", rustgis_map::RasterLayer::from_path(raster, "south.tif"));
+        s.map_mut().editing.settings.elevation = rustgis_map::design::Elevation::Surface("south".into());
+        s.active_layer = Some(id);
+        let error = add_point(&mut s, &json!({"x":0,"y":90})).unwrap_err();
+        assert!(error.contains("surface"), "{error}");
+        assert_eq!(s.map().layer(id).unwrap().dataset, kept, "a caught refusal must not retain the appended row");
+        assert_eq!(s.map().layer(id).unwrap().selection, selection);
+        assert_eq!(s.edit_counts, counts);
+        s.map_mut().editing.settings.elevation = rustgis_map::design::Elevation::Constant(5.0);
+        s.map_mut().layer_mut(id).unwrap().design.rules.push(rustgis_map::design::AttributeRule {
+            name: "Reject".into(),
+            kind: rustgis_map::design::RuleKind::Constraint,
+            field: String::new(),
+            expression: "1 = 0".into(),
+        });
+        assert!(add_point(&mut s, &json!({"x":2,"y":2})).unwrap_err().contains("Reject"));
+        assert_eq!(s.map().layer(id).unwrap().dataset, kept, "a late refusal also removes the added z column from older rows");
+        assert_eq!(s.map().layer(id).unwrap().selection, selection);
+        assert_eq!(s.edit_counts, counts);
+    }
+
+    #[test]
+    fn coordinate_points_share_a_layer_and_undo_as_single_edits() {
+        let mut s = Session::new(crate::Project::default());
+        s.run("edit.enable", &json!({"on":true})).unwrap();
+        let mark = s.notice_mark();
+        let first = s.run("edit.addPoint", &json!({"x":14.3,"y":-41.2,"name":"Survey"})).unwrap();
+        let id = first["layer"].as_u64().unwrap() as u32;
+        let l = s.map().layer(id).unwrap();
+        assert_eq!(l.dataset.features.len(), 1);
+        assert_eq!(l.dataset.value(0, 0), &Value::Text("Survey".into()));
+        assert_eq!(l.dataset.features.geometry(0), Some(&Geometry::Point(rustgis_geom::Coord::new(14.3, -41.2))));
+        assert!(s.map().editing.settings.enabled);
+        assert_eq!(
+            s.notices_since(mark).iter().filter(|n| n.text == "Created a Points layer because no loaded point layer was selected").count(),
+            1
+        );
+        s.run("edit.addPoint", &json!({"x":0,"y":0})).unwrap();
+        assert_eq!(s.map().layers.len(), 1);
+        assert_eq!(s.map().layer(id).unwrap().dataset.features.len(), 2);
+        assert_eq!(
+            s.notices_since(mark).iter().filter(|n| n.text == "Created a Points layer because no loaded point layer was selected").count(),
+            1
+        );
+        s.run("edit.undo", &json!({})).unwrap();
+        assert_eq!(s.map().layer(id).unwrap().dataset.features.len(), 1);
+        s.run("edit.undo", &json!({})).unwrap();
+        assert!(s.map().layers.is_empty());
+        s.run("edit.redo", &json!({})).unwrap();
+        assert_eq!(s.map().layer(id).unwrap().dataset.features.len(), 1);
+    }
+
+    #[test]
+    fn coordinate_point_refusals_leave_no_layer_and_projected_input_is_converted() {
+        let mut s = Session::new(crate::Project::default());
+        s.run("edit.enable", &json!({"on":true})).unwrap();
+        for p in [
+            json!({"x":"bad","y":0}),
+            json!({"x":0,"y":91}),
+            json!({"x":0,"y":0,"crs":"EPSG:0"}),
+            json!({"x":0,"y":0,"name":1}),
+            json!({"x":0,"y":0,"layer":true}),
+        ] {
+            assert!(s.run("edit.addPoint", &p).is_err(), "{p}");
+            assert!(s.map().layers.is_empty());
+        }
+        let at = rustgis_geom::lonlat_to_merc(rustgis_geom::Coord::new(7.44, 46.95));
+        s.run("edit.addPoint", &json!({"x":at.x,"y":at.y,"crs":"EPSG:3857"})).unwrap();
+        let l = s.map().layers.first().unwrap();
+        let Some(Geometry::Point(at)) = l.dataset.features.geometry(0) else { panic!("point expected") };
+        assert!((at.x - 7.44).abs() < 1e-8);
+        assert!((at.y - 46.95).abs() < 1e-8);
+    }
+
+    #[test]
+    fn coordinate_points_respect_editing_and_declare_the_surface_for_a_new_layer() {
+        use super::super::InputSource;
+        use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster};
+        let mut s = Session::new(crate::Project::default());
+        s.run("edit.enable", &json!({"on":false})).unwrap();
+        assert!(s.run("edit.addPoint", &json!({"x":0,"y":0})).unwrap_err().contains("editing is turned off"));
+        assert!(s.map().layers.is_empty());
+        let raster = Raster::new(
+            "dem",
+            1,
+            1,
+            vec![vec![12.0]],
+            GeoTransform { origin_x: -1.0, origin_y: 1.0, pixel_width: 2.0, pixel_height: -2.0 },
+            Crs::LonLat,
+            None,
+            ColorHint::Gray,
+            "Float32",
+        )
+        .unwrap();
+        let surface = s.map_mut().add_raster("dem", rustgis_map::RasterLayer::from_path(raster, "dem.tif"));
+        s.map_mut().editing.settings.elevation = rustgis_map::design::Elevation::Surface("dem".into());
+        s.active_layer = None;
+        let inputs = point_inputs(&s.input_context(), &json!({"x":0,"y":0})).unwrap();
+        assert_eq!(inputs.layers, vec![(s.map().instance_id(), surface)]);
+        assert!(inputs.uses_default);
+        for crs in ["map", "dem"] {
+            let combined = point_inputs(&s.input_context(), &json!({"x":0,"y":0,"crs":crs})).unwrap();
+            assert_eq!(
+                combined.state.pointer("/feature/surface"),
+                Some(&json!("dem")),
+                "coordinate inputs retain the feature surface binding: {crs}"
+            );
+        }
+        s.run("edit.enable", &json!({"on":true})).unwrap();
+        s.run("edit.addPoint", &json!({"x":0,"y":0})).unwrap();
+        let id = s.active_layer.unwrap();
+        let held = s.map().layer(id).unwrap().dataset.clone();
+        s.run("edit.enable", &json!({"on":false})).unwrap();
+        assert!(s.run("edit.addPoint", &json!({"x":1,"y":1})).unwrap_err().contains("editing is turned off"));
+        assert_eq!(s.map().layer(id).unwrap().dataset, held);
+    }
+
+    #[test]
+    fn coordinate_points_inherit_project_storage_and_reopen() {
+        use rustgis_data::raster::Crs;
+        let mut s = Session::new(crate::Project::default());
+        s.run("project.coordinateSystem", &json!({"crs":"EPSG:3857"})).unwrap();
+        s.run("edit.addPoint", &json!({"x":14.3,"y":-41.2,"name":"Survey"})).unwrap();
+        let expected = Geometry::Point(rustgis_geom::lonlat_to_merc(rustgis_geom::Coord::new(14.3, -41.2)));
+        let layer = s.map().layers.first().unwrap();
+        assert_eq!(layer.dataset.coord_crs(), Crs::WebMercator);
+        assert_eq!(layer.dataset.features.geometry(0), Some(&expected));
+        let (text, _) = s.project.saved_text(None).unwrap();
+        let reopened = crate::Project::from_json(&text).unwrap();
+        let layer = reopened.maps.first().unwrap().layers.first().unwrap();
+        assert_eq!(layer.dataset.coord_crs(), Crs::WebMercator);
+        assert_eq!(layer.dataset.features.geometry(0), Some(&expected));
+        assert_eq!(layer.dataset.value(0, 0), &Value::Text("Survey".into()));
     }
 }

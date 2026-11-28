@@ -1,17 +1,20 @@
 //! Each layer's GPU mesh kept from one scene to the next (#1057): restyling, editing or
 //! filtering one layer of a map drawn on the GPU tessellates that layer again, not every layer.
 //!
-//! A layer's mesh ([`crate::mesh::collect_layer`]) is made from the layer, the geometry copy it
-//! draws, the rows it draws, and the view: which features reach it (the GPU's cull, wider than
-//! the view so the camera can move the scene), the 0.35 px decimation, the stroke widths in
-//! pixels and where f32 holds its vertices. A kept mesh is taken again when all of those are
+//! A layer's mesh ([`crate::mesh::collect_layer`]: its tiles' meshes and its markers) is made
+//! from the layer, the geometry copy it draws, the rows it draws, and the view: which features
+//! reach it (the GPU's cull, wider than the view so the camera can move the scene), the 0.35 px
+//! decimation, the tiles at that scale, the stroke widths in pixels and where f32 holds its
+//! vertices. A kept mesh is taken again when all of those are
 //! as they were: the layer by its look ([`LayerLook`]), the rest by [`Made`] and the rows drawn.
 //! The mesh taken is then the one tessellating the layer again would make, vertex for vertex.
 //!
 //! A pan or a zoom makes the layers again. The GPU map moves a scene with the camera over the
 //! ground it was drawn for, so a scene must reach past the view as far as a new one would; a
 //! kept mesh panned to doesn't. Zoomed in, its decimation would be coarser than a new one's, and
-//! zoomed out it reaches less far.
+//! zoomed out it reaches less far. A pan keeps the scale, though, and with it the tiles
+//! ([`crate::mesh_tiles`]): the layer's tiles still in the new scene are taken as they were
+//! made ([`tiles`]), and only those it brings in are meshed.
 //!
 //! Only screen scenes keep meshes, not a turned or tilted view's bands (their own views, sized
 //! again after) nor exports, and only layers with a look: a layer read from its source draws
@@ -26,6 +29,7 @@ use rustgis_map::Projection;
 use rustgis_map::look::{Change, LayerLook};
 
 use crate::gpu_scene::{DrawCmd, MeshVertex, PointInstance};
+use crate::mesh_tiles::MadeTile;
 
 /// The most bytes of meshes kept, with what each was made from ([`ENTRY_BYTES`] and its rows):
 /// about 3.3 million vertices on the desktop and 0.8 million in the browser. Past it, the meshes
@@ -75,9 +79,14 @@ impl Made {
     /// Whether a mesh made from `self` is the one `other` makes.
     fn same(&self, other: &Made) -> bool {
         let extent = |e: &Extent| [e.min_x, e.min_y, e.max_x, e.max_y].map(f64::to_bits);
+        extent(&self.cull) == extent(&other.cull) && self.same_tiles(other)
+    }
+
+    /// Whether a tile made from `self` is the one `other` makes of the same tile: the same but
+    /// for the cull, which only says which tiles there are.
+    fn same_tiles(&self, other: &Made) -> bool {
         self.projection == other.projection
             && self.drawn == other.drawn
-            && extent(&self.cull) == extent(&other.cull)
             && self.map_per_px.to_bits() == other.map_per_px.to_bits()
             && self.ppp.to_bits() == other.ppp.to_bits()
             && self.wireframe == other.wireframe
@@ -97,6 +106,9 @@ struct Kept {
     rows: Vec<bool>,
     /// The layer's Mesh and Points commands, sharing their data with the scenes that drew them.
     cmds: Vec<DrawCmd>,
+    /// Its tiles, in grid order, sharing their meshes with `cmds`; none when it isn't tiled or
+    /// its tiles can't be taken again.
+    tiles: Arc<[MadeTile]>,
     /// The mesh's vertices, which the layer's vertex limit counts.
     vertices: usize,
     bytes: usize,
@@ -111,6 +123,8 @@ struct Meshes {
     /// The scenes being drawn ([`Scene`]), by number, with the clock when each began.
     drawing: Vec<(u64, u64)>,
     scenes: u64,
+    /// The clock at the last [`release`].
+    released: u64,
 }
 
 impl Meshes {
@@ -123,8 +137,8 @@ impl Meshes {
 /// A command sharing `cmd`'s data, when it is a mesh or points.
 fn share(cmd: &DrawCmd) -> Option<DrawCmd> {
     match cmd {
-        DrawCmd::Mesh { origin, vertices, indices } => {
-            Some(DrawCmd::Mesh { origin: *origin, vertices: Arc::clone(vertices), indices: Arc::clone(indices) })
+        DrawCmd::Mesh { origin, vertices, indices, square } => {
+            Some(DrawCmd::Mesh { origin: *origin, vertices: Arc::clone(vertices), indices: Arc::clone(indices), square: *square })
         }
         DrawCmd::Points { origin, instances } => Some(DrawCmd::Points { origin: *origin, instances: Arc::clone(instances) }),
         _ => None,
@@ -147,7 +161,8 @@ pub(crate) fn bytes_of(cmds: &[DrawCmd]) -> usize {
 /// The kept meshes, shared by the threads that draw scenes (the UI's and the one that draws a
 /// view once it settles).
 #[cfg(not(test))]
-static MESHES: std::sync::Mutex<Meshes> = std::sync::Mutex::new(Meshes { kept: Vec::new(), clock: 0, drawing: Vec::new(), scenes: 0 });
+static MESHES: std::sync::Mutex<Meshes> =
+    std::sync::Mutex::new(Meshes { kept: Vec::new(), clock: 0, drawing: Vec::new(), scenes: 0, released: 0 });
 
 /// Runs `f` on the kept meshes.
 #[cfg(not(test))]
@@ -167,6 +182,17 @@ thread_local! {
 #[cfg(test)]
 fn with_meshes<R>(f: impl FnOnce(&mut Meshes) -> R) -> R {
     MESHES.with_borrow_mut(f)
+}
+
+/// Drops every kept mesh ([`crate::release_memory`]), those a scene being drawn has used too: a
+/// scene shares its meshes' data, so what it draws stays while it does. Until the scenes begun
+/// before this are done, [`keep`] keeps nothing, so one still drawing brings nothing back.
+pub(crate) fn release() {
+    with_meshes(|m| {
+        m.kept = Vec::new();
+        m.clock += 1;
+        m.released = m.clock;
+    });
 }
 
 /// A scene being drawn, from [`Scene::begin`] until it is dropped (when the scene is done,
@@ -222,21 +248,63 @@ pub(crate) fn take(cmds: &mut Vec<DrawCmd>, look: &LayerLook, made: &Made, rows:
     Some(vertices)
 }
 
+/// The tiles kept for the layer that looks as `look`, made from `rows` as `made` is but for its
+/// cull (the scene panned since), in grid order: the latest kept. Empty when none are kept.
+pub(crate) fn tiles(look: &LayerLook, made: &Made, rows: &[bool]) -> Arc<[MadeTile]> {
+    with_meshes(|m| {
+        // Not counted as used: what the scene takes of them it keeps, counted there, and they
+        // stay while it shares them, whatever goes.
+        m.kept
+            .iter()
+            .filter(|k| {
+                !k.tiles.is_empty()
+                    && k.look.id() == look.id()
+                    && k.made.same_tiles(made)
+                    && k.look.change(look) == Change::Same
+                    && k.rows == rows
+            })
+            .max_by_key(|k| k.used)
+            .map_or_else(|| Arc::from(Vec::new()), |k| Arc::clone(&k.tiles))
+    })
+}
+
 /// Keeps `cmds` (a layer's Mesh and Points commands, of `vertices` vertices) for the next scene,
 /// in place of what the live layer `layer` had kept for the same view, and of its oldest view past
 /// [`VIEWS`]; `selected` is how many rows the layer has selected, which its look holds. See
 /// [`MAX_BYTES`] for what goes when they don't all fit: nothing goes unless this is kept. A layer
-/// with nothing in view keeps nothing: it is quick to find so again. Called while a [`Scene`] is
-/// drawn.
-pub(crate) fn keep(layer: u64, look: LayerLook, made: Made, rows: &[bool], cmds: &[DrawCmd], vertices: usize, selected: usize) {
-    keep_within(MAX_BYTES, layer, look, made, rows, cmds, vertices, selected);
+/// with nothing in view keeps nothing: it is quick to find so again. `tiles` are its tiles, to
+/// take again once the scene has panned ([`tiles`]). Called while a [`Scene`] is drawn.
+#[expect(clippy::too_many_arguments, reason = "a mesh, its tiles and what they were made from")]
+pub(crate) fn keep(
+    layer: u64,
+    look: LayerLook,
+    made: Made,
+    rows: &[bool],
+    cmds: &[DrawCmd],
+    tiles: Vec<MadeTile>,
+    vertices: usize,
+    selected: usize,
+) {
+    keep_within(MAX_BYTES, layer, look, made, rows, cmds, tiles, vertices, selected);
 }
 
 /// [`keep`], within `max` bytes.
-#[expect(clippy::too_many_arguments, reason = "a mesh, what it was made from, and the budget it is kept within")]
-fn keep_within(max: usize, layer: u64, look: LayerLook, made: Made, rows: &[bool], cmds: &[DrawCmd], vertices: usize, selected: usize) {
+#[expect(clippy::too_many_arguments, reason = "a mesh, its tiles, what they were made from, and the budget they are kept within")]
+fn keep_within(
+    max: usize,
+    layer: u64,
+    look: LayerLook,
+    made: Made,
+    rows: &[bool],
+    cmds: &[DrawCmd],
+    tiles: Vec<MadeTile>,
+    vertices: usize,
+    selected: usize,
+) {
     let cmds: Vec<DrawCmd> = cmds.iter().filter_map(share).collect();
+    // A tile's mesh is one of `cmds`, counted there: only the tile itself is counted on top.
     let bytes = bytes_of(&cmds)
+        .saturating_add(tiles.len().saturating_mul(std::mem::size_of::<MadeTile>()))
         .saturating_add(rows.len())
         .saturating_add(ENTRY_BYTES)
         .saturating_add(selected.saturating_mul(std::mem::size_of::<usize>()));
@@ -244,6 +312,10 @@ fn keep_within(max: usize, layer: u64, look: LayerLook, made: Made, rows: &[bool
         return;
     }
     with_meshes(|m| {
+        // Not while a scene from before the last release is drawing: this may be its mesh.
+        if m.drawing.iter().any(|(_, began)| *began < m.released) {
+            return;
+        }
         // What goes for this one, worked out before anything goes: the layer's meshes of another
         // look (they no longer match), the one of this view, and past `VIEWS` its oldest; none
         // that a scene being drawn uses.
@@ -299,7 +371,7 @@ fn keep_within(max: usize, layer: u64, look: LayerLook, made: Made, rows: &[bool
         m.clock += 1;
         let used = m.clock;
         let look = shared.unwrap_or_else(|| Arc::new(look));
-        m.kept.push(Kept { layer, look, made, rows: rows.to_vec(), cmds, vertices, bytes, used });
+        m.kept.push(Kept { layer, look, made, rows: rows.to_vec(), cmds, tiles: Arc::from(tiles), vertices, bytes, used });
     });
 }
 
@@ -331,8 +403,11 @@ mod tests {
     use rustgis_geom::{Coord, Extent};
     use rustgis_map::{Camera, Map, Renderer, Rgba, Symbol};
 
+    /// A square `s` degrees on a side, its south-west corner at `x` east and 0.2° north: clear of
+    /// the borders of the meshes' tiles at the views here, so a layer is one mesh.
     fn square(x: f64, s: f64) -> Geometry {
-        Geometry::Polygon(vec![vec![vec![Coord::new(x, 0.0), Coord::new(x + s, 0.0), Coord::new(x + s, s), Coord::new(x, s)]]])
+        let y = 0.2;
+        Geometry::Polygon(vec![vec![vec![Coord::new(x, y), Coord::new(x + s, y), Coord::new(x + s, y + s), Coord::new(x, y + s)]]])
     }
 
     /// A map of two polygon layers drawn on the GPU, `a` under `b`, and a view of them.
@@ -346,8 +421,8 @@ mod tests {
             d.push(Some(square(x, 1.0)), vec![]);
             m.add_dataset(d)
         };
-        let (a, b) = (layer("a", 0.0), layer("b", 2.0));
-        let camera = Camera { center: rustgis_geom::lonlat_to_merc(Coord::new(1.5, 0.5)), res: 2000.0, bearing: 0.0, pitch: 0.0 };
+        let (a, b) = (layer("a", 0.2), layer("b", 2.2));
+        let camera = Camera { center: rustgis_geom::lonlat_to_merc(Coord::new(1.7, 0.7)), res: 2000.0, bearing: 0.0, pitch: 0.0 };
         (m, a, b, View { width: 400.0, height: 300.0, pixels_per_point: 1.0, camera, sky: false })
     }
 
@@ -355,7 +430,7 @@ mod tests {
     /// (`frame_cache`) doesn't draw the layers under it. A frame drawn on the CPU instead fails
     /// the test.
     fn scene(m: &mut Map, view: &View) -> GpuScene {
-        crate::frame_cache::clear();
+        crate::frame_cache::release();
         match render_backend(m, view, Backend::Gpu) {
             Some(RenderOutput::Gpu(s)) => s,
             _ => panic!("no GPU scene"),
@@ -385,6 +460,67 @@ mod tests {
         if let Some(l) = m.layers.iter_mut().find(|l| l.id == id) {
             l.renderer = Renderer::Single(Symbol { fill, ..l.symbol(0) });
         }
+    }
+
+    /// A pan keeps the scale: the panned scene takes the meshes of its layer's tiles still in
+    /// view and meshes only those it brings in, and is the scene drawn afresh there, vertex for
+    /// vertex.
+    #[test]
+    fn a_panned_scene_takes_the_tiles_still_in_it() {
+        super::clear();
+        let mut m = Map::new("Map");
+        m.basemap = rustgis_map::Basemap::Blank;
+        m.graticule = false;
+        let mut d = Dataset::new("lines", GeometryType::Polyline, vec![]);
+        for n in 0u32..40 {
+            let k = f64::from(n);
+            let line = vec![Coord::new(-12.0 + k * 0.6, -9.0), Coord::new(12.0 - k * 0.3, 9.0), Coord::new(-11.0, 5.0 - k * 0.2)];
+            d.push(Some(Geometry::Line(vec![line])), vec![]);
+        }
+        m.add_dataset(d);
+        let at = |x: f64| View {
+            width: 1600.0,
+            height: 1200.0,
+            pixels_per_point: 1.0,
+            camera: Camera { center: rustgis_geom::lonlat_to_merc(Coord::new(x, 0.0)), res: 500.0, bearing: 0.0, pitch: 0.0 },
+            sky: false,
+        };
+        let first = scene(&mut m, &at(0.0));
+        let panned = scene(&mut m, &at(4.0));
+        let tiled = |s: &GpuScene| s.cmds.iter().filter(|c| matches!(c, DrawCmd::Mesh { square: Some(_), .. })).count();
+        assert!(tiled(&first) > 8, "many tiles: {}", tiled(&first));
+        let before: Vec<_> = meshes(&first).into_iter().map(|m| m.0).collect();
+        let taken = meshes(&panned).iter().filter(|m| before.contains(&m.0)).count();
+        assert!(taken > 0 && taken < tiled(&panned), "{taken} of {} tiles taken", tiled(&panned));
+        super::clear();
+        let afresh = scene(&mut m, &at(4.0));
+        let values = |s: &GpuScene| meshes(s).into_iter().map(|m| (m.1, m.2)).collect::<Vec<_>>();
+        assert!(values(&panned) == values(&afresh), "the panned scene is the one drawn afresh");
+        let squares = |s: &GpuScene| {
+            s.cmds
+                .iter()
+                .filter_map(|c| match c {
+                    DrawCmd::Mesh { origin, square, .. } => Some((origin.map(f64::to_bits), square.map(|q| q.map(f32::to_bits)))),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(squares(&panned), squares(&afresh));
+    }
+
+    /// A scene stopped by a memory warning may still be drawing: what it makes after the release
+    /// isn't kept, and a scene begun once it is done keeps again.
+    #[test]
+    fn a_release_is_not_undone_by_a_scene_begun_before_it() {
+        super::clear();
+        let (mut m, _, _, view) = two_layers();
+        let stopped = Scene::begin();
+        release();
+        scene(&mut m, &view);
+        assert_eq!(kept_bytes(), 0);
+        drop(stopped);
+        scene(&mut m, &view);
+        assert!(kept_bytes() > 0);
     }
 
     /// A scene of the same view after one layer was restyled takes the other's mesh, shared
@@ -476,6 +612,7 @@ mod tests {
             origin: [0.0; 2],
             vertices: Arc::new(vec![bytemuck::Zeroable::zeroed(); n]),
             indices: Arc::new(Vec::new()),
+            square: None,
         };
         let one = bytes_of(&[mesh(4096)]) + ENTRY_BYTES + 1;
         // Room for two of the three.
@@ -490,7 +627,7 @@ mod tests {
                 .filter(|(id, n)| {
                     let taken = take(&mut Vec::new(), &look(m, *id), &made, &[true]).is_some();
                     if !taken {
-                        keep_within(max, live(m, *id), look(m, *id), made.clone(), &[true], &[mesh(*n)], *n, 0);
+                        keep_within(max, live(m, *id), look(m, *id), made.clone(), &[true], &[mesh(*n)], Vec::new(), *n, 0);
                     }
                     taken
                 })
@@ -519,7 +656,7 @@ mod tests {
         // Nothing in view: nothing kept, nothing put out.
         let _scene = Scene::begin();
         let bytes = kept_bytes();
-        keep_within(max, live(&m, a), look(&m, a), made.clone(), &[true], &[], 0, 0);
+        keep_within(max, live(&m, a), look(&m, a), made.clone(), &[true], &[], Vec::new(), 0, 0);
         assert_eq!(kept_bytes(), bytes);
     }
 
@@ -546,14 +683,16 @@ mod tests {
             origin: [0.0; 2],
             vertices: Arc::new(vec![bytemuck::Zeroable::zeroed(); n]),
             indices: Arc::new(Vec::new()),
+            square: None,
         };
         let size = |n: usize| bytes_of(&[mesh(n)]) + ENTRY_BYTES + 1;
         let max = size(6000) + size(3000) + size(500);
         let layer = |m: &Map, id: u32| m.layers.iter().find(|l| l.id == id).expect("layer").clone();
         let (la, lb) = (layer(&m, a), layer(&m, b));
         let look = |l: &rustgis_map::Layer| LayerLook::of(l).expect("look");
-        let keep_at =
-            |l: &rustgis_map::Layer, dx: f64, n: usize| keep_within(max, l.instance_id(), look(l), at(dx), &[true], &[mesh(n)], n, 0);
+        let keep_at = |l: &rustgis_map::Layer, dx: f64, n: usize| {
+            keep_within(max, l.instance_id(), look(l), at(dx), &[true], &[mesh(n)], Vec::new(), n, 0)
+        };
         let has = |l: &rustgis_map::Layer, dx: f64| take(&mut Vec::new(), &look(l), &at(dx), &[true]);
         {
             let _old = Scene::begin();

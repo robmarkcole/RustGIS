@@ -212,10 +212,10 @@ s.undo()
 s.redo()
 ```
 
-A notice that says a command lost data, and has a [loss code](cli.md#loss-codes), is also raised
+A notice that says a command lost data, and has a [loss code](user-guide/loss-codes.md), is also raised
 as a Python warning: `rustgis.DroppedWarning`, `ChangedWarning`, `ApproximatedWarning` or
 `AssumedWarning`, all subclasses of `rustgis.DataLossWarning`. The warning's `code` (such as
-`"dropped.ring"`) and `kind` say which, and its message is the notice's text with the code. The
+`"dropped.ring"`) and `kind` say which, `url` is the code's entry in the guide, and its message is the notice's text with the code. The
 notice stays in `s.notices()`. Python's warning filters decide what happens, so a script can turn
 losses into errors and allow the ones it expects:
 

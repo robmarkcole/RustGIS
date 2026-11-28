@@ -26,7 +26,7 @@ Formats](data-formats.md).
 | DuckDB databases (`.duckdb`, `.ddb`) and SQL queries | Yes (desktop, when DuckDB is installed) | No |
 | GeoTIFF and cloud-optimised GeoTIFF (`.tif`, `.tiff`) | Yes | Yes |
 | ASCII grid (`.asc`, with an optional `.prj`) | Yes | No |
-| GRIB editions 1 and 2, simple packing on latitude/longitude grids (`.grb`, `.grib`, `.grb2`, `.grib2`) | Yes | No |
+| GRIB editions 1 and 2, simple packing and GRIB2's complex packing on latitude/longitude grids (`.grb`, `.grib`, `.grb2`, `.grib2`) | Yes | No |
 | SRTM height tiles (`.hgt`) and DTED (`.dt0`–`.dt2`) | Yes | No |
 | Unreferenced TIFF and PNG scans; JPEG with `"as": "scan"` | Yes | GeoTIFF after georeferencing |
 | PDF pages: GeoPDFs placed by their coordinates, other pages as scans | Yes (desktop, command line and Python) | GeoTIFF after georeferencing |
@@ -196,11 +196,18 @@ status bar. Remote
 FlatGeobuf date/time columns stay ISO text with a notice so opening them can keep reading by
 range without downloading every feature.
 
-Vector geometry is stored as WGS 84 longitude/latitude. Data in another supported coordinate
-system is converted as it is read; Shapefiles use their `.prj`, and formats such as GeoPackage,
-GeoParquet and FlatGeobuf carry their coordinate system in the file. Rasters keep their own
-coordinate system and are reprojected as they draw. The map uses Web Mercator by default, but
-**View › Projection** can change it; see [Maps](maps.md).
+A layer keeps its file's own coordinates and coordinate system; Shapefiles use their `.prj`, and
+formats such as GeoPackage, GeoParquet and FlatGeobuf carry their coordinate system in the file.
+Rasters keep theirs too. The map uses Web Mercator by default, but **View › Projection** can
+change it; see [Maps](maps.md). On a map in a coordinate system, a layer or raster in that system
+is drawn as it is. On a map in a system made for one area (a UTM zone or a Gauss-Krüger strip,
+say), one in another system is drawn by the transformation PROJ picks between the two (between
+two datums, the one for that pair, not one through WGS 84); on a world projection, such a layer
+goes through WGS 84 longitude/latitude. On a map in a coordinate system, Zoom To Layer, Zoom To
+Selection and Full Extent frame a layer in the map's system by its own coordinates, and its
+simplified drawing at small scales is made from them, with nothing converted. Labels, the
+selection and hit-testing read its coordinates too, so the map keeps no second copy of such a
+layer; a layer read in place keeps none of the view it reads either.
 
 Coordinate systems are read and transformed as PROJ 9.9.0 does, through terrio-crs. A few EPSG
 and ESRI codes PROJ 9.9.0 dropped or can't compute (EPSG:3752 and 22700, ESRI:10820 and 65162)
@@ -1479,6 +1486,25 @@ map, each feature is placed in longitude/latitude to be compared. Remote files h
 [Data formats](data-formats.md)). Smaller files load
 whole; `layer.addData` with `"stream": true` or `false` overrides the choice.
 
+On the desktop, adding a GeoPackage, GeoParquet, FlatGeobuf, Shapefile or `.geojson` file (with
+**Add Data**, by dropping it on the window or from the Browser pane) asks which: **Copy into the
+project** or **Link to the file**. The size rule above picks the answer already selected, so
+**Add** (or Enter) takes the file as before; a `.geojson` file is taken as the answer shows (one
+past 32 MiB starts at Link, and stays linked even when it holds few features). A linked layer is read in place, and the project keeps
+the file's path (relative to the project's folder when it can, so a folder moved whole keeps it),
+not its features: to edit it or define its projection, choose **Load All Features** first. A file
+too large to read whole can only be linked. A GeoPackage of several tables asks once, at the foot
+of **Choose Layers**, starting at **Link to the file** if any table would be linked. While that
+answer is untouched, a note says each table follows its own size (a large one is linked, a small
+one copied); clicking either answer sends it for every table. A GeoPackage table's size is the
+feature count GDAL keeps in `gpkg_ogr_contents`, when the file has one along with the triggers GDAL
+keeps it up to date by, so a large table isn't scanned to count it; otherwise its rows are counted
+(a table with Z or M on every geometry is always counted, as that also counts its geometries). A
+linked layer shows "(linked)" after its name in Layers, and Package Project
+names the layers it leaves linked to files outside the package. LiDAR is always linked, and a `.json`
+file (which may be a city model) isn't asked about: it is linked or copied by the size rule above,
+as before. Files read whole are copied.
+
 On the desktop, **Load All Features** from the layer's menu in Layers reads its features in the
 background, with **Cancel** in the status bar; the layer stays streamed until they are all read.
 
@@ -1662,6 +1688,23 @@ so reading it takes as long as decoding the whole file once. A cloud-optimised G
 web address is read in place instead, a tile at a time (see [Files on the
 web](data-formats.md#files-on-the-web)).
 
+On the desktop, a tiled GeoTIFF on this computer too large to hold, with overviews, is read in
+place too: the map draws the part in view at the level it needs. Commands that make a raster from
+it read the file again as they run. **Clip** by an extent reads only the part under the extent,
+at the file's full resolution when that part fits. **Indices**, **Raster Functions** (band math,
+NDVI, remap, threshold, slope, aspect and hillshade, those over a cell's neighbours reading each
+block with the cells around it), the **Function Editor** with those steps, and **Classification
+Tools** (each class's mean summed from the rows of the file under the training polygons, as
+from the whole raster) work a block of tiles at a time at the file's full resolution, as does
+**Process**'s resample. A result of up to 120 million pixels is held, as any other (a
+resample's, 120 million values of all its bands); a larger one is written to a tiled GeoTIFF in
+the project's results folder beside it (`Survey.rgis.data` for `Survey.rgis`), or in RustGIS's
+own folder for a project not saved yet, and the new layer reads it in place; a notice says where
+it is. A resample's file holds its means as 32-bit floats, every band. A chain that remaps or
+thresholds after a step over neighbours, or has a slope in percent before its last step, a
+resample the computer can't give the memory for, one of more than 32 bands too large to hold,
+and the other commands read the finest level of the file they can hold, and say which.
+
 The web app opens a picked or dropped file of up to 256 MB whole. A larger GeoTIFF is read a part
 at a time instead: its header, then only the tiles of the overview it opens from. A
 cloud-optimised file opens however large it is, as long as those parts fit in 256 MB (a 436 MB
@@ -1706,6 +1749,16 @@ rasters of at most 500,000 cells, and a cloud-optimised GeoTIFF read in place ha
 whole image is held: either way the layer is drawn without them, and a notice says so. Terrain
 outside the raster casts nothing on it, and a grid spanning 0 to 360° casts nothing across its
 seam.
+
+**Shadow softness**, on a Shaded Relief layer (`raster.symbology` `"shadowSoftness"`, 0.5 to 15
+degrees), is how soft the edges of its cast shadows are: half the apparent size of the sun they are
+traced with. A shadow's edge is the share of the sun's disc the terrain hides, so a wider disc
+keeps a shadow sharp near what casts it and fades it farther away, as real shadows do; it isn't a
+blur. 5, the default, draws the shadows as before; a small value gives a crisp shadow line, for a
+large-scale map of a cliff, and a large one fades the shadows of a mountain range at a small scale.
+Changing it works the shadows out again, as moving the sun does, and going back to a softness used
+before draws at once. A value outside 0.5 to 15 is refused; `"shadowSoftness": null` goes back to
+the default. It changes nothing while Cast shadows is 0.
 
 **Sky visibility**, on a Shaded Relief layer (`raster.symbology` `"sky"`, 0 to 1), dims the
 relief's ambient light where the terrain around a cell hides part of the sky: valley floors, pits

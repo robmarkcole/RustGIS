@@ -29,6 +29,8 @@ pub mod graphics;
 pub mod group;
 pub mod history;
 pub mod imagery;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod in_blocks;
 pub mod items;
 pub mod labels;
 pub mod layer;
@@ -196,6 +198,24 @@ pub(crate) fn saved_target(layer: &str, table: &str) -> String {
     if layer == table { layer.to_string() } else { format!("{layer}: {table}") }
 }
 
+/// An opaque colour under `k`: absent `None`, null `Some(None)`, `"#RRGGBB"` `Some(Some(colour))`;
+/// anything else, a translucent `#RRGGBBAA` included, refused. Six hex digits exactly: `from_hex`
+/// alone would take a sign in a pair ("#+F0000").
+pub(crate) fn opaque_color(p: &Value, k: &str) -> Result<Option<Option<rustgis_map::Rgba>>, String> {
+    match p.get(k) {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(Value::String(c)) => c
+            .trim()
+            .strip_prefix('#')
+            .filter(|h| h.len() == 6 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+            .and_then(rustgis_map::Rgba::from_hex)
+            .map(|rgba| Some(Some(rgba)))
+            .ok_or_else(|| format!("{k} must be \"#RRGGBB\" (opaque), not '{c}'")),
+        Some(_) => Err(format!("{k} must be \"#RRGGBB\" or null")),
+    }
+}
+
 pub(crate) fn ps<'a>(p: &'a Value, k: &str) -> Option<&'a str> {
     p.get(k).and_then(Value::as_str)
 }
@@ -208,6 +228,35 @@ pub(crate) fn f(p: &Value, k: &str) -> Option<f64> {
 /// numbers as floats).
 pub(crate) fn uint(p: &Value, k: &str) -> Option<u64> {
     f(p, k).filter(|x| *x >= 0.0 && x.fract() == 0.0 && *x <= u64::MAX as f64).map(|x| x as u64)
+}
+
+/// Moves item `from` of `items` to `p`'s `to` (0: first; past the end: last) for `map.move` and
+/// `layout.move`, and gives where it went. A move to where the item is changes nothing and leaves
+/// no undo step.
+pub(crate) fn move_item<T>(s: &mut Session, items: impl Fn(&mut Session) -> &mut Vec<T>, from: usize, p: &Value) -> Result<usize, String> {
+    let to = uint(p, "to").ok_or("to is required (an index)")?;
+    let v = items(s);
+    if from >= v.len() {
+        return Err("no such item".into());
+    }
+    let to = usize::try_from(to).unwrap_or(usize::MAX).min(v.len() - 1);
+    if to == from {
+        s.request_only = true;
+    } else {
+        let item = v.remove(from);
+        v.insert(to, item);
+    }
+    Ok(to)
+}
+
+/// Where the item at `at` is after [`move_item`] took the one at `from` to `to`.
+pub(crate) fn after_move(at: usize, from: usize, to: usize) -> usize {
+    match at {
+        a if a == from => to,
+        a if from < a && a <= to => a - 1,
+        a if to <= a && a < from => a + 1,
+        a => a,
+    }
 }
 
 /// The longest name a map or a layout keeps.

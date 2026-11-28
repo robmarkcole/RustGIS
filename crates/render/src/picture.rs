@@ -4,6 +4,7 @@
 
 mod svg;
 
+use rustgis_map::qgis::SvgColours;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hash, Hasher, RandomState};
@@ -32,10 +33,15 @@ const MARKER_SIDE: u32 = 700;
 /// passes): past it, it isn't decoded and is drawn as a circle. What a marker costs to check and
 /// draw is its pixels (decoding and scaling one takes some 19 ns a pixel), not its bytes: a PNG of
 /// a few kilobytes can declare hundreds of megapixels. So the cap is set by that cost, one at it
-/// taking some 80 ms; a marker is drawn from at most [`MARKER_SIDE`] pixels a side whatever its
-/// image's size. An SVG may have as much to draw, in [`svg::work`]'s units (some 13 ns each at
-/// most, so about as long).
+/// taking some 80 ms; a marker is drawn from at most `MARKER_SIDE` (700) pixels a side whatever
+/// its image's size. An SVG may have as much to draw, in the units of the renderer's SVG count
+/// (some 13 ns each at most, so about as long).
 pub const MARKER_PIXELS: u64 = MARKER_PIXELS_SIDE as u64 * MARKER_PIXELS_SIDE as u64;
+/// The most XML nodes and the deepest nesting of an SVG marker image, for messages (theirs, written
+/// out, a test pins).
+pub const SVG_XML_NODES: u32 = svg::XML_NODES;
+/// See [`SVG_XML_NODES`].
+pub const SVG_DEPTH: u32 = svg::DEPTH;
 /// The side of the square [`MARKER_PIXELS`] is, for messages (theirs, written out, a test pins).
 pub const MARKER_PIXELS_SIDE: u32 = 2048;
 /// The most pixels of different picture markers' images a run decodes, about 5 s of decoding;
@@ -68,13 +74,32 @@ const SVG_READ: u64 = 3;
 pub enum MarkerRefusal {
     /// It isn't a PNG, JPEG or SVG image that decodes.
     NotAnImage,
+    /// Its base64 is longer than a kept picture may be
+    /// ([`rustgis_map::symbology::MAX_PICTURE_BYTES`]).
+    TooManyBytes,
     /// It declares more than [`MARKER_PIXELS`].
     TooManyPixels,
-    /// It is an SVG with more to draw than [`MARKER_PIXELS`] (in [`svg::work`]'s units), or more
-    /// elements than [`svg::ELEMENTS`].
+    /// It is an SVG with more to draw than [`MARKER_PIXELS`] (in the units of the renderer's SVG
+    /// count, `svg::work`), or more elements than `svg::ELEMENTS` (10,000).
     TooMuchToDraw,
+    /// It is an SVG whose style sheets and `style` attributes, or whose elements' attributes, take
+    /// more to read than `svg::STYLE_UNITS` and `svg::ATTRIBUTE_PAIRS` allow, whose namespaces
+    /// take more to resolve, or whose entities expand to more, than
+    /// `rustgis_data::xml::check_limits` allows, or whose entities hold tags, which no count sees.
+    SvgTooMuchToRead,
+    /// It is an SVG with more XML nodes than `svg::XML_NODES` (40,000) or nested deeper than
+    /// `svg::DEPTH` (64).
+    SvgTooNested,
+    /// It is an SVG with a radius that may be any size: in em or ex, a font's size, or in % of a
+    /// size in em or ex, or of a size in % over 100% (other than the whole SVG's in %). An `<svg>`
+    /// with a view box takes the % from it, whatever its own size.
+    SvgUnknownRadius,
+    /// It is an SVG too small to scale up to a pixmap (its size near 0).
+    SvgTooSmall,
+    /// It is an SVG that isn't UTF-8 text.
+    SvgNotUtf8,
     /// It is an SVG with filters, text, images, animation or links to other files, which marker
-    /// images don't draw ([`svg`] says why).
+    /// images don't draw (the renderer's `svg` module says why).
     SvgUndrawn,
     /// It would take the run past [`RUN_MARKER_PIXELS`] or [`RUN_MARKER_BYTES`].
     PastRunPixels,
@@ -114,8 +139,14 @@ macro_rules! refusal_phrases {
 
 refusal_phrases! {
     NotAnImage => "isn't a PNG, JPEG or SVG RustGIS reads",
+    TooManyBytes => "is longer than 2 MiB as base64",
     TooManyPixels => "has more pixels than 2048 × 2048",
     TooMuchToDraw => "is an SVG with more to draw than a 2048 × 2048 image",
+    SvgTooMuchToRead => "is an SVG whose style sheets, element attributes, namespaces or entities take more to read than RustGIS allows",
+    SvgTooNested => "is an SVG with more than 40,000 XML nodes or nested deeper than 64 levels",
+    SvgUnknownRadius => "is an SVG with a radius whose size RustGIS can't know (in em or ex, or in % of a size in em or ex, or of a nested size in % over 100%)",
+    SvgTooSmall => "is an SVG too small to draw",
+    SvgNotUtf8 => "is an SVG that isn't UTF-8 text",
     SvgUndrawn => "is an SVG with filters, text, images, animation or links to other files, which RustGIS doesn't draw in marker images",
     PastRunPixels => "is past what RustGIS decodes of marker images until it restarts (256 megapixels, 128 MiB)",
 }
@@ -155,7 +186,8 @@ struct Decoded {
 /// A picture marker's decoded image, or why it is drawn as a circle.
 type Marker = Result<Arc<Decoded>, MarkerRefusal>;
 
-/// What the run has decoded of picture markers' images: the pixels they declared and the bytes
+/// What the run has decoded of picture markers' images: the pixels they declared (for an SVG, the
+/// units its reading, its style sheets' matching and its drawing came to) and the bytes
 /// they hold, decoded or compressed ([`RUN_MARKER_PIXELS`], [`RUN_MARKER_BYTES`]: compressed
 /// copies can take the bytes past it).
 #[derive(Default)]
@@ -207,7 +239,10 @@ struct Store {
 }
 
 /// The [`Store`]. Its lock is held while an image is decoded, so two threads meeting the same new
-/// image decode it once; another waits at most one image's decoding (80 ms at [`MARKER_PIXELS`]).
+/// image decode it once; another waits at most one image's decoding: 80 ms for a PNG or JPEG at
+/// [`MARKER_PIXELS`]; for an SVG, its reading (some 50 ms at the length a kept picture may be, and
+/// some 45 ms more matching its style sheets at most, [`svg::CSS_STEPS`]) and its drawing (as long
+/// as a PNG's at most).
 fn store() -> std::sync::MutexGuard<'static, Store> {
     static STORE: OnceLock<Mutex<Store>> = OnceLock::new();
     STORE.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner())
@@ -231,8 +266,9 @@ fn content_id(b64: &str) -> u128 {
 /// first bytes or its header) isn't kept: finding that again costs as little.
 ///
 /// Commands and a project's read check images on the UI thread. One image takes at most ~80 ms
-/// ([`MARKER_PIXELS`] at ~19 ns a pixel); everything a run decodes, ~5 s ([`RUN_MARKER_PIXELS`]),
-/// once: one call or file can spend it all, and after that a new image is refused from its header.
+/// ([`MARKER_PIXELS`] at ~19 ns a pixel), and an SVG its reading and matching besides ([`store`]);
+/// everything a run decodes, ~5 s ([`RUN_MARKER_PIXELS`]), once: one call or file can spend it
+/// all, and after that a new image is refused from its header.
 /// Kept on the UI thread for that bound: the check answers whether the command is taken.
 fn marker(b64: &str) -> Marker {
     marker_in(&mut store(), b64)
@@ -243,6 +279,11 @@ fn marker_in(store: &mut Store, b64: &str) -> Marker {
     use MarkerRefusal::*;
     let b64 = b64.trim();
     let Some(format) = format(b64) else { return Err(NotAnImage) };
+    // What a kept picture may be, whoever checks it: reading an SVG is then bounded too (~50 ms);
+    // matching its style sheets is bounded apart (`svg::CSS_STEPS`).
+    if b64.len() > rustgis_map::symbology::MAX_PICTURE_BYTES {
+        return Err(TooManyBytes);
+    }
     let id = content_id(b64);
     if let Some(found) = store.images.get(&id) {
         return found.clone();
@@ -273,21 +314,33 @@ fn marker_in(store: &mut Store, b64: &str) -> Marker {
     found
 }
 
-/// [`marker_in`] for SVG `bytes` (`id` in the store): its reading charged first, by its length;
-/// then what drawing it costs ([`svg::work`]) and the bytes it holds, before it is drawn. Kept
-/// whatever comes of it, refused or not (reading it again would cost as much), but for the run's
-/// refusal, which a later image giving back bytes may lift, as for a PNG.
+/// [`marker_in`] for SVG `bytes` (`id` in the store). Its reading is charged first, by its length.
+/// Matching its style sheets is charged once read, by the steps it took ([`svg::CSS_STEPS`]), a
+/// pixel each (a step takes some 11 ns, a pixel some 19 ns) and at least [`MARKER_CHARGE`] as every
+/// charge, refused or not, as a few hundred bytes of selectors can take them all. Then what drawing
+/// it costs ([`svg::work`]) and the bytes it holds are charged, before it is drawn. Kept whatever
+/// comes of it, refused or not (reading it again would cost as much), but for the run's refusal,
+/// which a later image giving back bytes may lift, as for a PNG. A refusal for the run that its
+/// matching meets is kept too: that charges pixels alone, which nothing gives back.
 fn svg_in(store: &mut Store, id: u128, bytes: &[u8]) -> Marker {
     use MarkerRefusal::*;
-    // What a kept picture may be, whoever checks it: reading it is then bounded too (~50 ms).
-    if bytes.len() > rustgis_map::symbology::MAX_PICTURE_BYTES / 4 * 3 {
-        return Err(TooMuchToDraw);
-    }
     let limits = (RUN_MARKER_PIXELS, RUN_MARKER_BYTES);
     store.budget.take((bytes.len() as u64).saturating_mul(SVG_READ), 0, limits)?;
     // Read from its first `<`, as `format` told it: XML takes nothing before its declaration.
     let text = std::str::from_utf8(bytes).map(|t| t.trim_start_matches('\u{feff}').trim_start());
-    let tree = text.map_err(|_| NotAnImage).and_then(|text| svg::read(text).map_err(MarkerRefusal::from));
+    // Matching takes at most what the run has left, so the run's bound holds for it too.
+    let room = RUN_MARKER_PIXELS.saturating_sub(store.budget.pixels);
+    let mut matched = 0;
+    let tree = text.map_err(|_| SvgNotUtf8).and_then(|text| svg::read(text, room, &mut matched).map_err(MarkerRefusal::from));
+    let matching_charge = if matched > 0 { store.budget.take(matched, 0, limits) } else { Ok(()) };
+    // Refused for the run by its matching, past the run's pixels, which are never given back, it
+    // stays refused until RustGIS restarts, and is kept: reading it again would only match it again.
+    let keep_refusal = matching_charge.is_err() || matches!(tree, Err(PastRunPixels));
+    // An SVG refused for itself keeps its cause, even when its matching's charge finds the run
+    // at its end: only one that would be drawn is then refused for the run (the charge is met
+    // after its own checks). Matching that reaches what the run has left inside `svg::read`
+    // refuses it for the run first, before its later checks (nested markers) run: finding its
+    // own cause would take that matching.
     let found = tree.and_then(|tree| {
         let size = tree.size();
         let (w, h) = (size.width(), size.height());
@@ -298,10 +351,12 @@ fn svg_in(store: &mut Store, id: u128, bytes: &[u8]) -> Marker {
         let (sx, sy) = (pw as f32 / w, ph as f32 / h);
         // One too small to scale up to a pixmap (its size near 0) can't be drawn.
         if !(k.is_finite() && sx.is_finite() && sy.is_finite()) {
-            return Err(NotAnImage);
+            return Err(SvgTooSmall);
         }
         let at = Transform::from_scale(sx, sy);
         let work = svg::work(&tree, (pw, ph), at, MARKER_PIXELS)?;
+        // Charged once its own checks pass: one too small or with too much to draw says so.
+        matching_charge?;
         let held = u64::from(pw) * u64::from(ph) * 4;
         store.budget.take(work, held, limits)?;
         let Some(image) = svg::draw(&tree, (pw, ph), at) else {
@@ -311,7 +366,7 @@ fn svg_in(store: &mut Store, id: u128, bytes: &[u8]) -> Marker {
         // Its proportions as drawn, as a PNG's: one thinner than a pixel is drawn a pixel thick.
         Ok(Arc::new(Decoded { image: Arc::new(image), aspect: ph as f32 / pw as f32, packed: OnceLock::new() }))
     });
-    if !matches!(found, Err(PastRunPixels)) {
+    if keep_refusal || !matches!(found, Err(PastRunPixels)) {
         store.images.insert(id, found.clone());
     }
     found
@@ -322,6 +377,10 @@ impl From<svg::Refusal> for MarkerRefusal {
         match why {
             svg::Refusal::NotSvg => MarkerRefusal::NotAnImage,
             svg::Refusal::TooMuch => MarkerRefusal::TooMuchToDraw,
+            svg::Refusal::PastRun => MarkerRefusal::PastRunPixels,
+            svg::Refusal::TooMuchToRead => MarkerRefusal::SvgTooMuchToRead,
+            svg::Refusal::TooNested => MarkerRefusal::SvgTooNested,
+            svg::Refusal::UnknownRadius => MarkerRefusal::SvgUnknownRadius,
             svg::Refusal::Undrawn => MarkerRefusal::SvgUndrawn,
         }
     }
@@ -528,6 +587,21 @@ pub fn check(b64: &str) -> Result<f32, MarkerRefusal> {
     }
 }
 
+/// Base64 `b64`, an SVG marker's image, with its `param(…)` values set from `colours`
+/// ([`svg::with_params`]), or `None` for one that has none, or isn't SVG text ([`check`] says why
+/// it isn't drawn).
+pub(crate) fn with_params(b64: &str, colours: &SvgColours) -> Result<Option<String>, MarkerRefusal> {
+    if !is_svg(b64) {
+        return Ok(None);
+    }
+    let engine = base64::engine::general_purpose::STANDARD;
+    let Ok(bytes) = engine.decode(b64.trim()) else { return Ok(None) };
+    let Ok(text) = std::str::from_utf8(&bytes) else { return Ok(None) };
+    // From its first `<`, as `svg_in` reads it.
+    let text = text.trim_start_matches('\u{feff}').trim_start();
+    Ok(svg::with_params(text, colours)?.map(|set| engine.encode(set)))
+}
+
 /// What a picture marker's image is, from its first bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Format {
@@ -535,6 +609,11 @@ enum Format {
     Raster,
     /// What may be an SVG (XML: its first character `<`), read ([`svg::read`] decides).
     Svg,
+}
+
+/// Whether base64 `b64` starts as an SVG would, as [`format`] tells it.
+pub(crate) fn is_svg(b64: &str) -> bool {
+    format(b64) == Some(Format::Svg)
 }
 
 /// What base64 `b64` starts as, if a picture marker may be one. Picture markers take PNG, JPEG and
@@ -563,10 +642,11 @@ fn format(b64: &str) -> Option<Format> {
 mod tests {
     use super::*;
 
-    /// Picture markers take PNG and JPEG alone, read from the first bytes: not a GIF (which the
-    /// desktop's decoder reads and the web's doesn't), nor what isn't base64 or an image.
+    /// Picture markers take PNG and JPEG images read from their first bytes (SVG too, tested
+    /// below): not a GIF (which the desktop's decoder reads and the web's doesn't), nor what isn't
+    /// base64 or an image.
     #[test]
-    fn a_marker_is_a_png_or_a_jpeg() {
+    fn a_marker_is_a_png_a_jpeg_or_an_svg() {
         let encoded = |format: image::ImageFormat| {
             let mut bytes = Vec::new();
             image::RgbImage::from_pixel(4, 2, image::Rgb([10, 20, 30])).write_to(&mut std::io::Cursor::new(&mut bytes), format).unwrap();
@@ -714,8 +794,21 @@ mod tests {
     fn only_the_runs_refusal_passes() {
         use MarkerRefusal::*;
         assert_eq!(
-            [NotAnImage, TooManyPixels, TooMuchToDraw, SvgUndrawn, PastRunPixels].map(MarkerRefusal::lasts),
-            [true, true, true, true, false]
+            [
+                NotAnImage,
+                TooManyBytes,
+                TooManyPixels,
+                TooMuchToDraw,
+                SvgTooMuchToRead,
+                SvgTooNested,
+                SvgUnknownRadius,
+                SvgTooSmall,
+                SvgNotUtf8,
+                SvgUndrawn,
+                PastRunPixels
+            ]
+            .map(MarkerRefusal::lasts),
+            [true, true, true, true, true, true, true, true, true, true, false]
         );
         // A kept image the run's spent budget refuses is kept as it is; one refused for itself
         // isn't; one that draws is.
@@ -767,6 +860,108 @@ mod tests {
         assert!(MarkerRefusal::PastRunPixels.what().contains(&run));
         assert_eq!(MarkerRefusal::NotAnImage.whose(), "whose image isn't a PNG, JPEG or SVG RustGIS reads");
         assert!(MarkerRefusal::TooMuchToDraw.what().contains(&format!("a {side} × {side} image")));
+        let mib = format!("longer than {} MiB as base64", rustgis_map::symbology::MAX_PICTURE_BYTES >> 20);
+        assert!(MarkerRefusal::TooManyBytes.what().contains(&mib));
+        let (nodes, depth) = (SVG_XML_NODES, SVG_DEPTH);
+        let nested = format!("more than {},{:03} XML nodes or nested deeper than {depth} levels", nodes / 1000, nodes % 1000);
+        assert!(MarkerRefusal::SvgTooNested.what().contains(&nested));
+    }
+
+    /// Matching an SVG's style sheets is charged to the run once it is read, refused or not: a few
+    /// hundred bytes of selectors can take every step there is (#2864).
+    #[test]
+    fn an_svgs_style_sheet_matching_is_charged_to_the_run() {
+        let deep = format!("{}<rect width=\"1\" height=\"1\"/>{}", "<g>".repeat(40), "</g>".repeat(40));
+        let text = format!(r#"<svg xmlns="http://www.w3.org/2000/svg"><style>x g g g g g g rect {{ fill: red }}</style>{deep}</svg>"#);
+        let mut store = Store::default();
+        assert_eq!(marker_in(&mut store, &b64(&text)).err(), Some(MarkerRefusal::TooMuchToDraw));
+        assert!(store.budget.pixels >= svg::CSS_STEPS, "{} charged", store.budget.pixels);
+        // With the run near its end, matching stops where the run does: refused for the run, and
+        // kept, as the pixels the run charged are never given back.
+        let mut full = Store::default();
+        full.budget.pixels = RUN_MARKER_PIXELS - 100_000;
+        assert_eq!(marker_in(&mut full, &b64(&text)).err(), Some(MarkerRefusal::PastRunPixels));
+        assert_eq!(full.images.len(), 1);
+        assert!(full.budget.pixels <= RUN_MARKER_PIXELS);
+        // So is one it would draw, the run at its end.
+        let drawn = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><style>g rect { fill: red }</style><g><rect width="9" height="9"/></g></svg>"#;
+        let mut spent = Store::default();
+        spent.budget.pixels = RUN_MARKER_PIXELS - MARKER_CHARGE;
+        assert_eq!(marker_in(&mut spent, &b64(drawn)).err(), Some(MarkerRefusal::PastRunPixels));
+        assert_eq!(spent.images.len(), 1);
+        assert!(marker_in(&mut Store::default(), &b64(drawn)).is_ok(), "drawn with the run's room");
+        // One matched within the run's room but refused for itself keeps its cause, and is kept,
+        // even when its matching's charge finds the run at its end.
+        let nested = r#"<svg xmlns="http://www.w3.org/2000/svg"><style>path { marker-mid: url(#b) }</style><marker id="b"><circle r="1"/></marker><marker id="a"><path d="M0 0L1 1L2 0"/></marker><path d="M0 0L1 1L2 0" marker-mid="url(#a)"/></svg>"#;
+        let mut near = Store::default();
+        near.budget.pixels = RUN_MARKER_PIXELS - MARKER_CHARGE - 100;
+        assert_eq!(marker_in(&mut near, &b64(nested)).err(), Some(MarkerRefusal::TooMuchToDraw));
+        assert_eq!(near.images.len(), 1);
+        // So does one too small to draw, refused after it is read (#2864).
+        let small = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1e-40 1e-40"><style>rect { fill: red }</style><rect width="1" height="1"/></svg>"#;
+        let mut low = Store::default();
+        low.budget.pixels = RUN_MARKER_PIXELS - MARKER_CHARGE - 100;
+        assert_eq!(marker_in(&mut low, &b64(small)).err(), Some(MarkerRefusal::SvgTooSmall));
+        // An SVG with no style sheet matches nothing, so the run's room left doesn't refuse it.
+        let plain = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><rect width="9" height="9"/></svg>"#;
+        let mut room = Store::default();
+        room.budget.pixels = RUN_MARKER_PIXELS - 10 * MARKER_CHARGE;
+        assert!(marker_in(&mut room, &b64(plain)).is_ok());
+    }
+
+    /// Each refusal says its own cause (#2713): a long image, an SVG nested deep or with many
+    /// nodes, a radius whose size can't be known, one too small to draw, one that isn't UTF-8.
+    #[test]
+    fn an_image_is_refused_for_its_own_cause() {
+        use MarkerRefusal::*;
+        let svg = |body: &str| b64(&format!(r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">{body}</svg>"#));
+        let deep = format!("{}<rect width='1' height='1'/>{}", "<g>".repeat(70), "</g>".repeat(70));
+        let nodes = "<!---->".repeat(svg::XML_NODES as usize);
+        let long_png = {
+            let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+            bytes.resize(rustgis_map::symbology::MAX_PICTURE_BYTES, 0);
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        };
+        let not_utf8 = base64::engine::general_purpose::STANDARD.encode(b"<svg xmlns='http://www.w3.org/2000/svg'>\xff</svg>");
+        for (image, why) in [
+            (long_png, TooManyBytes),
+            (svg(&deep), SvgTooNested),
+            (svg(&nodes), SvgTooNested),
+            // Its own cause (#2800), not "more to draw": 20,000 declarations in a `style` take too long to read.
+            (svg(&format!(r#"<rect width="1" height="1" style="{}"/>"#, "fill: red; ".repeat(20_000))), SvgTooMuchToRead),
+            // So do namespaces by the thousand around many elements (#3220).
+            (
+                svg(&format!(
+                    "<g{}>{}</g>",
+                    (0..3000).map(|i| format!(r#" xmlns:n{i}="u{i}""#)).collect::<String>(),
+                    r#"<g xmlns:a="v"/>"#.repeat(1000)
+                )),
+                SvgTooMuchToRead,
+            ),
+            (svg(r#"<circle r="1em"/>"#), SvgUnknownRadius),
+            (svg(r#"<rect width="9" height="9" rx="2ex"/>"#), SvgUnknownRadius),
+            // A radius in % of a size in em or ex with no view box, or of a nested one past 100%.
+            (
+                b64(r#"<svg xmlns="http://www.w3.org/2000/svg" width="2em" height="2em"><circle cx="50" cy="50" r="10%"/></svg>"#),
+                SvgUnknownRadius,
+            ),
+            (svg(r#"<svg width="150%" height="50%"><circle r="50%"/></svg>"#), SvgUnknownRadius),
+            (b64(r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1e-40 1e-40"/>"#), SvgTooSmall),
+            (not_utf8, SvgNotUtf8),
+        ] {
+            assert_eq!(marker_in(&mut Store::default(), &image).err(), Some(why), "{why:?}");
+        }
+        // A radius of 0 em is 0, drawn; so is one in em where the shape takes no such radius.
+        for drawn in [
+            r#"<circle r="0em"/>"#,
+            r#"<circle r="5" rx="1em"/>"#,
+            r#"<rect width="9" height="9" r="1em"/>"#,
+            // A % radius of a size it knows, and a nested size in % with no % radius.
+            r#"<circle r="10%"/>"#,
+            r#"<svg width="50%" height="50%"><circle r="5"/></svg>"#,
+        ] {
+            assert!(marker_in(&mut Store::default(), &svg(drawn)).is_ok(), "{drawn}");
+        }
     }
 
     fn b64(text: &str) -> String {
@@ -804,7 +999,7 @@ mod tests {
         // One too small to scale up isn't drawn; one thinner than a pixel is drawn a pixel thick,
         // its proportions those it is drawn at.
         let sized = |w: &str, h: &str| b64(&format!(r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}"/>"#));
-        assert_eq!(marker_in(&mut store, &sized("1e-40", "1e-40")).err(), Some(MarkerRefusal::NotAnImage));
+        assert_eq!(marker_in(&mut store, &sized("1e-40", "1e-40")).err(), Some(MarkerRefusal::SvgTooSmall));
         for ((w, h), drawn) in [(("1e30", "1e-30"), (700, 1, 1.0 / 700.0)), (("1e-30", "1"), (1, 256, 256.0))] {
             let found = marker_in(&mut store, &sized(w, h)).unwrap();
             assert_eq!((found.image.width(), found.image.height(), found.aspect), drawn, "{w} × {h}");
@@ -869,7 +1064,7 @@ mod tests {
         // One past what a kept picture may be is refused before it is read, charging nothing.
         let mut store = Store::default();
         let long = svg(format!("<!--{}-->", " ".repeat(rustgis_map::symbology::MAX_PICTURE_BYTES)));
-        assert_eq!(marker_in(&mut store, &long).err(), Some(MarkerRefusal::TooMuchToDraw));
+        assert_eq!(marker_in(&mut store, &long).err(), Some(MarkerRefusal::TooManyBytes));
         assert_eq!((store.budget.pixels, store.budget.bytes), (0, 0));
     }
 

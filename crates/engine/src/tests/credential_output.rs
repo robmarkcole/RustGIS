@@ -519,8 +519,8 @@ fn durable_future_documents_keep_their_exact_text_unchecked() {
         let kept = clean.map_or(text.clone(), |c| c["text"].as_str().unwrap_or_default().to_string());
         assert_eq!(kept.contains(SECRET), unchecked == 1, "{kept}");
     }
-    // A task document's reader doesn't look at `requires`, so listing one doesn't keep it unchecked;
-    // a future format stays as written because its typed copy could lose new fields.
+    // A task document's reader looks at `requires`, and its cleaned copy keeps the list (so listing one
+    // doesn't keep it unchecked); a future format stays as written because the reader refuses it.
     for (task, unchecked) in [
         (json!({"name": "t", "requires": ["z-values"], "steps": []}), 0),
         (json!({"format": crate::project::READ_FORMAT + 1, "name": "t", "steps": []}), 1),
@@ -532,6 +532,17 @@ fn durable_future_documents_keep_their_exact_text_unchecked() {
     let (clean, report) = crate::roles::command("project.openText", &json!({"text":malformed}), 0);
     assert_eq!(clean.unwrap()["text"], "[parameters withheld]", "malformed credential-bearing text keeps its existing handling");
     assert_eq!((report.withheld, report.unchecked), (1, 0));
+}
+
+/// A script line that doesn't read and holds a secret keeps only its command id, read as Run
+/// reads it: a line written `id={…` with no space keeps `id`, not the secret after the `=` (#2794).
+#[test]
+fn a_withheld_script_line_keeps_only_its_command_id() {
+    let secret = "RGSYNTH_glued_20261123";
+    let (clean, report) = crate::roles::script(&format!(r#"layer.rename={{"token":"{secret}""#), 0);
+    let clean = clean.unwrap();
+    assert_eq!(clean, "layer.rename [parameters withheld]");
+    assert_eq!(report.withheld, 1);
 }
 
 #[test]
@@ -1049,4 +1060,43 @@ fn copernicus_sign_in_secrets_stay_out_of_history_and_errors() {
     let status = s.run("copernicus.status", &Value::Null).unwrap();
     assert_eq!(status, json!({"signedIn": false, "remembered": false, "expired": false}));
     assert_eq!(s.run("copernicus.logout", &Value::Null).unwrap(), status);
+}
+
+/// Report a Problem's command lines take a login in use out of a logged parameter even when it
+/// has a quote in it, which the line's JSON writes escaped, and say the line no longer runs as it
+/// ran.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn the_problem_report_masks_a_login_in_use_with_a_quote_in_it() {
+    if isolate_process_test("tests::credential_output::the_problem_report_masks_a_login_in_use_with_a_quote_in_it") {
+        return;
+    }
+    use crate::render::rustgis_tiles::logins;
+    let login = "p\"ass-X7-synthetic";
+    let mut s = Session::new(Project::default());
+    s.log.clear();
+    s.log.push(crate::project_log::LogEntry { command: "map.new".into(), params: json!({"name": login}), ok: true, ..Default::default() });
+    // A number can be a login too.
+    s.log.push(crate::project_log::LogEntry {
+        command: "map.zoomTo".into(),
+        params: json!({"scale": 9_073_640_215_u64}),
+        ok: true,
+        ..Default::default()
+    });
+    let binding =
+        logins::activate("https://report-quote.invalid", "synthetic-report-quote", logins::Method::Header("X-Key".into()), login, false)
+            .unwrap();
+    let number = logins::activate(
+        "https://report-number.invalid",
+        "synthetic-report-number",
+        logins::Method::Header("X-Pin".into()),
+        "9073640215",
+        false,
+    )
+    .unwrap();
+    let report = s.problem_report(&crate::problem_report::About::default());
+    let (quoted, numeric) = (logins::deactivate(&binding), logins::deactivate(&number));
+    assert!(quoted && numeric);
+    assert!(!report.contains("ass-X7-synthetic") && !report.contains("9073640215"), "{report}");
+    assert!(report.contains("may not run as it ran\nmap.new"), "{report}");
 }

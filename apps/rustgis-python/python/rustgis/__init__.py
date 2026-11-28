@@ -44,6 +44,10 @@ __all__ = [
 PathLike = Union[str, "os.PathLike[str]"]
 
 
+# The guide's page of loss codes (rustgis_data::loss::GUIDE), an entry for each code.
+_LOSS_GUIDE = "https://rustgis.app/user-guide/loss-codes/"
+
+
 class DataLossWarning(UserWarning):
     """A command lost data: it dropped, changed, approximated or assumed something.
 
@@ -53,8 +57,9 @@ class DataLossWarning(UserWarning):
 
     Attributes:
         code: The loss code, such as ``"dropped.ring"``: never translated, renamed or reused.
-            The command line guide lists every code with what to do about it.
+            The guide has an entry for each code, with what to do about it (``url``).
         kind: The code's kind: ``"dropped"``, ``"changed"``, ``"approximated"`` or ``"assumed"``.
+        url: The code's entry in the guide: what it means and what to do about it.
     """
 
     def __init__(self, message: str, code: str) -> None:
@@ -67,6 +72,7 @@ class DataLossWarning(UserWarning):
         super().__init__(message)
         self.code = code
         self.kind = code.split(".", 1)[0]
+        self.url = _LOSS_GUIDE + "#" + code
 
     def __reduce__(self) -> Tuple[Any, ...]:
         """Pickles with the code and what was added to it (notes), so a warning turned into an

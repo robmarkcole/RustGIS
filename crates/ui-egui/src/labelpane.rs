@@ -142,10 +142,13 @@ fn shown(c: &Class) -> String {
 }
 
 /// `l` as a layer of this map of this project: another map, or another project, may reuse its id.
-/// A map goes by its place and its name, as Define Projection's does: deleting a map moves the
-/// next one into its place, and a copy keeps its layer ids.
+/// A map goes by what it is (`Map::instance_id`) and its name, as Define Projection's does: moving
+/// it keeps its typed text, a map deleted before it doesn't hand its state to the next one, and a
+/// copy keeps its layer ids and is another map. Renaming the map starts its layers' state afresh,
+/// as it always did.
 pub(crate) fn layer_key(app: &RustGisApp, l: &Layer) -> egui::Id {
-    egui::Id::unique((app.session.opened, app.session.project.active_map, app.session.map().name.as_str(), l.id))
+    let map = app.session.map();
+    egui::Id::unique((app.session.opened, map.instance_id(), map.name.as_str(), l.id))
 }
 
 /// Where the class chosen on a layer is kept.
@@ -965,11 +968,16 @@ fn square_to(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, c: &Class) {
     });
 }
 
-/// Where labels crowd: every one shown, over the others, rather than some left out; and
-/// callouts, which move a crowded label to a free spot nearby with a line back to its feature,
-/// no longer than so far.
+/// Where labels crowd: every one shown, over the others, rather than some left out; the class's
+/// weight, the heavier winning where labels compete; its clearance, the room its labels keep free
+/// of others; whether it removes duplicates, one label of a text where its features lie closer than
+/// so far (#2847); and callouts, which move a crowded label to a free spot nearby with a line back
+/// to its feature, no longer than so far.
 fn crowding(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, c: &Class) {
-    use rustgis_engine::map::symbology::{CALLOUT_REACH, callout_reach};
+    use rustgis_engine::map::symbology::{
+        CALLOUT_REACH, DEFAULT_LABEL_DUPLICATES, LABEL_CLEARANCE, LABEL_DUPLICATES, LABEL_WEIGHT, callout_reach, label_clearance,
+        label_duplicates, label_weight,
+    };
     let id = l.id;
     grid(ui, "crowding", |ui| {
         let input_label = ui.label(tl!("Show all labels"));
@@ -982,6 +990,78 @@ fn crowding(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, c: &Class) {
         {
             run(app, "labels.placement", c.params(json!({"showAll": all})));
         }
+        ui.end_row();
+        let input_label = ui.label(tl!("Weight"));
+        // Scoped to its layer and class: another chosen mid-drag drops the drag, and nothing is
+        // written until it is let go (#2803).
+        ui.push_id(("label_weight", l.instance_id(), c.name), |ui| {
+            let mut v = f64::from(c.it.weight);
+            let drag = crate::widgets::Dragged::lend(ui, egui::Id::unique(("label_weight_drag", l.instance_id(), c.name)), &mut v);
+            let r = ui
+                .add(egui::DragValue::new(&mut v).update_while_editing(false).range(LABEL_WEIGHT).speed(0.05).max_decimals(0))
+                .labelled_by(input_label.id)
+                .on_hover_text(tl!("Where labels compete for a place, the heavier class's label wins, whatever its layer's place."));
+            if drag.settled(ui, &r, &mut v) && label_weight(v) != c.it.weight {
+                run(app, "labels.placement", c.params(json!({"weight": label_weight(v)})));
+            }
+        });
+        ui.end_row();
+        let input_label = ui.label(tl!("Clearance"));
+        // As the weight: scoped to its layer and class, written when let go (#2828).
+        ui.push_id(("label_clearance", l.instance_id(), c.name), |ui| {
+            let mut v = f64::from(c.it.clearance);
+            let drag = crate::widgets::Dragged::lend(ui, egui::Id::unique(("label_clearance_drag", l.instance_id(), c.name)), &mut v);
+            let r = ui
+                .add(
+                    egui::DragValue::new(&mut v)
+                        .update_while_editing(false)
+                        .range(LABEL_CLEARANCE)
+                        .speed(0.1)
+                        .max_decimals(1)
+                        .suffix(" pt"),
+                )
+                .labelled_by(input_label.id)
+                .on_hover_text(tl!("The room this class's labels keep free of other labels."));
+            if drag.settled(ui, &r, &mut v) && label_clearance(v) != c.it.clearance {
+                run(app, "labels.placement", c.params(json!({"clearance": label_clearance(v)})));
+            }
+        });
+        ui.end_row();
+        let input_label = ui.label(tl!("Remove duplicates"));
+        ui.horizontal(|ui| {
+            let mut on = c.it.remove_duplicates.is_some();
+            let toggled = ui
+                .checkbox(&mut on, "")
+                .labelled_by(input_label.id)
+                .on_hover_text(tl!("Draw one label of a text where features of this class with the same text lie closer than this."))
+                .changed();
+            if toggled {
+                let within = if on { json!(DEFAULT_LABEL_DUPLICATES) } else { json!(false) };
+                run(app, "labels.placement", c.params(json!({"removeDuplicates": within})));
+            }
+            let Some(within) = c.it.remove_duplicates else { return };
+            // As the clearance: scoped to its layer and class, written when let go (#2847).
+            ui.push_id(("label_duplicates", l.instance_id(), c.name), |ui| {
+                let mut v = f64::from(within);
+                let drag = crate::widgets::Dragged::lend(ui, egui::Id::unique(("label_duplicates_drag", l.instance_id(), c.name)), &mut v);
+                let r = ui
+                    .add(
+                        egui::DragValue::new(&mut v)
+                            .update_while_editing(false)
+                            .range(LABEL_DUPLICATES)
+                            .speed(1.0)
+                            .max_decimals(0)
+                            .prefix(format!("{} ", tl!("within")))
+                            .suffix(" pt"),
+                    )
+                    .labelled_by(input_label.id)
+                    .on_hover_text(tl!("How close two labels of one text may be before the one placed later is left out."));
+                // An edit that ends in the frame the box changes yields to the box (#2847).
+                if drag.settled(ui, &r, &mut v) && !toggled && label_duplicates(v) != within {
+                    run(app, "labels.placement", c.params(json!({"removeDuplicates": label_duplicates(v)})));
+                }
+            });
+        });
         ui.end_row();
         let input_label = ui.label(tl!("Callouts"));
         ui.horizontal(|ui| {
@@ -1356,6 +1436,28 @@ mod tests {
         app.session.map().layers.iter().find(|l| l.name == name).unwrap().id
     }
 
+    /// What the pane and the Unique Values box keep for a layer (the class chosen, a search, the
+    /// typed expression) is found again when its map moves among the maps; another map's layer of the
+    /// same id is another key (#2959).
+    #[test]
+    fn a_layers_state_follows_its_map_when_the_map_moves() {
+        let mut app = with_cities();
+        let id = layer_id(&app, "Cities");
+        let first = app.session.map().name.clone();
+        let key = |app: &RustGisApp| super::layer_key(app, app.session.map().layer(id).unwrap());
+        let before = key(&app);
+        app.run("map.new", json!({"name": "Second"})).unwrap();
+        app.run("map.activate", json!({"name": first})).unwrap();
+        app.run("map.move", json!({"name": first, "to": 1})).unwrap();
+        assert_eq!(app.session.project.active_map, 1, "the map in view moved to the end");
+        assert_eq!(key(&app), before, "the same map, moved");
+        let original = app.session.map().instance_id();
+        app.run("map.duplicate", json!({"name": first})).unwrap();
+        // The copy is named "<map> copy", which the key tells apart anyway: it is the identity that
+        // `map.duplicate` renews, and the key is built from it.
+        assert_ne!(app.session.map().instance_id(), original, "a copy keeps the layer ids and is another map");
+    }
+
     fn with_cities() -> RustGisApp {
         // Keep the font picker ready before the harness checks its role or settles the layout.
         super::families::installed();
@@ -1588,6 +1690,238 @@ mod tests {
         h.key_press(egui::Key::Enter);
         h.run();
         assert_eq!(offset(&h), -2.0, "the side waits for a distance");
+    }
+
+    /// A label class's weight (#2803) is shown and set in Position, beside Show all labels.
+    #[test]
+    fn a_label_weight_is_set_in_the_pane() {
+        use egui::accesskit::Role;
+        let mut h = harness(with_cities());
+        h.run();
+        let cities = layer_id(h.state(), "Cities");
+        h.state_mut().session.run("layer.select", &json!({"layer": cities})).unwrap();
+        h.state_mut().session.run("labels.placement", &json!({"layer": cities, "weight": 7})).unwrap();
+        h.run();
+        open_tab(&mut h, "Position");
+        let weight =
+            |h: &egui_kittest::Harness<'_, RustGisApp>| h.state().session.map().layer_by_name("Cities").unwrap().labels.default.weight;
+        let shown = h.get_by_role_and_label(Role::SpinButton, "Weight").accesskit_node().numeric_value();
+        assert_eq!(shown, Some(7.0), "the class's weight");
+        h.get_by_role_and_label(Role::SpinButton, "Weight").focus();
+        h.run();
+        h.get_by_role_and_label(Role::SpinButton, "Weight").type_text("9");
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert_eq!(weight(&h), 9);
+        // Dragged slowly left over several frames, then let go: two less, in one step.
+        h.state_mut().session.run("labels.placement", &json!({"layer": cities, "weight": 5})).unwrap();
+        h.run();
+        let steps = h.state().session.undo_depth();
+        let at = h.get_by_role_and_label(Role::SpinButton, "Weight").rect().center();
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        h.event(egui::Event::PointerMoved(at));
+        h.step();
+        h.event(button(at, true));
+        h.step();
+        for i in 1..=10 {
+            h.event(egui::Event::PointerMoved(at - egui::vec2(4.0 * i as f32, 0.0)));
+            h.step();
+        }
+        h.event(button(at - egui::vec2(40.0, 0.0), false));
+        h.step();
+        h.run();
+        assert_eq!(weight(&h), 3, "each frame's part of the drag counts");
+        assert_eq!(h.state().session.undo_depth(), steps + 1, "a drag is one step");
+        // Another layer chosen mid-drag: the drag is dropped, neither layer's weight changed and
+        // nothing to undo.
+        let rivers = layer_id(h.state(), "Rivers");
+        let weights = |h: &egui_kittest::Harness<'_, RustGisApp>| {
+            let m = h.state().session.map();
+            (m.layer(cities).unwrap().labels.default.weight, m.layer(rivers).unwrap().labels.default.weight)
+        };
+        let steps = h.state().session.undo_depth();
+        h.event(egui::Event::PointerMoved(at));
+        h.step();
+        h.event(button(at, true));
+        h.step();
+        for i in 1..=5 {
+            h.event(egui::Event::PointerMoved(at + egui::vec2(8.0 * i as f32, 0.0)));
+            h.step();
+        }
+        h.state_mut().session.run("layer.select", &json!({"layer": rivers})).unwrap();
+        for i in 6..=10 {
+            h.event(egui::Event::PointerMoved(at + egui::vec2(8.0 * i as f32, 0.0)));
+            h.step();
+        }
+        h.event(button(at + egui::vec2(80.0, 0.0), false));
+        h.step();
+        h.run();
+        assert_eq!(weights(&h), (3, 5), "nothing moved on either layer");
+        assert_eq!(h.state().session.undo_depth(), steps, "nothing to undo");
+    }
+
+    /// A label class's clearance (#2828) is shown and set in Position, under Weight: typed, a
+    /// fraction kept; dragged, one step when let go; another layer chosen mid-drag, nothing.
+    #[test]
+    fn a_label_clearance_is_set_in_the_pane() {
+        use egui::accesskit::Role;
+        let mut h = harness(with_cities());
+        h.run();
+        let cities = layer_id(h.state(), "Cities");
+        h.state_mut().session.run("layer.select", &json!({"layer": cities})).unwrap();
+        h.state_mut().session.run("labels.placement", &json!({"layer": cities, "clearance": 7})).unwrap();
+        h.run();
+        open_tab(&mut h, "Position");
+        let clearance =
+            |h: &egui_kittest::Harness<'_, RustGisApp>| h.state().session.map().layer_by_name("Cities").unwrap().labels.default.clearance;
+        let shown = h.get_by_role_and_label(Role::SpinButton, "Clearance").accesskit_node().numeric_value();
+        assert_eq!(shown, Some(7.0), "the class's clearance");
+        h.get_by_role_and_label(Role::SpinButton, "Clearance").focus();
+        h.run();
+        h.get_by_role_and_label(Role::SpinButton, "Clearance").type_text("9.5");
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert_eq!(clearance(&h), 9.5);
+        // Dragged slowly left over several frames, then let go: four less, in one step.
+        h.state_mut().session.run("labels.placement", &json!({"layer": cities, "clearance": 7})).unwrap();
+        h.run();
+        let steps = h.state().session.undo_depth();
+        let at = h.get_by_role_and_label(Role::SpinButton, "Clearance").rect().center();
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        h.event(egui::Event::PointerMoved(at));
+        h.step();
+        h.event(button(at, true));
+        h.step();
+        for i in 1..=10 {
+            h.event(egui::Event::PointerMoved(at - egui::vec2(4.0 * i as f32, 0.0)));
+            h.step();
+        }
+        h.event(button(at - egui::vec2(40.0, 0.0), false));
+        h.step();
+        h.run();
+        // (A few points of the first move start the drag, so not quite four.)
+        assert!((2.5..4.0).contains(&clearance(&h)), "each frame's part of the drag counts: {}", clearance(&h));
+        assert_eq!(h.state().session.undo_depth(), steps + 1, "a drag is one step");
+        // Another layer chosen mid-drag: the drag is dropped, neither layer's clearance changed
+        // and nothing to undo.
+        let rivers = layer_id(h.state(), "Rivers");
+        let before = clearance(&h);
+        let steps = h.state().session.undo_depth();
+        h.event(egui::Event::PointerMoved(at));
+        h.step();
+        h.event(button(at, true));
+        h.step();
+        for i in 1..=5 {
+            h.event(egui::Event::PointerMoved(at + egui::vec2(8.0 * i as f32, 0.0)));
+            h.step();
+        }
+        h.state_mut().session.run("layer.select", &json!({"layer": rivers})).unwrap();
+        for i in 6..=10 {
+            h.event(egui::Event::PointerMoved(at + egui::vec2(8.0 * i as f32, 0.0)));
+            h.step();
+        }
+        h.event(button(at + egui::vec2(80.0, 0.0), false));
+        h.step();
+        h.run();
+        let m = h.state().session.map();
+        assert_eq!((m.layer(cities).unwrap().labels.default.clearance, m.layer(rivers).unwrap().labels.default.clearance), (before, 2.0));
+        assert_eq!(h.state().session.undo_depth(), steps, "nothing to undo");
+    }
+
+    /// A label class removes its duplicates from Position, under Clearance (#2847): ticked, within
+    /// 200 points; a distance typed, or dragged and let go in one step; unticked, off again.
+    #[test]
+    fn duplicate_labels_are_removed_from_the_pane() {
+        use egui::accesskit::Role;
+        let mut h = harness(with_cities());
+        h.run();
+        let cities = layer_id(h.state(), "Cities");
+        h.state_mut().session.run("layer.select", &json!({"layer": cities})).unwrap();
+        h.run();
+        open_tab(&mut h, "Position");
+        let within = |h: &egui_kittest::Harness<'_, RustGisApp>| {
+            h.state().session.map().layer_by_name("Cities").unwrap().labels.default.remove_duplicates
+        };
+        assert_eq!(within(&h), None);
+        assert!(h.query_by_role_and_label(Role::SpinButton, "Remove duplicates").is_none(), "no distance while off");
+        h.get_by_role_and_label(Role::CheckBox, "Remove duplicates").click();
+        h.run();
+        assert_eq!(within(&h), Some(200.0), "ticked: within 200 points");
+        h.get_by_role_and_label(Role::SpinButton, "Remove duplicates").focus();
+        h.run();
+        h.get_by_role_and_label(Role::SpinButton, "Remove duplicates").type_text("350");
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert_eq!(within(&h), Some(350.0));
+        // Dragged right over several frames, then let go: more, in one step.
+        let steps = h.state().session.undo_depth();
+        let at = h.get_by_role_and_label(Role::SpinButton, "Remove duplicates").rect().center();
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        h.event(egui::Event::PointerMoved(at));
+        h.step();
+        h.event(button(at, true));
+        h.step();
+        for i in 1..=10 {
+            h.event(egui::Event::PointerMoved(at + egui::vec2(4.0 * i as f32, 0.0)));
+            h.step();
+        }
+        h.event(button(at + egui::vec2(40.0, 0.0), false));
+        h.step();
+        h.run();
+        assert!(within(&h).is_some_and(|d| d > 350.0), "dragged further: {:?}", within(&h));
+        assert_eq!(h.state().session.undo_depth(), steps + 1, "a drag is one step");
+        h.get_by_role_and_label(Role::CheckBox, "Remove duplicates").click();
+        h.run();
+        assert_eq!(within(&h), None, "unticked: off");
+    }
+
+    /// Unticked while a typed distance is still being edited (#2847): the click that ends the edit
+    /// leaves removal off, not back on at the typed distance.
+    #[test]
+    fn unticking_remove_duplicates_mid_edit_leaves_it_off() {
+        use egui::accesskit::Role;
+        let mut h = harness(with_cities());
+        h.run();
+        let cities = layer_id(h.state(), "Cities");
+        h.state_mut().session.run("layer.select", &json!({"layer": cities})).unwrap();
+        h.state_mut().session.run("labels.placement", &json!({"layer": cities, "removeDuplicates": 200})).unwrap();
+        h.run();
+        open_tab(&mut h, "Position");
+        h.get_by_role_and_label(Role::SpinButton, "Remove duplicates").focus();
+        h.run();
+        h.get_by_role_and_label(Role::SpinButton, "Remove duplicates").type_text("350");
+        h.run();
+        // The box pressed and let go in one frame: the edit ends in the frame the box changes.
+        let at = h.get_by_role_and_label(Role::CheckBox, "Remove duplicates").rect().center();
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        h.event(egui::Event::PointerMoved(at));
+        h.step();
+        h.event(button(true));
+        h.event(button(false));
+        h.step();
+        h.run();
+        let within = h.state().session.map().layer_by_name("Cities").unwrap().labels.default.remove_duplicates;
+        assert_eq!(within, None, "unticked: off");
     }
 
     /// A line layer's labels can try other places along the line (#1187): the box is there for a

@@ -377,7 +377,7 @@ impl ArcgisSource {
     /// What a read's pages lost, said: Z values only when the layer didn't say it has them, and,
     /// for a view, as counted in the pages read for it, which hold features around it (and those
     /// crossing its cells twice).
-    fn notes(&self, mut losses: crate::esripbf::Losses, view: bool) -> Vec<String> {
+    fn notes(&self, mut losses: crate::esripbf::Losses, view: bool) -> crate::loss::Notes {
         if self.info.zm_dropped {
             losses.with_zm = 0;
         }
@@ -386,12 +386,12 @@ impl ArcgisSource {
         }
         // Features without usable coordinates are left out of a view, not kept.
         let unplaced = std::mem::take(&mut losses.unprojected);
-        let mut notes: Vec<String> =
-            losses.messages().into_iter().map(|n| format!("{n}, counted in the pages read for the view")).collect();
+        let mut notes: crate::loss::Notes =
+            losses.messages().into_iter().map(|n| n.map_text(|t| format!("{t}, counted in the pages read for the view"))).collect();
         if unplaced > 0 {
-            notes.push(format!(
+            notes.push(crate::loss::Note::loss(crate::loss::LossCode::DroppedFeature, format!(
                 "{unplaced} features have coordinates outside their coordinate system, so are left out of the view, counted in the pages read for it"
-            ));
+            )));
         }
         notes
     }
@@ -399,7 +399,9 @@ impl ArcgisSource {
     /// Whether a feature, held in the layer's system, meets a view in longitude/latitude.
     fn meets(&self, g: &crate::Geometry, view: &Extent) -> bool {
         match &self.to_lonlat {
-            Some(t) => crate::io::lonlat_box(g, t).is_some_and(|b| b.intersects(view)),
+            // A place that converts beyond longitude/latitude meets the view where it draws, as a
+            // whole read keeps it (#2032 C2f-4b).
+            Some(t) => crate::io::places_lonlat_extent(g, t).is_some_and(|b| b.intersects(view)),
             None => g.extent().intersects(view),
         }
     }
@@ -600,7 +602,7 @@ impl ArcgisSource {
         let matched = if complete { features.len() as u64 } else { matched };
         let mut notes = self.notes(losses, view.is_some());
         notes.extend(shortfall(short));
-        Ok(Batch { features, matched, complete, skipped, notes: notes.into(), ..Batch::default() })
+        Ok(Batch { features, matched, complete, skipped, notes, ..Batch::default() })
     }
 
     /// A count's answer, or `None` when it isn't fetched yet (noted as missing).
@@ -656,6 +658,11 @@ impl ArcgisSource {
 }
 
 impl FeatureSource for ArcgisSource {
+    /// Its pages' notes count them ([`crate::esripbf::Losses`]).
+    fn says_unplaced_at_open(&self) -> bool {
+        true
+    }
+
     fn info(&self) -> &SourceInfo {
         &self.info
     }
@@ -824,7 +831,7 @@ impl FeatureSource for ArcgisSource {
             let mut notes = self.notes(losses, view.is_some());
             let short = total.saturating_sub(received);
             notes.extend(shortfall(short));
-            Ok(Batch { matched: visited, complete: short == 0, skipped, notes: notes.into(), ..Batch::default() })
+            Ok(Batch { matched: visited, complete: short == 0, skipped, notes, ..Batch::default() })
         }
     }
 }

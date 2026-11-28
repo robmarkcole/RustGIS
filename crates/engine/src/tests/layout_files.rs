@@ -1,5 +1,5 @@
-//! Layout files (`.rgislayout`) read with a format header, so an older RustGIS refuses what it
-//! can't keep (#2277).
+//! Layout files (`.rgislayout`) written and read with a format header, so an older RustGIS
+//! refuses what it can't keep (#2277).
 
 use crate::{Project, Session};
 use serde_json::{Value, json};
@@ -72,4 +72,157 @@ fn a_layout_file_read_from_its_path_is_checked_too() {
     assert!(refused.unwrap_err().contains("layout-element-hologram"));
     opened.unwrap();
     assert_eq!(s.project.layouts.len(), 2);
+}
+
+#[test]
+fn a_layout_file_requiring_scale_bar_details_opens() {
+    let (mut s, bare) = with_layout();
+    s.run("layout.import", &json!({"text": headed(&bare, 2, json!(["layout-scale-bar-details"]))})).unwrap();
+    assert_eq!(s.project.layouts.len(), 2);
+}
+
+#[test]
+fn a_layout_file_requiring_legend_fit_opens() {
+    let (mut s, bare) = with_layout();
+    s.run("layout.import", &json!({"text": headed(&bare, 2, json!(["layout-legend-fit"]))})).unwrap();
+    assert_eq!(s.project.layouts.len(), 2);
+}
+
+#[test]
+fn a_layout_file_requiring_text_block_opens() {
+    let (mut s, bare) = with_layout();
+    s.run("layout.import", &json!({"text": headed(&bare, 2, json!(["layout-text-block"]))})).unwrap();
+    assert_eq!(s.project.layouts.len(), 2);
+}
+
+/// What `layout.save` writes for the layout at `layout`, as text and as a value.
+fn saved_file(s: &mut Session, layout: usize, tag: &str) -> (String, Value) {
+    let path = std::env::temp_dir().join(format!("rustgis-layout-save-{}-{tag}.rgislayout", std::process::id()));
+    let ran = s.run("layout.save", &json!({"layout": layout, "path": path.display().to_string()}));
+    let text = std::fs::read_to_string(&path);
+    let _ = std::fs::remove_file(&path);
+    ran.unwrap();
+    let text = text.unwrap();
+    let value = serde_json::from_str(&text).unwrap();
+    (text, value)
+}
+
+/// A saved layout file requires what its elements use, as the fixture that holds only that layout
+/// requires: the eleven capabilities, two of them at once, and none. Imported into a project without
+/// the layout, it is the same layout, and saved again it is the same file.
+#[test]
+fn a_saved_layout_file_requires_what_its_elements_use_and_reads_back_the_same() {
+    for (name, fixture) in [
+        ("background", include_str!("../../../../schema/fixtures/layout_element_background.rgis")),
+        ("ink", include_str!("../../../../schema/fixtures/layout_element_ink.rgis")),
+        ("wrap", include_str!("../../../../schema/fixtures/layout_element_wrap.rgis")),
+        ("text-block", include_str!("../../../../schema/fixtures/layout_text_block.rgis")),
+        ("data", include_str!("../../../../schema/fixtures/layout_chart_data.rgis")),
+        ("look", include_str!("../../../../schema/fixtures/layout_chart_look.rgis")),
+        ("classes", include_str!("../../../../schema/fixtures/layout_chart_classes.rgis")),
+        ("stack", include_str!("../../../../schema/fixtures/layout_chart_stack.rgis")),
+        ("facing", include_str!("../../../../schema/fixtures/layout_chart_facing.rgis")),
+        ("outline", include_str!("../../../../schema/fixtures/layout_chart_outline.rgis")),
+        ("border", include_str!("../../../../schema/fixtures/layout_frame_border.rgis")),
+        ("section", include_str!("../../../../schema/fixtures/layout_section.rgis")),
+        ("legend-text", include_str!("../../../../schema/fixtures/layout_legend_text.rgis")),
+        ("legend-fit", include_str!("../../../../schema/fixtures/layout_legend_fit.rgis")),
+        ("legend-class-labels", include_str!("../../../../schema/fixtures/layout_legend_class_labels.rgis")),
+        ("legend-counts", include_str!("../../../../schema/fixtures/layout_legend_counts.rgis")),
+        ("scale-grid-text", include_str!("../../../../schema/fixtures/layout_scale_grid_text.rgis")),
+        ("page-color", include_str!("../../../../schema/fixtures/layout_page_color.rgis")),
+        ("plain", include_str!("../../../../schema/fixtures/layout_no_data.rgis")),
+    ] {
+        let project = Project::from_json(fixture).unwrap();
+        // What the fixture was written with, not what this RustGIS works out for it.
+        let expected = serde_json::from_str::<Value>(fixture).unwrap().get("requires").cloned();
+        let layout = serde_json::to_value(&project.layouts[0]).unwrap();
+        let mut s = Session::new(project.clone());
+        let (text, file) = saved_file(&mut s, 0, name);
+        assert_eq!(file["format"], json!(crate::project::FORMAT), "{name}");
+        assert_eq!(file.get("requires").cloned(), expected, "{name}");
+        // Read into the same project without its layout, then saved again.
+        let mut bare = project;
+        bare.layouts.clear();
+        let mut s = Session::new(bare);
+        s.run("layout.import", &json!({"text": text})).unwrap();
+        assert_eq!(serde_json::to_value(&s.project.layouts[0]).unwrap(), layout, "{name}");
+        let (again, _) = saved_file(&mut s, 0, &format!("{name}-again"));
+        assert_eq!(again, text, "{name}");
+    }
+}
+
+/// A layout file holds one layout and no commands: what another layout of the project uses, or a
+/// saved command, is the project's to require, not the file's.
+#[test]
+fn a_layout_file_requires_nothing_for_other_layouts_or_saved_commands() {
+    let mut document: Value = serde_json::from_str(include_str!("../../../../schema/fixtures/layout_element_background.rgis")).unwrap();
+    document["tasks"] = json!([{"name": "Task", "steps": [{"title": "Wrap", "command": "layout.addElement", "params": {"kind": "text", "text": "A", "wrap": true}}]}]);
+    let mut s = Session::new(Project::from_json(&document.to_string()).unwrap());
+    s.run("layout.new", &json!({"page": "a4", "template": "map"})).unwrap();
+    let project = serde_json::to_value(&s.project).unwrap();
+    assert_eq!(project["requires"], json!(["layout-element-wrap", "layout-element-background"]));
+    let (_, background) = saved_file(&mut s, 0, "other-background");
+    assert_eq!(background["requires"], json!(["layout-element-background"]));
+    let (_, plain) = saved_file(&mut s, 1, "other-plain");
+    assert_eq!(plain["format"], json!(crate::project::FORMAT));
+    assert!(plain.get("requires").is_none(), "{plain}");
+}
+
+/// A layout file with a scale bar that has details requires `layout-scale-bar-details`, so an
+/// older RustGIS refuses it instead of drawing a plain bar; a plain bar's file requires nothing.
+#[test]
+fn a_layout_file_with_scale_bar_details_says_so_in_its_header() {
+    let (mut s, _) = with_layout();
+    s.run("layout.addElement", &json!({"kind": "scaleBar"})).unwrap();
+    let (_, plain) = saved_file(&mut s, 0, "plain-bar");
+    assert_eq!(plain["format"], json!(crate::project::FORMAT));
+    assert!(plain.get("requires").is_none(), "{plain}");
+    s.run("layout.new", &json!({"page": "a4", "template": "map"})).unwrap();
+    s.run("layout.addElement", &json!({"kind": "scaleBar", "subdivisions": 4})).unwrap();
+    assert!(s.project.layouts[1].elements.iter().any(|e| e.kind.scale_bar_uses_details()));
+    let (text, detailed) = saved_file(&mut s, 1, "detailed-bar");
+    assert_eq!(detailed["requires"], json!(["layout-scale-bar-details"]));
+    // This RustGIS reads it back.
+    s.run("layout.import", &json!({"text": text})).unwrap();
+    assert!(s.project.layouts[2].elements.iter().any(|e| e.kind.scale_bar_uses_details()));
+}
+
+/// A layout file with a legend that fits its box, leaves its layer names off or has more than
+/// three columns requires `layout-legend-fit`, so an older RustGIS refuses it instead of drawing the
+/// legend as set by hand, named and in three columns; a plain legend's file requires nothing.
+#[test]
+fn a_layout_file_with_a_fitted_legend_says_so_in_its_header() {
+    let (mut s, _) = with_layout();
+    let legend = s.project.layouts[0].elements.iter().find(|e| e.kind.code() == "legend").unwrap().id;
+    let (_, plain) = saved_file(&mut s, 0, "plain-legend");
+    assert_eq!(plain["format"], json!(crate::project::FORMAT));
+    assert!(plain.get("requires").is_none(), "{plain}");
+    s.run("layout.update", &json!({"element": legend, "fit": "adjustColumns"})).unwrap();
+    assert!(s.project.layouts[0].elements.iter().any(|e| e.kind.legend_uses_fit()));
+    let (text, fitted) = saved_file(&mut s, 0, "fitted-legend");
+    assert_eq!(fitted["requires"], json!(["layout-legend-fit"]));
+    // This RustGIS reads it back.
+    s.run("layout.import", &json!({"text": text})).unwrap();
+    assert!(s.project.layouts[1].elements.iter().any(|e| e.kind.legend_uses_fit()));
+}
+
+/// A layout file with a text placed down its box, spaced or cased requires `layout-text-block`, so
+/// an older RustGIS refuses it instead of drawing the text at the top, at the usual spacing and as
+/// typed; a plain text's file requires nothing.
+#[test]
+fn a_layout_file_with_a_text_block_says_so_in_its_header() {
+    let (mut s, _) = with_layout();
+    s.run("layout.addElement", &json!({"kind": "text"})).unwrap();
+    let (_, plain) = saved_file(&mut s, 0, "plain-text");
+    assert_eq!(plain["format"], json!(crate::project::FORMAT));
+    assert!(plain.get("requires").is_none(), "{plain}");
+    s.run("layout.new", &json!({"page": "a4", "template": "map"})).unwrap();
+    s.run("layout.addElement", &json!({"kind": "text", "case": "upper"})).unwrap();
+    assert!(s.project.layouts[1].elements.iter().any(|e| e.kind.text_uses_block()));
+    let (text, cased) = saved_file(&mut s, 1, "cased-text");
+    assert_eq!(cased["requires"], json!(["layout-text-block"]));
+    // This RustGIS reads it back.
+    s.run("layout.import", &json!({"text": text})).unwrap();
+    assert!(s.project.layouts[2].elements.iter().any(|e| e.kind.text_uses_block()));
 }

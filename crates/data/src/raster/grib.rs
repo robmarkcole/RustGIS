@@ -2,19 +2,27 @@
 //! without GDAL. Each field is a band.
 //!
 //! Read: editions 1 and 2, simple packing (GRIB1's grid point data with simple packing, GRIB2's
-//! data representation template 5.0), on a regular latitude/longitude grid (GRIB1 data
-//! representation type 0, GRIB2 grid definition template 3.0), in any scanning order, with or
-//! without a bitmap. Following WMO's Manual on Codes (WMO-No. 306), Volume I.2, FM 92 GRIB.
+//! data representation template 5.0) and GRIB2's complex packing, with or without spatial
+//! differencing (5.2 and 5.3), on a regular latitude/longitude grid (GRIB1 data representation
+//! type 0, GRIB2 grid definition template 3.0), in any scanning order, with or without a bitmap.
+//! Following WMO's Manual on Codes (WMO-No. 306), Volume I.2, FM 92 GRIB.
 //!
-//! Not read yet, and said: complex, JPEG 2000, PNG and the other packings; other grids (Gaussian,
-//! rotated, projected, quasi-regular). A message the reader can't read is left out with a notice
-//! naming why; a file with nothing it can read is an error naming why.
+//! Not read yet, and said: GRIB1's second-order packing, JPEG 2000, PNG, CCSDS and the other
+//! packings; other grids (Gaussian, rotated, projected, quasi-regular). A message the reader can't
+//! read is left out with a notice naming why; a file with nothing it can read is an error naming
+//! why.
 //!
 //! The fields on the grid of the first one read are the raster's bands, in file order; fields on
 //! another grid are left out with a notice. Values are `(R + X × 2^E) / 10^D`, in the units the
 //! file stores (kelvin stays kelvin), unpacked in `f64`; those `f32` changes are counted in
-//! [`Raster::rounded`]. Points a bitmap masks are NaN. Rows are laid out north up,
-//! and a grid round the whole globe runs from −180° (as GDAL lays it out).
+//! [`Raster::rounded`]. Points a bitmap masks, or complex packing marks missing, are NaN.
+//! Rows are laid out north up, and a grid round the whole globe runs from −180° (as GDAL lays it
+//! out).
+
+mod complex;
+mod rows;
+
+pub use rows::{HEAD, Plan, Rows, cut, plan};
 
 use super::{Crs, Exact, GeoTransform, Raster, Uncounted, max_samples};
 use crate::{DataError, Result};
@@ -204,7 +212,10 @@ fn read_limited<R: Read + Seek>(mut source: R, name: &str, sidecar_nodata: Optio
         return Err(bad(if skipped.cut > 0 { "the first message is cut short" } else { "no GRIB message in the file" }));
     }
     if fields.is_empty() {
-        return Err(bad(format!("nothing in it can be read here: {}", skipped.notes(limit).join("; "))));
+        return Err(bad(format!(
+            "nothing in it can be read here: {}",
+            skipped.notes(limit).iter().map(|n| n.as_str()).collect::<Vec<_>>().join("; ")
+        )));
     }
     // Each grid's notices, once: grids at the same places may still say different things (one
     // laid out from BAM's latitudes, one not). Past [`MAX_REASONS`] of them, the fields with more
@@ -500,35 +511,39 @@ impl Skipped {
         tally(&mut self.damage, why);
     }
 
-    fn notes(&self, limit: usize) -> Vec<String> {
-        let mut out: Vec<String> = self.reasons.iter().map(|(r, n)| format!("{} left out: {r}, not read yet", count(*n))).collect();
-        out.extend(self.damage.iter().map(|(r, n)| format!("{} left out: damaged ({r})", count(*n))));
+    /// Fields and messages left out are lost, with their codes (those past a memory limit as
+    /// such); bytes that aren't GRIB are passed over, plain.
+    fn notes(&self, limit: usize) -> Vec<crate::loss::Note> {
+        use crate::loss::{LossCode, Note};
+        let feature = |t: String| Note::loss(LossCode::DroppedFeature, t);
+        let mut out: Vec<Note> = self.reasons.iter().map(|(r, n)| feature(format!("{} left out: {r}, not read yet", count(*n)))).collect();
+        out.extend(self.damage.iter().map(|(r, n)| feature(format!("{} left out: damaged ({r})", count(*n)))));
         out.extend(self.messages.iter().map(|(r, n)| {
             let what = if *n == 1 { "1 message".to_string() } else { format!("{n} messages") };
-            format!("{what} left out: {r}")
+            feature(format!("{what} left out: {r}"))
         }));
         if self.other_grid > 0 {
-            out.push(format!("{} left out: on another grid than the first field's", count(self.other_grid)));
+            out.push(feature(format!("{} left out: on another grid than the first field's", count(self.other_grid))));
         }
         if self.over_limit > 0 {
-            out.push(format!(
+            out.push(Note::loss(LossCode::DroppedOverLimit, format!(
                 "{} left out: the bands read hold the most this computer keeps in memory ({limit} values); split the file with a GRIB tool (wgrib2 or CDO) and add its parts",
                 count(self.over_limit)
-            ));
+            )));
         }
         if self.too_long > 0 {
-            out.push(format!(
+            out.push(Note::loss(LossCode::DroppedOverLimit, format!(
                 "{} left out: their message is larger than the memory left lets be read whole, even where one of its fields would fit; split the file with a GRIB tool (wgrib2 or CDO) and add its parts",
                 count(self.too_long)
-            ));
+            )));
         }
         if self.cut > 0 {
-            out.push("the file ends inside a message, which is left out".to_string());
+            out.push(feature("the file ends inside a message, which is left out".to_string()));
         }
         if self.junk == 1 {
-            out.push("1 byte outside its messages isn't GRIB, and is passed over".to_string());
+            out.push(Note::plain("1 byte outside its messages isn't GRIB, and is passed over"));
         } else if self.junk > 1 {
-            out.push(format!("{} bytes outside its messages aren't GRIB, and are passed over", self.junk));
+            out.push(Note::plain(format!("{} bytes outside its messages aren't GRIB, and are passed over", self.junk)));
         }
         out
     }
@@ -694,7 +709,8 @@ fn round6(v: f64) -> f64 {
     (v * 1e6).round() / 1e6
 }
 
-/// One field: its band name, grid and values in scanning order (NaN where a bitmap masks).
+/// One field: its band name, grid and values in scanning order (NaN where a bitmap masks, or the
+/// packing marks them missing).
 struct Field {
     name: String,
     grid: Grid,
@@ -762,10 +778,18 @@ fn to_raster(fields: Vec<Field>, name: &str) -> Result<Raster> {
         r.rounded = rounded;
     }
     if past > 0 {
-        let (what, has) = if past == 1 { ("1 value".to_string(), "has") } else { (format!("{past} values"), "have") };
-        r.lost.push(format!("{what} past the range of 32-bit floats (±3.4 × 10^38) {has} no value"));
+        r.lost.push(past_note(past));
     }
     Ok(r)
+}
+
+/// What says values past `f32`'s range, in every notice about them.
+const PAST: &str = "past the range of 32-bit floats (±3.4 × 10^38)";
+
+/// The notice of `past` values past `f32`'s range, which have no value.
+fn past_note(past: u64) -> crate::loss::Note {
+    let (what, has) = if past == 1 { ("1 value".to_string(), "has") } else { (format!("{past} values"), "have") };
+    crate::loss::Note::loss(crate::loss::LossCode::DroppedValue, format!("{what} {PAST} {has} no value"))
 }
 
 /// Octets `o..o + n` (0-based offset `o`) of `b`, unsigned, big-endian; 0 past the end.
@@ -780,6 +804,17 @@ fn signed(b: &[u8], o: usize, n: usize) -> i64 {
     if v & sign != 0 { -(v & (sign - 1)) } else { v }
 }
 
+/// The `n` bits (at most 32) of `b` from bit `at`, unsigned, big-endian; 0 past the end.
+fn bits(b: &[u8], at: u64, n: u32) -> u64 {
+    if n == 0 {
+        return 0;
+    }
+    // The 8 octets from the value's first: at most 7 bits before it, and its 32 at most.
+    let byte = (at / 8) as usize;
+    let word = (0..8).fold(0u64, |w, i| (w << 8) | u64::from(b.get(byte + i).copied().unwrap_or(0)));
+    (word << (at % 8)) >> (64 - n)
+}
+
 /// An IBM System/360 single-precision number (GRIB1's reference value).
 fn ibm(v: u32) -> f64 {
     let sign = if v & 0x8000_0000 != 0 { -1.0 } else { 1.0 };
@@ -789,18 +824,19 @@ fn ibm(v: u32) -> f64 {
 }
 
 /// The `points` values of a field in scanning order, written straight into one vector: the
-/// `count` values `next` gives (in `f64`), held as `f32`, over the points a bitmap keeps (NaN at
-/// the others), or all of them without one. Also how many of them `f32` rounded, and how many
-/// are past its range (about ±3.4 × 10^38, `f64`'s too): those have no value (NaN) rather than
-/// an infinity. A sidecar's no-data value isn't counted either way ([`Uncounted`]'s rule), and
-/// neither is a point of a repeated first column (`grid`'s, which [`to_raster`] doesn't lay out).
+/// `count` values `next` gives (in `f64`; a missing one, `None`, is NaN), held as `f32`, over the
+/// points a bitmap keeps (NaN at the others), or all of them without one. Also how many of them
+/// `f32` rounded, and how many are past its range (about ±3.4 × 10^38, `f64`'s too): those have no
+/// value (NaN) rather than an infinity. A sidecar's no-data value isn't counted either way
+/// ([`Uncounted`]'s rule), and neither is a point of a repeated first column (`grid`'s, which
+/// [`to_raster`] doesn't lay out).
 /// The values are never held apart from the field, so it costs 4 bytes a point.
 fn field_values(
     (points, grid): (usize, &Grid),
     mask: Option<&[u8]>,
     count: usize,
     uncounted: Uncounted,
-    mut next: impl FnMut() -> f64,
+    mut next: impl FnMut() -> Option<f64>,
 ) -> std::result::Result<(Vec<f32>, u64, u64), Skip> {
     match mask {
         None if count != points => return Err(Skip::Damaged("a field whose values don't fill its grid".to_string())),
@@ -817,7 +853,10 @@ fn field_values(
         let kept = mask.is_none_or(|bits| bits.get(k / 8).is_some_and(|b| b & (0x80 >> (k % 8)) != 0));
         if kept && left > 0 {
             left -= 1;
-            let wide = next();
+            let Some(wide) = next() else {
+                out.push(f32::NAN);
+                continue;
+            };
             let v = wide as f32;
             let laid = u64::from(!repeats || grid.place(k).0 < columns);
             match uncounted.decides(v, || Some(Exact::Float(wide))) {
@@ -849,6 +888,20 @@ fn field_values(
 /// ([`field_values`]); with fewer bits there than that, an error.
 fn unpack(
     data: &[u8],
+    packed: (usize, u32),
+    scale: (f64, i64, i64),
+    mask: Option<&[u8]>,
+    at: (usize, &Grid),
+    uncounted: Uncounted,
+) -> std::result::Result<(Vec<f32>, u64, u64), Skip> {
+    unpack_from(data, 0, packed, scale, mask, at, uncounted)
+}
+
+/// [`unpack`], the first value starting `skip` bits into `data` (a run of rows cut from a data
+/// section starts inside an octet when a row isn't a whole number of them).
+fn unpack_from(
+    data: &[u8],
+    skip: u32,
     (count, bits): (usize, u32),
     (r, e, d): (f64, i64, i64),
     mask: Option<&[u8]>,
@@ -858,11 +911,42 @@ fn unpack(
     if bits > MAX_BITS {
         return Err(Skip::Other(format!("values of {bits} bits")));
     }
-    let need = (count as u64).saturating_mul(u64::from(bits)).div_ceil(8);
+    let need = (count as u64).saturating_mul(u64::from(bits)).saturating_add(u64::from(skip)).div_ceil(8);
     if (data.len() as u64) < need {
         return Err(Skip::Damaged("a data section shorter than its values".to_string()));
     }
     reference(r)?;
+    let scale = scaling(r, e, d);
+    let mut bit = u64::from(skip);
+    field_values(at, mask, count, uncounted, || {
+        let x = self::bits(data, bit, bits) as f64;
+        bit += u64::from(bits);
+        Some(scale(x))
+    })
+}
+
+/// [`unpack`] for complex packing ([`complex`]): `count` values from `data`, some of which it may
+/// mark missing.
+fn unpack_complex(
+    data: &[u8],
+    (count, packing): (usize, complex::Complex),
+    (r, e, d): (f64, i64, i64),
+    mask: Option<&[u8]>,
+    at: (usize, &Grid),
+    uncounted: Uncounted,
+) -> std::result::Result<(Vec<f32>, u64, u64), Skip> {
+    reference(r)?;
+    let mut values = packing.values(data, count)?;
+    let scale = scaling(r, e, d);
+    let field = field_values(at, mask, count, uncounted, || values.next().map(&scale))?;
+    if values.too_large {
+        return Err(Skip::Damaged("differences that add up past any packed value".to_string()));
+    }
+    Ok(field)
+}
+
+/// What a packed value X stands for, `(R + X × 2^E) / 10^D`.
+fn scaling(r: f64, e: i64, d: i64) -> impl Fn(f64) -> f64 {
     // 2^E and 10^D, where `f64` holds them. Past that (no producer writes such an E or D, but
     // they are kept), `R + X × 2^E` is divided by [`scaled_by`] where `f64` holds it (so a sum of
     // 0 stays 0); where it is past `f64` but the division brings it back, the value is made as
@@ -871,13 +955,7 @@ fn unpack(
     let two = (-1000..=1000).contains(&e).then(|| 2f64.powi(e as i32));
     let ten = decimal(d);
     let (base, step) = (scaled_by(r, 0, d), scaled_by(1.0, e, d));
-    let mut bit = 0u64;
-    field_values(at, mask, count, uncounted, || {
-        // The 8 octets from the value's first: at most 7 bits before it, and its 32 at most.
-        let byte = (bit / 8) as usize;
-        let word = (0..8).fold(0u64, |w, i| (w << 8) | u64::from(data.get(byte + i).copied().unwrap_or(0)));
-        let x = ((word << (bit % 8)) >> (64 - bits)) as f64;
-        bit += u64::from(bits);
+    move |x| {
         // X = 0 is R whatever E is (never 0 × ∞).
         let sum = if x == 0.0 { r } else { two.map_or(f64::INFINITY, |s| r + x * s) };
         let wide = ten.map_or(f64::INFINITY, |ten| sum / ten);
@@ -890,7 +968,7 @@ fn unpack(
         } else {
             base + x * step
         }
-    })
+    }
 }
 
 /// 10^`d`, the decimal scale factor's divisor, where `f64` holds it at full precision.
@@ -942,7 +1020,7 @@ fn constant(
     reference(r)?;
     // As in `unpack`: an `R` that isn't 0 divided down to 0 is counted as rounded.
     let v = decimal(d).map(|ten| r / ten).filter(|v| *v != 0.0 || r == 0.0).unwrap_or_else(|| scaled_by(r, 0, d));
-    field_values(at, mask, count, uncounted, || v)
+    field_values(at, mask, count, uncounted, || Some(v))
 }
 
 /// `n` bitmap bits set among the first `points`.
@@ -975,19 +1053,7 @@ fn grib1(b: &[u8], room: usize, first: Option<Grid>, uncounted: Uncounted) -> st
         return Err(Skip::Other(format!("predefined grids (grid {})", pds[6])));
     }
     let d = signed(pds, 26, 2);
-    let century = i64::from(pds[24]);
-    let year = (century - 1) * 100 + i64::from(pds[12]);
-    let name = format!(
-        "{}:kpds5={}:kpds6={}:kpds7={}:TR={}:P1={}:P2={}:TimeU={}",
-        date(year, u32::from(pds[13]), u32::from(pds[14]), u32::from(pds[15])),
-        pds[8],
-        pds[9],
-        be(pds, 10, 2),
-        pds[20],
-        pds[18],
-        pds[19],
-        pds[17],
-    );
+    let name = grib1_name(pds);
     let gds_at = 8 + pds.len();
     let gds = section1(b, gds_at)?;
     let grid = grib1_grid(gds)?;
@@ -1033,6 +1099,23 @@ fn grib1(b: &[u8], room: usize, first: Option<Grid>, uncounted: Uncounted) -> st
         unpack(data, (count, bits), (r, e, d), bitmap, (points, &grid), uncounted)?
     };
     Ok(Field { name, grid, values, rounded, past })
+}
+
+/// A GRIB1 field's band name, from its product definition section (of 28 octets or more).
+fn grib1_name(pds: &[u8]) -> String {
+    let octet = |o: usize| pds.get(o).copied().unwrap_or(0);
+    let year = (i64::from(octet(24)) - 1) * 100 + i64::from(octet(12));
+    format!(
+        "{}:kpds5={}:kpds6={}:kpds7={}:TR={}:P1={}:P2={}:TimeU={}",
+        date(year, u32::from(octet(13)), u32::from(octet(14)), u32::from(octet(15))),
+        octet(8),
+        octet(9),
+        be(pds, 10, 2),
+        octet(20),
+        octet(18),
+        octet(19),
+        octet(17),
+    )
 }
 
 /// A GRIB1 grid description section: a regular latitude/longitude grid only.
@@ -1125,7 +1208,7 @@ fn grib2(b: &[u8], room: usize, mut first: Option<Grid>, uncounted: Uncounted) -
     let mut reference = String::from("d=?");
     let mut grid: Option<std::result::Result<Grid, Skip>> = None;
     let mut product: Option<String> = None;
-    let mut packing: Option<std::result::Result<(usize, f64, i64, i64, u32), Skip>> = None;
+    let mut packing: Option<std::result::Result<(usize, f64, i64, i64, Packing), Skip>> = None;
     let mut bitmap: Option<std::result::Result<Option<&[u8]>, Skip>> = None;
     let mut previous_bitmap: Option<&[u8]> = None;
     let mut held = 0usize;
@@ -1190,7 +1273,7 @@ fn grib2(b: &[u8], room: usize, mut first: Option<Grid>, uncounted: Uncounted) -
                 let field = (|| {
                     let grid = grid.clone().ok_or_else(|| Skip::Damaged("a field without a grid".to_string()))??;
                     let product = product.ok_or_else(|| Skip::Damaged("a field without its product definition".to_string()))?;
-                    let (count, r, e, d, bits) = packing.ok_or_else(|| Skip::Damaged("a field without its packing".to_string()))??;
+                    let (count, r, e, d, packing) = packing.ok_or_else(|| Skip::Damaged("a field without its packing".to_string()))??;
                     let mask = bitmap.ok_or_else(|| Skip::Damaged("a field without its bitmap section".to_string()))??;
                     if first.is_some_and(|g| !g.same(&grid)) {
                         return Err(Skip::OtherGrid);
@@ -1199,10 +1282,11 @@ fn grib2(b: &[u8], room: usize, mut first: Option<Grid>, uncounted: Uncounted) -
                     if mask.is_some_and(|m| kept(m, points) != count) || (mask.is_none() && count != points) {
                         return Err(Skip::Damaged("a field whose values don't fill its grid".to_string()));
                     }
-                    let (values, rounded, past) = if bits == 0 {
-                        constant((r, d), count, mask, (points, &grid), uncounted)?
-                    } else {
-                        unpack(s.get(5..).unwrap_or_default(), (count, bits), (r, e, d), mask, (points, &grid), uncounted)?
+                    let (data, at) = (s.get(5..).unwrap_or_default(), (points, &grid));
+                    let (values, rounded, past) = match packing {
+                        Packing::Simple(0) => constant((r, d), count, mask, at, uncounted)?,
+                        Packing::Simple(bits) => unpack(data, (count, bits), (r, e, d), mask, at, uncounted)?,
+                        Packing::Complex(p) => unpack_complex(data, (count, p), (r, e, d), mask, at, uncounted)?,
                     };
                     held += points;
                     first.get_or_insert(grid);
@@ -1337,13 +1421,21 @@ fn scaled(s: &[u8], o: usize, value_signed: bool) -> String {
     round6(v / 10f64.powi(signed(s, o, 1) as i32)).to_string()
 }
 
-/// A GRIB2 data representation section: template 5.0 (simple packing) only, as the number of
-/// values, R, E, D and the bits a value.
-fn grib2_packing(s: &[u8]) -> std::result::Result<(usize, f64, i64, i64, u32), Skip> {
+/// How a GRIB2 field's values are packed.
+#[derive(Clone, Copy)]
+enum Packing {
+    /// Simple packing (template 5.0), in this many bits a value (0: a constant field).
+    Simple(u32),
+    /// Complex packing (templates 5.2 and 5.3).
+    Complex(complex::Complex),
+}
+
+/// A GRIB2 data representation section (templates 5.0, 5.2 and 5.3): the number of values, R, E, D
+/// and the packing.
+fn grib2_packing(s: &[u8]) -> std::result::Result<(usize, f64, i64, i64, Packing), Skip> {
     let template = be(s, 9, 2);
-    if template != 0 {
+    if !matches!(template, 0 | 2 | 3) {
         let kind = match template {
-            2 | 3 => "complex packing",
             4 => "IEEE floating point",
             40 => "JPEG 2000",
             41 => "PNG",
@@ -1355,8 +1447,9 @@ fn grib2_packing(s: &[u8]) -> std::result::Result<(usize, f64, i64, i64, u32), S
     if s.len() < 21 {
         return Err(Skip::Damaged("a damaged data representation section".to_string()));
     }
+    let packing = if template == 0 { Packing::Simple(u32::from(s[19])) } else { complex::Complex::of(s, template)? };
     let r = f64::from(f32::from_bits(be(s, 11, 4)));
-    Ok((be(s, 5, 4) as usize, r, signed(s, 15, 2), signed(s, 17, 2), u32::from(s[19])))
+    Ok((be(s, 5, 4) as usize, r, signed(s, 15, 2), signed(s, 17, 2), packing))
 }
 
 #[cfg(test)]

@@ -699,6 +699,29 @@ the way, once for each document at most, and a map layer is added by the run tha
 16 documents are read at a time, and asking for more fails. In the web app
 `service.add` still refuses to download.
 
+`overture.add` does the same on the desktop when it adds an area's files: each GeoParquet file is
+left to download as `layer.addUrl` does, and while any is under way it answers `{"pending": true,
+"files": n, "layers": [...]}` (the layers already in; none on the first run), so the command can
+return and runs again once they are added, when `overture.add` answers the ids of the layers it
+added. Where it adds the files in the same run (the command line, the assistant) it adds all of an
+area's files or none. When they are left to download, a file that fails stops the command with an
+error that says how many landed before it. Those stay, each its own undo step.
+It also fetches the catalog on each run, which waits with the window held.
+
+`cube.reduce` and `cube.trend` over a STAC collection (`"collection"`, or a catalogue's `"cube"`
+entry of one) do the same on the desktop: the call checks its parameters and searches the
+collection, with the window held as before, then answers `{"pending": true}` and leaves the slices
+to read on a thread of their own. The status bar names the command, with the read's progress and a
+Cancel. Once the read has landed the command runs again, and the same call, with the same
+parameters, adds the layers at once and answers them as it would have (`{"layers", "dates"}`):
+they are part of the command's own undo step. Cancelled, or failed, the read is that call's error.
+Several in one call are read one after another, and the command runs again once all have landed;
+up to 4 wait at a time, read or landed, and asking for more fails. Their layers are made on the
+read's thread and held in memory until the command has run again, which adds those same layers; a
+read that would hold more than the memory there is room for is refused, saying to take a smaller
+area or a coarser cell size. A project opened meanwhile stops the reads of the one before. A cube of layers, bands or a Zarr store is read in the call, as before, and
+`rustgis-cli`, a script or a task waits for the read.
+
 While a command waits the window answers, so the user can work and the project can change. The
 status bar says the command is running, and asking for it again with the same parameters does
 nothing. A run again sees the view the command first ran with, and the window's size then, unless
@@ -759,6 +782,14 @@ that needs it left out.
   `host.fetch` answers from what was kept. A command that walks a chain of documents, each
   address taken from the one before, runs once per step, up to 64 times. The browser follows
   redirects itself, and the server must allow requests from web pages (CORS).
+
+The commands a plugin runs follow the same rule. A web address it gives one that connects (the
+`url` of `stac.search`, `portal.add`, `layer.addUrl`, `map.addTiles` or `osm.download`, a portal's
+address, a service or catalogue to discover) must be on the internet, or the command is refused
+before anything is read. Every request such a command makes connects only to the internet,
+wherever its name resolves: the address itself, the requests made from it (a listing, a search,
+the next page), those a saved connection sends, and the documents read from it, any `text` the
+plugin supplies and everything they name.
 
 Use `host::call("host.fetch", json!({"url": url}))` in the Rust SDK, or
 `host::call("host.fetch", json!({"url": url, "json": false}))` for the text only.

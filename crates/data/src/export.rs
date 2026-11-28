@@ -76,7 +76,7 @@ pub struct Exported {
     /// empty for the other formats).
     pub written_values: Vec<usize>,
     /// GeoParquet timestamp representation changes counted during export.
-    pub date_messages: Vec<String>,
+    pub date_messages: Vec<crate::loss::Note>,
     /// What reading the source lost or assumed besides the counts above
     /// ([`crate::source::Batch::notes`]), said as they are.
     pub read_notes: crate::loss::Notes,
@@ -303,7 +303,7 @@ fn write_chunks_as(
             if let Some(t) = &t {
                 // Counted by the source scan, so only stopped on a cancel here. A feature with a
                 // place the export's system can't hold is written without its geometry, and said.
-                unplaced = unplaced.saturating_add(project_each_leaving_out(&mut chunk, t, false)?);
+                unplaced = unplaced.saturating_add(project_each_leaving_out(&mut chunk, t, false)?.0);
             }
             total = total.saturating_add(chunk.len());
             null_numbers = null_numbers.saturating_add(numbers_written_as_null(&chunk, &layer.fields, ext));

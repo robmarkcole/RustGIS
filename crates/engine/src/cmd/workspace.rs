@@ -219,19 +219,27 @@ pub fn commands() -> Vec<C> {
             r#"{"layer": elevation raster, "samples"?: number (default 200), "points": [[lon, lat], [lon, lat]] (the line crossed), "at"?: 0..1 along it, "width"?: metres}"#,
         ),
         C::new("profile.alongLine", "Profile Along a Line", "View › Profile Viewing", |s, p| {
-            let lines = selected_lines(s, p, false)?;
+            let (lines, _) = selected_lines(s, p, false)?;
             let first = lines.into_iter().next().ok_or("no line")?;
             profile(s, p, &first)
         }).inputs(profile_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
         .view()
         .params(r#"{"layer": elevation raster, "samples"?: number (default 200), "lines": line layer, "row"?: number (the first selected when omitted)}"#),
         C::new("profile.alongSelected", "Profile Along Selected Lines", "View › Profile Viewing", |s, p| {
-            let lines = selected_lines(s, p, true)?;
+            let (lines, unplaced) = selected_lines(s, p, true)?;
             // The lines past the first 50 get no profile, and that is said (#1896).
             if lines.len() > MAX_PROFILED_LINES {
                 s.notify(format!("Profile Along Selected Lines: the first {MAX_PROFILED_LINES} of the {} lines are profiled", lines.len()), false);
             }
             let out: Vec<Value> = lines.iter().take(MAX_PROFILED_LINES).map(|l| profile(s, p, l)).collect::<Result<_, _>>()?;
+            if unplaced > 0 {
+                s.say(rustgis_data::loss::Note::loss(
+                    rustgis_data::loss::LossCode::DroppedCalculationResult,
+                    format!(
+                        "Profile Along Selected Lines: {unplaced} line(s) have a place that can't be given in longitude/latitude, so they get no profile"
+                    ),
+                ));
+            }
             Ok(Value::Array(out))
         }).inputs(profile_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
         .view()
@@ -247,6 +255,12 @@ pub fn commands() -> Vec<C> {
         C::new("offline.package", "Package for the Field", "Data › Offline", |s, p| {
             let written = s.notice_mark();
             let path = super::ps(p, "path").ok_or("path is required")?.to_string();
+            // Refused before the package, and its offline area, are made.
+            if s.downloads_files() {
+                return Err(format!(
+                    "{path}: the web app can't write a field package to a path, from a script or the Assistant either; use Package for the Field on the ribbon, which downloads it"
+                ));
+            }
             super::field::not_the_project(s, std::path::Path::new(&path))?;
             let had = s.project.offline_areas.len();
             let (area, bytes, notes) = super::field::package_output(s, p)?;
@@ -279,6 +293,7 @@ pub fn commands() -> Vec<C> {
         C::new("offline.remove", "Remove", "Data › Offline", |s, p| {
             let n = ps(p, "name").ok_or("name is required")?;
             let ai = s.project.offline_areas.iter().position(|a| a.name.eq_ignore_ascii_case(n)).ok_or_else(|| format!("no offline area '{n}'"))?;
+            let named = super::layout::maps_layouts_name(&s.project);
             let area = s.project.offline_areas.remove(ai);
             let kept = offline_map_index(&s.project, &area);
             // A copy kept as the only map is no longer the area's: neither its saved association
@@ -288,10 +303,11 @@ pub fn commands() -> Vec<C> {
                     m.offline_area_id = None;
                 }
             }
+            let mut gone = None;
             if let Some(i) = kept
                 && s.project.maps.len() > 1
             {
-                s.project.maps.remove(i);
+                gone = Some(s.project.maps.remove(i).name);
                 // The active map stays the same map; if it was the removed one, a neighbour.
                 let a = s.project.active_map;
                 s.project.active_map = if a > i { a - 1 } else { a.min(s.project.maps.len().saturating_sub(1)) };
@@ -306,6 +322,10 @@ pub fn commands() -> Vec<C> {
                 // Layouts, presentations and other areas made from it follow, as on a rename.
                 super::navigate::follow_renamed_map(s, &old, &kept);
                 s.notify(format!("The offline area's map was the only one, so it was kept as '{kept}'"), false);
+            }
+            super::layout::say_map_texts(s, &named);
+            if let Some(gone) = gone {
+                super::presentation::say_pages_without_their_map(s, super::presentation::PagesOf::Map(&gone));
             }
             Ok(Value::Null)
         }).roles(&[]).effects(crate::policy::Effects::NONE)
@@ -554,7 +574,9 @@ fn profile(s: &Session, p: &Value, path: &[Coord]) -> CmdResult {
     Ok(json!({"length": prof.last().map_or(0.0, |x| x.0), "min": lo, "max": hi, "gain": gain, "loss": loss, "samples": rows}))
 }
 
-fn selected_lines(s: &Session, p: &Value, all: bool) -> Result<Vec<Vec<Coord>>, String> {
+/// The chosen lines of the line layer `lines` names, in longitude/latitude, and how many of them
+/// were left out as a place of theirs can't be given there. Refused when none is left.
+fn selected_lines(s: &Session, p: &Value, all: bool) -> Result<(Vec<Vec<Coord>>, usize), String> {
     let n = profile_lines(p)?;
     let l =
         s.map().layer_by_name(n).filter(|l| l.geometry_type() == GeometryType::Polyline).ok_or_else(|| format!("no line layer '{n}'"))?;
@@ -566,19 +588,26 @@ fn selected_lines(s: &Session, p: &Value, all: bool) -> Result<Vec<Vec<Coord>>, 
     };
     // Sampled in longitude/latitude, whatever system the layer holds its coordinates in.
     let mut out: Vec<Vec<Coord>> = Vec::new();
+    let mut unplaced = 0usize;
     let to = l.dataset.lonlat_conversion().map_err(|e| format!("{n}: {e}"))?;
     for f in rows.iter().filter_map(|r| l.dataset.features.row(*r)) {
         let Some(g) = f.geometry().filter(|g| matches!(g, Geometry::Line(_))) else { continue };
-        if let Geometry::Line(parts) =
-            &*rustgis_data::Dataset::geometry_to_lonlat_by(&to, g).map_err(|e| format!("{n}: feature {}: {e}", f.id()))?
-        {
+        let Some(g) = rustgis_data::Dataset::converted_to_lonlat(&to, g) else {
+            unplaced += 1;
+            continue;
+        };
+        if let Geometry::Line(parts) = &*g {
             let v: Vec<Coord> = parts.iter().flatten().copied().collect();
             if v.len() >= 2 {
                 out.push(v);
             }
         }
     }
-    if out.is_empty() { Err("no usable lines".into()) } else { Ok(out) }
+    match (out.is_empty(), unplaced) {
+        (true, 0) => Err("no usable lines".into()),
+        (true, u) => Err(format!("no usable lines: {u} have a place that can't be given in longitude/latitude")),
+        (false, _) => Ok((out, unplaced)),
+    }
 }
 
 /// Every keyframe-to-keyframe move rendered as PNG frames in a zip.
@@ -1065,13 +1094,37 @@ pub(crate) fn sync_area(s: &mut Session, ai: usize, edited: &rustgis_map::Map, p
             // The source's fields the area hasn't (added there since): a deletion offline loses their
             // values too.
             let source_only: Vec<usize> = (0..sl.dataset.fields.len()).filter(|j| !to_source.contains(&Some(*j))).collect();
-            let held = (sl.dataset.coord_crs() != rustgis_data::raster::Crs::LonLat).then(|| sl.dataset.clone());
-            if held.is_some() {
-                sl.dataset = sl.dataset.in_lonlat().map_err(|e| sync_error(&ol.name, e))?.into_owned();
-            }
             // The ids the area held when it was last synced.
             let had: std::collections::HashSet<u64> = base.keys().copied().collect();
             let now_ids: std::collections::HashSet<u64> = ol_ds.features.rows().map(|r| r.id()).collect();
+            let held = (sl.dataset.coord_crs() != rustgis_data::raster::Crs::LonLat).then(|| sl.dataset.clone());
+            if let Some(own) = &held {
+                // A source feature with a place that can't be given in longitude/latitude is read
+                // without its geometry: one outside the area is left as stored (`merged_from_lonlat`
+                // takes it as the source holds it); one the area holds can't be compared, and
+                // refuses the sync, naming it.
+                let (lonlat, unplaced) = own.in_lonlat_leaving_out().map_err(|e| sync_error(&ol.name, e))?;
+                if unplaced > 0
+                    && let Some(fid) = own
+                        .features
+                        .rows()
+                        .zip(lonlat.features.rows())
+                        .find(|(o, l)| {
+                            o.geometry().is_some() && l.geometry().is_none() && (had.contains(&o.id()) || now_ids.contains(&o.id()))
+                        })
+                        .map(|(o, _)| o.id())
+                {
+                    return Err(sync_error(
+                        &ol.name,
+                        format!(
+                            "{}: feature {fid} has a place in {} that can't be given in longitude/latitude, so it can't be compared with the area's",
+                            own.name,
+                            own.coord_crs().label()
+                        ),
+                    ));
+                }
+                sl.dataset = lonlat.into_owned();
+            }
             // The features this sync writes, by their ids in the source: only these are converted
             // back to a held source's system.
             let mut written = std::collections::HashSet::new();

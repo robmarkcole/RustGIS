@@ -25,6 +25,7 @@ nav = [
     "user-guide/editing.md",
     "user-guide/analysis.md",
     "user-guide/expressions.md",
+    "user-guide/loss-codes.md",
     "user-guide/layouts.md",
     "user-guide/sharing.md",
     "user-guide/workspace.md",

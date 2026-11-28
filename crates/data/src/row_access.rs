@@ -102,11 +102,54 @@ impl Features {
     /// Adds a column after the last, holding `value` in every row (Add Field): one new column
     /// when values are kept by column, not a change to every row.
     pub fn add_column(&mut self, value: Value) {
-        for f in self.rows_mut() {
-            // Exactly one more slot: a doubled capacity in every row would cost more than the column.
-            f.attrs.reserve_exact(1);
-            f.attrs.push(value.clone());
+        self.add_columns(1, value);
+    }
+
+    /// Adds `n` columns after the last, each holding `value` in every row: several fields added at
+    /// once, with each row changed once rather than once per field.
+    pub fn add_columns(&mut self, n: usize, value: Value) {
+        // A step that never fails: the change can't stop part way.
+        let done: Result<(), std::convert::Infallible> = self.try_add_columns(n, value, || Ok(()));
+        let Ok(()) = done;
+    }
+
+    /// [`Features::add_columns`], calling `step` before each row (for progress and Cancel); its
+    /// error ends the change there, leaving shared rows as they were and rows of its own with the
+    /// columns in the rows before. A caller that added the fields first drops the dataset on an
+    /// error, as Add Field's table edit does with its copy.
+    ///
+    /// Rows another owner shares (an Undo snapshot) are copied once, each at its new length. Copied
+    /// first and then grown, every row would take a second allocation and leave the first as a gap
+    /// that rows of the same length can't fill: on a large layer, about one more copy of it held
+    /// (#2431). Rows of its own grow in place by exactly `n`, even while a cache holds their
+    /// [`Features::allocation_key`]: that key stops matching, and nothing is copied.
+    pub fn try_add_columns<E>(&mut self, n: usize, value: Value, mut step: impl FnMut() -> Result<(), E>) -> Result<(), E> {
+        if n == 0 {
+            return Ok(());
         }
+        let added = std::iter::repeat_n(value, n);
+        // The strong count, not `Arc::get_mut`, which also refuses while a cache's weak key is
+        // alive: with no other owner, `rows_mut` moves the rows out from under the key uncopied.
+        if Arc::strong_count(&self.rows) == 1 {
+            for f in self.rows_mut() {
+                step()?;
+                // Exactly `n` more slots: a doubled capacity in every row would cost more than the columns.
+                f.attrs.reserve_exact(n);
+                f.attrs.extend(added.clone());
+            }
+            return Ok(());
+        }
+        self.before_copy();
+        let mut copy = Vec::with_capacity(self.rows.len());
+        for f in self.rows.iter() {
+            step()?;
+            let mut attrs = Vec::with_capacity(f.attrs.len().saturating_add(n));
+            attrs.extend_from_slice(&f.attrs);
+            attrs.extend(added.clone());
+            copy.push(Feature { id: f.id, geometry: f.geometry.clone(), attrs });
+        }
+        self.rows = Arc::new(copy);
+        Ok(())
     }
 
     /// Removes column `field` from every row that has it (Delete Field).
@@ -178,7 +221,8 @@ impl Features {
     }
 
     /// The rows for a change, copied first when another owner (an Undo snapshot) shares them.
-    /// Every change goes through it, so the hook [`crate::before_rows_copy`] sets runs before a
+    /// Every change goes through it, or calls `before_copy` itself where it copies the rows its own
+    /// way ([`Features::try_add_columns`]), so the hook [`crate::before_rows_copy`] sets runs before a
     /// copy, as it does through `DerefMut`.
     fn rows_mut(&mut self) -> &mut Vec<Feature> {
         self.before_copy();
@@ -314,6 +358,61 @@ mod tests {
         assert_eq!(old, Ok(vec![Value::Int(1), Value::Int(2), Value::Null]));
         ds.features.remove_column(0);
         assert_eq!(ds.features.row(2).map(|r| r.values().cloned().collect::<Vec<_>>()), Some(vec![Value::Int(9), Value::Null]));
+    }
+
+    #[test]
+    fn a_column_stopped_part_way_leaves_shared_rows_as_they_were() {
+        let ds = layer();
+        let mut copy = ds.features.clone();
+        // Cancelled at the second row.
+        let mut asked = 0;
+        let step = || {
+            asked += 1;
+            if asked == 2 { Err("cancelled") } else { Ok(()) }
+        };
+        assert_eq!(copy.try_add_columns(1, Value::Int(0), step), Err("cancelled"));
+        assert!(copy.shares(&ds.features));
+        // Rows of its own take the column in place.
+        let mut own: Features = ds.features.to_rows().into();
+        own.add_column(Value::Int(0));
+        assert!(own.rows().all(|r| r.value(2) == &Value::Int(0)));
+        // Shared rows are copied at their new length, with the same values.
+        copy.add_column(Value::Int(0));
+        assert!(!copy.shares(&ds.features));
+        assert_eq!(copy.to_rows(), own.to_rows());
+        assert!(copy.iter().all(|f| f.attrs.len() == f.attrs.capacity()));
+        assert!(ds.features.rows().all(|r| r.values().len() == 2));
+    }
+
+    #[test]
+    fn a_column_added_to_rows_of_its_own_under_a_cache_key_copies_nothing() {
+        let mut ds = layer();
+        let rows = ds.features.as_slice().as_ptr();
+        let key = ds.features.allocation_key();
+        ds.features.add_column(Value::Null);
+        // The same rows, moved rather than copied, and the key no longer matches them.
+        assert_eq!(ds.features.as_slice().as_ptr(), rows);
+        assert!(!std::sync::Weak::ptr_eq(&key, &ds.features.allocation_key()));
+        assert!(ds.features.rows().all(|r| r.values().len() == 3));
+    }
+
+    #[test]
+    fn fields_added_together_change_each_row_once() {
+        let mut ds = layer();
+        let shared = ds.features.clone();
+        // A name already there keeps its index; one given twice is added once.
+        assert_eq!(
+            ds.ensure_fields([("a", FieldType::Double), ("n", FieldType::Text), ("b", FieldType::Double), ("a", FieldType::Text)]),
+            [2, 1, 3, 2]
+        );
+        assert_eq!(ds.fields.len(), 4);
+        assert!(ds.features.rows().all(|r| r.values().len() == 4 && r.value(2).is_null() && r.value(3).is_null()));
+        assert!(ds.features.iter().all(|f| f.attrs.len() == f.attrs.capacity()));
+        assert!(shared.rows().all(|r| r.values().len() == 2));
+        // Nothing missing: nothing changes, and the rows stay shared.
+        let shared = ds.features.clone();
+        assert_eq!(ds.ensure_fields([("b", FieldType::Double)]), [3]);
+        assert!(ds.features.shares(&shared));
     }
 
     #[test]

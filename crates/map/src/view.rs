@@ -249,8 +249,8 @@ pub enum BlockShape {
         radius: Option<f64>,
     },
     /// The polygons of `layer` (by name, as the terrain's DEM) that `filter` picks among the rows
-    /// its definition query keeps (all of them without one): the ground inside their outer rings,
-    /// their holes not cut, the box being the one round them.
+    /// its definition query keeps (all of them without one): the ground inside them, each hole a
+    /// well, the box being the one round them.
     Polygon {
         layer: String,
         #[serde(rename = "where", default, skip_serializing_if = "Option::is_none")]
@@ -273,7 +273,8 @@ impl TerrainBlock {
 }
 
 /// How deep the water a block diagram's walls cut through is (#2317). A DEM holds the water's
-/// surface, not its bed, so the depth is given: schematic unless it comes from a field.
+/// surface, not its bed, so the depth is given: schematic unless it comes from a field, or the
+/// bed is read from a raster of its heights (#2434).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BlockWater {
     /// Metres from the level down to the floor, before exaggeration: every water body's, or
@@ -283,6 +284,11 @@ pub struct BlockWater {
     /// A numeric field of the terrain's water layer holding each water body's depth (metres).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub field: Option<String>,
+    /// A raster layer of the bed's heights (metres, on the DEM's vertical datum; the DEM itself
+    /// when it is topo-bathymetric), kept by name (#2434): the floor along the walls' water where
+    /// it has data, never above the level, else the field's depth or `depth`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bed: Option<String>,
 }
 
 /// The least depth (metres, before exaggeration) of a block diagram's base below its lowest
@@ -343,8 +349,13 @@ impl TerrainBlock {
             return Err("block's walls is an opaque colour, #RRGGBB".into());
         }
         if let Some(w) = &self.water {
-            if w.depth.is_none() && w.field.is_none() {
-                return Err("block's water needs a depth (metres) or a field of the water layer holding them".into());
+            if w.depth.is_none() && w.field.is_none() && w.bed.is_none() {
+                return Err(
+                    "block's water needs a depth (metres), a field of the water layer holding them, or a bed raster of its heights".into(),
+                );
+            }
+            if w.bed.as_deref().is_some_and(|b| b.trim().is_empty()) {
+                return Err("block's water bed is a raster layer of the bed's heights".into());
             }
             if let Some(d) = w.depth
                 && !(d.is_finite() && (0.0..=BLOCK_MAX_DEPTH).contains(&d))

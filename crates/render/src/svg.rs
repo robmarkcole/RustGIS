@@ -61,7 +61,9 @@ fn layout_svg_inner(
     if !defs.text.is_empty() {
         let _ = write!(s, "<defs>\n{}</defs>\n", defs.text);
     }
-    let _ = writeln!(s, r##"<rect width="{}" height="{}" fill="#ffffff"/>"##, num(pw), num(ph));
+    // The page's colour (#2855), white unless given; its channels alone, opaque as the PNG's.
+    let paper = layout.paper.map_or_else(|| "#ffffff".to_string(), |c| format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b()));
+    let _ = writeln!(s, r##"<rect width="{}" height="{}" fill="{paper}"/>"##, num(pw), num(ph));
     body.insert_str(0, &s);
     body.push_str("</svg>\n");
     Some((body, pictured))
@@ -93,7 +95,22 @@ fn elements(
         background(&mut s, e);
         let (x, y, w, h) = (e.x, e.y, e.w, e.h);
         match &e.kind {
-            ElementKind::Text { text: t, size, color, bold, italic, align, letter_spacing, font, font_name, rotation, wrap } => {
+            ElementKind::Text {
+                text: t,
+                size,
+                color,
+                bold,
+                italic,
+                align,
+                letter_spacing,
+                font,
+                font_name,
+                rotation,
+                wrap,
+                valign,
+                line_spacing,
+                case,
+            } => {
                 let first = layout.first_frame().and_then(|id| layout.element(id)).and_then(|f| match &f.kind {
                     ElementKind::MapFrame { map, center, scale, bearing, pitch, .. } => {
                         let m = maps.iter().find(|m| m.name.eq_ignore_ascii_case(map))?;
@@ -101,17 +118,18 @@ fn elements(
                     }
                     _ => None,
                 });
-                let text = expand(t, layout, info, first);
-                // A wrapped text in the lines the page breaks it into (#2346), each its own line.
-                let text = if *wrap {
-                    let style = crate::layout::text_style(*bold, *italic, *font, font_name.as_deref(), *align, *letter_spacing);
-                    crate::layout::wrapped(&text, w, *size, style)
-                } else {
-                    text
-                };
-                // As the page draws it: the size in points, lines 1.25 apart, the first baseline
-                // 0.6 of the size below the top, lines past the frame left out.
+                let style = crate::layout::text_style(*bold, *italic, *font, font_name.as_deref(), *align, *letter_spacing)
+                    .with_block(*valign, *line_spacing);
+                // Its tokens filled in, then its case, then, wrapped, the lines the page breaks it
+                // into (#2346), each its own line ([`crate::layout::drawn_text`]).
+                let text = crate::layout::drawn_text(expand(t, layout, info, first), *case, *wrap, w, *size, style);
+                // As the page draws it: the size in points, the block at the top, middle or bottom
+                // of the box (from the top when taller than it), lines 1.25 em times the line
+                // spacing apart, the first baseline 0.6 of the size below the block's top, lines
+                // past the frame left out.
                 let em = size.clamp(2.0, 400.0) * 1.33 / PT_PER_MM;
+                let ls = f64::from(style.line_spacing);
+                let top = y + crate::layout::text_shift(style.valign, h, em, &text, ls);
                 let (anchor, tx) = match align {
                     TextAlign::Left => ("start", x),
                     TextAlign::Center => ("middle", x + w / 2.0),
@@ -121,7 +139,7 @@ fn elements(
                     .lines()
                     .take(200)
                     .enumerate()
-                    .map(|(i, l)| (y + em * (0.6 + 1.25 * i as f64), l))
+                    .map(|(i, l)| (top + em * (0.6 + 1.25 * ls * i as f64), l))
                     .take_while(|(ly, _)| *ly <= y + h + em)
                     .collect();
                 // A named family first (#762), quoted as CSS has it (its own backslashes and
@@ -135,7 +153,7 @@ fn elements(
                     s,
                     r#"<text x="{}" y="{}" font-family="{}" font-size="{}" font-weight="{}" font-style="{}" text-anchor="{anchor}" letter-spacing="{}"{} xml:space="preserve""#,
                     num(tx),
-                    num(lines.first().map_or(y + em * 0.6, |l| l.0)),
+                    num(lines.first().map_or(top + em * 0.6, |l| l.0)),
                     esc(&family),
                     num(em),
                     if *bold { "bold" } else { "normal" },
@@ -474,6 +492,10 @@ mod tests {
                 labels: Default::default(),
                 color: None,
                 text_size: rustgis_map::layout::LEGEND_TEXT_PT,
+                fit: rustgis_map::layout::LegendFit::Manual,
+                show_layer_names: rustgis_map::layout::LayerNames::Shown,
+                class_labels: Default::default(),
+                show_counts: Default::default(),
             },
         );
         assert_eq!(picture_dpi(&layout, 600.0, |e| !written_as_svg(e)), 600.0);
@@ -516,6 +538,10 @@ mod tests {
                 labels: Default::default(),
                 color: None,
                 text_size: rustgis_map::layout::LEGEND_TEXT_PT,
+                fit: rustgis_map::layout::LegendFit::Manual,
+                show_layer_names: rustgis_map::layout::LayerNames::Shown,
+                class_labels: Default::default(),
+                show_counts: Default::default(),
             },
         );
         let info = PageInfo::default();
@@ -658,7 +684,13 @@ mod tests {
         };
         let plain = svg(false);
         assert!(!plain.contains("<tspan") && plain.contains(note), "one line: {plain}");
-        let style = crate::layout::TextStyle { face: crate::text::Face::default(), align: TextAlign::Left, spacing: 0.0 };
+        let style = crate::layout::TextStyle {
+            face: crate::text::Face::default(),
+            align: TextAlign::Left,
+            spacing: 0.0,
+            valign: rustgis_map::layout::TextVAlign::Top,
+            line_spacing: 1.0,
+        };
         let lines = crate::layout::wrapped(note, 40.0, 12.0, style);
         let wrapped = svg(true);
         assert!(lines.lines().count() > 3, "{lines}");
@@ -666,6 +698,99 @@ mod tests {
         for line in lines.lines() {
             assert!(wrapped.contains(&format!(">{}</tspan>", esc(line))), "{line}: {wrapped}");
         }
+    }
+
+    /// A text's block in SVG sits, is spaced and is cased as the page draws it, turned about the
+    /// same centre, its cased words escaped; a block taller than its box keeps its first lines, as
+    /// on the page; and a setting that is not a value writes the plain text, nothing not a number.
+    #[test]
+    fn a_text_block_is_written_where_the_page_draws_it() {
+        use rustgis_map::layout::{TextCase, TextVAlign};
+        let turned = |text: &str, h: f64, v: TextVAlign, ls: f64, c: TextCase, turn: f64| {
+            let mut l = Layout::new("SVG", 100.0, 80.0);
+            let mut kind = ElementKind::text(text, 10.0, rustgis_map::Rgba::rgb(0, 0, 0), false);
+            if let ElementKind::Text { valign, line_spacing, case, rotation, .. } = &mut kind {
+                (*valign, *line_spacing, *case, *rotation) = (v, ls, c, turn);
+            }
+            l.add("Text", (30.0, 10.0, 30.0, h), kind);
+            layout_svg(&l, &mut [], 72.0, &PageInfo::default()).unwrap().0
+        };
+        let page = |text: &str, h: f64, v: TextVAlign, ls: f64, c: TextCase| turned(text, h, v, ls, c, 0.0);
+        let spans = |svg: &str| -> Vec<(f64, String)> {
+            svg.split("<tspan ")
+                .skip(1)
+                .filter_map(|t| {
+                    let y = t.split("y=\"").nth(1)?.split('"').next()?.parse().ok()?;
+                    Some((y, t.split('>').nth(1)?.split('<').next()?.to_string()))
+                })
+                .collect()
+        };
+        let got = spans(&page("one\ntwo\nthree", 60.0, TextVAlign::Bottom, 1.5, TextCase::Upper));
+        assert_eq!(got.iter().map(|s| s.1.as_str()).collect::<Vec<_>>(), ["ONE", "TWO", "THREE"]);
+        let em = 10.0 * 1.33 / PT_PER_MM;
+        assert!(((got[1].0 - got[0].0) - em * 1.25 * 1.5).abs() < 0.01, "{got:?}");
+        assert!((got[2].0 - (70.0 - em * 1.25 + em * 0.6)).abs() < 0.01, "the last on the bottom: {got:?}");
+        let tall = "one\ntwo\nthree\nfour\nfive";
+        let from_top = spans(&page(tall, 9.0, TextVAlign::Top, 1.0, TextCase::None));
+        assert!(!from_top.is_empty(), "two lines fit");
+        assert_eq!(spans(&page(tall, 9.0, TextVAlign::Bottom, 1.0, TextCase::None)), from_top, "taller than its box: from the top");
+        // Middle: half the free height above the block, the first line 0.6 em below its top.
+        let middle = spans(&page("one\ntwo\nthree", 60.0, TextVAlign::Middle, 1.5, TextCase::None));
+        let block = em * 1.25 * (1.0 + 2.0 * 1.5);
+        assert!((middle[0].0 - (10.0 + (60.0 - block) / 2.0 + em * 0.6)).abs() < 0.01, "{middle:?}");
+        // Turned, the block moves down its box as upright, the turn about the box's centre.
+        let bottom = page("one\ntwo\nthree", 60.0, TextVAlign::Bottom, 1.5, TextCase::None);
+        let turned_top = turned("one\ntwo\nthree", 60.0, TextVAlign::Top, 1.5, TextCase::None, 90.0);
+        let turned_bottom = turned("one\ntwo\nthree", 60.0, TextVAlign::Bottom, 1.5, TextCase::None, 90.0);
+        for svg in [&turned_top, &turned_bottom] {
+            assert!(svg.contains(r#"transform="rotate(90 45 40)""#), "{svg}");
+        }
+        assert_eq!(spans(&turned_bottom), spans(&bottom), "the same lines as upright");
+        let (top_first, bottom_first) = (spans(&turned_top)[0].0, spans(&turned_bottom)[0].0);
+        assert!((bottom_first - top_first - (60.0 - block)).abs() < 0.01, "down by the free height: {top_first} {bottom_first}");
+        // Its cased words are escaped as any text's.
+        let amp = page("a & b < c", 60.0, TextVAlign::Top, 1.0, TextCase::Upper);
+        assert!(amp.contains(">A &amp; B &lt; C</text>"), "{amp}");
+        // Not a value: the plain text, with nothing not a number written.
+        let plain = page("one\ntwo\nthree", 60.0, TextVAlign::Top, 1.0, TextCase::None);
+        for odd in [
+            page("one\ntwo\nthree", 60.0, TextVAlign::Invalid, f64::NAN, TextCase::Invalid),
+            page("one\ntwo\nthree", 60.0, TextVAlign::Top, f64::INFINITY, TextCase::None),
+        ] {
+            assert_eq!(odd, plain);
+            assert!(!odd.contains("NaN") && !odd.contains("inf"), "{odd}");
+        }
+    }
+
+    /// The vector PDF records the block as the page draws it: a block's PDF differs from the plain
+    /// text's, an upper-case text's is the same as one typed in capitals, and the plain one is still
+    /// main's (`plain_texts_export_as_before`).
+    #[test]
+    fn a_text_block_reaches_the_pdf() {
+        use rustgis_map::layout::{TextCase, TextVAlign};
+        let pdf_of = |text: &str, v: TextVAlign, ls: f64, c: TextCase| {
+            let mut l = Layout::new("PDF", 100.0, 80.0);
+            let mut kind = ElementKind::text(text, 10.0, rustgis_map::Rgba::rgb(0, 0, 0), false);
+            if let ElementKind::Text { valign, line_spacing, case, .. } = &mut kind {
+                (*valign, *line_spacing, *case) = (v, ls, c);
+            }
+            l.add("Text", (30.0, 10.0, 30.0, 60.0), kind);
+            let (drawing, _) = crate::layout::render_drawing(&l, &mut [], 150.0, &PageInfo::default()).unwrap();
+            crate::pdf::write(&[crate::pdf::Page::drawing(drawing, l.width, l.height)], "Block")
+        };
+        let pdf = |v: TextVAlign, ls: f64, c: TextCase| pdf_of("one\ntwo\nthree", v, ls, c);
+        let plain = pdf(TextVAlign::Top, 1.0, TextCase::None);
+        let block = pdf(TextVAlign::Bottom, 1.5, TextCase::Upper);
+        assert!(plain.starts_with(b"%PDF") && block.starts_with(b"%PDF"), "both write");
+        assert_ne!(plain, block, "the block's case, shift and spacing reach the PDF");
+        // Each setting alone changes what is recorded.
+        for (v, ls, c) in
+            [(TextVAlign::Bottom, 1.0, TextCase::None), (TextVAlign::Top, 1.5, TextCase::None), (TextVAlign::Top, 1.0, TextCase::Upper)]
+        {
+            assert_ne!(pdf(v, ls, c), plain, "{v:?} {ls} {c:?}");
+        }
+        let typed = pdf_of("ONE\nTWO\nTHREE", TextVAlign::Top, 1.0, TextCase::None);
+        assert!(pdf(TextVAlign::Top, 1.0, TextCase::Upper) == typed, "upper case records the capitals as typed");
     }
 
     /// An element's background (#2257) is a `<rect>` of its own under the element, its box grown
@@ -698,5 +823,123 @@ mod tests {
         assert!(s.find(rect).is_some_and(|at| at < s.find("<text").unwrap_or(0)), "under the text: {s}");
         let turned = svg(90.0, Some(b));
         assert!(turned.contains(r#"stroke-width="0.265" transform="rotate(90 50 45)"/>"#), "turned about the box's centre: {turned}");
+    }
+
+    /// 64-bit FNV-1a over a byte slice.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn fnv(b: &[u8]) -> u64 {
+        b.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3))
+    }
+
+    /// How [`plain_texts_export_as_before`]'s pages were written as SVG and as a vector PDF before
+    /// texts had a block alignment, line spacing or case; in the built-in face.
+    #[cfg(not(target_arch = "wasm32"))]
+    const PINNED_TEXT_SVG: u64 = 0xf2dd_eccc_ab7b_44bc;
+    #[cfg(not(target_arch = "wasm32"))]
+    const PINNED_TEXT_PDF: u64 = 0xf770_433e_0662_5b2e;
+
+    /// The SVG and the vector PDF of a text with none of the block settings are byte for byte main's:
+    /// in a process of its own, told to use the built-in face before any text.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn plain_texts_export_as_before() {
+        if std::env::var_os("RUSTGIS_TEXT_EXPORT_PIN_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "svg::tests::plain_texts_export_as_before", "--nocapture"])
+                .env("RUSTGIS_TEXT_EXPORT_PIN_CHILD", "1")
+                .env("RUSTGIS_BUILTIN_FONTS", "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"), "the test didn't run in the child process");
+            return;
+        }
+        let info = PageInfo { page: 2, pages: 3, page_name: String::new() };
+        let (mut svg, mut pdf) = (Vec::new(), Vec::new());
+        for l in crate::layout::plain_text_pages() {
+            svg.extend(layout_svg(&l, &mut [], 72.0, &info).unwrap().0.into_bytes());
+            let (drawing, _) = crate::layout::render_drawing(&l, &mut [], 150.0, &info).unwrap();
+            pdf.extend(crate::pdf::write(&[crate::pdf::Page::drawing(drawing, l.width, l.height)], "Plain"));
+        }
+        let (s, p) = (fnv(&svg), fnv(&pdf));
+        assert_eq!((s, p), (PINNED_TEXT_SVG, PINNED_TEXT_PDF), "{s:#x} {p:#x}");
+    }
+
+    /// How [`legends_export_as_before`]'s pages were written as SVG and as a vector PDF before
+    /// legends had a fit, layer names to leave off or more than three columns, in the built-in
+    /// face: each page of [`crate::layout::legend_pin_pages`] in turn.
+    #[cfg(not(target_arch = "wasm32"))]
+    const PINNED_LEGEND_SVG: [u64; 18] = [
+        0xdde9_9bbd_fcfa_7b03, // 1: one column, roomy
+        0x434f_548a_b50a_d07f, // 2: two columns, roomy
+        0x71c1_fa20_bd53_8683, // 3: three columns, roomy
+        0x81df_80de_1501_6f46, // 4: one column, short
+        0xc8f1_9adc_aefe_782f, // 5: two columns, short
+        0x7f24_8684_f29d_4892, // 6: three columns, short
+        0xdde9_9bbd_fcfa_7b03, // 7: one column, narrow
+        0xaa01_df65_0173_015e, // 8: two columns, narrow
+        0x23a2_a454_7d20_f432, // 9: three columns, narrow
+        0xdbab_b441_685c_fbc4, // 10: 14 pt, two columns
+        0x621c_672e_2968_bf38, // 11: 5 pt, three columns, short
+        0xd2c2_978b_14ce_f64c, // 12: no title, what the frame draws, other left out
+        0x8546_8a86_082b_7af2, // 13: labelled, excluded, ink
+        0x878e_7b18_1718_8c95, // 14: no-data rows, two columns
+        0xaae8_b8f8_936e_ecff, // 15: across the right edge
+        0x4546_c89f_1cf7_5dff, // 16: shorter than its title
+        0x4546_c89f_1cf7_5dff, // 17: nothing to list
+        0xa10a_680a_ac4d_2b58, // 18: what the frame draws, no-data asked
+    ];
+    #[cfg(not(target_arch = "wasm32"))]
+    const PINNED_LEGEND_PDF: [u64; 18] = [
+        0xe316_5ff2_9099_46df, // 1: one column, roomy
+        0xdc6c_aa9d_bfa7_2264, // 2: two columns, roomy
+        0x523d_fde1_8e25_b26b, // 3: three columns, roomy
+        0x3c1d_85dd_54b4_cde8, // 4: one column, short
+        0xa5ea_4672_820f_7bb1, // 5: two columns, short
+        0x3ce3_aef6_103c_ea2c, // 6: three columns, short
+        0xe316_5ff2_9099_46df, // 7: one column, narrow
+        0x0853_87ac_de13_68de, // 8: two columns, narrow
+        0xbc8b_12e8_b710_8539, // 9: three columns, narrow
+        0x728a_470d_c6a9_dccf, // 10: 14 pt, two columns
+        0xb7be_f398_0c8a_9815, // 11: 5 pt, three columns, short
+        0x78ab_2e33_4226_39a9, // 12: no title, what the frame draws, other left out
+        0x32f7_77da_1f52_9178, // 13: labelled, excluded, ink
+        0x1c4b_2dcc_00bc_3477, // 14: no-data rows, two columns
+        0x97fe_9568_01e8_cac8, // 15: across the right edge
+        0x7e4f_2651_6981_e5bf, // 16: shorter than its title
+        0x7e4f_2651_6981_e5bf, // 17: nothing to list
+        0x26d6_182c_6b62_bbe2, // 18: what the frame draws, no-data asked
+    ];
+
+    /// The SVG and the vector PDF of a legend with none of the fitting settings are byte for byte
+    /// main's, page by page: in a process of its own, told to use the built-in face before any
+    /// text.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn legends_export_as_before() {
+        if std::env::var_os("RUSTGIS_LEGEND_EXPORT_PIN_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "svg::tests::legends_export_as_before", "--nocapture"])
+                .env("RUSTGIS_LEGEND_EXPORT_PIN_CHILD", "1")
+                .env("RUSTGIS_BUILTIN_FONTS", "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"), "the test didn't run in the child process");
+            return;
+        }
+        let info = PageInfo::default();
+        let (mut svg, mut pdf) = (Vec::new(), Vec::new());
+        for (i, (l, mut maps)) in crate::layout::legend_pin_pages().into_iter().enumerate() {
+            let page = format!("page {}", i + 1);
+            let written = layout_svg(&l, &mut maps, 72.0, &info).unwrap().0.into_bytes();
+            svg.push((page.clone(), fnv(&written)));
+            let (drawing, _) = crate::layout::render_drawing(&l, &mut maps, 150.0, &info).unwrap();
+            let bytes = crate::pdf::write(&[crate::pdf::Page::drawing(drawing, l.width, l.height)], "Legends");
+            pdf.push((page, fnv(&bytes)));
+        }
+        let mut wrong = crate::layout::pin_mismatches("SVG", &svg, &PINNED_LEGEND_SVG);
+        wrong.extend(crate::layout::pin_mismatches("PDF", &pdf, &PINNED_LEGEND_PDF));
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 }

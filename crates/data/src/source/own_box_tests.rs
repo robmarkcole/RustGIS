@@ -121,12 +121,15 @@ fn a_geojson_read_in_place_given_its_box_in_its_own_system_tests_features_there(
 
 #[test]
 fn a_box_in_its_own_system_is_tested_without_converting() {
-    let mut notes = Vec::new();
+    let mut notes = crate::loss::Notes::new();
     let r = Reproject::from_crs(utm31(), &mut notes);
     let (lonlat, utm) = around_paris();
     let far = Geometry::Line(vec![vec![Coord::new(451_500.0, 5_411_500.0), Coord::new(1e9, 5_411_500.0)]]);
-    // No place in longitude/latitude: left out as before without the box, kept with it.
-    assert!(r.place(far.clone(), &Request { extent: Some(lonlat), limit: 1, own: None }).is_none());
+    // No place in longitude/latitude: kept as the file holds it (#2032 C2f-4b), outside a box
+    // there, within a whole read, and tested by its own box with one in its own system.
+    let kept = r.place(far.clone(), &Request { extent: Some(lonlat), limit: 1, own: None }).unwrap();
+    assert!(!kept.inside && kept.geometry == far);
+    assert!(r.place(far.clone(), &Request { extent: None, limit: 1, own: None }).unwrap().inside);
     let fitted = r.place(far.clone(), &Request { extent: Some(lonlat), limit: 1, own: Some((utm31(), utm)) }).unwrap();
     assert!(fitted.inside);
     assert_eq!(fitted.geometry, far);
@@ -141,7 +144,7 @@ fn a_box_in_its_own_system_is_tested_without_converting() {
 
 #[test]
 fn a_coordinate_that_isnt_a_number_is_left_out_in_its_own_system_too() {
-    let mut notes = Vec::new();
+    let mut notes = crate::loss::Notes::new();
     let r = Reproject::from_crs(utm31(), &mut notes);
     let (lonlat, utm) = around_paris();
     let req = Request { extent: Some(lonlat), limit: 1, own: Some((utm31(), utm)) };
@@ -151,4 +154,40 @@ fn a_coordinate_that_isnt_a_number_is_left_out_in_its_own_system_too() {
     assert!(r.place(missing, &Request { own: None, ..req }).is_none());
     let clean = Geometry::Line(vec![vec![Coord::new(451_500.0, 5_411_500.0), Coord::new(452_000.0, 5_411_500.0)]]);
     assert!(r.place(clean, &req).unwrap().inside);
+}
+
+/// A box over the whole plane holds every shape, one with no place (a polygon of no parts)
+/// included, as a read without a box keeps it (#2788).
+#[test]
+fn the_whole_plane_holds_a_shape_with_no_place() {
+    let utm = Crs::from_epsg(32631).unwrap();
+    let reproject = Reproject::known(Some((utm, utm.transformer().unwrap())));
+    let empty = Geometry::Polygon(Vec::new());
+    let whole = Request { extent: None, limit: usize::MAX, own: Some((utm, whole_plane())) };
+    let none = Request { extent: None, limit: usize::MAX, own: None };
+    let small = Request { extent: None, limit: usize::MAX, own: Some((utm, Extent::new(0.0, 0.0, 1.0, 1.0))) };
+    assert!(reproject.place(empty.clone(), &whole).is_some_and(|f| f.inside), "the whole plane");
+    assert!(reproject.place(empty.clone(), &none).is_some_and(|f| f.inside), "no box");
+    assert!(reproject.place(empty, &small).is_some_and(|f| !f.inside), "a box of somewhere");
+}
+
+/// A source read by its rows (MySQL, SQL Server) keeps a geometry with no place in
+/// longitude/latitude as the table holds it (#2032 C2f-4b): within a whole read, outside any
+/// extent. One with a coordinate that isn't a number is left out for the reader to count.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_row_with_no_place_in_longitude_latitude_is_kept_outside_any_extent() {
+    let mut notes = crate::loss::Notes::new();
+    let r = Reproject::from_crs(utm31(), &mut notes);
+    let (lonlat, _) = around_paris();
+    let far = Geometry::Line(vec![vec![Coord::new(451_500.0, 5_411_500.0), Coord::new(1e9, 5_411_500.0)]]);
+    let kept = r.read(far.clone()).unwrap();
+    assert_eq!(kept.geometry, far);
+    assert_eq!(kept.lonlat, None);
+    assert!(Reproject::within(kept.lonlat.as_ref(), None), "a whole read");
+    assert!(!Reproject::within(kept.lonlat.as_ref(), Some(&lonlat)), "a read of a box");
+    let paris = r.read(Geometry::Point(Coord::new(451_500.0, 5_411_500.0))).unwrap();
+    assert!(Reproject::within(paris.lonlat.as_ref(), Some(&lonlat)));
+    assert!(r.read(Geometry::Point(Coord::new(f64::NAN, 5_411_500.0))).is_none());
+    assert!(notes.is_empty(), "{notes:?}");
 }

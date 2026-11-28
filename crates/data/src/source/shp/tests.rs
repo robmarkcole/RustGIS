@@ -665,7 +665,7 @@ fn a_nan_shape_outside_an_area_its_system_cant_bound_is_counted_as_of_the_layer(
             p
         };
         let view = Extent::new(-120.0, -30.0, 10.0, 30.0);
-        let r = Reproject::from_crs(crs, &mut Vec::new());
+        let r = Reproject::from_crs(crs, &mut crate::loss::Notes::new());
         assert!(r.extent_from_lonlat(&view).is_none(), "the view's edge is refused");
         const SAID: &str = "have a coordinate that isn't a number under a bounding box that is one";
         let said = |notes: &[crate::loss::Note]| notes.iter().filter(|n| n.contains(SAID)).map(|n| n.text.clone()).collect::<Vec<_>>();
@@ -692,23 +692,62 @@ fn a_nan_shape_outside_an_area_its_system_cant_bound_is_counted_as_of_the_layer(
         std::fs::write(&p, b).unwrap();
         let src = open_path(&p, None).unwrap();
         // Every record is visited, so the NaN shapes can't be ruled out of the area: both reads
-        // skip them, and the note says its count is of the layer, not of the area.
+        // give none of them (a shape without geometry is in no area), and the note says its count
+        // is of the layer, not of the area.
         let layer = vec![format!(
-            "2 shape(s) in the layer (a count of the whole layer, as the area couldn't be placed in its coordinates) {SAID}: they're left out of the read, but the layer's extent and its index still take in their stored boxes"
+            "2 shape(s) in the layer (a count of the whole layer, as the area couldn't be placed in its coordinates) {SAID}: they have no geometry, so the read leaves them out, but the layer's extent and its index still take in their stored boxes"
         )];
-        assert_eq!(reads(src.as_ref()), ((0, 2, layer.clone()), (0, 2, layer)));
-        // A whole read keeps its plain count.
-        assert_eq!(said(&src.read(&Request::all()).unwrap().notes).first().map(|n| n.starts_with("2 shape(s) have")), Some(true));
+        assert_eq!(reads(src.as_ref()), ((0, 0, layer.clone()), (0, 0, layer)));
+        // A box in the file's own system is an area too, which holds no shape without geometry:
+        // only the line with a place.
+        let own = Some((crs, Extent::new(-1e7, -1e7, 1e7, 1e7)));
+        let boxed = src.read(&Request { own, ..Request::all() }).unwrap();
+        assert_eq!(boxed.features.iter().map(|f| f.geometry.is_some()).collect::<Vec<_>>(), [true]);
+        // A box over the whole plane in its own system is no area: every record, as a whole read
+        // gives them, one without a usable box too (the first record's stored box made
+        // backwards: its corners at 112..144 swapped).
+        let p = write("nan_unboxed.shp");
+        let mut b = std::fs::read(&p).unwrap();
+        b[156..164].copy_from_slice(&f64::NAN.to_le_bytes());
+        let (lo, hi) = (b[112..128].to_vec(), b[128..144].to_vec());
+        b[112..128].copy_from_slice(&hi);
+        b[128..144].copy_from_slice(&lo);
+        std::fs::write(&p, b).unwrap();
+        let unboxed = open_path(&p, None).unwrap();
+        let plane = Request { own: Some((crs, crate::source::whole_plane())), ..Request::all() };
+        let all = |r: &Batch| r.features.iter().map(|f| f.geometry.is_some()).collect::<Vec<_>>();
+        assert_eq!(all(&unboxed.read(&plane).unwrap()), [false, true, true]);
+        assert_eq!(all(&unboxed.read(&Request::all()).unwrap()), [false, true, true]);
+        // With an extent beside it, the whole-plane box is an area again, read alike sampled and
+        // in chunks: the index takes no record without a usable box, and no shape without
+        // geometry is in an area.
+        let both = Request { extent: Some(Extent::new(-180.0, -90.0, 180.0, 90.0)), ..plane };
+        let mut chunked = Vec::new();
+        unboxed
+            .visit_request_chunks(&both, 1 << 20, &mut |f| {
+                chunked.extend(f.iter().map(|f| f.geometry.is_some()));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(all(&unboxed.read(&both).unwrap()), [true, true]);
+        assert_eq!(chunked, [true, true]);
+        // A whole read gives them without geometry, and says that once, with its plain count.
+        let whole = src.read(&Request::all()).unwrap();
+        assert!(said(&whole.notes).is_empty(), "{:?}", whole.notes);
+        let kept: Vec<_> = whole.notes.iter().filter(|n| n.contains("their features are kept without geometry")).collect();
+        assert_eq!(kept.len(), 1, "{:?}", whole.notes);
+        assert!(kept[0].starts_with("2 shape(s) have"), "{:?}", kept[0]);
     });
     std::fs::remove_dir_all(fixture).unwrap();
 }
 
 /// A line with a coordinate that isn't a number under a stored box that is one: the index takes
-/// the stored box (the points aren't read to build it), and a read leaves the line out. Both
-/// reads, sampled and in chunks, count it and say so, once with its count, whole or by area; a
-/// limited read says its count is of the shapes it read; a clean file says nothing.
+/// the stored box (the points aren't read to build it), and a read keeps the line's attributes
+/// without its geometry, as a whole read of the file does (#2032 C2f). Both reads, sampled and in
+/// chunks, say so, once with its count, whole or by area (which gives no feature without
+/// geometry); a limited read says its count is of the shapes it read; a clean file says nothing.
 #[test]
-fn a_nan_shape_under_a_finite_box_is_said_when_left_out() {
+fn a_nan_shape_under_a_finite_box_is_said_when_kept_without_geometry() {
     let fixture = dir();
     cache::with_index_dir(fixture.join("cache"), || {
         let write = |name: &str| {
@@ -722,16 +761,42 @@ fn a_nan_shape_under_a_finite_box_is_said_when_left_out() {
             p
         };
         const SAID: &str = "have a coordinate that isn't a number under a bounding box that is one";
-        let said = |notes: &[crate::loss::Note]| notes.iter().filter(|n| n.contains(SAID)).map(|n| n.text.clone()).collect::<Vec<_>>();
+        const KEPT: &str = "have a coordinate that isn't a number (NaN or infinite): their features are kept without geometry";
+        // A read says the shapes it gave without geometry as dropped geometry, and those an area
+        // read left out as dropped features, which the checks below see.
+        let said = |notes: &[crate::loss::Note]| {
+            notes
+                .iter()
+                .filter(|n| n.contains(SAID))
+                .inspect(|n| assert_eq!(n.loss, Some(crate::loss::LossCode::DroppedFeature), "{n:?}"))
+                .map(|n| n.text.clone())
+                .collect::<Vec<_>>()
+        };
+        let kept = |notes: &[crate::loss::Note]| {
+            notes
+                .iter()
+                .filter(|n| n.contains(KEPT))
+                .inspect(|n| assert_eq!(n.loss, Some(crate::loss::LossCode::DroppedGeometry), "{n:?}"))
+                .map(|n| n.text.clone())
+                .collect::<Vec<_>>()
+        };
+        // Skips, features without geometry given, and the two notes.
         let chunk_notes = |src: &dyn FeatureSource, extent| {
-            let batch = src.visit_chunks(extent, 1 << 20, &mut |_| Ok(())).unwrap();
-            (batch.skipped, said(&batch.notes))
+            let mut bare = 0;
+            let batch = src
+                .visit_chunks(extent, 1 << 20, &mut |f| {
+                    bare += f.iter().filter(|f| f.geometry.is_none()).count();
+                    Ok(())
+                })
+                .unwrap();
+            (batch.skipped, bare, said(&batch.notes), kept(&batch.notes))
         };
         let clean = open_path(&write("clean.shp"), None).unwrap();
         let (_, report) = crate::source::materialize(clean.as_ref()).unwrap();
         assert!(said(&report.messages).is_empty(), "{:?}", report.messages);
         assert!(said(&clean.read(&Request::all()).unwrap().notes).is_empty());
-        assert_eq!(chunk_notes(clean.as_ref(), None), (0, Vec::new()));
+        assert!(kept(&clean.read(&Request::all()).unwrap().notes).is_empty());
+        assert_eq!(chunk_notes(clean.as_ref(), None), (0, 0, Vec::new(), Vec::new()));
         // The second record (each record 8 + 80 bytes, so its content at 100 + 88 + 8): its first
         // point's x at 196 + 48 = 244, its stored box (1, 1, 2, 2) left as it is.
         let p = write("nan.shp");
@@ -742,20 +807,30 @@ fn a_nan_shape_under_a_finite_box_is_said_when_left_out() {
         assert!(src.info().indexed);
         assert_eq!(src.info().extent, Extent::new(0.0, 0.0, 3.0, 3.0), "the stored box framed");
         let one = vec![format!(
-            "1 shape(s) {SAID}: they're left out of the read, but the layer's extent and its index still take in their stored boxes"
+            "1 shape(s) {SAID}: they have no geometry, so the read leaves them out, but the layer's extent and its index still take in their stored boxes"
         )];
+        const BOXES: &str = ", but the layer's extent and its index still take in their stored boxes";
+        let one_kept = vec![format!("1 shape(s) {KEPT}")];
+        let one_kept_boxed = vec![format!("1 shape(s) {KEPT}{BOXES}")];
+        // Kept without geometry, its attributes too, as a whole read of the file keeps it.
         let (ds, report) = crate::source::materialize(src.as_ref()).unwrap();
-        assert_eq!((ds.features.len(), report.skipped), (2, 1));
-        assert_eq!(said(&report.messages).len(), 1, "{:?}", report.messages);
-        assert!(report.messages.iter().any(|m| m.ends_with(&one[0])), "{:?}", report.messages);
+        assert_eq!((ds.features.len(), report.skipped), (3, 0));
+        assert!(ds.features[1].geometry.is_none());
+        let (whole, _) = crate::io::read_path(&p).unwrap();
+        assert_eq!(whole.features.iter().map(|f| f.geometry.is_none()).collect::<Vec<_>>(), [false, true, false]);
+        // Said once: kept without geometry, under its stored box.
+        assert!(said(&report.messages).is_empty(), "{:?}", report.messages);
+        assert_eq!(kept(&report.messages).len(), 1, "{:?}", report.messages);
+        assert!(report.messages.iter().any(|m| m.ends_with(&one_kept_boxed[0])), "{:?}", report.messages);
         let all = src.read(&Request::all()).unwrap();
-        assert_eq!((all.skipped, said(&all.notes)), (1, one.clone()));
-        // By area, over the stored box only: matched by it, left out, said.
+        assert_eq!((all.features.len(), all.skipped, said(&all.notes), kept(&all.notes)), (3, 0, Vec::new(), one_kept_boxed.clone()));
+        // By area, over the stored box only: matched by it, left out (a shape without geometry is
+        // in no area), its box said.
         let area = Some(Extent::new(1.4, 1.4, 1.6, 1.6));
         let by_area = src.read(&Request { extent: area, ..Request::all() }).unwrap();
-        assert_eq!((by_area.features.len(), by_area.skipped, said(&by_area.notes)), (0, 1, one.clone()));
-        assert_eq!(chunk_notes(src.as_ref(), None), (1, one.clone()));
-        assert_eq!(chunk_notes(src.as_ref(), area), (1, one.clone()));
+        assert_eq!((by_area.features.len(), by_area.skipped, said(&by_area.notes), kept(&by_area.notes)), (0, 0, one.clone(), Vec::new()));
+        assert_eq!(chunk_notes(src.as_ref(), None), (0, 1, Vec::new(), one_kept_boxed.clone()));
+        assert_eq!(chunk_notes(src.as_ref(), area), (0, 0, one.clone(), Vec::new()));
         // A limited read visits a sample (here the first and third records), so its count is of
         // the shapes it read, not a total: the first record's point made NaN (content at 108,
         // its first x at 108 + 48 = 156).
@@ -766,18 +841,13 @@ fn a_nan_shape_under_a_finite_box_is_said_when_left_out() {
         let src = open_path(&p, None).unwrap();
         let some = src.read(&Request { limit: 2, ..Request::all() }).unwrap();
         assert!(!some.complete);
+        let sample = "1 of the shapes read (a sample of the layer, which may hold more)";
         assert_eq!(
-            (some.features.len(), some.skipped, said(&some.notes)),
-            (
-                1,
-                1,
-                vec![format!(
-                    "1 of the shapes read (a sample of the layer, which may hold more) {SAID}: they're left out of the read, but the layer's extent and its index still take in their stored boxes"
-                )]
-            )
+            (some.features.len(), some.skipped, said(&some.notes), kept(&some.notes)),
+            (2, 0, Vec::new(), vec![format!("{sample} {KEPT}{BOXES}")])
         );
         // A whole read of the same file still gives the total.
-        assert_eq!(said(&src.read(&Request::all()).unwrap().notes), one);
+        assert_eq!(kept(&src.read(&Request::all()).unwrap().notes), one_kept_boxed);
         // The second record's stored box made backwards, (2, 2, 1, 1) at 200..232, over the same
         // NaN point: the index can't frame it from the points, so it's left out of the extent and
         // said as having no usable box, and the read doesn't claim the index took it in. Reads by
@@ -795,12 +865,12 @@ fn a_nan_shape_under_a_finite_box_is_said_when_left_out() {
         let src = open_path(&p, None).unwrap();
         let unboxed = "1 shape(s) have no usable bounding box";
         let (ds, report) = crate::source::materialize(src.as_ref()).unwrap();
-        assert_eq!((ds.features.len(), report.skipped), (2, 1));
+        assert_eq!((ds.features.len(), report.skipped), (3, 0));
         assert!(said(&report.messages).is_empty(), "{:?}", report.messages);
         assert!(report.messages.iter().any(|m| m.contains(unboxed)), "{:?}", report.messages);
         let all = src.read(&Request::all()).unwrap();
-        assert_eq!((all.skipped, said(&all.notes)), (1, Vec::new()));
-        assert_eq!(chunk_notes(src.as_ref(), None), (1, Vec::new()));
+        assert_eq!((all.skipped, said(&all.notes), kept(&all.notes)), (0, Vec::new(), one_kept.clone()));
+        assert_eq!(chunk_notes(src.as_ref(), None), (0, 1, Vec::new(), one_kept));
     });
     std::fs::remove_dir_all(fixture).unwrap();
 }
@@ -915,5 +985,95 @@ fn a_shapefile_says_whether_it_is_as_it_was_opened() {
         assert!(!s.same_as_opened().unwrap(), "written again");
         std::fs::remove_file(&path).unwrap();
         assert!(s.same_as_opened().is_err(), "gone");
+    });
+}
+
+/// The ids a complete read with this own box (no longitude/latitude extent) gives.
+fn without_shape(s: &ShpSource, own: Option<(crate::raster::Crs, Extent)>) -> Vec<u64> {
+    let mut ids = Vec::new();
+    s.visit_request_chunks(&Request { extent: None, limit: usize::MAX, own }, 4096, &mut |chunk| {
+        ids.extend(chunk.iter().map(|f| f.id));
+        Ok(())
+    })
+    .unwrap();
+    ids
+}
+
+/// A complete read by a box in the file's own system (#2788) gives the shapes meeting it and no
+/// row without a shape, as a read by area in longitude/latitude does, also when it gives no
+/// longitude/latitude extent beside the box.
+#[test]
+fn a_complete_read_by_its_own_box_leaves_out_rows_without_a_shape() {
+    let utm = crate::raster::Crs::from_epsg(32631).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("pts.shp");
+    let mut ds = Dataset::new("pts", GeometryType::Point, vec![Field::new("n", FieldType::Integer)]);
+    for (i, p) in
+        [Some((450_000.0, 5_410_000.0)), None, Some((460_000.0, 5_420_000.0)), Some((900_000.0, 5_000_000.0))].into_iter().enumerate()
+    {
+        ds.push(p.map(|(x, y)| Geometry::Point(Coord::new(x, y))), vec![Value::Int(i as i64)]);
+    }
+    ds.held_in = utm;
+    crate::io::write_path_in(&ds, &path, utm).unwrap();
+    // The first record made a shape of no geometry (its type, at 108, 0), as other writers give
+    // a feature without one.
+    let mut b = std::fs::read(&path).unwrap();
+    b[108..112].copy_from_slice(&0i32.to_le_bytes());
+    std::fs::write(&path, b).unwrap();
+    cache::with_index_dir(tmp.path().join("cache"), || {
+        let s = ShpSource::open_path(&path, "pts").unwrap();
+        let own = Extent::new(440_000.0, 5_400_000.0, 470_000.0, 5_430_000.0);
+        let mut got = Vec::new();
+        s.visit_request_chunks(&Request { extent: None, limit: usize::MAX, own: Some((utm, own)) }, 4096, &mut |chunk| {
+            got.extend(chunk.iter().map(|f| f.id));
+            Ok(())
+        })
+        .unwrap();
+        // What a whole read gives, the features with a shape in the box.
+        let mut expected = Vec::new();
+        let mut rows = 0;
+        s.visit_chunks(None, 4096, &mut |chunk| {
+            rows += chunk.len();
+            expected.extend(chunk.iter().filter(|f| f.geometry.as_ref().is_some_and(|g| g.extent().intersects(&own))).map(|f| f.id));
+            Ok(())
+        })
+        .unwrap();
+        assert!(rows > expected.len() && !expected.is_empty(), "{rows} rows, {expected:?} in the box");
+        assert_eq!(got, expected, "the points in the box, not a row without a shape or the far point");
+        assert!(without_shape(&s, None).contains(&1), "a whole read gives the row without a shape");
+        // A box in another system is read as if absent: every row, the one without a shape too.
+        let lonlat = Some((crate::raster::Crs::LonLat, own));
+        assert_eq!(without_shape(&s, lonlat), without_shape(&s, None), "a box in another system reads everything");
+        // A box over the whole plane reads everything too, as a whole read does.
+        assert_eq!(without_shape(&s, Some((utm, super::super::whole_plane()))), without_shape(&s, None));
+    });
+}
+
+/// A read by feature ids gives exactly those features, in file order whatever order they are
+/// asked in, leaves out ids the file doesn't hold, and doesn't count as the whole read that looks
+/// at the stored boxes (#2788).
+#[test]
+fn a_read_by_ids_gives_those_features_in_file_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("pts.shp");
+    let mut ds = Dataset::new("pts", GeometryType::Point, vec![Field::new("n", FieldType::Integer)]);
+    for i in 0..300 {
+        ds.push(Some(Geometry::Point(Coord::new(f64::from(i % 20), f64::from(i / 20)))), vec![Value::Int(i64::from(i))]);
+    }
+    write_shapefile(&ds, &path);
+    cache::with_index_dir(tmp.path().join("cache"), || {
+        let s = ShpSource::open_path(&path, "pts").unwrap();
+        assert!(s.visits_ids());
+        let mut got = Vec::new();
+        let batch = s
+            .visit_ids_chunks(&[250, 3, 0, 120, 3, 9_999], 4096, &mut |chunk| {
+                got.extend(chunk.iter().map(|f| (f.id, f.attrs.first().cloned())));
+                Ok(())
+            })
+            .unwrap();
+        assert!(batch.complete);
+        // Ids from 1: 0 and 9,999 aren't records of this file.
+        assert_eq!(got, [(3, Some(Value::Int(2))), (120, Some(Value::Int(119))), (250, Some(Value::Int(249)))]);
+        assert!(!s.finds_all_by_area(), "a read by ids isn't the whole read that looks at the boxes");
     });
 }

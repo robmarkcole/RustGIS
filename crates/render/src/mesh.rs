@@ -17,6 +17,7 @@ use rustgis_geom::{Coord, Extent};
 use rustgis_map::{Layer, Marker, Rgba, Symbol};
 
 use crate::gpu_scene::{DrawCmd, MeshVertex, PointInstance, f32_holds};
+use crate::mesh_tiles::Tiling;
 use crate::{GPU_CULL_MARGIN, SELECTION};
 
 /// Why a mesh wasn't made; the caller falls the layer (or the outline) back to the CPU path.
@@ -210,7 +211,7 @@ pub(crate) fn fill_polygon(
 /// far past both edges (#1295). Tessellated wider than drawn only folds a few sharp joins
 /// lyon would not have. 1.0 when the product isn't a usable width (the tests' `map_per_px` of
 /// 0).
-fn tessellation_width(width_px: f32, map_per_px: f64) -> f32 {
+pub(crate) fn tessellation_width(width_px: f32, map_per_px: f64) -> f32 {
     let w = (f64::from(width_px) * map_per_px * (1.0 + 2.0 * GPU_CULL_MARGIN)) as f32;
     // The round joins' tolerance is a fraction of it: that must be a positive normal float too.
     if w > 0.0 && (w * STROKE_TOLERANCE).is_normal() { w } else { 1.0 }
@@ -226,7 +227,7 @@ const STROKE_TOLERANCE: f32 = 0.005;
 /// vertex shader applies the real width. Ring outlines take no width floor (`Ctx::polygon`),
 /// line parts floor at half a physical pixel (`Ctx::line`). `Err(TooDense)` once the vertices
 /// would pass `limit`, as soon as one doesn't fit.
-fn stroke(
+pub(crate) fn stroke(
     rings: &[Vec<Coord>],
     origin: [f64; 2],
     color: [f32; 4],
@@ -327,7 +328,7 @@ pub(crate) fn marker_instances(c: Coord, origin: [f64; 2], s: &Symbol, ppp: f32,
 
 /// Appends a tessellated part with its indices rebased onto the shared vertex list. `Err` when
 /// lyon failed the part or the result would overflow the u32 index space.
-fn extend_mesh(
+pub(crate) fn extend_mesh(
     v: &mut Vec<MeshVertex>,
     i: &mut Vec<u32>,
     part: Result<Option<(Vec<MeshVertex>, Vec<u32>)>, TessError>,
@@ -348,7 +349,7 @@ fn extend_mesh(
 /// no-ops, and not emitting them is identical output for less work. `Err` when lyon refuses
 /// the geometry, or once the mesh passes `limit` vertices — the layer then falls back to the
 /// CPU path entirely.
-fn append_geometry(
+pub(crate) fn append_geometry(
     v: &mut Vec<MeshVertex>,
     i: &mut Vec<u32>,
     pts: &mut Vec<PointInstance>,
@@ -407,7 +408,7 @@ pub(crate) const NO_LIMIT: usize = usize::MAX;
 /// draw as instances and count nothing. It is an early out, not a bound: lyon adds vertices
 /// where an EvenOdd ring crosses itself, and decimation drops some, so the tessellation itself
 /// stops at the limit ([`Capped`]).
-fn estimate_vertices(g: &Geometry, s: &Symbol, wireframe: bool) -> usize {
+pub(crate) fn estimate_vertices(g: &Geometry, s: &Symbol, wireframe: bool) -> usize {
     fn stroked<'a>(rings: impl Iterator<Item = &'a Vec<Coord>>, closed: bool) -> usize {
         rings.map(|r| 2 * r.len() + joins(r, closed) + if closed { 0 } else { 32 }).sum()
     }
@@ -440,14 +441,39 @@ fn estimate_vertices(g: &Geometry, s: &Symbol, wireframe: bool) -> usize {
     }
 }
 
+/// How far a feature's stroke reaches past its geometry as tessellated, map units: half the
+/// widest it is drawn at before the scene is made again ([`tessellation_width`]), and a pixel
+/// at that scale beside it. 0 for a feature with no stroke (a fill, a point: markers aren't
+/// tiled).
+fn stroke_reach(g: &Geometry, s: &Symbol, wireframe: bool, ppp: f32, map_per_px: f64) -> f64 {
+    let width_px = match g {
+        Geometry::Point(_) | Geometry::MultiPoint(_) => return 0.0,
+        Geometry::Line(_) if s.stroke.a() > 0 => (s.stroke_width * ppp).max(0.5),
+        Geometry::Line(_) => return 0.0,
+        Geometry::Polygon(_) if wireframe => s.stroke_width.max(1.0) * ppp,
+        Geometry::Polygon(_) if s.stroke_width > 0.0 && s.stroke.a() > 0 => s.stroke_width * ppp,
+        Geometry::Polygon(_) => return 0.0,
+    };
+    if !width_px.is_finite() {
+        return 0.0;
+    }
+    let widest = map_per_px * (1.0 + 2.0 * GPU_CULL_MARGIN);
+    f64::from(tessellation_width(width_px, map_per_px)) / 2.0 + widest
+}
+
 /// Collects one GPU-eligible layer, or one streamed batch of it, into Mesh/Points commands.
 /// `geoms`, `extents`, `rows` and `visible` are the render loop's own (geometries as the CPU
 /// draws them, their cached extents, row filter, extent cull), so the GPU draws exactly the
-/// features the CPU would. `limit` is what is left of the layer's [`MAX_LAYER_VERTICES`] (its
-/// earlier batches took the rest). `Ok` with the mesh vertices pushed; `Err(Refused)` when
-/// lyon refused a feature, `Err(TooDense)` when the mesh would pass `limit`, `Err(Imprecise)` when
-/// the features reach too far for f32 at this zoom — the caller then draws the layer
-/// (or batch) with tiny-skia instead (nothing is pushed part-way).
+/// features the CPU would. Its lines and polygons are cut into the tiles of the scene's cull
+/// ([`Tiling`], [`crate::mesh_tiles`]), those kept from an earlier scene taken as they are and
+/// the rest meshed on several threads, or made one mesh when `tiling` is `None` (a tilted view,
+/// whose far strokes are wider than a tile's reach); its markers follow them as one command.
+/// Tiled, its lines and polygons are those within a tile of the cull's tiles
+/// ([`crate::mesh_tiles::feature_area`]), which may be more than `visible` keeps, out of view. `limit` is what is left of the layer's
+/// [`MAX_LAYER_VERTICES`] (its earlier batches took the rest). `Ok` with the mesh vertices pushed; `Err(Refused)` when lyon refused a
+/// feature, `Err(TooDense)` when the mesh would pass `limit`, `Err(Imprecise)` when the
+/// features reach too far for f32 at this zoom — the caller then draws the layer (or batch)
+/// with tiny-skia instead (nothing is pushed part-way).
 pub(crate) fn collect_layer(
     cmds: &mut Vec<DrawCmd>,
     layer: &Layer,
@@ -455,54 +481,126 @@ pub(crate) fn collect_layer(
     extents: &[Extent],
     rows: &[bool],
     visible: &dyn Fn(&Extent) -> bool,
+    tiling: Option<Tiling<'_>>,
     wireframe: bool,
     ppp: f32,
     map_per_px: f64,
     limit: usize,
 ) -> Result<usize, TessError> {
-    // Stable origin: the centre of the drawn features' extent, so the features are listed
-    // first — with their symbols and estimates, each worked out once. The same pass gives up on
-    // a layer too dense to mesh before any of it is tessellated.
+    // The features are listed first, with their symbols and estimates, each worked out once.
+    // The same pass gives up on a layer too dense to mesh before any of it is tessellated.
+    // Markers are kept apart: they draw as instances, after the layer's meshes.
     let mut ext = Extent::EMPTY;
+    let mut marked = Extent::EMPTY;
     let mut estimate = 0usize;
     let mut features = Vec::new();
+    let mut markers = Vec::new();
+    // Tiled, a tile's mesh takes every feature reaching it, wherever the cull's edge lies, so a
+    // kept tile is the one meshing it again makes: lines and polygons are kept by the tiles' area
+    // (a tile past them all round), markers by the cull.
+    let side = crate::mesh_tiles::tile_side(map_per_px);
+    let near = tiling.as_ref().and_then(|t| crate::mesh_tiles::feature_area(t.area, map_per_px));
+    let mut farthest = 0f64;
     for (row, g) in geoms.iter().enumerate() {
         let Some(g) = g else { continue };
         // Culled on the extent the CPU path culls on (the full geometry's, cached), so both
         // backends keep the same features; the globe has none cached.
         let e = extents.get(row).copied().unwrap_or_else(|| g.extent());
-        if rows.get(row) != Some(&true) || !visible(&e) {
+        let marker = matches!(g, Geometry::Point(_) | Geometry::MultiPoint(_));
+        let seen = match &near {
+            Some(near) if !marker => e.intersects(near),
+            _ => visible(&e),
+        };
+        if rows.get(row) != Some(&true) || !seen {
             continue;
         }
         ext = ext.union(&e);
         let s = layer.symbol(row);
-        let n = estimate_vertices(g, &s, wireframe);
-        estimate = estimate.saturating_add(n);
-        if estimate > limit {
-            return Err(TessError::TooDense);
+        if marker {
+            // A character or an image has no shape template: its layer draws on the CPU.
+            if matches!(s.marker, Marker::Char(_) | Marker::Picture(_)) {
+                return Err(TessError::Refused);
+            }
+            marked = marked.union(&e);
+            markers.push((*g, s));
+            continue;
         }
-        features.push((*g, s, n));
+        let n = estimate_vertices(g, &s, wireframe);
+        // One mesh takes every feature whole, so a layer estimated past the limit isn't started;
+        // tiles take only each feature's part in them, and keep to the limit as they're made.
+        if tiling.is_none() {
+            estimate = estimate.saturating_add(n);
+            if estimate > limit {
+                return Err(TessError::TooDense);
+            }
+        }
+        let reach = stroke_reach(g, &s, wireframe, ppp, map_per_px);
+        farthest = farthest.max(reach);
+        features.push(crate::mesh_tiles::Feature { geometry: g, symbol: s, estimate: n, extent: e, reach });
     }
     if ext.is_empty() {
         return Ok(0);
     }
-    let origin = origin_for(&ext, map_per_px)?;
-    let (mut v, mut i, mut pts) = (Vec::new(), Vec::new(), Vec::new());
-    for (g, s, n) in &features {
-        // The estimate is rough: a feature estimated not to fit isn't started, and
-        // `append_geometry` stops one that overflows at the first vertex past the limit.
-        if v.len().saturating_add(*n) > limit {
-            return Err(TessError::TooDense);
+    let tiled = match tiling {
+        _ if features.is_empty() => Some(Ok((Vec::new(), 0))),
+        Some(t) => {
+            // A stroke reaching a tile or more past its feature could reach in from one left out
+            // (past `near`): its tiles aren't taken again, nor kept.
+            let keeps = side.is_some_and(|side| farthest < side);
+            let kept = if keeps { t.kept } else { &[] };
+            let made = crate::mesh_tiles::tile_meshes(&features, t.area, kept, wireframe, ppp, map_per_px, limit);
+            made.map(|made| {
+                made.map(|(tiles, used)| {
+                    let cmds = tiles.iter().filter_map(|t| t.cmd.as_ref().and_then(DrawCmd::share)).collect();
+                    if keeps {
+                        *t.made = tiles;
+                    }
+                    (cmds, used)
+                })
+            })
         }
-        append_geometry(&mut v, &mut i, &mut pts, g, s, origin, wireframe, ppp, map_per_px, limit)?;
-    }
-    let used = v.len();
-    if !i.is_empty() {
-        cmds.push(DrawCmd::Mesh { origin, vertices: Arc::new(v), indices: Arc::new(i) });
-    }
-    if !pts.is_empty() {
-        cmds.push(DrawCmd::Points { origin, instances: Arc::new(pts) });
-    }
+        None => None,
+    };
+    let (meshes, used) = match tiled {
+        Some(made) => made?,
+        // No tiles at this scale, or too many: one mesh, its origin the centre of the drawn
+        // features' extent.
+        None => {
+            // Only those `visible` keeps: the ones past it were taken for the tiles.
+            let shown: Vec<&crate::mesh_tiles::Feature<'_>> = features.iter().filter(|f| visible(&f.extent)).collect();
+            let at = shown.iter().fold(marked, |e, f| e.union(&f.extent));
+            let origin = if at.is_empty() { [0.0, 0.0] } else { origin_for(&at, map_per_px)? };
+            let (mut v, mut i) = (Vec::new(), Vec::new());
+            for f in shown {
+                // The estimate is rough: a feature estimated not to fit isn't started, and
+                // `append_geometry` stops one that overflows at the first vertex past the limit.
+                if v.len().saturating_add(f.estimate) > limit {
+                    return Err(TessError::TooDense);
+                }
+                append_geometry(&mut v, &mut i, &mut Vec::new(), f.geometry, &f.symbol, origin, wireframe, ppp, map_per_px, limit)?;
+            }
+            let used = v.len();
+            let mesh = (!i.is_empty()).then(|| DrawCmd::Mesh { origin, vertices: Arc::new(v), indices: Arc::new(i), square: None });
+            (mesh.into_iter().collect(), used)
+        }
+    };
+    // The markers' origin: the centre of their extent.
+    let points = if markers.is_empty() {
+        None
+    } else {
+        let origin = origin_for(&marked, map_per_px)?;
+        let mut pts = Vec::new();
+        for (g, s) in &markers {
+            match g {
+                Geometry::Point(c) => pts.extend(marker_instances(*c, origin, s, ppp, None)),
+                Geometry::MultiPoint(cs) => cs.iter().for_each(|c| pts.extend(marker_instances(*c, origin, s, ppp, None))),
+                _ => {}
+            }
+        }
+        (!pts.is_empty()).then(|| DrawCmd::Points { origin, instances: Arc::new(pts) })
+    };
+    cmds.extend(meshes);
+    cmds.extend(points);
     Ok(used)
 }
 
@@ -527,7 +625,7 @@ pub(crate) fn collect_highlight(cmds: &mut Vec<DrawCmd>, g: &Geometry, s: &Symbo
             )?;
             extend_mesh(&mut v, &mut i, stroke_lines(parts, origin, premul(s.stroke), s.stroke_width * ppp, map_per_px, NO_LIMIT))?;
             if !i.is_empty() {
-                cmds.push(DrawCmd::Mesh { origin, vertices: Arc::new(v), indices: Arc::new(i) });
+                cmds.push(DrawCmd::Mesh { origin, vertices: Arc::new(v), indices: Arc::new(i), square: None });
             }
         }
         Geometry::Polygon(polys) => {
@@ -535,7 +633,7 @@ pub(crate) fn collect_highlight(cmds: &mut Vec<DrawCmd>, g: &Geometry, s: &Symbo
             extend_mesh(&mut v, &mut i, fill_polygon(polys, origin, premul(SELECTION.with_alpha(40)), map_per_px, NO_LIMIT))?;
             extend_mesh(&mut v, &mut i, stroke_rings(polys, origin, premul(SELECTION), 2.0 * ppp, map_per_px, NO_LIMIT))?;
             if !i.is_empty() {
-                cmds.push(DrawCmd::Mesh { origin, vertices: Arc::new(v), indices: Arc::new(i) });
+                cmds.push(DrawCmd::Mesh { origin, vertices: Arc::new(v), indices: Arc::new(i), square: None });
             }
         }
     }
@@ -559,7 +657,7 @@ pub(crate) fn collect_basemap(
         extend_mesh(&mut v, &mut i, stroke_rings(polys, origin, premul(outline), 0.6 * ppp, map_per_px, NO_LIMIT))?;
     }
     if !i.is_empty() {
-        cmds.push(DrawCmd::Mesh { origin, vertices: Arc::new(v), indices: Arc::new(i) });
+        cmds.push(DrawCmd::Mesh { origin, vertices: Arc::new(v), indices: Arc::new(i), square: None });
     }
     Ok(())
 }
@@ -578,7 +676,7 @@ pub(crate) fn collect_graticule(
     let (mut v, mut i) = (Vec::new(), Vec::new());
     extend_mesh(&mut v, &mut i, stroke_lines(lines, origin, premul(grat), width * ppp, map_per_px, NO_LIMIT))?;
     if !i.is_empty() {
-        cmds.push(DrawCmd::Mesh { origin, vertices: Arc::new(v), indices: Arc::new(i) });
+        cmds.push(DrawCmd::Mesh { origin, vertices: Arc::new(v), indices: Arc::new(i), square: None });
     }
     Ok(())
 }

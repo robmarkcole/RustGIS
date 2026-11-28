@@ -147,7 +147,8 @@ fn a_ring_without_area_is_left_out_and_said() {
     let (ds, report) = read(&bytes, "t").unwrap();
     let Some(Geometry::Polygon(polygons)) = &ds.features[0].geometry else { panic!("not a polygon") };
     assert_eq!(polygons.len(), 1);
-    assert_eq!(report.messages, ["1 polygon rings have no area and are left out"]);
+    assert_eq!(report.messages.texts().collect::<Vec<_>>(), ["1 polygon rings have no area and are left out"]);
+    assert_eq!(report.messages[0].loss, Some(crate::loss::LossCode::DroppedRing));
 }
 
 #[test]
@@ -163,7 +164,7 @@ fn z_and_m_are_dropped_and_said_even_when_they_are_all_alike() {
     let (ds, report) = read(&bytes, "t").unwrap();
     assert_eq!(ds.features[0].geometry, Some(Geometry::Point(c(4.0, 6.0))));
     assert!(ds.zm_dropped);
-    assert_eq!(report.messages, [crate::zm_note(Some(2))]);
+    assert_eq!(report.messages, [crate::loss::Note::loss(crate::loss::LossCode::DroppedZm, crate::zm_note(Some(2)))]);
 }
 
 #[test]
@@ -203,7 +204,7 @@ fn a_page_read_within_a_limit_counts_what_the_features_kept_lost() {
     ]);
     let page = read_page_within(&bytes, "t", 1).unwrap();
     assert_eq!((page.dataset.features.len(), page.left_out, page.losses.with_zm), (1, 2, 1));
-    assert_eq!(page.losses.messages(), [crate::zm_note(Some(1))]);
+    assert_eq!(page.losses.messages(), [crate::loss::Note::loss(crate::loss::LossCode::DroppedZm, crate::zm_note(Some(1)))]);
     assert!(page.report.messages.is_empty(), "the losses are said apart: {:?}", page.report.messages);
     // Within a limit it doesn't reach, the whole page.
     let page = read_page_within(&bytes, "t", 3).unwrap();
@@ -233,7 +234,15 @@ fn an_unknown_coordinate_system_is_said() {
     let bytes = answer(&[message(8, &number(1, 999_999)), transform(false, 1.0, 0.0, 0.0), feature(&[geometry(&[], &[1, 2])])]);
     let (ds, report) = read(&bytes, "t").unwrap();
     assert!(ds.crs.is_none());
-    assert_eq!(report.messages, ["coordinate system 999999 can't be used; coordinates are read as longitude/latitude"]);
+    assert_eq!(
+        report.messages.texts().collect::<Vec<_>>(),
+        ["coordinate system 999999 can't be used; coordinates are read as longitude/latitude"]
+    );
+    assert_eq!(report.messages[0].loss, Some(crate::loss::LossCode::AssumedCrs));
+    // An answer with no geometry places nothing in it: nothing assumed, nothing said.
+    let rows = answer(&[message(8, &number(1, 999_999)), transform(false, 1.0, 0.0, 0.0), feature(&[])]);
+    let (_, report) = read(&rows, "t").unwrap();
+    assert!(!report.messages.iter().any(|m| m.contains("can't be used")), "{:?}", report.messages);
 }
 
 #[test]
@@ -241,11 +250,15 @@ fn an_answer_without_a_coordinate_system_is_said_to_be_read_as_longitude_latitud
     let bytes = answer(&[transform(false, 1.0, 0.0, 0.0), feature(&[geometry(&[], &[1, 2])])]);
     let (ds, report) = read(&bytes, "t").unwrap();
     assert_eq!(ds.features[0].geometry, Some(Geometry::Point(c(1.0, 2.0))));
-    assert_eq!(report.messages, ["the answer names no coordinate system; coordinates are read as longitude/latitude"]);
+    assert_eq!(
+        report.messages.texts().collect::<Vec<_>>(),
+        ["the answer names no coordinate system; coordinates are read as longitude/latitude"]
+    );
+    assert_eq!(report.messages[0].loss, Some(crate::loss::LossCode::AssumedCrs));
 }
 
 #[test]
-fn coordinates_past_longitude_latitude_lose_their_geometry_and_the_layer_says_so() {
+fn coordinates_past_longitude_latitude_are_kept_and_the_layer_says_so() {
     // Web Mercator: 1,113,195 m is 10°; 1,000,000,000 m comes out near 8,983°, beyond the world.
     let bytes = answer(&[
         message(8, &number(1, 3857)),
@@ -255,10 +268,17 @@ fn coordinates_past_longitude_latitude_lose_their_geometry_and_the_layer_says_so
     ]);
     let (ds, report) = read(&bytes, "t").unwrap();
     assert!(ds.features[0].geometry.is_some());
-    assert_eq!(ds.features[1].geometry, None);
-    // Defining the projection again can't bring it back.
-    assert!(ds.crs_incomplete);
-    assert_eq!(report.messages, ["1 features have coordinates outside their coordinate system: they are kept without geometry"]);
+    // Kept as the answer gives it (#2032 C2f-4b), and said: it converts beyond
+    // longitude/latitude, so it draws out of place. Nothing was lost, so a projection can still be
+    // defined.
+    assert_eq!(ds.features[1].geometry, Some(Geometry::Point(c(1e9, 0.0))));
+    assert!(!ds.crs_incomplete);
+    assert_eq!(
+        report.messages,
+        [
+            "one feature has coordinates that come out beyond longitude/latitude once converted from the answer's coordinate system: it may not be their coordinate system, and it may draw out of place"
+        ]
+    );
 }
 
 #[test]
@@ -272,8 +292,9 @@ fn text_that_isnt_utf8_is_read_with_replacements_and_said() {
     assert_eq!(ds.fields[0].name, "N\u{FFFD}AME");
     assert_eq!(ds.features[0].attrs, [Value::Text("a\u{FFFD}b".into())]);
     assert_eq!(ds.features[1].attrs, [Value::Text("ok".into())]);
+    assert_eq!(report.messages[0].loss, Some(crate::loss::LossCode::ChangedEncoding));
     assert_eq!(
-        report.messages,
+        report.messages.texts().collect::<Vec<_>>(),
         ["2 values, field names or aliases aren't valid UTF-8; the bytes that can't be read are replaced with U+FFFD"]
     );
 }
@@ -303,13 +324,14 @@ fn repeated_names_and_unread_field_types_are_left_out_and_said() {
     assert_eq!(ds.fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["NAME", "COUNT"]);
     assert_eq!(ds.features[0].attrs, [Value::Text("a".into()), Value::Null]);
     assert_eq!(
-        report.messages,
+        report.messages.texts().collect::<Vec<_>>(),
         [
             "1 fields repeat an earlier field's name and are left out",
             "1 fields hold geometries, blobs or rasters, which aren't read, and are left out",
             "1 values don't fit their field's type and are left empty",
         ]
     );
+    assert!(report.messages.iter().all(|m| m.loss == Some(crate::loss::LossCode::DroppedValue)), "{:?}", report.messages);
     // A table: no geometry type, no geometry.
     assert_eq!(ds.geometry_type, GeometryType::None);
 }
@@ -319,7 +341,10 @@ fn a_page_cut_at_the_record_limit_says_so() {
     let bytes = answer(&[number(9, 1), field("OBJECTID", OID), feature(&[uint(1)])]);
     assert!(read_page(&bytes, "t").unwrap().exceeded_transfer_limit);
     let (_, report) = read(&bytes, "t").unwrap();
-    assert_eq!(report.messages, ["the service sent 1 features only (its record limit); the rest aren't in this answer"]);
+    assert_eq!(
+        report.messages.texts().collect::<Vec<_>>(),
+        ["the service sent 1 features only (its record limit); the rest aren't in this answer"]
+    );
 }
 
 #[test]
@@ -428,6 +453,20 @@ fn lengths_in_several_fields_keep_their_order() {
     assert!(report.messages.is_empty(), "{:?}", report.messages);
 }
 
+/// A WKT RustGIS can't read is assumed to be longitude/latitude only for an answer with a
+/// geometry read in it: one without places nothing there.
+#[test]
+fn an_unreadable_wkt_is_assumed_only_with_a_geometry() {
+    let wkt: &[u8] = b"PROJCS[\"nonsense\"]";
+    let assumed = |features: &[u8]| {
+        let bytes = answer(&[message(8, &message(5, wkt)), transform(false, 1.0, 0.0, 0.0), features.to_vec()]);
+        let (_, report) = read(&bytes, "t").unwrap();
+        report.messages.iter().filter(|m| m.contains("read as longitude/latitude")).map(|m| m.loss).collect::<Vec<_>>()
+    };
+    assert_eq!(assumed(&feature(&[geometry(&[], &[1, 2])])), [Some(crate::loss::LossCode::AssumedCrs)]);
+    assert_eq!(assumed(&feature(&[])), [None]);
+}
+
 #[test]
 fn a_wkt_that_isnt_utf8_is_said() {
     let wkt = b"GEOGCS[\"GCS_WGS_1984\xff\",DATUM[\"D_WGS_1984\",SPHEROID[\"WGS_1984\",6378137.0,298.257223563]],PRIMEM[\"Greenwich\",0.0],UNIT[\"Degree\",0.0174532925199433]]";
@@ -437,6 +476,11 @@ fn a_wkt_that_isnt_utf8_is_said() {
         report.messages.first().map(|m| m.as_str()),
         Some("the coordinate system's WKT isn't valid UTF-8; the bytes that can't be read are replaced with U+FFFD")
     );
+    assert_eq!(report.messages[0].loss, Some(crate::loss::LossCode::ChangedEncoding));
+    // On a page with no geometry, nothing is placed in the system: said, without a code.
+    let rows = answer(&[message(8, &message(5, wkt)), transform(false, 1.0, 0.0, 0.0), feature(&[])]);
+    let (_, report) = read(&rows, "t").unwrap();
+    assert_eq!(report.messages.first().map(|m| m.loss), Some(None), "{:?}", report.messages);
     // Unused when a code RustGIS knows names the system: nothing to say.
     let with_code = answer(&[
         message(8, &[number(1, 4326), message(5, wkt)].concat()),
@@ -487,7 +531,10 @@ fn a_wkts_own_shift_wins_over_its_wkid() {
     assert!(!crate::raster::wkt::parses(&String::from_utf8_lossy(&broken)));
     let (p, messages) = at(&page([number(1, 27700), message(5, &broken)].concat()));
     assert!((p.x - by_code.x).abs() < 1e-9 && (p.y - by_code.y).abs() < 1e-9, "{p:?} {by_code:?}");
-    assert_eq!(messages, ["the coordinate system's WKT isn't valid UTF-8; the bytes that can't be read are replaced with U+FFFD"]);
+    assert_eq!(
+        messages.texts().collect::<Vec<_>>(),
+        ["the coordinate system's WKT isn't valid UTF-8; the bytes that can't be read are replaced with U+FFFD"]
+    );
     // A non-EPSG Esri code: its WKT is read only for another body's system, so a byte that
     // breaks the WKT is said, and a byte in a name is not. The WKT's shift (OSGB 1936's) is set
     // aside for the code's, which is said.
@@ -495,7 +542,10 @@ fn a_wkts_own_shift_wins_over_its_wkid() {
     let albers = crate::filegdb::crs_of_code(102033).unwrap().transformer().unwrap().to_lonlat(xy).unwrap();
     let (p, messages) = at(&page([number(1, 102033), message(5, &broken)].concat()));
     assert!((p.x - albers.x).abs() < 1e-9 && (p.y - albers.y).abs() < 1e-9, "{p:?} {albers:?}");
-    assert_eq!(messages, ["the coordinate system's WKT isn't valid UTF-8; the bytes that can't be read are replaced with U+FFFD"]);
+    assert_eq!(
+        messages.texts().collect::<Vec<_>>(),
+        ["the coordinate system's WKT isn't valid UTF-8; the bytes that can't be read are replaced with U+FFFD"]
+    );
     let (p, messages) = at(&page([number(1, 102033), message(5, &not_utf8)].concat()));
     assert!((p.x - albers.x).abs() < 1e-9 && (p.y - albers.y).abs() < 1e-9, "{p:?} {albers:?}");
     assert_eq!(
@@ -681,7 +731,7 @@ fn a_repeated_field_of_an_unknown_type_is_only_said_left_out() {
     let bytes = answer(&[field("NAME", 4), field("name", 17), feature(&[text("a"), uint(5)])]);
     let (ds, report) = read(&bytes, "t").unwrap();
     assert_eq!(ds.fields.len(), 1);
-    assert_eq!(report.messages, ["1 fields repeat an earlier field's name and are left out"]);
+    assert_eq!(report.messages.texts().collect::<Vec<_>>(), ["1 fields repeat an earlier field's name and are left out"]);
 }
 
 #[test]
@@ -690,10 +740,13 @@ fn a_left_out_field_whose_name_isnt_utf8_is_only_said_left_out() {
     let repeat = message(13, &[message(1, b"N\xffame"), number(2, 4)].concat());
     let bytes = answer(&[field("N\u{FFFD}AME", 4), repeat, feature(&[text("a"), text("b")])]);
     let (_, report) = read(&bytes, "t").unwrap();
-    assert_eq!(report.messages, ["1 fields repeat an earlier field's name and are left out"]);
+    assert_eq!(report.messages.texts().collect::<Vec<_>>(), ["1 fields repeat an earlier field's name and are left out"]);
     let geometry = message(13, &[message(1, b"G\xff"), number(2, 7)].concat());
     let (_, report) = read(&answer(&[field("NAME", 4), geometry, feature(&[text("a")])]), "t").unwrap();
-    assert_eq!(report.messages, ["1 fields hold geometries, blobs or rasters, which aren't read, and are left out"]);
+    assert_eq!(
+        report.messages.texts().collect::<Vec<_>>(),
+        ["1 fields hold geometries, blobs or rasters, which aren't read, and are left out"]
+    );
 }
 
 #[test]
@@ -745,4 +798,24 @@ fn a_wkt_is_taken_from_the_text_room_at_its_size_once_read() {
     let reference = message(5, b"GEOGCS\xff\xfe[]");
     assert!(spatial_reference(&reference, &mut Tally { text_room: 13, ..Tally::default() }).is_err());
     assert!(spatial_reference(&reference, &mut Tally { text_room: 14, ..Tally::default() }).is_ok());
+}
+
+/// Pages joined that name different codes RustGIS can't use say the first and how many others,
+/// so every page's assumption is said; the same code again adds nothing.
+#[test]
+fn joined_pages_say_every_unusable_code() {
+    let page = |code| Losses { unusable_code: Some(code), ..Losses::default() };
+    let mut all = page(999_999);
+    all.add(&page(999_999));
+    all.add(&page(888_888));
+    all.add(&page(777_777));
+    let said: Vec<_> = all.messages().iter().map(|m| (m.as_str().to_string(), m.loss)).collect();
+    assert_eq!(
+        said,
+        [(
+            "coordinate system 999999 can't be used (and 2 other pages name codes it can't use either); coordinates are read as longitude/latitude"
+                .to_string(),
+            Some(crate::loss::LossCode::AssumedCrs)
+        )]
+    );
 }

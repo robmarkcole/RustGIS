@@ -56,10 +56,7 @@ fn get<'a>(row: &'a [(String, Val)], col: &str) -> Option<&'a Val> {
 }
 
 fn text(v: Option<&Val>) -> Option<String> {
-    match v? {
-        Val::Text(s) => Some(s.clone()),
-        _ => None,
-    }
+    v?.text().map(std::borrow::Cow::into_owned)
 }
 
 /// An integer value, exactly (an id, a code).
@@ -119,7 +116,7 @@ pub fn unsupported_table_counts(bytes: Shared) -> Result<Vec<(String, u64)>> {
     let mut invalid = 0u64;
     // Count in place: the contents catalog can be large without materializing its rows.
     db.rows(table, |_, row| {
-        let (Some(Val::Text(kind)), Some(Val::Text(name))) = (row.get(kind_col), row.get(name_col)) else {
+        let (Some(kind), Some(name)) = (row.get(kind_col).and_then(Val::text), row.get(name_col).and_then(Val::text)) else {
             invalid = invalid.saturating_add(1);
             return ControlFlow::Continue(());
         };
@@ -158,7 +155,7 @@ impl GpkgMemSource {
                 .ok_or_else(|| DataError::Format(format!("no feature table '{l}' (tables: {})", tables.join(", "))))?,
             None => tables.first().cloned().ok_or_else(|| DataError::Format("the GeoPackage has no feature tables".into()))?,
         };
-        let mut notes = Vec::new();
+        let mut notes = crate::loss::Notes::new();
         if layer.is_none() && tables.len() > 1 {
             notes.push(format!("the first of {} feature tables ({})", tables.len(), tables.join(", ")));
         }
@@ -191,13 +188,18 @@ impl GpkgMemSource {
             .ok_or_else(|| DataError::Format(format!("GeoPackage: no column '{geom}' in {table_name}")))?;
         let mut fields = Vec::new();
         let mut field_cols = Vec::new();
+        // The columns with no field type (BLOB), which reading leaves out.
+        let mut left_out = Vec::new();
         for (i, c) in table.columns.iter().enumerate() {
             if i == geom_col || Some(i) == table.rowid_column {
                 continue;
             }
-            if let Some(ty) = super::gpkg_blob::field_type(&c.decl) {
-                fields.push(Field::new(c.name.clone(), ty));
-                field_cols.push(i);
+            match super::gpkg_blob::field_type(&c.decl) {
+                Some(ty) => {
+                    fields.push(Field::new(c.name.clone(), ty));
+                    field_cols.push(i);
+                }
+                None => left_out.push((c.name.clone(), "binary".to_string())),
             }
         }
         let contents = meta_rows(&db, &schema, "gpkg_contents").unwrap_or_default();
@@ -211,7 +213,7 @@ impl GpkgMemSource {
             "POLYGON" | "MULTIPOLYGON" | "SURFACE" | "MULTISURFACE" => GeometryType::Polygon,
             _ => GeometryType::None,
         };
-        let info = SourceInfo {
+        let mut info = SourceInfo {
             name: table_name,
             format: "GeoPackage",
             geometry_type,
@@ -222,9 +224,13 @@ impl GpkgMemSource {
             // (`SourceInfo::coordinate_system`), as a Shapefile's .prj does (#1476).
             crs: reproject.info_crs(),
             indexed: false,
-            notes: notes.into(),
+            notes,
             zm_dropped: false,
         };
+        info.note_columns(
+            &left_out,
+            ["of a type RustGIS has no field for was left out", "of types RustGIS has no field for were left out"],
+        );
         let mut src = GpkgMemSource { info, db, table, geom_col, field_cols, reproject };
         // The extent the file declares, else the envelopes in the geometry headers.
         let native = match declared.filter(|e| !e.is_empty()) {
@@ -311,26 +317,40 @@ impl GpkgMemSource {
 }
 
 /// An attribute value of a field's type, for the field `k`. One a date field can't hold is null,
-/// and counted in `unread` ([`Batch::unread_dates`]); a date-time with digits past the microsecond
-/// is rounded and counted in `rounded` ([`Batch::rounded_dates`]).
-fn value(v: &Val, ty: FieldType, unread: &mut Vec<usize>, rounded: &mut Vec<usize>, k: usize) -> Value {
+/// and counted in `unread` ([`Batch::unread_dates`]): text that isn't a number in a number field,
+/// a blob. A date-time with digits past the microsecond, or a whole number past 2^53 in a Double
+/// field, is rounded and counted in `rounded` ([`Batch::rounded_dates`]).
+fn value(v: &Val, ty: FieldType, unread: &mut Vec<usize>, rounded: &mut Vec<usize>, not_utf8: &mut Vec<usize>, k: usize) -> Value {
     match (v, ty) {
         (Val::Null, _) => Value::Null,
-        (v, FieldType::Date | FieldType::DateTime) => {
-            super::gpkg_blob::temporal(if let Val::Text(t) = v { Some(t) } else { None }, ty, unread, Some(rounded), k)
-        }
-        (Val::Blob(_), _) => Value::Null,
+        (v, FieldType::Date | FieldType::DateTime) => super::gpkg_blob::temporal(v.text().as_deref(), ty, unread, Some(rounded), k),
         (Val::Int(i), FieldType::Boolean) => Value::Bool(*i != 0),
-        (Val::Int(i), FieldType::Double) => Value::Float(*i as f64),
+        (Val::Int(i), FieldType::Double) => super::int_as_double(*i, Some(rounded), k),
         (Val::Int(i), _) => Value::Int(*i),
         (Val::Real(f), FieldType::Integer) if f.fract() == 0.0 && f.abs() < 9e15 => Value::Int(*f as i64),
         (Val::Real(f), _) => Value::Float(*f),
         (Val::Text(t), FieldType::Text) => Value::Text(t.clone()),
-        (Val::Text(t), ty) => Value::parse_source(t, ty),
+        (Val::BadText(b), FieldType::Text) => super::utf8_text(b, not_utf8, k),
+        // Elsewhere it reads as its text with U+FFFD, which no number, date or yes/no word holds.
+        (Val::BadText(b), FieldType::Boolean) => super::yes_no_text(&String::from_utf8_lossy(b), unread, k),
+        (Val::BadText(b), ty) => super::number_text(&String::from_utf8_lossy(b), ty, unread, Some(rounded), k),
+        (Val::Text(t), FieldType::Boolean) => super::yes_no_text(t, unread, k),
+        (Val::Text(t), ty) => super::number_text(t, ty, unread, Some(rounded), k),
+        // A blob in a text column is its text, as SQLite stores text either way.
+        (Val::Blob(b), FieldType::Text) => super::utf8_text(b, not_utf8, k),
+        // A blob isn't a value another attribute column holds.
+        (Val::Blob(_), _) => {
+            super::unread_date(unread, k);
+            Value::Null
+        }
     }
 }
 
 impl FeatureSource for GpkgMemSource {
+    /// Text that isn't valid UTF-8 is said as GeoPackage text ([`super::not_utf8_note`]).
+    fn text_encoding(&self) -> &'static str {
+        super::GEOPACKAGE_TEXT
+    }
     fn info(&self) -> &SourceInfo {
         &self.info
     }
@@ -355,7 +375,7 @@ impl FeatureSource for GpkgMemSource {
         }
         // A whole read knows its count; an extent, bounded natively or not, is matched as it goes.
         let mut sample = if req.extent.is_none() { Sampler::with_total(limit, self.info.count.unwrap_or(0)) } else { Sampler::new(limit) };
-        let (mut skipped, mut unread_dates, mut rounded_dates) = (0, Vec::new(), Vec::new());
+        let (mut skipped, mut unread_dates, mut rounded_dates, mut not_utf8) = (0, Vec::new(), Vec::new(), Vec::new());
         let mut failed = None;
         crate::progress::begin(self.info.count.and_then(|n| usize::try_from(n).ok()).unwrap_or(0));
         self.db
@@ -373,7 +393,7 @@ impl FeatureSource for GpkgMemSource {
                             sample.keep(Feature {
                                 id: rowid as u64,
                                 geometry: None,
-                                attrs: self.attrs(r, &mut unread_dates, &mut rounded_dates),
+                                attrs: self.attrs(r, &mut unread_dates, &mut rounded_dates, &mut not_utf8),
                             });
                         }
                         return ControlFlow::Continue(());
@@ -410,7 +430,7 @@ impl FeatureSource for GpkgMemSource {
                 sample.keep(Feature {
                     id: rowid as u64,
                     geometry: Some(geometry),
-                    attrs: self.attrs(r, &mut unread_dates, &mut rounded_dates),
+                    attrs: self.attrs(r, &mut unread_dates, &mut rounded_dates, &mut not_utf8),
                 });
                 ControlFlow::Continue(())
             })
@@ -427,7 +447,7 @@ impl FeatureSource for GpkgMemSource {
             rounded_dates,
             null_text: Vec::new(),
             notes: Default::default(),
-            not_utf8: Vec::new(),
+            not_utf8,
         })
     }
 
@@ -484,7 +504,7 @@ impl FeatureSource for GpkgMemSource {
                 match chunks.push(Feature {
                     id: rowid as u64,
                     geometry,
-                    attrs: self.attrs(r, &mut out.unread_dates, &mut out.rounded_dates),
+                    attrs: self.attrs(r, &mut out.unread_dates, &mut out.rounded_dates, &mut out.not_utf8),
                 }) {
                     Ok(()) => ControlFlow::Continue(()),
                     Err(e) => {
@@ -505,11 +525,11 @@ impl FeatureSource for GpkgMemSource {
 impl GpkgMemSource {
     /// A row's field values, in `info.fields` order, counting in `unread_dates` the dates that
     /// aren't ones.
-    fn attrs(&self, r: &[Val], unread_dates: &mut Vec<usize>, rounded_dates: &mut Vec<usize>) -> Vec<Value> {
+    fn attrs(&self, r: &[Val], unread_dates: &mut Vec<usize>, rounded_dates: &mut Vec<usize>, not_utf8: &mut Vec<usize>) -> Vec<Value> {
         let mut out = Vec::with_capacity(self.info.fields.len());
         for (k, (f, &c)) in self.info.fields.iter().zip(&self.field_cols).enumerate() {
             out.push(match r.get(c) {
-                Some(v) => value(v, f.ty, unread_dates, rounded_dates, k),
+                Some(v) => value(v, f.ty, unread_dates, rounded_dates, not_utf8, k),
                 None => Value::Null,
             });
         }

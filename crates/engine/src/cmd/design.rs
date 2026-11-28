@@ -194,27 +194,16 @@ pub(crate) fn apply_with<B: Borrow<Feature>>(s: &mut Session, id: u32, changes: 
         };
         zs.push((*r, z));
     }
-    // Construction belongs to an object, not a reusable numeric id. Each removed or inserted
-    // feature that passes here (cut/paste, split pieces, edits) forgets its construction. Some
-    // row changes don't (GeoPackage and offline-area syncs, archive restore): there a feature
-    // keeps its construction only while its geometry still equals it (see `box_spec`). Undo
-    // keeps its own cache snapshot.
-    for change in &changes {
-        let feature = match (change.before(), change.row) {
-            (Some(before), None) => Some(before.id),
-            (None, Some(row)) => s.map().layer(id).and_then(|l| l.dataset.features.get(row)).map(|f| f.id),
-            _ => None,
-        };
-        if let Some(feature) = feature {
-            crate::construction::forget_feature(s, id, feature);
-        }
-    }
     let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
-    // New features: subtype defaults fill empty fields; elevation goes in `z`.
+    // New features: subtype defaults fill empty fields; elevation goes in `z`. A default its field
+    // can't hold as given (one saved before it was checked, or for a field retyped since) is left
+    // out, and said once the edit is kept, naming its fields; one that isn't finite refuses the edit.
+    let (mut unheld, mut unheld_rows): (Vec<String>, usize) = (Vec::new(), 0);
     if let Some(st) = l.design.subtypes.clone()
         && let Some(sfi) = l.dataset.field_index(&st.field)
     {
         for r in &new_rows {
+            let mut left_out = false;
             let code = l.dataset.value(*r, sfi).as_f64().map(|v| v as i64);
             let Some(sub) = code.and_then(|c| st.subtypes.iter().find(|x| x.code == c)) else { continue };
             for (field, v) in &sub.defaults {
@@ -223,12 +212,22 @@ pub(crate) fn apply_with<B: Borrow<Feature>>(s: &mut Session, id: u32, changes: 
                     && let Some(cell) = l.dataset.features.get_mut(*r).and_then(|f| f.attrs.get_mut(fi))
                     && cell.is_null()
                 {
+                    // One that isn't finite refuses the edit, as it always has: no cell takes it.
                     if super::edit::non_finite_input(v, ty) {
                         return Err(format!("field '{field}' requires a finite number"));
                     }
-                    *cell = super::edit::coerce(v.clone(), ty);
+                    match super::edit::held_default(field, v, ty) {
+                        Ok(held) => *cell = held,
+                        Err(_) => {
+                            left_out = true;
+                            if !unheld.contains(field) {
+                                unheld.push(field.clone());
+                            }
+                        }
+                    }
                 }
             }
+            unheld_rows += usize::from(left_out);
         }
     }
     if elevation != Elevation::None && !zs.is_empty() {
@@ -242,11 +241,6 @@ pub(crate) fn apply_with<B: Borrow<Feature>>(s: &mut Session, id: u32, changes: 
         }
     }
     let rows: Vec<usize> = changes.iter().filter_map(|c| c.row).collect();
-    // What each calculation rule's whole-number field cut: the rule and the field's name. Each
-    // rule's cuts are said, even when a later rule writes the same field: it may read them.
-    // With them, per rule, the results its field couldn't hold and those an error made null
-    // (`WriteLosses`), and its type.
-    let mut cuts: Vec<(String, String, super::edit::WriteLosses, FieldType)> = Vec::new();
     // Parsing against the fields separates a measurement failure from a stale rule. The latter
     // may still be skipped below, but an ambiguous area must never disable a valid rule.
     let metadata = rustgis_data::Dataset::new(l.dataset.name.clone(), l.dataset.geometry_type, l.dataset.fields.clone());
@@ -267,36 +261,15 @@ pub(crate) fn apply_with<B: Borrow<Feature>>(s: &mut Session, id: u32, changes: 
     {
         return Err(format!("{}: {message}", l.dataset.name));
     }
-    // Calculation rules, in order.
-    for rule in l.design.rules.iter().filter(|r| r.kind == RuleKind::Calculation) {
-        let Some(fi) = l.dataset.field_index(&rule.field) else { continue };
-        let ty = l.dataset.fields.get(fi).map(|f| f.ty).unwrap_or(FieldType::Text);
-        // A rule that no longer reads (its field was removed, or a hand-edited file) is skipped
-        // rather than blocking every edit.
-        let Ok(calc) = super::edit::Calculation::parse(&rule.expression, &metadata) else { continue };
-        // Counted as Calculate Field counts them.
-        // A change set may repeat a row: its losses are counted once.
-        let mut losses = super::edit::WriteLosses::once_per_row();
-        for r in &rows {
-            let v = losses.write(*r, calc.eval_or_fault(&l.dataset, *r), ty);
-            if let Some(cell) = l.dataset.features.get_mut(*r).and_then(|f| f.attrs.get_mut(fi)) {
-                *cell = v;
-            }
-        }
-        let name = l.dataset.fields.get(fi).map(|f| f.name.clone()).unwrap_or_default();
-        cuts.push((rule.name.clone(), name, losses, ty));
-    }
-    // Validation. Domains and contingent values are checked on the fields an edit changed (all
-    // of a new feature's), so a value set before the domain doesn't block unrelated edits.
-    let constraints: Vec<(String, String, rustgis_data::query::Expr)> = l
-        .design
-        .rules
-        .iter()
-        .filter(|r| r.kind == RuleKind::Constraint)
-        .filter_map(|rule| {
-            rustgis_data::query::parse(&rule.expression, &metadata).ok().map(|e| (rule.name.clone(), rule.expression.clone(), e))
-        })
-        .collect();
+    // Calculation rules, in order. Those that no longer read, by name, said once the edit is kept.
+    let layer = l.dataset.name.clone();
+    // What each calculation rule's whole-number field cut: the rule and the field's name. Each
+    // rule's cuts are said, even when a later rule writes the same field: it may read them.
+    // With them, per rule, the results its field couldn't hold and those an error made null
+    // (`WriteLosses`), and its type.
+    let (cuts, unread) = calculation_rules(&l.design, &mut l.dataset, &metadata, &rows, 0);
+    // Validation (`refusal`), against each row's state before the first edit.
+    let constraints = constraint_rules(&l.design, &metadata);
     let mut original = HashMap::new();
     if !l.design.domains.is_empty() || !l.design.contingent.is_empty() {
         // A row edited more than once still validates against its state before the first edit.
@@ -307,35 +280,8 @@ pub(crate) fn apply_with<B: Borrow<Feature>>(s: &mut Session, id: u32, changes: 
         }
     }
     for r in &rows {
-        let before = original.get(r).copied().flatten().zip(l.dataset.features.get(*r));
-        let touched = |fi: usize| before.is_none_or(|(old, now)| old.attrs.get(fi) != now.attrs.get(fi));
-        for d in &l.design.domains {
-            if let Some(fi) = l.dataset.field_index(&d.field).filter(|fi| touched(*fi)) {
-                let v = l.dataset.value(*r, fi);
-                if !d.allows(v) {
-                    return Err(format!("{} isn't allowed in {} (its domain)", v, d.field));
-                }
-            }
-        }
-        for c in &l.design.contingent {
-            let vals: Vec<&Value> =
-                c.fields.iter().map(|f| l.dataset.field_index(f).map(|fi| l.dataset.value(*r, fi)).unwrap_or(&Value::Null)).collect();
-            let any_touched = c.fields.iter().any(|f| l.dataset.field_index(f).is_some_and(touched));
-            if !any_touched || vals.iter().all(|v| v.is_null()) {
-                continue;
-            }
-            let ok = c.combos.iter().any(|combo| {
-                combo.iter().zip(&vals).all(|(want, got)| want.is_null() || got.is_null() || want.to_string() == got.to_string())
-            });
-            if !ok {
-                let shown: Vec<String> = vals.iter().map(|v| v.to_string()).collect();
-                return Err(format!("{} isn't a valid combination of {} ({})", shown.join(", "), c.fields.join(", "), c.name));
-            }
-        }
-        for (name, expr, e) in &constraints {
-            if !rustgis_data::query::eval(e, &l.dataset, *r) {
-                return Err(format!("the edit breaks the rule {name} ({expr})"));
-            }
+        if let Some(refused) = refusal(&l.design, &l.dataset, &constraints, *r, original.get(r).copied().flatten(), 0) {
+            return Err(refused);
         }
     }
     // Archive and counts.
@@ -368,6 +314,22 @@ pub(crate) fn apply_with<B: Borrow<Feature>>(s: &mut Session, id: u32, changes: 
     e.added += counts.added;
     e.modified += counts.modified;
     e.deleted += counts.deleted;
+    // All refusals are past: construction metadata changes only for a kept edit.
+    // Construction belongs to an object, not a reusable numeric id. Each removed or inserted
+    // feature that passes here (cut/paste, split pieces, edits) forgets its construction. Some
+    // row changes don't (GeoPackage and offline-area syncs, archive restore): there a feature
+    // keeps its construction only while its geometry still equals it (see `box_spec`). Undo
+    // keeps its own cache snapshot.
+    for change in &changes {
+        let feature = match (change.before(), change.row) {
+            (Some(before), None) => Some(before.id),
+            (None, Some(row)) => s.map().layer(id).and_then(|l| l.dataset.features.get(row)).map(|f| f.id),
+            _ => None,
+        };
+        if let Some(feature) = feature {
+            crate::construction::forget_feature(s, id, feature);
+        }
+    }
     // Said once the edit is kept: a rejected one changed nothing.
     for (rule, field, losses, ty) in cuts {
         let by = crate::notice_text::NoticeText::format("Attribute rule {rule}", [("rule", rule.into())]);
@@ -375,7 +337,131 @@ pub(crate) fn apply_with<B: Borrow<Feature>>(s: &mut Session, id: u32, changes: 
             s.notify_loss(code, notice);
         }
     }
+    if unheld_rows > 0 {
+        let features = if unheld_rows == 1 { "1 new feature".to_string() } else { format!("{unheld_rows} new features") };
+        let fields: Vec<String> = unheld.iter().map(|f| format!("'{f}'")).collect();
+        s.notify_loss(
+            rustgis_data::loss::LossCode::DroppedValue,
+            format!("{layer}: subtype defaults left out of {features}, as their fields can't hold them as given: {}", fields.join(", "))
+                .into(),
+        );
+    }
+    if !unread.is_empty() {
+        s.notify(
+            format!(
+                "{layer}: {} calculation rule(s) skipped because they no longer read, so their fields weren't computed: {}",
+                unread.len(),
+                unread.join(", ")
+            ),
+            false,
+        );
+    }
     Ok(())
+}
+
+/// What each calculation rule of `design` cut, by rule: its name, its field's, what writing its
+/// results lost (counted once per row, as Calculate Field counts them) and the field's type.
+type RuleCuts = Vec<(String, String, super::edit::WriteLosses, FieldType)>;
+
+/// Runs `design`'s calculation rules, in order, on `rows` of `ds`, whose first row has `offset`
+/// rows before it in the layer (0 but for the Calculate Field preview's one-row copy, #2837):
+/// what each cut, and the names of the rules that no longer read against `metadata` (the
+/// layer's fields), skipped rather than blocking every edit.
+pub(crate) fn calculation_rules(
+    design: &rustgis_map::design::Design,
+    ds: &mut rustgis_data::Dataset,
+    metadata: &rustgis_data::Dataset,
+    rows: &[usize],
+    offset: usize,
+) -> (RuleCuts, Vec<String>) {
+    let (mut cuts, mut unread) = (Vec::new(), Vec::new());
+    for rule in design.rules.iter().filter(|r| r.kind == RuleKind::Calculation) {
+        let Some(fi) = ds.field_index(&rule.field) else { continue };
+        let ty = ds.fields.get(fi).map(|f| f.ty).unwrap_or(FieldType::Text);
+        // A rule that no longer reads (a hand-edited file, one past the length limit from an
+        // earlier version) is skipped rather than blocking every edit, and said.
+        let Ok(calc) = super::edit::Calculation::parse(&rule.expression, metadata) else {
+            // Said only for an edit with rows: one with none (a deletion) computes nothing anyway.
+            if !rows.is_empty() {
+                unread.push(rule.name.clone());
+            }
+            continue;
+        };
+        // Counted as Calculate Field counts them.
+        // A change set may repeat a row: its losses are counted once.
+        let mut losses = super::edit::WriteLosses::once_per_row();
+        for r in rows {
+            let v = losses.write(*r, calc.eval_or_fault_at(ds, *r, offset), ty);
+            if let Some(cell) = ds.features.get_mut(*r).and_then(|f| f.attrs.get_mut(fi)) {
+                *cell = v;
+            }
+        }
+        let name = ds.fields.get(fi).map(|f| f.name.clone()).unwrap_or_default();
+        cuts.push((rule.name.clone(), name, losses, ty));
+    }
+    (cuts, unread)
+}
+
+/// `design`'s constraint rules that read against `metadata` (the layer's fields): name,
+/// expression as written, and parsed.
+pub(crate) fn constraint_rules(
+    design: &rustgis_map::design::Design,
+    metadata: &rustgis_data::Dataset,
+) -> Vec<(String, String, rustgis_data::query::Expr)> {
+    design
+        .rules
+        .iter()
+        .filter(|r| r.kind == RuleKind::Constraint)
+        .filter_map(|rule| {
+            rustgis_data::query::parse(&rule.expression, metadata).ok().map(|e| (rule.name.clone(), rule.expression.clone(), e))
+        })
+        .collect()
+}
+
+/// The error an edit of row `r` of `ds` is refused with, by the first of `design`'s checks it
+/// breaks: a domain or an allowed combination of values, on the fields the edit changed from
+/// `before` (all of a new feature's), so a value set before the domain doesn't block unrelated
+/// edits, then the `constraints` ([`constraint_rules`]). `offset` as [`calculation_rules`] reads
+/// it.
+pub(crate) fn refusal(
+    design: &rustgis_map::design::Design,
+    ds: &rustgis_data::Dataset,
+    constraints: &[(String, String, rustgis_data::query::Expr)],
+    r: usize,
+    before: Option<&Feature>,
+    offset: usize,
+) -> Option<String> {
+    let before = before.zip(ds.features.get(r));
+    let touched = |fi: usize| before.is_none_or(|(old, now)| old.attrs.get(fi) != now.attrs.get(fi));
+    for d in &design.domains {
+        if let Some(fi) = ds.field_index(&d.field).filter(|fi| touched(*fi)) {
+            let v = ds.value(r, fi);
+            if !d.allows(v) {
+                return Some(format!("{} isn't allowed in {} (its domain)", v, d.field));
+            }
+        }
+    }
+    for c in &design.contingent {
+        let vals: Vec<&Value> = c.fields.iter().map(|f| ds.field_index(f).map(|fi| ds.value(r, fi)).unwrap_or(&Value::Null)).collect();
+        let any_touched = c.fields.iter().any(|f| ds.field_index(f).is_some_and(touched));
+        if !any_touched || vals.iter().all(|v| v.is_null()) {
+            continue;
+        }
+        let ok = c
+            .combos
+            .iter()
+            .any(|combo| combo.iter().zip(&vals).all(|(want, got)| want.is_null() || got.is_null() || want.to_string() == got.to_string()));
+        if !ok {
+            let shown: Vec<String> = vals.iter().map(|v| v.to_string()).collect();
+            return Some(format!("{} isn't a valid combination of {} ({})", shown.join(", "), c.fields.join(", "), c.name));
+        }
+    }
+    for (name, expr, e) in constraints {
+        if !rustgis_data::query::matches_at(e, ds, r, &rustgis_data::query::Env::default(), offset) {
+            return Some(format!("the edit breaks the rule {name} ({expr})"));
+        }
+    }
+    None
 }
 
 /// Registers data-design and editing commands, including opt-in exact-coordinate polygon moves.
@@ -479,17 +565,21 @@ pub fn commands() -> Vec<C> {
             if !(dx.is_finite() && dy.is_finite()) || dx.abs() > 4e7 || dy.abs() > 4e7 {
                 return Err("dx and dy must be finite distances in the command's units (limit: 40,000 km per axis after ground-to-grid)".into());
             }
-            // In Web Mercator, as always, while a feature and its result stay within its square
-            // (each moved once, and kept for the move); one that doesn't, and those sharing a
-            // vertex with it, move on the ground (#1033), or for a move of no distance stay as
-            // they are.
+            // A layer held in a projected system moves along its own grid (#2032 C2f-6). Any
+            // other in Web Mercator, as always, while a feature and its result stay within its
+            // square (each moved once, and kept for the move); one that doesn't, and those
+            // sharing a vertex with it, move on the ground (#1033), or for a move of no distance
+            // stay as they are.
+            let own = one_grid(s, dx == 0.0 && dy == 0.0);
             let mut shifted: HashMap<(u32, usize), Geometry> = HashMap::new();
-            for l in s.map().layers.iter().filter(|l| !l.is_raster()) {
+            for l in s.map().layers.iter().filter(|l| !l.is_raster() && !l.selection.is_empty() && !own.contains_key(&l.id)) {
+                let to = l.dataset.shown_conversion()?;
                 for r in &l.selection {
-                    // Moved in longitude/latitude, from the layer's own coordinates (`modify` writes
-                    // it back in them).
+                    // Moved in longitude/latitude, from the layer's own coordinates (`modify_in` writes
+                    // it back in them). A feature with a place that can't be given there stays
+                    // as it is (`modify_in` counts it).
                     let Some(own) = l.dataset.features.get(*r).and_then(|f| f.geometry.as_ref()) else { continue };
-                    let g = l.dataset.geometry_to_lonlat(own)?;
+                    let Some(g) = rustgis_data::Dataset::converted_to_lonlat(&to, own) else { continue };
                     if !within_square(&g) {
                         continue;
                     }
@@ -507,14 +597,21 @@ pub fn commands() -> Vec<C> {
             let (planes, ground, coarse) = if still {
                 (HashMap::new(), 0, 0)
             } else {
-                move_planes(s, |key| shifted.contains_key(&key), dx.hypot(dy))?
+                move_planes(s, &own, |key| shifted.contains_key(&key), dx.hypot(dy))?
             };
             let mut placed = HashMap::new();
             placed.try_reserve(ground).map_err(|_| "not enough memory to move the selection on the ground")?;
             // Each group's move, worked out once: its planes and its turn's sine and cosine.
             let mut moves: HashMap<(i64, i64), (Aeqd, Aeqd, f64, f64)> = HashMap::new();
-            let done = move_features(s, |key, g| match planes.get(&key) {
-                Some(center) => {
+            let done = move_features(s, &own, |key, g| match (own.get(&key.0), planes.get(&key)) {
+                // A move of no distance (with other layers' features in Web Mercator) leaves
+                // these as they are, with no edit of them recorded.
+                (Some(_), _) if still => Ok(None),
+                (Some(grid), _) => {
+                    let d = grid.step(dx, dy);
+                    OwnGrid::map(g, |c| Coord::new(c.x + d.x, c.y + d.y)).map(Some)
+                }
+                (None, Some(center)) => {
                     let (from, to, sin, cos) = *moves.entry(vertex_key(*center)).or_insert_with(|| {
                         let (from, to, turn) = ground_move(*center, dx, dy);
                         let (sin, cos) = turn.sin_cos();
@@ -523,7 +620,7 @@ pub fn commands() -> Vec<C> {
                     polar_transform(g, (&from, &to), Some(&mut placed), |p| Coord::new(p.x * cos + p.y * sin, p.y * cos - p.x * sin))
                         .map(Some)
                 }
-                None => Ok(shifted.remove(&key)),
+                (None, None) => Ok(shifted.remove(&key)),
             })?;
             center_notice(s, coarse);
             Ok(done)
@@ -533,12 +630,16 @@ pub fn commands() -> Vec<C> {
         C::new("edit.rotate", "Rotate", "Edit › Features › Modify", |s, p| {
             let deg = f(p, "angle").ok_or("angle is required")?;
             let mut steps = CenterSteps::new();
-            let done = move_features(s, |_, g| {
+            let own = own_grids(s);
+            let done = move_features(s, &own, |key, g| {
                 // Any point, a feature's or a text graphic's, turns on itself: left out, so a
                 // selection of points alone fails rather than recording an edit that changes
                 // nothing (and an undo step).
                 if matches!(g, Geometry::Point(_)) {
                     return Ok(None);
+                }
+                if let Some(grid) = own.get(&key.0) {
+                    return grid.rotate(g, deg).map(Some);
                 }
                 let (sin, cos) = (-deg.to_radians()).sin_cos();
                 about_center(
@@ -559,10 +660,14 @@ pub fn commands() -> Vec<C> {
         C::new("edit.scale", "Scale", "Edit › Features › Modify", |s, p| {
             let k = f(p, "factor").filter(|k| *k > 0.0 && *k < 1e6).ok_or("factor must be a positive number")?;
             let mut steps = CenterSteps::new();
-            let done = move_features(s, |_, g| {
+            let own = own_grids(s);
+            let done = move_features(s, &own, |key, g| {
                 // Any point, a feature's or a text graphic's, scales on itself: left out, as above.
                 if matches!(g, Geometry::Point(_)) {
                     return Ok(None);
+                }
+                if own.contains_key(&key.0) {
+                    return OwnGrid::scale(g, k).map(Some);
                 }
                 let merc = |c: Coord, m: Coord| Coord::new(c.x + (m.x - c.x) * k, c.y + (m.y - c.y) * k);
                 about_center(g, merc, |p| Coord::new(p.x * k, p.y * k), &mut steps)
@@ -573,7 +678,8 @@ pub fn commands() -> Vec<C> {
         .when(need_editable_selection)
         .params(r#"{"factor": number}"#),
         C::new("edit.flip", "Flip Line", "Edit › Features › Modify", |s, _| {
-            modify(s, |_, g| match g {
+            // Only the vertices' order changes, so in the layer's own coordinates, as stored.
+            modify_in(s, |_| Space::Own, |_, g| match g {
                 Geometry::Line(parts) => Ok(Some(Geometry::Line(parts.iter().rev().map(|p| p.iter().rev().copied().collect()).collect()))),
                 _ => Ok(None),
             })
@@ -583,11 +689,11 @@ pub fn commands() -> Vec<C> {
             .when(need_editable)
             .params(r#"{"layer"?, "row": number, "geometry": GeoJSON geometry}"#),
         C::new("edit.vertex", "Edit Vertex", "Edit › Features › Modify", edit_vertex).roles(&[]).effects(crate::policy::Effects::NONE).when(need_editable).params(
-            r#"{"layer"?, "row": number, "action": "move"|"insert"|"delete", "part"?: number, "ring"?: number, "index": number (insert: the vertex the new one follows), "lon"?, "lat"?}"#,
+            r#"{"layer"?, "row": number, "action": "move"|"insert"|"delete", "part"?: number, "ring"?: number, "index": number (insert: the vertex the new one follows), "lon"?, "lat"?, "x"?, "y"? (in place of lon/lat: in the layer's own coordinates, written as they are)}"#,
         ),
         C::new("edit.merge", "Merge", "Edit › Features › Modify", merge).roles(&[]).effects(crate::policy::Effects::NONE).when(need_editable_selection),
         C::new("edit.moveSharedVertex", "Move Shared Vertex", "Edit › Features › Modify", shared_vertex::run).roles(&[]).effects(crate::policy::Effects::NONE).when(need_editable).params(
-            r#"{"layer"?, "row": number, "part"?: number, "ring"?: number, "index": number, "lon": degrees, "lat": degrees}"#,
+            r#"{"layer"?, "row": number, "part"?: number, "ring"?: number, "index": number, "lon"?: degrees, "lat"?: degrees, "x"?, "y"? (in place of lon/lat: in the layer's own coordinates)}"#,
         ),
         C::new("edit.explode", "Explode", "Edit › Features › Modify", explode).roles(&[]).effects(crate::policy::Effects::NONE).when(need_editable_selection),
         C::new("edit.split", "Split", "Edit › Features › Modify", split).roles(&[]).effects(crate::policy::Effects::NONE).when(need_editable_selection).params(r#"{"lon", "lat"}"#),
@@ -598,7 +704,7 @@ pub fn commands() -> Vec<C> {
             .when(need_editable_selection)
             .params(r#"{"line": GeoJSON LineString (lon/lat) drawn across the selected line or polygon's boundary}"#),
         C::new("edit.trace", "Trace Edge Path", "Edit › Features", sketch::trace).roles(&[]).effects(crate::policy::Effects::NONE).view().params(
-            r#"{"from": [lon, lat], "to": [lon, lat], "layer"?, "row"?: number (else the nearest edge within the tolerance), "tolerancePx"?: number (default: the snapping tolerance)}"#,
+            r#"{"from": [lon, lat], "to": [lon, lat], "layer"?, "row"?: number (else the nearest edge within the tolerance), "tolerancePx"?: number (default: the snapping tolerance); returns fromOffM and toOffM: Web Mercator metres, or metres of the grid of a layer held in a projected system}"#,
         ),
         C::new("edit.traverse", "Traverse", "Edit › Features › Modify", traverse).roles(&[]).effects(crate::policy::Effects::NONE).when(need_editable).params(
             r#"{"layer"?, "start": [lon, lat], "units"?: "Meters" (default)|"Feet"|"Kilometers"|"Miles", "legs": [{"distance": number, "bearing": degrees from north}]} (closed in a polygon layer, open in a line layer)"#,
@@ -659,6 +765,120 @@ fn distance_unit_metres(p: &Json) -> Result<f64, String> {
     };
     let unit = if units.is_empty() { "Meters" } else { units };
     rustgis_geom::distance_unit_metres(&unit.to_ascii_lowercase()).ok_or_else(|| "units must be Meters, Feet, Kilometers or Miles".into())
+}
+
+/// The grid of a layer held in a projected system, which Move, Rotate, Scale and Traverse work in
+/// (#2032 C2f-6), as the analysis tools do ([`rustgis_analysis::works_in`]): distances flat in its
+/// unit, directions from its grid north, by the order and direction of its axes. A layer in
+/// longitude/latitude, Web Mercator, another world projection or a geographic system has none,
+/// and is edited in Web Mercator or on the ground, as before.
+#[derive(Clone, Copy)]
+pub(super) struct OwnGrid {
+    /// The system.
+    pub(super) crs: rustgis_data::raster::Crs,
+    /// Metres per unit of its coordinates.
+    pub(super) unit_m: f64,
+    /// The (east, north) of a step of one along x, then along y.
+    axes: [(f64, f64); 2],
+}
+
+impl OwnGrid {
+    /// The grid layer `l` is edited in, if any.
+    pub(super) fn of(l: &rustgis_map::Layer) -> Option<Self> {
+        let crs = l.dataset.coord_crs();
+        // Graphics are edited as before: their shapes share no places with features.
+        if l.is_raster() || l.graphics || !rustgis_analysis::works_in(crs) {
+            return None;
+        }
+        let (unit_m, axes) = crs.unit_and_axes();
+        let [(xe, xn), (ye, yn)] = axes;
+        // Axes along one line give no plane to step in.
+        ((xe * yn - ye * xn).abs() > 1e-9).then_some(Self { crs, unit_m, axes })
+    }
+
+    /// A step `(e, n)` east and north of the grid, in its units, as a step of its coordinates.
+    fn coords_of(self, e: f64, n: f64) -> Coord {
+        let [(xe, xn), (ye, yn)] = self.axes;
+        let det = xe * yn - ye * xn;
+        Coord::new((e * yn - n * ye) / det, (xe * n - xn * e) / det)
+    }
+
+    /// A step of its coordinates as (east, north) of the grid, in its units.
+    fn east_north(self, d: Coord) -> (f64, f64) {
+        let [(xe, xn), (ye, yn)] = self.axes;
+        (d.x * xe + d.y * ye, d.x * xn + d.y * yn)
+    }
+
+    /// A step of `dx` and `dy` metres east and north of the grid, in its coordinates.
+    fn step(self, dx: f64, dy: f64) -> Coord {
+        self.coords_of(dx / self.unit_m, dy / self.unit_m)
+    }
+
+    /// `g` with each vertex `f` gives for it (one missing a coordinate, or with an infinite one,
+    /// stays as it was, as in longitude/latitude); refused when a vertex would get none.
+    fn map(g: &Geometry, f: impl Fn(Coord) -> Coord) -> Result<Geometry, String> {
+        let lost = std::cell::Cell::new(false);
+        let done = g.map_coords(&|c: Coord| {
+            if !c.is_finite() {
+                return c;
+            }
+            let p = f(c);
+            lost.set(lost.get() || !p.is_finite());
+            p
+        });
+        if lost.get() {
+            return Err("that would carry a vertex past any coordinate its layer's system can hold".into());
+        }
+        Ok(done)
+    }
+
+    /// `g` turned clockwise by `deg` (grid north up) about the middle of its extent.
+    fn rotate(self, g: &Geometry, deg: f64) -> Result<Geometry, String> {
+        let (sin, cos) = (-deg.to_radians()).sin_cos();
+        let c = g.extent().center();
+        Self::map(g, |p| {
+            let (e, n) = self.east_north(Coord::new(p.x - c.x, p.y - c.y));
+            let d = self.coords_of(e * cos - n * sin, e * sin + n * cos);
+            Coord::new(c.x + d.x, c.y + d.y)
+        })
+    }
+
+    /// `g` scaled by `k` about the middle of its extent.
+    fn scale(g: &Geometry, k: f64) -> Result<Geometry, String> {
+        let c = g.extent().center();
+        Self::map(g, |p| Coord::new(c.x + (p.x - c.x) * k, c.y + (p.y - c.y) * k))
+    }
+}
+
+/// The grid each layer with a selection is edited in ([`OwnGrid`]), by layer id.
+fn own_grids(s: &Session) -> HashMap<u32, OwnGrid> {
+    s.map().layers.iter().filter(|l| !l.selection.is_empty()).filter_map(|l| Some((l.id, OwnGrid::of(l)?))).collect()
+}
+
+/// The grid a Move takes for its selection: [`own_grids`] while every layer with a selection is
+/// held in one projected system; none when they are in more than one (or some in one and some
+/// not), since a feature of one may share a place with a feature of another that a step on
+/// another grid, or in Web Mercator, would tear from it. That selection moves in Web Mercator or
+/// on the ground, as before, and says so (a move of no distance, refused, says nothing). Graphics
+/// layers, whose shapes share no places with features, don't count.
+fn one_grid(s: &mut Session, still: bool) -> HashMap<u32, OwnGrid> {
+    let own = own_grids(s);
+    let selected: Vec<&rustgis_map::Layer> =
+        s.map().layers.iter().filter(|l| !l.is_raster() && !l.graphics && !l.selection.is_empty()).collect();
+    let first = own.values().next().map(|g| g.crs);
+    let one = selected.iter().all(|l| own.get(&l.id).is_some_and(|g| Some(g.crs) == first));
+    if own.is_empty() || one {
+        return own;
+    }
+    if still {
+        return HashMap::new();
+    }
+    let names = selected.iter().filter(|l| own.contains_key(&l.id)).map(|l| format!("'{}'", l.name)).collect::<Vec<_>>().join(", ");
+    s.warn(format!(
+        "the selection spans layers in more than one coordinate system, so {names} moved the same way as \
+         the rest, in Web Mercator (or on the ground), not along its own grid, to keep places the layers share together: select one system's layers to move along its grid"
+    ));
+    HashMap::new()
 }
 
 /// A point moved by metres east and north (Web Mercator stretched to the point's latitude).
@@ -867,15 +1087,21 @@ fn about_center(
 /// ([`ground_movable`]). With the map, how many vertices move on the ground.
 fn move_planes(
     s: &Session,
+    own: &HashMap<u32, OwnGrid>,
     stays: impl Fn((u32, usize)) -> bool,
     reach_m: f64,
 ) -> Result<(HashMap<(u32, usize), Coord>, usize, usize), String> {
     // In longitude/latitude, from each layer's own coordinates.
     let mut selected: Vec<((u32, usize), std::borrow::Cow<'_, Geometry>)> = Vec::new();
-    for l in s.map().layers.iter().filter(|l| !l.is_raster()) {
+    // A feature with a place that can't be given there isn't moved ([`modify_in`] counts it), nor
+    // one of a layer moved along its own grid (`own`).
+    for l in s.map().layers.iter().filter(|l| !l.is_raster() && !l.selection.is_empty() && !own.contains_key(&l.id)) {
+        let to = l.dataset.shown_conversion()?;
         for r in &l.selection {
             let Some(g) = l.dataset.features.get(*r).and_then(|f| f.geometry.as_ref()) else { continue };
-            selected.push(((l.id, *r), l.dataset.geometry_to_lonlat(g)?));
+            if let Some(g) = rustgis_data::Dataset::converted_to_lonlat(&to, g) {
+                selected.push(((l.id, *r), g));
+            }
         }
     }
     // Most moves stay within the square: then no feature needs grouping.
@@ -1092,11 +1318,17 @@ fn polar_transform(
     })
 }
 
-/// [`modify`] for a move, turn or scale, which leaves a vertex missing a coordinate (or with an
-/// infinite one) where it was: says how many of the features it changed have one.
-fn move_features(s: &mut Session, mut change: impl FnMut((u32, usize), &Geometry) -> Result<Option<Geometry>, String>) -> CmdResult {
+/// [`modify_in`] for a move, turn or scale, which leaves a vertex missing a coordinate (or with an
+/// infinite one) where it was: says how many of the features it changed have one. A layer in
+/// `own` gives its geometry in its own coordinates, to be changed in its grid.
+fn move_features(
+    s: &mut Session,
+    own: &HashMap<u32, OwnGrid>,
+    mut change: impl FnMut((u32, usize), &Geometry) -> Result<Option<Geometry>, String>,
+) -> CmdResult {
     let mut missing = 0usize;
-    let done = modify(s, |key, g| {
+    let space = |id: u32| if own.contains_key(&id) { Space::Own } else { Space::LonLat };
+    let done = modify_in(s, space, |key, g| {
         let moved = change(key, g)?;
         if moved.is_some() {
             let mut has = false;
@@ -1111,29 +1343,67 @@ fn move_features(s: &mut Session, mut change: impl FnMut((u32, usize), &Geometry
     Ok(done)
 }
 
-/// Applies a geometry change to every selected feature of every layer (in the selection's layers).
-fn modify(s: &mut Session, mut change: impl FnMut((u32, usize), &Geometry) -> Result<Option<Geometry>, String>) -> CmdResult {
+/// Where [`modify_in`] gives each geometry to a change.
+#[derive(Clone, Copy, PartialEq)]
+enum Space {
+    /// In longitude/latitude, written back in the layer's own coordinates, keeping what the
+    /// change left as stored.
+    LonLat,
+    /// In the layer's own coordinates, as stored: for a change that only reorders vertices (a
+    /// flip), or one made in the layer's own grid ([`OwnGrid`]), so a feature with a place that
+    /// can't be given in longitude/latitude changes too.
+    Own,
+}
+
+/// Applies a geometry change to every selected feature of every layer (in the selection's layers),
+/// each layer's geometry given in the [`Space`] `space` gives for its id. In longitude/latitude
+/// ([`Space::LonLat`]), a feature with a place that can't be given there is left as it is, and
+/// said with a count per layer; when every changeable feature is such a feature, the edit is
+/// refused saying why.
+fn modify_in(
+    s: &mut Session,
+    space: impl Fn(u32) -> Space,
+    mut change: impl FnMut((u32, usize), &Geometry) -> Result<Option<Geometry>, String>,
+) -> CmdResult {
     let mut n = 0;
+    let mut unplaced: Vec<(String, usize)> = Vec::new();
     let ids: Vec<u32> = s.map().layers.iter().filter(|l| !l.selection.is_empty() && !l.is_raster()).map(|l| l.id).collect();
     for id in ids {
         let mut changes = Vec::new();
-        let selection = s.map().layer(id).ok_or("no such layer")?.selection.clone();
+        let l = s.map().layer(id).ok_or("no such layer")?;
+        let selection = l.selection.clone();
+        let to = match space(id) {
+            Space::LonLat => Some(l.dataset.shown_conversion()?),
+            Space::Own => None,
+        };
+        let mut left = 0usize;
         for r in selection {
             // Read first, writing only a row that changes: the first write copies the layer's rows
             // when Undo shares them, and frees history set aside for that copy (#2431).
-            // Changed in longitude/latitude, and written back in the layer's own coordinates,
-            // keeping what the change left as stored.
             let l = s.map().layer(id).ok_or("no such layer")?;
             let Some(f) = l.dataset.features.get(r) else { continue };
             let Some(own) = f.geometry.as_ref() else { continue };
-            let lonlat = l.dataset.geometry_to_lonlat(own)?;
-            let Some(g) = change((id, r), &lonlat)? else { continue };
-            super::edit::validate(&g)?;
-            // A change of the whole shape (a move, a rotation) has no place of its own to snap:
-            // only the feature's own places are held, with no search of other features.
-            let mut held = rustgis_data::HeldPlaces::default();
-            l.dataset.hold_places(own, None, &mut held);
-            let g = l.dataset.edit_from_lonlat(g, &held)?;
+            let g = match &to {
+                Some(to) => {
+                    let Some(lonlat) = rustgis_data::Dataset::converted_to_lonlat(to, own) else {
+                        left += 1;
+                        continue;
+                    };
+                    let Some(g) = change((id, r), &lonlat)? else { continue };
+                    super::edit::validate(&g)?;
+                    // A change of the whole shape (a move, a rotation) has no place of its own to
+                    // snap: only the feature's own places are held, with no search of other
+                    // features.
+                    let mut held = rustgis_data::HeldPlaces::default();
+                    l.dataset.hold_places(own, None, &mut held);
+                    l.dataset.edit_from_lonlat(g, &held)?
+                }
+                None => {
+                    let Some(g) = change((id, r), own)? else { continue };
+                    super::edit::validate(&g)?;
+                    g
+                }
+            };
             let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
             let Some(f) = l.dataset.features.get_mut(r) else { continue };
             let before = f.clone();
@@ -1141,13 +1411,30 @@ fn modify(s: &mut Session, mut change: impl FnMut((u32, usize), &Geometry) -> Re
             changes.push(Change { before: Some(before), row: Some(r) });
             n += 1;
         }
+        if left > 0 {
+            unplaced.push((s.map().layer(id).map(|l| l.name.clone()).unwrap_or_default(), left));
+        }
         s.map_mut().layer_mut(id).ok_or("no such layer")?.touch_geometry();
         apply(s, id, changes)?;
+    }
+    if n == 0 && !unplaced.is_empty() {
+        return Err(format!("{}, so nothing selected can be changed this way", unplaced_said(&unplaced)));
     }
     if n == 0 {
         return Err("nothing selected can be changed this way".into());
     }
+    if !unplaced.is_empty() {
+        s.warn(format!("{}, so they were left as they were", unplaced_said(&unplaced)));
+    }
     Ok(json!({"modified": n}))
+}
+
+/// "n feature(s) of 'a' (k), 'b' (m) have a place that can't be given in longitude/latitude":
+/// the features an edit in longitude/latitude leaves out, by layer.
+pub(crate) fn unplaced_said(by_layer: &[(String, usize)]) -> String {
+    let n: usize = by_layer.iter().map(|(_, k)| k).sum();
+    let layers = by_layer.iter().map(|(name, k)| format!("'{name}' ({k})")).collect::<Vec<_>>().join(", ");
+    format!("{n} feature(s) of {layers} have a place that can't be given in longitude/latitude")
 }
 
 fn set_geometry(s: &mut Session, p: &Json) -> CmdResult {
@@ -1171,28 +1458,98 @@ fn edit_vertex(s: &mut Session, p: &Json) -> CmdResult {
         }
     };
     let v = rustgis_data::VertexId::new(num("part")?.unwrap_or(0), num("ring")?.unwrap_or(0), num("index")?.ok_or("index is required")?);
-    let at = || -> Result<Coord, String> {
-        let (lon, lat) = (f(p, "lon").ok_or("lon is required")?, f(p, "lat").ok_or("lat is required")?);
-        if !(lon.is_finite() && lat.is_finite()) || lon.abs() > 360.0 || lat.abs() > 90.0 {
-            return Err("lon and lat are degrees".into());
-        }
-        Ok(Coord::new(lon, lat))
-    };
-    // In longitude/latitude, from the layer's own coordinates (`replace_geometry` writes it back).
+    let action = ps(p, "action").ok_or("action is required")?;
+    if !matches!(action, "move" | "insert" | "delete") {
+        return Err(format!("unknown action '{action}'"));
+    }
+    // A deleted vertex needs no place.
+    let own_at = own_place(p)?;
     let l = s.map().layer(id).ok_or("no such row")?;
-    let own = l.dataset.features.get(row).ok_or("no such row")?.geometry.as_ref().ok_or("the feature has no shape")?;
-    let g = l.dataset.geometry_to_lonlat(own)?.into_owned();
-    let (g, v) = match ps(p, "action").ok_or("action is required")? {
-        "move" => (g.move_vertex(v, at()?).ok_or("no such vertex")?, v),
-        "insert" => {
-            let g = g.insert_vertex(v, at()?).ok_or("vertices can only be inserted in lines and polygons")?;
-            (g, rustgis_data::VertexId::new(v.part, v.ring, v.index + 1))
-        }
-        "delete" => (g.delete_vertex(v)?, v),
-        a => return Err(format!("unknown action '{a}'")),
+    let feature = l.dataset.features.row(row).ok_or("no such row")?;
+    let own = feature.geometry().ok_or("the feature has no shape")?;
+    // Deleting a vertex, or placing one in the layer's own coordinates, edits the feature as it
+    // is stored: no other vertex moves, and a feature with no place in longitude/latitude can be
+    // edited too (#2032 C2f-7).
+    if action == "delete" || own_at.is_some() {
+        let g = own.clone();
+        let (g, v) = vertex_edit(g, action, v, || own_at.ok_or_else(|| "x and y are both required".to_string()))?;
+        replace_geometry_own(s, id, row, g)?;
+        return Ok(json!({"part": v.part, "ring": v.ring, "index": v.index}));
+    }
+    // In longitude/latitude, from the layer's own coordinates (`replace_geometry` writes it back).
+    let Ok(g) = l.dataset.feature_to_lonlat(feature.id(), own) else {
+        // A feature with a place that has no longitude/latitude: edited as stored, the place given
+        // in longitude/latitude written in the layer's coordinates (a place snapped to as stored).
+        let g = own.clone();
+        let (g, v) = vertex_edit(g, action, v, || lonlat_in_own(s, id, lonlat_place(p)?))?;
+        replace_geometry_own(s, id, row, g)?;
+        return Ok(json!({"part": v.part, "ring": v.ring, "index": v.index}));
     };
+    let (g, v) = vertex_edit(g.into_owned(), action, v, || lonlat_place(p))?;
     replace_geometry(s, id, row, g)?;
     Ok(json!({"part": v.part, "ring": v.ring, "index": v.index}))
+}
+
+/// A place in longitude/latitude in the coordinates of layer `id`, as [`replace_geometry`] writes
+/// an edit's places: a stored place of a layer in its system that it reads as ([`held_places`]),
+/// as stored; any other converted as the layer is drawn.
+fn lonlat_in_own(s: &Session, id: u32, at: Coord) -> Result<Coord, String> {
+    let point = Geometry::Point(at);
+    let held = held_places(s, id, &[], &[&point]);
+    match s.map().layer(id).ok_or("no such layer")?.dataset.edit_from_lonlat(point, &held)? {
+        Geometry::Point(c) => Ok(c),
+        _ => Err("the place can't be given in the layer's coordinates".into()),
+    }
+}
+
+/// A vertex's place given in the layer's own coordinates (`x`, `y`: as the vertex editor gives it
+/// on a map in the layer's system, #2032 C2f-7), or `None` when it is given in longitude/latitude
+/// ([`lonlat_place`]) or not at all. Both kinds at once, or half of one, are refused.
+pub(super) fn own_place(p: &Json) -> Result<Option<Coord>, String> {
+    let given = |k: &str| p.get(k).is_some_and(|v| !v.is_null());
+    if !given("x") && !given("y") {
+        // Half a pair is refused here too, even where no place is needed (a deleted vertex).
+        if given("lon") != given("lat") {
+            return Err("lon and lat are both required".into());
+        }
+        return Ok(None);
+    }
+    if given("lon") || given("lat") {
+        return Err("give lon and lat or x and y, not both".into());
+    }
+    let (x, y) = (f(p, "x").ok_or("x and y are both required")?, f(p, "y").ok_or("x and y are both required")?);
+    if !(x.is_finite() && y.is_finite()) {
+        return Err("x and y must be numbers".into());
+    }
+    Ok(Some(Coord::new(x, y)))
+}
+
+/// A vertex's place given in longitude/latitude (`lon`, `lat`).
+pub(super) fn lonlat_place(p: &Json) -> Result<Coord, String> {
+    let (lon, lat) = (f(p, "lon").ok_or("lon is required")?, f(p, "lat").ok_or("lat is required")?);
+    if !(lon.is_finite() && lat.is_finite()) || lon.abs() > 360.0 || lat.abs() > 90.0 {
+        return Err("lon and lat are degrees".into());
+    }
+    Ok(Coord::new(lon, lat))
+}
+
+/// [`edit_vertex`]'s `action` on vertex `v` of `g`, placing a moved or inserted vertex `at`, with
+/// the vertex edited after it (an inserted one follows `v`).
+fn vertex_edit(
+    g: Geometry,
+    action: &str,
+    v: rustgis_data::VertexId,
+    at: impl FnOnce() -> Result<Coord, String>,
+) -> Result<(Geometry, rustgis_data::VertexId), String> {
+    match action {
+        "move" => Ok((g.move_vertex(v, at()?).ok_or("no such vertex")?, v)),
+        "insert" => {
+            let g = g.insert_vertex(v, at()?).ok_or("vertices can only be inserted in lines and polygons")?;
+            Ok((g, rustgis_data::VertexId::new(v.part, v.ring, v.index + 1)))
+        }
+        "delete" => Ok((g.delete_vertex(v)?, v)),
+        a => Err(format!("unknown action '{a}'")),
+    }
 }
 
 /// The places an edit of layer `id`, given in longitude/latitude (`edited`), keeps as stored when
@@ -1201,9 +1558,10 @@ fn edit_vertex(s: &mut Session, p: &Json) -> CmdResult {
 /// same system that one of its other places reads exactly as (a vertex snapped to, a feature
 /// pasted where it was copied from). Each other place is converted on its own to find what is
 /// stored near it, so no stored place is missed however large the edit, and only stored places
-/// one of them reads as are held. The search reads the box of every feature of the layers in its
-/// system, each from its vertices, once a command (an added feature, a paste): work that grows
-/// with those layers, which C2 is to take to a spatial index.
+/// one of them reads as are held. The features near them are found through each layer's grid of
+/// boxes ([`rustgis_map::Layer::rows_touching`]), made once until that layer's rows change: the
+/// first search after an edit walks the edited layer's rows again to make its grid (as the search
+/// before the grid did each time), the other layers of its system keep theirs.
 /// Empty while the layer is in longitude/latitude: its edits are written as they are.
 pub(crate) fn held_places(s: &Session, id: u32, originals: &[&Geometry], edited: &[&Geometry]) -> rustgis_data::HeldPlaces {
     let mut held = rustgis_data::HeldPlaces::default();
@@ -1214,7 +1572,9 @@ pub(crate) fn held_places(s: &Session, id: u32, originals: &[&Geometry], edited:
     // Only what an edited place still lacks is held from here on.
     held.want_only(edited);
     let system = l.dataset.coord_crs();
-    let Ok(to_own) = rustgis_data::raster::Crs::LonLat.to(system) else { return held };
+    // Through the map's system when the layer is shown through it: the route its stored places
+    // are read by, so a place snapped to one lands within the box looked in.
+    let Ok(to_own) = l.dataset.shown_from_lonlat() else { return held };
     // The places not held yet, each in the layer's coordinates, and the box they are in there,
     // padded by what a round trip moves a place: a stored place reading as one lies within it.
     let mut within = rustgis_geom::Extent::EMPTY;
@@ -1233,8 +1593,8 @@ pub(crate) fn held_places(s: &Session, id: u32, originals: &[&Geometry], edited:
         return held;
     }
     for m in s.map().layers.iter().filter(|m| !m.is_raster() && m.dataset.coord_crs() == system) {
-        for f in &m.dataset.features {
-            if let Some(g) = &f.geometry
+        for row in m.rows_touching(&within) {
+            if let Some(g) = m.dataset.features.geometry(row)
                 && g.extent().intersects(&within)
             {
                 m.dataset.hold_places(g, Some(&within), &mut held);
@@ -1242,6 +1602,23 @@ pub(crate) fn held_places(s: &Session, id: u32, originals: &[&Geometry], edited:
         }
     }
     held
+}
+
+/// A line drawn on the map, in longitude/latitude, in the coordinates of layer `id`, held in a
+/// projected system, for an edit worked out there (#2032 C2f-7): a point snapped to a stored place
+/// of a layer in that system is that place, as stored ([`held_places`]); any other is converted
+/// as the layer is drawn ([`rustgis_data::Dataset::shown_from_lonlat`]).
+pub(super) fn line_in_own(s: &Session, id: u32, line: &[Coord]) -> Result<Vec<Coord>, String> {
+    let held = held_places(s, id, &[], &[&Geometry::Line(vec![line.to_vec()])]);
+    // Through the map's system when the layer is shown through it, as its features are drawn.
+    let to = s.map().layer(id).ok_or("no such layer")?.dataset.shown_from_lonlat()?;
+    line.iter()
+        .map(|c| {
+            held.get(*c)
+                .or_else(|| to.point(*c))
+                .ok_or_else(|| "a point of the line is no place in the layer's coordinate system".to_string())
+        })
+        .collect()
 }
 
 /// How far a round trip through longitude/latitude may move place `c`, in its own units, with
@@ -1257,8 +1634,15 @@ pub(crate) fn replace_geometry(s: &mut Session, id: u32, row: usize, g: Geometry
     // What the edit left of the feature, or snapped to, stays as stored.
     let original = s.map().layer(id).and_then(|l| l.dataset.features.get(row)?.geometry.as_ref());
     let held = held_places(s, id, &original.into_iter().collect::<Vec<_>>(), &[&g]);
+    let g = s.map().layer(id).ok_or("no such layer")?.dataset.edit_from_lonlat(g, &held)?;
+    replace_geometry_own(s, id, row, g)
+}
+
+/// [`replace_geometry`] with `g` in the layer's own coordinates, written as it is: for a shape
+/// built in its own grid (#2032 C2f-6).
+pub(crate) fn replace_geometry_own(s: &mut Session, id: u32, row: usize, g: Geometry) -> Result<(), String> {
+    super::edit::validate(&g)?;
     let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
-    let g = l.dataset.edit_from_lonlat(g, &held)?;
     if l.geometry_type() != GeometryType::None && l.geometry_type() != g.kind() {
         return Err(format!("a {} can't replace a {}", g.kind().label(), l.geometry_type().label()));
     }
@@ -1293,11 +1677,20 @@ fn merge(s: &mut Session, _: &Json) -> CmdResult {
     if sel.len() < 2 {
         return Err("select two or more features to merge".into());
     }
-    // Merged in longitude/latitude, from the layer's own coordinates, and written back in them, the
-    // places it keeps as stored.
-    let originals: Vec<&Geometry> = sel.iter().filter_map(|r| l.dataset.features.get(*r)?.geometry.as_ref()).collect();
-    let geoms: Vec<Geometry> =
-        originals.iter().map(|g| l.dataset.geometry_to_lonlat(g).map(std::borrow::Cow::into_owned)).collect::<Result<_, _>>()?;
+    // Held in a projected system, merged in its own coordinates, as they are: the shapes are
+    // unioned where their segments run straight there (#2032 C2f-7), and nothing is converted.
+    // Otherwise merged in longitude/latitude, from the layer's own coordinates, and written back
+    // in them, the places it keeps as stored; a feature with a place that can't be given there
+    // refuses the merge, naming it: the merged shape would lose that place.
+    let own = OwnGrid::of(l).is_some();
+    let with_ids: Vec<(u64, &Geometry)> =
+        sel.iter().filter_map(|r| l.dataset.features.row(*r)).filter_map(|f| Some((f.id(), f.geometry()?))).collect();
+    let originals: Vec<&Geometry> = with_ids.iter().map(|(_, g)| *g).collect();
+    let geoms: Vec<Geometry> = if own {
+        originals.iter().map(|g| (*g).clone()).collect()
+    } else {
+        with_ids.iter().map(|(fid, g)| l.dataset.feature_to_lonlat(*fid, g).map(std::borrow::Cow::into_owned)).collect::<Result<_, _>>()?
+    };
     let kind = |g: &Geometry| match g {
         Geometry::Point(_) | Geometry::MultiPoint(_) => 0,
         Geometry::Line(_) => 1,
@@ -1306,12 +1699,19 @@ fn merge(s: &mut Session, _: &Json) -> CmdResult {
     if geoms.len() != sel.len() || geoms.windows(2).any(|w| w.first().map(kind) != w.get(1).map(kind)) {
         return Err("merge features of one kind (all points, all lines or all polygons), each with a shape".into());
     }
-    let merged = rustgis_analysis::topology::merge(&geoms).ok_or("these features can't be merged")?;
-    let mut held = rustgis_data::HeldPlaces::default();
-    for g in &originals {
-        l.dataset.hold_places(g, None, &mut held);
-    }
-    let merged = l.dataset.edit_from_lonlat(merged, &held)?;
+    let merged = {
+        let _plane = own.then(|| rustgis_analysis::convert::install(rustgis_analysis::convert::run_plane_for(l.dataset.coord_crs())));
+        rustgis_analysis::topology::merge(&geoms).ok_or("these features can't be merged")?
+    };
+    let merged = if own {
+        merged
+    } else {
+        let mut held = rustgis_data::HeldPlaces::default();
+        for g in &originals {
+            l.dataset.hold_places(g, None, &mut held);
+        }
+        l.dataset.edit_from_lonlat(merged, &held)?
+    };
     let keep = sel.first().copied().ok_or("nothing selected")?;
     let mut changes = Vec::new();
     for r in sel.iter().skip(1).rev() {
@@ -1372,6 +1772,9 @@ fn split(s: &mut Session, p: &Json) -> CmdResult {
         return Err("lon and lat are degrees".into());
     }
     let id = selection_layer(s)?;
+    if let Some(grid) = s.map().layer(id).and_then(OwnGrid::of) {
+        return split_own(s, id, grid, at);
+    }
     let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
     // A vertex past ±90° is no place: the search would take it for the pole, so the lines are
     // refused up front, before any is split.
@@ -1379,10 +1782,13 @@ fn split(s: &mut Session, p: &Json) -> CmdResult {
     // written back in them.
     // Only lines are split, so only they are converted: another feature selected with them
     // doesn't refuse the split.
+    // A line with a place that can't be given there isn't split; it is counted and said.
+    let to = l.dataset.shown_conversion()?;
     let mut beyond_pole = false;
     for feat in l.selection.iter().filter_map(|r| l.dataset.features.get(*r)) {
         if let Some(g @ Geometry::Line(_)) = &feat.geometry
-            && let Geometry::Line(parts) = &*l.dataset.geometry_to_lonlat(g)?
+            && let Some(lonlat) = rustgis_data::Dataset::converted_to_lonlat(&to, g)
+            && let Geometry::Line(parts) = &*lonlat
         {
             beyond_pole |= parts.iter().flatten().any(|c| c.is_finite() && c.y.abs() > 90.0);
         }
@@ -1396,10 +1802,14 @@ fn split(s: &mut Session, p: &Json) -> CmdResult {
     // split at the nearest point it found, or left whole when that was an end.
     let (mut rough, mut whole) = (0, 0);
     let mut unmeasured = 0usize;
+    let mut unplaced = 0usize;
     for r in l.selection.clone() {
         let Some(f) = l.dataset.features.get(r).cloned() else { continue };
         let Some(own @ Geometry::Line(_)) = &f.geometry else { continue };
-        let lonlat = l.dataset.geometry_to_lonlat(own)?;
+        let Some(lonlat) = rustgis_data::Dataset::converted_to_lonlat(&to, own) else {
+            unplaced += 1;
+            continue;
+        };
         let Geometry::Line(parts) = &*lonlat else { continue };
         steps.floor = f64::INFINITY;
         // The nearest segment of the nearest part, in the analysis plane (Web Mercator within
@@ -1514,7 +1924,11 @@ fn split(s: &mut Session, p: &Json) -> CmdResult {
     }
     let unsearched =
         |n: usize| format!("{n} line(s) near a pole couldn't be searched in full within one split's limit of a million distances");
+    let unplaced_lines = (unplaced > 0).then(|| unplaced_said(&[(l.name.clone(), unplaced)]));
     if changes.is_empty() {
+        if let Some(said) = unplaced_lines {
+            return Err(format!("{said}, so they can't be split; no other selected line was split away from its ends"));
+        }
         if unmeasured > 0 {
             return Err(format!(
                 "no line could be split away from its ends; {unmeasured} segment(s) could not be measured because of invalid coordinates"
@@ -1527,6 +1941,9 @@ fn split(s: &mut Session, p: &Json) -> CmdResult {
     }
     l.touch_geometry();
     apply(s, id, changes)?;
+    if let Some(said) = unplaced_lines {
+        s.warn(format!("{said}, so they weren't split"));
+    }
     if unmeasured > 0 {
         s.warn(format!("{unmeasured} segment(s) of the selected lines could not be measured because of invalid coordinates; the split search skipped them, so the point found may not be the nearest"));
     }
@@ -1535,6 +1952,85 @@ fn split(s: &mut Session, p: &Json) -> CmdResult {
     }
     if whole > 0 {
         s.warn(format!("{} and were left whole: the nearest point found was at an end", unsearched(whole)));
+    }
+    Ok(json!({"split": true}))
+}
+
+/// [`split`] of the selected lines of layer `id`, held in `grid`'s projected system, in its own
+/// coordinates (#2032 C2f-7): at the point nearest `at` (longitude/latitude) on its segments as
+/// they run straight there, measured flat in its grid. Every place of the line stays as stored;
+/// only the point it is split at is new.
+fn split_own(s: &mut Session, id: u32, grid: OwnGrid, at: Coord) -> CmdResult {
+    // Converted as the layer is drawn; the split point is projected onto a segment anyway, so
+    // stored places aren't looked up for it.
+    let to_own = s.map().layer(id).ok_or("no such layer")?.dataset.shown_from_lonlat()?;
+    let at = to_own.point(at).ok_or("the point to split at is no place in the layer's coordinate system")?;
+    // A millimetre and a centimetre of the grid, in its units.
+    let (mm, cm) = (0.001 / grid.unit_m, 0.01 / grid.unit_m);
+    let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
+    let (mut changes, mut unmeasured) = (Vec::new(), 0usize);
+    for r in l.selection.clone() {
+        let Some(Geometry::Line(parts)) = l.dataset.features.geometry(r) else { continue };
+        let parts = parts.clone();
+        let mut best: Option<(f64, usize, usize, Coord)> = None;
+        for (pi, part) in parts.iter().enumerate() {
+            for (si, w) in part.windows(2).enumerate() {
+                let (a, b) = (w[0], w[1]);
+                if !(a.is_finite() && b.is_finite()) {
+                    unmeasured += 1;
+                    continue;
+                }
+                let (dx, dy) = (b.x - a.x, b.y - a.y);
+                let len2 = dx * dx + dy * dy;
+                let t = if len2 > 0.0 { (((at.x - a.x) * dx + (at.y - a.y) * dy) / len2).clamp(0.0, 1.0) } else { 0.0 };
+                let q = Coord::new(a.x + t * dx, a.y + t * dy);
+                let d = (q.x - at.x).hypot(q.y - at.y);
+                // A segment too long to measure (its distance not a number) is passed over.
+                if !d.is_finite() {
+                    unmeasured += 1;
+                } else if best.is_none_or(|b| d < b.0) {
+                    best = Some((d, pi, si, q));
+                }
+            }
+        }
+        let Some((_, pi, si, q)) = best else { continue };
+        let Some(part) = parts.get(pi) else { continue };
+        let apart = |a: &Coord, b: Coord| (a.x - b.x).hypot(a.y - b.y);
+        // At a vertex (to within a millimetre), the parts meet there, without it repeated.
+        let q = [part.get(si), part.get(si + 1)].into_iter().flatten().find(|v| apart(v, q) < mm).copied().unwrap_or(q);
+        let mut first: Vec<Coord> = part.iter().take(si + 1).copied().collect();
+        if first.last() != Some(&q) {
+            first.push(q);
+        }
+        let mut second = vec![q];
+        second.extend(part.iter().skip(si + 1).copied().skip_while(|c| *c == q));
+        // At (or within a centimetre of) the line's ends isn't a split.
+        let near = |a: Option<&Coord>| a.is_some_and(|a| apart(a, q) < cm);
+        if first.len() < 2 || second.len() < 2 || near(first.first()) || near(second.last()) {
+            continue;
+        }
+        let mut a_parts: Vec<Vec<Coord>> = parts.iter().take(pi).cloned().collect();
+        a_parts.push(first);
+        let mut b_parts = vec![second];
+        b_parts.extend(parts.iter().skip(pi + 1).cloned());
+        let Some(f) = l.dataset.features.get(r).cloned() else { continue };
+        l.dataset.features.set_geometry(r, Some(Geometry::Line(a_parts)));
+        l.dataset.push(Some(Geometry::Line(b_parts)), f.attrs.clone());
+        changes.push(Change { before: Some(f), row: Some(r) });
+        changes.push(Change { before: None, row: Some(l.dataset.features.len() - 1) });
+    }
+    if changes.is_empty() {
+        if unmeasured > 0 {
+            return Err(format!(
+                "no line could be split away from its ends; {unmeasured} segment(s) could not be measured because of invalid coordinates"
+            ));
+        }
+        return Err("select a line to split (away from its ends)".into());
+    }
+    l.touch_geometry();
+    apply(s, id, changes)?;
+    if unmeasured > 0 {
+        s.warn(format!("{unmeasured} segment(s) of the selected lines could not be measured because of invalid coordinates; the split search skipped them, so the point found may not be the nearest"));
     }
     Ok(json!({"split": true}))
 }
@@ -1671,7 +2167,25 @@ fn traverse(s: &mut Session, p: &Json) -> CmdResult {
     }
     let unit = distance_unit_metres(p)?;
     let g2g = s.map().editing.settings.ground_to_grid;
-    let mut pts = vec![start];
+    let id = s.layer_id(p)?;
+    let l = s.map().layer(id).ok_or("no such layer")?;
+    let gt = l.geometry_type();
+    // A layer held in a projected system is drawn on its own grid (#2032 C2f-6): the start in its
+    // coordinates, each leg flat in its unit from its grid north.
+    let grid = OwnGrid::of(l);
+    // The start converted, or a stored place that reads exactly as it (a traverse begun at a
+    // corner), as an added feature keeps it.
+    let start_own = match grid {
+        Some(_) => Some(match held_places(s, id, &[], &[&Geometry::Point(start)]).get(start) {
+            Some(stored) => stored,
+            None => rustgis_data::raster::Crs::LonLat
+                .to(l.dataset.coord_crs())?
+                .point(start)
+                .ok_or_else(|| format!("the start can't be given in the system that '{}' is held in", l.name))?,
+        }),
+        None => None,
+    };
+    let mut pts = vec![start_own.unwrap_or(start)];
     for leg in legs {
         let d = leg
             .get("distance")
@@ -1685,11 +2199,26 @@ fn traverse(s: &mut Session, p: &Json) -> CmdResult {
             (dx, dy) = ground_to_grid(dx, dy, k, rot);
         }
         let last = pts.last().copied().unwrap_or(start);
-        pts.push(shift(last, dx, dy));
+        pts.push(match grid {
+            Some(grid) => {
+                let d = grid.step(dx, dy);
+                Coord::new(last.x + d.x, last.y + d.y)
+            }
+            None => shift(last, dx, dy),
+        });
     }
-    let id = s.layer_id(p)?;
-    let gt = s.map().layer(id).map(|l| l.geometry_type()).ok_or("no such layer")?;
     // The layer decides: a polygon layer gets a closed traverse, a line layer an open one.
+    if let Some(first) = start_own {
+        let g = match gt {
+            GeometryType::Polygon => {
+                pts.push(first);
+                Geometry::Polygon(vec![vec![pts]])
+            }
+            GeometryType::Polyline => Geometry::Line(vec![pts]),
+            _ => return Err("traverses go into a line or polygon layer".into()),
+        };
+        return super::edit::add_feature_own(s, id, &json!({"layer": id}), g);
+    }
     let g = match gt {
         GeometryType::Polygon => {
             pts.push(start);
@@ -1713,15 +2242,16 @@ fn domain(s: &mut Session, p: &Json) -> CmdResult {
         return Ok(Json::Null);
     }
     let kind = if let Some(codes) = p.get("coded").and_then(Json::as_array) {
-        let pairs: Vec<(Value, String)> = codes
-            .iter()
-            .take(10_000)
-            .filter_map(|c| {
-                let code = super::edit::coerce(Value::from_json(c.get(0)?), ty);
-                let desc = c.get(1).and_then(Json::as_str).map(String::from).unwrap_or_else(|| code.to_string());
-                (!code.is_null()).then_some((code, desc))
-            })
-            .collect();
+        // A code its field can't hold as given is refused, not cut to another or left out.
+        let mut pairs: Vec<(Value, String)> = Vec::new();
+        for c in codes.iter().take(10_000) {
+            let Some(given) = c.get(0) else { continue };
+            let code = super::edit::held_default(&fname, &Value::from_json(given), ty)?;
+            let desc = c.get(1).and_then(Json::as_str).map(String::from).unwrap_or_else(|| code.to_string());
+            if !code.is_null() {
+                pairs.push((code, desc));
+            }
+        }
         if pairs.is_empty() {
             return Err("coded is a list of [code, description] pairs".into());
         }
@@ -1769,16 +2299,14 @@ fn subtypes(s: &mut Session, p: &Json) -> CmdResult {
     for v in list {
         let code = v.get("code").and_then(Json::as_i64).ok_or("each subtype has an integer code")?;
         let name = super::within("name", "a subtype's name", v.get("name").and_then(Json::as_str).ok_or("each subtype has a name")?, 200)?;
-        let defaults: Vec<(String, Value)> = v
+        let mut defaults: Vec<(String, Value)> = v
             .get("defaults")
             .and_then(Json::as_object)
             .map(|o| o.iter().map(|(k, v)| (k.clone(), Value::from_json(v))).collect())
             .unwrap_or_default();
-        for (field, value) in &defaults {
-            if let Some(ty) = l.dataset.field_index(field).and_then(|i| l.dataset.fields.get(i)).map(|f| f.ty)
-                && super::edit::non_finite_input(value, ty)
-            {
-                return Err(format!("field '{field}' requires a finite number"));
+        for (field, value) in &mut defaults {
+            if let Some(ty) = l.dataset.field_index(field).and_then(|i| l.dataset.fields.get(i)).map(|f| f.ty) {
+                *value = super::edit::held_default(field, value, ty)?;
             }
         }
         if subs.iter().any(|x: &Subtype| x.code == code) {
@@ -1912,7 +2440,8 @@ fn contingent(s: &mut Session, p: &Json) -> CmdResult {
         .take(100_000)
         .map(|c| {
             let vals = c.as_array().filter(|a| a.len() == fields.len()).ok_or("each combination has one value per field")?;
-            Ok(vals.iter().zip(&fields).map(|(v, (_, ty))| super::edit::coerce(Value::from_json(v), *ty)).collect())
+            // A value its field can't hold as given is refused, not cut to another.
+            vals.iter().zip(&fields).map(|(v, (name, ty))| super::edit::held_default(name, &Value::from_json(v), *ty)).collect()
         })
         .collect::<Result<_, String>>()?;
     let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
@@ -2066,7 +2595,7 @@ fn related(s: &mut Session, p: &Json) -> CmdResult {
     Ok(json!({"related": total, "layers": names}))
 }
 
-/// Validates defaults before replacing a template; a refused numeric value leaves it intact.
+/// Validates defaults before replacing a template; a refused value leaves it intact.
 fn template(s: &mut Session, p: &Json) -> CmdResult {
     let id = s.layer_id(p)?;
     let name = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).ok_or("name is required")?.to_string();
@@ -2081,15 +2610,7 @@ fn template(s: &mut Session, p: &Json) -> CmdResult {
         for (k, v) in o {
             let fi = l.dataset.field_index(k).ok_or_else(|| format!("no field named '{k}'"))?;
             let ty = l.dataset.fields.get(fi).map(|f| f.ty).unwrap_or(FieldType::Text);
-            let value = Value::from_json(v);
-            if super::edit::non_finite_input(&value, ty) {
-                return Err(format!("field '{k}' requires a finite number"));
-            }
-            let coerced = super::edit::coerce(value.clone(), ty);
-            // A default a date field can't hold is refused, as edit.addFeature refuses the value.
-            if ty.is_temporal() && coerced.is_null() && !value.asks_null() {
-                return Err(format!("field '{k}': '{value}' isn't a {} value", ty.label()));
-            }
+            let coerced = super::edit::held_default(k, &Value::from_json(v), ty)?;
             defaults.push((l.dataset.fields.get(fi).map(|f| f.name.clone()).unwrap_or_default(), coerced));
         }
     }
@@ -2172,9 +2693,11 @@ fn snap_excluding(
         }
         let id = l.id;
         l.projected_in(&flat, &key);
+        let boxes = l.projected_extents();
         for (row, g) in l.projected_cache().iter().enumerate() {
             let Some(g) = g.as_ref().filter(|_| skip != Some((id, row))) else { continue };
-            if !g.extent().padded(0.0, tol).contains(m) {
+            // Its box as kept with the projected shape: a snap asks on every pointer move.
+            if !boxes.get(row).copied().unwrap_or_else(|| g.extent()).padded(0.0, tol).contains(m) {
                 continue;
             }
             of.set((id, row));
@@ -2400,6 +2923,12 @@ struct TopologyChecked {
     /// and covering layers whose edges bend by their conversion into it (how many, how far).
     fell_back: Vec<String>,
     bent: Vec<(String, usize, f64)>,
+    /// Rules checked in longitude/latitude that left out features with a place that can't be
+    /// given there: "{rule} on '{layer}': n feature(s) of '{layer}'", said once.
+    unplaced: Vec<String>,
+    /// Issues found in a layer's own system at a place that can't be given in longitude/latitude:
+    /// kept, with no place to zoom to (NaN).
+    unlocated: usize,
 }
 
 /// Checks each rule and its query on the worker, with Cancel between rows/rules and counted
@@ -2419,6 +2948,7 @@ fn check_topology(inputs: &[TopologyInput], tol: f64) -> Result<TopologyChecked,
     let mut skipped = Vec::new();
     let mut query_errors = Vec::with_capacity(inputs.len());
     let (mut fell_back, mut bent) = (Vec::new(), Vec::new());
+    let (mut unplaced, mut unlocated) = (Vec::new(), 0usize);
     for i in inputs {
         rustgis_data::progress::check().map_err(|_| cancelled())?;
         let (query, error) = match rustgis_data::rows::Query::compile(i.query.as_deref(), &i.data) {
@@ -2475,13 +3005,37 @@ fn check_topology(inputs: &[TopologyInput], tol: f64) -> Result<TopologyChecked,
                 bent.push((format!("'{}' for {} on '{}' ({n}, into {})", i.by_layer, i.rule.label(), i.layer, crs.label()), n, far));
             }
         }
+        // In longitude/latitude, a feature with a place that can't be given there is read
+        // without its geometry, so the rule checks the rest, and is said with a count.
+        let mut left_out = false;
         let (work, data, by) = match own {
             Some((crs, by)) => (crs, std::borrow::Cow::Borrowed(&i.data), by),
-            None => (
-                rustgis_data::raster::Crs::LonLat,
-                i.data.in_lonlat().map_err(|e| named(&i.data.name, &i.layer, e))?,
-                i.by.as_ref().map(|b| b.in_lonlat().map_err(|e| named(&b.name, &i.by_layer, e))).transpose()?,
-            ),
+            None => {
+                let (data, _) = i.data.in_lonlat_leaving_out().map_err(|e| named(&i.data.name, &i.layer, e))?;
+                let left = rows
+                    .iter()
+                    .filter(|&&r| {
+                        i.data.features.row(r).is_some_and(|f| f.geometry().is_some())
+                            && data.features.row(r).is_some_and(|f| f.geometry().is_none())
+                    })
+                    .count();
+                if left > 0 {
+                    unplaced.push(format!("{} on '{}': {left} feature(s) of '{}'", i.rule.label(), i.layer, i.layer));
+                    left_out = true;
+                }
+                let by = match &i.by {
+                    Some(b) => {
+                        let (by, left) = b.in_lonlat_leaving_out().map_err(|e| named(&b.name, &i.by_layer, e))?;
+                        if left > 0 {
+                            unplaced.push(format!("{} on '{}': {left} feature(s) of '{}'", i.rule.label(), i.layer, i.by_layer));
+                            left_out = true;
+                        }
+                        Some(by)
+                    }
+                    None => None,
+                };
+                (rustgis_data::raster::Crs::LonLat, data, by)
+            }
         };
         let _plane = rustgis_analysis::convert::install(rustgis_analysis::convert::run_plane_for(work));
         let lonlat = work == rustgis_data::raster::Crs::LonLat;
@@ -2506,7 +3060,9 @@ fn check_topology(inputs: &[TopologyInput], tol: f64) -> Result<TopologyChecked,
             (TopologyRule::MustBeCoveredBy { .. }, None) => t::Checked { errors: Vec::new(), complete: true, skipped: 0 },
         };
         rustgis_data::progress::check().map_err(|_| cancelled())?;
-        if !checked.complete || checked.skipped > 0 {
+        // A feature left out for want of a place can make its neighbours' issues (a gap where it
+        // lay, a dangle where it joined, a point it covered): the rule is said to be incomplete.
+        if !checked.complete || checked.skipped > 0 || left_out {
             incomplete.push(i.rule.label().to_string());
         }
         if checked.skipped > 0 {
@@ -2521,19 +3077,14 @@ fn check_topology(inputs: &[TopologyInput], tol: f64) -> Result<TopologyChecked,
         let to_lonlat = if lonlat { None } else { Some(work.to(rustgis_data::raster::Crs::LonLat)?) };
         for issue in checked.errors {
             rustgis_data::progress::check().map_err(|_| cancelled())?;
-            // One the layer's system can't give there is refused, naming the feature, as a
-            // check in longitude/latitude refuses it.
+            // One the layer's system can't give there is kept with no place (NaN), counted and
+            // said: the Error Inspector can't zoom to it.
             let at = match &to_lonlat {
                 None => issue.at,
-                Some(to) => to.point(issue.at).filter(|c| c.is_finite()).ok_or_else(|| {
-                    let feature = issue.rows.first().and_then(|&r| i.data.features.row(r)).map(|r| format!("feature {}", r.id()));
-                    format!(
-                        "{}: {} has a place in {} that can't be given in longitude/latitude",
-                        i.layer,
-                        feature.as_deref().unwrap_or("a gap"),
-                        work.label()
-                    )
-                })?,
+                Some(to) => to.point(issue.at).filter(|c| c.is_finite()).unwrap_or_else(|| {
+                    unlocated += 1;
+                    rustgis_geom::Coord::new(f64::NAN, f64::NAN)
+                }),
             };
             errors.push(crate::TopologyIssue {
                 rule: i.rule.label().to_string(),
@@ -2545,7 +3096,7 @@ fn check_topology(inputs: &[TopologyInput], tol: f64) -> Result<TopologyChecked,
         }
         query_errors.push(error);
     }
-    Ok(TopologyChecked { errors, incomplete, skipped, query_errors, fell_back, bent })
+    Ok(TopologyChecked { errors, incomplete, skipped, query_errors, fell_back, bent, unplaced, unlocated })
 }
 
 /// The tolerance `topology.validate` checks dangles with, in metres.
@@ -2603,6 +3154,12 @@ pub(crate) fn topology_ahead(s: &Session, p: &Json) -> Option<super::reads::Read
 /// command line call commands one at a time on the session and use each answer before the next,
 /// so they check where they ask, with the work limit of a run that can't be cancelled. A registered
 /// window owner refuses an unprepared nonempty check instead of computing it inline.
+/// One issue as `topology.validate` answers it. `located` is false for an issue at a place that
+/// can't be given in longitude/latitude, whose `lon` and `lat` are then null.
+fn issue_json(e: &crate::TopologyIssue) -> Json {
+    json!({"rule": e.rule, "layer": e.layer, "rows": e.rows, "lon": e.lon, "lat": e.lat, "located": e.lon.is_finite() && e.lat.is_finite()})
+}
+
 fn topology_validate(s: &mut Session, p: &Json) -> CmdResult {
     let tol = topology_tolerance(p);
     let inputs = topology_checks(s);
@@ -2641,12 +3198,7 @@ fn topology_validate(s: &mut Session, p: &Json) -> CmdResult {
         let answer = found
             .as_ref()
             .map(|checked| {
-                let first: Vec<Json> = checked
-                    .errors
-                    .iter()
-                    .take(1000)
-                    .map(|e| json!({"rule": e.rule, "layer": e.layer, "rows": e.rows, "lon": e.lon, "lat": e.lat}))
-                    .collect();
+                let first: Vec<Json> = checked.errors.iter().take(1000).map(issue_json).collect();
                 json!({"errors": checked.errors.len(), "first": first, "incomplete": checked.incomplete})
             })
             .map_err(Clone::clone);
@@ -2655,7 +3207,7 @@ fn topology_validate(s: &mut Session, p: &Json) -> CmdResult {
         super::gp::record_read(s, TOPOLOGY_AHEAD, p, recorded);
         return answer;
     }
-    let TopologyChecked { errors, incomplete, skipped, query_errors, fell_back, bent } = found?;
+    let TopologyChecked { errors, incomplete, skipped, query_errors, fell_back, bent, unplaced, unlocated } = found?;
     if !fell_back.is_empty() {
         s.warn(format!(
             "{} topology rule(s) checked in longitude/latitude, as their layer's own system can't hold their covering layer: {}",
@@ -2700,9 +3252,19 @@ fn topology_validate(s: &mut Session, p: &Json) -> CmdResult {
             skipped.join("; ")
         ));
     }
+    if !unplaced.is_empty() {
+        s.warn(format!(
+            "Features with a place that can't be given in longitude/latitude, where a rule is checked, were left out of the check: {}",
+            unplaced.join("; ")
+        ));
+    }
+    if unlocated > 0 {
+        s.warn(format!(
+            "{unlocated} topology issue(s) are at a place that can't be given in longitude/latitude, so the Error Inspector can't zoom to them"
+        ));
+    }
     let n = errors.len();
-    let out: Vec<Json> =
-        errors.iter().take(1000).map(|e| json!({"rule": e.rule, "layer": e.layer, "rows": e.rows, "lon": e.lon, "lat": e.lat})).collect();
+    let out: Vec<Json> = errors.iter().take(1000).map(issue_json).collect();
     s.topology_errors = errors;
     // Count layers once even when several rules read the same unreadable query. Bound
     // NoticeText::list nesting independently of the number of rules or layers.
@@ -2826,11 +3388,16 @@ pub(crate) fn new_feature_inputs(input: &super::InputContext<'_>, p: &Json) -> R
         return Ok(inputs);
     }
     let mut inputs = super::Inputs::primary(s, p)?;
-    if let Elevation::Surface(name) = &s.map().editing.settings.elevation {
-        inputs.layers.extend(surface_layer(input, name).map(|l| (s.map().instance_id(), l.id)));
+    include_new_feature_surface(input, &mut inputs);
+    Ok(inputs)
+}
+
+/// Every new feature may sample the configured elevation raster, even in a newly created layer.
+pub(super) fn include_new_feature_surface(input: &super::InputContext<'_>, inputs: &mut super::Inputs) {
+    if let Elevation::Surface(name) = &input.map().editing.settings.elevation {
+        inputs.layers.extend(surface_layer(input, name).map(|l| (input.map().instance_id(), l.id)));
         inputs.state = json!({"surface":name});
     }
-    Ok(inputs)
 }
 
 #[cfg(test)]
@@ -2871,11 +3438,12 @@ mod tests {
     }
 
     /// A held layer with an error at a place that can't be given in longitude/latitude (checked in
-    /// its own system, #2032 C2e-5) is refused, naming the layer once; a covering layer the
-    /// checked one's system can't hold is checked in longitude/latitude, where its place that
-    /// can't be given there is refused, named as that layer, not the one checked.
+    /// its own system, #2032 C2e-5) keeps it with no place, counted, under the layer's map name;
+    /// a covering layer the checked one's system can't hold is checked in longitude/latitude,
+    /// where its feature with no place there is left out, named as that layer as the map has it,
+    /// and the rule is said to be incomplete (#2032 C2f-4b-1c).
     #[test]
-    fn a_topology_refusal_names_its_layer_once() {
+    fn a_topology_check_names_what_it_cant_place_by_the_maps_names() {
         let held = |name: &str, kind: GeometryType, far: bool| {
             let mut ds = rustgis_data::Dataset::new(name, kind, vec![]);
             ds.hold_in(rustgis_data::raster::Crs::Epsg(32632)).unwrap();
@@ -2893,17 +3461,13 @@ mod tests {
         };
         let mut s = Session::new(crate::Project::default());
         s.map_mut().add_dataset(held("Parcels", GeometryType::Polyline, true));
-        s.run("topology.rules", &json!({"add": {"rule": "mustNotHaveDangles", "layer": "Parcels"}})).unwrap();
-        let Err(e) = check_topology(&topology_checks(&s), 1.0) else { panic!("the check is refused") };
-        assert!(e.starts_with("Parcels: feature"), "{e}");
-        assert_eq!(e.matches("Parcels").count(), 1, "{e}");
-        // A checked layer whose map name isn't its data's (a name taken on a clash) is named as
-        // the map has it, once.
+        // A checked layer whose map name isn't its data's (a name taken on a clash).
         s.map_mut().layers.iter_mut().find(|l| l.name == "Parcels").unwrap().name = "Parcels (2)".into();
         s.map_mut().editing.topology = vec![TopologyRule::MustNotHaveDangles { layer: "Parcels (2)".into() }];
-        let Err(e) = check_topology(&topology_checks(&s), 1.0) else { panic!("the check is refused") };
-        assert!(e.starts_with("Parcels (2): feature"), "{e}");
-        assert_eq!(e.matches("Parcels").count(), 1, "{e}");
+        let checked = check_topology(&topology_checks(&s), 1.0).unwrap();
+        assert_eq!(checked.errors.len(), 2, "both ends dangle");
+        assert!(checked.errors.iter().all(|e| e.layer == "Parcels (2)" && !e.lon.is_finite()), "{:?}", checked.errors);
+        assert_eq!(checked.unlocated, 2);
 
         let mut s = Session::new(crate::Project::default());
         s.map_mut().add_dataset(held("Cities", GeometryType::Point, false));
@@ -2911,18 +3475,13 @@ mod tests {
         let mut countries = held("Countries", GeometryType::Polygon, true);
         countries.held_in = rustgis_data::raster::Crs::Epsg(32633);
         s.map_mut().add_dataset(countries);
-        s.run("topology.rules", &json!({"add": {"rule": "mustBeCoveredBy", "layer": "Cities", "by": "Countries"}})).unwrap();
-        let Err(e) = check_topology(&topology_checks(&s), 1.0) else { panic!("the check is refused") };
-        assert!(e.starts_with("Countries: feature"), "{e}");
-        assert!(!e.contains("Cities"), "{e}");
-        // A covering layer whose map name isn't its data's (a name taken on a clash) is named as
-        // the map has it.
+        // A covering layer whose map name isn't its data's.
         s.map_mut().layers.iter_mut().find(|l| l.name == "Countries").unwrap().name = "Borders".into();
         s.map_mut().editing.topology = vec![TopologyRule::MustBeCoveredBy { layer: "Cities".into(), by: "Borders".into() }];
-        let Err(e) = check_topology(&topology_checks(&s), 1.0) else { panic!("the check is refused") };
-        assert!(e.starts_with("Borders: feature"), "{e}");
-        assert_eq!(e.matches("Countries").count() + e.matches("Borders").count(), 1, "{e}");
-        assert!(!e.contains("Cities"), "{e}");
+        let checked = check_topology(&topology_checks(&s), 1.0).unwrap();
+        assert_eq!(checked.unplaced, vec!["Must Be Covered By on 'Cities': 1 feature(s) of 'Borders'".to_string()]);
+        assert_eq!(checked.incomplete.len(), 1);
+        assert_eq!(checked.errors.len(), 1, "the city, its covering polygon left out");
     }
 
     #[test]

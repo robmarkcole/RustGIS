@@ -10,7 +10,9 @@
 
 use std::collections::BTreeMap;
 
-use rustgis_data::raster;
+#[cfg(not(target_arch = "wasm32"))]
+use rustgis_data::loss::{LossCode, Note};
+use rustgis_data::{Geometry, GeometryType, raster};
 use rustgis_map::raster::RasterLayer;
 use serde_json::{Value, json};
 
@@ -32,11 +34,11 @@ pub fn commands() -> Vec<C> {
             r#"{"dataset": "alphaearth" | "earth-index" | "tessera" | "olmoearth", "url"?: "AlphaEarth's tile or Earth Index's file, as embeddings.search lists it (Earth Index: default the MGRS tile at the view's centre)", "year"?: number (Tessera and OlmoEarth, default 2024), "bands"?: [red, green, blue] (bands from 1; AlphaEarth default [2, 17, 10], Tessera and OlmoEarth [1, 2, 3]), "stretch"?: number (AlphaEarth: dequantised values shown over ±stretch, default 0.3), "dimension"?: number (Earth Index: a vector value kept as each point's `value`, from 1), "bbox"?: [west, south, east, north] | "view" (Earth Index, Tessera and OlmoEarth: the area read, default the map's extent), "name"?: text, "ran"?: (internal: what the app read)}"#,
         ),
         C::new("embeddings.addCube", "Add Satellite Embeddings over Time", "Home › Add › Web Data", add_cube).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network)).params(
-            r#"{"dataset": "alphaearth", "bbox"?: [west, south, east, north] | "view" (the area searched, default the map's extent), "start"?: year (default 2017), "end"?: year (default 2025), "bands"?: [red, green, blue] (bands from 1, default [2, 17, 10]), "stretch"?: number (dequantised values shown over ±stretch, default 0.3), "name"?: text, "found"?: (internal: the tiles the app found, each {years: {year: address}}), "complete"?: (internal: false when the app's search read only part of the index)} → a tile layer per AlphaEarth tile, a file per year, following the time slider (turned on over the years when it is off)"#,
+            r#"{"dataset": "alphaearth", "bbox"?: [west, south, east, north] | "view" (the area searched, default the map's extent), "start"?: year (default 2017), "end"?: year (default 2025), "bands"?: [red, green, blue] (bands from 1, default [2, 17, 10]), "stretch"?: number (dequantised values shown over ±stretch, default 0.3), "name"?: text, "found"?: (internal: the tiles the app found, each {years: {year: address}}), "complete"?: (internal: false when the app's search read only part of the index), "unusable"?: (internal: the rows of the index the app's search left out, as they can't be read)} → a tile layer per AlphaEarth tile, a file per year, following the time slider (turned on over the years when it is off)"#,
         ),
         // Each makes a raster; on another thread from the app (workflows::IN_BACKGROUND).
-        C::new("embeddings.similarity", "Satellite Embedding Similarity", "Home › Add › Web Data", similarity).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network)).params(
-            r#"{"dataset": "alphaearth", "point"?: [longitude, latitude] (the reference: the embedding of the cell there), "points"?: [[longitude, latitude], …] (the reference: the mean of their cells' embeddings, at most 1000; give point or points, inside the area), "year"?: number (2017–2025, default 2024), "bbox"?: [west, south, east, north] | "view" (the area read, default the map's extent; at most about 1000 × 1000 cells), "cellSize"?: metres (an overview with cells at most this size, for a larger area), "name"?: text, "ran"?: (internal: a raster the app has worked out)} → a raster of each cell's cosine similarity to the reference's embedding, from −1 to 1, in the tile's coordinate system (UTM)"#,
+        C::new("embeddings.similarity", "Satellite Embedding Similarity", "Home › Add › Web Data", similarity).inputs(similarity_inputs).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network)).params(
+            r#"{"dataset": "alphaearth", "point"?: [longitude, latitude] (the reference: the embedding of the cell there), "points"?: [[longitude, latitude], …] | a point layer's name or id (the reference: the mean of their cells' embeddings, at most 1000 points; of a layer, its selected features, or all of them when none is selected, that its definition query keeps, each point of a multipoint; give point or points, inside the area), "year"?: number (2017–2025, default 2024), "bbox"?: [west, south, east, north] | "view" (the area read, default the map's extent; at most about 1000 × 1000 cells), "cellSize"?: metres (an overview with cells at most this size, for a larger area), "name"?: text, "ran"?: (internal: a raster the app has worked out)} → a raster of each cell's cosine similarity to the reference's embedding, from −1 to 1, in the tile's coordinate system (UTM)"#,
         ),
         C::new("embeddings.change", "Satellite Embedding Change", "Home › Add › Web Data", change).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network)).params(
             r#"{"dataset": "alphaearth", "from"?: year (default 2017), "to"?: year after from (default 2025), "bbox"?: [west, south, east, north] | "view" (the area read, default the map's extent; at most about 1000 × 1000 cells), "cellSize"?: metres (an overview with cells at most this size, for a larger area), "name"?: text, "ran"?: (internal: a raster the app has worked out)} → a raster of how far each cell's embedding moved between the two years, 1 − their cosine, from 0 (the same) to 2 (opposite), in the tile's coordinate system (UTM)"#,
@@ -118,16 +120,15 @@ fn search(s: &mut Session, p: &Value) -> CmdResult {
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let (tiles, complete) = match d.id {
+        let found = match d.id {
             "alphaearth" => emb::search_aef_blocking(area, year)?,
             "earth-index" => emb::search_earth_index_blocking(area)?,
-            _ => tessera::tiles(tessera::store(d.id).ok_or_else(|| format!("{} can't be searched", d.name))?, area, year),
+            _ => tessera::tiles(tessera::store(d.id).ok_or_else(|| format!("{} can't be searched", d.name))?, area, year).into(),
         };
+        search_notices(s, d, &found);
+        let emb::Found { tiles, complete, .. } = found;
         let mut r = json!({"dataset": d.id, "year": year, "count": tiles.len(), "complete": complete,
             "tiles": tiles.iter().map(emb::Tile::to_json).collect::<Vec<_>>()});
-        if !complete {
-            s.notify(format!("{}: the area holds more tiles than one search reads; zoom in to list them all", d.name), false);
-        }
         if super::b(p, "footprints") != Some(false) && !tiles.is_empty() && tessera::store(d.id).is_none() {
             let name = format!("{} tiles {year}", d.name.split(" (").next().unwrap_or(d.name));
             if let Some(id) = super::stac::add_collection(s, &emb::footprints_geojson(&tiles), &name)? {
@@ -135,6 +136,17 @@ fn search(s: &mut Session, p: &Value) -> CmdResult {
             }
         }
         Ok(r)
+    }
+}
+
+/// Says what a search left out: rows past one read, and rows that can't be read.
+#[cfg(not(target_arch = "wasm32"))]
+fn search_notices(s: &mut Session, d: &emb::EmbeddingDataset, found: &emb::Found) {
+    if !found.complete {
+        s.notify(format!("{}: the area holds more tiles than one search reads; zoom in to list them all", d.name), false);
+    }
+    if let Some(note) = emb::unusable_note(found.unusable, found.complete) {
+        s.notify(format!("{}: {note}", d.name), false);
     }
 }
 
@@ -220,24 +232,28 @@ fn add_cube(s: &mut Session, p: &Value) -> CmdResult {
     let given = p.get("found").filter(|v| !v.is_null());
     // Whether the index was read whole: a tile-year with no file is then the index's gap, not
     // the read's. The files handed over outside the years asked for, left out. And what the
-    // search left out, said once the cube is added (a refused one adds nothing to speak of).
-    let (series, complete, outside, notes) = match given {
+    // search left out, said once the cube is added (a refused one adds nothing to speak of), or
+    // with the error when there is no tile; the rows that can't be read, of which one may be a file.
+    let (series, complete, outside, unusable, notes) = match given {
         Some(v) => {
             let (series, outside) = found(v, start, end)?;
             let complete = super::b(p, "complete") != Some(false);
             // A part read: said even when every year of the tiles handed over is there.
-            let notes = if complete { Vec::new() } else { vec![PART_READ.to_string()] };
-            (series, complete, outside, notes)
+            let unusable = p.get("unusable").and_then(Value::as_u64).and_then(|n| usize::try_from(n).ok()).unwrap_or(0);
+            let left = emb::SeriesFound { complete, unusable, ..Default::default() };
+            (series, complete, outside, unusable, series_notes(&left))
         }
         None => {
-            let (series, complete, notes) = search_series(s, p, (start, end))?;
-            (series, complete, 0, notes)
+            let f = search_series(s, p, (start, end))?;
+            let notes = series_notes(&f);
+            (f.series.into_iter().map(|x| x.years).collect(), f.complete, 0, f.unusable, notes)
         }
     };
     let listed = series.len();
     let series: Vec<BTreeMap<i32, String>> = series.into_iter().filter(|y| !y.is_empty()).collect();
     if series.is_empty() {
-        return Err(format!("AlphaEarth has no tiles there for {start}–{end}"));
+        let left = if notes.is_empty() { String::new() } else { format!(" ({})", notes.join("; ")) };
+        return Err(format!("AlphaEarth has no tiles there for {start}–{end}{left}"));
     }
     let room = rustgis_map::tiles::MAX_TILE_LAYERS.saturating_sub(s.map().tiles.len());
     if series.len() > room {
@@ -325,19 +341,22 @@ fn add_cube(s: &mut Session, p: &Value) -> CmdResult {
             false,
         );
     }
+    let read = if unusable > 0 { ", among the rows that can be read" } else { "" };
     if listed > series.len() {
-        s.notify(format!("{base}: {} of the {listed} tiles have no file in {start}–{end} and were left out", listed - series.len()), false);
+        let n = listed - series.len();
+        s.notify(format!("{base}: {n} of the {listed} tiles have no file in {start}–{end}{read} and were left out"), false);
     }
     if missing > 0 {
         let total = series.len() * span;
+        let (index, zoom) = if complete {
+            ("AlphaEarth's index", "")
+        } else {
+            ("the part of AlphaEarth's index that was read", " (zoom in to read it whole)")
+        };
         s.notify(
-            if complete {
-                format!("{base}: {missing} of the {total} tile-years have no file in AlphaEarth's index; in those years the tile shows nothing")
-            } else {
-                format!(
-                    "{base}: {missing} of the {total} tile-years have no file in the part of AlphaEarth's index that was read (zoom in to read it whole); in those years the tile shows nothing"
-                )
-            },
+            format!(
+                "{base}: {missing} of the {total} tile-years have no file in {index}{read}{zoom}; in those years the tile shows nothing"
+            ),
             false,
         );
     }
@@ -377,9 +396,8 @@ fn found(v: &Value, start: i32, end: i32) -> Result<(Vec<BTreeMap<i32, String>>,
 }
 
 /// AlphaEarth's tiles over the years where the command says, from one read of the index, waiting
-/// for it (the command line); whether it read the index whole for the area; and what the read
-/// left out, to be said.
-fn search_series(s: &mut Session, p: &Value, years: (i32, i32)) -> Result<(Vec<BTreeMap<i32, String>>, bool, Vec<String>), String> {
+/// for it (the command line), with what the read left out.
+fn search_series(s: &mut Session, p: &Value, years: (i32, i32)) -> Result<emb::SeriesFound, String> {
     let area = bbox(s, p)?;
     #[cfg(target_arch = "wasm32")]
     {
@@ -394,18 +412,15 @@ fn search_series(s: &mut Session, p: &Value, years: (i32, i32)) -> Result<(Vec<B
                 "AlphaEarth's index is read off the frame here: add its years from Home › Add › Web Data › Satellite Embeddings".into()
             );
         }
-        let f = emb::search_aef_series_blocking(area, years)?;
-        let notes = series_notes(&f);
-        Ok((f.series.into_iter().map(|x| x.years).collect(), f.complete, notes))
+        emb::search_aef_series_blocking(area, years)
     }
 }
 
 /// A search over the years that read part of the index, said.
 const PART_READ: &str = "AlphaEarth: the area holds more tiles than one search reads; zoom in to take them all";
 
-/// What a search over the years left out: rows past one read, tiles past a search's list, and a
-/// tile's second file for a year.
-#[cfg(not(target_arch = "wasm32"))]
+/// What a search over the years left out: rows past one read, tiles past a search's list, a
+/// tile's second file for a year, and rows that can't be read.
 fn series_notes(f: &emb::SeriesFound) -> Vec<String> {
     let mut notes = Vec::new();
     if !f.complete {
@@ -417,6 +432,7 @@ fn series_notes(f: &emb::SeriesFound) -> Vec<String> {
     if f.duplicates > 0 {
         notes.push(format!("AlphaEarth: {} tile-years had a second file in the index; the first was taken", f.duplicates));
     }
+    notes.extend(emb::unusable_note(f.unusable, f.complete).map(|n| format!("AlphaEarth: {n}")));
     notes
 }
 
@@ -512,9 +528,10 @@ fn add_zones(s: &mut Session, p: &Value, d: &emb::EmbeddingDataset, name: Option
     let year = year(d, p)?;
     let b = bands(p, z.bands, tessera::DEFAULT_BANDS)?;
     let none = format!("{} has no embeddings there", z.name);
-    let (r, tif) = match handed(s, p)? {
+    // Whether `tif` is the file `geotiff::write` wrote of `r`, rather than one handed over.
+    let (r, tif, written) = match handed(s, p)? {
         Some((_, tif)) => match raster::read_bytes(&format!("{}.tif", z.id), &tif) {
-            Ok(r) if r.bands.iter().any(|band| band.stats.count > 0) => (r, tif),
+            Ok(r) if r.bands.iter().any(|band| band.stats.count > 0) => (r, tif, false),
             Ok(_) => return Err(none),
             Err(e) => return Err(e.to_string()),
         },
@@ -536,7 +553,7 @@ fn add_zones(s: &mut Session, p: &Value, d: &emb::EmbeddingDataset, name: Option
                     s.notify(format!("{}: the view is larger than one read; its centre was read (zoom in for the rest)", z.name), false);
                 }
                 let tif = raster::geotiff::write(&r, 0).map_err(|e| e.to_string())?;
-                (r, tif)
+                (r, tif, true)
             }
         }
     };
@@ -544,7 +561,8 @@ fn add_zones(s: &mut Session, p: &Value, d: &emb::EmbeddingDataset, name: Option
         return Err(none);
     }
     let name = name.unwrap_or_else(|| format!("{} {year} ({})", z.name, band_label(b)));
-    let layer = RasterLayer::from_bytes(r, format!("{}_{year}.tif", z.id), tif);
+    let file = format!("{}_{year}.tif", z.id);
+    let layer = if written { RasterLayer::from_written(r, file, tif) } else { RasterLayer::from_bytes(r, file, tif) };
     let mut out = super::raster::add_raster(s, &name, layer)?;
     if !d.license.is_empty() {
         out["license"] = json!(d.license);
@@ -569,8 +587,11 @@ const AEF_BANDS: usize = 64;
 /// works on its caller's thread, waiting for AlphaEarth's index and the window: the command line
 /// and Python have no window to hold, and the app's workflows start it on a thread
 /// ([`super::workflows::raster_start`]) and add what it made with `ran`. The app's assistant runs
-/// its tools on the frame, so there the window waits, as it does for `raster.change` and the other
-/// commands that read the network; a plugin's command in the app is refused ([`analysis`]).
+/// its tools on the frame, as it needs a command's answer before its next one, so there the window
+/// waits, without Cancel, as it does for `raster.change` and the other commands of
+/// [`super::workflows::IN_BACKGROUND`]: for the network, and for a point layer's reference
+/// ([`layer_points`]), whose definition query reads every feature, and whose points end at the
+/// limit. A plugin's command in the app is refused ([`analysis`]).
 fn similarity(s: &mut Session, p: &Value) -> CmdResult {
     super::workflows::made_or_ran(s, p, "embeddings.similarity")
 }
@@ -618,26 +639,174 @@ fn year_param(d: &emb::EmbeddingDataset, p: &Value, k: &str, default: i32) -> Re
     }
 }
 
-/// `embeddings.similarity`'s reference: `point`, or the `points` whose embeddings are averaged.
-fn reference_points(p: &Value) -> Result<Vec<(f64, f64)>, String> {
-    const POINTS: &str = "points is a list of [longitude, latitude] in degrees";
+/// The layer `embeddings.similarity` takes its reference from, when `points` names one, as the
+/// `layer` parameter [`Session::layer_id`] reads.
+fn points_layer(p: &Value) -> Option<Value> {
+    let layer = p.get("points").filter(|v| v.is_string() || v.is_number())?;
+    Some(json!({"layer": layer}))
+}
+
+/// The layer `points` names, shared with exact approval; a list of points reads none.
+fn similarity_inputs(input: &super::InputContext<'_>, p: &Value) -> Result<super::Inputs, String> {
+    match points_layer(p) {
+        Some(named) => super::Inputs::single_layer(input, &named),
+        None => Ok(super::Inputs::layers(std::iter::empty())),
+    }
+}
+
+/// The points of a similarity's reference (longitude, latitude), what its answer says of the
+/// layer they are from, and what to say of it.
+type Taken = (Vec<(f64, f64)>, Option<Value>, Vec<String>);
+
+/// `embeddings.similarity`'s reference: `point`, or the `points` whose embeddings are averaged (a
+/// list, or a layer's). What it reads of the session is read now; a layer's points are taken
+/// where the work runs ([`layer_points`]).
+fn reference_points(s: &Session, p: &Value) -> Result<Box<dyn FnOnce() -> Result<Taken, String> + Send>, String> {
+    const POINTS: &str = "points is a list of [longitude, latitude] in degrees, or a point layer's name or id";
     let pair = |v: &Value| {
         v.as_array()
             .filter(|a| a.len() == 2)
             .and_then(|a| Some((a.first()?.as_f64()?, a.get(1)?.as_f64()?)))
             .filter(|(x, y)| (-180.0..=180.0).contains(x) && (-90.0..=90.0).contains(y))
     };
-    match (p.get("point").filter(|v| !v.is_null()), p.get("points").filter(|v| !v.is_null())) {
-        (Some(_), Some(_)) => Err("give point or points, not both".into()),
-        (Some(v), None) => Ok(vec![pair(v).ok_or("point is [longitude, latitude] in degrees")?]),
-        (None, Some(Value::Array(list))) if list.is_empty() => Err("points is empty: give at least one [longitude, latitude]".into()),
-        (None, Some(Value::Array(list))) if list.len() > MAX_REFERENCE_POINTS => {
-            Err(format!("{} points given: at most {MAX_REFERENCE_POINTS} make a reference", list.len()))
+    let points: Vec<(f64, f64)> = match (p.get("point").filter(|v| !v.is_null()), p.get("points").filter(|v| !v.is_null())) {
+        (Some(_), Some(_)) => return Err("give point or points, not both".into()),
+        (Some(v), None) => vec![pair(v).ok_or("point is [longitude, latitude] in degrees")?],
+        (None, Some(Value::Array(list))) if list.is_empty() => {
+            return Err("points is empty: give at least one [longitude, latitude]".into());
         }
-        (None, Some(Value::Array(list))) => list.iter().map(|v| pair(v).ok_or_else(|| POINTS.to_string())).collect(),
-        (None, Some(_)) => Err(POINTS.into()),
-        (None, None) => Err("the reference is required: point [longitude, latitude], or points [[longitude, latitude], …]".into()),
+        (None, Some(Value::Array(list))) if list.len() > MAX_REFERENCE_POINTS => {
+            return Err(format!("{} points given: at most {MAX_REFERENCE_POINTS} make a reference", list.len()));
+        }
+        (None, Some(Value::Array(list))) => list.iter().map(|v| pair(v).ok_or_else(|| POINTS.to_string())).collect::<Result<_, _>>()?,
+        (None, Some(_)) => {
+            let l = reference_layer(s, &points_layer(p).ok_or(POINTS)?)?;
+            return Ok(Box::new(move || layer_points(l)));
+        }
+        (None, None) => {
+            return Err(
+                "the reference is required: point [longitude, latitude], or points [[longitude, latitude], …] or a point layer".into()
+            );
+        }
+    };
+    Ok(Box::new(move || Ok((points, None, Vec::new()))))
+}
+
+/// `error`, with what a reference layer had to say (`notes`): it may be why.
+fn with_notes(error: String, notes: &[String]) -> String {
+    if notes.is_empty() { error } else { format!("{error} ({})", notes.join("; ")) }
+}
+
+/// The point layer `p` names, for [`layer_points`]: what that reads of it (its rows shared, not
+/// copied, its selection and its definition query). One read in place holds only the features of
+/// the last view, so only its selection is taken.
+fn reference_layer(s: &Session, p: &Value) -> Result<rustgis_map::Layer, String> {
+    let l = s.map().layer(s.layer_id(p)?).ok_or("no such layer")?;
+    if l.is_raster() || l.geometry_type() != GeometryType::Point {
+        let kind = if l.is_raster() { "raster" } else { l.geometry_type().label() };
+        return Err(format!("{}: points is a point layer, and it is a {} layer", l.name, kind.to_lowercase()));
     }
+    if l.is_streamed() && l.selection.is_empty() {
+        return Err(format!(
+            "{}: it is read in place, a view at a time: select the features to use, or load all its features first (Layers › Load All Features)",
+            l.name
+        ));
+    }
+    let mut read = rustgis_map::Layer::new(l.id, l.dataset.clone());
+    read.name = l.name.clone();
+    read.definition_query = l.definition_query.clone();
+    read.selection = l.selection.clone();
+    Ok(read)
+}
+
+/// The points of layer `l`, in longitude/latitude, each of a multipoint's: of its selected
+/// features, or all of them without a selection, that its definition query keeps, as the tools
+/// take a layer. What is left out is said, by kind with a count; the first point past
+/// [`MAX_REFERENCE_POINTS`] refuses the layer, the rest of it not read. Cancel is looked at every
+/// few thousand features; the definition query is one pass that doesn't
+/// ([`rustgis_map::Layer::resolve_rows`]).
+fn layer_points(mut l: rustgis_map::Layer) -> Result<Taken, String> {
+    use rustgis_map::rows::{Policy, Rows};
+    l.selection.sort_unstable();
+    l.selection.dedup();
+    let (name, ds, selected) = (&l.name, &l.dataset, !l.selection.is_empty());
+    let total = ds.features.len();
+    if total == 0 {
+        return Err(format!("{name} has no features to take reference points from"));
+    }
+    let resolved = l.resolve_rows(ds, Policy::SelectionAndQuery, None)?;
+    let filtered = resolved.query_error.is_none() && l.definition_query.as_deref().is_some_and(|q| !q.trim().is_empty());
+    let mut notes = Vec::new();
+    if let Some(e) = resolved.query_error {
+        notes.push(format!("{name}: its definition query can't be read, so it isn't applied: {e}"));
+    }
+    let (rows, taken): (Box<dyn Iterator<Item = usize>>, usize) = match resolved.rows {
+        Rows::All => (Box::new(0..total), total),
+        Rows::Subset(rows) if rows.is_empty() => {
+            let of = if selected { "selected feature" } else { "feature" };
+            return Err(format!("{name}: its definition query hides every {of}, so it has no reference points"));
+        }
+        Rows::Subset(rows) => {
+            let taken = rows.len();
+            (Box::new(rows.into_iter()), taken)
+        }
+    };
+    if taken < total {
+        let how = match (selected, filtered) {
+            (true, true) => "its selection, within its definition query",
+            (true, false) => "its selection",
+            (false, _) => "its definition query",
+        };
+        let of = if ds.windowed { "features read for the view" } else { "features" };
+        notes.push(format!("{name}: reference points taken from {taken} of its {total} {of} ({how})"));
+    }
+    let to = ds.lonlat_conversion().map_err(|e| format!("{name}: {e}"))?;
+    let (mut points, mut used) = (Vec::new(), 0usize);
+    let (mut without, mut others, mut unplaced) = (0usize, 0usize, 0usize);
+    for (k, row) in rows.enumerate() {
+        if k.is_multiple_of(4096) {
+            rustgis_data::progress::check().map_err(|e| e.to_string())?;
+        }
+        let coords: &[_] = match ds.features.geometry(row) {
+            Some(Geometry::Point(c)) => std::slice::from_ref(c),
+            Some(Geometry::MultiPoint(c)) => c,
+            Some(_) => {
+                others += 1;
+                continue;
+            }
+            None => &[],
+        };
+        // An empty point's coordinates are missing (NaN).
+        if !coords.iter().any(|c| c.is_finite()) {
+            without += 1;
+            continue;
+        }
+        let before = points.len();
+        for c in coords {
+            match to.point(*c).filter(|c| (-180.0..=180.0).contains(&c.x) && (-90.0..=90.0).contains(&c.y)) {
+                Some(_) if points.len() == MAX_REFERENCE_POINTS => {
+                    let e = format!(
+                        "{name} has more than {MAX_REFERENCE_POINTS} points, the most that make a reference: select the ones to use"
+                    );
+                    return Err(with_notes(e, &notes));
+                }
+                Some(c) => points.push((c.x, c.y)),
+                None => unplaced += 1,
+            }
+        }
+        used += usize::from(points.len() > before);
+    }
+    let left_out = [
+        (without, "features without geometry"),
+        (others, "features that aren't points"),
+        (unplaced, "points that can't be given in longitude/latitude"),
+    ];
+    notes.extend(left_out.iter().filter(|(n, _)| *n > 0).map(|(n, what)| format!("{name}: {what}, left out of the reference: {n}")));
+    if points.is_empty() {
+        return Err(with_notes(format!("{name} has no reference points"), &notes));
+    }
+    let from = json!({"layer": name, "features": used, "selected": selected, "filtered": filtered});
+    Ok((points, Some(from), notes))
 }
 
 /// What `embeddings.similarity` reads of the session, and the work that reads the tile and
@@ -645,7 +814,7 @@ fn reference_points(p: &Value) -> Result<Vec<(f64, f64)>, String> {
 pub(crate) fn similarity_work(s: &Session, p: &Value) -> Result<super::workflows::Work, String> {
     let (d, area, cell, name) = analysis(s, p)?;
     let year = year(d, p)?;
-    let points = reference_points(p)?;
+    let points = reference_points(s, p)?;
     #[cfg(target_arch = "wasm32")]
     {
         let _ = (area, cell, name, year, points);
@@ -654,17 +823,26 @@ pub(crate) fn similarity_work(s: &Session, p: &Value) -> Result<super::workflows
     #[cfg(not(target_arch = "wasm32"))]
     Ok(Box::new(move || {
         rustgis_data::progress::check().map_err(|e| e.to_string())?;
-        let (files, place, mut notes) = tile_files(area, &[year])?;
+        // Before anything is asked of the network: a layer that can't be the reference is refused.
+        let (points, from, taken) = points()?;
+        let (files, place, searched) = tile_files(area, &[year])?;
+        let mut notes: Vec<Note> = searched.into_iter().map(Note::plain).collect();
         let file = files.first().ok_or("AlphaEarth has no file there")?;
         let w = read_window(file, area, cell)?;
         notes.extend(w.notes());
         let r = &w.raster;
-        let (reference, missed) = reference(r, &points)?;
+        // A reference with no embedding fails with what its layer said.
+        let (reference, missed) = reference(r, &points).map_err(|e| with_notes(e, &taken))?;
+        notes.extend(taken.into_iter().map(Note::plain));
         notes.extend(missed_points(missed, points.len()));
         let band = similarity_band(r, &reference)?;
         let name = name.unwrap_or_else(|| format!("AlphaEarth {year} similarity"));
         let raster = rustgis_analysis::rasterops::derive(r, &name, vec![band])?;
-        made_saying(raster, notes, json!({"year": year, "tile": place, "points": points.len() - missed}))
+        let mut answer = json!({"year": year, "tile": place, "points": points.len() - missed});
+        if let Some(from) = from {
+            answer["reference"] = from;
+        }
+        made_saying(raster, notes, answer)
     }))
 }
 
@@ -685,7 +863,8 @@ pub(crate) fn change_work(s: &Session, p: &Value) -> Result<super::workflows::Wo
     #[cfg(not(target_arch = "wasm32"))]
     Ok(Box::new(move || {
         rustgis_data::progress::check().map_err(|e| e.to_string())?;
-        let (files, place, mut notes) = tile_files(area, &[from, to])?;
+        let (files, place, searched) = tile_files(area, &[from, to])?;
+        let mut notes: Vec<Note> = searched.into_iter().map(Note::plain).collect();
         let (Some(a), Some(b)) = (files.first(), files.get(1)) else { return Err("AlphaEarth has no files there".into()) };
         let a = read_window(a, area, cell)?;
         let b = read_window(b, area, cell)?;
@@ -704,16 +883,16 @@ const IN_THE_BROWSER: &str = "AlphaEarth's similarity and change are worked out 
 /// The made raster, kept as a GeoTIFF, with what to say of it once it is added (by its name on
 /// the map) and what the command answers besides.
 #[cfg(not(target_arch = "wasm32"))]
-fn made_saying(r: rustgis_data::raster::Raster, notes: Vec<String>, extra: Value) -> Result<super::workflows::Made, String> {
+fn made_saying(r: rustgis_data::raster::Raster, notes: Vec<Note>, extra: Value) -> Result<super::workflows::Made, String> {
     let bytes = raster::geotiff::write_all(&r).map_err(|e| e.to_string())?;
     let name = r.name.clone();
-    let layer = RasterLayer::from_bytes(r, format!("{name}.tif"), bytes);
+    let layer = RasterLayer::from_written(r, format!("{name}.tif"), bytes);
     let said = name.clone();
     let then: super::workflows::Then = Box::new(move |s: &mut Session, v: &mut Value| {
         let id = v.get("layer").and_then(Value::as_u64).and_then(|i| u32::try_from(i).ok());
         let added = id.and_then(|id| s.map().layer(id)).map_or(said, |l| l.name.clone());
         for note in notes {
-            s.notify(format!("{added}: {note}"), false);
+            s.say(note.prefixed(&added));
         }
     });
     Ok(super::workflows::made_layer(name, layer, Some(extra), Some(then)))
@@ -744,7 +923,10 @@ fn pick_tile(found: &emb::SeriesFound, years: &[i32]) -> Result<(Vec<String>, St
             ),
         };
         // A part of the index read: the tile may be in the rest of it.
-        if found.complete { none } else { format!("{none}, in the part of the index that was read: take a smaller box to read it whole") }
+        let none =
+            if found.complete { none } else { format!("{none}, in the part of the index that was read: take a smaller box to read it whole") };
+        // Or in a row left out.
+        emb::unusable_note(found.unusable, found.complete).map_or_else(|| none.clone(), |n| format!("{none} ({n})"))
     })?;
     let files: Vec<String> = years.iter().filter_map(|y| tile.years.get(y).cloned()).collect();
     let place = files.first().and_then(|u| emb::aef_place(u)).unwrap_or_else(|| tile.tile.title.clone());
@@ -764,6 +946,7 @@ fn pick_tile(found: &emb::SeriesFound, years: &[i32]) -> Result<(Vec<String>, St
     if found.duplicates > 0 {
         notes.push(format!("{} tile-years had a second file in AlphaEarth's index; the first was taken", found.duplicates));
     }
+    notes.extend(emb::unusable_note(found.unusable, found.complete));
     if kept + dropped > 1 {
         notes.push(format!(
             "the area meets {} AlphaEarth tiles: one is read ({place}), the nearest its centre with files for {listed}; a box within one tile is read whole",
@@ -777,26 +960,36 @@ fn pick_tile(found: &emb::SeriesFound, years: &[i32]) -> Result<(Vec<String>, St
 /// are on one grid, so the second's says the same; anything it adds is said too, by its year),
 /// and what each file's header left out, by year: once, for both, when both left it out.
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn two_years_notes(a: &super::layer::WindowRaster, b: &super::layer::WindowRaster, (from, to): (i32, i32)) -> Vec<String> {
-    let mut notes = a.read_notes();
+pub(crate) fn two_years_notes(a: &super::layer::WindowRaster, b: &super::layer::WindowRaster, (from, to): (i32, i32)) -> Vec<Note> {
+    let mut notes: Vec<Note> = a.read_notes().into_iter().map(Note::plain).collect();
     for n in b.read_notes() {
-        if !notes.contains(&n) {
-            notes.push(format!("the {to} file: {n}"));
+        if !notes.iter().any(|known| known.text == n) {
+            notes.push(Note::plain(format!("the {to} file: {n}")));
         }
     }
-    for l in &a.raster.lost {
-        let both = b.raster.lost.contains(l);
-        notes.push(if both { format!("the {from} and {to} files: {l}") } else { format!("the {from} file: {l}") });
+    for l in a.raster.lost.iter() {
+        let both = b.raster.lost.says(&l.text);
+        notes.push(if both {
+            l.clone().prefixed(&format!("the {from} and {to} files"))
+        } else {
+            l.clone().prefixed(&format!("the {from} file"))
+        });
     }
-    notes.extend(b.raster.lost.iter().filter(|l| !a.raster.lost.contains(l)).map(|l| format!("the {to} file: {l}")));
+    notes.extend(b.raster.lost.iter().filter(|l| !a.raster.lost.says(&l.text)).map(|l| l.clone().prefixed(&format!("the {to} file"))));
     notes
 }
 
-/// What a similarity says of its reference points that have no embedding in the area read.
+/// What a similarity says of its reference points that have no embedding in the area read: left
+/// out of the reference, so a loss.
 #[cfg(not(target_arch = "wasm32"))]
-fn missed_points(missed: usize, of: usize) -> Option<String> {
+fn missed_points(missed: usize, of: usize) -> Option<Note> {
     (missed > 0).then(|| {
-        format!("{missed} of the {of} reference points have no embedding in the area read (outside it, or no data there) and were left out")
+        Note::loss(
+            LossCode::DroppedFeature,
+            format!(
+                "{missed} of the {of} reference points have no embedding in the area read (outside it, or no data there) and were left out"
+            ),
+        )
     })
 }
 
@@ -808,10 +1001,12 @@ fn read_window(url: &str, area: [f64; 4], cell: Option<f64>) -> Result<super::la
     use std::sync::atomic::{AtomicBool, Ordering};
     let asked = super::layer::WindowAsked::of(url, area, cell, AEF_BANDS);
     let stop = AtomicBool::new(false);
+    // The reader carries the request context on (a plugin's command reaches only the internet).
+    let still = crate::render::rustgis_tiles::cache::current_still();
     let w = std::thread::scope(|scope| {
-        let reader = std::thread::Builder::new()
-            .name("AlphaEarth window".into())
-            .spawn_scoped(scope, || super::layer::read_window_raster(&asked, &stop));
+        let reader = std::thread::Builder::new().name("AlphaEarth window".into()).spawn_scoped(scope, || {
+            crate::render::rustgis_tiles::cache::with_optional_still(still, || super::layer::read_window_raster(&asked, &stop))
+        });
         let Ok(reader) = reader else { return super::layer::read_window_raster(&asked, &stop) };
         while !reader.is_finished() {
             if rustgis_data::progress::check().is_err() {
@@ -819,7 +1014,7 @@ fn read_window(url: &str, area: [f64; 4], cell: Option<f64>) -> Result<super::la
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        reader.join().unwrap_or_else(|_| Err(format!("{url}: the read failed unexpectedly")))
+        reader.join().unwrap_or_else(|payload| Err(crate::bug(&format!("{url}: the read"), payload.as_ref())))
     })?;
     rustgis_data::progress::check().map_err(|e| e.to_string())?;
     Ok(w)
@@ -1042,6 +1237,46 @@ mod tests {
         let whole = json!([{"years": {"2024": file(2024, "7-8"), "2025": file(2025, "7-8")}}]);
         v.run("embeddings.addCube", &json!({"dataset": "alphaearth", "start": 2024, "found": whole, "complete": false})).unwrap();
         assert!(v.notices.iter().any(|n| n.text.contains("more tiles than one search reads")), "a part read is said");
+        // Rows the search left out, as they can't be read, one of which may be the file: said, with a
+        // missing year's notice that doesn't call it the index's gap, and in the error of no tiles.
+        let mut x = Session::new(Project::default());
+        let some = json!([{"years": {"2025": file(2025, "9-1")}}]);
+        let gap = |end: &str| format!("1 of the 2 tile-years have no file in {end}; in those years the tile shows nothing");
+        let dated = ", among the rows that can be read";
+        for (complete, end) in [
+            (true, format!("AlphaEarth's index{dated}")),
+            (false, format!("the part of AlphaEarth's index that was read{dated} (zoom in to read it whole)")),
+        ] {
+            let p = json!({"dataset": "alphaearth", "start": 2024, "found": some, "complete": complete, "unusable": 4});
+            x.run("embeddings.addCube", &p).unwrap();
+            let said: Vec<&str> = x.notices.iter().map(|n| n.text.as_str()).collect();
+            let note = if complete { "read: 4" } else { "read: 4 of those read" };
+            assert!(
+                said.iter().any(|n| n.ends_with(&format!("left out, as their date, address or footprint can't be {note}"))),
+                "{said:?}"
+            );
+            assert!(said.iter().any(|n| n.ends_with(&gap(&end))), "{said:?}");
+            x.notices.clear();
+        }
+        let out = json!([{"years": {"2025": file(2025, "9-2")}}, {"years": {"2016": file(2016, "9-3")}}]);
+        x.run("embeddings.addCube", &json!({"dataset": "alphaearth", "start": 2024, "found": out, "unusable": 4})).unwrap();
+        let out = format!("1 of the 2 tiles have no file in 2024–2025{dated} and were left out");
+        assert!(x.notices.iter().any(|n| n.text.ends_with(&out)), "{out}");
+        let none = json!([{"years": {"2016": file(2016, "9-1")}}]);
+        let empty = |x: &mut Session, unusable: u64| {
+            let p = json!({"dataset": "alphaearth", "start": 2024, "found": none, "unusable": unusable});
+            x.run("embeddings.addCube", &p).unwrap_err()
+        };
+        let e = empty(&mut x, 4);
+        assert!(
+            e.ends_with("(AlphaEarth: rows of AlphaEarth's index left out, as their date, address or footprint can't be read: 4)"),
+            "{e}"
+        );
+        assert_eq!(empty(&mut x, 0), "AlphaEarth has no tiles there for 2024–2025");
+        // So is a part of the index read.
+        let part = json!({"dataset": "alphaearth", "start": 2024, "found": none, "complete": false, "unusable": 4});
+        let e = x.run("embeddings.addCube", &part).unwrap_err();
+        assert!(e.contains(PART_READ) && e.ends_with("can't be read: 4 of those read)"), "{e}");
         // An hourly slider widened over the years would be more steps than it lists: refused,
         // the slider and the map as they were.
         let mut h = Session::new(Project::default());
@@ -1082,12 +1317,30 @@ mod tests {
     fn series_notes_say_what_a_search_left_out() {
         let whole = emb::SeriesFound { complete: true, ..Default::default() };
         assert!(series_notes(&whole).is_empty(), "a whole search says nothing");
-        let gaps = emb::SeriesFound { complete: false, dropped: 61, duplicates: 2, ..Default::default() };
+        let gaps = emb::SeriesFound { complete: false, dropped: 61, duplicates: 2, unusable: 4, ..Default::default() };
         let notes = series_notes(&gaps);
-        assert_eq!(notes.len(), 3, "{notes:?}");
+        assert_eq!(notes.len(), 4, "{notes:?}");
+        assert_eq!(
+            notes[3],
+            "AlphaEarth: rows of AlphaEarth's index left out, as their date, address or footprint can't be read: 4 of those read"
+        );
         assert!(notes.iter().any(|n| n == PART_READ), "{notes:?}");
         assert!(notes.iter().any(|n| n.contains("61 tiles past the 60 a search lists were left out")), "{notes:?}");
         assert!(notes.iter().any(|n| n.contains("2 tile-years had a second file in the index")), "{notes:?}");
+        // A search of one year says the rows left out too, and nothing when there were none.
+        let mut s = Session::new(Project::default());
+        let d = emb::dataset("alphaearth").unwrap();
+        search_notices(&mut s, d, &emb::Found { complete: true, ..Default::default() });
+        assert!(s.notices.is_empty());
+        search_notices(&mut s, d, &emb::Found { complete: true, unusable: 4, ..Default::default() });
+        assert!(
+            s.notices.len() == 1 && s.notices[0].text.ends_with("left out, as their date, address or footprint can't be read: 4"),
+            "{:?}",
+            s.notices[0].text
+        );
+        // So does the tile a similarity or a change picks, or fails to.
+        let e = pick_tile(&emb::SeriesFound { complete: true, unusable: 4, ..Default::default() }, &[2024]).unwrap_err();
+        assert!(e.starts_with("AlphaEarth has no tiles there (rows of AlphaEarth's index left out"), "{e}");
     }
 
     /// A plugin's command in the app (`leave_downloads`) doesn't read an AlphaEarth tile's header
@@ -1240,32 +1493,38 @@ mod tests {
             years: years.iter().map(|y| (*y, format!("https://x.org/{y}/23S/h{y}-{place}.tiff"))).collect(),
         };
         // One tile, the index read whole: nothing to say.
-        let one = emb::SeriesFound { series: vec![tile("0-0", &[2017, 2025])], dropped: 0, duplicates: 0, complete: true };
+        let one = emb::SeriesFound { series: vec![tile("0-0", &[2017, 2025])], dropped: 0, duplicates: 0, complete: true, unusable: 0 };
         let (files, place, notes) = pick_tile(&one, &[2017, 2025]).unwrap();
         assert_eq!(files, ["https://x.org/2017/23S/h2017-0-0.tiff", "https://x.org/2025/23S/h2025-0-0.tiff"]);
         assert_eq!((place.as_str(), notes.len()), ("23S 0-0", 0));
         // The nearest tile without 2017: the next one is read. Part of the index read, and three
         // tiles past a search's list: each said, the tiles counted with them.
-        let many =
-            emb::SeriesFound { series: vec![tile("0-0", &[2025]), tile("0-1", &[2017, 2025])], dropped: 3, duplicates: 2, complete: false };
+        let many = emb::SeriesFound {
+            series: vec![tile("0-0", &[2025]), tile("0-1", &[2017, 2025])],
+            dropped: 3,
+            duplicates: 2,
+            complete: false,
+            unusable: 4,
+        };
         let (files, place, notes) = pick_tile(&many, &[2017, 2025]).unwrap();
         assert_eq!((files.len(), place.as_str()), (2, "23S 0-1"));
-        assert_eq!(notes.len(), 4, "{notes:?}");
+        assert_eq!(notes.len(), 5, "{notes:?}");
         assert!(notes[0].contains("a tile nearer its centre may have been missed"), "{notes:?}");
         assert_eq!(notes[1], "3 AlphaEarth tiles past the 60 nearest the area's centre were left out, not looked at: take a smaller box");
         assert_eq!(notes[2], "2 tile-years had a second file in AlphaEarth's index; the first was taken");
-        assert!(notes[3].starts_with("the area meets 5 AlphaEarth tiles: one is read (23S 0-1)"), "{notes:?}");
+        assert_eq!(notes[3], "rows of AlphaEarth's index left out, as their date, address or footprint can't be read: 4 of those read");
+        assert!(notes[4].starts_with("the area meets 5 AlphaEarth tiles: one is read (23S 0-1)"), "{notes:?}");
         // No tile with the years: tiles left out are said, not taken for none there, and so is a
         // part of the index read.
         let e = pick_tile(&many, &[2018]).unwrap_err();
         assert!(e.contains("none of the 2 AlphaEarth tiles nearest the area's centre has files for 2018, and 3 more"), "{e}");
         assert!(
             e.ends_with(
-                "and 3 more were left out: take a smaller box, in the part of the index that was read: take a smaller box to read it whole"
+                "and 3 more were left out: take a smaller box, in the part of the index that was read: take a smaller box to read it whole (rows of AlphaEarth's index left out, as their date, address or footprint can't be read: 4 of those read)"
             ),
             "{e}"
         );
-        let kept = emb::SeriesFound { dropped: 0, duplicates: 0, complete: true, ..many.clone() };
+        let kept = emb::SeriesFound { dropped: 0, duplicates: 0, complete: true, unusable: 0, ..many.clone() };
         assert_eq!(pick_tile(&kept, &[2018]).unwrap_err(), "AlphaEarth has no tile there with files for 2018");
         assert_eq!(
             pick_tile(&emb::SeriesFound { complete: true, ..emb::SeriesFound::default() }, &[2018]).unwrap_err(),
@@ -1274,24 +1533,196 @@ mod tests {
         // Reference points with no embedding: said with a count, nothing when all have one.
         assert_eq!(missed_points(0, 3), None);
         assert_eq!(
-            missed_points(1, 3).as_deref(),
-            Some("1 of the 3 reference points have no embedding in the area read (outside it, or no data there) and were left out")
+            missed_points(1, 3),
+            Some(Note::loss(
+                LossCode::DroppedFeature,
+                "1 of the 3 reference points have no embedding in the area read (outside it, or no data there) and were left out"
+            ))
         );
         // What the work says is said once its raster is added, under the layer's name; a raster
         // with nothing to say adds none.
         let mut s = Session::new(Project::default());
         let r = quantised([[1.0; 3]; 4]);
-        let made = |name: &str, notes: Vec<String>| {
+        let made = |name: &str, notes: Vec<Note>| {
             let raster = rustgis_analysis::rasterops::derive(&r, name, vec![vec![0.5; 4]]).unwrap();
             made_saying(raster, notes, json!({"year": 2024})).unwrap()
         };
         let mark = s.notice_mark();
-        let v = super::super::workflows::add_made(&mut s, made("Sim", notes.clone())).unwrap();
+        let mut with_loss: Vec<Note> = notes.iter().map(Note::from).collect();
+        with_loss.extend(missed_points(2, 5));
+        let v = super::super::workflows::add_made(&mut s, made("Sim", with_loss)).unwrap();
         assert_eq!(v["year"], 2024);
         let said: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
-        assert_eq!(said.iter().filter(|n| n.starts_with("Sim: ")).count(), 4, "{said:?}");
+        assert_eq!(said.iter().filter(|n| n.starts_with("Sim: ")).count(), 6, "{said:?}");
+        // The loss keeps its code under the layer's name; the others are ordinary notices.
+        let coded: Vec<_> = s.notices_since(mark).iter().filter_map(|n| n.loss().map(|c| (c, n.text.clone()))).collect();
+        assert_eq!(coded.len(), 1, "{coded:?}");
+        assert!(coded[0].0 == LossCode::DroppedFeature && coded[0].1.starts_with("Sim: 2 of the 5 reference points"), "{coded:?}");
         let mark = s.notice_mark();
         super::super::workflows::add_made(&mut s, made("Clean", Vec::new())).unwrap();
         assert!(!s.notices_since(mark).iter().any(|n| n.text.starts_with("Clean: ")));
+    }
+
+    /// A session whose only layer is `Samples`: a field `n` from 1, and a feature a geometry.
+    fn samples(geometries: Vec<Option<Geometry>>) -> Session {
+        use rustgis_data::{Dataset, Field, FieldType, Value as Cell};
+        let mut ds = Dataset::new("Samples", GeometryType::Point, vec![Field::new("n", FieldType::Integer)]);
+        for (i, g) in geometries.into_iter().enumerate() {
+            ds.push(g, vec![Cell::Int(i as i64 + 1)]);
+        }
+        let mut s = Session::new(Project::default());
+        s.map_mut().add_dataset(ds);
+        s
+    }
+
+    fn at(lon: f64, lat: f64) -> Option<Geometry> {
+        Some(Geometry::Point(rustgis_geom::Coord::new(lon, lat)))
+    }
+
+    fn taken(s: &Session) -> Result<Taken, String> {
+        reference_points(s, &json!({"points": "Samples"}))?()
+    }
+
+    #[test]
+    fn a_point_layers_reference_is_its_points_lists() {
+        use rustgis_data::raster::Crs;
+        let list = json!([[10.5, 45.5], [11.5, 44.5], [10.5, 44.5]]);
+        let (given, from, notes) = reference_points(&Session::new(Project::default()), &json!({"points": list})).unwrap()().unwrap();
+        assert_eq!((from, notes.len()), (None, 0));
+        let multi = Geometry::MultiPoint(vec![rustgis_geom::Coord::new(11.5, 44.5), rustgis_geom::Coord::new(10.5, 44.5)]);
+        // In longitude/latitude, and in a projected system (UTM 32N): a point and a multipoint.
+        for crs in [Crs::LonLat, Crs::Epsg(32632)] {
+            let mut s = samples(vec![at(10.5, 45.5), Some(multi.clone())]);
+            let l = s.map_mut().layers.first_mut().unwrap();
+            l.dataset.hold_in(crs).unwrap();
+            let id = l.id;
+            for points in [json!("Samples"), json!(id), json!(id.to_string())] {
+                let (points, from, notes) = reference_points(&s, &json!({"points": points})).unwrap()().unwrap();
+                assert!(points.iter().zip(&given).all(|(a, b)| (a.0 - b.0).abs() < 1e-8 && (a.1 - b.1).abs() < 1e-8), "{points:?}");
+                assert_eq!(points.len(), given.len());
+                assert_eq!(from, Some(json!({"layer": "Samples", "features": 2, "selected": false, "filtered": false})));
+                // Every feature taken: nothing to say.
+                assert!(notes.is_empty(), "{notes:?}");
+                let r = quantised([[100.0, -50.0, 20.0], [1.0, 2.0, 3.0], [9.0, -128.0, 1.0], [30.0, 60.0, -90.0]]);
+                assert_eq!(reference(&r, &points).unwrap(), reference(&r, &given).unwrap());
+            }
+            // The layer is what exact approval binds; a list binds none.
+            let bound = |p: Value| similarity_inputs(&super::super::InputSource::input_context(&s), &p).unwrap();
+            assert_eq!(bound(json!({"points": "Samples"})).layers, [(s.map().instance_id(), id)]);
+            assert_eq!(bound(json!({"points": "Later"})).future_layers, ["Later"]);
+            assert!(bound(json!({"points": list})).layers.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_point_layers_selection_and_definition_query_are_its_reference() {
+        let mut s = samples(vec![at(10.1, 45.0), at(10.2, 45.0), at(10.3, 45.0), at(10.4, 45.0)]);
+        let mut with = |query: Option<&str>, selection: &[usize]| {
+            let l = s.map_mut().layers.first_mut().unwrap();
+            l.definition_query = query.map(String::from);
+            l.selection = selection.to_vec();
+            taken(&s).map(|(points, from, notes)| (points.iter().map(|p| p.0).collect::<Vec<_>>(), from.unwrap(), notes))
+        };
+        // A selection as it is clicked, a feature twice: each once.
+        let (lon, from, notes) = with(None, &[3, 1, 3]).unwrap();
+        assert_eq!(lon, [10.2, 10.4]);
+        assert_eq!(from, json!({"layer": "Samples", "features": 2, "selected": true, "filtered": false}));
+        assert_eq!(notes, ["Samples: reference points taken from 2 of its 4 features (its selection)"]);
+        let (lon, from, notes) = with(Some("n > 1"), &[]).unwrap();
+        assert_eq!(lon, [10.2, 10.3, 10.4]);
+        assert_eq!(from, json!({"layer": "Samples", "features": 3, "selected": false, "filtered": true}));
+        assert_eq!(notes, ["Samples: reference points taken from 3 of its 4 features (its definition query)"]);
+        let (lon, _, notes) = with(Some("n > 1"), &[0, 1]).unwrap();
+        assert_eq!(lon, [10.2]);
+        assert_eq!(notes, ["Samples: reference points taken from 1 of its 4 features (its selection, within its definition query)"]);
+        // A query that hides none leaves none out; one that hides all is refused.
+        assert!(with(Some("n > 0"), &[]).unwrap().2.is_empty());
+        assert_eq!(
+            with(Some("n > 9"), &[]).unwrap_err(),
+            "Samples: its definition query hides every feature, so it has no reference points"
+        );
+        assert!(with(Some("n > 1"), &[0]).unwrap_err().contains("hides every selected feature"));
+        // One that can't be read isn't applied, and is said.
+        let (lon, from, notes) = with(Some("n = = 1"), &[]).unwrap();
+        assert_eq!((lon.len(), from["filtered"].as_bool()), (4, Some(false)));
+        assert!(
+            notes.len() == 1 && notes[0].starts_with("Samples: its definition query can't be read, so it isn't applied: "),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn a_point_layer_says_what_its_reference_leaves_out() {
+        use rustgis_geom::Coord;
+        let nan = Coord::new(f64::NAN, f64::NAN);
+        let line = Geometry::Line(vec![vec![Coord::new(10.0, 45.0), Coord::new(10.1, 45.0)]]);
+        let s = samples(vec![
+            at(10.1, 45.0),
+            None,
+            Some(Geometry::Point(nan)),
+            Some(Geometry::MultiPoint(Vec::new())),
+            Some(line.clone()),
+            Some(Geometry::MultiPoint(vec![Coord::new(10.2, 45.0), Coord::new(200.0, 45.0), Coord::new(10.0, 95.0)])),
+        ]);
+        let (points, from, notes) = taken(&s).unwrap();
+        assert_eq!(points, [(10.1, 45.0), (10.2, 45.0)]);
+        assert_eq!(from.unwrap()["features"], 2);
+        assert_eq!(
+            notes,
+            [
+                "Samples: features without geometry, left out of the reference: 3",
+                "Samples: features that aren't points, left out of the reference: 1",
+                "Samples: points that can't be given in longitude/latitude, left out of the reference: 2",
+            ]
+        );
+        // All of them left out, an empty layer, and more points than a reference takes: refused.
+        let none = taken(&samples(vec![None, at(200.0, 45.0)])).unwrap_err();
+        assert_eq!(
+            none,
+            "Samples has no reference points (Samples: features without geometry, left out of the reference: 1; \
+             Samples: points that can't be given in longitude/latitude, left out of the reference: 1)"
+        );
+        assert_eq!(taken(&samples(Vec::new())).unwrap_err(), "Samples has no features to take reference points from");
+        let many = |n: usize| taken(&samples(vec![Some(Geometry::MultiPoint(vec![Coord::new(10.0, 45.0); n])), at(10.1, 45.0)]));
+        assert_eq!(many(MAX_REFERENCE_POINTS - 1).unwrap().0.len(), MAX_REFERENCE_POINTS);
+        assert_eq!(
+            many(MAX_REFERENCE_POINTS).unwrap_err(),
+            "Samples has more than 1000 points, the most that make a reference: select the ones to use"
+        );
+        // The refusal says what narrowed the layer, or failed to: a definition query that can't be read.
+        let mut s = samples(vec![Some(Geometry::MultiPoint(vec![Coord::new(10.0, 45.0); MAX_REFERENCE_POINTS + 1]))]);
+        s.map_mut().layers.first_mut().unwrap().definition_query = Some("n = = 1".into());
+        assert!(taken(&s).unwrap_err().contains("(Samples: its definition query can't be read, so it isn't applied: "));
+    }
+
+    #[test]
+    fn a_reference_layer_that_isnt_one_is_refused() {
+        let area = json!([10.0, 45.0, 10.1, 45.1]);
+        let mut s = samples(vec![at(10.05, 45.05)]);
+        let mut lines = rustgis_data::Dataset::new("Roads", GeometryType::Polyline, Vec::new());
+        lines.push(None, Vec::new());
+        s.map_mut().add_dataset(lines);
+        let grid = quantised([[1.0; 3]; 4]);
+        let raster = rustgis_analysis::rasterops::derive(&grid, "Grid", vec![vec![0.5; 4]]).unwrap();
+        super::super::workflows::add_made(&mut s, made_saying(raster, Vec::new(), json!({})).unwrap()).unwrap();
+        let mut refused = |points: Value| {
+            let before = s.map().layers.len();
+            let e = s.run("embeddings.similarity", &json!({"dataset": "alphaearth", "points": points, "bbox": area})).unwrap_err();
+            assert_eq!(s.map().layers.len(), before);
+            e
+        };
+        assert_eq!(refused(json!("Roads")), "Roads: points is a point layer, and it is a polyline layer");
+        assert_eq!(refused(json!("Grid")), "Grid: points is a point layer, and it is a raster layer");
+        assert_eq!(refused(json!("Nowhere")), "no layer named 'Nowhere'");
+        assert_eq!(refused(json!(99)), "no layer with id 99");
+        for other in [json!(true), json!({"layer": "Samples"})] {
+            assert!(refused(other).contains("or a point layer's name or id"));
+        }
+        // Read in place: only a selection is taken, as what it holds is the last view's features.
+        let l = s.map_mut().layers.iter_mut().find(|l| l.name == "Samples").unwrap();
+        l.source = Some(rustgis_map::source::SourceLayer::default());
+        assert!(taken(&s).unwrap_err().contains("load all its features first"));
+        s.map_mut().layers.iter_mut().find(|l| l.name == "Samples").unwrap().selection = vec![0];
+        assert_eq!(taken(&s).unwrap().0, [(10.05, 45.05)]);
     }
 }

@@ -3,7 +3,7 @@
 //! delimited text or spreadsheet read whole, a ZIP or CityJSON/CityGML model's layers, the opening
 //! of a large Shapefile or GeoJSON file read in place, #2446), Repair/Reload Data, Load All
 //! Features, Convert To Annotation's read of a layer read in place, native models or scripts, the
-//! Error Inspector's topology check (#1291), Source File State's hashing of a layer's file, Column Statistics' count of a column and Import QGIS Style's file and images. [`read_ahead`]
+//! Error Inspector's topology check (#1291), Source File State's hashing of a layer's file, Column Statistics' count of a column, Import QGIS Style's file and images, and Import QGIS Project's import on a copy of the session. [`read_ahead`]
 //! takes what the read needs of the session, [`ReadAhead::run`] reads on the thread, and [`read_land`]
 //! runs the admitted command under its initiating owner: the command takes
 //! it instead of reading again, so what it adds, says, logs and puts in Undo is the same as when
@@ -191,7 +191,10 @@ impl ReadAhead {
                 })
             })
         }))
-        .unwrap_or_else(|_| Err(format!("{name} failed unexpectedly")));
+        .unwrap_or_else(|payload| {
+            let incident = rustgis_data::incident::caught(payload.as_ref());
+            Err(rustgis_data::incident::message(name, false, &incident.id))
+        });
         res?;
         Ok(Read {
             op,
@@ -210,6 +213,41 @@ impl ReadAhead {
 /// keeps its original operation for synchronous landing.
 pub fn read_ahead(s: &mut Session, command: &str, p: &Value) -> Result<ReadAhead, String> {
     s.start_read(command, p)
+}
+
+/// An import of a QGIS project's first part, which the desktop app makes on a thread of its own
+/// before [`read_ahead_scanned`] (`control` stops it): its file read and parsed and the web
+/// addresses its layers name found, so that the window opens their logins and starts the import
+/// without reading the file. Its failure (a file that isn't a project, too large) is the import's.
+/// With `log_inputs` (the session's processing log on: `Session::log`), the files it reads (the
+/// project's, its markers' images) are kept for the import to log as its inputs.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn scan_import(
+    p: &Value,
+    control: &std::sync::Arc<rustgis_analysis::control::Control>,
+    log_inputs: bool,
+) -> Result<super::qgis::ImportScan, String> {
+    let mut scanned = Err(String::new());
+    let capture = log_inputs.then(rustgis_data::provenance::Capture::start);
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rustgis_analysis::run_under("Import QGIS Project", control, || {
+            scanned = super::qgis::scan(p);
+            Ok(())
+        })
+    }))
+    .unwrap_or_else(|payload| Err(crate::bug("Import QGIS Project", payload.as_ref())));
+    let inputs = capture.as_ref().map_or_else(Vec::new, rustgis_data::provenance::Capture::inputs);
+    res?;
+    scanned.map(|scan| scan.with_inputs(inputs))
+}
+
+/// [`read_ahead`] for `project.importQgis`, given the project [`scan_import`] read for `p`.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn read_ahead_scanned(s: &mut Session, p: &Value, scan: super::qgis::ImportScan) -> Result<ReadAhead, String> {
+    s.import_scanned = Some(scan);
+    let read = s.start_read("project.importQgis", p);
+    s.import_scanned = None;
+    read
 }
 
 /// The commands whose read the desktop app makes on a thread of its own before they land
@@ -237,6 +275,7 @@ pub(crate) const IN_BACKGROUND: &[(&str, &str)] = &[
     ("layer.sizeBy", "Size by Field"),
     ("offline.keepRows", "Keep Field Package Rows"),
     ("style.importQgis", "Import QGIS Style"),
+    ("project.importQgis", "Import QGIS Project"),
 ];
 
 /// What `command`'s read is called, when it is one the app makes before the command lands
@@ -331,6 +370,13 @@ pub(crate) fn prepare(s: &mut Session, op: Authorized<CommandOp>, owner: Continu
         "layer.sizeBy" => (super::layer::size_by_ahead(s, params), None),
         "offline.keepRows" => (super::field_changes::keep_ahead(s), None),
         "style.importQgis" => (super::qgis::style_ahead(s, params), None),
+        "project.importQgis" => {
+            #[cfg(not(target_arch = "wasm32"))]
+            let work = super::qgis::import_ahead(s, params, owner.native_tool_owner());
+            #[cfg(target_arch = "wasm32")]
+            let work = None;
+            (work, None)
+        }
         // Listed in IN_BACKGROUND without a read here.
         id => return Err(not_in_background(id)),
     };

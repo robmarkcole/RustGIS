@@ -19,10 +19,12 @@ use rustgis_data::source::{Batch, FeatureSource, Request, SourceInfo};
 use rustgis_geom::{Coord, Extent};
 use serde::{Deserialize, Serialize};
 
+mod drawn_index;
 #[cfg(test)]
 mod own_tests;
 mod render_lod;
 mod render_view;
+pub use drawn_index::{DrawnBoxes, PACKING_BYTES};
 pub use render_view::KEPT_VIEW_BYTES;
 mod window;
 pub(crate) use window::Query;
@@ -186,6 +188,9 @@ pub struct SourceLayer {
     /// The last view's rows and drawn geometry, shared by render snapshots ([`render_view`]).
     #[serde(skip)]
     render_view: Arc<Mutex<render_view::KeptView>>,
+    /// The features indexed by their boxes as drawn, shared by render snapshots ([`drawn_index`]).
+    #[serde(skip)]
+    render_drawn: Arc<Mutex<drawn_index::DrawnIndex>>,
     #[serde(skip)]
     pending: Option<Arc<Pending>>,
     /// Projection used for this disposable window's geometry cache.
@@ -221,6 +226,10 @@ pub struct SourceLayer {
     /// Why the source couldn't be opened or read.
     #[serde(skip)]
     pub error: Option<String>,
+    /// A header incompatible with the saved fields must not reach the direct renderer.
+    /// Unlike transient read/render errors, this needs schema reconciliation before retry.
+    #[serde(skip)]
+    pub(crate) schema_refused: bool,
     /// Last read failure reported by the session, independent of disposable render copies.
     #[serde(skip)]
     error_said: Option<String>,
@@ -866,6 +875,64 @@ pub enum Polled {
 }
 
 impl SourceLayer {
+    /// Whether saving this source serializes a [`rustgis_data::raster::Crs`] requiring `crs-wkt`.
+    /// Exhaustively destructured so any new `Crs`-bearing field forces an explicit decision.
+    pub fn needs_wkt(&self) -> bool {
+        let Self {
+            path: _,
+            file_name: _,
+            table: _,
+            shapefile_crs,
+            embedded: _,
+            handle: _,
+            conversion_info: _,
+            conversion_fallback: _,
+            conversion_notes_unsaid: _,
+            unread_dates: _,
+            rounded_dates: _,
+            unread_dates_said: _,
+            rounded_dates_said: _,
+            null_text: _,
+            null_text_said: _,
+            not_utf8: _,
+            not_utf8_in: _,
+            not_utf8_said: _,
+            read_notes: _,
+            read_note_kinds: _,
+            window: _,
+            render_lod: _,
+            render_view: _,
+            render_drawn: _,
+            pending: _,
+            projection: _,
+            ready_cache: _,
+            byte_budget: _,
+            estimated_row_bytes: _,
+            full_read: _,
+            saved_selection: _,
+            grids: _,
+            window_fields: _,
+            query: _,
+            opening: _,
+            error: _,
+            schema_refused: _,
+            error_said: _,
+            login: _,
+            reconnect_required: _,
+            limit: _,
+            reads: _,
+            display_read_said: _,
+            area_counts: _,
+            area_features: _,
+            gdal: _,
+            duckdb: _,
+            postgis: _,
+            mysql: _,
+            sqlserver: _,
+        } = self;
+        shapefile_crs.is_some_and(rustgis_data::raster::Crs::needs_wkt)
+    }
+
     /// Counts for the installed read, or `None` if its features have since been changed.
     pub fn unavailable_areas(&self, features: &rustgis_data::Features) -> Option<AmbiguousAreas> {
         self.area_features.as_ref().filter(|key| Weak::ptr_eq(key, &features.allocation_key())).map(|_| self.area_counts)
@@ -890,7 +957,7 @@ impl SourceLayer {
     /// What view reads found of values in date fields that weren't dates
     /// ([`rustgis_data::source::unread_dates_note`]) and of date-times rounded to the microsecond
     /// ([`rustgis_data::source::rounded_dates_note`]), once for the source.
-    pub fn take_unread_dates(&mut self) -> (Option<String>, Option<String>) {
+    pub fn take_unread_dates(&mut self) -> (Option<rustgis_data::loss::Note>, Option<rustgis_data::loss::Note>) {
         let Some(fields) = self.info().map(|i| i.fields.clone()) else { return (None, None) };
         let (unread, rounded) = (std::mem::take(&mut self.unread_dates).total(), std::mem::take(&mut self.rounded_dates).total());
         if unread.is_none() && rounded.is_none() {
@@ -914,7 +981,7 @@ impl SourceLayer {
 
     /// What view reads found of text values `<Null>` read as null
     /// ([`rustgis_data::source::null_text_note`]), once for the source.
-    pub fn take_null_text(&mut self) -> Option<String> {
+    pub fn take_null_text(&mut self) -> Option<rustgis_data::loss::Note> {
         let fields = self.info().map(|i| i.fields.clone())?;
         let counts = std::mem::take(&mut self.null_text).total()?;
         self.null_text_said = true;
@@ -937,7 +1004,7 @@ impl SourceLayer {
 
     /// What view reads found of text values that aren't UTF-8
     /// ([`rustgis_data::source::not_utf8_note`]), once for the source.
-    pub fn take_not_utf8(&mut self) -> Option<String> {
+    pub fn take_not_utf8(&mut self) -> Option<rustgis_data::loss::Note> {
         // Checked first: this runs every frame for each layer with a source, and most have nothing pending.
         if self.not_utf8.is_empty() {
             return None;
@@ -1044,6 +1111,7 @@ impl SourceLayer {
 
     /// Clears a recovered failure and its notice marker, even between notice passes.
     pub fn clear_error(&mut self) {
+        self.schema_refused = false;
         self.error = None;
         self.error_said = None;
     }
@@ -1061,6 +1129,7 @@ impl SourceLayer {
 
     /// Opens a replacement with fresh handles, windows, caches and selection.
     pub fn relinked(&self, path: &str, table: Option<&str>) -> Result<SourceLayer, String> {
+        use rustgis_data::loss::{Counted, Finder, Note, Tally};
         if self.embedded.is_some() || self.postgis.is_some() || self.mysql.is_some() || self.sqlserver.is_some() {
             return Err("the layer reads a database or data kept in the project: there's no file to repair".into());
         }
@@ -1112,14 +1181,22 @@ impl SourceLayer {
                     .map_err(|e| format!("{path}: {e}"))?;
                 let out = fresh.output;
                 if out.skipped > 0 {
-                    conversion_notes.push(format!("DuckDB: {} rows without a geometry were left out", out.skipped));
+                    // A row is a feature: one without geometry isn't added, and its values go with it.
+                    conversion_notes.push(Note::tallied(
+                        Some(rustgis_data::loss::LossCode::DroppedFeature),
+                        Tally::new(Finder::Duckdb, Counted::RowsWithoutGeometry, Some(out.skipped)),
+                    ));
                 }
                 if out.other_family > 0 {
-                    conversion_notes.push(format!("DuckDB: {} rows of another geometry type were left out", out.other_family));
+                    conversion_notes
+                        .push(Note::tallied(None, Tally::new(Finder::Duckdb, Counted::OtherGeometryType, Some(out.other_family))));
                 }
                 let part = out.parts.first().ok_or_else(|| format!("{path}: the table returns no {}", d.family.label()))?;
                 if part.zm_dropped > 0 {
-                    conversion_notes.push(rustgis_data::zm_note(Some(part.zm_dropped)));
+                    conversion_notes.push(
+                        Note::loss(rustgis_data::loss::LossCode::DroppedZm, rustgis_data::zm_note(Some(part.zm_dropped)))
+                            .with_tally(Tally::new(Finder::Duckdb, Counted::ZmDropped, Some(part.zm_dropped))),
+                    );
                 }
                 declared_empty = part.count == 0;
                 new.path = Some(part.path.display().to_string());
@@ -1176,7 +1253,8 @@ impl SourceLayer {
             )));
         }
         if probe.skipped > 0 {
-            conversion_notes.push(format!("{} rows could not be read while checking the replacement", probe.skipped));
+            // A probe of one feature: the reads that follow count these rows as they say them.
+            conversion_notes.push(Note::tallied(None, Tally::new(Finder::Rustgis, Counted::UnreadableRows, probe.skipped.try_into().ok())));
         }
         if let Some(info) = new.info() {
             let mut info = info.clone();
@@ -1208,6 +1286,18 @@ impl SourceLayer {
         self.handle.as_ref().map_or(rustgis_data::raster::Crs::LonLat, |h| h.coord_crs())
     }
 
+    /// A numeric field's range across the whole source, when it states one ([`FeatureSource::field_range`]);
+    /// `None` while the source isn't open (before a project's reopen finishes, say).
+    pub fn field_range(&self, field: &str) -> Option<(f64, f64)> {
+        self.handle.as_ref()?.field_range(field)
+    }
+
+    /// Its source's number of features, when known exactly: a database's can be an estimate.
+    pub fn exact_count(&self) -> Option<u64> {
+        let database = self.postgis.is_some() || self.mysql.is_some() || self.sqlserver.is_some();
+        self.info().filter(|_| !database)?.count
+    }
+
     /// Whether its source tests its features against a box in its own system
     /// ([`FeatureSource::reads_own_box`]); no until it is open.
     pub fn reads_own_box(&self) -> bool {
@@ -1224,9 +1314,10 @@ impl SourceLayer {
         self.handle.as_ref().filter(|h| h.visits_extent_chunks()).cloned()
     }
 
-    /// A source capable of a complete, ordered render traversal.
+    /// A source capable of a complete, ordered render traversal. An incompatible schema must
+    /// not bypass its refusal. Other read/render errors retain the handle for recovery/retry.
     pub fn chunk_source(&self) -> Option<Arc<dyn FeatureSource>> {
-        self.handle.as_ref().filter(|h| h.streams_chunks()).cloned()
+        self.handle.as_ref().filter(|h| !self.schema_refused && h.streams_chunks()).cloned()
     }
 
     /// Reuses a complete source's thinning decision for a projection and LOD level. Both
@@ -1271,9 +1362,80 @@ impl SourceLayer {
         self.render_view.lock().unwrap_or_else(std::sync::PoisonError::into_inner).put(handle, key, read, res, chunks);
     }
 
-    /// Lets the kept view go when it holds more than `room` bytes.
+    /// Lets the drawn-box index, then the kept view, go when they hold more than `room` bytes
+    /// between them.
     pub fn trim_kept_view(&self, room: usize) {
-        self.render_view.lock().unwrap_or_else(std::sync::PoisonError::into_inner).trim(room);
+        let mut drawn = self.render_drawn.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        drawn.trim(room);
+        let left = room.saturating_sub(drawn.bytes());
+        drop(drawn);
+        self.render_view.lock().unwrap_or_else(std::sync::PoisonError::into_inner).trim(left);
+    }
+
+    /// The source's features indexed by their boxes as drawn for `key` (the projection and datum
+    /// grids, as the renderer names them), when a frame that read them all made one (#2788).
+    pub fn drawn_index(&self, key: &str) -> Option<Arc<DrawnBoxes>> {
+        let handle = self.handle.as_ref()?;
+        self.render_drawn.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(handle, key)
+    }
+
+    /// Whether a frame reading every feature for `key` should gather their drawn boxes to make
+    /// an index: not when one is kept, or was too large to keep.
+    pub fn drawn_index_wanted(&self, key: &str, share: usize) -> bool {
+        let Some(handle) = &self.handle else { return false };
+        self.render_drawn.lock().unwrap_or_else(std::sync::PoisonError::into_inner).wanted(handle, key, share)
+    }
+
+    /// Packs the boxes as drawn (feature id, box) a frame gathered for `key` from a read of every
+    /// feature into an index, off that frame: on a worker on the desktop, as the packing takes
+    /// seconds for millions of features. It is kept when it fits `share` bytes (the source's share
+    /// of the map's view memory beside its interaction rows), the kept view then trimmed to what
+    /// is left; otherwise none is gathered again for `key`. Nothing is packed when an index is
+    /// kept or being packed for `key`; one whose worker can't start is gathered again.
+    pub fn index_drawn_boxes(&self, key: &str, boxes: Vec<(u32, [f32; 4])>, share: usize) {
+        let Some(handle) = self.handle.as_ref() else { return };
+        let lock =
+            |m: &Mutex<drawn_index::DrawnIndex>| m.lock().unwrap_or_else(std::sync::PoisonError::into_inner).begin(handle, key, share);
+        let Some(ticket) = lock(&self.render_drawn) else { return };
+        let (drawn, view) = (Arc::clone(&self.render_drawn), Arc::clone(&self.render_view));
+        let slot = Arc::clone(&drawn);
+        let pack = move || {
+            // Given up once this packing is no longer the one the slot waits for.
+            let replaced = || slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).building_ticket() != Some(ticket);
+            let index = DrawnBoxes::new(boxes, replaced);
+            // The kept view is trimmed to the room the index leaves only when the index is kept.
+            let left = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).finish(ticket, index, share);
+            if let Some(left) = left {
+                view.lock().unwrap_or_else(std::sync::PoisonError::into_inner).trim(left);
+            }
+        };
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = &drawn;
+            pack();
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if std::thread::Builder::new().name("rustgis-drawn-index".into()).spawn(pack).is_err() {
+            drawn.lock().unwrap_or_else(std::sync::PoisonError::into_inner).finish(ticket, None, share);
+        }
+    }
+
+    /// Keeps no index for `key`: its boxes, `need` bytes, were too large to gather; they are
+    /// gathered again once the source's share has that much room.
+    pub fn refuse_drawn_index(&self, key: &str, need: usize) {
+        let Some(handle) = &self.handle else { return };
+        self.render_drawn.lock().unwrap_or_else(std::sync::PoisonError::into_inner).refuse(handle, key, need);
+    }
+
+    /// Whether an index is being packed for `key` ([`SourceLayer::index_drawn_boxes`]).
+    pub fn drawn_index_building(&self, key: &str) -> bool {
+        let Some(handle) = &self.handle else { return false };
+        self.render_drawn.lock().unwrap_or_else(std::sync::PoisonError::into_inner).building(handle, key)
+    }
+
+    /// The memory the drawn-box index holds.
+    pub fn drawn_index_bytes(&self) -> usize {
+        self.render_drawn.lock().unwrap_or_else(std::sync::PoisonError::into_inner).bytes()
     }
 
     /// Puts the kept chunks drawn again, with the geometry drawing made of them, in place of
@@ -1539,8 +1701,10 @@ impl SourceLayer {
             let _progress = rustgis_data::progress::install(progress.map(|p| p as Arc<dyn rustgis_data::progress::Probe>));
             let result = rustgis_data::source::remote::with_optional_still(still, || {
                 rustgis_data::progress::check()?;
-                let source = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
-                    .unwrap_or_else(|_| Err(rustgis_data::DataError::Format("opening the layer failed unexpectedly".into())))?;
+                let source = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).unwrap_or_else(|payload| {
+                    let incident = rustgis_data::incident::caught(payload.as_ref());
+                    Err(rustgis_data::DataError::Format(rustgis_data::incident::message("Opening the layer", false, &incident.id)))
+                })?;
                 rustgis_data::progress::check()?;
                 Ok(Arc::from(source))
             });
@@ -1741,12 +1905,22 @@ impl SourceLayer {
     /// Every feature of the source, up to the read limit (a source by its web address fetching
     /// what that needs, on the desktop).
     pub fn read_all(&self) -> Result<(rustgis_data::Dataset, rustgis_data::ReadReport), String> {
+        self.read_all_within(None)
+    }
+
+    /// [`SourceLayer::read_all`], within `limit` when given: the most bytes of features, and the
+    /// error past them ([`rustgis_data::source::materialize_up_to`]).
+    pub(crate) fn read_all_within(&self, limit: Option<(u64, &str)>) -> Result<(rustgis_data::Dataset, rustgis_data::ReadReport), String> {
         let h = self.handle.clone().ok_or("the layer's source isn't open")?;
+        let read = |source: &dyn FeatureSource| match limit {
+            Some((budget, refusal)) => rustgis_data::source::materialize_up_to(source, budget, refusal),
+            None => rustgis_data::source::materialize(source),
+        };
         #[cfg(not(target_arch = "wasm32"))]
         if h.remote().is_some() {
-            return rustgis_data::source::materialize(&rustgis_data::source::Fetching(h)).map_err(|e| e.to_string());
+            return read(&rustgis_data::source::Fetching(h)).map_err(|e| e.to_string());
         }
-        let r = rustgis_data::source::materialize(h.as_ref()).map_err(|e| e.to_string());
+        let r = read(h.as_ref()).map_err(|e| e.to_string());
         match r {
             Err(e) if e.contains(rustgis_data::source::remote::NEED) => {
                 Err("the web app reads a file by its address a view at a time: download it to load it whole".into())
@@ -1815,6 +1989,7 @@ impl SourceLayer {
         self.pending = None;
         self.render_lod = Default::default();
         self.render_view = Default::default();
+        self.render_drawn = Default::default();
     }
 
     /// Whether `other` (a copy of this one) reads the same source the same way: the same file and
@@ -1839,6 +2014,7 @@ impl SourceLayer {
     pub fn reset(&mut self) {
         self.render_lod = Default::default();
         self.render_view = Default::default();
+        self.render_drawn = Default::default();
         self.reset_window();
     }
 
@@ -1972,7 +2148,10 @@ impl SourceLayer {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     window::read_mode(h2.as_ref(), &req, budget, &projection, estimate, full_read, fields, query.as_ref())
                 }))
-                .unwrap_or_else(|_| Err(rustgis_data::DataError::Format("the read failed unexpectedly".into())))
+                .unwrap_or_else(|payload| {
+                    let incident = rustgis_data::incident::caught(payload.as_ref());
+                    Err(rustgis_data::DataError::Format(rustgis_data::incident::message("The read", false, &incident.id)))
+                })
             });
             rustgis_data::source::remote::drive(
                 file,
@@ -1995,7 +2174,10 @@ impl SourceLayer {
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             window::read_mode(h.as_ref(), &req, budget, &projection, estimate, full_read, fields, query.as_ref())
                         }))
-                        .unwrap_or_else(|_| Err(rustgis_data::DataError::Format("the read failed unexpectedly".into())))
+                        .unwrap_or_else(|payload| {
+                            let incident = rustgis_data::incident::caught(payload.as_ref());
+                            Err(rustgis_data::DataError::Format(rustgis_data::incident::message("The read", false, &incident.id)))
+                        })
                         .map_err(|e| e.to_string())
                     })
                     .and_then(|r| rustgis_data::source::remote::check_still(&still).map(|()| r));
@@ -2195,6 +2377,7 @@ impl SourceLayer {
             window: _,
             render_lod: _,
             render_view: _,
+            render_drawn: _,
             pending: _,
             projection: _,
             ready_cache: _,
@@ -2207,6 +2390,7 @@ impl SourceLayer {
             query: _,
             opening: _,
             error: _,
+            schema_refused: _,
             error_said: _,
             login: _,
             reconnect_required: _,

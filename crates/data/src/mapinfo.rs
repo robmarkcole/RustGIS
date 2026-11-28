@@ -241,7 +241,8 @@ pub fn read(mif: &str, mid: Option<&str>, name: &str) -> Result<(Dataset, ReadRe
                     .unwrap_or(w.len());
                 match coordsys(w.get(i + 1..end).unwrap_or_default()) {
                     Ok(c) => crs = c,
-                    Err(e) => report.messages.push(e),
+                    // Its coordinates are kept as they are: a system assumed.
+                    Err(e) => report.messages.push(crate::loss::Note::loss(crate::loss::LossCode::AssumedCrs, e)),
                 }
                 i = end;
             }
@@ -378,38 +379,49 @@ pub fn read(mif: &str, mid: Option<&str>, name: &str) -> Result<(Dataset, ReadRe
             }
         }
     }
-    for (count, one, many) in [
-        (arcs, "MapInfo arc object was kept as a row without geometry", "MapInfo arc objects were kept as rows without geometry"),
+    use crate::loss::LossCode::{DroppedGeometry, DroppedRing};
+    for (count, one, many, code) in [
+        (
+            arcs,
+            "MapInfo arc object was kept as a row without geometry",
+            "MapInfo arc objects were kept as rows without geometry",
+            DroppedGeometry,
+        ),
         (
             texts,
             "MapInfo text object was kept as a row without its position or text",
             "MapInfo text objects were kept as rows without their position or text",
+            DroppedGeometry,
         ),
         (
             short_parts,
             "MapInfo line part with fewer than two coordinates was omitted",
             "MapInfo line parts with fewer than two coordinates were omitted",
+            DroppedGeometry,
         ),
         (
             short_rings,
             "MapInfo polygon ring with fewer than four coordinates after closure was omitted",
             "MapInfo polygon rings with fewer than four coordinates after closure were omitted",
+            DroppedRing,
         ),
     ] {
         if count > 0 {
             let subject = if count == 1 { one } else { many };
-            report.messages.push(format!("{count} {subject}"));
+            report.messages.push(crate::loss::Note::loss(code, format!("{count} {subject}")));
         }
     }
     if empty_objects > 0 {
         let subject = if empty_objects == 1 { "object was kept as a row" } else { "objects were kept as rows" };
         let possessive = if empty_objects == 1 { "its" } else { "their" };
-        report
-            .messages
-            .push(format!("{empty_objects} MapInfo {subject} without geometry because all {possessive} parts or rings were too short"));
+        report.messages.push(crate::loss::Note::loss(
+            DroppedGeometry,
+            format!("{empty_objects} MapInfo {subject} without geometry because all {possessive} parts or rings were too short"),
+        ));
     }
+    // The objects after one that can't be read are left out.
     if let Some(e) = error {
-        report.messages.push(e);
+        report.messages.push(crate::loss::Note::loss(crate::loss::LossCode::DroppedFeature, e));
     }
     if !columns.is_empty() && mid.is_none() {
         report.messages.push("no .mid file next to the .mif: the attributes are empty");
@@ -435,7 +447,10 @@ pub fn read(mif: &str, mid: Option<&str>, name: &str) -> Result<(Dataset, ReadRe
         Some(c) => match c.transformer() {
             Ok(t) => Some(t),
             Err(e) => {
-                report.messages.push(format!("the coordinate system: {e}; coordinates are kept as they are"));
+                report.messages.push(crate::loss::Note::loss(
+                    crate::loss::LossCode::AssumedCrs,
+                    format!("the coordinate system: {e}; coordinates are kept as they are"),
+                ));
                 None
             }
         },
@@ -444,17 +459,18 @@ pub fn read(mif: &str, mid: Option<&str>, name: &str) -> Result<(Dataset, ReadRe
     if let (Some(_), Some(c)) = (&t, crs) {
         ds.held_in = c;
     }
-    let (mut lost, mut null_text) = (0usize, Vec::new());
+    let (mut lost, mut placed, mut beyond, mut null_text) = (0usize, 0usize, 0usize, Vec::new());
     for (k, g) in geoms.into_iter().enumerate() {
-        // Kept as the file holds it when it has a place in longitude/latitude.
-        let g = match (&t, g) {
-            (Some(t), Some(g)) => {
-                let ok = crate::io::places_in_lonlat(&g, t);
-                lost += usize::from(!ok);
-                ok.then_some(g)
+        // Kept as the file holds it; counted when it has no place in longitude/latitude.
+        if let (Some(t), Some(g)) = (&t, &g) {
+            match crate::io::places_lonlat_extent(g, t) {
+                Some(e) => {
+                    placed += 1;
+                    beyond += usize::from(e.beyond_lonlat());
+                }
+                None => lost += 1,
             }
-            (_, g) => g,
-        };
+        }
         let row = rows.get(k);
         let attrs = ds
             .fields
@@ -470,8 +486,9 @@ pub fn read(mif: &str, mid: Option<&str>, name: &str) -> Result<(Dataset, ReadRe
             .collect();
         ds.push_next(g, attrs);
     }
-    if lost > 0 {
-        report.messages.push(format!("{lost} objects couldn't be converted to longitude/latitude"));
+    if let (Some(_), Some(c)) = (&t, crs) {
+        report.messages.extend(crate::io::kept_unplaced_note("objects", lost, placed == 0, c));
+        report.messages.extend(crate::io::beyond_lonlat_note("objects", beyond, c));
     }
     report.messages.extend(crate::source::null_text_note(&ds.fields, &null_text));
     ds.geometry_type = crate::io::dominant_type(&ds);
@@ -525,17 +542,29 @@ mod tests {
             assert_eq!(ds.features[1].geometry, Some(Geometry::Point(Coord::new(9.0, 9.0))));
             assert_eq!(ds.features[1].attrs, vec![Value::Int(8)]);
             assert_eq!(report.skipped, 0);
-            assert_eq!(report.messages, [message]);
+            assert_eq!(report.messages.texts().collect::<Vec<_>>(), [message]);
+            let code =
+                if message.contains("polygon ring") { crate::loss::LossCode::DroppedRing } else { crate::loss::LossCode::DroppedGeometry };
+            assert_eq!(report.messages[0].loss, Some(code), "{message}");
             let mif = format!("Columns 1\nid Integer\nData\n{object}\n{object}\n");
             let (twice, report) = read(&mif, Some("7\n8\n"), "twice").unwrap();
             assert_eq!(twice.features.len(), 2);
             assert_eq!(twice.features[0].geometry, geometry);
             assert_eq!(twice.features[1].geometry, geometry);
-            assert_eq!(report.messages, [repeated_message]);
+            assert_eq!(report.messages.texts().collect::<Vec<_>>(), [repeated_message]);
         }
         let (_, clean) =
             read("Columns 1\nid Integer\nData\nPline 2 0 0 1 1\nRegion 1 3 0 0 4 0 4 4\nNone", Some("1\n2\n3"), "clean").unwrap();
         assert!(clean.messages.is_empty(), "{clean:?}");
+    }
+
+    /// An object that can't be read ends the read: the objects after it are left out, said as
+    /// dropped features.
+    #[test]
+    fn the_objects_after_one_that_cant_be_read_are_said_left_out() {
+        let (_, report) = read("Columns 1\nid Integer\nData\nPoint 0 0\nRegion x\nPoint 1 1\n", Some("1\n2\n3\n"), "cut").unwrap();
+        let note = report.messages.iter().find(|m| m.contains("the objects after it are left out")).unwrap();
+        assert_eq!(note.loss, Some(crate::loss::LossCode::DroppedFeature), "{:?}", report.messages);
     }
 
     /// A row stays aligned even when all of its short line parts or polygon rings disappear.
@@ -554,9 +583,10 @@ mod tests {
             assert_eq!(ds.features[1].attrs, [Value::Int(8)]);
             assert_eq!(report.skipped, 0);
             assert_eq!(
-                report.messages,
+                report.messages.texts().collect::<Vec<_>>(),
                 [part_note, "1 MapInfo object was kept as a row without geometry because all its parts or rings were too short",]
             );
+            assert_eq!(report.messages[1].loss, Some(crate::loss::LossCode::DroppedGeometry));
         }
     }
 
@@ -582,7 +612,8 @@ mod tests {
         assert_eq!(ds.value(0, 0), &Value::Text(" 2535 ".into()));
         assert_eq!(ds.value(0, 1), &Value::Int(7));
         assert_eq!(ds.value(1, 0), &Value::Null);
-        assert_eq!(report.messages, ["1 value written as Null was read as empty, in 'code'"]);
+        assert_eq!(report.messages.texts().collect::<Vec<_>>(), ["1 value written as Null was read as empty, in 'code'"]);
+        assert_eq!(report.messages[0].loss, Some(crate::loss::LossCode::AssumedNullMarker));
         let (_, clean) = read(mif, Some("\" 2535 \", 7 \n\"b\",8\n"), "t").unwrap();
         assert!(clean.messages.is_empty(), "no marker, no notice: {:?}", clean.messages);
     }
@@ -616,7 +647,7 @@ mod tests {
         assert!(matches!(&ds.features[3].geometry, Some(Geometry::Line(l)) if l.len() == 2));
         assert!(ds.features[4].geometry.is_none() && ds.features[5].geometry.is_none(), "text and none");
         assert!(matches!(&ds.features[6].geometry, Some(Geometry::Polygon(_))));
-        assert_eq!(rep.messages, ["1 MapInfo text object was kept as a row without its position or text"]);
+        assert_eq!(rep.messages.texts().collect::<Vec<_>>(), ["1 MapInfo text object was kept as a row without its position or text"]);
     }
 
     #[test]
@@ -653,7 +684,11 @@ mod tests {
         assert!(read("Version 300\nColumns 1\n x Integer\n", None, "x").is_err(), "no DATA");
         assert!(read("Version 300\nColumns 99999\nData\n", None, "x").is_err());
         let (_, rep) = read("CoordSys NonEarth Units \"m\" Bounds (0, 0) (10, 10)\nData\nPoint 1 1\n", None, "n").unwrap();
-        assert!(rep.messages.iter().any(|m| m.contains("non-earth")));
+        assert!(
+            rep.messages.iter().any(|m| m.contains("non-earth") && m.loss == Some(crate::loss::LossCode::AssumedCrs)),
+            "{:?}",
+            rep.messages
+        );
         for cut in (0..MIF.len()).step_by(7) {
             let _ = read(MIF.get(..cut).unwrap_or(""), Some(MID), "t");
         }

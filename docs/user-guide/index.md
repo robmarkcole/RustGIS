@@ -12,6 +12,7 @@ This guide walks through RustGIS by task. Each page covers one part of the app:
 | [Editing](editing.md) | Creating and modifying features, data design, the clipboard and pop-ups |
 | [Analysis](analysis.md) | Selection and SQL queries, geoprocessing, the GeoLibre tools, guided workflows, imagery, data cubes and time series |
 | [Expressions](expressions.md) | The expression language of queries, filters and Calculate Field: grammar, operators, functions |
+| [Data Loss Codes](loss-codes.md) | What each data loss code means, where it is said and what to do about it |
 | [Layouts and Reports](layouts.md) | Page layouts, map series, reports, presentations and notebooks |
 | [Sharing](sharing.md) | Exports, packages and open-format web maps, layers, styles and scenes |
 | [Workspace](workspace.md) | Linked views, the Browser view, animation, profiles, offline areas, customizing the ribbon |
@@ -99,10 +100,10 @@ This guide walks through RustGIS by task. Each page covers one part of the app:
   and closes it when it is. **Pane Sets** keep the tabs open.
 - **Status bar**: the scale (type one, or pick from the list), the zoom level, bearing and pitch
   (click them to face north and look straight down again), the pointer's coordinates (click them
-  to step through map coordinates (the map's own system, the default), decimal degrees, DMS, UTM and MGRS; see [Coordinate readouts](maps.md#coordinate-readouts)),
-  the coordinate system (click it to change the
-  projection), the selection count (with a button to clear it), the latest notice (click to open
-  **Messages**), a **Messages** button, the last draw time, the frame rate and a **GPU**/**CPU**
+  to step through map coordinates (the map's own system, the default), decimal degrees, DMS, UTM, MGRS and layer coordinates (the active layer's projected system); see [Coordinate readouts](maps.md#coordinate-readouts)),
+  the coordinate system (click its button to
+  change the projection), the selection count (with a button to clear it), the latest notice (click
+  to open **Messages**), a **Messages** button, the last draw time, the frame rate and a **GPU**/**CPU**
   renderer switch. While agents control the desktop app, it also shows the MCP relay or file bridge.
 
 **Command Search** (++ctrl+k++, or the box at the top right) finds commands and geoprocessing
@@ -125,13 +126,20 @@ Open **View › Windows › Messages**, click the status-bar notice or **Message
 or search for **Messages** in Command Search (`ui.pane.diagnosticLog`). This troubleshooting
 history is separate from **Help › Diagnostic Monitor**, which still shows performance metrics.
 
-Messages are collected even while the pane is closed. The newest entries appear first, with
-a UTC timestamp, severity, and source (such as the command id or Network). Expand **Technical
+Messages are collected even while the pane is closed. The newest entries appear first. A
+command's messages sit under its name, what it worked on (a layer or table) and the UTC time of its
+latest message; a message no command said shows its own time and source (such as Network).
+
+A message that reports lost data is laid out like a compiler's: its severity and
+[loss code](loss-codes.md) (`Warning [changed.truncated] data changed`), the message, then
+**What happened** and **What to do** for that code. Both are built into RustGIS, so
+they read offline; **More in the guide** opens the code's entry. **Undo to before this** takes
+the project back to before that command, and the changes after it, while Undo still reaches it. Expand **Technical
 details** for failed requests: their address, method, observed HTTP status and duration when
 available. Native connection failures and timeouts are identified when the transport knows
 them; an opaque browser failure does not claim a status or a specific DNS, CORS, or connection cause.
 
-Use **All**, **Errors**, **Warnings**, **Info**, or **Network failures** to filter the history
+Use **All**, **Errors**, **Warnings**, **Info**, **Network failures** or **Data losses** to filter the history
 (**Network failures** also lists the notes below about omitted absences). **Copy diagnostics**
 copies the filtered entries and their technical details, including folded details, as plain
 text: oldest entry first, with UTC Unix-millisecond timestamps, where the pane shows the newest
@@ -153,6 +161,22 @@ A credential field in the middle of a line is removed when its value is one word
 a value of several words reads as prose and is kept (`… password: correct horse battery`).
 Review copied diagnostics for private layer names or file paths before sharing them.
 
+### Report a Problem
+
+**Help › Report a Problem** (also in the Messages pane, and the Help menu on macOS) shows, in
+one window, what a bug report needs from this session: the RustGIS version, the system, the
+graphics the map is drawn with, whether the last run closed normally, each bug met this session
+with its incident reference and where in RustGIS it happened, the last 50 commands from the
+[session log](workspace.md#session-log) as Script pane lines that run them again, and the whole Messages history. A command that
+failed says its error; one whose parameters were cut or had a secret taken out, or that a script
+can't run, says so in a comment. Logins and secrets are removed as in Messages, with the same
+limits; file paths and layer names stay.
+
+You can edit the text: **Copy** copies it as you leave it, so delete anything you don't want to
+share. **Report on GitHub…** copies it too and opens a new bug report with the version and system
+filled in; paste the diagnostics into its logs field. Opening the form sends GitHub only the
+version and system; the diagnostics go when you paste them and submit.
+
 ## The ribbon
 
 | Tab | Groups |
@@ -162,12 +186,12 @@ Review copied diagnostics for private layer names or file paths before sharing t
 | **Style** | For the layer selected in Layers. A feature layer: Visibility Range, Effects, Drawing, Drawing Effects, Extrusion for polygons (with Faces and Light and Shadow once on) and Layer. A raster layer: Visibility Range, Effects, Compare, Raster Effects, Rendering, Enhancement and Layer. Both: Styles |
 | **Labeling** | For the feature layer selected in Layers: Labels (Label, Properties), Label Class (Class, Field), Text Symbol (Size, Color, Bold, Halo), Label Placement and Label Range. Whatever is selected: Map Labeling (Lock, Pause, View Unplaced, Convert) |
 | **Edit** | Manage Edits (Edit, Save, Undo, Redo, Status, Save to PostGIS and Discard PostGIS Edits on the desktop while a [PostGIS layer is loaded for editing](data.md#editing-postgis-tables), Settings, Templates, Topology), Snapping, Features (Create, Delete, Edit Vertices, Modify), Tools, Elevation, Corrections, Graphics, Graphics and Text, Clipboard |
-| **Analyze** | Geoprocessing (History, Tools, Model Builder, Script, SQL, Environments), Tasks (the Tasks pane; Task: Record Task, New Task From History, Import Task, run a task), AI (AI Assistant), Portal (Feature Analysis, Raster Analysis), Workflows, Raster (Raster Functions, Function Editor), Tools (the tool gallery), Selection, Notebook |
+| **Analyze** | Geoprocessing (History, Tools, Model Builder, Script, SQL, Environments), Tasks (the Tasks pane; Task: Record Task, New Task From History, Import Task, run a task), AI (AI Assistant), Portal (Feature Analysis, Raster Analysis), Workflows, Raster (Raster Functions, Function Editor, Process), Tools (the tool gallery), Selection, Notebook |
 | **View** | Display (Graticule, GPU Rendering), View (Globe, Projection, Global; Local on the desktop), Effects, Scene, Windows, Navigation, Link, Workspace, Animation, Time (Time Slider), Profile (Profile; Time Series on the desktop) |
 | **Publish** | While a layout is open, its groups first (Page, Map Frames, Map Surrounds, Shapes, Text, Export); then Report, Presentation, Output (Export Map, Export Features, Print Map, Capture To Clipboard, Report, Presentation, Export To 3D), Package, Share As, Layout, Save As, Thumbnail |
 | **Plugins** | Plugins (Plugin Manager, Install From File, Browse Plugins), Extensions (the [Extensions](#extensions) window), plus a group for each enabled [plugin](../plugins.md) with commands or tools; a plugin with its own tab adds that tab instead |
 | **Settings** | Theme (the theme list, Follow the System, Interface Scale), Customize (Ribbon, Quick Access), Language (interface language and worldview), Start-up (Start With, Projection, Extent), Autosave on the desktop |
-| **Help** | Performance (Diagnostic Monitor), Learn (Learning Resources), Help (About, Check for Updates on the desktop, Command Search, Shortcuts) |
+| **Help** | Performance (Diagnostic Monitor), Learn (Learning Resources), Help (About, Report a Problem, Check for Updates on the desktop, Command Search, Shortcuts) |
 | **Imagery** | The [Imagery extension](#extensions)'s tab, after Help, while it is on (it is off until you turn it on): Ortho Mapping, Reality Mapping, Alignment, Image Analysis, Image Classification, Imagery Sharing, Mensuration, Imagery Tools |
 
 The tabs stay the same whatever is selected: Style, Labeling and Data act on the layer selected in Layers.
@@ -178,17 +202,21 @@ Extensions are optional parts of RustGIS that you turn on or off. Unlike a
 [plugin](../plugins.md), an extension ships with RustGIS: there is nothing to download or install.
 **Plugins › Extensions** opens the Extensions window, which lists each extension with a switch,
 what it adds and where it shows. An extension with a tab of its own adds that tab after Help
-(before plugins' own tabs) while it is on; one without a tab adds a group to the Plugins tab.
+(before plugins' own tabs) while it is on; one without a tab adds its buttons to RustGIS's own
+tabs, or a group to the Plugins tab.
 
 | Extension | Default | Adds |
 | --- | --- | --- |
-| **Imagery** (`imagery`) | Off | The Imagery tab: Ortho Mapping, Reality Mapping, Alignment (Georeference), Image Analysis, Image Classification (with Deep Learning Tools), Imagery Sharing, Mensuration and Imagery Tools, and their commands (`imagery.*`, `dl.*`, and the `raster.*` commands those groups run) |
+| **Imagery** (`imagery`) | Off | The Imagery tab: Ortho Mapping, Reality Mapping, Alignment (Georeference), Image Analysis, Image Classification (with Deep Learning Tools), Imagery Sharing, Mensuration and Imagery Tools (Indices, Pixel Editor), and their commands (`imagery.*`, `dl.*`, and the `raster.*` commands those groups run). Process (clip and resample a raster), Mosaic Rasters, Project Raster and Polygons to Raster aren't part of it and always run |
+| **AI Assistant** (`assistant`) | On | The [AI Assistant](assistant.md) pane, with its buttons in Analyze › AI and View › Windows (`ui.pane.assistant`). The [MCP server](../mcp.md) (`rustgis-cli mcp`, and the desktop app's MCP Relay) and `rustgis-cli ask` aren't part of it and run either way |
 
-While an extension is off, its tab, its buttons, its Workflows pane sections and its commands in
-Command Search and the AI Assistant's command search are hidden. Its commands are refused with a
-message naming the extension, whoever runs them: a script, a model, the command line, Python or
-the assistant. Hiding the extension's tab in Settings › Customize › Ribbon only hides the tab; the
-commands still run.
+While an extension is off, its tab, its pane, its buttons, its Workflows pane sections and its
+commands in Command Search, the Keyboard Shortcuts editor, the Quick Access Toolbar and the AI
+Assistant's command search are hidden. Its commands are refused with a message naming the
+extension, whoever runs them: a shortcut, a script, a model, the command line, Python or the
+assistant. Shortcuts and Quick Access buttons you gave them are kept and come back with it.
+Hiding the extension's tab in Settings › Customize › Ribbon only hides the tab; the commands still
+run.
 
 The desktop and web apps start each extension at its default and remember your choices (the
 `extensions` setting). A setting saved by a newer RustGIS that names extensions this version
@@ -542,14 +570,31 @@ with `{"layer":"parcels"}`.
 | ++ctrl+equal++ / ++ctrl+minus++ | Zoom in / out |
 | ++home++ | Full extent |
 | ++esc++ | Back to Explore; cancel a sketch |
-| ++delete++ | Delete selected features; with Edit Vertices, the chosen vertex; in a layout, the selected element |
+| ++delete++ | Delete selected features; with Edit Vertices, the chosen vertex; in a layout, the selected element; in the layer list, remove the selected layers (++backspace++ too) |
 | ++ctrl+d++ | Duplicate the selected layout element |
 | Arrow keys / ++shift++ + arrow keys | Nudge the selected layout element / nudge it further |
+| Arrow keys / ++enter++ | In the attribute table, move the current cell / edit it |
 | ++alt+shift+right++ / ++alt+shift+left++ | Indent the active layer into the group above it / outdent it out of its group |
 | ++alt+shift+up++ / ++alt+shift+down++ | Move the active layer up / down one step in the Layers pane |
-| ++f2++ | Rename the active layer |
-| ++ctrl+c++ / ++ctrl+x++ / ++ctrl+v++ | Copy / Cut / Paste features |
+| ++f2++ | Rename the active layer; on the map and layout tabs, and in a layout, the map or layout in view |
+| ++ctrl+a++ | Select every feature of the active layer; in the attribute table, of the layer it shows; in a text field, its text |
+| ++ctrl+c++ / ++ctrl+x++ / ++ctrl+v++ | Copy / Cut / Paste features; in the layer list, Copy and Paste the selected layers |
 
 On macOS, ++cmd++ takes the place of ++ctrl++. **Help › Shortcuts** lists them all in the app,
 from the same table the app runs them from. While you type in a text field, undo and redo take
 back its typing, not the project's last change.
+
+++delete++, ++f2++ and the arrow keys act on the part of the window you last clicked, dragged or
+scrolled in. Click a layer in the Layers pane and ++delete++ removes it (Undo brings it back),
+whatever is selected on the map; click or scroll the map and it deletes the selected features
+again. When ++delete++ has nothing to act on, a notice says why. In the
+[attribute table](analysis.md#the-attribute-table) the arrow keys move between cells; on the map
+they pan it, and in a layout they nudge the selected element.
+
+Copy and Paste follow it too. In the Layers pane they copy and paste the selected layers, as **Copy
+Layer** and **Paste Layer** in a layer's menu do: the copies go above the active layer, or at the
+top of its group. Copying layers puts their names on the clipboard as text, and Paste adds the
+layers while the clipboard still holds those names; features or text copied after that are what
+Paste takes next, in the Layers pane as on the map. Cut does nothing in the Layers pane: copy a
+layer, then remove it with ++delete++. ++ctrl+a++ is left alone in a layout and in ModelBuilder,
+where there are no features to select.

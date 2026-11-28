@@ -74,10 +74,34 @@ A feature with a place that can't be given in the system written (one far past w
 layer's own system reaches, exported in WGS 84) is written without its geometry, and the export
 says how many; a format that holds only features with geometry leaves it out. Copy, Data
 Interop, the shared web map, web layer, geodata service and locator, 3D files and the mobile
-map package do the same. The web app downloads every format but GeoPackage and FlatGeobuf. `share.exportTable` exports a
-standalone table. **Data › Export** also writes rasters to GeoTIFF, and **Data Interop** converts layers to
-KML, GPX or CSV with WKT. Layouts, reports and presentations export from their own tabs and panes
-(see [Layouts and Reports](layouts.md)).
+map package do the same. The web app downloads every format but GeoPackage and FlatGeobuf. **Data › Export** also writes
+rasters to GeoTIFF, and **Data Interop** converts layers to KML, GPX or CSV with WKT. Layouts, reports and
+presentations export from their own tabs and panes (see [Layouts and Reports](layouts.md)).
+
+To export a standalone table, such as a Summary Statistics result, right-click it in the Layers pane and
+choose **Export Table…**, or run **Export Table** from Command Search and pick the table. The dialog offers
+the formats above that can hold it: for a table without geometry, CSV, GeoJSON, GeoPackage and GeoParquet
+(no GeoPackage in the web app, which downloads the file). Scripts and the command line use
+`share.exportTable`.
+
+The browser can't write to a folder, so in the web app an export command with a `path` (from the
+Script pane, the Assistant or a plugin) downloads the file under the name the path ends in, once
+the commands finish: `share.exportLayer`, `share.exportTable`, `share.exportMap`,
+`share.exportRaster` (a raster layer), `layout.export`, `report.export` and `data.convert`. A
+folder in the path isn't used, and a `.shp` path downloads a `.zip` of the Shapefile's files; a
+notice says each. At most 8 files, 256 MiB in all, can wait to be downloaded (a geoprocessing
+tool's file output waits the same way), and those of a script that then fails, or of a project
+replaced before they are offered, are dropped with a notice. A tool output dropped this way leaves
+its run out of the geoprocessing history. An export is refused once its file passes what is left of
+the 256 MiB, as it is made where the format allows, and for a Shapefile's `.zip` or a KMZ counting
+its files before they are zipped: export a selection of features, a smaller size or fewer pages,
+or use the desktop app.
+`share.exportLayer` and `data.convert` read a layer read in place whole for such a download, up to
+256 MiB of features; past that, select the features you need and export a layer made from them with
+**Make Layer From Selected Features**, or use the desktop app. They don't read a layer added by its
+web address this way: download the file and add it, or use the desktop app.
+GeoPackage and FlatGeobuf, a tile layer as a raster, an orbit, a block and publishing to a source
+need the desktop app; for a field package, use **Package for the Field** on the ribbon.
 
 To export the largest rows of a Summary Statistics result, give `share.exportTable` an optional
 `sort` list and `limit`. Each sort key names a stored field; `descending` defaults to `false`.
@@ -112,7 +136,7 @@ its own view is still loading: it waits for the map to move there, without progr
 
 A GeoPackage export writes a new file by default, and refuses an existing `.gpkg` to protect its
 tables, even if the save dialog offers to replace the file. To put the layer into an existing
-GeoPackage instead, choose GeoPackage in **Export Features**, then under **Into** either
+GeoPackage instead, choose GeoPackage in **Export Features** (or **Export Table**), then under **Into** either
 **A new table in a GeoPackage** or **A table replaced in a GeoPackage**, name the table, and
 pick the file (on the desktop). The GeoPackage's other tables stay as they were: one table is
 added, or one feature or attribute table of that name is replaced (a feature table with its

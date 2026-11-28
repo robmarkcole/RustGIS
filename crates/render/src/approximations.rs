@@ -324,6 +324,31 @@ pub(crate) fn walls_left_plain(name: &str, n: usize) {
     );
 }
 
+/// What a block diagram's walls drew of the water's bed raster `name` (#2434): it has no heights
+/// along `n` stretches of the walls' water, in `bodies` water bodies, where the floor is the
+/// water's depth or field instead (no water there without either).
+pub(crate) fn bed_unread(name: &str, n: usize, bodies: usize) {
+    let stretches = if n == 1 { "1 stretch".to_string() } else { format!("{n} stretches") };
+    let bodies = if bodies == 1 { "1 water body".to_string() } else { format!("{bodies} water bodies") };
+    note(
+        format!("{name}\0bed"),
+        format!(
+            "{name}: the block's water bed has no heights along {stretches} of the walls' water, in {bodies}, so there the walls show the water down to its depth or field (none without either)"
+        ),
+    );
+}
+
+/// Notes a block's water bed (#2434) named by a layer `name` that isn't a raster (renamed or
+/// added to the bed's name): the walls read no bed from it.
+pub(crate) fn bed_not_raster(name: &str) {
+    note(
+        format!("{name} bed layer"),
+        format!(
+            "{name}: the block's water bed isn't a raster layer, so the walls show the water down to its depth or field (none without either) until a raster layer of that name is there"
+        ),
+    );
+}
+
 /// What to say of a block diagram whose `share` (0 to 1) of the ground it read for its base
 /// had no height (off the DEM, the DEM's nodata, an elevation tile that failed), taken as 0
 /// ([`crate::terrain::Block::without_height_notice`]).

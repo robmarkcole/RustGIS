@@ -3,6 +3,7 @@
 //! ```text
 //! rustgis-cli commands                                  # list command ids and parameters
 //! rustgis-cli tools                                     # list geoprocessing tools
+//! rustgis-cli explain changed.rounded                   # what a loss code means and what to do, offline
 //! rustgis-cli info data.geojson                         # layer summary as JSON
 //! rustgis-cli render data.geojson out.png [--basemap ocean] [--tiles URL] [--width 1600 --height 900]
 //! rustgis-cli run [--sample | --project p.rgis | --data f.geojson …] \
@@ -12,7 +13,7 @@
 //! rustgis-cli run … --strict [--allow dropped.ring]   # exit 3 when a command loses data (see the guide's loss codes)
 //! rustgis-cli run … --threads 4                    # the most threads one piece of work uses (default: the cores, up to 16)
 //! rustgis-cli ask [--sample | --project p.rgis | --data f.geojson …] "Which cities have over 10 million people?" \
-//!     [--provider anthropic|openai|chatgpt|gemini|openrouter|ollama|custom|requesty|trustedrouter|opper] [--model M] [--base-url URL] [--yes] [--save out.rgis] [--trace log.txt]
+//!     [--provider anthropic|openai|chatgpt|gemini|openrouter|ollama|custom|requesty|trustedrouter|opper|mistral] [--model M] [--base-url URL] [--yes] [--save out.rgis] [--trace log.txt]
 //! rustgis-cli ask --sample "Style the countries like this map" --image reference.png   # pictures go with the request (up to 4)
 //! rustgis-cli ask --models [--provider P]                # list the provider's models
 //! rustgis-cli ask --accounts | --account CLIENT_ID       # list or select a saved registration
@@ -50,11 +51,29 @@ use serde_json::{Map, Value, json};
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage:\n  rustgis-cli commands | tools\n  rustgis-cli plugins [install <file|folder> | uninstall <id> | enable <id> | disable <id> | browse | get <id> | prepare <id>] [--registry URL]\n  rustgis-cli skills [add <SKILL.md|folder|.zip> | remove <name> | enable <name> | disable <name>]\n  rustgis-cli info <data>\n  rustgis-cli logo <out.png|out.ico|out.bmp> [--size N] [--canvas WxH --at X,Y (.bmp only)]\n  rustgis-cli render <data|project> <out.png> [--basemap NAME] [--tiles URL] [--width N] [--height N] [--dpi N] [--worldview auto|default|CODE] [--worldview-detail simplified|original]\n  rustgis-cli run [--sample] [--project P] [--data F]… --cmd 'id={{json}}'… [--save P] [--strict [--allow KIND|CODE]…] [--worldview auto|default|CODE] [--worldview-detail simplified|original]\n  rustgis-cli ask [--sample] [--project P] [--data F]… \"request\" [--image PICTURE]… [--provider P] [--model M] [--base-url URL] [--yes] [--save P]\n  rustgis-cli ask --models [--provider P]\n  rustgis-cli ask --login [--another-account] [--account CLIENT_ID] | --logout\n  rustgis-cli ask --accounts | --account CLIENT_ID | --remove-account CLIENT_ID\n  common options: --use-saved-secrets (use the connections, passwords, keys, ChatGPT sign-in and Earthdata Login token the RustGIS app saved; reads the system keychain), --threads N (the most threads one piece of work uses, 1-1024; default: the cores, up to 16)\n  rustgis-cli mcp [--sample] [--project P] [--data F]… [--yes] [--attach [PORT] [--token-file FILE] [--timeout SECONDS (5-600)]]\n  rustgis-cli mcp-register [--client claude] [--name NAME] [--port PORT]"
+        "usage:\n  rustgis-cli commands | tools\n  rustgis-cli explain [CODE]\n  rustgis-cli plugins [install <file|folder> | uninstall <id> | enable <id> | disable <id> | browse | get <id> | prepare <id>] [--registry URL]\n  rustgis-cli skills [add <SKILL.md|folder|.zip> | remove <name> | enable <name> | disable <name>]\n  rustgis-cli info <data>\n  rustgis-cli logo <out.png|out.ico|out.bmp> [--size N] [--canvas WxH --at X,Y (.bmp only)]\n  rustgis-cli render <data|project> <out.png> [--basemap NAME] [--tiles URL] [--width N] [--height N] [--dpi N] [--worldview auto|default|CODE] [--worldview-detail simplified|original]\n  rustgis-cli run [--sample] [--project P] [--data F]… --cmd 'id={{json}}'… [--save P] [--strict [--allow KIND|CODE]…] [--worldview auto|default|CODE] [--worldview-detail simplified|original]\n  rustgis-cli ask [--sample] [--project P] [--data F]… \"request\" [--image PICTURE]… [--provider P] [--model M] [--base-url URL] [--yes] [--save P]\n  rustgis-cli ask --models [--provider P]\n  rustgis-cli ask --login [--another-account] [--account CLIENT_ID] | --logout\n  rustgis-cli ask --accounts | --account CLIENT_ID | --remove-account CLIENT_ID\n  common options: --use-saved-secrets (use the connections, passwords, keys, ChatGPT sign-in and Earthdata Login token the RustGIS app saved; reads the system keychain), --threads N (the most threads one piece of work uses, 1-1024; default: the cores, up to 16)\n  rustgis-cli mcp [--sample] [--project P] [--data F]… [--yes] [--attach [PORT] [--token-file FILE] [--timeout SECONDS (5-600)]]\n  rustgis-cli mcp-register [--client claude] [--name NAME] [--port PORT]"
     );
     ExitCode::from(2)
 }
 
+/// `explain [CODE]`: what a loss code means and what to do about it, from the text built into
+/// RustGIS, so it reads offline, as a compiler explains its error codes; with no code, every code.
+fn explain(code: Option<&str>) -> Result<(), String> {
+    let Some(id) = code else {
+        for code in LossCode::ALL {
+            let spec = code.spec();
+            out!("{:<28} {}", spec.id, spec.meaning);
+        }
+        return Ok(());
+    };
+    let code = LossCode::from_id(id).ok_or_else(|| format!("explain {id}: not a loss code (`rustgis-cli explain` lists them)"))?;
+    let spec = code.spec();
+    out!("{}: {}\n\n{}\n\nWhat to do: {}\n\nMore: {}", spec.id, spec.kind.id(), spec.meaning, spec.action, code.doc_url());
+    Ok(())
+}
+
+/// The value after `name`. A flag that takes one is in [`VALUE_FLAGS`], which [`check_values`]
+/// checks before anything runs, so the value is there and isn't another option.
 fn opt<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).map(|s| s.as_str())
 }
@@ -144,7 +163,11 @@ impl Strict {
             };
             if LossKind::from_id(v).is_none() && LossCode::from_id(v).is_none() {
                 let kinds: Vec<&str> = LossKind::ALL.iter().map(|k| k.id()).collect();
-                return Err(format!("--allow {v}: not a loss kind ({}) or code (listed in the command line guide)", kinds.join(", ")));
+                return Err(format!(
+                    "--allow {v}: not a loss kind ({}) or code (listed at {})",
+                    kinds.join(", "),
+                    rustgis_engine::data::loss::GUIDE
+                ));
             }
             allow.push(v.to_string());
         }
@@ -184,7 +207,7 @@ impl Strict {
             let spec = code.spec();
             // A counted notice says how many it lost in its text; this counts the notices.
             let notices = if n == 1 { "1 notice".to_string() } else { format!("{n} notices") };
-            said.push_str(&format!("\n  {} ({notices}): {}", spec.id, spec.action));
+            said.push_str(&format!("\n  {} ({notices}): {}\n    {}", spec.id, spec.action, code.doc_url()));
         }
         Err(said)
     }
@@ -210,6 +233,86 @@ fn is_project(path: &str) -> bool {
     rustgis_engine::project::opens_as_project(path)
 }
 
+/// The options that take exactly one value. Left out: `--allow` (checked by [`Strict::from_args`],
+/// just before), `--attach` (its port is optional) and the `--threads=N` form, which has no separate
+/// value. `--threads`, `--image` ([`ask_pictures`]) and `mcp-register`'s `--client`, `--name` and
+/// `--port` keep their checks further on, as guards for what a value may be.
+const VALUE_FLAGS: &[&str] = &[
+    "--project",
+    "--data",
+    "--cmd",
+    "--save",
+    "--plugin",
+    "--registry",
+    "--worldview",
+    "--worldview-detail",
+    "--basemap",
+    "--tiles",
+    "--width",
+    "--height",
+    "--dpi",
+    "--provider",
+    "--model",
+    "--base-url",
+    "--trace",
+    "--account",
+    "--remove-account",
+    "--size",
+    "--canvas",
+    "--at",
+    "--token-file",
+    "--timeout",
+    "--threads",
+    "--image",
+    "--client",
+    "--name",
+    "--port",
+];
+
+/// Refuses an option from [`VALUE_FLAGS`] with no value, an empty one, or another option where the
+/// value goes (`run --save --cmd x` would save a project named `--cmd`), and a `render` size that
+/// isn't a finite number above 0. Every occurrence is checked, as `--data` and `--cmd` repeat.
+fn check_values(cmd: &str, args: &[String]) -> Result<(), String> {
+    for (i, flag) in args.iter().enumerate() {
+        if !VALUE_FLAGS.contains(&flag.as_str()) {
+            continue;
+        }
+        let value = match args.get(i + 1).map(String::as_str) {
+            None | Some("") => return Err(format!("{cmd} {flag}: expected a value")),
+            Some(next) if next.starts_with("--") => return Err(format!("{cmd} {flag}: expected a value, found the option {next}")),
+            Some(value) => value,
+        };
+        if cmd == "render"
+            && matches!(flag.as_str(), "--width" | "--height" | "--dpi")
+            && !value.parse::<f64>().is_ok_and(|v| v.is_finite() && v > 0.0)
+        {
+            return Err(format!("{cmd} {flag} {value}: expected a positive number"));
+        }
+    }
+    Ok(())
+}
+
+/// A `render` size in points (pixels at 96 DPI): `--width` or `--height`, else `default`, kept
+/// within 16 to 8000. One moved is said, as a notice that is also printed. [`check_values`] has
+/// seen that a given one is a positive number.
+fn side(s: &mut Session, args: &[String], name: &str, default: f64) -> f64 {
+    let (Some(given), Some(text)) = (num(args, name), opt(args, name)) else { return default };
+    let kept = given.clamp(16.0, 8000.0);
+    let which = if kept > given {
+        "least"
+    } else if kept < given {
+        "most"
+    } else {
+        return kept;
+    };
+    let mark = s.notice_mark();
+    s.notify(format!("{name} {text}: using {kept} points, the {which} a side takes (16 to 8000)"), false);
+    for n in s.notices_since(mark) {
+        eprintln!("rustgis-cli: {}", n.text);
+    }
+    kept
+}
+
 fn num(args: &[String], name: &str) -> Option<f64> {
     opt(args, name).and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite())
 }
@@ -232,10 +335,8 @@ fn open_inputs(s: &mut Session, strict: Option<&Strict>, args: &[String]) -> Res
     if let Some(p) = opt(args, "--project") {
         load(s, strict, p)?;
     }
-    for (i, a) in args.iter().enumerate() {
-        if a == "--data"
-            && let Some(p) = args.get(i + 1)
-        {
+    for (a, p) in args.iter().zip(args.iter().skip(1)) {
+        if a == "--data" {
             load(s, strict, p)?;
         }
     }
@@ -818,6 +919,8 @@ fn mcp(s: &mut Session, args: &[String]) -> Result<(), String> {
 
 /// Runs the command line, then stops the session plugins' programs its commands started.
 fn main() -> ExitCode {
+    // A bug caught in a command says so, with a reference to its details.
+    rustgis_engine::data::incident::install();
     let code = cli();
     // Session plugins' programs a command started end with the command line.
     rustgis_engine::plugins::session::stop_all();
@@ -846,15 +949,18 @@ fn cli() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // Before plugins load or anything is read or downloaded.
+    if let Err(e) = check_values(cmd, &args) {
+        eprintln!("rustgis-cli: {e}");
+        return ExitCode::from(2);
+    }
     if !args.iter().any(|a| a == "--no-plugins") {
         for e in rustgis_engine::cmd::plugins::load_installed() {
             eprintln!("rustgis-cli: warning: {e}");
         }
     }
-    for (i, a) in args.iter().enumerate() {
-        if a == "--plugin"
-            && let Some(p) = args.get(i + 1)
-        {
+    for (a, p) in args.iter().zip(args.iter().skip(1)) {
+        if a == "--plugin" {
             let loaded =
                 rustgis_engine::plugins::Package::from_path(std::path::Path::new(p)).and_then(|pkg| rustgis_engine::plugins::load(pkg, p));
             if let Err(e) = loaded {
@@ -961,6 +1067,23 @@ fn cli() -> ExitCode {
             print(&out);
             Ok(())
         }
+        "explain" => {
+            // The common options (`--threads 2`, `--use-saved-secrets`) are taken, and their values.
+            let mut words = Vec::new();
+            let mut rest = args.iter().skip(1);
+            while let Some(arg) = rest.next() {
+                if VALUE_FLAGS.contains(&arg.as_str()) {
+                    rest.next();
+                } else if !arg.starts_with("--") {
+                    words.push(arg.as_str());
+                }
+            }
+            match words.as_slice() {
+                [] => explain(None),
+                [code] => explain(Some(code)),
+                _ => Err("explain takes one loss code, or none to list them all".into()),
+            }
+        }
         "skills" => skills(&args),
         "mcp-register" => mcp_register(&args),
         "commands" => {
@@ -1028,8 +1151,8 @@ fn cli() -> ExitCode {
             if let Some(u) = opt(&args, "--tiles") {
                 run(&mut s, "map.addTiles", json!({"url": u}))?;
             }
-            let w = num(&args, "--width").unwrap_or(1600.0).clamp(16.0, 8000.0);
-            let h = num(&args, "--height").unwrap_or(900.0).clamp(16.0, 8000.0);
+            let w = side(&mut s, &args, "--width", 1600.0);
+            let h = side(&mut s, &args, "--height", 900.0);
             s.view_size = (w, h);
             if !is_project(input) {
                 run(&mut s, "map.zoomFull", Value::Null)?;
@@ -1064,10 +1187,8 @@ fn cli() -> ExitCode {
             s.stoppable = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
             let strict = strict.as_ref();
             open_inputs(&mut s, strict, &args)?;
-            for (i, a) in args.iter().enumerate() {
-                if a == "--cmd"
-                    && let Some(c) = args.get(i + 1)
-                {
+            for (a, c) in args.iter().zip(args.iter().skip(1)) {
+                if a == "--cmd" {
                     let (id, p) = match c.split_once('=') {
                         Some((id, json)) => (id, serde_json::from_str(json).map_err(|e| format!("{id}: bad JSON: {e}"))?),
                         None => (c.as_str(), Value::Null),
@@ -1164,6 +1285,59 @@ mod tests {
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|a| a.to_string()).collect()
+    }
+
+    #[test]
+    fn check_values_refuses_a_missing_value_an_option_in_its_place_and_a_bad_size() {
+        let check = |list: &[&str]| check_values(list.first().copied().unwrap_or(""), &args(list));
+        for (list, said) in [
+            (&["run", "--save"][..], "run --save: expected a value"),
+            (&["run", "--save", ""], "run --save: expected a value"),
+            (&["run", "--save", "--cmd", "x"], "run --save: expected a value, found the option --cmd"),
+            (&["run", "--data", "a.geojson", "--data"], "run --data: expected a value"),
+            (&["run", "--plugin"], "run --plugin: expected a value"),
+            (&["run", "--threads"], "run --threads: expected a value"),
+            (&["ask", "x", "--image"], "ask --image: expected a value"),
+            (&["mcp-register", "--client", "--name", "x"], "mcp-register --client: expected a value, found the option --name"),
+            (&["mcp-register", "--name"], "mcp-register --name: expected a value"),
+            (&["mcp-register", "--port"], "mcp-register --port: expected a value"),
+            (&["mcp", "--attach", "5000", "--timeout"], "mcp --timeout: expected a value"),
+            (&["render", "a", "b.png", "--width", "abc"], "render --width abc: expected a positive number"),
+            (&["render", "a", "b.png", "--height", "1e400"], "render --height 1e400: expected a positive number"),
+            (&["render", "a", "b.png", "--dpi", "0"], "render --dpi 0: expected a positive number"),
+            (&["render", "a", "b.png", "--dpi", "-5"], "render --dpi -5: expected a positive number"),
+            (&["render", "a", "b.png", "--width", "NaN"], "render --width NaN: expected a positive number"),
+        ] {
+            assert_eq!(check(list).unwrap_err(), said);
+        }
+        // Well-formed input, an option that isn't this check's, a lone `--attach`, a value with one dash,
+        // and a size where the subcommand doesn't read one.
+        for list in [
+            &["run", "--save", "out.rgis", "--cmd", "gp.threads", "--cmd", "gp.threads"][..],
+            &["render", "a", "b.png", "--width", "64.5", "--dpi", "96"],
+            &["logo", "l.png", "--canvas", "10x10", "--at", "-5,-5"],
+            &["mcp", "--attach"],
+            &["run", "--threads=4"],
+            &["run", "--allow"],
+            &["run", "--width", "abc"],
+        ] {
+            assert_eq!(check(list), Ok(()), "{list:?}");
+        }
+    }
+
+    #[test]
+    fn every_option_read_with_opt_is_checked_by_check_values() {
+        let source = include_str!("main.rs");
+        let mut missing = Vec::new();
+        for call in ["opt(&args, \"", "opt(args, \""] {
+            for part in source.split(call).skip(1) {
+                let flag = format!("--{}", part.trim_start_matches('-').split('"').next().unwrap_or(""));
+                if !VALUE_FLAGS.contains(&flag.as_str()) {
+                    missing.push(flag);
+                }
+            }
+        }
+        assert!(missing.is_empty(), "read with opt but not in VALUE_FLAGS: {missing:?}");
     }
 
     /// An environment with no keys.

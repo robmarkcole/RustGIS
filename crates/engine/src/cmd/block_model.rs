@@ -72,8 +72,9 @@ fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
 /// progress and Cancel, as an export is (`exports::IN_BACKGROUND`), since it waits for elevation
 /// tiles and draws a texture of up to 8192 pixels a side.
 pub(crate) fn export_work(s: &Session, p: &Value) -> Result<super::exports::Work, String> {
-    if cfg!(target_arch = "wasm32") {
-        return Err("exporting a block needs the desktop app".into());
+    // Refused where files are downloaded: the web app doesn't wait for elevation tiles ([`read_ground`]).
+    if s.downloads_files() {
+        return Err("the web app can't export a block; open the project in the desktop app and export it there".into());
     }
     let path = ps(p, "path").ok_or("path is required (a .glb, or a .gltf with everything embedded)")?.to_string();
     let lower = path.to_ascii_lowercase();

@@ -75,7 +75,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' && !inputs.release-build }}
       # Nextest's own checksums are verified by the action, as for the tools the other workflows
       # install; the version is pinned.
-      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2
         if: inputs.packages != 'none'
         with:
           tool: cargo-nextest@0.9.151
@@ -137,7 +137,7 @@ jobs:
         if: inputs.release-build
         run: cargo build --release --locked -p rustgis -p rustgis-cli
       # Last, so a disagreement here doesn't skip the doctests, layering check or release build.
-      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         if: matrix.os == 'ubuntu-latest' && github.workflow != 'Nightly' && (inputs.packages == '--workspace' || contains(format('{0} ', inputs.packages), '-p rustgis-analysis '))
       - name: Compare generated polygon overlays with GEOS
         if: matrix.os == 'ubuntu-latest' && github.workflow != 'Nightly' && (inputs.packages == '--workspace' || contains(format('{0} ', inputs.packages), '-p rustgis-analysis '))

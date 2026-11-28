@@ -57,6 +57,27 @@ from the roadmap, or narrows it to what is left; one that lands an item of the
 [GeoLibre parity checklist](docs/geolibre-parity.md) updates that file. Either change goes in the same pull
 request.
 
+## Adding an AI provider
+
+A preset in the Assistant's list reads as RustGIS recommending a service. Requests can carry
+layer names, rows the assistant reads and pictures of the user's map. A preset needs:
+
+1. **A named operator and a published data policy.** Its site names the legal entity, country
+   and contact address, and explains retention and training for request and reply content,
+   including services it forwards to.
+2. **No training by default, or a plain warning.** Where the API provides a per-request control,
+   the preset uses it by default. Otherwise its description says when training can happen and
+   how users can turn it off. Check the account reached through the preset's key link.
+3. **Known upstreams.** A gateway names the services it forwards to. Requests must not pass
+   through anonymous resellers' accounts.
+4. **Affiliation disclosed** in the pull request.
+
+Link the evidence in the pull request, and add the same short description of the operator and
+privacy considerations to the preset and the [user guide](docs/user-guide/assistant.md#choosing-a-model).
+Keep setup instructions in the guide's Key column. Other services can use the OpenAI-compatible
+provider and its **Address**. A preset that stops meeting these criteria may be removed;
+removal must tell affected users before requests go to a different provider.
+
 ## AI-assisted contributions
 
 Code written with AI tools is welcome, from anyone, whatever their programming experience

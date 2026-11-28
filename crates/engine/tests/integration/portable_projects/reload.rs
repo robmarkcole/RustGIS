@@ -493,7 +493,7 @@ fn raster_reload_and_repair_disclose_fresh_losses_once_without_repeating_them_on
         s.notice_landed_rasters();
         s.notice_landed_rasters();
         for loss in losses {
-            assert_eq!(s.notices_since(mark).iter().filter(|n| n.text.ends_with(&loss)).count(), 1, "{command}: {loss}");
+            assert_eq!(s.notices_since(mark).iter().filter(|n| n.text.ends_with(loss.as_str())).count(), 1, "{command}: {}", loss.text);
         }
     }
     raster_file(&moved, 1);
@@ -569,7 +569,7 @@ fn reload_reconverts_original_gdal_folder_and_accepts_its_declared_empty_table()
         data::source::gdal,
         map::source::{GdalOrigin, SourceLayer},
     };
-    if !gdal::usable() {
+    if !gdal::test_runs().unwrap() {
         return;
     }
     let f = Fixture::new("reload-gdal-folder");
@@ -721,7 +721,7 @@ fn reload_reconverts_original_gdal_folder_and_accepts_its_declared_empty_table()
 #[test]
 fn reload_reconverts_duckdb_table_and_keeps_only_its_original_geometry_branch() {
     use rustgis_engine::data::source::duckdb;
-    if !duckdb::available() {
+    if !duckdb::test_runs().unwrap() {
         return;
     }
     let f = Fixture::new("reload-duckdb");
@@ -833,7 +833,7 @@ fn saved_gdal_conversion_restores_fresh_data_and_loss_notes_despite_an_unchanged
         data::source::{Family, gdal},
         map::source::{GdalOrigin, SourceLayer},
     };
-    if !gdal::usable() {
+    if !gdal::test_runs().unwrap() {
         return;
     }
     let f = Fixture::new("restore-gdal-signature");
@@ -920,7 +920,7 @@ fn saved_gdal_conversion_restores_fresh_data_and_loss_notes_despite_an_unchanged
 #[test]
 fn saved_duckdb_conversion_restores_fresh_selected_family_despite_an_unchanged_signature() {
     use rustgis_engine::data::source::duckdb;
-    if !duckdb::available() {
+    if !duckdb::test_runs().unwrap() {
         return;
     }
     let f = Fixture::new("restore-duckdb-signature");
@@ -1013,7 +1013,7 @@ fn reload_duckdb_sql(path: &Path, statement: &str) {
 #[test]
 fn duckdb_reload_reports_other_family_rows_only_for_mixed_tables() {
     use rustgis_engine::data::source::duckdb;
-    if !duckdb::available() {
+    if !duckdb::test_runs().unwrap() {
         return;
     }
     let f = Fixture::new("reload-duckdb-family-notice");
@@ -1043,7 +1043,7 @@ fn duckdb_reload_reports_other_family_rows_only_for_mixed_tables() {
 #[test]
 fn duckdb_repair_refuses_other_family_only_tables_while_reload_installs_an_empty_branch() {
     use rustgis_engine::data::source::{Family, duckdb};
-    if !duckdb::available() {
+    if !duckdb::test_runs().unwrap() {
         return;
     }
     for (family, geometry, dimension, left_out) in
@@ -1332,7 +1332,7 @@ fn saved_conversion_cannot_borrow_another_sessions_reload_workspace_when_origina
 #[test]
 fn load_all_after_empty_duckdb_reload_exports_a_point_geopackage() {
     use rustgis_engine::data::source::duckdb;
-    if !duckdb::available() {
+    if !duckdb::test_runs().unwrap() {
         return;
     }
     let f = Fixture::new("reload-duckdb-empty-export");
@@ -1358,7 +1358,7 @@ fn load_all_after_empty_duckdb_reload_exports_a_point_geopackage() {
 #[test]
 fn direct_export_after_empty_duckdb_reload_is_a_point_geopackage() {
     use rustgis_engine::data::source::duckdb;
-    if !duckdb::available() {
+    if !duckdb::test_runs().unwrap() {
         return;
     }
     let f = Fixture::new("reload-duckdb-empty-direct-export");
@@ -1383,7 +1383,7 @@ fn project_open_reports_fresh_conversion_losses_once_per_kind_but_not_clean_conv
         data::source::{Family, gdal},
         map::source::{GdalOrigin, SourceLayer},
     };
-    if !gdal::usable() {
+    if !gdal::test_runs().unwrap() {
         return;
     }
     for layer_count in [1, 2] {
@@ -1439,7 +1439,8 @@ fn project_open_reports_fresh_conversion_losses_once_per_kind_but_not_clean_conv
                     assert!(losses[0].text.starts_with("2 layers: "), "{}", losses[0].text);
                     assert!(losses[0].text.ends_with(&format!("first: {first}")), "{}", losses[0].text);
                 }
-                assert!(losses[0].text.contains("1 source feature(s)"), "{}", losses[0].text);
+                // One feature each: several layers' notice gives their total.
+                assert!(losses[0].text.contains(&format!("{layer_count} source feature(s)")), "{}", losses[0].text);
                 assert!(!losses[0].error);
             } else {
                 assert!(losses.is_empty(), "{notices:?}");
@@ -1461,7 +1462,7 @@ fn project_open_sums_counted_conversion_losses_across_layers_and_keeps_single_la
         data::source::{Family, gdal},
         map::source::{GdalOrigin, SourceLayer},
     };
-    if !gdal::usable() {
+    if !gdal::test_runs().unwrap() {
         return;
     }
     for layer_count in [1, 2, 3] {
@@ -1528,7 +1529,7 @@ fn reload_generic_gdal_layer_reports_selected_zm_loss_but_not_xy_or_other_famili
         data::source::{Family, gdal},
         map::source::{GdalOrigin, SourceLayer},
     };
-    if !gdal::usable() {
+    if !gdal::test_runs().unwrap() {
         return;
     }
     let f = Fixture::new("reload-gdal-generic-dimensions");

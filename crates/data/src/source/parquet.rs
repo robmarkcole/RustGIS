@@ -223,7 +223,7 @@ impl ParquetSource {
         if schema.column(geom_col).physical_type() != Physical::BYTE_ARRAY {
             return Err(DataError::Format(format!("geometry column '{primary}' is not binary")));
         }
-        let mut notes = Vec::new();
+        let mut notes = crate::loss::Notes::new();
         let crs = col_meta.and_then(|c| c.get("crs"));
         let code = crs_code(crs);
         // Another body's system is said, or refused when its coordinates aren't longitude/latitude.
@@ -235,7 +235,10 @@ impl ParquetSource {
             notes.push(format!("its coordinate system: {note}"));
         } else if code.is_none() && crs.is_some_and(|c| !c.is_null() && !is_crs84(c)) {
             // A coordinate system given without an EPSG code (and not OGC:CRS84) can't be converted.
-            notes.push("its coordinate system has no EPSG code; read as longitude/latitude".into());
+            notes.push(crate::loss::Note::loss(
+                crate::loss::LossCode::AssumedCrs,
+                "its coordinate system has no EPSG code; read as longitude/latitude",
+            ));
         }
         let reproject = Reproject::from_epsg(code, &mut notes);
         let covering = find_covering(md, col_meta, &primary);
@@ -315,7 +318,7 @@ impl ParquetSource {
             count,
             crs: reproject.label(),
             indexed: covering.is_some(),
-            notes: notes.into(),
+            notes,
             zm_dropped: false,
         };
         info.note_columns(
@@ -484,6 +487,42 @@ impl ParquetSource {
 impl FeatureSource for ParquetSource {
     fn info(&self) -> &SourceInfo {
         &self.info
+    }
+
+    /// From every row group's statistics of the field's column, which the footer holds: no byte of
+    /// the data is read. A row group without a statistics object, or whose statistics give no
+    /// bounds while it has values, or bounds that aren't finite and in order, leaves the range
+    /// unknown (`None`); one whose statistics count only nulls adds nothing. The field is named exactly
+    /// as the source lists it.
+    fn field_range(&self, field: &str) -> Option<(f64, f64)> {
+        let i = self.info.fields.iter().position(|f| f.name == field && f.ty.is_numeric())?;
+        let col = *self.field_cols.get(i)?;
+        let md = self.reader.metadata();
+        let desc = md.file_metadata().schema_descr().column(col);
+        // Unsigned integers are ordered as unsigned in the statistics, not as the values are read.
+        if matches!(desc.logical_type_ref(), Some(LogicalType::Integer(t)) if !t.is_signed)
+            || matches!(
+                desc.converted_type(),
+                ConvertedType::UINT_8 | ConvertedType::UINT_16 | ConvertedType::UINT_32 | ConvertedType::UINT_64
+            )
+        {
+            return None;
+        }
+        let scale = decimal_scale(&desc).map_or(1.0, |s| 10f64.powi(-s));
+        let (lo, hi) = (0..md.num_row_groups()).try_fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), g| {
+            let rg = md.row_group(g);
+            let s = rg.columns().get(col)?.statistics()?;
+            match (number_stat(s, false), number_stat(s, true)) {
+                (Some(a), Some(b)) => {
+                    let (a, b) = (a * scale, b * scale);
+                    (a.is_finite() && b.is_finite() && a <= b).then(|| (lo.min(a), hi.max(b)))
+                }
+                // A row group of nulls only has no bounds.
+                _ if s.null_count_opt() == Some(u64::try_from(rg.num_rows()).ok()?) => Some((lo, hi)),
+                _ => None,
+            }
+        })?;
+        (lo.is_finite() && hi.is_finite() && lo <= hi).then_some((lo, hi))
     }
 
     fn reads_own_box(&self) -> bool {
@@ -1065,6 +1104,23 @@ fn stat(s: Option<&Statistics>, max: bool) -> Option<f64> {
         Statistics::Float(v) => (if max { v.max_opt() } else { v.min_opt() }).map(|x| f64::from(*x)),
         Statistics::Double(v) => (if max { v.max_opt() } else { v.min_opt() }).copied(),
         _ => None,
+    }
+}
+
+/// A numeric column's smallest or largest value in a row group's statistics.
+fn number_stat(s: &Statistics, max: bool) -> Option<f64> {
+    match s {
+        Statistics::Int32(v) => (if max { v.max_opt() } else { v.min_opt() }).map(|x| f64::from(*x)),
+        // Past 2^53, the next double out, so the bound still holds every value.
+        Statistics::Int64(v) => (if max { v.max_opt() } else { v.min_opt() }).map(|&x| {
+            let y = x as f64;
+            match (y as i128).cmp(&i128::from(x)) {
+                std::cmp::Ordering::Less if max => y.next_up(),
+                std::cmp::Ordering::Greater if !max => y.next_down(),
+                _ => y,
+            }
+        }),
+        _ => stat(Some(s), max),
     }
 }
 
@@ -1677,19 +1733,25 @@ impl DateLayout {
     }
     /// Counts each representation change and names its fields for the user-facing export notice,
     /// each after `target: ` (nothing before it when `target` is empty: the caller adds the path).
-    fn notes(&self, fields: &[Field], target: &str) -> Vec<String> {
+    /// An offset left out is a value lost; ISO text keeps the value.
+    fn notes(&self, fields: &[Field], target: &str) -> Vec<crate::loss::Note> {
         let target: String = target.chars().map(crate::io::dbf_notice_char).collect();
         let target = if target.is_empty() { String::new() } else { format!("{target}: ") };
         let mut notes = Vec::new();
         let utc: Vec<usize> = self.offsets.iter().enumerate().map(|(k, &n)| if self.modes.get(k) == Some(&2) { n } else { 0 }).collect();
         let text: Vec<usize> = self.counts.iter().enumerate().map(|(k, &n)| if self.modes.get(k) == Some(&3) { n } else { 0 }).collect();
-        for (counts, what) in [
-            (&utc, "date-times were written in UTC without their original offsets"),
-            (&text, "date-times were written as ISO text because their column mixes zoned and unzoned values"),
+        for (counts, what, lost) in [
+            (&utc, "date-times were written in UTC without their original offsets", true),
+            (&text, "date-times were written as ISO text because their column mixes zoned and unzoned values", false),
         ] {
             let n: usize = counts.iter().sum();
             if n > 0 {
-                notes.push(format!("{target}{n} {what}, in {}", crate::io::named_fields(fields, counts)));
+                let text = format!("{target}{n} {what}, in {}", crate::io::named_fields(fields, counts));
+                notes.push(if lost {
+                    crate::loss::Note::loss(crate::loss::LossCode::DroppedValue, text)
+                } else {
+                    crate::loss::Note::plain(text)
+                });
             }
         }
         notes
@@ -1733,7 +1795,7 @@ fn unfit(ty: FieldType, value: &Value) -> bool {
 /// The notice for values a GeoParquet export wrote as null because their column's type couldn't
 /// hold them, given the count per field (as `write_features` returns); `None` when there are
 /// none. Names the first five fields.
-pub fn unfit_note(fields: &[Field], counts: &[usize], target: &str) -> Option<String> {
+pub fn unfit_note(fields: &[Field], counts: &[usize], target: &str) -> Option<crate::loss::Note> {
     let total = counts.iter().fold(0usize, |a, n| a.saturating_add(*n));
     if total == 0 {
         return None;
@@ -1748,12 +1810,15 @@ pub fn unfit_note(fields: &[Field], counts: &[usize], target: &str) -> Option<St
         format!("{total} values couldn't be written as their columns' types and were")
     };
     let target: String = target.chars().map(crate::io::dbf_notice_char).collect();
-    Some(format!("{target}: {what} written as null, in {}{more}", list.join(", ")))
+    Some(crate::loss::Note::loss(
+        crate::loss::LossCode::DroppedValue,
+        format!("{target}: {what} written as null, in {}{more}", list.join(", ")),
+    ))
 }
 
 /// Export notices for the whole of `ds`: unfit values and timestamp representation changes.
 /// Cancellation omits notices; the following writer's check returns the cancellation error.
-pub fn values_note(ds: &crate::Dataset, target: &str) -> Option<String> {
+pub fn values_note(ds: &crate::Dataset, target: &str) -> Option<crate::loss::Note> {
     let mut counts = vec![0usize; ds.fields.len()];
     let mut layout = DateLayout::default();
     for chunk in ds.features.chunks(BATCH) {
@@ -1768,9 +1833,18 @@ pub fn values_note(ds: &crate::Dataset, target: &str) -> Option<String> {
             }
         }
     }
-    let mut notes: Vec<String> = unfit_note(&ds.fields, &counts, target).into_iter().collect();
-    notes.extend(layout.notes(&ds.fields, target));
-    if notes.is_empty() { None } else { Some(notes.join("; ")) }
+    // One notice: the values written as null, then how date-times are written; coded when either
+    // loses a value.
+    let said: Vec<crate::loss::Note> =
+        unfit_note(&ds.fields, &counts, target).into_iter().chain(layout.notes(&ds.fields, target)).collect();
+    let loss = said.iter().find_map(|n| n.loss);
+    (!said.is_empty()).then(|| {
+        let text = said.iter().map(|n| n.text.as_str()).collect::<Vec<_>>().join("; ");
+        match loss {
+            Some(code) => crate::loss::Note::loss(code, text),
+            None => crate::loss::Note::plain(text),
+        }
+    })
 }
 
 /// Writes GeoParquet to `out`: the features `feed` hands to the function it is given, a run at
@@ -1788,7 +1862,7 @@ pub(crate) fn write_features<W: std::io::Write + Send>(
     crs: Crs,
     out: W,
     feed: &mut dyn FnMut(&mut dyn FnMut(&[Feature]) -> Result<()>) -> Result<()>,
-) -> Result<(W, Vec<usize>, Vec<String>)> {
+) -> Result<(W, Vec<usize>, Vec<crate::loss::Note>)> {
     use parquet::basic::{Compression, Encoding, Repetition, ZstdLevel};
     use parquet::data_type::{BoolType, ByteArray, ByteArrayType, DoubleType, Int32Type, Int64Type};
     use parquet::file::metadata::KeyValue;
