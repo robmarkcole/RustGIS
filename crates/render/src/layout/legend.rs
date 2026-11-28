@@ -1,6 +1,7 @@
 //! The legend: its rows, columns, sizes and the wait for service legend pictures.
 
 use super::*;
+use rustgis_map::layout::ClassLabels;
 
 /// Each visible layer's legend for what it draws at a scale denominator (#207), by layer id; a
 /// layer that draws nothing there isn't listed. The scale is the one the renderer draws the frame
@@ -161,6 +162,7 @@ pub(super) struct LegendOptions<'a> {
     pub(super) names: bool,
     pub(super) exclude: &'a [String],
     pub(super) labels: &'a BTreeMap<String, String>,
+    pub(super) class_labels: &'a ClassLabels,
     pub(super) scale: f64,
     pub(super) size: f32,
     pub(super) text_size: f64,
@@ -891,6 +893,27 @@ pub(super) fn measure(m: Measured, columns: usize) -> (f32, f32) {
     (across(m, &starts), height)
 }
 
+/// Every class of a layer, whatever a frame draws of it: a classified raster's (#1679), or its
+/// renderer's with the sizes of its points after them.
+fn every_class(l: &rustgis_map::Layer) -> Vec<LegendEntry> {
+    if l.is_raster() { raster_classes(l, true).unwrap_or_default() } else { l.with_size_legend(l.renderer.legend()) }
+}
+
+/// The labels of every class row a legend can list for a layer, those a legend can give its own
+/// text to (#3187): its classes, its missing-value row (drawn only under `show_no_data`) and its
+/// diagram's categories. Empty for a layer with none of these, whose row bears its name.
+pub fn class_row_labels(l: &rustgis_map::Layer) -> Vec<String> {
+    if !legend_lists(l) {
+        return Vec::new();
+    }
+    let mut entries = every_class(l);
+    entries.extend(l.renderer.no_data_legend(&l.dataset, None));
+    if let Some(d) = &l.diagram {
+        entries.extend(d.legend(l.geometry_type()));
+    }
+    entries.into_iter().map(|e| e.label).collect()
+}
+
 /// The rows of the legend of a frame's map. With `drawn` (from [`shown_legends`]) it shows what the
 /// frame draws: only the layers listed there, with their classes. Without, every class of every
 /// visible layer. `opts` leaves out `<all other values>` and the layers it names, either way, and
@@ -938,9 +961,7 @@ pub(super) fn legend_rows_missing<'a>(
                 Some((_, entries)) => entries.clone(),
                 None => continue,
             },
-            // A classified raster's every class (#1679).
-            None if l.is_raster() => raster_classes(l, true).unwrap_or_default(),
-            None => l.with_size_legend(l.renderer.legend()),
+            None => every_class(l),
         };
         if drawn.is_none() && opts.show_no_data {
             entries.extend(l.renderer.no_data_legend(&l.dataset, None));
@@ -969,7 +990,14 @@ pub(super) fn legend_rows_missing<'a>(
         if opts.names {
             rows.push(LegendRow::Head(opts.shown(&l.name)));
         }
-        rows.extend(entries.into_iter().map(|en| LegendRow::Class(l, en)));
+        // The legend's own text for a class, by the label the layer gives it (#3187).
+        let own = opts.class_labels.of(&l.name);
+        rows.extend(entries.into_iter().map(|mut en| {
+            if let Some(text) = own.and_then(|o| o.get(&en.label)) {
+                en.label.clone_from(text);
+            }
+            LegendRow::Class(l, en)
+        }));
     }
     (rows, missing)
 }
@@ -1227,7 +1255,11 @@ pub fn legend_sizes_in_columns_mm<const N: usize>(
     (show_no_data, text_size): (bool, f64),
     (exclude, labels): (&[String], &BTreeMap<String, String>),
 ) -> Option<[(f64, f64); N]> {
-    let asked = LegendAsked { all_classes, hide_other, show_no_data, layer_names: true, text_size, exclude, labels };
+    // Measured with no class labels: publication's legends have none, and the public sizers that
+    // come here (`legend_sizes_mm`, `legend_sizes_with_no_data_mm`) take none. A saved legend is
+    // measured through `LegendAsked`, which carries its own.
+    let class_labels = &ClassLabels::NONE;
+    let asked = LegendAsked { all_classes, hide_other, show_no_data, layer_names: true, text_size, exclude, labels, class_labels };
     sizes_asked_mm(map, scale, &asked)
 }
 
@@ -1242,6 +1274,7 @@ pub struct LegendAsked<'a> {
     pub text_size: f64,
     pub exclude: &'a [String],
     pub labels: &'a BTreeMap<String, String>,
+    pub class_labels: &'a ClassLabels,
 }
 
 /// The columns and text size a legend's fit draws its rows at, and whether they are still wider
@@ -1257,10 +1290,10 @@ pub struct LegendFitted {
 /// The rows of the legend `asked` of `map` at the renderer's scale denominator `scale`, as the
 /// drawing makes them, given to `with`. `None` when a complete source can't be read.
 fn asked_rows<T>(map: &mut Map, scale: f64, asked: &LegendAsked, with: impl FnOnce(&[LegendRow]) -> T) -> Option<T> {
-    let LegendAsked { all_classes, hide_other, show_no_data, layer_names, text_size, exclude, labels } = *asked;
+    let LegendAsked { all_classes, hide_other, show_no_data, layer_names, text_size, exclude, labels, class_labels } = *asked;
     let drawn = if all_classes { None } else { Some(complete_shown_legends(map, scale, show_no_data, &mut None, &Env::default())?) };
     let size = legend_size(text_size);
-    let opts = LegendOptions { show_no_data, hide_other, names: layer_names, exclude, labels, scale, size, text_size };
+    let opts = LegendOptions { show_no_data, hide_other, names: layer_names, exclude, labels, class_labels, scale, size, text_size };
     Some(with(&legend_rows(map, drawn.as_deref(), &opts)))
 }
 

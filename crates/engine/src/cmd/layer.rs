@@ -7326,7 +7326,7 @@ pub(crate) fn legends_follow_layer(s: &mut Session, old: &str, new: Option<&str>
     }
     let shared = new.is_some_and(|n| named(s, n) > 1);
     let map = s.map().name.clone();
-    let mut unlabelled = 0usize;
+    let (mut unlabelled, mut unclassed) = (0usize, 0usize);
     for layout in &mut s.project.layouts {
         let frames: Vec<u32> = layout
             .elements
@@ -7335,7 +7335,7 @@ pub(crate) fn legends_follow_layer(s: &mut Session, old: &str, new: Option<&str>
             .map(|e| e.id)
             .collect();
         for e in &mut layout.elements {
-            if let rustgis_map::layout::ElementKind::Legend { frame, exclude, labels, .. } = &mut e.kind
+            if let rustgis_map::layout::ElementKind::Legend { frame, exclude, labels, class_labels, .. } = &mut e.kind
                 && frames.contains(frame)
             {
                 // Its label (#1654), taken off the old name; onto the new one unless another layer
@@ -7348,6 +7348,17 @@ pub(crate) fn legends_follow_layer(s: &mut Session, old: &str, new: Option<&str>
                         labels.insert(n.to_string(), l);
                     }
                     (Some(_), Some(_), true) => unlabelled += 1,
+                    _ => {}
+                }
+                // Its classes' labels (#3187) go the same way.
+                let keys: Vec<String> = class_labels.by_layer.keys().filter(|n| n.eq_ignore_ascii_case(old)).cloned().collect();
+                let classes = keys.iter().filter_map(|k| class_labels.by_layer.remove(k)).last();
+                match (new, classes, shared) {
+                    (Some(n), Some(c), false) => {
+                        class_labels.by_layer.retain(|x, _| !x.eq_ignore_ascii_case(n));
+                        class_labels.by_layer.insert(n.to_string(), c);
+                    }
+                    (Some(_), Some(_), true) => unclassed += 1,
                     _ => {}
                 }
                 match new {
@@ -7372,6 +7383,12 @@ pub(crate) fn legends_follow_layer(s: &mut Session, old: &str, new: Option<&str>
                 }
             }
         }
+    }
+    if let Some(n) = new.filter(|_| unclassed > 0) {
+        s.notify(
+            format!("'{old}', renamed '{n}', lost its class labels in {unclassed} legend(s): another layer is called '{n}', and a legend labels layers by name"),
+            false,
+        );
     }
     // The text given for the layer goes while the layer stays: said. (A removed layer's goes
     // with its row.)

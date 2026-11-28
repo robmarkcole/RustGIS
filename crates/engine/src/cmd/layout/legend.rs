@@ -119,8 +119,8 @@ pub(in crate::cmd::layout) fn tells_legend_fit(kind: &ElementKind, p: &Value) ->
     let ElementKind::Legend { columns, text_size, fit, .. } = kind else { return false };
     let given = |k: &str| p.get(k).is_some_and(|v| !v.is_null());
     let watched = *columns > 1 || *text_size != rustgis_map::layout::LEGEND_TEXT_PT || fit.kept() != LegendFit::Manual;
-    let refitted = ["w", "h", "title", "allClasses", "hideOther", "exclude", "labels"].iter().any(|k| given(k));
-    ["columns", "showNoData", "labels", "fit", "showLayerNames"].iter().any(|k| given(k))
+    let refitted = ["w", "h", "title", "allClasses", "hideOther", "exclude", "labels", "classLabels"].iter().any(|k| given(k));
+    ["columns", "showNoData", "labels", "classLabels", "fit", "showLayerNames"].iter().any(|k| given(k))
         || p.get("textSize").is_some()
         || (watched && refitted)
 }
@@ -144,6 +144,7 @@ pub(in crate::cmd::layout) fn say_legend_fit(s: &mut Session, li: usize, id: u32
         text_size,
         fit,
         show_layer_names,
+        class_labels,
         ..
     } = &e.kind
     else {
@@ -156,7 +157,7 @@ pub(in crate::cmd::layout) fn say_legend_fit(s: &mut Session, li: usize, id: u32
     let room = (e.w, e.h - if title.is_empty() { 0.0 } else { crate::render::layout::legend_title_mm(*text_size) });
     let (all_classes, hide_other, show_no_data, exclude, columns, labels, text_size) =
         (*all_classes, *hide_other, *show_no_data, exclude.clone(), *columns, labels.clone(), *text_size);
-    let (fit, layer_names) = (fit.kept(), show_layer_names.shown());
+    let (fit, layer_names, class_labels) = (fit.kept(), show_layer_names.shown(), class_labels.clone());
     let found = shown
         .and_then(|(name, center, scale)| Some((s.project.maps.iter_mut().find(|m| m.name.eq_ignore_ascii_case(&name))?, center, scale)));
     let Some((map, center, scale)) = found else {
@@ -172,6 +173,7 @@ pub(in crate::cmd::layout) fn say_legend_fit(s: &mut Session, li: usize, id: u32
         text_size,
         exclude: &exclude,
         labels: &labels,
+        class_labels: &class_labels,
     };
     let measured = if fit == LegendFit::Manual {
         let n = rustgis_map::layout::legend_columns_in_range(columns);
@@ -447,6 +449,120 @@ pub(in crate::cmd::layout) fn with_labels(
     }
     if out.len() > MAX_LEGEND_LABELS {
         return Err(format!("a legend can label at most {MAX_LEGEND_LABELS} layers"));
+    }
+    Ok(out)
+}
+
+/// The refusal for `classLabels` on an element other than a legend.
+pub(in crate::cmd::layout) const ONLY_LEGEND_CLASS_LABELS: &str = "only legends take classLabels";
+
+/// The shape a legend's `classLabels` takes.
+pub(in crate::cmd::layout) const CLASS_LABELS_SHAPE: &str =
+    r#"classLabels is an object of layer names and their classes' labels: {"<layer>": {"<class label>": "<text>" | null} | null}"#;
+
+/// The most class names a refusal lists.
+const CLASSES_SAID: usize = 10;
+
+/// A legend's `classLabels` as given: each layer, as the map spells it, with each class and the
+/// text to show for it (`None`: the layer's own label again), or `None` for the layer to show all
+/// of its own labels again.
+pub(in crate::cmd::layout) type GivenClassLabels = Vec<(String, Option<Vec<(String, Option<String>)>>)>;
+
+/// A legend's `classLabels` from `p` (#3187): `None` when not given; an empty list for `{}`, which
+/// shows every class's own label again. A text for a class the layer doesn't list or for a layer
+/// with no classes to rename, a layer the map hasn't or a layer named twice is an error; taking a
+/// text off isn't, whatever the layer lists now.
+pub(in crate::cmd::layout) fn legend_class_labels(
+    input: &impl crate::cmd::InputSource,
+    l: &Layout,
+    frame: u32,
+    p: &Value,
+) -> Result<Option<GivenClassLabels>, String> {
+    let Some(v) = p.get("classLabels").filter(|v| !v.is_null()) else { return Ok(None) };
+    let given = v.as_object().ok_or(CLASS_LABELS_SHAPE)?;
+    let too_many = || format!("a legend can label at most {MAX_LEGEND_LABELS} classes");
+    if given.len() > MAX_LEGEND_LABELS {
+        return Err(format!("classLabels names at most {MAX_LEGEND_LABELS} layers"));
+    }
+    let map = legend_map(input, l, frame)?;
+    let mut room = MAX_LEGEND_LABELS;
+    let mut out: GivenClassLabels = Vec::new();
+    for (n, classes) in given {
+        let classes = match classes {
+            Value::Null => None,
+            Value::Object(c) if c.is_empty() => None,
+            Value::Object(c) => Some(c),
+            _ => return Err(CLASS_LABELS_SHAPE.into()),
+        };
+        let name = legend_layer(map, n)?;
+        if out.iter().any(|(o, _)| o.eq_ignore_ascii_case(name)) {
+            return Err(format!("classLabels names layer '{name}' twice"));
+        }
+        let Some(classes) = classes else {
+            out.push((name.clone(), None));
+            continue;
+        };
+        room = room.checked_sub(classes.len()).ok_or_else(too_many)?;
+        // Read once a layer, and only if a text is given: layers may share a name.
+        let mut listed: Option<Vec<String>> = None;
+        let mut entries = Vec::new();
+        for (class, text) in classes {
+            let text = match text {
+                Value::Null => None,
+                Value::String(t) if t.trim().is_empty() => None,
+                Value::String(t) if t.chars().count() > MAX_LEGEND_LABEL_CHARS => {
+                    return Err(format!(
+                        "a legend's label is at most {MAX_LEGEND_LABEL_CHARS} characters ('{class}' of '{name}' has {})",
+                        t.chars().count()
+                    ));
+                }
+                Value::String(t) => Some(t.clone()),
+                _ => return Err(CLASS_LABELS_SHAPE.into()),
+            };
+            if text.is_some() {
+                let listed = listed.get_or_insert_with(|| {
+                    map.layers
+                        .iter()
+                        .filter(|l| l.name.eq_ignore_ascii_case(name))
+                        .flat_map(crate::render::layout::class_row_labels)
+                        .collect()
+                });
+                if listed.is_empty() {
+                    return Err(format!("'{name}' has no classes to rename; give its name in labels"));
+                }
+                if !listed.contains(class) {
+                    let more = if listed.len() > CLASSES_SAID { ", …" } else { "" };
+                    let some = listed.iter().take(CLASSES_SAID).cloned().collect::<Vec<_>>().join(", ");
+                    return Err(format!("'{name}' lists no class '{class}' (it lists: {some}{more})"));
+                }
+            }
+            entries.push((class.clone(), text));
+        }
+        out.push((name.clone(), Some(entries)));
+    }
+    Ok(Some(out))
+}
+
+/// A legend's class labels with those `given` ([`legend_class_labels`]) put in, class by class;
+/// none at all for an empty list. More than a legend keeps is an error.
+pub(in crate::cmd::layout) fn with_class_labels(kept: &ClassLabels, given: GivenClassLabels) -> Result<ClassLabels, String> {
+    let mut out = if given.is_empty() { ClassLabels::default() } else { kept.clone() };
+    for (name, classes) in given {
+        let spellings: Vec<String> = out.by_layer.keys().filter(|n| n.eq_ignore_ascii_case(&name)).cloned().collect();
+        let mut own: BTreeMap<String, String> = spellings.iter().filter_map(|n| out.by_layer.remove(n)).flatten().collect();
+        let Some(classes) = classes else { continue };
+        for (class, text) in classes {
+            match text {
+                Some(text) => own.insert(class, text),
+                None => own.remove(&class),
+            };
+        }
+        if !own.is_empty() {
+            out.by_layer.insert(name, own);
+        }
+    }
+    if out.by_layer.values().map(BTreeMap::len).sum::<usize>() > MAX_LEGEND_LABELS {
+        return Err(format!("a legend can label at most {MAX_LEGEND_LABELS} classes"));
     }
     Ok(out)
 }

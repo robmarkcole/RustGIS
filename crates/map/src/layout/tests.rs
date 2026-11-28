@@ -1966,3 +1966,48 @@ fn scale_bars_without_details_save_as_before() {
     }
     assert_eq!(ScaleBarFit::from_name("manual"), None);
 }
+
+/// A legend's class labels (#3187) save only when set; a hand-edited file's are brought into
+/// range and counted, and never fail the read.
+#[test]
+fn legend_class_labels_save_only_when_set_and_load_into_range() {
+    use serde_json::json;
+    let plain = r#"{"Legend":{"frame":1,"title":"L","all_classes":false,"hide_other":false}}"#;
+    let set = r#"{"Legend":{"frame":1,"title":"L","all_classes":false,"hide_other":false,"class_labels":{"a":{"x":"X"}}}}"#;
+    for (text, labelled) in [(plain, false), (set, true)] {
+        let k: ElementKind = serde_json::from_str(text).unwrap();
+        assert_eq!(serde_json::to_string(&k).unwrap(), text);
+        assert_eq!(k.legend_labels_classes(), labelled);
+    }
+    let long = "x".repeat(MAX_LEGEND_LABEL_CHARS + 1);
+    let many: serde_json::Map<String, serde_json::Value> = (0..=MAX_LEGEND_LABELS).map(|i| (format!("c{i:05}"), json!("t"))).collect();
+    // (what the file holds, what is kept, adjusted, cut: a cut element counts as adjusted too)
+    let cases = [
+        (json!(7), json!(null), 1, 0),
+        (json!(["a"]), json!(null), 1, 0),
+        (json!({"a": "X"}), json!(null), 1, 0),
+        (json!({"a": {"x": 3, "y": "Y"}}), json!({"a": {"y": "Y"}}), 1, 0),
+        (json!(null), json!(null), 0, 0),
+        // Blank texts and layers left with none only mean the layer's own labels.
+        (json!({"a": {"x": " "}, "b": {}}), json!(null), 1, 0),
+        (json!({"A": {"x": "X"}, "a": {"y": "Y"}}), json!({"A": {"x": "X"}}), 1, 1),
+        (json!({"a": {"x": long}}), json!({"a": {"x": "x".repeat(MAX_LEGEND_LABEL_CHARS)}}), 1, 1),
+        // A text blank once cut is no text: the layer's own label shows.
+        (json!({"a": {"x": format!("{}X", " ".repeat(MAX_LEGEND_LABEL_CHARS))}}), json!(null), 1, 1),
+    ];
+    let load = |given: &serde_json::Value| {
+        let frame = json!({"id": 1, "name": "f", "x": 0, "y": 0, "w": 100, "h": 100,
+            "kind": {"MapFrame": {"map": "M", "center": {"x": 0, "y": 0}, "scale": 1e6}}});
+        let legend = json!({"id": 2, "name": "l", "x": 0, "y": 0, "w": 50, "h": 50,
+            "kind": {"Legend": {"frame": 1, "title": "L", "all_classes": false, "hide_other": false, "class_labels": given}}});
+        let mut l: Layout = serde_json::from_value(json!({"name": "x", "width": 297, "height": 210, "elements": [frame, legend]})).unwrap();
+        let repairs = l.clamp();
+        let saved = serde_json::to_value(&l.element(2).unwrap().kind).unwrap()["Legend"]["class_labels"].clone();
+        (saved, repairs.elements_adjusted, repairs.elements_cut)
+    };
+    for (given, kept, adjusted, cut) in cases {
+        assert_eq!(load(&given), (kept, adjusted, cut), "{given}");
+    }
+    let (saved, _, cut) = load(&json!({"a": many}));
+    assert_eq!((saved["a"].as_object().unwrap().len(), cut), (MAX_LEGEND_LABELS, 1));
+}

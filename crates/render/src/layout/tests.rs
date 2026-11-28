@@ -741,6 +741,7 @@ fn an_ink_colours_legends_colorbars_tables_and_charts() {
         size: 1.0,
         names: true,
         text_size: 9.0,
+        class_labels: &NO_CLASS_LABELS,
     };
     let grey = ColorScale::Ramp { lo: 0.0, hi: 10.0, colors: vec![Rgba::rgb(0, 0, 0), Rgba::rgb(255, 255, 255)] };
     let bar = |ink| Bar {
@@ -808,6 +809,7 @@ fn layout_no_data_legend_follows_the_frame() {
             size: 1.0,
             names: true,
             text_size: 9.0,
+            class_labels: &NO_CLASS_LABELS,
         };
         legend_rows(map, drawn.as_deref(), &opts)
             .into_iter()
@@ -873,6 +875,7 @@ fn layout_text_clipping_uses_ink_and_visibility() {
             text_size: rustgis_map::layout::LEGEND_TEXT_PT,
             fit: rustgis_map::layout::LegendFit::Manual,
             show_layer_names: rustgis_map::layout::LayerNames::Shown,
+            class_labels: Default::default(),
         },
     );
     assert_eq!(clipped_text(&l, &[Map::new("m")], 96.0, &info), vec![(legend, "Legend".into())]);
@@ -902,6 +905,7 @@ impl Drop for ShortLegendWait {
 
 /// No layer labelled: every layer under its name.
 static NO_LABELS: BTreeMap<String, String> = BTreeMap::new();
+static NO_CLASS_LABELS: rustgis_map::layout::ClassLabels = rustgis_map::layout::ClassLabels::NONE;
 
 fn legend_page(url: &str) -> (Layout, Vec<Map>) {
     let (mut page, mut maps) = vector_page();
@@ -923,6 +927,7 @@ fn legend_page(url: &str) -> (Layout, Vec<Map>) {
             text_size: rustgis_map::layout::LEGEND_TEXT_PT,
             fit: rustgis_map::layout::LegendFit::Manual,
             show_layer_names: rustgis_map::layout::LayerNames::Shown,
+            class_labels: Default::default(),
         },
     );
     let mut tile = rustgis_map::TileLayer::new("Walls", rustgis_map::TileKind::Raster, "https://tiles.test/red/{z}/{x}/{y}.png");
@@ -1032,6 +1037,7 @@ fn an_svg_export_gives_up_on_held_legends_at_one_deadline() {
             text_size: rustgis_map::layout::LEGEND_TEXT_PT,
             fit: rustgis_map::layout::LegendFit::Manual,
             show_layer_names: rustgis_map::layout::LayerNames::Shown,
+            class_labels: Default::default(),
         },
     );
     // The thread-local budget and the shortened wait belong to this worker alone.
@@ -1091,6 +1097,7 @@ fn a_legend_says_from_the_lookup_that_draws_it_whether_a_picture_is_missing() {
         size: 1.0,
         names: true,
         text_size: 9.0,
+        class_labels: &NO_CLASS_LABELS,
     };
     let mut canvas = Canvas::new(200, 200).unwrap();
     let draw = |canvas: &mut Canvas| {
@@ -1403,6 +1410,7 @@ fn a_web_layers_legend_is_its_services_picture() {
             size: 1.0,
             names: true,
             text_size: 9.0,
+            class_labels: &NO_CLASS_LABELS,
         };
         crate::canvas::with_canvas(&mut pm, |c| legend(c, Rect::from_xywh(0.0, 0.0, width, 400.0).unwrap(), map, ("", 1), None, opts, 1.0));
         let hits: Vec<u32> = (0..pm.height())
@@ -1442,6 +1450,7 @@ fn a_web_layers_legend_is_its_services_picture() {
         size: 1.0,
         names: true,
         text_size: 9.0,
+        class_labels: &NO_CLASS_LABELS,
     };
     crate::canvas::with_canvas(&mut pm, |c| legend(c, Rect::from_xywh(0.0, 0.0, 70.0, 200.0).unwrap(), &map, ("", 1), None, opts, 1.0));
     let red_rows =
@@ -1765,6 +1774,7 @@ fn a_legends_rows_go_into_columns() {
         size: 1.0,
         names: true,
         text_size: 9.0,
+        class_labels: &NO_CLASS_LABELS,
     };
     let rows = legend_rows(&map, None, &opts());
     assert_eq!(rows.len(), 32);
@@ -1860,6 +1870,7 @@ fn a_layers_name_stays_with_its_class_only_in_columns() {
         size: 1.0,
         names: true,
         text_size: 9.0,
+        class_labels: &NO_CLASS_LABELS,
     };
     let rows = legend_rows(&map, None, &opts());
     let (starts, _) = flow_at(&rows, 2, LEGEND_ROW, (1e6, 1.0));
@@ -1893,6 +1904,7 @@ fn a_legends_columns_hold_large_point_symbols() {
         size: 1.0,
         names: true,
         text_size: 9.0,
+        class_labels: &NO_CLASS_LABELS,
     };
     let rows = legend_rows(&map, None, &opts);
     let tall = rows[1].height(1e6, 1.0);
@@ -1959,7 +1971,17 @@ fn point_rows_map(n: usize, symbol_size: Option<f64>) -> Map {
 /// A legend's options at 1:1e6 and its default text size, with or without its layers' names.
 fn opts(names: bool) -> LegendOptions<'static> {
     let text_size = rustgis_map::layout::LEGEND_TEXT_PT;
-    LegendOptions { show_no_data: false, hide_other: false, names, exclude: &[], labels: &NO_LABELS, scale: 1e6, size: 1.0, text_size }
+    LegendOptions {
+        show_no_data: false,
+        hide_other: false,
+        names,
+        exclude: &[],
+        labels: &NO_LABELS,
+        scale: 1e6,
+        size: 1.0,
+        text_size,
+        class_labels: &NO_CLASS_LABELS,
+    }
 }
 
 /// The legend of `map` titled `title`, its text `text_size` points, in `columns` under `fit`, in
@@ -2128,6 +2150,7 @@ fn layer_names_can_be_left_off_a_legend() {
             text_size: rustgis_map::layout::LEGEND_TEXT_PT,
             exclude: &[],
             labels: &NO_LABELS,
+            class_labels: &NO_CLASS_LABELS,
         };
         legend_sizes_asked_mm(&mut map.clone(), 1e6, &asked).unwrap()[0].1
     };
@@ -2204,6 +2227,7 @@ fn fit_page(map: Map, (w, h): (f64, f64), (columns, fit): (usize, LegendFit), (t
             text_size,
             fit,
             show_layer_names: rustgis_map::layout::LayerNames::Shown,
+            class_labels: Default::default(),
         },
     );
     let scale = frame_render_scale(&map, Coord::new(0.0, 0.0), 150_000_000.0);
@@ -2224,6 +2248,7 @@ fn a_legends_fit_is_the_same_at_every_resolution() {
         text_size: 9.0,
         exclude: &[],
         labels: &NO_LABELS,
+        class_labels: &NO_CLASS_LABELS,
     };
     for (fit, room) in [(LegendFit::AdjustSize, (40.0, 20.0 * row)), (LegendFit::AdjustColumns, (100.0, 12.0 * row))] {
         let (page, mut maps, scale) = fit_page(rows_map(32), room, (1, fit), ("", 9.0));
@@ -2261,6 +2286,7 @@ fn a_fitted_legend_exports_as_a_manual_legend_of_its_fitted_size() {
         text_size: 9.0,
         exclude: &[],
         labels: &NO_LABELS,
+        class_labels: &NO_CLASS_LABELS,
     };
     let info = PageInfo::default();
     let export = |(page, mut maps, _): (Layout, Vec<Map>, f64)| {
@@ -2588,6 +2614,7 @@ fn a_legend_measured_in_its_own_columns_lays_out_only_those() {
         text_size: 9.0,
         exclude: &[],
         labels: &NO_LABELS,
+        class_labels: &NO_CLASS_LABELS,
     };
     let six = legend_sizes_asked_mm(&mut map, 1e6, &asked).unwrap();
     for (columns, laid_in) in [(0, 1), (1, 1), (2, 2), (3, 3), (6, 6), (9, 6)] {
@@ -2637,6 +2664,7 @@ fn a_legend_shows_a_layers_label() {
             size: 1.0,
             names: true,
             text_size: 9.0,
+            class_labels: &NO_CLASS_LABELS,
         };
         legend_rows(&map, None, &opts)
             .iter()
@@ -2671,6 +2699,7 @@ fn a_legend_shows_a_layers_label() {
             size: 1.0,
             names: true,
             text_size: 9.0,
+            class_labels: &NO_CLASS_LABELS,
         };
         crate::canvas::with_canvas(&mut pm, |c| {
             legend(c, Rect::from_xywh(0.0, 0.0, 400.0, 200.0).unwrap(), &map, ("", 1), None, opts, 1.0)
@@ -2723,6 +2752,7 @@ fn legends_leave_out_what_the_frame_does_not_draw() {
             size: 1.0,
             names: true,
             text_size: 9.0,
+            class_labels: &NO_CLASS_LABELS,
         };
         crate::canvas::with_canvas(&mut pm, |c| {
             legend(c, Rect::from_xywh(0.0, 0.0, 300.0, 400.0).unwrap(), map, ("", 1), drawn, opts, 1.0)
@@ -2761,6 +2791,7 @@ fn legends_leave_out_what_the_frame_does_not_draw() {
                     size: 1.0,
                     names: true,
                     text_size: 9.0,
+                    class_labels: &NO_CLASS_LABELS,
                 },
                 1.0,
             )
@@ -3038,6 +3069,7 @@ fn a_legend_lists_a_classified_rasters_classes() {
         size: 1.0,
         names: true,
         text_size: 9.0,
+        class_labels: &NO_CLASS_LABELS,
     };
     let labels = |rows: &[LegendRow]| -> Vec<String> {
         rows.iter()
@@ -6938,6 +6970,7 @@ fn point_legend(map: &Map) -> Pixmap {
         size: 1.0,
         names: true,
         text_size: 9.0,
+        class_labels: &NO_CLASS_LABELS,
     };
     crate::canvas::with_canvas(&mut pm, |c| legend(c, Rect::from_xywh(0.0, 0.0, 200.0, 200.0).unwrap(), map, ("", 1), None, opts, 1.0));
     pm
@@ -6956,6 +6989,7 @@ fn recorded_legend(map: &Map, side: u32) -> Pixmap {
         size: 1.0,
         names: true,
         text_size: 9.0,
+        class_labels: &NO_CLASS_LABELS,
     };
     legend(&mut c, Rect::from_xywh(0.0, 0.0, side as f32, side as f32).unwrap(), map, ("", 1), None, opts, 1.0);
     let (_, _, items) = c.into_drawing().unwrap().finish();
@@ -7180,6 +7214,7 @@ fn a_legend_grows_to_hold_a_large_point() {
         size: 1.0,
         names: true,
         text_size: 9.0,
+        class_labels: &NO_CLASS_LABELS,
     };
     crate::canvas::with_canvas(&mut pm, |c| legend(c, Rect::from_xywh(0.0, 0.0, 200.0, 47.0).unwrap(), &map, ("", 1), None, opts, 1.0));
     assert!(pm.data() == blank.data());
@@ -7224,6 +7259,7 @@ fn a_legends_text_size_scales_its_rows_but_not_its_point_symbols() {
         size: 2.0,
         names: true,
         text_size: 18.0,
+        class_labels: &NO_CLASS_LABELS,
     };
     crate::canvas::with_canvas(&mut pm, |c| legend(c, Rect::from_xywh(0.0, 0.0, 200.0, 200.0).unwrap(), &map, ("", 1), None, opts, 1.0));
     assert!(same_corner(&pm, &drawn_point(&s(40.0), &[], (24.0, 24.0), 1.0), 48, 48), "the symbol as the map draws it");
@@ -7643,6 +7679,7 @@ fn a_recorded_point_is_cut_at_its_box() {
         size: 1.0,
         names: true,
         text_size: 9.0,
+        class_labels: &NO_CLASS_LABELS,
     };
     legend(&mut c, Rect::from_xywh(0.5, 0.5, 2099.0, 2099.0).unwrap(), &map, ("", 1), None, opts, 1.0);
     let (_, _, items) = c.into_drawing().unwrap().finish();
@@ -7776,6 +7813,7 @@ fn an_oversized_point_stays_in_its_row() {
             size: 1.0,
             names: true,
             text_size: 9.0,
+            class_labels: &NO_CLASS_LABELS,
         };
         crate::canvas::with_canvas(&mut pm, |c| {
             legend(c, Rect::from_xywh(0.0, 0.0, 2100.0, 2100.0).unwrap(), &map, ("", 1), None, opts, 1.0)
@@ -7814,6 +7852,7 @@ fn a_see_through_point_larger_than_the_canvas_covers_it_from_off_its_edge() {
         size: 1.0,
         names: true,
         text_size: 9.0,
+        class_labels: &NO_CLASS_LABELS,
     };
     crate::canvas::with_canvas(&mut pm, |c| {
         legend(c, Rect::from_xywh(-50.0, -50.0, 2100.0, 2100.0).unwrap(), &map, ("", 1), None, opts, 1.0)
@@ -8181,4 +8220,55 @@ fn section_lines_are_drawn_over_their_frame() {
     };
     let (solid, half) = (faded(255), faded(128));
     assert!(solid == (0, 0, 255) && half.2 == 255 && (100..160).contains(&half.0), "{solid:?} {half:?}");
+}
+
+/// A legend's own text for a class (#3187) stands in for the label the layer gives it, in its rows
+/// and so in what is measured; every other row, and the layer, keep their labels.
+#[test]
+fn a_legend_labels_a_layers_classes_itself() {
+    use rustgis_map::layout::ClassLabels;
+    let mut map = rows_map(4);
+    let labels_of = |rows: &[LegendRow]| -> Vec<String> {
+        rows.iter().filter_map(|r| if let LegendRow::Class(_, e) = r { Some(e.label.clone()) } else { None }).collect()
+    };
+    let listed = ClassLabels::NONE;
+    let opts = |class_labels, hide_other| LegendOptions {
+        show_no_data: false,
+        hide_other,
+        names: true,
+        exclude: &[],
+        labels: &NO_LABELS,
+        class_labels,
+        scale: 1e6,
+        size: 1.0,
+        text_size: 9.0,
+    };
+    assert_eq!(labels_of(&legend_rows(&map, None, &opts(&listed, false))), ["c0", "c1", "c99"]);
+    assert_eq!(class_row_labels(&map.layers[0]), ["c0", "c1", "c99"]);
+    let mut own = ClassLabels::default();
+    own.by_layer.insert(
+        "PTS".into(),
+        BTreeMap::from([("c0".into(), "First".into()), ("c99".into(), "Elsewhere".into()), ("gone".into(), "Unused".into())]),
+    );
+    assert_eq!(labels_of(&legend_rows(&map, None, &opts(&own, false))), ["First", "c1", "Elsewhere"]);
+    // The fallback row is still the fallback, whatever it says.
+    assert_eq!(labels_of(&legend_rows(&map, None, &opts(&own, true))), ["First", "c1"]);
+    assert_eq!(class_row_labels(&map.layers[0]), ["c0", "c1", "c99"], "the layer keeps its own");
+    // A longer text is measured as it is drawn.
+    let mut width = |class_labels: &ClassLabels| {
+        let asked = LegendAsked {
+            all_classes: true,
+            hide_other: false,
+            show_no_data: false,
+            layer_names: true,
+            text_size: 9.0,
+            exclude: &[],
+            labels: &NO_LABELS,
+            class_labels,
+        };
+        legend_size_asked_mm(&mut map, 1e6, &asked, 1).unwrap().0
+    };
+    let plain = width(&listed);
+    own.by_layer.get_mut("PTS").unwrap().insert("c1".into(), "A much longer text for the second class".into());
+    assert!(width(&own) > plain);
 }

@@ -7,10 +7,10 @@ use std::sync::LazyLock;
 
 use rustgis_geom::{Coord, Extent};
 use rustgis_map::layout::{
-    Arrange, ArrowStyle, Background, CHART_BAR, CHART_BARS, CHART_OUTLINE, ChartOrder, ChartOutline, CoordFormat, ElementKind, FontFamily,
-    FrameShape, GRID_LABEL_PT, Grid, GridEdges, GridKind, GridStyle, Guides, LAYOUT_TEXT_SIZE, LINE_SPACING, LayerNames, Layout, LegendFit,
-    LineDir, LineHead, MAX_CHART_BARS, MAX_CHART_DECIMALS, MAX_CHART_OUTLINE_WIDTH, MAX_COLORBAR_TICKS, MAX_GRID_WIDTH, MAX_GUIDES,
-    MAX_LEGEND_COLUMNS, MAX_LEGEND_LABEL_CHARS, MAX_LEGEND_LABELS, MAX_LINE_SPACING, MAX_SCALE_BEFORE_ZERO, MAX_SCALE_DECIMALS,
+    Arrange, ArrowStyle, Background, CHART_BAR, CHART_BARS, CHART_OUTLINE, ChartOrder, ChartOutline, ClassLabels, CoordFormat, ElementKind,
+    FontFamily, FrameShape, GRID_LABEL_PT, Grid, GridEdges, GridKind, GridStyle, Guides, LAYOUT_TEXT_SIZE, LINE_SPACING, LayerNames,
+    Layout, LegendFit, LineDir, LineHead, MAX_CHART_BARS, MAX_CHART_DECIMALS, MAX_CHART_OUTLINE_WIDTH, MAX_COLORBAR_TICKS, MAX_GRID_WIDTH,
+    MAX_GUIDES, MAX_LEGEND_COLUMNS, MAX_LEGEND_LABEL_CHARS, MAX_LEGEND_LABELS, MAX_LINE_SPACING, MAX_SCALE_BEFORE_ZERO, MAX_SCALE_DECIMALS,
     MAX_SCALE_DIVISIONS, MAX_SCALE_SUBDIVISIONS, MAX_SECTIONS, MAX_TICK_MM, MAX_UNIT_LABEL_CHARS, MIN_ELEMENT_MM, MIN_LINE_SPACING,
     MapSeries, Orientation, PAGES, SCALE_BAR_TEXT_PT, ScaleBarFit, ScaleBarStyle, ScaleLabelPosition, ScaleUnits, Section, SectionLine,
     TextAlign, TextCase, TextVAlign, TickSide, UnitLabelPosition, fit_scale, line_angle, line_at_angle, line_length,
@@ -207,6 +207,7 @@ pub fn commands() -> Vec<C> {
                 r##""exclude"?: [layer names] (legend: layers it leaves out though the map draws them), "##,
                 r##""columns"?: 1..6 (legend: the columns its rows are laid in; default 1; with a fit that adds columns, the fewest it starts from), "##,
                 r##""textSize"?: points, 4 to 100 (legend: its layers' names and classes' labels, its title, rows, swatches and gaps following in proportion and a point symbol keeping the size the map draws it at; default 9; scaleBar: its labels, the room over the bar and between them following, the bar keeping its size; default 8; refused outside that range, and for other kinds unless null, as showNoData is), "##,
+                r##""classLabels"?: {"<layer>": {"<class label>": "<text>"}} (legend: its own text for a class, by the label the layer shows for it, up to 200 characters; the layer keeps its label; a layer or class it can't find is refused), "##,
                 r##""showLayerNames"?: bool (legend: the name over each layer's classes and over a web layer's legend picture; default true; a layer drawn in one symbol keeps its name; refused for other kinds), "##,
                 r##""orientation"?: "horizontal"|"vertical" (colorbar; chart: bars running across, the default, or columns standing up, each label centred under its column), "##,
                 r##""ticks"?: 2..21 (colorbar: labelled values, ends included), "##,
@@ -305,6 +306,7 @@ pub fn commands() -> Vec<C> {
                 r##""showNoData"?: bool (legend; default false), "##,
                 r##""exclude"?: [layer names] (legend; [] lists every layer again), "##,
                 r##""labels"?: {"<layer>": "<label>"|null} (legend: what it shows instead of a layer's name, up to 200 characters, a longer one is refused; each entry replaces that layer's label, null or "" shows its name again, {} every layer's; a layer the map hasn't is refused), "##,
+                r##""classLabels"?: {"<layer>": {"<class label>": "<text>"|null}|null} (legend, as in layout.addElement; each entry replaces that class's text, null or "" shows the layer's label again, a layer's null or {} all of its classes', {} every layer's), "##,
                 r##""columns"?: 1..6 (legend), "##,
                 r##""textSize"?: points, 4 to 100 (legend, scaleBar, as in layout.addElement, null giving each its default again; refused outside that range, and for other elements unless null), "##,
                 r##""showLayerNames"?: bool (legend, as in layout.addElement; null leaves it as it is), "##,
@@ -602,6 +604,7 @@ pub(crate) fn new_layout(s: &mut Session, p: &Value) -> CmdResult {
                     text_size: rustgis_map::layout::LEGEND_TEXT_PT,
                     fit: rustgis_map::layout::LegendFit::Manual,
                     show_layer_names: rustgis_map::layout::LayerNames::Shown,
+                    class_labels: Default::default(),
                 },
             );
             l.add("North Arrow", (side + sw / 2.0 - 8.0, m + 16.0 + fh * 0.62, 16.0, 24.0), ElementKind::north_arrow(frame));

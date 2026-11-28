@@ -171,6 +171,7 @@ const COMMAND_CAPABILITIES: &[(&str, CommandCheck)] = &[
     ("layout-section", command_uses_section),
     ("layout-text-size", command_uses_text_size),
     ("layout-legend-fit", command_uses_legend_fit),
+    ("layout-legend-class-labels", command_uses_legend_class_labels),
     ("layout-scale-bar-details", command_uses_scale_bar_details),
     ("dggs-system", command_uses_dggs_system),
     ("label-weight", command_weighs_labels),
@@ -427,6 +428,28 @@ fn command_uses_legend_fit(id: &str, params: &Value) -> bool {
         "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_uses_legend_fit)),
         _ => false,
     }
+}
+
+/// A layout command that gives a legend its own text for a class (#3187): an older reader ignores
+/// `classLabels`, and a legend saved with them, drawing the layer's labels. `null`, a blank text
+/// and an empty object only give those back.
+fn command_uses_legend_class_labels(id: &str, params: &Value) -> bool {
+    match id {
+        "layout.addElement" | "layout.update" => params.get("classLabels").and_then(Value::as_object).is_some_and(|layers| {
+            layers
+                .values()
+                .filter_map(Value::as_object)
+                .any(|classes| classes.values().any(|t| t.as_str().is_some_and(|t| !t.trim().is_empty())))
+        }),
+        "layout.import" | "report.existingTemplate" => imported_layout_uses(params, &["\"class_labels\""], legend_labels_classes),
+        "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_uses_legend_class_labels)),
+        _ => false,
+    }
+}
+
+/// Whether a layout element is a legend with its own text for a class.
+fn legend_labels_classes(e: &rustgis_map::layout::Element) -> bool {
+    e.kind.legend_labels_classes()
 }
 
 /// A layout command that changes a map frame's border (#2557): an older reader warns that it
@@ -1224,6 +1247,7 @@ fn layout_capabilities(layouts: &[rustgis_map::layout::Layout]) -> Vec<&'static 
         (elements().any(|e| e.kind.has_sections()), "layout-section"),
         (elements().any(|e| e.kind.has_custom_text_size()), "layout-text-size"),
         (elements().any(legends_fitting), "layout-legend-fit"),
+        (elements().any(legend_labels_classes), "layout-legend-class-labels"),
         (elements().any(bar_details), "layout-scale-bar-details"),
         (layouts.iter().any(|l| l.paper.is_some()), "layout-page-color"),
         (elements().any(text_statistics), "layout-text-statistics"),
@@ -1538,6 +1562,7 @@ mod tests {
             (&["layout-section"], "layout.update", json!({"element": 1, "section": {"name": "A", "y": 0}})),
             (&["layout-text-size"], "layout.update", json!({"element": 1, "textSize": 12})),
             (&["layout-legend-fit"], "layout.update", json!({"element": 1, "fit": "adjustSize"})),
+            (&["layout-legend-class-labels"], "layout.update", json!({"element": 1, "classLabels": {"a": {"x": "X"}}})),
             (&["dggs-system"], "a5Grid", json!({"system": "H3"})),
             (&["dggs-system"], "a5Aggregate", json!({"system": "S2"})),
             (&["label-weight"], "labels.placement", json!({"weight": 9})),

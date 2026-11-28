@@ -1963,6 +1963,7 @@ pub(in crate::cmd::layout) fn publication(s: &mut Session, p: &Value) -> CmdResu
                     text_size: legend_pt,
                     fit: LegendFit::Manual,
                     show_layer_names: LayerNames::Shown,
+                    class_labels: Default::default(),
                 },
             );
         }

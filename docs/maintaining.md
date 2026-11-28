@@ -305,6 +305,13 @@ Saved `layout.addElement` and `layout.update` commands that set one require it t
 `fit` values need nothing. A saved `layout.import` whose `text` has such a legend requires it as
 well, and a layout file (`.rgislayout`) with one lists it in its header.
 
+Projects with a legend that gives a class its own text (`class_labels` on a legend element)
+require `layout-legend-class-labels`, so an older reader refuses them instead of drawing the
+layer's labels and saving the legend again without its own (#3187). Saved `layout.addElement` and
+`layout.update` commands whose `classLabels` give a text require it too; `null`, a blank text and
+an empty object need nothing. A saved `layout.import` whose `text` has such a legend requires it as
+well, and a layout file (`.rgislayout`) with one lists it in its header.
+
 Projects with a scale bar that has subdivisions, divisions before zero, labels below, a unit
 label of its own or placed elsewhere, decimals or a fit other than the defaults
 (`subdivisions`, `divisions_before_zero`, `label_position`, `unit_label`, `unit_label_position`,

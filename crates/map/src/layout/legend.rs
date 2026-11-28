@@ -11,6 +11,102 @@ pub const MAX_LEGEND_LABELS: usize = 1000;
 /// The most characters of a legend's label for a layer.
 pub const MAX_LEGEND_LABEL_CHARS: usize = 200;
 
+/// A legend's own labels for its layers' classes (#3187): by the layer's name (any case), the
+/// label the layer gives a class, and the text this legend shows instead.
+///
+/// A file's value of another shape is read keeping its good entries and marked `damaged`, so the
+/// read never fails; [`Layout::clamp`] clears the mark and counts the element.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClassLabels {
+    pub by_layer: BTreeMap<String, BTreeMap<String, String>>,
+    damaged: bool,
+}
+
+impl ClassLabels {
+    /// No class labelled otherwise.
+    pub const NONE: ClassLabels = ClassLabels { by_layer: BTreeMap::new(), damaged: false };
+
+    pub fn is_empty(&self) -> bool {
+        self.by_layer.is_empty()
+    }
+
+    /// The labels given for the classes of the layer named `name`, in any case.
+    pub fn of(&self, name: &str) -> Option<&BTreeMap<String, String>> {
+        self.by_layer.get(name).or_else(|| self.by_layer.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, c)| c))
+    }
+
+    /// Brought into range, as the layers' labels are: blank ones and layers left with none go,
+    /// one entry per layer in any case, at most [`MAX_LEGEND_LABELS`] classes in all, each text
+    /// cut to [`MAX_LEGEND_LABEL_CHARS`]. Whether anything was cut.
+    pub(super) fn clamp(&mut self) -> bool {
+        // Cleared, not counted here: `Layout::clamp` counts the element as adjusted because the
+        // mark differs from the copy it took before.
+        self.damaged = false;
+        let mut cut = false;
+        let mut seen = std::collections::HashSet::new();
+        let mut room = MAX_LEGEND_LABELS;
+        self.by_layer.retain(|name, classes| {
+            // Cut first: a text can be blank only once cut.
+            classes.retain(|_, text| {
+                let end = text.char_indices().nth(MAX_LEGEND_LABEL_CHARS).map_or(text.len(), |(i, _)| i);
+                cut |= end < text.len();
+                text.truncate(end);
+                !text.trim().is_empty()
+            });
+            if classes.is_empty() {
+                return false;
+            }
+            if room == 0 || !seen.insert(name.to_ascii_lowercase()) {
+                cut = true;
+                return false;
+            }
+            while classes.len() > room {
+                classes.pop_last();
+                cut = true;
+            }
+            room -= classes.len();
+            true
+        });
+        cut
+    }
+}
+
+impl Serialize for ClassLabels {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.by_layer.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ClassLabels {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<ClassLabels, D::Error> {
+        use serde_json::Value;
+        let mut read = ClassLabels::default();
+        match Value::deserialize(d)? {
+            Value::Null => {}
+            Value::Object(layers) => {
+                for (layer, classes) in layers {
+                    let Value::Object(classes) = classes else {
+                        read.damaged = true;
+                        continue;
+                    };
+                    let mut kept = BTreeMap::new();
+                    for (class, text) in classes {
+                        match text {
+                            Value::String(text) => {
+                                kept.insert(class, text);
+                            }
+                            _ => read.damaged = true,
+                        }
+                    }
+                    read.by_layer.insert(layer, kept);
+                }
+            }
+            _ => read.damaged = true,
+        }
+        Ok(read)
+    }
+}
+
 /// How a legend fits its rows into its box.
 ///
 /// `Invalid` is what a file's unknown name or wrong kind of value is read as; it is never kept:

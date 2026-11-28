@@ -431,6 +431,18 @@ pub(in crate::cmd::layout) fn update(s: &mut Session, p: &Value) -> CmdResult {
             _ => None,
         }
     };
+    // And its classes' labels, the same way.
+    let new_class_labels = {
+        let l = s.project.layouts.get(li).ok_or("no layout")?;
+        match l.element(id).map(|e| &e.kind) {
+            Some(ElementKind::Legend { frame, class_labels, .. }) => match legend_class_labels(s, l, *frame, p)? {
+                Some(given) => Some(with_class_labels(class_labels, given)?),
+                None => None,
+            },
+            _ if p.get("classLabels").is_some_and(|v| !v.is_null()) => return Err(ONLY_LEGEND_CLASS_LABELS.into()),
+            _ => None,
+        }
+    };
     // Its background (#2257): the keys given over those it has, or none with null.
     let new_background = {
         let e = s.project.layouts.get(li).and_then(|l| l.element(id)).ok_or_else(|| format!("no element {id}"))?;
@@ -577,8 +589,12 @@ pub(in crate::cmd::layout) fn update(s: &mut Session, p: &Value) -> CmdResult {
             text_size,
             fit,
             show_layer_names,
+            class_labels,
             ..
         } => {
+            if let Some(given) = new_class_labels {
+                *class_labels = given;
+            }
             if let Some(names) = new_exclude {
                 *exclude = names;
             }

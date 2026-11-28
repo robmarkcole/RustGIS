@@ -91,7 +91,11 @@ pub(in crate::cmd::layout) fn element_inputs(input: &crate::cmd::InputContext<'_
     }
     let layout = s.project.layouts.get(index(input, p)?).ok_or("no layout")?;
     let frame = frame_of(layout, p)?;
-    if kind == "legend" && legend_exclude(input, layout, frame, p)?.is_none() && legend_labels(input, layout, frame, p)?.is_none() {
+    if kind == "legend"
+        && legend_exclude(input, layout, frame, p)?.is_none()
+        && legend_labels(input, layout, frame, p)?.is_none()
+        && legend_class_labels(input, layout, frame, p)?.is_none()
+    {
         let mut inputs = object_inputs(input, p)?;
         inputs.state["frame"] = json!(frame);
         return Ok(inputs);
@@ -106,7 +110,8 @@ pub(in crate::cmd::layout) fn element_inputs(input: &crate::cmd::InputContext<'_
             inputs.extend(crate::cmd::Inputs::named(map, [name.as_str()])?);
         }
     } else {
-        legend_inputs(&mut inputs, map, legend_exclude(input, layout, frame, p)?, legend_labels(input, layout, frame, p)?);
+        let (names, labels) = (legend_exclude(input, layout, frame, p)?, legend_labels(input, layout, frame, p)?);
+        legend_inputs(&mut inputs, map, names, labels, legend_class_labels(input, layout, frame, p)?);
     }
     inputs.maps.push(map.instance_id());
     inputs.state = json!({"layout":index(input,p)?,"frame":frame,"selectors":inputs.state});
@@ -219,8 +224,9 @@ pub(in crate::cmd::layout) fn update_inputs(input: &crate::cmd::InputContext<'_>
         }
         Some(ElementKind::Legend { frame, .. }) => {
             let (names, labels) = (legend_exclude(input, l, *frame, p)?, legend_labels(input, l, *frame, p)?);
-            if names.is_some() || labels.is_some() {
-                legend_inputs(&mut inputs, frame_map(input, l, *frame)?, names, labels);
+            let classes = legend_class_labels(input, l, *frame, p)?;
+            if names.is_some() || labels.is_some() || classes.is_some() {
+                legend_inputs(&mut inputs, frame_map(input, l, *frame)?, names, labels, classes);
             }
         }
         _ => {}
@@ -229,17 +235,18 @@ pub(in crate::cmd::layout) fn update_inputs(input: &crate::cmd::InputContext<'_>
     Ok(inputs)
 }
 
-/// The layers a legend's `exclude` and `labels` name, as inputs. Tile layers' names are stored
+/// The layers a legend's `exclude`, `labels` and `classLabels` name, as inputs. Tile layers' names are stored
 /// selector text, not invented layer/table identities.
 pub(in crate::cmd::layout) fn legend_inputs(
     inputs: &mut crate::cmd::Inputs,
     map: &Map,
     names: Option<Vec<String>>,
     labels: Option<Vec<(String, Option<String>)>>,
+    classes: Option<GivenClassLabels>,
 ) {
-    let named = names.iter().flatten().chain(labels.iter().flatten().map(|(n, _)| n));
+    let named = names.iter().flatten().chain(labels.iter().flatten().map(|(n, _)| n)).chain(classes.iter().flatten().map(|(n, _)| n));
     inputs.layers.extend(named.filter_map(|n| map.layer_by_name(n)).map(|l| (map.instance_id(), l.id)));
-    inputs.state = json!({"exclude": names, "labels": labels});
+    inputs.state = json!({"exclude": names, "labels": labels, "classLabels": classes});
 }
 
 /// Reference-only operations bind the actual chosen layout, without reading its stored maps.
@@ -271,7 +278,9 @@ pub(in crate::cmd::layout) fn element_selectors(kind: &ElementKind) -> Option<Va
         ElementKind::Chart { frame, layer, field, label, group, stack, .. } => {
             json!({"frame":frame,"layer":layer,"field":field,"label":label,"group":group,"stack":stack})
         }
-        ElementKind::Legend { frame, exclude, labels, .. } => json!({"frame":frame,"exclude":exclude,"labels":labels}),
+        ElementKind::Legend { frame, exclude, labels, class_labels, .. } => {
+            json!({"frame":frame,"exclude":exclude,"labels":labels,"classLabels":class_labels})
+        }
         ElementKind::Colorbar { frame, layer, .. } => json!({"frame":frame,"layer":layer}),
         ElementKind::NorthArrow { frame, .. } | ElementKind::ScaleBar { frame, .. } => json!({"frame":frame}),
         _ => return None,

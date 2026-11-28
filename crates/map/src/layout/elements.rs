@@ -147,6 +147,10 @@ pub enum ElementKind {
         /// layouts saved before keep their bytes.
         #[serde(default, skip_serializing_if = "LayerNames::is_shown")]
         show_layer_names: LayerNames,
+        /// Its own labels for its layers' classes (#3187); a class not in them shows the label its
+        /// layer gives it. Left out when empty, so layouts saved before keep their bytes.
+        #[serde(default, skip_serializing_if = "ClassLabels::is_empty")]
+        class_labels: ClassLabels,
     },
     /// The colour scale of a raster layer in a frame's map: a gradient bar for a stretch, steps
     /// for classes, a block per value for unique values and colour tables (#326).
@@ -426,6 +430,13 @@ impl ElementKind {
             return false;
         };
         !fit.is_manual() || !show_layer_names.is_shown() || legend_columns_in_range(*columns) > LEGEND_COLUMNS_BEFORE_FIT
+    }
+
+    /// Whether this is a legend with a text of its own for a class: a blank one, which a load
+    /// drops, isn't one.
+    pub fn legend_labels_classes(&self) -> bool {
+        let ElementKind::Legend { class_labels, .. } = self else { return false };
+        class_labels.by_layer.values().flat_map(|classes| classes.values()).any(|text| !text.trim().is_empty())
     }
 
     /// Whether this is a scale bar with any of the details set: subdivisions, divisions before

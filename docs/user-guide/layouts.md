@@ -430,7 +430,7 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
     short fills each column in turn and leaves out the last rows (a **Fit**, below, can change
     that).
     A legend says when its box loses rows or closes its columns up when it is given `"columns"`,
-    `"textSize"` (`null` included), `"showNoData"`, `"labels"`, `"fit"` or `"showLayerNames"`, and,
+    `"textSize"` (`null` included), `"showNoData"`, `"labels"`, `"classLabels"`, `"fit"` or `"showLayerNames"`, and,
     in columns, at a text size of its own or with a fit, when its box or what it lists changes. A
     legend in one column at the default size and with no fit is told so only when given one of
     those. A manual legend is checked when it is added or changed, as it always has been, not again
@@ -463,6 +463,17 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
     a fit, leaves its layer names off or has more than three columns can't be opened by an older
     RustGIS, and a layout file (`.rgislayout`) with such a legend lists that in its header, so an
     older RustGIS refuses it as well.
+  - **Class labels** (`"classLabels"`, commands and scripts only): the legend's own text for a
+    class, leaving the layer, the Layers pane and every other legend as they are:
+    `layout.update {"element": 3, "classLabels": {"Roads": {"Primary": "Main roads"}}}`.
+    A class is named by the label the layer shows for it, a range or `<all other values>` included;
+    its text is up to 200 characters. A text for the missing-value row shows when `"showNoData"` is
+    on. Each entry replaces that class's text; `null` or `""` shows the layer's label again, a
+    layer's `null` all of its own, and `{}` every layer's. A layer or class that isn't there is
+    refused, and a layer drawn in one symbol has no classes to rename (use `"labels"`). The text
+    follows a renamed layer. If the layer's label for a class changes later, the legend shows the
+    new one. A project or layout file with such a legend lists it in its `requires`, so a RustGIS
+    that checks that list and doesn't know the capability refuses to open it.
   - **Text size** (`"textSize"`, 4 to 100 points, 9 by default; a size outside that range is
     refused): the size of its layers' names and classes' labels. Its title, rows, indents and the
     gap between columns follow in proportion, and so do a web layer's legend pictures and the length

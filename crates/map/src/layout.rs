@@ -587,7 +587,8 @@ impl Layout {
                     }
                     cut |= Section::clamp_all(sections);
                 }
-                ElementKind::Legend { exclude, columns, labels, text_size, fit, show_layer_names, .. } => {
+                ElementKind::Legend { exclude, columns, labels, text_size, fit, show_layer_names, class_labels, .. } => {
+                    cut |= class_labels.clamp();
                     *text_size = layout_text_in_range(*text_size, LEGEND_TEXT_PT);
                     // A file's unknown name or wrong kind of value is read as a marker: back to the
                     // default.

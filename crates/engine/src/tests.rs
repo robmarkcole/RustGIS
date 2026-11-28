@@ -129,6 +129,9 @@ mod layout_publication_parts;
 #[path = "tests/layout_typed_values.rs"]
 mod layout_typed_values;
 
+#[path = "tests/layout_legend_class_labels.rs"]
+mod layout_legend_class_labels;
+
 #[path = "tests/layout_report_text.rs"]
 mod layout_report_text;
 
@@ -156,6 +159,8 @@ fn plugin_store_turn() -> std::sync::MutexGuard<'static, ()> {
     static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
     TURN.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
+
+static NO_CLASS_LABELS: rustgis_map::layout::ClassLabels = rustgis_map::layout::ClassLabels::NONE;
 
 fn world() -> Session {
     isolate_plugins();
@@ -8471,6 +8476,9 @@ fn hostile_junk() -> Vec<Value> {
         json!({"kind": "legend", "element": 1, "fit": {}, "showLayerNames": [null], "columns": f64::MAX}),
         json!({"kind": "legend", "element": 1, "fit": "x".repeat(5000), "showLayerNames": "true", "columns": -1}),
         json!({"kind": "text", "element": 1, "fit": "adjustSize", "showLayerNames": false}),
+        json!({"kind": "legend", "element": 1, "classLabels": {"x".repeat(5000): {"": "y".repeat(5000)}}}),
+        json!({"kind": "legend", "element": 1, "classLabels": [{"Countries": [null]}]}),
+        json!({"kind": "legend", "element": 1, "classLabels": {"Countries": {"Africa": f64::MAX}}}),
         // A QGIS project and style whose web layer and scale range are junk.
         json!({"text": "<qgis><projectlayers><maplayer type=\"raster\" hasScaleBasedVisibilityFlag=\"1\" minScale=\"NaN\" maxScale=\"-1e308\"><datasource>type=xyz&amp;url=&amp;zmax=999</datasource><layername></layername><provider>wms</provider><pipe><rasterrenderer opacity=\"inf\"/></pipe></maplayer></projectlayers></qgis>"}),
         // A label class placed along lines, with junk the placement and style read after it.
@@ -13164,6 +13172,7 @@ fn a_manual_legend_that_overflows_still_warns_and_a_fitted_one_does_not() {
         text_size: pt,
         exclude: &[],
         labels: &labels,
+        class_labels: &NO_CLASS_LABELS,
     };
     // A box as wide as its rows at 9 points, and half-way between their heights at 9 and at 4.
     let (big, small) = (legend_sizes(&mut s, frame, &at(9.0))[0], legend_sizes(&mut s, frame, &at(4.0))[0]);
@@ -13214,6 +13223,7 @@ fn a_fit_that_cannot_make_a_legend_fit_says_so() {
         text_size: pt,
         exclude: &[],
         labels: &labels,
+        class_labels: &NO_CLASS_LABELS,
     };
     let (big, small) = (legend_sizes(&mut s, frame, &at(9.0)), legend_sizes(&mut s, frame, &at(4.0)));
     // A box less than half as tall as its rows in six columns at 4 points: no fit makes them fit.
@@ -13291,6 +13301,7 @@ fn a_report_says_the_fitted_legends_on_its_layouts_that_no_longer_fit() {
         text_size: pt,
         exclude: &[],
         labels: &labels,
+        class_labels: &NO_CLASS_LABELS,
     };
     let point = r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[2.35,48.85]}}]}"#;
     let added = json!({"fileName": "extra.geojson", "text": point, "name": "Extra"});
@@ -13354,6 +13365,7 @@ fn a_fitted_legend_that_no_longer_fits_says_so_at_export() {
         text_size: pt,
         exclude: &[],
         labels: &labels,
+        class_labels: &NO_CLASS_LABELS,
     };
     let point = r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[2.35,48.85]}}]}"#;
     let added = json!({"fileName": "extra.geojson", "text": point, "name": "Extra"});

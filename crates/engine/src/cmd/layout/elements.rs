@@ -290,6 +290,9 @@ pub(in crate::cmd::layout) fn add_element(s: &mut Session, p: &Value) -> CmdResu
         Some(_) if kind != "legend" && kind != "grid" => return Err(ONLY_LEGEND_LABELS.into()),
         _ => {}
     }
+    if kind != "legend" && gives(p, "classLabels") {
+        return Err(ONLY_LEGEND_CLASS_LABELS.into());
+    }
     // A family is a text's: refused elsewhere, as a legend's left-out layers are, so a script
     // doesn't take it as applied.
     if !matches!(kind, "text" | "dynamicText") && gives_font(p) {
@@ -391,6 +394,10 @@ pub(in crate::cmd::layout) fn add_element(s: &mut Session, p: &Value) -> CmdResu
                 Some(given) => with_labels(&BTreeMap::new(), given)?,
                 None => BTreeMap::new(),
             };
+            let class_labels = match legend_class_labels(s, l, frame, p)? {
+                Some(given) => with_class_labels(&ClassLabels::default(), given)?,
+                None => ClassLabels::default(),
+            };
             let text_size =
                 text_size_param(p, "textSize", rustgis_map::layout::LEGEND_TEXT_PT)?.unwrap_or(rustgis_map::layout::LEGEND_TEXT_PT);
             let fit = legend_fit_param(p)?.unwrap_or_default();
@@ -411,6 +418,7 @@ pub(in crate::cmd::layout) fn add_element(s: &mut Session, p: &Value) -> CmdResu
                     text_size,
                     fit,
                     show_layer_names,
+                    class_labels,
                 },
             )
         }
@@ -974,6 +982,7 @@ const ADD_LEGEND_KEYS: &[&str] = &[
     "exclude",
     "columns",
     "labels",
+    "classLabels",
     "textSize",
     "fit",
     "showLayerNames",
