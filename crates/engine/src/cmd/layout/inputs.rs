@@ -16,7 +16,7 @@ pub(in crate::cmd::layout) fn frame_layer_name(
         _ => return Err("no such frame".into()),
     };
     let m = s.project.maps.iter().find(|m| m.name.eq_ignore_ascii_case(&map)).ok_or_else(|| format!("no map '{map}'"))?;
-    let found = match ps(p, "layer") {
+    let found = match given_name(p, "layer", "a feature layer's name")? {
         Some(n) => m.layer_by_name(n),
         None => m.layers.iter().find(|l| !l.is_raster() && !l.graphics),
     };

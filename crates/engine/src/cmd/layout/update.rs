@@ -196,6 +196,11 @@ pub(in crate::cmd::layout) fn update(s: &mut Session, p: &Value) -> CmdResult {
     }
     // A new layer (tables and charts) or field (charts) must exist in the frame's map.
     let checked = checked_update(s, p, li, id)?;
+    // Only tables have rows: read before anything changes.
+    let new_rows = match s.project.layouts.get(li).and_then(|l| l.element(id)).map(|e| &e.kind) {
+        Some(ElementKind::Table { .. }) => table_rows(p)?,
+        _ => None,
+    };
     // A chart's options, read over its own on the layer it will chart.
     let (new_chart, chart_field, chart_said) = match chart_update(s, p, li, id, checked.as_ref())? {
         Some((o, f, said)) => (Some(o), f, said),
@@ -670,8 +675,8 @@ pub(in crate::cmd::layout) fn update(s: &mut Session, p: &Value) -> CmdResult {
             }
         }
         ElementKind::Table { rows, layer, .. } => {
-            if let Some(v) = p.get("rows").and_then(Value::as_u64) {
-                *rows = v.clamp(1, 500) as usize;
+            if let Some(v) = new_rows {
+                *rows = v;
             }
             if let Some((l, _)) = &checked {
                 *layer = l.clone();
@@ -826,7 +831,15 @@ pub(in crate::cmd::layout) fn checked_update(
     Ok({
         let l = s.project.layouts.get(li).ok_or("no layout")?;
         let e = l.element(id).ok_or_else(|| format!("no element {id}"))?;
-        match (&e.kind, ps(p, "layer"), ps(p, "field")) {
+        let new_layer = match &e.kind {
+            ElementKind::Table { .. } | ElementKind::Chart { .. } => given_name(p, "layer", "a feature layer's name")?,
+            _ => None,
+        };
+        let new_field = match &e.kind {
+            ElementKind::Chart { .. } => given_name(p, "field", "a field's name")?,
+            _ => ps(p, "field"),
+        };
+        match (&e.kind, new_layer, new_field) {
             (ElementKind::Table { frame, layer, .. } | ElementKind::Chart { frame, layer, .. }, nl, nf) if nl.is_some() || nf.is_some() => {
                 let map = match l.element(*frame).map(|f| &f.kind) {
                     Some(ElementKind::MapFrame { map, .. }) => map.clone(),

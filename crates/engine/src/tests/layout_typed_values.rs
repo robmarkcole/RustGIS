@@ -210,3 +210,71 @@ fn a_null_or_valid_colorbar_legend_or_shape_value_is_read_as_before() {
     let chart = id(&s, |k| matches!(k, ElementKind::Chart { .. }));
     refused(&mut s, "layout.update", json!({"element": chart, "title": 17}), "a chart's title is a text");
 }
+
+/// [`laid_out`], with a table and a chart too: their ids.
+fn with_data() -> (Session, u64, u64) {
+    let mut s = laid_out();
+    for kind in ["table", "chart"] {
+        s.run("layout.addElement", &json!({"kind": kind, "layer": "Countries"})).unwrap();
+    }
+    let table = id(&s, |k| matches!(k, ElementKind::Table { .. }));
+    let chart = id(&s, |k| matches!(k, ElementKind::Chart { .. }));
+    (s, table, chart)
+}
+
+fn rows(s: &Session) -> usize {
+    elements(s)
+        .iter()
+        .rev()
+        .find_map(|e| match &e.kind {
+            ElementKind::Table { rows, .. } => Some(*rows),
+            _ => None,
+        })
+        .unwrap()
+}
+
+#[test]
+fn a_table_or_chart_layer_field_or_rows_of_the_wrong_type_is_refused() {
+    let (mut s, table, chart) = with_data();
+    for (kind, element, key) in [("table", table, "layer"), ("table", table, "rows"), ("chart", chart, "layer"), ("chart", chart, "field")]
+    {
+        // A number is what rows takes: ones that aren't whole or are below 0 stand in for it, and so
+        // does text.
+        let bad =
+            if key == "rows" { vec![json!(2.5), json!(-3), json!("many"), json!(true), json!([]), json!({})] } else { wrong().to_vec() };
+        for v in bad {
+            let mut add = json!({"kind": kind});
+            add[key] = v.clone();
+            refused(&mut s, "layout.addElement", add, &format!("{key} is "));
+            let mut update = json!({"element": element});
+            update[key] = v;
+            refused(&mut s, "layout.update", update, &format!("{key} is "));
+        }
+    }
+}
+
+#[test]
+fn a_null_or_valid_table_or_chart_value_is_taken() {
+    let (mut s, table, chart) = with_data();
+    let kept = serde_json::to_value(elements(&s)).unwrap();
+    s.run("layout.update", &json!({"element": table, "layer": null, "rows": null})).unwrap();
+    s.run("layout.update", &json!({"element": chart, "layer": null, "field": null})).unwrap();
+    assert_eq!(serde_json::to_value(elements(&s)).unwrap(), kept);
+    // A table has no field: one given to it is ignored, as before.
+    s.run("layout.update", &json!({"element": table, "field": 17})).unwrap();
+    assert_eq!(serde_json::to_value(elements(&s)).unwrap(), kept);
+    s.run("layout.addElement", &json!({"kind": "table", "layer": null, "rows": null})).unwrap();
+    assert_eq!(rows(&s), 12);
+    s.run("layout.addElement", &json!({"kind": "chart", "layer": null, "field": null})).unwrap();
+    for (given, taken) in [(json!(5), 5), (json!("7"), 7), (json!(0), 1), (json!(900), 500)] {
+        s.run("layout.addElement", &json!({"kind": "table", "rows": given})).unwrap();
+        assert_eq!(rows(&s), taken, "add {given}");
+        let table = id(&s, |k| matches!(k, ElementKind::Table { .. }));
+        s.run("layout.update", &json!({"element": table, "rows": 3})).unwrap();
+        s.run("layout.update", &json!({"element": table, "rows": given})).unwrap();
+        assert_eq!(rows(&s), taken, "update {given}");
+    }
+    // A chart keeps its own messages for a name the layer doesn't have.
+    refused(&mut s, "layout.addElement", json!({"kind": "chart", "field": "nope"}), "no field 'nope'");
+    refused(&mut s, "layout.update", json!({"element": chart, "field": "nope"}), "no numeric field 'nope'");
+}

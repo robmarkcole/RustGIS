@@ -51,6 +51,17 @@ pub(in crate::cmd::layout) fn given_num(p: &Value, k: &str, what: &str) -> Resul
     }
 }
 
+/// A table's "rows", when it's given (and not null), held to 1 to 500: an error when it's not a
+/// whole number of 0 or more.
+pub(in crate::cmd::layout) fn table_rows(p: &Value) -> Result<Option<usize>, String> {
+    let what = "a whole number of 0 or more";
+    match given_num(p, "rows", what)? {
+        Some(n) if n >= 0.0 && n.fract() == 0.0 => Ok(Some(n.clamp(1.0, 500.0) as usize)),
+        Some(_) => Err(format!("rows is {what}")),
+        None => Ok(None),
+    }
+}
+
 /// A line's "dir": `default` when it's not given (or null), an error when it's not a direction's
 /// name.
 pub(in crate::cmd::layout) fn line_dir(p: &Value, default: LineDir) -> Result<LineDir, String> {
@@ -453,7 +464,7 @@ pub(in crate::cmd::layout) fn add_element(s: &mut Session, p: &Value) -> CmdResu
         "table" => {
             let frame = frame_of(l, p)?;
             let layer = frame_layer_name(s, l, frame, p)?;
-            let rows = p.get("rows").and_then(Value::as_u64).unwrap_or(12).clamp(1, 500) as usize;
+            let rows = table_rows(p)?.unwrap_or(12);
             ("Table Frame", place(p, l, (15.0, ph * 0.6, pw * 0.5, ph * 0.35))?, ElementKind::Table { frame, layer, rows, color: ink })
         }
         "chart" => {
@@ -466,7 +477,7 @@ pub(in crate::cmd::layout) fn add_element(s: &mut Session, p: &Value) -> CmdResu
                 return Err(said);
             }
             // Not given: the first numeric field, or for a count the field it groups by.
-            let field = match ps(p, "field") {
+            let field = match given_name(p, "field", "a field's name")? {
                 Some(fl) => ds.field_index(fl).and_then(|i| ds.fields.get(i)).ok_or_else(|| format!("no field '{fl}'"))?,
                 None => ds
                     .fields
