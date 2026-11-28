@@ -5,7 +5,7 @@ use super::{
 use crate::RustGisApp;
 use egui::{Event, Key, Modifiers, PointerButton, Pos2, Rect, vec2};
 use rustgis_engine::map::Rgba;
-use rustgis_engine::map::layout::{Background, ElementKind, INK, Layout};
+use rustgis_engine::map::layout::{Background, ElementKind, FrameShape, INK, Layout};
 use serde_json::json;
 use std::{cell::Cell, rc::Rc};
 
@@ -132,19 +132,76 @@ fn ink_reads_each_shape_as_drawn() {
     assert_eq!(inked(PAGE, None, turned(0.0), nothing), INK);
 }
 
-/// A map or a picture under an element has no one fill to read: the page decides, as before.
+/// A map or a picture under an element has no one fill to read, and hides whatever lies under it
+/// where it covers: the page decides, as before.
 #[test]
 fn ink_reads_no_map_or_picture() {
-    let picture = |l: &mut Layout| {
-        l.add("Picture", (0.0, 0.0, 100.0, 100.0), ElementKind::Picture { image: String::new() });
+    let picture = |rect| {
+        move |l: &mut Layout| {
+            l.add("Picture", rect, ElementKind::Picture { image: String::new() });
+        }
     };
-    assert_eq!(inked(PAGE, None, picture, nothing), INK);
-    assert_eq!(inked(NAVY, None, picture, nothing), PAGE);
-    let map = |l: &mut Layout| {
-        let kind = serde_json::from_value(json!({"MapFrame": {"map": "Map", "center": {"x": 0.0, "y": 0.0}, "scale": 1000000.0}}));
-        l.add("Map", (0.0, 0.0, 100.0, 100.0), kind.unwrap());
+    let map = |rect, shape: FrameShape| {
+        move |l: &mut Layout| {
+            let mut kind: ElementKind =
+                serde_json::from_value(json!({"MapFrame": {"map": "Map", "center": {"x": 0.0, "y": 0.0}, "scale": 1000000.0}})).unwrap();
+            if let ElementKind::MapFrame { shape: s, .. } = &mut kind {
+                *s = shape;
+            }
+            l.add("Map", rect, kind);
+        }
     };
-    assert_eq!(inked(NAVY, None, map, nothing), PAGE);
+    let full = (0.0, 0.0, 100.0, 100.0);
+    assert_eq!(inked(PAGE, None, picture(full), nothing), INK);
+    assert_eq!(inked(NAVY, None, picture(full), nothing), PAGE);
+    assert_eq!(inked(NAVY, None, map(full, FrameShape::Rectangle), nothing), PAGE);
+    // Whether a dark box under `over` still counts.
+    let boxed = |over: Box<dyn FnOnce(&mut Layout)>| {
+        let under = |l: &mut Layout| {
+            covering(DARK)(l);
+            over(l);
+        };
+        inked(PAGE, None, under, nothing)
+    };
+    assert_eq!(boxed(Box::new(picture(full))), INK, "hidden by a picture");
+    assert_eq!(boxed(Box::new(map(full, FrameShape::Rectangle))), INK, "hidden by a map");
+    assert_eq!(boxed(Box::new(picture((60.0, 60.0, 20.0, 20.0)))), PAGE, "a picture elsewhere");
+    // An image 4 by 1 pixels, drawn fitted and centred in its box: over (30, 30) in a box 60 mm
+    // tall, and leaving it bare in one 100 mm tall.
+    let image = |h: f64, data: &'static str| {
+        move |l: &mut Layout| {
+            l.add("Picture", (0.0, 0.0, 100.0, h), ElementKind::Picture { image: data.into() });
+        }
+    };
+    let wide = "iVBORw0KGgoAAAANSUhEUgAAAAQAAAABCAIAAAB2XpiaAAAAC0lEQVR4nGP4jwQATb8L9davaZUAAAAASUVORK5CYII=";
+    assert_eq!(boxed(Box::new(image(60.0, wide))), INK, "hidden by the image");
+    assert_eq!(boxed(Box::new(image(100.0, wide))), PAGE, "beside the image, in its box");
+    // The same size declared over data that doesn't decode: its placeholder covers the box.
+    let broken = "iVBORw0KGgoAAAANSUhEUgAAAAQAAAABCAIAAAB2XpiaAAAACElEQVRub3QgemxpYlVpEfcAAAAASUVORK5CYII=";
+    assert_eq!(boxed(Box::new(image(100.0, broken))), INK, "hidden by a placeholder");
+    // The centre (30, 30) is in this box, near its corner: outside its circle and its ellipse.
+    let corner = (28.0, 28.0, 60.0, 60.0);
+    assert_eq!(boxed(Box::new(map(corner, FrameShape::Circle))), PAGE, "outside the circle");
+    assert_eq!(boxed(Box::new(map(corner, FrameShape::Ellipse))), PAGE, "outside the ellipse");
+    assert_eq!(boxed(Box::new(map(full, FrameShape::Circle))), INK, "inside the circle");
+    assert_eq!(boxed(Box::new(map(full, FrameShape::Ellipse))), INK, "inside the ellipse");
+    // A circle is round in a wide box too: 100 by 40 mm about (52, 30), its circle spans x 32 to 72.
+    assert_eq!(boxed(Box::new(map((2.0, 10.0, 100.0, 40.0), FrameShape::Circle))), PAGE, "beside the circle");
+    let triangle = |side: f64| FrameShape::Polygon(vec![(0.0, 0.0), (side, 0.0), (0.0, side)]);
+    assert_eq!(boxed(Box::new(map(full, triangle(1.0)))), INK, "inside the polygon");
+    assert_eq!(boxed(Box::new(map(full, triangle(0.4)))), PAGE, "outside the polygon");
+    let reversed = FrameShape::Polygon(vec![(0.0, 0.0), (0.0, 1.0), (1.0, 0.0)]);
+    assert_eq!(boxed(Box::new(map(full, reversed))), INK, "inside a polygon wound the other way");
+    let hidden = |l: &mut Layout| {
+        map(full, FrameShape::Rectangle)(l);
+        l.elements.last_mut().unwrap().visible = false;
+    };
+    assert_eq!(boxed(Box::new(hidden)), PAGE, "a hidden map hides nothing");
+    let over_map = |l: &mut Layout| {
+        map(full, FrameShape::Rectangle)(l);
+        covering(DARK)(l);
+    };
+    assert_eq!(inked(PAGE, None, over_map, nothing), PAGE, "a box over a map counts");
 }
 
 /// In the browser, a page drawn while its frames' tiles were on their way is drawn again as

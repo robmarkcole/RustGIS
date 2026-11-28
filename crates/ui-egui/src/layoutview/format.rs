@@ -21,7 +21,8 @@ use frame::*;
 use legend::*;
 use north::*;
 use rustgis_engine::map::layout::{
-    Element, ElementKind, INK, LAYOUT_TEXT_SIZE, Layout, MAX_BACKGROUND_PADDING, MAX_BACKGROUND_RADIUS, MAX_BACKGROUND_WIDTH, Orientation,
+    Element, ElementKind, FrameShape, INK, LAYOUT_TEXT_SIZE, Layout, MAX_BACKGROUND_PADDING, MAX_BACKGROUND_RADIUS, MAX_BACKGROUND_WIDTH,
+    Orientation,
 };
 use rustgis_engine::map::symbology::Dash;
 use scalebar::*;
@@ -382,12 +383,15 @@ pub(super) fn choice(ui: &mut Ui, salt: (&str, u32), label: egui::Id, current: &
 /// The ink an element starts with when Ink is turned on (#2257): white over what shows under its
 /// text when that is dark, else the default dark grey, so its text never disappears. What shows is
 /// read at the centre of its box: the page's colour (#2855), the fills drawn there by the visible
-/// elements under it (#2953), then its own background.
+/// elements under it (#2953), those under a map or a picture hidden by it, then its own background.
 pub(super) fn first_ink(layout: &Layout, e: &Element) -> rustgis_engine::map::Rgba {
     let centre = (e.x + e.w / 2.0, e.y + e.h / 2.0);
     let page = layout.paper.unwrap_or(rustgis_engine::map::Rgba::rgb(0xFF, 0xFF, 0xFF));
-    let under = layout.elements.iter().take_while(|u| u.id != e.id).filter(|u| u.visible);
-    let fills = under.flat_map(|u| fills_at(u, centre)).chain(e.background.map(|b| b.fill));
+    let under = layout.elements.split(|u| u.id == e.id).next().unwrap_or_default();
+    // What lies under the topmost map or picture there doesn't show.
+    let from = under.iter().rposition(|u| u.visible && hides(u, centre)).map_or(0, |i| i + 1);
+    let shown_under = under.iter().skip(from).filter(|u| u.visible);
+    let fills = shown_under.flat_map(|u| fills_at(u, centre)).chain(e.background.map(|b| b.fill));
     let shown = fills.fold(Color32::from_rgb(page.r(), page.g(), page.b()), |below, fill| {
         let a = u16::from(fill.a());
         let over = |c: u8, under: u8| u8::try_from((u16::from(c) * a + u16::from(under) * (255 - a)) / 255).unwrap_or(u8::MAX);
@@ -395,6 +399,52 @@ pub(super) fn first_ink(layout: &Layout, e: &Element) -> rustgis_engine::map::Rg
     });
     let white = rustgis_engine::map::Rgba::rgb(0xFF, 0xFF, 0xFF);
     if crate::theme::contrast(shown, Color32::WHITE) > crate::theme::contrast(shown, crate::theme::c32(INK)) { white } else { INK }
+}
+
+/// Whether `e` is a map or a picture covering a page point (mm): what lies under it there doesn't
+/// show, and it has no one colour of its own. A map covers its shape, a picture its image as drawn,
+/// fitted and centred in its box (transparent pixels counted as covering), or the whole box where
+/// it doesn't decode and a placeholder is drawn. Only a picture whose box holds the point is
+/// decoded.
+fn hides(e: &Element, (x, y): (f64, f64)) -> bool {
+    // The point in the box's unit square, and from the box's centre in millimetres.
+    let (u, v) = ((x - e.x) / e.w, (y - e.y) / e.h);
+    let (dx, dy) = (x - e.x - e.w / 2.0, y - e.y - e.h / 2.0);
+    let in_box = (0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&v);
+    match &e.kind {
+        ElementKind::Picture { image } => {
+            in_box
+                && rustgis_engine::render::picture_drawn_size(image).is_none_or(|(iw, ih)| {
+                    let s = (e.w / f64::from(iw)).min(e.h / f64::from(ih));
+                    dx.abs() <= f64::from(iw) * s / 2.0 && dy.abs() <= f64::from(ih) * s / 2.0
+                })
+        }
+        ElementKind::MapFrame { shape, .. } => match shape {
+            FrameShape::Rectangle => in_box,
+            FrameShape::Circle => dx.hypot(dy) <= e.w.min(e.h) / 2.0,
+            FrameShape::Ellipse => (dx / e.w).hypot(dy / e.h) <= 0.5,
+            FrameShape::Polygon(points) => winds_around(points, (u, v)),
+        },
+        _ => false,
+    }
+}
+
+/// Whether the closed ring `points` winds around the point, as a frame's shape is filled.
+fn winds_around(points: &[(f64, f64)], (x, y): (f64, f64)) -> bool {
+    let edges = points.iter().zip(points.iter().cycle().skip(1));
+    let turns: i64 = edges
+        .map(|(&(ax, ay), &(bx, by))| {
+            let left = (bx - ax) * (y - ay) - (x - ax) * (by - ay);
+            if ay <= y && by > y && left > 0.0 {
+                1
+            } else if ay > y && by <= y && left < 0.0 {
+                -1
+            } else {
+                0
+            }
+        })
+        .sum();
+    turns != 0
 }
 
 /// The fills `e` draws at a page point (mm), the lower first: its background's, rounded corners

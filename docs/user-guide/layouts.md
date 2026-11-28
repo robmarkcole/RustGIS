@@ -710,13 +710,14 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   **Ink** in the Format pane and pick its colour to read them on a dark page or over imagery. It
   starts white when the colour shown at the element's centre is dark, and dark grey otherwise: that
   colour is the page's, with the backgrounds, rectangles and ellipses under the element and its own
-  background over it (maps and pictures aren't read). Turned off it is the dark grey again. A
-  legend's title, layer names and class labels, a colorbar's title, outline, ticks and labels, a
-  table's text and a chart's title and labels take it; a chart's bars and a colorbar's colours keep
-  theirs. A table with an ink draws no white cells of its own, only its header and every other row
-  in a light tint of the ink, so it reads on whatever is behind it: give it a **Background** for a
-  box. From a command: `layout.update={"element":5,"color":"#FFFFFF"}`, and `"color":null` for the
-  default; `layout.addElement` takes it too.
+  background over it (a map or a picture there isn't read and hides what is under it). Turned off it
+  is the dark grey again. A legend's title, layer names and class labels, a colorbar's title,
+  outline, ticks and labels, a table's text and a chart's title and labels take it; a chart's bars
+  and a colorbar's colours keep theirs. A table with an ink draws no white cells of its own, only
+  its header and every other row in a light tint of the ink, so it reads on whatever is behind it:
+  give it a **Background** for a box. From a command:
+  `layout.update={"element":5,"color":"#FFFFFF"}`, and `"color":null` for the default;
+  `layout.addElement` takes it too.
 - **Chart frame**: a bar chart of a layer of the frame's map. Its properties pick the **Layer**
   and the numeric **Field**, and by default draw a bar per feature, the largest first, each
   labelled by the **Label** field. **Group by** a field draws a bar per value of that field

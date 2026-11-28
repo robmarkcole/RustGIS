@@ -618,6 +618,12 @@ pub fn picture_size(b64: &str) -> Option<(u32, u32)> {
     picture::size(b64)
 }
 
+/// The pixel size a base64 picture is drawn from, `None` when a layout draws a placeholder instead.
+/// Decodes the whole image, as drawing it does: [`picture_size`] reads only the header.
+pub fn picture_drawn_size(b64: &str) -> Option<(u32, u32)> {
+    picture::decode(b64).map(|pm| (pm.width(), pm.height()))
+}
+
 pub use picture::{MARKER_PIXELS, MARKER_PIXELS_SIDE, MarkerRefusal, RUN_MARKER_BYTES, RUN_MARKER_PIXELS, SVG_DEPTH, SVG_XML_NODES};
 
 /// Base64 `b64` as a picture marker's image (one kept already, or one before it is set): its
