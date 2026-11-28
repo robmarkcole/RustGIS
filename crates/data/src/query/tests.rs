@@ -66,6 +66,43 @@ fn v(text: &str) -> Value {
     value(&parse(text, &d).unwrap_or_else(|e| panic!("{text}: {e}")), &d, 0, &Env { map_scale: Some(25_000.0), ..Env::default() })
 }
 
+#[test]
+fn number_literals_are_exact_or_refused() {
+    let d = ds();
+    assert_eq!(v("9007199254740993"), Value::Int(9_007_199_254_740_993));
+    assert_eq!(v(&i64::MAX.to_string()), Value::Int(i64::MAX));
+    assert_eq!(v("-9007199254740993"), Value::Int(-9_007_199_254_740_993));
+    assert_eq!(select("pop > 9007199254740993", &d).unwrap(), Vec::<usize>::new());
+    // 2^63, past `i64::MAX`, is a decimal that holds it exactly.
+    assert_eq!(v("9223372036854775808"), Value::Float(9_223_372_036_854_775_808.0));
+    for text in [
+        "9223372036854775809",
+        "99999999999999999999",
+        "9007199254740993.0",
+        "9007199254740993.5",
+        "12345678901234567000.0",
+        "1.2345678901234567891e19",
+        // A fraction that rounds up into the whole number changes it, at any size.
+        "1000000000000000.99",
+        "2.99999999999999999",
+        "99999999999999.99999999",
+        // Zeros written before an exponent count as digits.
+        "100000000000000000000000e1",
+    ] {
+        assert!(parse(text, &d).is_err_and(|e| e.contains("exact") || e.contains("rounded")), "{text}");
+    }
+    assert_eq!(v("0.1"), Value::Float(0.1));
+    assert_eq!(v("2.5"), Value::Float(2.5));
+    assert_eq!(v("1e3"), Value::Int(1000));
+    assert_eq!(v("1.5e3"), Value::Int(1500));
+    assert_eq!(v("1e19"), Value::Float(1e19), "a decimal holds it exactly");
+    assert_eq!(v("1e24"), Value::Float(1e24), "only its written 1 needs holding");
+    // Only whole-number digits are kept from rounding: a fraction past them reads as the nearest decimal.
+    assert_eq!(v("1000000000000000.123456789"), Value::Float(1_000_000_000_000_000.1));
+    assert_eq!(v("9007199254740992.0"), Value::Float(9_007_199_254_740_992.0));
+    assert_eq!(v("0.12345678901234567891"), Value::Float(0.123_456_789_012_345_68));
+}
+
 fn t(s: &str) -> Value {
     Value::Text(s.into())
 }

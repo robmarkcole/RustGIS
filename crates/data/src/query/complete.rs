@@ -188,9 +188,9 @@ pub fn follows(text: &str) -> Follows {
     let joins = [Kw::And, Kw::Or, Kw::When, Kw::Then, Kw::Else, Kw::End];
     let is = |word: &str, kws: &[Kw]| kws.iter().any(|k| k.word().eq_ignore_ascii_case(word));
     match toks.into_iter().next() {
-        Some(Tok::Str(_) | Tok::QuotedIdent(_) | Tok::Num(_) | Tok::Var(_) | Tok::LParen | Tok::Arith(Arith::Add | Arith::Sub)) => {
-            Follows::Value
-        }
+        Some(
+            Tok::Str(_) | Tok::QuotedIdent(_) | Tok::Num(_) | Tok::Int(_) | Tok::Var(_) | Tok::LParen | Tok::Arith(Arith::Add | Arith::Sub),
+        ) => Follows::Value,
         Some(Tok::Op(_)) => Follows::Comparison,
         Some(Tok::Concat | Tok::Arith(_)) => Follows::Operator,
         Some(Tok::Ident(word)) if is(&word, &left_side) => Follows::Comparison,

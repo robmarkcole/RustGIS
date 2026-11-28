@@ -79,7 +79,7 @@ operator: write `a < b AND b < c`, not `a < b < c`.
 
 | Write | Meaning |
 | --- | --- |
-| `42`, `3.5`, `1e6`, `.5` | Numbers; whole numbers are integers |
+| `42`, `3.5`, `1e6`, `.5` | Numbers. Written in digits only (`9007199254740993`), a whole number is an exact integer up to 9223372036854775807, and past that a decimal when one holds it exactly. Written with a point or an exponent (`9007199254740993.0`, `1e6`), a number is a decimal. Either way, one whose whole-number digits would change (`99999999999999999999`, `9007199254740993.0`, `1.2345678901234567891e19`, `1000000000000000.99`) is refused, not rounded; digits after the point read as the nearest decimal, as in `0.1` |
 | `'text'`, `'it''s'` | Text in single quotes; two quotes stand for one |
 | `TRUE`, `FALSE`, `NULL` | Booleans and the missing value |
 | `pop_est`, `"Pop Est"`, `!Pop Est!` | A field, by name, ignoring letter case; quote a name with spaces, punctuation or the name of a keyword (`"OR"`, `"null"`) |

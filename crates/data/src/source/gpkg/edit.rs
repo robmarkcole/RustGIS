@@ -34,6 +34,8 @@ pub struct Editable {
     pub unread_dates: Vec<usize>,
     /// Date-times rounded to the microsecond, by field ([`crate::source::Batch::rounded_dates`]).
     pub rounded_dates: Vec<usize>,
+    /// Text values that aren't valid UTF-8, by field ([`crate::source::Batch::not_utf8`]).
+    pub not_utf8: Vec<usize>,
     pub writable: bool,
 }
 
@@ -63,6 +65,9 @@ pub struct SavedRows {
     /// the save: the load said those. A row only a trigger touched wasn't read before the save, so
     /// its rounded values are counted even when unchanged, and may be said again.
     pub rounded_dates: Vec<usize>,
+    /// Per supplied field, text read back that isn't valid UTF-8 ([`crate::source::not_utf8_note`]),
+    /// counted as [`SavedRows::rounded_dates`] is.
+    pub not_utf8: Vec<usize>,
 }
 
 /// An existing feature table; its read connection is never reused for writes.
@@ -159,6 +164,7 @@ impl EditTable {
             skipped: 0,
             unread_dates: Vec::new(),
             rounded_dates: Vec::new(),
+            not_utf8: Vec::new(),
             writable: std::fs::metadata(&self.path).is_ok_and(|m| !m.permissions().readonly()),
         };
         {
@@ -183,7 +189,14 @@ impl EditTable {
                 }
                 let mut values = Vec::with_capacity(attrs.len());
                 for (k, (f, &i)) in self.info().fields.iter().zip(&attrs).enumerate() {
-                    values.push(value(row.get_ref(i).map_err(err)?, f.ty, &mut out.unread_dates, Some(&mut out.rounded_dates), k));
+                    values.push(value(
+                        row.get_ref(i).map_err(err)?,
+                        f.ty,
+                        &mut out.unread_dates,
+                        Some(&mut out.rounded_dates),
+                        &mut out.not_utf8,
+                        k,
+                    ));
                 }
                 let attrs = values;
                 out.versions.push((id, hash.cast_signed()));
@@ -295,7 +308,7 @@ impl EditTable {
         let mut spatial_changed = !edits.inserts.is_empty() || !edits.deletes.is_empty();
         let mut utc_dates = vec![0usize; fields.len()];
         let mut fine_dates = vec![0usize; fields.len()];
-        let (mut unread_dates, mut rounded_dates) = (Vec::new(), Vec::new());
+        let (mut unread_dates, mut rounded_dates, mut not_utf8) = (Vec::new(), Vec::new(), Vec::new());
         for (f, _) in &edits.updates {
             let row = current.get(&f.id.cast_signed()).ok_or_else(|| self.shape_error())?;
             let mut sets = Vec::new();
@@ -306,7 +319,7 @@ impl EditTable {
                 let attr = f.attrs.get(i).unwrap_or(&Value::Null);
                 // A stored date that isn't one reads as null and is kept unless edited; one with
                 // digits past the microsecond reads rounded, as the load showed it, so it is kept too.
-                let previous = value(ValueRef::from(old), field.ty, &mut Vec::new(), Some(&mut Vec::new()), 0);
+                let previous = value(ValueRef::from(old), field.ty, &mut Vec::new(), Some(&mut Vec::new()), &mut Vec::new(), 0);
                 let same_nan = matches!((&previous, attr), (Value::Float(a), Value::Float(b)) if a.is_nan() && b.is_nan());
                 if previous != *attr && !same_nan {
                     sets.push(format!("{} = ?", quote(columns.get(c).ok_or_else(|| self.shape_error())?)));
@@ -332,16 +345,44 @@ impl EditTable {
                 tx.execute(&format!("UPDATE {table} SET {} WHERE {pk} = ?", sets.join(", ")), params_from_iter(args)).map_err(err)? as u64;
             saved.updated += 1;
         }
-        // What the date columns of the updated rows held before the save, to tell a value the save
-        // changed from one the load already said; the rest of the rows isn't kept.
-        let dated: Vec<usize> = snapshot_columns
+        // What the updated rows held before the save, to tell a value the save changed from one the
+        // load already said. Only a value a read can say something of is kept (see `said`); the
+        // deleted rows and the rest of each row aren't.
+        let updated: std::collections::HashSet<i64> = edits.updates.iter().map(|(f, _)| f.id.cast_signed()).collect();
+        let decimal: std::collections::HashSet<usize> = snapshot_columns
+            .iter()
+            .filter(|(i, _)| fields.get(*i).is_some_and(|f| f.ty == crate::FieldType::Double))
+            .map(|&(_, c)| c)
+            .collect();
+        let dated: std::collections::HashSet<usize> = snapshot_columns
             .iter()
             .filter(|(i, _)| fields.get(*i).is_some_and(|f| matches!(f.ty, crate::FieldType::Date | crate::FieldType::DateTime)))
             .map(|&(_, c)| c)
             .collect();
-        let before: std::collections::HashMap<(i64, usize), Sql> =
-            current.iter().flat_map(|(k, row)| dated.iter().filter_map(move |&c| row.get(c).map(|v| ((*k, c), v.clone())))).collect();
-        drop(current);
+        let text: std::collections::HashSet<usize> = snapshot_columns
+            .iter()
+            .filter(|(i, _)| fields.get(*i).is_some_and(|f| f.ty == crate::FieldType::Text))
+            .map(|&(_, c)| c)
+            .collect();
+        // A date column's every cell, as before (a number there isn't a date either); text in a
+        // number or yes/no column; a blob anywhere (in a text column, its bytes may not be UTF-8);
+        // a whole number in a decimal column. Text in a text column was read as UTF-8 here
+        // already, so nothing is said of it and it isn't kept.
+        let said = |c: usize, v: &Sql| {
+            dated.contains(&c)
+                || matches!(v, Sql::Blob(_))
+                || matches!(v, Sql::Text(_)) && !text.contains(&c)
+                || matches!(v, Sql::Integer(_)) && decimal.contains(&c)
+        };
+        let columns_kept: std::collections::HashSet<usize> = snapshot_columns.iter().map(|&(_, c)| c).collect();
+        // Moved out of the rows read, which aren't needed past here: no second copy.
+        let before: std::collections::HashMap<(i64, usize), Sql> = current
+            .into_iter()
+            .filter(|(k, _)| updated.contains(k))
+            .flat_map(|(k, row)| {
+                row.into_iter().enumerate().filter(|(c, v)| columns_kept.contains(c) && said(*c, v)).map(move |(c, v)| ((k, c), v))
+            })
+            .collect();
         // Reserve the loaded baseline as well as live and historical keys. A deleted source row
         // can still be present in the layer, so SQLite's ordinary rowid allocation is not enough.
         let mut high_water = 0;
@@ -446,11 +487,12 @@ impl EditTable {
                 // before the save, which the load already said; an inserted row, or one only a
                 // trigger touched, wasn't read before, so it is said.
                 let stored = row.get(c).ok_or_else(|| self.shape_error())?;
-                let (mut unread, mut rounded) = (Vec::new(), Vec::new());
-                let read = value(ValueRef::from(stored), field.ty, &mut unread, Some(&mut rounded), i);
+                let (mut unread, mut rounded, mut bad_text) = (Vec::new(), Vec::new(), Vec::new());
+                let read = value(ValueRef::from(stored), field.ty, &mut unread, Some(&mut rounded), &mut bad_text, i);
                 if before.get(&(k, c)) != Some(stored) {
                     crate::source::add_unread_dates(&mut unread_dates, &unread);
                     crate::source::add_unread_dates(&mut rounded_dates, &rounded);
+                    crate::source::add_unread_dates(&mut not_utf8, &bad_text);
                 }
                 *attr = read;
             }
@@ -511,6 +553,7 @@ impl EditTable {
             fine_dates,
             unread_dates,
             rounded_dates,
+            not_utf8,
         }))
     }
 

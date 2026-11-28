@@ -590,6 +590,8 @@ enum Tok {
     QuotedIdent(String),
     Str(String),
     Num(f64),
+    /// A whole-number literal (digits only) that an `i64` holds: exact, never via a float.
+    Int(i64),
     /// A comparison operator.
     Op(String),
     Arith(Arith),
@@ -777,7 +779,7 @@ fn lex_first(s: &str, tolerant: bool, most: usize) -> Result<Lexed, String> {
                     }
                 }
                 let t: String = cs.get(st..i).map(|s| s.iter().collect()).unwrap_or_default();
-                out.push(Tok::Num(t.parse().map_err(|_| format!("bad number '{t}'"))?));
+                out.push(number_token(&t)?);
             }
             '@' | '$' => {
                 i += 1;
@@ -796,6 +798,88 @@ fn lex_first(s: &str, tolerant: bool, most: usize) -> Result<Lexed, String> {
         }
     }
     Ok(Lexed { toks: out, spans, open })
+}
+
+/// The token of a number literal, refusing one that can't be held exactly rather than rounding it.
+/// A literal of digits only is an exact `i64`; past `i64::MAX`, a decimal that holds it exactly, or
+/// refused. Any other literal is a
+/// decimal (`f64`), refused only when the decimal read would have other whole-number digits than
+/// written (`9007199254740993.0`, `1.2345678901234567891e19`, `2.99999999999999999`); its
+/// fraction digits round as any do. One that merely has no
+/// exact binary form (`0.1`) or many fraction digits (`0.12345678901234567891`) is read as the
+/// nearest decimal, as every number written in decimal is.
+fn number_token(t: &str) -> Result<Tok, String> {
+    if t.bytes().all(|b| b.is_ascii_digit()) {
+        if let Ok(i) = t.parse::<i64>() {
+            return Ok(Tok::Int(i));
+        }
+        // Past `i64::MAX`, a whole number is a decimal when one holds it exactly (2^63 does), and
+        // refused when it would be rounded.
+        if Value::Text(t.to_string()).rounds_as_double() {
+            return Err(format!("the whole number {t} has more digits than a number holds exactly, so it would be rounded"));
+        }
+        return t.parse().map(Tok::Num).map_err(|_| format!("bad number '{t}'"));
+    }
+    let n: f64 = t.parse().map_err(|_| format!("bad number '{t}'"))?;
+    // Refused when the decimal read has other whole-number digits than written: a decimal can't
+    // hold them, or the fraction rounds up into them (`2.99999999999999999` reads as 3). Its
+    // fraction digits read as the nearest decimal, as any fraction does.
+    if n.is_finite() && whole_digits_round(t) {
+        return Err(format!("the number {t} has more whole-number digits than a decimal number holds exactly, so it would be rounded"));
+    }
+    Ok(Tok::Num(n))
+}
+
+/// Whether a decimal literal's whole-number digits, its exponent applied, would be changed: digits
+/// written out (`9007199254740993.0`, `1.2345678901234567891e19`) must be read back as written,
+/// a fraction rounding up into them (`1000000000000000.99`) included; zeros an
+/// exponent adds past them (`1e307`) weren't written, so only the written digits need holding.
+/// `false` for one that isn't written in digits.
+pub(crate) fn whole_digits_round(t: &str) -> bool {
+    // An ordinary number, with at most 15 digits in all and no exponent, a decimal holds exactly,
+    // fraction included, so it can't round into the whole part.
+    if !t.contains(['e', 'E']) && t.trim_start_matches(['0', '.']).bytes().filter(u8::is_ascii_digit).count() <= 15 {
+        return false;
+    }
+    let (mantissa, exp) = match t.split_once(['e', 'E']) {
+        Some((m, e)) => match e.parse::<i64>() {
+            Ok(e) => (m, e),
+            Err(_) => return false,
+        },
+        None => (t, 0),
+    };
+    let (int, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if !int.bytes().chain(frac.bytes()).all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    let digits = format!("{int}{frac}");
+    // Where the point falls in `digits`, the exponent moving it.
+    let Some(point) = i64::try_from(int.len()).ok().and_then(|n| n.checked_add(exp)).and_then(|p| usize::try_from(p).ok()) else {
+        return false;
+    };
+    let written: String = digits.chars().take(point).collect();
+    let added = point.saturating_sub(digits.len());
+    if added == 0 {
+        // The whole part of the decimal read must be the one written: a decimal that can't hold
+        // those digits (`9007199254740993.0`) changes them, and so does a fraction that rounds up
+        // into them (`1000000000000000.99` reads as 1000000000000001).
+        let written = written.trim_start_matches('0');
+        let written = if written.is_empty() { "0" } else { written };
+        !t.parse::<f64>().is_ok_and(|x| x.is_finite() && format!("{:.0}", x.abs().trunc()) == written)
+    } else {
+        // Every digit written counts, trailing zeros too (`100000000000000000000000e1`): the decimal
+        // read, to as many significant digits, must give them back. The zeros the exponent adds
+        // weren't written, so `1e24` needs only its `1`.
+        let written = written.trim_start_matches('0');
+        if written.is_empty() {
+            return false;
+        }
+        let precision = written.len() - 1;
+        !t.parse::<f64>().is_ok_and(|x| {
+            let shown = format!("{:.*e}", precision, x.abs());
+            x.is_finite() && shown.split(['e', 'E']).next().is_some_and(|m| m.replace('.', "") == written)
+        })
+    }
 }
 
 /// A number literal: whole numbers are integers.
@@ -1089,9 +1173,10 @@ impl Parser<'_> {
     /// `1 IN (1 IN (…))` meets the limit.
     fn item(&mut self) -> Result<Expr, String> {
         let sign = usize::from(matches!(self.toks.get(self.pos), Some(Tok::Arith(Arith::Add | Arith::Sub))));
-        let single =
-            matches!(self.toks.get(self.pos + sign), Some(Tok::Num(_) | Tok::Str(_) | Tok::Ident(_) | Tok::QuotedIdent(_) | Tok::Var(_)))
-                && matches!(self.toks.get(self.pos + sign + 1), Some(Tok::Comma | Tok::RParen));
+        let single = matches!(
+            self.toks.get(self.pos + sign),
+            Some(Tok::Num(_) | Tok::Int(_) | Tok::Str(_) | Tok::Ident(_) | Tok::QuotedIdent(_) | Tok::Var(_))
+        ) && matches!(self.toks.get(self.pos + sign + 1), Some(Tok::Comma | Tok::RParen));
         if single {
             return self.unary();
         }
@@ -1225,7 +1310,7 @@ impl Parser<'_> {
         };
         self.pos += 1;
         // A sign before a number is part of the literal and nests nothing.
-        let nests = !matches!(self.toks.get(self.pos), Some(Tok::Num(_)));
+        let nests = !matches!(self.toks.get(self.pos), Some(Tok::Num(_) | Tok::Int(_)));
         if nests {
             self.deeper()?;
         }
@@ -1299,6 +1384,7 @@ impl Parser<'_> {
             // A number too large to represent (`1e999`) would be infinity, which nothing reads.
             Some(Tok::Num(n)) if n.is_finite() => Ok(Expr::Lit(num(n))),
             Some(Tok::Num(_)) => Err("the number is too large".into()),
+            Some(Tok::Int(i)) => Ok(Expr::Lit(Value::Int(i))),
             Some(Tok::Str(s)) => Ok(Expr::Lit(Value::Text(s))),
             Some(Tok::QuotedIdent(s)) => self.field(&s),
             Some(Tok::Var(v)) => match VARS.iter().find(|s| s.names.iter().any(|n| n.eq_ignore_ascii_case(&v))).map(|s| s.var) {
@@ -1441,6 +1527,7 @@ fn show(t: Option<&Tok>) -> String {
         Some(Tok::QuotedIdent(s)) => format!("\"{s}\""),
         Some(Tok::Str(s)) => format!("'{s}'"),
         Some(Tok::Num(n)) => n.to_string(),
+        Some(Tok::Int(i)) => i.to_string(),
         Some(Tok::Op(o)) => format!("'{o}'"),
         Some(Tok::Arith(a)) => format!(
             "'{}'",

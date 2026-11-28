@@ -301,13 +301,76 @@ pub(crate) fn yes_no_text(text: &str, counts: &mut Vec<usize>, k: usize) -> crat
     v
 }
 
+/// The value of the number field at `k` (`ty` Integer or Double) from a file's text
+/// ([`crate::Value::parse_source`]): text that isn't a number is null, counted in `counts`
+/// ([`Batch::unread_dates`]), which says it as a value that isn't a number ([`unread_dates_note`]).
+/// Empty text and `<Null>` are null, uncounted.
+pub(crate) fn number_text(
+    text: &str,
+    ty: crate::FieldType,
+    counts: &mut Vec<usize>,
+    rounded: Option<&mut Vec<usize>>,
+    k: usize,
+) -> crate::Value {
+    // `NaN` and `inf` written as words are kept as they are (a field holds them, and a save writes
+    // them back); a number in digits past a decimal's range (`1e400`) would be infinity, which it
+    // isn't: empty, and said as text that isn't a number.
+    let words = |t: &str| matches!(t.trim().trim_start_matches(['-', '+']).to_ascii_lowercase().as_str(), "nan" | "inf" | "infinity");
+    let v = match crate::Value::parse_source(text, ty) {
+        crate::Value::Float(f) if !f.is_finite() && !words(text) => crate::Value::Null,
+        v => v,
+    };
+    if v.is_null() && !text.trim().is_empty() && !crate::Value::is_null_marker(text) {
+        unread_date(counts, k);
+    }
+    // A number whose whole-number digits a decimal can't hold (`9007199254740993`) is rounded:
+    // counted in `rounded` ([`Batch::rounded_dates`]), as a whole number stored past 2^53 is. A
+    // fraction past what a decimal holds reads as the nearest decimal, as a stored one does.
+    let trimmed = text.trim().trim_start_matches(['-', '+']);
+    // Text past a decimal's range reads as infinity: an overflow, not a rounding.
+    if let (crate::Value::Float(f), Some(rounded)) = (&v, rounded)
+        && f.is_finite()
+        && crate::query::whole_digits_round(trimmed)
+    {
+        unread_date(rounded, k);
+    }
+    v
+}
+
+/// The text encoding a GeoPackage reader gives ([`FeatureSource::text_encoding`]): UTF-8, which the
+/// standard requires, so [`not_utf8_note`] says why without a `.cpg` to point to.
+pub const GEOPACKAGE_TEXT: &str = "UTF-8 (GeoPackage)";
+
+/// A text field's value from bytes SQLite holds as text or as a blob: the text, or, when they
+/// aren't valid UTF-8, the text with U+FFFD in place of what isn't, counted in `not_utf8`
+/// ([`Batch::not_utf8`], said by [`not_utf8_note`]).
+pub(crate) fn utf8_text(bytes: &[u8], not_utf8: &mut Vec<usize>, k: usize) -> crate::Value {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => crate::Value::Text(text.to_string()),
+        Err(_) => {
+            not_utf8_at(not_utf8, k);
+            crate::Value::Text(String::from_utf8_lossy(bytes).into_owned())
+        }
+    }
+}
+
+/// The decimal value of a whole number stored in a Double field at `k`: counted in `rounded`
+/// ([`Batch::rounded_dates`]) when a decimal can't hold it exactly (past 2^53).
+pub(crate) fn int_as_double(i: i64, rounded: Option<&mut Vec<usize>>, k: usize) -> crate::Value {
+    if let Some(rounded) = rounded
+        && crate::Value::Int(i).rounds_as_double()
+    {
+        unread_date(rounded, k);
+    }
+    crate::Value::Float(i as f64)
+}
+
 /// Counts one more text value `<Null>` read as null in the field at `k` ([`Batch::null_text`]).
 pub(crate) fn null_text_at(counts: &mut Vec<usize>, k: usize) {
     unread_dates_by(counts, k, 1);
 }
 
 /// Counts one more text value that isn't valid in its encoding in the field at `k` ([`Batch::not_utf8`]).
-#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn not_utf8_at(counts: &mut Vec<usize>, k: usize) {
     unread_dates_by(counts, k, 1);
 }
@@ -352,14 +415,34 @@ pub fn unread_dates_note(fields: &[crate::Field], counts: &[usize]) -> Option<cr
     if total == 0 {
         return None;
     }
-    // Yes/no fields count text that isn't yes or no here too ([`yes_no_text`]).
-    let counted = |boolean: bool| fields.iter().zip(counts).any(|(f, n)| *n > 0 && (f.ty == crate::FieldType::Boolean) == boolean);
-    let what = match (counted(false), counted(true), total == 1) {
-        (false, true, true) => "1 value isn't yes or no and was".to_string(),
-        (false, true, false) => format!("{total} values aren't yes or no and were"),
-        (true, true, _) => format!("{total} values aren't dates or yes/no values and were"),
-        (_, _, true) => "1 value isn't a date and was".to_string(),
-        _ => format!("{total} values aren't dates and were"),
+    // Fields of other types count values too: text that isn't yes or no ([`yes_no_text`]), text or a
+    // blob that isn't a number ([`number_text`]), a blob.
+    let mut kinds: Vec<&str> = Vec::new();
+    for (f, _) in fields.iter().zip(counts).filter(|(_, n)| **n > 0) {
+        let kind = match f.ty {
+            crate::FieldType::Boolean => "yes/no values",
+            crate::FieldType::Integer | crate::FieldType::Double => "numbers",
+            // A text field counts dates a mixed column held ([`crate::sheets`]).
+            crate::FieldType::Text | crate::FieldType::Date | crate::FieldType::DateTime => "dates",
+        };
+        if !kinds.contains(&kind) {
+            kinds.push(kind);
+        }
+    }
+    // Dates first, as a read of dates alone always said, then the rest in a fixed order.
+    kinds.sort_by_key(|k| ["dates", "yes/no values", "numbers"].iter().position(|n| n == k));
+    let what = match (kinds.as_slice(), total == 1) {
+        ([], true) | (["dates"], true) => "1 value isn't a date and was".to_string(),
+        ([], false) | (["dates"], false) => format!("{total} values aren't dates and were"),
+        (["yes/no values"], true) => "1 value isn't yes or no and was".to_string(),
+        (["yes/no values"], false) => format!("{total} values aren't yes or no and were"),
+        (["numbers"], true) => "1 value isn't a number and was".to_string(),
+        (["numbers"], false) => format!("{total} values aren't numbers and were"),
+        (kinds, _) => {
+            let (last, first) = kinds.split_last().map_or(("", &[][..]), |(l, f)| (*l, f));
+            let list = if first.is_empty() { last.to_string() } else { format!("{} or {last}", first.join(", ")) };
+            format!("{total} values aren't {list} and were")
+        }
     };
     let text = format!("{what} read as empty, in {}", crate::io::named_fields(fields, counts));
     Some(crate::loss::Note::loss(crate::loss::LossCode::DroppedValue, text))
@@ -386,6 +469,12 @@ pub fn not_utf8_note(fields: &[crate::Field], counts: &[usize], encoding: &str) 
     if total == 0 {
         return None;
     }
+    // A GeoPackage's text is UTF-8 by its standard: no file chooses another.
+    let (encoding, cause) = if encoding == GEOPACKAGE_TEXT {
+        ("UTF-8", "a GeoPackage holds its text in UTF-8".to_string())
+    } else {
+        (encoding, crate::dbf::cause(encoding))
+    };
     let what = if total == 1 {
         format!("1 text value isn't valid {encoding} and was")
     } else {
@@ -394,21 +483,42 @@ pub fn not_utf8_note(fields: &[crate::Field], counts: &[usize], encoding: &str) 
     let text = format!(
         "{what} read with U+FFFD in place of the bytes that can't be read, in {}; {}",
         crate::io::named_fields(fields, counts),
-        crate::dbf::cause(encoding)
+        cause
     );
     Some(crate::loss::Note::loss(crate::loss::LossCode::ChangedEncoding, text))
 }
 
-/// What a read says of date-times it rounded to the microsecond ([`Batch::rounded_dates`]), naming
-/// the first five fields. `None` when there were none.
+/// What a read says of values it rounded ([`Batch::rounded_dates`]): date-times to the microsecond,
+/// whole numbers past 2^53 to the nearest decimal number a Double field holds. Names the first five
+/// fields. `None` when there were none.
 pub fn rounded_dates_note(fields: &[crate::Field], counts: &[usize]) -> Option<crate::loss::Note> {
     let total: usize = counts.iter().sum();
     if total == 0 {
         return None;
     }
-    let what = if total == 1 { "1 date-time was".to_string() } else { format!("{total} date-times were") };
-    let text =
-        format!("{what} rounded to the microsecond, as more digits than that aren't kept, in {}", crate::io::named_fields(fields, counts));
+    let number = |f: &crate::Field| matches!(f.ty, crate::FieldType::Integer | crate::FieldType::Double);
+    let counted = |numbers: bool| fields.iter().zip(counts).any(|(f, n)| *n > 0 && number(f) == numbers);
+    let (numbers, dates) = (counted(true), counted(false));
+    let text = match (numbers, dates) {
+        (true, true) => format!(
+            "{total} values were rounded, date-times to the microsecond and numbers to the nearest decimal number, as more digits than that aren't kept, in {}",
+            crate::io::named_fields(fields, counts)
+        ),
+        (true, false) => {
+            let what = if total == 1 { "1 number was".to_string() } else { format!("{total} numbers were") };
+            format!(
+                "{what} rounded to the nearest decimal number, changing digits before the point, as a decimal field doesn't keep more than 15 or 16 digits, in {}",
+                crate::io::named_fields(fields, counts)
+            )
+        }
+        _ => {
+            let what = if total == 1 { "1 date-time was".to_string() } else { format!("{total} date-times were") };
+            format!(
+                "{what} rounded to the microsecond, as more digits than that aren't kept, in {}",
+                crate::io::named_fields(fields, counts)
+            )
+        }
+    };
     Some(crate::loss::Note::loss(crate::loss::LossCode::ChangedRounded, text))
 }
 

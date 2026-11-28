@@ -471,13 +471,14 @@ impl GpkgSource {
         req: &Request,
         unread_dates: &mut Vec<usize>,
         rounded_dates: &mut Vec<usize>,
+        not_utf8: &mut Vec<usize>,
     ) -> rusqlite::Result<Row> {
         // Integer keys, negative ones too, map to distinct ids.
         let Some(id) = r.get::<_, Option<i64>>(0)?.map(|i| i as u64) else { return Ok(Row::Bad) };
         let mut attrs = || {
             let mut out = Vec::with_capacity(self.info.fields.len());
             for (k, f) in self.info.fields.iter().enumerate() {
-                out.push(match r.get_ref(k + 2).map(|v| value(v, f.ty, unread_dates, Some(&mut *rounded_dates), k)) {
+                out.push(match r.get_ref(k + 2).map(|v| value(v, f.ty, unread_dates, Some(&mut *rounded_dates), &mut *not_utf8, k)) {
                     Ok(v) => v,
                     // The select list holds a column for every field, so there is no column to miss.
                     Err(_) => Value::Null,
@@ -518,6 +519,10 @@ enum Row {
 }
 
 impl FeatureSource for GpkgSource {
+    /// Text that isn't valid UTF-8 is said as GeoPackage text ([`super::not_utf8_note`]).
+    fn text_encoding(&self) -> &'static str {
+        super::GEOPACKAGE_TEXT
+    }
     fn info(&self) -> &SourceInfo {
         &self.info
     }
@@ -596,7 +601,9 @@ impl FeatureSource for GpkgSource {
                     let mut st = conn.prepare(&sql).map_err(err)?;
                     let mut rows = st.query(params_from_iter(chunk.iter())).map_err(err)?;
                     while let Some(r) = rows.next().map_err(err)? {
-                        let row = self.feature(r, native.as_ref(), req, &mut out.unread_dates, &mut out.rounded_dates).map_err(err)?;
+                        let row = self
+                            .feature(r, native.as_ref(), req, &mut out.unread_dates, &mut out.rounded_dates, &mut out.not_utf8)
+                            .map_err(err)?;
                         push(row, &mut out);
                     }
                     if out.features.len() >= limit {
@@ -637,7 +644,10 @@ impl FeatureSource for GpkgSource {
                     if known && !sample.wants() {
                         continue;
                     }
-                    match self.feature(r, native.as_ref(), req, &mut out.unread_dates, &mut out.rounded_dates).map_err(err)? {
+                    match self
+                        .feature(r, native.as_ref(), req, &mut out.unread_dates, &mut out.rounded_dates, &mut out.not_utf8)
+                        .map_err(err)?
+                    {
                         Row::Feature(f) if known || sample.wants() => sample.keep(f),
                         Row::Feature(_) | Row::Skip => {}
                         Row::Bad => out.skipped += 1,
@@ -688,7 +698,7 @@ impl FeatureSource for GpkgSource {
         crate::progress::begin(self.progress_total());
         while let Some(r) = rows.next().map_err(err)? {
             crate::progress::step(1)?;
-            match self.feature(r, native.as_ref(), &req, &mut out.unread_dates, &mut out.rounded_dates).map_err(err)? {
+            match self.feature(r, native.as_ref(), &req, &mut out.unread_dates, &mut out.rounded_dates, &mut out.not_utf8).map_err(err)? {
                 Row::Feature(f) => {
                     out.matched += 1;
                     chunks.push(f)?;
@@ -1573,9 +1583,17 @@ fn to_millisecond(t: crate::date::DateTime) -> crate::date::DateTime {
 }
 
 /// An attribute value of a field's type, for the field `k`. One a date field can't hold is null,
-/// and counted in `unread` ([`Batch::unread_dates`]); with `rounded`, a date-time with digits past
-/// the microsecond is rounded and counted there ([`Batch::rounded_dates`]), else it isn't a date.
-fn value(v: ValueRef<'_>, ty: FieldType, unread: &mut Vec<usize>, rounded: Option<&mut Vec<usize>>, k: usize) -> Value {
+/// and counted in `unread` ([`Batch::unread_dates`]): text that isn't a number in a number field,
+/// a blob. With `rounded`, a date-time with digits past the microsecond, or a whole number past 2^53
+/// in a Double field, is rounded and counted there ([`Batch::rounded_dates`]), else the date-time isn't a date.
+fn value(
+    v: ValueRef<'_>,
+    ty: FieldType,
+    unread: &mut Vec<usize>,
+    rounded: Option<&mut Vec<usize>>,
+    not_utf8: &mut Vec<usize>,
+    k: usize,
+) -> Value {
     match (v, ty) {
         (ValueRef::Null, _) => Value::Null,
         (v, FieldType::Date | FieldType::DateTime) => {
@@ -1583,14 +1601,20 @@ fn value(v: ValueRef<'_>, ty: FieldType, unread: &mut Vec<usize>, rounded: Optio
             super::gpkg_blob::temporal(text.as_deref(), ty, unread, rounded, k)
         }
         (ValueRef::Integer(i), FieldType::Boolean) => Value::Bool(i != 0),
-        (ValueRef::Integer(i), FieldType::Double) => Value::Float(i as f64),
+        (ValueRef::Integer(i), FieldType::Double) => super::int_as_double(i, rounded, k),
         (ValueRef::Integer(i), _) => Value::Int(i),
         (ValueRef::Real(f), FieldType::Integer) if f.fract() == 0.0 && f.abs() < 9e15 => Value::Int(f as i64),
         (ValueRef::Real(f), _) => Value::Float(f),
-        (ValueRef::Text(t), FieldType::Text) => Value::Text(String::from_utf8_lossy(t).into_owned()),
+        (ValueRef::Text(t), FieldType::Text) => super::utf8_text(t, not_utf8, k),
         (ValueRef::Text(t), FieldType::Boolean) => super::yes_no_text(&String::from_utf8_lossy(t), unread, k),
-        (ValueRef::Text(t), ty) => Value::parse_source(&String::from_utf8_lossy(t), ty),
-        (ValueRef::Blob(_), _) => Value::Null,
+        (ValueRef::Text(t), ty) => super::number_text(&String::from_utf8_lossy(t), ty, unread, rounded, k),
+        // A blob in a text column is its text, as SQLite stores text either way.
+        (ValueRef::Blob(b), FieldType::Text) => super::utf8_text(b, not_utf8, k),
+        // A blob isn't a value another attribute column holds.
+        (ValueRef::Blob(_), _) => {
+            super::unread_date(unread, k);
+            Value::Null
+        }
     }
 }
 
