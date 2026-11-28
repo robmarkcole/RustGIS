@@ -1182,6 +1182,8 @@ fn report_pages_bytes(
     // The legends its layouts' pages drew under a fit still cut, and the charts they drew, by
     // layout ([`keep_drawn`]).
     let (mut unfitted, mut charts) = (Vec::new(), Vec::new());
+    // The texts cut off on its layouts' pages, by layout and element.
+    let mut clipped = ClippedTexts::new();
     // Counted, and stopped on Cancel, a page at a time.
     rustgis_data::progress::begin(n);
     for k in 0..n {
@@ -1190,6 +1192,17 @@ fn report_pages_bytes(
             Some(rustgis_render::report::Page::Layout(li)) => Some(*li),
             _ => None,
         };
+        if let Some(li) = page_layout
+            && let Some(layout) = s.project.layouts.get(li)
+        {
+            // The page's own number, as the page draws it: a text that shows it may only be cut
+            // off on some pages.
+            let info = rustgis_render::layout::PageInfo { page: k + 1, pages: pages.len(), page_name: String::new() };
+            let cut = rustgis_render::layout::clipped_text(layout, &s.project.maps, dpi, &info);
+            if !cut.is_empty() {
+                clipped.entry(li).or_default().extend(cut);
+            }
+        }
         if !pdf {
             let (drawn, listed, shown) =
                 listing(|| rustgis_render::report::draw_page(doc, pages, k, dpi, &s.project.layouts, &mut s.project.maps));
@@ -1198,6 +1211,7 @@ fn report_pages_bytes(
             keep_drawn(&mut charts, page_layout, shown);
             say_report_unfitted(s, &unfitted);
             say_report_charts(s, &charts);
+            say_report_clipped(s, &clipped);
             say_sections_not_drawn(s, pages, 1);
             return Ok((img.encode_png().map_err(|e| e.to_string())?, pages.len()));
         }
@@ -1232,6 +1246,7 @@ fn report_pages_bytes(
     }
     say_report_unfitted(s, &unfitted);
     say_report_charts(s, &charts);
+    say_report_clipped(s, &clipped);
     super::layout::pictured_notices(s, &frames_pictured, &pages_pictured);
     say_sections_not_drawn(s, pages, n);
     Ok((rustgis_render::pdf::write(&out, &doc.title), pages.len()))
@@ -1296,6 +1311,21 @@ fn say_report_charts(s: &mut Session, kept: &[(usize, rustgis_render::layout::Dr
     let drawn = kept.iter().filter_map(|(li, chart)| Some((Some(*li), s.project.layouts.get(*li)?, chart)));
     for note in super::layout::chart_notice_lines_in(drawn) {
         s.warn(note);
+    }
+}
+
+/// The texts cut off on a report's layout pages: each layout's (by its index) elements, by id.
+type ClippedTexts = std::collections::BTreeMap<usize, std::collections::BTreeMap<u32, String>>;
+
+/// Says the texts cut off on the report's layout pages as each layout's export says them, one
+/// notice a layout, which it names: the advice depends on that layout's elements.
+fn say_report_clipped(s: &mut Session, clipped: &ClippedTexts) {
+    for (li, texts) in clipped {
+        let Some(layout) = s.project.layouts.get(*li) else { continue };
+        let texts: Vec<_> = texts.clone().into_iter().collect();
+        let Some(note) = rustgis_render::layout::clipped_text_notice(layout, &texts) else { continue };
+        let name = crate::project::short_name(&layout.name);
+        s.warn(format!("The report, layout \"{name}\": {note}"));
     }
 }
 

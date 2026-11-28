@@ -558,9 +558,11 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   `layout.update={"element":7,"angle":-90}` to turn one.
 - **Text clipping**: the layout view and PNG, PDF and SVG exports warn when a text element or
   legend title runs off the page, or a text element has more lines than its height allows.
-  The notice counts and names the affected elements with their IDs. A line may extend beyond
-  its element's width while remaining on the page; that alone is not clipped. Reduce the size,
-  add line breaks, turn on **Wrap to the box**, or resize or move the element to keep all its text;
+  The notice counts and names the affected elements with their IDs. Exporting a report that draws
+  a layout as a page says the same of that page's texts, in a notice for each such layout that
+  names it. A line may extend beyond its element's width while remaining on the page; that alone
+  is not clipped. Reduce the size, add line breaks, turn on **Wrap to the box**, or resize or move
+  the element to keep all its text;
   when every text it names is already wrapped, the notice suggests only the size and the box, and
   a legend's title, which has no wrap, is told to add line breaks. Lines left out below a text's
   box are said as soon as they are: `layout.addElement` and `layout.update` warn how many lines

@@ -126,6 +126,9 @@ mod layout_publication_parts;
 #[path = "tests/layout_typed_values.rs"]
 mod layout_typed_values;
 
+#[path = "tests/layout_report_text.rs"]
+mod layout_report_text;
+
 #[path = "tests/sde_connections.rs"]
 mod sde_connections;
 
