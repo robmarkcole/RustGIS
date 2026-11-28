@@ -1162,6 +1162,9 @@ pub struct Session {
     /// The download requests of the plugin call running now (none outside one): each one's
     /// number, and what was asked.
     pub(crate) call_requests: Option<Vec<(u64, serde_json::Value)>>,
+    /// The data cube summaries the plugin call running now left to read off the frame (#3183),
+    /// until the call is kept to run again.
+    pub(crate) call_summaries: Vec<cmd::plugins::summary::Left>,
     /// While a plugin command runs again for its downloads: what each one asked for, and what
     /// adding it answered, for its `layer.addUrl` to answer once.
     pub(crate) rerun_landed: Vec<(serde_json::Value, CmdResult, cmd::plugins::fetch::Added)>,
@@ -1630,6 +1633,7 @@ impl Session {
             url_waits: cmd::plugins::fetch::UrlWaits::default(),
             next_request: 0,
             call_requests: None,
+            call_summaries: Vec::new(),
             rerun_landed: Vec::new(),
             rerun_told: Vec::new(),
             rerun_said: Vec::new(),
@@ -2745,6 +2749,8 @@ impl Session {
         self.request_only = outer_request_only;
         if res.is_err() {
             self.restore_url_request_checkpoint(requests);
+            // The summaries it started stop: those before it are kept, and nothing waits for the others.
+            self.url_waits.stop_summaries_beside(&retry_state.1);
             (self.plugin_retries, self.url_waits) = retry_state;
             // Keep only still-present old identities: drained bytes and terminal refusals stay consumed.
             let (kept, mut dropped): (Vec<_>, Vec<_>) =
@@ -2763,6 +2769,8 @@ impl Session {
         if self.depth == 0 {
             if let Some(replaced) = self.put_aside.take() {
                 self.say_dropped_downloads(&replaced.file_outputs, "as another project replaced theirs first");
+                // Its summaries being read for plugin commands stop: their project won't come back.
+                replaced.url_waits.stop_every_summary();
             }
             self.published_syncs.clear();
             // Frame maintenance and some policy adapters run a guard without command dispatch.
@@ -2924,6 +2932,8 @@ impl Session {
         (self.path, self.model_run, self.style_view) = (path, model_run, style_view);
         self.opened_package = opened_package;
         self.file_identity = file_identity;
+        // The replacement's summaries being read for plugin commands stop: its project is gone.
+        self.url_waits.stop_every_summary();
         (self.pending, self.plugin_runs, self.plugin_retries, self.url_waits) = (pending, plugin_runs, plugin_retries, url_waits);
         let replaced = std::mem::replace(&mut self.file_outputs, file_outputs);
         (self.downloading, self.downloaded, self.url_requests) = (downloading, downloaded, url_requests);
@@ -3905,6 +3915,8 @@ impl Session {
     pub fn clear_history(&mut self) {
         let replaced = self.take_project_state();
         self.say_dropped_downloads(&replaced.file_outputs, "as another project replaced theirs first");
+        // Its summaries being read for plugin commands stop with it.
+        replaced.url_waits.stop_every_summary();
         self.undo_memory.clear();
         self.project_starts = self.project_starts.wrapping_add(1);
         // A state of its own: undo back past a replacement made within a command (a task's step)

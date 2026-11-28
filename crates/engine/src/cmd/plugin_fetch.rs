@@ -22,7 +22,9 @@
 //!
 //! A plugin command's `service.add` on the desktop waits the same way (#1319): the documents it
 //! reads are fetched off the frame ([`Session::left_document`]), and its features or coverage are
-//! left to the app as `layer.addUrl`'s download is.
+//! left to the app as `layer.addUrl`'s download is. So does its `cube.reduce` or `cube.trend` on a
+//! STAC collection (#3183): the slices are read on a thread of the session's (see
+//! [`super::summary`]).
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -435,7 +437,7 @@ pub(crate) struct UrlWaits {
     pub(crate) views: std::collections::BTreeMap<u64, [f64; 4]>,
     owners: std::collections::BTreeMap<u64, crate::policy::Continuation>,
     in_flight: Vec<(u64, Value, Instant)>,
-    landed: Vec<(u64, Value, CmdResult, Added)>,
+    pub(super) landed: Vec<(u64, Value, CmdResult, Added)>,
     /// Requests given up (past [`REQUEST_WAIT`], or their command replaced or dropped), with their
     /// addresses (about [`MAX_EXPIRED`] at most, see `remember_given_up`): one that lands after is
     /// refused, not added with no command left to go on with it.
@@ -446,6 +448,8 @@ pub(crate) struct UrlWaits {
     added: VecDeque<(u64, Value)>,
     /// A service's documents being read off the frame, by request number.
     reading: Vec<(u64, String, Arc<Mutex<Option<Result<Vec<u8>, String>>>>)>,
+    /// Data cubes' summaries being read off the frame ([`super::summary`]).
+    pub(super) summaries: Vec<super::summary::Reading>,
 }
 
 /// What adding a landed download added, to tell when its command runs again whether it is still
@@ -463,6 +467,8 @@ pub(crate) struct Added {
     pub(crate) map: u64,
     /// A service's document read off the frame ([`Session::left_document`]), which adds nothing.
     pub(crate) document: Option<Arc<[u8]>>,
+    /// A data cube's summary read off the frame ([`super::summary`]), which its command adds.
+    pub(crate) summary: Option<super::summary::Summary>,
 }
 
 impl Added {
@@ -482,7 +488,12 @@ impl Added {
             (None, Some(i)) => usize::try_from(i).ok().and_then(|i| map.tiles.get(i)).cloned().into_iter().collect(),
             _ => Vec::new(),
         };
-        Added { layers, tiles, map: at, document: None }
+        Added { layers, tiles, map: at, document: None, summary: None }
+    }
+
+    /// What a data cube's summary read off the frame made: no layer yet, its command adds them.
+    pub(super) fn of_summary(summary: super::summary::Summary) -> Added {
+        Added { summary: Some(summary), ..Added::default() }
     }
 
     /// `answer` as it stands in `map` now: a tile layer's place in the list, which moves as others
@@ -551,6 +562,10 @@ const MAX_EXPIRED: usize = 1024;
 /// the address the front end downloads, with the range marked in it
 /// ([`crate::cmd::layer::ranged_address`]), and its rows of a box (`"bbox"`) with the box too.
 fn asked_by(asked: &Value, params: &Value) -> bool {
+    // A summary read off the frame has no address: no front end's download is it.
+    if super::summary::is_summary(asked) {
+        return false;
+    }
     let Some(o) = asked.as_object() else { return false };
     let range = match asked.get("bytes").and_then(Value::as_array).map(Vec::as_slice) {
         Some([a, b]) => a.as_u64().zip(b.as_u64()),
@@ -633,8 +648,8 @@ impl UrlWaits {
     pub(crate) fn land(&mut self, n: u64, answer: CmdResult, added: Added) {
         if let Some(i) = self.in_flight.iter().position(|(m, ..)| *m == n) {
             let (_, asked, _) = self.in_flight.remove(i);
-            // (A document adds nothing, and no front end lands it again by its number.)
-            if answer.is_ok() && added.document.is_none() {
+            // (A document or a summary adds nothing, and no front end lands it again by its number.)
+            if answer.is_ok() && added.document.is_none() && added.summary.is_none() {
                 if self.added.len() >= MAX_EXPIRED {
                     self.added.pop_front();
                 }
@@ -650,7 +665,7 @@ impl UrlWaits {
     }
 
     /// Waits for request `n`, which asked for `asked`.
-    fn wait(&mut self, n: u64, asked: Value) {
+    pub(super) fn wait(&mut self, n: u64, asked: Value) {
         if !self.has(n) {
             self.in_flight.push((n, asked, Instant::now()));
         }
@@ -663,7 +678,8 @@ impl UrlWaits {
         let late: Vec<(u64, Value)> = self
             .in_flight
             .iter()
-            .filter(|(.., at)| now.saturating_duration_since(*at) >= REQUEST_WAIT)
+            // A summary still being read has its own end, and its Cancel.
+            .filter(|(n, _, at)| now.saturating_duration_since(*at) >= REQUEST_WAIT && !self.summarising(*n))
             .map(|(n, q, _)| (*n, q.clone()))
             .collect();
         let mut addresses = Vec::new();
@@ -679,6 +695,9 @@ impl UrlWaits {
     /// so a late landing is refused.
     /// `taken`: whether the front end took it (it may still land); one it didn't is just forgotten.
     fn give_up(&mut self, n: u64, taken: bool) {
+        // A summary being read is stopped, and never lands: there is nothing to refuse later.
+        let taken = taken && !self.summarising(n);
+        self.stop_summaries(|m| m != n);
         if let Some(i) = self.in_flight.iter().position(|(m, ..)| *m == n) {
             let (_, asked, _) = self.in_flight.remove(i);
             if taken {
@@ -760,6 +779,7 @@ impl UrlWaits {
         self.in_flight.retain(|(n, ..)| wanted(n));
         self.landed.retain(|(n, ..)| wanted(n));
         self.views.retain(|n, _| wanted(n));
+        self.stop_summaries(|n| wanted(&n));
         let retained: Vec<u64> = self
             .in_flight
             .iter()
@@ -970,8 +990,14 @@ impl Session {
         if !fetching.is_empty() {
             answer["fetching"] = json!(fetching);
         }
-        if !requests.is_empty() {
-            answer["downloading"] = json!(requests.iter().map(|(_, q)| q["url"].as_str().map(crate::sources::redact)).collect::<Vec<_>>());
+        let (summaries, downloads): (Vec<&(u64, Value)>, Vec<&(u64, Value)>) =
+            requests.iter().partition(|(_, q)| super::summary::is_summary(q));
+        if !downloads.is_empty() {
+            answer["downloading"] = json!(downloads.iter().map(|(_, q)| q["url"].as_str().map(crate::sources::redact)).collect::<Vec<_>>());
+        }
+        // A summary read off the frame, by its command's name.
+        if !summaries.is_empty() {
+            answer["reading"] = json!(summaries.iter().map(|(_, q)| q["summary"].clone()).collect::<Vec<_>>());
         }
         let numbers = requests.iter().map(|(n, _)| *n).collect();
         for (n, asked) in requests {
@@ -1053,6 +1079,7 @@ impl Session {
     /// by then are given up (a test passes a later time instead of backdating the waits).
     fn poll_plugin_retries_at(&mut self, now: Instant) -> Vec<(String, CmdResult)> {
         self.url_waits.documents_in();
+        self.url_waits.summaries_in();
         if self.plugin_retries.is_empty() {
             self.url_waits.prune_views();
             return Vec::new();

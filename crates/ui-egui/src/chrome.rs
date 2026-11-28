@@ -544,6 +544,9 @@ pub fn status_bar(app: &mut RustGisApp, ui: &mut Ui) {
                 }
                 #[cfg(not(target_arch = "wasm32"))]
                 source_open_status(app, ui, &t);
+                // Data cubes' summaries plugin commands left to read off the frame (#3183).
+                #[cfg(not(target_arch = "wasm32"))]
+                summaries_status(app, ui, &t);
                 crate::geocodeui::status(app, ui);
                 // Downloads and windows being read off the frame, each with its Cancel.
                 if !app.ui.downloads.is_empty() || window_reads_under_way(app) {
@@ -730,11 +733,42 @@ fn source_open_status(app: &RustGisApp, ui: &mut Ui, t: &Tokens) {
     ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
 }
 
+/// The data cubes' summaries plugin commands left to read off the frame (#3183), each naming its
+/// command, with its progress and Cancel: the command runs again once its summary has landed, or
+/// says it was cancelled.
+#[cfg(not(target_arch = "wasm32"))]
+fn summaries_status(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
+    let under_way = app.session.plugin_summaries();
+    if under_way.is_empty() {
+        return;
+    }
+    let size = StripSize::of(app);
+    let mut cancel = None;
+    for summary in &under_way {
+        sep(ui, t);
+        ui.spinner();
+        if size.cancel_first(ui, !summary.cancelled) {
+            cancel = Some(summary.id);
+        }
+        let reading = crate::i18n::fmt("Reading for {command}…", &[("command", &crate::pluginstart::title(app, &summary.command))]);
+        ui.label(egui::RichText::new(reading).size(size.text).color(t.text_dim));
+        size.progress(ui, summary.done as f32 / summary.total.max(1) as f32);
+        if size.cancel_last(ui, !summary.cancelled) {
+            cancel = Some(summary.id);
+        }
+    }
+    if let Some(id) = cancel {
+        app.session.cancel_plugin_summary(id);
+    }
+    // The bar moves while the slices are read on their thread.
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+}
+
 /// Whether work is running that the status bar shows with its progress and Cancel: an export, a
-/// file or a layer being read, a download.
+/// file or a layer being read, a download, a plugin command's summary.
 pub(crate) fn background_busy(app: &RustGisApp) -> bool {
     #[cfg(not(target_arch = "wasm32"))]
-    if app.export_job.is_some() || crate::readjob::showing(app) || sources_opening(app) {
+    if app.export_job.is_some() || crate::readjob::showing(app) || sources_opening(app) || !app.session.plugin_summaries().is_empty() {
         return true;
     }
     !app.ui.downloads.is_empty() || window_reads_under_way(app)
@@ -753,6 +787,8 @@ pub(crate) fn background_status(app: &mut RustGisApp, ui: &mut Ui) {
     }
     #[cfg(not(target_arch = "wasm32"))]
     source_open_status(app, ui, &t);
+    #[cfg(not(target_arch = "wasm32"))]
+    summaries_status(app, ui, &t);
     if !app.ui.downloads.is_empty() || window_reads_under_way(app) {
         downloads_status(app, ui, &t);
     }

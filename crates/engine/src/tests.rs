@@ -49,6 +49,9 @@ mod cube_mask;
 #[cfg(not(target_arch = "wasm32"))]
 #[path = "tests/cube_rgb.rs"]
 mod cube_rgb;
+#[cfg(not(target_arch = "wasm32"))]
+#[path = "tests/plugin_summaries.rs"]
+mod plugin_summaries;
 
 #[path = "tests/permission_policy.rs"]
 mod permission_policy;

@@ -198,6 +198,68 @@ pub fn wasm_with_host_call(request: &serde_json::Value) -> Vec<u8> {
     .unwrap_or_default()
 }
 
+/// A test module that makes fixed host calls one after another, in one call of its own, and
+/// answers what the last one replied: a command that asks for several things at once.
+pub fn wasm_with_host_calls(requests: &[serde_json::Value]) -> Vec<u8> {
+    calls_module(&[(None, requests)])
+}
+
+/// [`wasm_with_host_calls`] with the calls of each command, by its one-letter id (`'f'`, `'h'`…):
+/// a plugin whose commands ask for different things. A command not listed makes no call.
+pub fn wasm_with_host_calls_by_command(commands: &[(char, &[serde_json::Value])]) -> Vec<u8> {
+    let commands: Vec<(Option<char>, &[serde_json::Value])> = commands.iter().map(|(id, requests)| (Some(*id), *requests)).collect();
+    calls_module(&commands)
+}
+
+/// A module making `commands`' calls: each list for its command id (the byte at 15 of a command's
+/// request, `{"abi":1,"id":"f"…`), or for every command when it has none.
+fn calls_module(commands: &[(Option<char>, &[serde_json::Value])]) -> Vec<u8> {
+    // The requests, then the heap the host's answers are put in, then the last reply.
+    const REPLY: usize = 4 << 16;
+    let (mut data, mut calls, mut at) = (String::new(), String::new(), 0usize);
+    for (id, requests) in commands {
+        let mut block = String::new();
+        for request in *requests {
+            let request = request.to_string();
+            let encoded: String = request.bytes().map(|byte| format!("\\{byte:02x}")).collect();
+            data.push_str(&format!("(data (i32.const {at}) \"{encoded}\")\n"));
+            block.push_str(&format!(
+                "(local.set $len (call $call (i32.const {at}) (i32.const {len})))\n(call $result (i32.const {REPLY}))\n",
+                len = request.len(),
+            ));
+            at += request.len();
+        }
+        match id {
+            Some(id) => calls.push_str(&format!(
+                "(if (i32.eq (i32.load8_u (i32.add (local.get $request) (i32.const 15))) (i32.const {})) (then {block}))\n",
+                u32::from(*id)
+            )),
+            None => calls.push_str(&block),
+        }
+    }
+    let heap = at.div_ceil(65536).max(1) * 65536;
+    wat::parse_str(format!(
+        r#"
+        (module
+            (import "rustgis" "call" (func $call (param i32 i32) (result i32)))
+            (import "rustgis" "result" (func $result (param i32)))
+            (memory (export "memory") 6)
+            (global $heap (mut i32) (i32.const {heap}))
+            {data}
+            (func (export "rustgis_alloc") (param $n i32) (result i32)
+                (local $p i32)
+                (local.set $p (global.get $heap))
+                (global.set $heap (i32.add (global.get $heap) (local.get $n)))
+                (local.get $p))
+            (func (export "rustgis_call") (param $request i32) (param i32) (result i64)
+                (local $len i32)
+                {calls}
+                (i64.or (i64.shl (i64.const {REPLY}) (i64.const 32)) (i64.extend_i32_u (local.get $len)))))
+    "#
+    ))
+    .unwrap_or_default()
+}
+
 /// Calls the host, handles its error as data, and returns a successful plugin result.
 /// Exercises host-call rollback when the guest does not propagate the host's failure.
 pub fn wasm_with_handled_host_error(request: &serde_json::Value) -> Vec<u8> {

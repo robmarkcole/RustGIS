@@ -7,6 +7,10 @@
 //!
 //! A command that isn't a plugin's, asked for during the wait, runs first. One that replaces the
 //! project takes the commands waiting with it, and says so: they name the old project's layers.
+//!
+//! A plugin command's `cube.reduce` or `cube.trend` on a STAC collection doesn't hold the frame
+//! for its slices either (#3183): they are read on a thread, shown in the status bar with their
+//! progress and Cancel, and the command runs again once they have landed (`run_again`).
 
 use crate::{RustGisApp, i18n};
 use serde_json::Value;
@@ -141,7 +145,7 @@ pub(crate) fn running(app: &RustGisApp) -> Option<String> {
 }
 
 /// A plugin command as the user knows it: `BrasilData: Solos`.
-fn title(app: &RustGisApp, id: &str) -> String {
+pub(crate) fn title(app: &RustGisApp, id: &str) -> String {
     let plugin = rustgis_engine::plugins::split_id(id).and_then(|(plugin, item)| Some((rustgis_engine::plugins::get(plugin)?, item)));
     plugin.map_or_else(
         || id.to_string(),
@@ -365,6 +369,36 @@ mod tests {
         ask(&mut app, id, json!({"op": "layer.addUrl", "params": {"url": "https://x.org/b.csv"}})).unwrap();
         assert_eq!(app.ui.plugin_start.waiting.len(), 1);
         plugins::unload("ui-again-asked");
+    }
+
+    /// A summary a plugin command left to read off the frame shows in the status bar, naming the
+    /// command, with its progress; its Cancel stops it, and the window answers meanwhile (#3183).
+    #[test]
+    fn a_summary_read_off_the_frame_shows_with_its_cancel() {
+        let mut h = launch("ui-summary");
+        let id = h.state_mut().session.start_test_summary("plugin:ui-summary/f");
+        h.step();
+        h.step();
+        let _ = h.get_by_label_contains("Reading for Test ui-summary: Forward");
+        // Its progress, told from its thread.
+        let started = web_time::Instant::now();
+        while h.state().session.plugin_summaries()[0].done == 0 && started.elapsed() < Duration::from_secs(30) {
+            std::thread::sleep(Duration::from_millis(5)); // test-wait: the read's thread tells its progress when it starts
+        }
+        assert_eq!(h.state().session.plugin_summaries()[0].done, 1);
+        h.get_by_label("Cancel").click();
+        h.step();
+        assert!(h.state().session.plugin_summaries().iter().all(|s| s.id == id && s.cancelled));
+        // It stops between slices, and is gone from the status bar.
+        let started = web_time::Instant::now();
+        while !h.state().session.plugin_summaries().is_empty() && started.elapsed() < Duration::from_secs(30) {
+            h.step();
+            std::thread::sleep(Duration::from_millis(5)); // test-wait: the cancelled read ends on its thread, polled as the frame loop polls it
+        }
+        assert!(h.state().session.plugin_summaries().is_empty());
+        h.step();
+        assert!(h.query_by_label_contains("Reading for").is_none());
+        plugins::unload("ui-summary");
     }
 
     /// Clicks are dropped once, after a long run; what the pointer did otherwise stays.

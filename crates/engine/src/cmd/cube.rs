@@ -606,6 +606,14 @@ pub struct TrendRun {
 }
 
 impl TrendRun {
+    /// About the bytes its four outputs hold once made, with their GeoTIFFs: all of them, for a
+    /// cube that knows its size, as the run doesn't cap its outputs (only its pairs); when it
+    /// doesn't, those of a block of [`MAX_VALUES`] cells.
+    pub fn output_bytes(&self) -> u64 {
+        let cells = self.cube.size().map_or(MAX_VALUES, |(w, h)| (w as u64).saturating_mul(h as u64));
+        output_bytes(cells.saturating_mul(OUTPUTS as u64))
+    }
+
     /// The work, for a progress bar: the slices read (every piece's), then the cells worked out,
     /// in [`CELL_PARTS`] parts.
     pub fn total(&self) -> usize {
@@ -1108,6 +1116,14 @@ fn trend_cmd(s: &mut Session, p: &Value) -> CmdResult {
         let (_, rasters, dates) = s.trend_results.remove(at);
         return add_outputs(s, rasters, dates);
     }
+    // A plugin's command the app runs reads a STAC collection off the frame (#3183), with the
+    // panes' bound, as the Workflows pane's thread does.
+    if let Some(left) = super::plugins::summary::left(s, "cube.trend", p, |s| {
+        let run = trend_start(s, p)?;
+        Ok(super::plugins::summary::Work::new(run.total(), run.dates(), run.output_bytes(), move |cancel, done| run.run(cancel, done)))
+    }) {
+        return left;
+    }
     // Worked out here, waited for with no Cancel: in the app (a script, the assistant) and Python a
     // run of seconds, not minutes; where only a shell waits on it (`rustgis-cli run`), the panes'
     // bound, its progress told.
@@ -1212,25 +1228,48 @@ fn run_telling<T: Send>(
     })
 }
 
+/// About the bytes `values` output cells hold as a raster (4 bytes each) and as its GeoTIFF.
+fn output_bytes(values: u64) -> u64 {
+    values.saturating_mul(8)
+}
+
 /// Adds a trend's (or a summary's) layers, each as a GeoTIFF the project keeps.
 pub fn add_outputs(s: &mut Session, rasters: Vec<Raster>, dates: usize) -> CmdResult {
     let mut layers = Vec::new();
     for r in rasters {
-        let name = r.name.clone();
-        let tif = raster::geotiff::write_all(&r).map_err(|e| e.to_string())?;
-        let file: String = name.chars().map(|c| if c.is_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' }).collect();
-        let named = class_values(&r);
-        let mut layer = rustgis_map::raster::RasterLayer::from_written(r, format!("{file}.tif"), tif);
-        // Named classes (firstDate's dates): a colour each for every value held, from the
-        // earliest, labelled by its name (a day before 1970, unnamed, by its number).
-        if !named.is_empty() && named.len() <= rustgis_map::raster::MAX_UNIQUE_VALUES {
-            let ramp = rustgis_map::color::Ramp::Viridis;
-            let values = named.iter().enumerate().map(|(k, v)| (*v, ramp.pick(k, named.len()))).collect();
-            layer.style.renderer = rustgis_map::raster::RasterRenderer::UniqueValues { band: 0, ramp, values };
-            layer.style.stretch = rustgis_map::raster::Stretch::None;
-            layer.style.resampling = rustgis_map::raster::Resampling::Nearest;
-        }
+        let (name, layer) = output_layer(r)?;
         let out = super::raster::add_raster(s, &name, layer)?;
+        layers.push(out["layer"].clone());
+    }
+    Ok(json!({ "layers": layers, "dates": dates }))
+}
+
+/// A trend's (or a summary's) output as the layer it adds, with its name: its GeoTIFF written, so
+/// it is made on any thread.
+pub(crate) fn output_layer(r: Raster) -> Result<(String, rustgis_map::raster::RasterLayer), String> {
+    let name = r.name.clone();
+    let tif = raster::geotiff::write_all(&r).map_err(|e| e.to_string())?;
+    let file: String = name.chars().map(|c| if c.is_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' }).collect();
+    let named = class_values(&r);
+    let mut layer = rustgis_map::raster::RasterLayer::from_written(r, format!("{file}.tif"), tif);
+    // Named classes (firstDate's dates): a colour each for every value held, from the
+    // earliest, labelled by its name (a day before 1970, unnamed, by its number).
+    if !named.is_empty() && named.len() <= rustgis_map::raster::MAX_UNIQUE_VALUES {
+        let ramp = rustgis_map::color::Ramp::Viridis;
+        let values = named.iter().enumerate().map(|(k, v)| (*v, ramp.pick(k, named.len()))).collect();
+        layer.style.renderer = rustgis_map::raster::RasterRenderer::UniqueValues { band: 0, ramp, values };
+        layer.style.stretch = rustgis_map::raster::Stretch::None;
+        layer.style.resampling = rustgis_map::raster::Resampling::Nearest;
+    }
+    Ok((name, layer))
+}
+
+/// Adds layers [`output_layer`] made (a summary read off the frame, #3183), sharing their pixels
+/// and GeoTIFFs with whatever holds them.
+pub(crate) fn add_output_layers(s: &mut Session, made: &[(String, rustgis_map::raster::RasterLayer)], dates: usize) -> CmdResult {
+    let mut layers = Vec::new();
+    for (name, layer) in made {
+        let out = super::raster::add_raster(s, name, layer.clone())?;
         layers.push(out["layer"].clone());
     }
     Ok(json!({ "layers": layers, "dates": dates }))
@@ -1803,6 +1842,17 @@ pub struct ReduceRun {
 }
 
 impl ReduceRun {
+    /// About the bytes its outputs hold once made, with their GeoTIFFs: a band for each group and
+    /// asset (firstDate's one date for all the assets, as [`ReduceRun::run`] makes them); the most
+    /// a run can make ([`MAX_REDUCED`] values) when the cube doesn't know its size, or for
+    /// frequency, whose classes aren't known before it is read.
+    pub fn output_bytes(&self) -> u64 {
+        let per = if self.stat == Stat::FirstDate { 1 } else { self.cube.assets().len().max(1) };
+        let slots = (self.groups.len() * per) as u64;
+        let cells = self.cube.size().filter(|_| self.stat != Stat::Frequency).map(|(w, h)| (w as u64).saturating_mul(h as u64));
+        output_bytes(cells.map_or(MAX_REDUCED, |c| c.saturating_mul(slots).min(MAX_REDUCED)))
+    }
+
     /// The work, for a progress bar: the slices read, every piece's, and the dates' clear shares
     /// when first takes them in that order.
     pub fn total(&self) -> usize {
@@ -2470,6 +2520,13 @@ pub fn reduce_start(s: &mut Session, p: &Value) -> Result<ReduceRun, String> {
 /// `cube.reduce`: the summary computed here (blocking), its progress told where only a shell waits
 /// on it (`rustgis-cli run`), its layers added, each kept in the project as a GeoTIFF.
 fn reduce_cmd(s: &mut Session, p: &Value) -> CmdResult {
+    // A plugin's command the app runs reads a STAC collection off the frame (#3183).
+    if let Some(left) = super::plugins::summary::left(s, "cube.reduce", p, |s| {
+        let run = reduce_start(s, p)?;
+        Ok(super::plugins::summary::Work::new(run.total(), run.dates(), run.output_bytes(), move |cancel, done| run.run(cancel, done)))
+    }) {
+        return left;
+    }
     let run = reduce_start(s, p)?;
     let rasters = run_here(s.long_runs, "cube.reduce", run.total(), |cancel, done| run.run(cancel, done))?;
     let added = add_outputs(s, rasters, run.dates());

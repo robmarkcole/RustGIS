@@ -16,6 +16,8 @@ use crate::{CmdResult, CommandSpec as C, Session};
 
 #[path = "plugin_fetch.rs"]
 pub mod fetch;
+#[path = "plugin_summary.rs"]
+pub mod summary;
 
 pub fn commands() -> Vec<C> {
     vec![
@@ -927,6 +929,7 @@ impl Session {
         let queued_before = self.queued_authority();
         // The downloads this call leaves to the app: its own, apart from a calling command's.
         let outer = self.call_requests.replace(Vec::new());
+        let outer_summaries = std::mem::take(&mut self.call_summaries);
         let mark = self.notice_mark();
         let res = self.guarded(label, mutates, |s| {
             let fetches = fetch::Calls::for_plugin(&plugin.manifest.id);
@@ -981,6 +984,8 @@ impl Session {
             }
         }
         self.call_requests = outer;
+        // The summaries this call left to read off the frame (#3183), read once it is kept.
+        let summaries = std::mem::replace(&mut self.call_summaries, outer_summaries);
         // A session's program this command found failed, and started again: the command line
         // has no poll, so this is where it hears of it.
         #[cfg(not(target_arch = "wasm32"))]
@@ -1006,6 +1011,9 @@ impl Session {
         // and with no command waiting nothing would take it.
         let documents: Vec<(u64, Value)> =
             requested.iter().filter(|(n, asked)| !giving_up && fetch::is_document(asked) && !self.url_waits.has(*n)).cloned().collect();
+        // So is a summary this call left (one asked for again is already being read).
+        let summarised: Vec<u64> =
+            requested.iter().filter(|(_, asked)| !giving_up && summary::is_summary(asked)).map(|(n, _)| *n).collect();
         // The errors this run said stay: the next run, doing the same again, doesn't repeat them.
         let earlier = self.rerun_said.len();
         let said: Vec<String> = self.notices_since(mark).iter().filter(|n| n.error).map(|n| n.text.clone()).collect();
@@ -1019,6 +1027,9 @@ impl Session {
         } else {
             for (n, asked) in &documents {
                 self.url_waits.read_document(*n, asked);
+            }
+            for left in summaries.into_iter().filter(|l| summarised.contains(&l.number())) {
+                self.url_waits.read_summary(left, id);
             }
         }
         res
