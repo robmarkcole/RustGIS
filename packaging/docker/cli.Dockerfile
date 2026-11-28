@@ -10,7 +10,7 @@
 # for. .github/workflows/docker.yml builds each platform on a runner of its own.
 # Dependabot keeps the base images current.
 
-FROM rust:1.100.0-slim@sha256:6f14b2b4b278ec0d50aa1d69541c304ce0f95e0f6268487aa9924af1c2e9aebe AS build
+FROM rust:1.100.0-slim@sha256:3b199fd6db7d709274df56565b8f4003f9e30d7bfcff9d53148c86053b7855e2 AS build
 
 # crates/render/build.rs uses curl to fetch the Natural Earth sample data it embeds.
 RUN apt-get update \
