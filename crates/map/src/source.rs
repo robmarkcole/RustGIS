@@ -226,6 +226,10 @@ pub struct SourceLayer {
     /// Why the source couldn't be opened or read.
     #[serde(skip)]
     pub error: Option<String>,
+    /// A header incompatible with the saved fields must not reach the direct renderer.
+    /// Unlike transient read/render errors, this needs schema reconciliation before retry.
+    #[serde(skip)]
+    pub(crate) schema_refused: bool,
     /// Last read failure reported by the session, independent of disposable render copies.
     #[serde(skip)]
     error_said: Option<String>,
@@ -911,6 +915,7 @@ impl SourceLayer {
             query: _,
             opening: _,
             error: _,
+            schema_refused: _,
             error_said: _,
             login: _,
             reconnect_required: _,
@@ -1106,6 +1111,7 @@ impl SourceLayer {
 
     /// Clears a recovered failure and its notice marker, even between notice passes.
     pub fn clear_error(&mut self) {
+        self.schema_refused = false;
         self.error = None;
         self.error_said = None;
     }
@@ -1308,9 +1314,10 @@ impl SourceLayer {
         self.handle.as_ref().filter(|h| h.visits_extent_chunks()).cloned()
     }
 
-    /// A source capable of a complete, ordered render traversal.
+    /// A source capable of a complete, ordered render traversal. An incompatible schema must
+    /// not bypass its refusal. Other read/render errors retain the handle for recovery/retry.
     pub fn chunk_source(&self) -> Option<Arc<dyn FeatureSource>> {
-        self.handle.as_ref().filter(|h| h.streams_chunks()).cloned()
+        self.handle.as_ref().filter(|h| !self.schema_refused && h.streams_chunks()).cloned()
     }
 
     /// Reuses a complete source's thinning decision for a projection and LOD level. Both
@@ -2383,6 +2390,7 @@ impl SourceLayer {
             query: _,
             opening: _,
             error: _,
+            schema_refused: _,
             error_said: _,
             login: _,
             reconnect_required: _,

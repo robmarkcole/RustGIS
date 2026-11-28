@@ -580,6 +580,60 @@ impl Layer {
         moved
     }
 
+    /// Reopens a source whose contents a command deliberately replaced. Its new header is
+    /// authoritative; retain aliases for unchanged columns, but discard the old window before
+    /// any new rows can be paired with it. Obsolete label moves are reset with a counted note,
+    /// including on failed reopening. External source changes still use strict validation.
+    pub fn refresh_replaced_source(&mut self) -> Result<(), String> {
+        let Some(source) = &mut self.source else { return Ok(()) };
+        let moved: usize = std::iter::once(&self.labels.default).chain(&self.labels.classes).map(|class| class.moved.len()).sum();
+        self.labels.default.moved.clear();
+        self.labels.classes.iter_mut().for_each(|class| class.moved.clear());
+        let reopened = source.reopen();
+        if moved > 0 {
+            source.saw_read_notes(&[format!("{moved} saved label move(s) reset: replacement data may reuse feature ids").into()]);
+        }
+        if let Err(error) = reopened {
+            self.touch_replacement();
+            self.install(Vec::new());
+            return Err(error);
+        }
+        if let Some(info) = source.info() {
+            let removed: Vec<_> = self
+                .dataset
+                .fields
+                .iter()
+                .filter(|saved| !info.fields.iter().any(|fresh| fresh.name == saved.name))
+                .map(|field| field.name.clone())
+                .collect();
+            self.dataset.fields = info
+                .fields
+                .iter()
+                .map(|fresh| {
+                    self.dataset
+                        .fields
+                        .iter()
+                        .find(|saved| saved.name == fresh.name && saved.ty == fresh.ty)
+                        .cloned()
+                        .unwrap_or_else(|| fresh.clone())
+                })
+                .collect();
+            self.dataset.geometry_type = info.geometry_type;
+            self.dataset.crs = info.coordinate_system();
+            self.dataset.zm_dropped = info.zm_dropped;
+            if !removed.is_empty() {
+                let count = removed.len();
+                let columns = if count == 1 { "column" } else { "columns" };
+                let names = removed.iter().take(5).map(|name| format!("'{}'", name.escape_debug())).collect::<Vec<_>>().join(", ");
+                let more = if count > 5 { format!(" and {} more", count - 5) } else { String::new() };
+                source.saw_read_notes(&[format!("the replaced source no longer has {count} saved {columns}: {names}{more}").into()]);
+            }
+        }
+        self.touch_replacement();
+        self.install(Vec::new());
+        Ok(())
+    }
+
     /// The dataset, streamed, raster and time-following Zarr addresses used to read this layer
     /// again, in that order. Local paths are included; database origins stay password-free.
     pub fn addresses_mut(&mut self) -> impl Iterator<Item = &mut String> {
@@ -734,23 +788,39 @@ impl Layer {
                 return src.is_pending();
             }
         }
-        // A project that lists no fields for a streamed layer (one written by another app, which
-        // can't know which columns the reader takes) gets the source's: reads keep the attributes
-        // in that order, and a renderer on a field finds it.
-        if self.dataset.fields.is_empty()
-            && let Some(info) = self.source.as_ref().and_then(|s| s.info())
-        {
-            self.dataset.fields = info.fields.clone();
-        }
         if let Some(info) = self.source.as_ref().and_then(|s| s.info()) {
-            let mut fields = self.dataset.fields.clone();
-            if let Err(error) = self.date_fields_from_source(&mut fields, &info.fields, info.format) {
-                if let Some(source) = &mut self.source {
-                    source.error = Some(error);
+            match self.fields_from_source(&info.fields, info.format) {
+                Ok(fields) => {
+                    let note = self.added_source_fields_note(&fields);
+                    self.dataset.fields = fields;
+                    if let Some(source) = &mut self.source {
+                        if source.schema_refused {
+                            source.clear_error();
+                            source.reread();
+                        }
+                        if let Some(note) = note {
+                            source.saw_read_notes(&[note]);
+                        }
+                    }
                 }
-                return false;
+                Err(error) => {
+                    // Hide a refused window without losing its feature-id selection. Taking
+                    // the parked vector avoids copying it again on each refused frame.
+                    let mut selected = Vec::new();
+                    if let Some(source) = &mut self.source {
+                        selected = std::mem::take(&mut source.saved_selection);
+                        source.schema_refused = true;
+                        source.error = Some(error);
+                    }
+                    selected.extend(self.selection.iter().filter_map(|row| self.dataset.features.row(*row)).map(|feature| feature.id()));
+                    self.selection.clear();
+                    self.install(Vec::new());
+                    if let Some(source) = &mut self.source {
+                        source.saved_selection = selected;
+                    }
+                    return false;
+                }
             }
-            self.dataset.fields = fields;
         }
         // An opened source's dropped Z or M values, for a project saved without the mark. Added to,
         // not replaced: a source that couldn't tell (a check that timed out) mustn't clear a mark the
@@ -876,6 +946,48 @@ impl Layer {
         self.load_all_counted().map(|(ds, _)| ds)
     }
 
+    /// Keeps saved aliases and compatible date handling, adopts appended fields, and refuses
+    /// positional reads after columns move, disappear or change type. No source rows are copied.
+    fn fields_from_source(&self, source: &[rustgis_data::Field], format: &str) -> Result<Vec<rustgis_data::Field>, String> {
+        if self.dataset.fields.is_empty() {
+            return Ok(source.to_vec());
+        }
+        let mut fields = self.dataset.fields.clone();
+        self.date_fields_from_source(&mut fields, source, format)?;
+        let mismatch = fields.iter().zip(source).find(|(saved, fresh)| {
+            saved.name != fresh.name || (saved.ty != fresh.ty && !(saved.ty == rustgis_data::FieldType::Text && fresh.ty.is_temporal()))
+        });
+        if fields.len() > source.len() || mismatch.is_some() {
+            let name = mismatch
+                .map(|(saved, _)| saved.name.as_str())
+                .or_else(|| fields.get(source.len()).map(|f| f.name.as_str()))
+                .unwrap_or_default();
+            let advice = if cfg!(not(target_arch = "wasm32")) && self.linked_file().is_some() {
+                "Use Reload Data to reconcile its current columns"
+            } else {
+                "Remove this layer and add its source again to use the current columns"
+            };
+            return Err(format!(
+                "The source's columns no longer match the saved layer at '{name}'; saved fields and settings were kept unchanged. {advice}"
+            ));
+        }
+        fields.extend(source.iter().skip(fields.len()).cloned());
+        Ok(fields)
+    }
+
+    /// Names the first few appended columns once; a project with no saved schema has no change
+    /// to compare, and a repeated view has already adopted the columns.
+    fn added_source_fields_note(&self, fields: &[rustgis_data::Field]) -> Option<rustgis_data::loss::Note> {
+        let saved = self.dataset.fields.len();
+        if saved == 0 || fields.len() <= saved {
+            return None;
+        }
+        let count = fields.len() - saved;
+        let names = fields.iter().skip(saved).take(5).map(|f| format!("'{}'", f.name)).collect::<Vec<_>>().join(", ");
+        let more = if count > 5 { format!(" and {} more", count - 5) } else { String::new() };
+        Some(format!("the source has {count} field(s) not listed in the saved layer, read with: {names}{more}").into())
+    }
+
     /// Reconciles source dates with a saved schema before installing any source values.
     /// Old GeoParquet epoch-integer schemas require re-adding the source: changing the type
     /// alone cannot preserve saved queries, class keys and calculation rules. Newly exposed
@@ -898,7 +1010,7 @@ impl Layer {
         }
         if format == "GeoParquet"
             && source.iter().any(|f| f.ty.is_temporal())
-            && (fields.len() != source.len() || fields.iter().zip(source).any(|(saved, fresh)| saved.name != fresh.name))
+            && (fields.len() > source.len() || fields.iter().zip(source).any(|(saved, fresh)| saved.name != fresh.name))
         {
             return Err(
                 "The source's columns don't match this saved layer's fields. Add the data source again to use its current schema.".into()
@@ -991,6 +1103,8 @@ impl Layer {
     /// given, and names and types what is read as the layer does.
     fn load_all_with_notices(&self, limit: Option<(u64, &str)>) -> Result<(Dataset, rustgis_data::ReadReport), String> {
         let Some(copy) = self.open_source()? else { return Ok((self.dataset.clone(), rustgis_data::ReadReport::default())) };
+        // Refuse an incompatible header before reading an arbitrarily large source's rows.
+        let fields = copy.info().map(|info| self.fields_from_source(&info.fields, info.format)).transpose()?;
         let (mut ds, mut report) = copy.read_all_within(limit)?;
         if let Some(info) = copy.info() {
             ds.zm_dropped |= info.zm_dropped;
@@ -1010,12 +1124,9 @@ impl Layer {
                 copy.info().map_or(rustgis_data::GeometryType::None, |info| info.geometry_type)
             };
         }
-        // (A project that lists no fields keeps the source's, as `sync_source` gives it.)
-        if !self.dataset.fields.is_empty() {
-            ds.fields = self.dataset.fields.clone();
-            if let Some(info) = copy.info() {
-                self.date_fields_from_source(&mut ds.fields, &info.fields, info.format)?;
-            }
+        if let Some(fields) = fields {
+            report.messages.extend(self.added_source_fields_note(&fields).map(|n| n.prefixed(&self.name)));
+            ds.fields = fields;
         }
         ds.source = self.dataset.source.clone();
         Ok((ds, report))
@@ -1057,10 +1168,7 @@ impl Layer {
         ds.held_in = src.coord_crs();
         // What reading the source drops, the export lacks (see `Dataset::zm_dropped`).
         ds.zm_dropped = info.zm_dropped || self.dataset.zm_dropped;
-        if !self.dataset.fields.is_empty() {
-            ds.fields = self.dataset.fields.clone();
-            self.date_fields_from_source(&mut ds.fields, &info.fields, info.format)?;
-        }
+        ds.fields = self.fields_from_source(&info.fields, info.format)?;
         // (A source declaring no geometry type takes its first geometry's when exported, as a
         // whole read does.)
         ds.source = self.dataset.source.clone();
@@ -3630,9 +3738,13 @@ impl Map {
         self.layers.iter().fold(Extent::EMPTY, |e, l| e.union(&l.selection_extent()))
     }
 
+    /// Clears visible row selections and ids parked for a streamed layer's next compatible read.
     pub fn clear_selection(&mut self) {
         for l in &mut self.layers {
             l.selection.clear();
+            if let Some(source) = &mut l.source {
+                source.saved_selection.clear();
+            }
         }
     }
 
@@ -4110,6 +4222,192 @@ mod tests {
     use rustgis_data::{Field, FieldType, Value};
     use rustgis_geom::lonlat_to_merc;
 
+    /// An actual in-memory file reader with a saved schema that differs from its fresh header.
+    fn linked_schema_layer(saved: &[&str], fresh: &[&str]) -> Layer {
+        let mut ds = Dataset::new("Sites", GeometryType::Point, fresh.iter().map(|name| Field::new(*name, FieldType::Integer)).collect());
+        ds.push(Some(Geometry::Point(Coord::new(1.0, 1.0))), fresh.iter().enumerate().map(|(i, _)| Value::Int(10 + i as i64)).collect());
+        let bytes = std::sync::Arc::new(rustgis_data::source::fgb::write(&ds).unwrap());
+        let handle = rustgis_data::source::open_shared("sites.fgb", bytes, None).unwrap();
+        let mut layer = Layer::new_streamed(1, source::SourceLayer::from_path("sites.fgb", None, handle));
+        layer.dataset.fields = saved.iter().map(|name| Field::new(*name, FieldType::Integer)).collect();
+        layer
+    }
+
+    #[test]
+    fn linked_source_schema_additions_reach_views_whole_reads_and_exports() {
+        let mut layer = linked_schema_layer(&["rank"], &["rank", "download"]);
+        let (all, report) = layer.load_all_reported().unwrap();
+        assert_eq!(all.fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["rank", "download"]);
+        assert_eq!(all.features.value(0, 1), &Value::Int(11));
+        assert_eq!(report.messages.iter().filter(|n| n.contains("1 field") && n.contains("download")).count(), 1);
+        let (_, exported) = layer.chunk_export().unwrap().unwrap();
+        assert_eq!(exported.fields, all.fields);
+        layer.sync_source(&Extent::new(-180.0, -80.0, 180.0, 80.0), true);
+        assert_eq!(layer.dataset.fields, all.fields);
+        assert_eq!(layer.dataset.features.value(0, 1), &Value::Int(11));
+        let notices = layer.source.as_mut().unwrap().take_read_notes();
+        assert_eq!(notices.iter().filter(|n| n.contains("1 field") && n.contains("download")).count(), 1);
+        layer.sync_source(&Extent::new(-180.0, -80.0, 180.0, 80.0), true);
+        assert!(layer.source.as_mut().unwrap().take_read_notes().is_empty());
+    }
+
+    #[test]
+    fn linked_source_schema_changes_refuse_positional_values_and_keep_saved_fields() {
+        for (saved, fresh) in [
+            (&["rank", "other"][..], &["other"][..]),
+            (&["rank", "other"][..], &["other", "rank"][..]),
+            (&["rank"][..], &["new", "rank"][..]),
+        ] {
+            let mut layer = linked_schema_layer(saved, fresh);
+            let kept = layer.dataset.fields.clone();
+            let error = layer.load_all().unwrap_err();
+            assert!(error.contains("Reload Data"), "{error}");
+            assert!(layer.load_all_counted_up_to(1 << 20, "fixture budget").unwrap_err().contains("Reload Data"));
+            assert!(layer.chunk_export().is_err());
+            layer.sync_source(&Extent::new(-180.0, -80.0, 180.0, 80.0), true);
+            assert!(layer.dataset.features.is_empty());
+            assert_eq!(layer.dataset.fields, kept);
+            assert!(layer.source.as_ref().unwrap().error.as_deref().unwrap().contains("Reload Data"));
+        }
+        let mut layer = linked_schema_layer(&["rank"], &["rank"]);
+        layer.dataset.fields[0].ty = FieldType::Double;
+        assert!(layer.load_all().is_err(), "a changed declared type also needs explicit reload");
+    }
+
+    /// The renderer's direct Shapefile chunks must not bypass a schema refusal, and an
+    /// in-session refusal clears already loaded rows instead of keeping an old window visible.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn linked_source_schema_refusal_hides_old_rows_and_render_chunks() {
+        let path = std::env::temp_dir().join(format!("rustgis-linked-schema-{}.shp", std::process::id()));
+        assert!(!path.exists());
+        let seed = linked_schema_layer(&["rank"], &["rank"]).load_all().unwrap();
+        rustgis_data::io::write_path(&seed, &path).unwrap();
+        let handle = rustgis_data::source::open_path(&path, None).unwrap();
+        let source = source::SourceLayer::from_path(path.to_str().unwrap(), None, handle);
+        let mut layer = Layer::new_streamed(1, source);
+        assert!(layer.source.as_ref().unwrap().chunk_source().is_some());
+        let view = Extent::new(-180.0, -80.0, 180.0, 80.0);
+        layer.sync_source(&view, true);
+        assert_eq!(layer.dataset.features.len(), 1);
+        layer.dataset.fields[0].name = "saved_old_name".into();
+        layer.sync_source(&view, true);
+        assert!(layer.dataset.features.is_empty());
+        let source = layer.source.as_ref().unwrap();
+        assert!(source.error.as_deref().unwrap().contains("saved_old_name"));
+        assert!(source.chunk_source().is_none(), "render traversal must honor the refusal");
+        // Reconciled saved fields recover at the same view, without a pan or reopen.
+        layer.dataset.fields[0].name = "rank".into();
+        layer.sync_source(&view, true);
+        assert_eq!(layer.dataset.features.len(), 1);
+        assert!(layer.source.as_ref().unwrap().error.is_none());
+        assert!(layer.source.as_ref().unwrap().chunk_source().is_some());
+        // An explicitly replaced source adopts its header, preserves matching aliases and
+        // names saved columns that disappeared; old window rows cannot survive the change.
+        layer.dataset.fields[0].alias = Some("Rank".into());
+        layer.dataset.fields.push(Field::new("gone", FieldType::Integer));
+        let moved = symbology::MovedLabel { id: layer.dataset.features.row(0).unwrap().id(), at: [4.0, 5.0] };
+        layer.labels.default.moved.push(moved);
+        let mut class = layer.labels.default.clone();
+        class.name = "Subset".into();
+        layer.labels.classes.push(class);
+        let previous = layer.replacement_revision();
+        layer.refresh_replaced_source().unwrap();
+        assert!(layer.labels.in_order().all(|class| class.moved.is_empty()));
+        assert_ne!(layer.replacement_revision(), previous, "the prior contents no longer own selected vertices");
+        assert!(layer.dataset.features.is_empty());
+        assert_eq!(layer.dataset.fields.len(), 1);
+        assert_eq!(layer.dataset.fields[0].alias.as_deref(), Some("Rank"));
+        let notes = layer.source.as_mut().unwrap().take_read_notes();
+        assert!(notes.iter().any(|n| n.contains("1 saved column") && n.contains("'gone'")), "{notes:?}");
+        assert_eq!(notes.iter().filter(|n| n.contains("2 saved label move(s) reset")).count(), 1);
+        layer.sync_source(&view, true);
+        assert_eq!(layer.dataset.features.len(), 1);
+        layer.labels.default.moved.push(moved);
+        layer.labels.classes[0].moved.push(moved);
+        std::fs::remove_file(&path).unwrap();
+        let previous = layer.replacement_revision();
+        assert!(layer.refresh_replaced_source().is_err());
+        assert!(layer.labels.in_order().all(|class| class.moved.is_empty()));
+        let notes = layer.source.as_mut().unwrap().take_read_notes();
+        assert_eq!(notes.iter().filter(|n| n.contains("2 saved label move(s) reset")).count(), 1);
+        assert_ne!(layer.replacement_revision(), previous, "a failed replacement also invalidates ownership of the old contents");
+        assert!(layer.dataset.features.is_empty(), "a failed replacement cannot leave rows from the previous file drawn");
+        assert_eq!(layer.dataset.fields[0].alias.as_deref(), Some("Rank"));
+        drop(layer);
+        for extension in ["shp", "shx", "dbf", "prj", "cpg"] {
+            let _ = std::fs::remove_file(path.with_extension(extension));
+        }
+    }
+
+    /// A schema refusal hides rows temporarily rather than discarding selected feature ids.
+    /// Repeated refusals retain parked ids, and the same view restores their selection on read.
+    #[test]
+    fn linked_source_schema_refusal_preserves_selection_until_recovery() {
+        let mut map = Map::new("Sources");
+        let id = map.add_layer(linked_schema_layer(&["rank"], &["rank"]));
+        let layer = map.layer_mut(id).unwrap();
+        let view = Extent::new(-180.0, -80.0, 180.0, 80.0);
+        layer.sync_source(&view, true);
+        layer.selection = vec![0];
+        let selected = layer.selected_ids();
+        assert_eq!(selected.len(), 1);
+        layer.dataset.fields[0].name = "saved_old_name".into();
+        for _ in 0..2 {
+            layer.sync_source(&view, true);
+            assert!(layer.dataset.features.is_empty());
+            assert!(layer.selection.is_empty());
+            assert_eq!(layer.selected_ids(), selected, "a refused window must retain its selected ids");
+        }
+        layer.dataset.fields[0].name = "rank".into();
+        layer.sync_source(&view, true);
+        assert_eq!(layer.selection, [0]);
+        assert_eq!(layer.selected_ids(), selected);
+        assert!(layer.source.as_ref().unwrap().saved_selection.is_empty());
+        // An explicit Clear Selection during a later refusal cancels that restoration.
+        layer.dataset.fields[0].name = "saved_old_name".into();
+        layer.sync_source(&view, true);
+        assert_eq!(layer.selected_ids(), selected);
+        map.clear_selection();
+        let layer = map.layer_mut(id).unwrap();
+        assert!(layer.selected_ids().is_empty(), "Clear Selection also clears the parked ids");
+        layer.dataset.fields[0].name = "rank".into();
+        layer.sync_source(&view, true);
+        assert!(layer.selection.is_empty(), "cleared selection cannot reappear on recovery");
+    }
+
+    /// A saved native-date prefix can gain a trailing field before any view sync. Whole reads,
+    /// chunk exports and views all adopt that same source header without epoch reinterpretation.
+    #[test]
+    fn linked_source_schema_native_parquet_dates_allow_trailing_fields() {
+        let fields = vec![Field::new("issued", FieldType::Date), Field::new("download", FieldType::Integer)];
+        let mut ds = Dataset::new("Permits", GeometryType::Point, fields.clone());
+        let date = Value::parse("2026-11-27", FieldType::Date);
+        ds.push(Some(Geometry::Point(Coord::new(1.0, 1.0))), vec![date.clone(), Value::Int(11)]);
+        let bytes = std::sync::Arc::new(rustgis_data::io::write_bytes(&ds, "parquet").unwrap().0);
+        let handle = rustgis_data::source::open_shared("permits.parquet", bytes, None).unwrap();
+        let mut layer = Layer::new_streamed(1, source::SourceLayer::from_path("permits.parquet", None, handle));
+        layer.dataset.fields.truncate(1);
+        let (all, report) = layer.load_all_reported().unwrap();
+        assert_eq!(all.fields, fields);
+        assert_eq!(all.features.value(0, 0), &date);
+        assert_eq!(all.features.value(0, 1), &Value::Int(11));
+        assert_eq!(report.messages.iter().filter(|n| n.contains("1 field") && n.contains("download")).count(), 1);
+        assert_eq!(layer.chunk_export().unwrap().unwrap().1.fields, fields);
+        layer.sync_source(&Extent::new(-180.0, -80.0, 180.0, 80.0), true);
+        assert_eq!(layer.dataset.fields, fields);
+        assert_eq!(layer.dataset.features.value(0, 0), &date);
+        assert_eq!(layer.dataset.features.value(0, 1), &Value::Int(11));
+    }
+
+    #[test]
+    fn linked_source_schema_clean_reads_have_no_change_notice() {
+        let mut layer = linked_schema_layer(&["rank"], &["rank"]);
+        assert!(layer.load_all_reported().unwrap().1.messages.is_empty());
+        layer.sync_source(&Extent::new(-180.0, -80.0, 180.0, 80.0), true);
+        assert!(layer.source.as_mut().unwrap().take_read_notes().is_empty());
+    }
+
     /// A text field an old project lists for a source's date column becomes a date field, unless
     /// a filter reads it as text and wouldn't as dates: then it stays text and the filter works.
     #[test]
@@ -4178,15 +4476,14 @@ mod tests {
         assert!(rustgis_data::query::parse_fields("starts_on <= ends_on", &Dataset::new("", GeometryType::Point, current)).is_ok());
     }
 
-    /// Previously omitted INT96 fields can now be present between saved columns, or after them.
-    /// Refusal keeps the saved schema intact and prevents shifted or silently omitted values.
+    /// Previously omitted INT96 fields inserted between saved columns would shift their values.
+    /// Refusal keeps that saved schema intact; a matching prefix can safely gain trailing fields.
     #[test]
     fn newly_read_date_columns_refuse_stale_saved_field_positions() {
         let fields = vec![Field::new("name", FieldType::Text), Field::new("population", FieldType::Integer)];
         let layer = Layer::new(1, Dataset::new("old", GeometryType::Point, fields.clone()));
         for source in [
             vec![fields[0].clone(), Field::new("legacy_time", FieldType::DateTime), fields[1].clone()],
-            vec![fields[0].clone(), fields[1].clone(), Field::new("legacy_time", FieldType::DateTime)],
             vec![Field::new("name", FieldType::DateTime), fields[0].clone(), fields[1].clone()],
         ] {
             let mut saved = fields.clone();
@@ -4197,6 +4494,8 @@ mod tests {
             layer.date_fields_from_source(&mut fresh, &source, "GeoParquet").unwrap();
             assert_eq!(fresh, source);
         }
+        let appended = vec![fields[0].clone(), fields[1].clone(), Field::new("legacy_time", FieldType::DateTime)];
+        assert_eq!(layer.fields_from_source(&appended, "GeoParquet").unwrap(), appended);
     }
 
     #[test]

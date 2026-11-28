@@ -149,8 +149,10 @@ fn add_layer(s: &mut Session, p: &Value) -> CmdResult {
 /// with no table named) read it again, in every map: its rows were written, or (with `reopen`)
 /// the table was made anew, so its fields and system are read again too. Returns how many read
 /// it again, and the layers that couldn't reopen it with why (each also keeps its error).
+/// Replacement notes are reported immediately, including for callers without a frame loop.
 pub(crate) fn reset_sources(s: &mut Session, path: &std::path::Path, table: &str, reopen: bool) -> (usize, Vec<String>) {
     let (mut n, mut failed) = (0, Vec::new());
+    let mut notes = Vec::new();
     let canonical = std::fs::canonicalize(path).ok();
     for map in &mut s.project.maps {
         for l in map.layers.iter_mut() {
@@ -167,13 +169,21 @@ pub(crate) fn reset_sources(s: &mut Session, path: &std::path::Path, table: &str
                     source.reset();
                     n += 1;
                 } else {
-                    match source.reopen() {
+                    let reopened = l.refresh_replaced_source();
+                    if let Some(source) = &mut l.source {
+                        notes.extend(source.take_read_notes().into_iter().map(|note| note.prefixed(&l.name)));
+                    }
+                    match reopened {
                         Ok(()) => n += 1,
                         Err(e) => failed.push(format!("{} ({e})", l.name)),
                     }
                 }
             }
         }
+    }
+    // Replacement notes must land with the command, including in callers without a frame loop.
+    for note in notes {
+        s.say(note);
     }
     (n, failed)
 }
