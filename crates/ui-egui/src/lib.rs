@@ -90,6 +90,7 @@ mod pluginstart;
 mod pluginsui;
 mod popupmedia;
 mod portalsui;
+mod problemreport;
 mod publicationwizard;
 #[cfg(not(target_arch = "wasm32"))]
 mod readjob;
@@ -1026,6 +1027,8 @@ pub struct UiState {
     /// A ribbon button being shown by a task step's Show Me.
     pub show_me: Option<showme::ShowMe>,
     pub about: bool,
+    /// Help › Report a Problem, while open.
+    pub problem_report: Option<problemreport::Window>,
     pub shortcuts: bool,
     /// The keyboard shortcuts.
     pub keymap: keymap::Keymap,
@@ -1295,6 +1298,7 @@ impl Default for UiState {
             command_search_composing: false,
             show_me: None,
             about: false,
+            problem_report: None,
             shortcuts: false,
             keymap: keymap::Keymap::default(),
             shortcut_editor: shortcutui::Editor::default(),
@@ -1509,6 +1513,9 @@ pub struct RustGisApp {
     /// The touch interface a phone's shell offers (`rustgis-ui-touch`), kept while the desktop
     /// interface is in its place so `ui.touchInterface` can bring it back. `None` elsewhere.
     pub touch: Option<Chrome>,
+    /// How the app's last run ended, as its shell said at start, for Report a Problem: not
+    /// reported where the shell doesn't keep track.
+    pub last_run: rustgis_engine::problem_report::LastRun,
     /// Whether the user wants the device's position shown: a shell that can report one (a
     /// phone's) starts and stops its positioning by this, and fills in [`RustGisApp::position`].
     pub locate: bool,
@@ -1892,6 +1899,7 @@ impl RustGisApp {
             reads_off_frame: false,
             chrome: None,
             touch: None,
+            last_run: rustgis_engine::problem_report::LastRun::NotReported,
             locate: false,
             position: None,
             fixes: std::collections::VecDeque::new(),
@@ -4687,6 +4695,7 @@ impl RustGisApp {
             }
             "ui.commandSearch" => self.ui.command_search = Some(String::new()),
             "ui.about" => self.ui.about = true,
+            "ui.reportProblem" => self.open_problem_report(),
             // Back from the desktop interface to the phone's, which the shell left in `touch`.
             "ui.touchInterface" => match (self.chrome, self.touch) {
                 (Some(_), _) => {}
@@ -7870,6 +7879,7 @@ impl RustGisApp {
         chrome::command_search(self, &ctx);
         shortcutui::show(self, &ctx);
         chrome::about(self, &ctx);
+        problemreport::show(self, &ctx);
         #[cfg(not(target_arch = "wasm32"))]
         agentthreads::windows(self, &ctx);
         // The keys that follow a click of this frame, now that the panes have taken it and the

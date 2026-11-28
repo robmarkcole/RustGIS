@@ -4426,6 +4426,17 @@ fn help_tab(app: &mut RustGisApp, ui: &mut Ui) {
     });
     group(ui, "Help", |ui| {
         big(ui, app, "help", "About", "About RustGIS.", "ui.about", Value::Null, false, false);
+        big(
+            ui,
+            app,
+            "message_log",
+            "Report a\nProblem",
+            "See the diagnostics a bug report needs, then copy them or open a bug report on GitHub.",
+            "ui.reportProblem",
+            Value::Null,
+            false,
+            false,
+        );
         if !cfg!(target_arch = "wasm32") {
             big(
                 ui,

@@ -801,6 +801,8 @@ fn main() -> eframe::Result {
     // The marker, shared from here: what runs is noted in it, start-up commands (a project or file
     // opened) included, so a run that ends without closing says what it was doing.
     let other_copy = marker.as_ref().is_err_and(|no| no.other_copy);
+    // Without a marker an unclean exit isn't noticed, so the report can't say the last run closed.
+    let tracked = marker.is_ok();
     let marker: running::Shared = std::sync::Arc::new(std::sync::Mutex::new(marker.ok()));
     let crumbs = marker.clone();
     app.session.on_run = Some(Box::new(move |run| running::note(&crumbs, run)));
@@ -816,7 +818,12 @@ fn main() -> eframe::Result {
     if crashed.is_some() || unclean {
         // Notices are shown as written: translate this one now that the language is known.
         rustgis_ui_egui::i18n::set_current(app.chosen_lang());
-        app.session.notify(last_run_notice(&app, crashed.as_deref(), unclean, last_command.as_ref()), true);
+        let notice = last_run_notice(&app, crashed.as_deref(), unclean, last_command.as_ref());
+        // Kept for Report a Problem too: Messages may have let it go by then.
+        app.last_run = rustgis_engine::problem_report::LastRun::Left(notice.clone());
+        app.session.notify(notice, true);
+    } else if tracked {
+        app.last_run = rustgis_engine::problem_report::LastRun::Closed;
     }
     if let Some(e) = no_autosave {
         log::warn!("no autosave: {e}");

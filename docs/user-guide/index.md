@@ -161,6 +161,22 @@ A credential field in the middle of a line is removed when its value is one word
 a value of several words reads as prose and is kept (`… password: correct horse battery`).
 Review copied diagnostics for private layer names or file paths before sharing them.
 
+### Report a Problem
+
+**Help › Report a Problem** (also in the Messages pane, and the Help menu on macOS) shows, in
+one window, what a bug report needs from this session: the RustGIS version, the system, the
+graphics the map is drawn with, whether the last run closed normally, each bug met this session
+with its incident reference and where in RustGIS it happened, the last 50 commands from the
+[session log](workspace.md#session-log) as Script pane lines that run them again, and the whole Messages history. A command that
+failed says its error; one whose parameters were cut or had a secret taken out, or that a script
+can't run, says so in a comment. Logins and secrets are removed as in Messages, with the same
+limits; file paths and layer names stay.
+
+You can edit the text: **Copy** copies it as you leave it, so delete anything you don't want to
+share. **Report on GitHub…** copies it too and opens a new bug report with the version and system
+filled in; paste the diagnostics into its logs field. Opening the form sends GitHub only the
+version and system; the diagnostics go when you paste them and submit.
+
 ## The ribbon
 
 | Tab | Groups |
@@ -175,7 +191,7 @@ Review copied diagnostics for private layer names or file paths before sharing t
 | **Publish** | While a layout is open, its groups first (Page, Map Frames, Map Surrounds, Shapes, Text, Export); then Report, Presentation, Output (Export Map, Export Features, Print Map, Capture To Clipboard, Report, Presentation, Export To 3D), Package, Share As, Layout, Save As, Thumbnail |
 | **Plugins** | Plugins (Plugin Manager, Install From File, Browse Plugins), Extensions (the [Extensions](#extensions) window), plus a group for each enabled [plugin](../plugins.md) with commands or tools; a plugin with its own tab adds that tab instead |
 | **Settings** | Theme (the theme list, Follow the System, Interface Scale), Customize (Ribbon, Quick Access), Language (interface language and worldview), Start-up (Start With, Projection, Extent), Autosave on the desktop |
-| **Help** | Performance (Diagnostic Monitor), Learn (Learning Resources), Help (About, Check for Updates on the desktop, Command Search, Shortcuts) |
+| **Help** | Performance (Diagnostic Monitor), Learn (Learning Resources), Help (About, Report a Problem, Check for Updates on the desktop, Command Search, Shortcuts) |
 | **Imagery** | The [Imagery extension](#extensions)'s tab, after Help, while it is on (it is off until you turn it on): Ortho Mapping, Reality Mapping, Alignment, Image Analysis, Image Classification, Imagery Sharing, Mensuration, Imagery Tools |
 
 The tabs stay the same whatever is selected: Style, Labeling and Data act on the layer selected in Layers.

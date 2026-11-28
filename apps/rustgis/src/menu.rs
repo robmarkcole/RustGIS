@@ -145,6 +145,7 @@ const MENUS: &[(&str, &[Entry])] = &[
             Item("RustGIS Help", Command("ui.learn", ""), None),
             Item("Keyboard Shortcuts", Command("ui.shortcuts", ""), None),
             Separator,
+            Item("Report a Problem", Command("ui.reportProblem", ""), None),
             Item("Report an Issue", Command("ui.learn", r#"{"url":"https://github.com/opengeos/RustGIS/issues/new/choose"}"#), None),
         ],
     ),

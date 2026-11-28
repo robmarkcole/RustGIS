@@ -656,6 +656,26 @@ impl LogEntry {
         self.inputs_omitted = self.inputs_omitted.saturating_add(u64::try_from(omitted).unwrap_or(u64::MAX));
     }
 
+    /// Its parameters as one line of JSON: none for no parameters.
+    pub fn params_text(&self) -> String {
+        match &self.params {
+            Value::Null => String::new(),
+            Value::Object(m) if m.is_empty() => String::new(),
+            p => p.to_string(),
+        }
+    }
+
+    /// A Script pane line for it: its command and parameters, as History's Copy as Command writes
+    /// one. Undo and redo alone: what the log keeps of them is the step's label, not a parameter.
+    pub fn script_line(&self) -> String {
+        let params = self.params_text();
+        if params.is_empty() || matches!(self.command.as_str(), "edit.undo" | "edit.redo") {
+            self.command.clone()
+        } else {
+            format!("{} {params}", self.command)
+        }
+    }
+
     /// When it started, as `2026-10-30 14:05:09` (UTC).
     pub fn time_utc(&self) -> String {
         let (date, time) = rustgis_map::graphics::civil(self.at / 1000);

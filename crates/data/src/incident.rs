@@ -125,6 +125,11 @@ pub fn caught(payload: &(dyn std::any::Any + Send)) -> Incident {
     incident
 }
 
+/// The incidents kept, oldest first: for a bug report.
+pub fn kept() -> Vec<Incident> {
+    lock(&RECENT).iter().cloned().collect()
+}
+
 /// An incident kept by its reference.
 pub fn find(id: &str) -> Option<Incident> {
     lock(&RECENT).iter().rev().find(|i| i.id == id).cloned()

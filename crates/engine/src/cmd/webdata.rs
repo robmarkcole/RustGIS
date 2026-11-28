@@ -329,7 +329,7 @@ fn national_map_template(s: &NmService) -> String {
 }
 
 /// A query value with everything but letters, digits and `-_.~` percent-encoded.
-fn percent_encode(s: &str) -> String {
+pub(crate) fn percent_encode(s: &str) -> String {
     s.bytes()
         .map(|b| {
             if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {

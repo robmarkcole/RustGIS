@@ -46,6 +46,13 @@ pub(crate) fn show(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 ui.ctx().copy_text(app.session.diagnostics.report(app.ui.diagnostic_filter));
             }
             if ui
+                .button(tl!("Report a Problem"))
+                .on_hover_text(tl!("See the diagnostics a bug report needs, then copy them or open a bug report on GitHub"))
+                .clicked()
+            {
+                app.open_problem_report();
+            }
+            if ui
                 .add_enabled(!records.is_empty(), egui::Button::new(tl!("Clear")))
                 .on_hover_text(tl!("Clear all diagnostic history for this session"))
                 .clicked()

@@ -30,6 +30,7 @@ pub mod shape_conversion;
 pub use peer::Peer;
 pub(crate) use roles::{Document, ParamRole, Role};
 mod parameters;
+pub mod problem_report;
 pub mod project_log;
 mod received;
 pub use parameters::{params_envelope, script_line, split_script_id};

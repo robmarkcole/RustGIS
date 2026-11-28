@@ -1447,6 +1447,7 @@ pub(crate) const UI_COMMANDS: &[(&str, &str, &str)] = &[
     ("ui.traceEdges", "Trace", "Edit › Features"),
     ("ui.exportMap", "Export Map…", "Publish › Output"),
     ("ui.checkUpdate", "Check for Updates…", "Help › Help"),
+    ("ui.reportProblem", "Report a Problem", "Help › Help"),
     ("ui.touchInterface", "Use the Touch Interface", "View › Interface"),
 ];
 
