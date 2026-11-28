@@ -742,6 +742,7 @@ fn an_ink_colours_legends_colorbars_tables_and_charts() {
         names: true,
         text_size: 9.0,
         class_labels: &NO_CLASS_LABELS,
+        counts: None,
     };
     let grey = ColorScale::Ramp { lo: 0.0, hi: 10.0, colors: vec![Rgba::rgb(0, 0, 0), Rgba::rgb(255, 255, 255)] };
     let bar = |ink| Bar {
@@ -810,6 +811,7 @@ fn layout_no_data_legend_follows_the_frame() {
             names: true,
             text_size: 9.0,
             class_labels: &NO_CLASS_LABELS,
+            counts: None,
         };
         legend_rows(map, drawn.as_deref(), &opts)
             .into_iter()
@@ -876,6 +878,7 @@ fn layout_text_clipping_uses_ink_and_visibility() {
             fit: rustgis_map::layout::LegendFit::Manual,
             show_layer_names: rustgis_map::layout::LayerNames::Shown,
             class_labels: Default::default(),
+            show_counts: Default::default(),
         },
     );
     assert_eq!(clipped_text(&l, &[Map::new("m")], 96.0, &info), vec![(legend, "Legend".into())]);
@@ -928,6 +931,7 @@ fn legend_page(url: &str) -> (Layout, Vec<Map>) {
             fit: rustgis_map::layout::LegendFit::Manual,
             show_layer_names: rustgis_map::layout::LayerNames::Shown,
             class_labels: Default::default(),
+            show_counts: Default::default(),
         },
     );
     let mut tile = rustgis_map::TileLayer::new("Walls", rustgis_map::TileKind::Raster, "https://tiles.test/red/{z}/{x}/{y}.png");
@@ -1038,6 +1042,7 @@ fn an_svg_export_gives_up_on_held_legends_at_one_deadline() {
             fit: rustgis_map::layout::LegendFit::Manual,
             show_layer_names: rustgis_map::layout::LayerNames::Shown,
             class_labels: Default::default(),
+            show_counts: Default::default(),
         },
     );
     // The thread-local budget and the shortened wait belong to this worker alone.
@@ -1098,6 +1103,7 @@ fn a_legend_says_from_the_lookup_that_draws_it_whether_a_picture_is_missing() {
         names: true,
         text_size: 9.0,
         class_labels: &NO_CLASS_LABELS,
+        counts: None,
     };
     let mut canvas = Canvas::new(200, 200).unwrap();
     let draw = |canvas: &mut Canvas| {
@@ -1411,6 +1417,7 @@ fn a_web_layers_legend_is_its_services_picture() {
             names: true,
             text_size: 9.0,
             class_labels: &NO_CLASS_LABELS,
+            counts: None,
         };
         crate::canvas::with_canvas(&mut pm, |c| legend(c, Rect::from_xywh(0.0, 0.0, width, 400.0).unwrap(), map, ("", 1), None, opts, 1.0));
         let hits: Vec<u32> = (0..pm.height())
@@ -1451,15 +1458,16 @@ fn a_web_layers_legend_is_its_services_picture() {
         names: true,
         text_size: 9.0,
         class_labels: &NO_CLASS_LABELS,
+        counts: None,
     };
     crate::canvas::with_canvas(&mut pm, |c| legend(c, Rect::from_xywh(0.0, 0.0, 70.0, 200.0).unwrap(), &map, ("", 1), None, opts, 1.0));
     let red_rows =
         (0..pm.height()).filter(|&y| (0..pm.width()).any(|x| pm.pixel(x, y).is_some_and(|p| p.red() > 200 && p.green() < 60))).count();
     assert!(red_rows >= 2 * 63, "both pictures, {red_rows} rows");
-    let names: Vec<&str> = legend_rows(&map, None, &opts)
+    let names: Vec<String> = legend_rows(&map, None, &opts)
         .iter()
         .filter_map(|r| match r {
-            LegendRow::Head(n) => Some(*n),
+            LegendRow::Head(n) => Some(n.to_string()),
             _ => None,
         })
         .collect();
@@ -1469,11 +1477,11 @@ fn a_web_layers_legend_is_its_services_picture() {
     let lower = map.add_dataset(rustgis_data::Dataset::new("Lower", GeometryType::Point, vec![]));
     map.add_dataset(rustgis_data::Dataset::new("Upper", GeometryType::Point, vec![]));
     map.tiles[1].over = Some(lower);
-    let listed: Vec<&str> = legend_rows(&map, None, &opts)
+    let listed: Vec<String> = legend_rows(&map, None, &opts)
         .iter()
         .filter_map(|r| match r {
-            LegendRow::Head(n) => Some(*n),
-            LegendRow::Plain(_, name) => Some(*name),
+            LegendRow::Head(n) => Some(n.to_string()),
+            LegendRow::Plain(_, name) => Some(name.to_string()),
             _ => None,
         })
         .collect();
@@ -1775,6 +1783,7 @@ fn a_legends_rows_go_into_columns() {
         names: true,
         text_size: 9.0,
         class_labels: &NO_CLASS_LABELS,
+        counts: None,
     };
     let rows = legend_rows(&map, None, &opts());
     assert_eq!(rows.len(), 32);
@@ -1786,7 +1795,13 @@ fn a_legends_rows_go_into_columns() {
     let (starts, fits) = flow_at(&rows, 3, 5.0 * LEGEND_ROW, (1e6, 1.0));
     assert_eq!((starts, fits), (vec![0, 5, 10], false));
     // A layer's name isn't left at the foot of a column; the last, with none under it, can be.
-    let heads = [LegendRow::Head("a"), LegendRow::Head("b"), LegendRow::Head("c"), LegendRow::Head("d"), LegendRow::Head("e")];
+    let heads = [
+        LegendRow::Head("a".into()),
+        LegendRow::Head("b".into()),
+        LegendRow::Head("c".into()),
+        LegendRow::Head("d".into()),
+        LegendRow::Head("e".into()),
+    ];
     assert_eq!(flow_at(&heads, 3, 3.0 * LEGEND_ROW, (1e6, 1.0)), (vec![0, 2], true));
 
     let sizes = legend_sizes_mm(&mut map, 1e6, true, false, (&[], &NO_LABELS)).unwrap();
@@ -1871,6 +1886,7 @@ fn a_layers_name_stays_with_its_class_only_in_columns() {
         names: true,
         text_size: 9.0,
         class_labels: &NO_CLASS_LABELS,
+        counts: None,
     };
     let rows = legend_rows(&map, None, &opts());
     let (starts, _) = flow_at(&rows, 2, LEGEND_ROW, (1e6, 1.0));
@@ -1905,6 +1921,7 @@ fn a_legends_columns_hold_large_point_symbols() {
         names: true,
         text_size: 9.0,
         class_labels: &NO_CLASS_LABELS,
+        counts: None,
     };
     let rows = legend_rows(&map, None, &opts);
     let tall = rows[1].height(1e6, 1.0);
@@ -1981,6 +1998,7 @@ fn opts(names: bool) -> LegendOptions<'static> {
         size: 1.0,
         text_size,
         class_labels: &NO_CLASS_LABELS,
+        counts: None,
     }
 }
 
@@ -2138,7 +2156,7 @@ fn layer_names_can_be_left_off_a_legend() {
     let labels = BTreeMap::from([("Parks".to_string(), "Green space".to_string())]);
     for names in [true, false] {
         let rows = legend_rows(&map, None, &LegendOptions { labels: &labels, ..opts(names) });
-        assert!(rows.iter().any(|row| matches!(row, LegendRow::Plain(_, "Green space"))), "names {names}");
+        assert!(rows.iter().any(|row| matches!(row, LegendRow::Plain(_, name) if name == "Green space")), "names {names}");
     }
     // Measured as drawn: two rows less in one column, the picture's height the same either way.
     let height = |layer_names: bool| {
@@ -2151,6 +2169,7 @@ fn layer_names_can_be_left_off_a_legend() {
             exclude: &[],
             labels: &NO_LABELS,
             class_labels: &NO_CLASS_LABELS,
+            show_counts: false,
         };
         legend_sizes_asked_mm(&mut map.clone(), 1e6, &asked).unwrap()[0].1
     };
@@ -2228,6 +2247,7 @@ fn fit_page(map: Map, (w, h): (f64, f64), (columns, fit): (usize, LegendFit), (t
             fit,
             show_layer_names: rustgis_map::layout::LayerNames::Shown,
             class_labels: Default::default(),
+            show_counts: Default::default(),
         },
     );
     let scale = frame_render_scale(&map, Coord::new(0.0, 0.0), 150_000_000.0);
@@ -2249,6 +2269,7 @@ fn a_legends_fit_is_the_same_at_every_resolution() {
         exclude: &[],
         labels: &NO_LABELS,
         class_labels: &NO_CLASS_LABELS,
+        show_counts: false,
     };
     for (fit, room) in [(LegendFit::AdjustSize, (40.0, 20.0 * row)), (LegendFit::AdjustColumns, (100.0, 12.0 * row))] {
         let (page, mut maps, scale) = fit_page(rows_map(32), room, (1, fit), ("", 9.0));
@@ -2287,6 +2308,7 @@ fn a_fitted_legend_exports_as_a_manual_legend_of_its_fitted_size() {
         exclude: &[],
         labels: &NO_LABELS,
         class_labels: &NO_CLASS_LABELS,
+        show_counts: false,
     };
     let info = PageInfo::default();
     let export = |(page, mut maps, _): (Layout, Vec<Map>, f64)| {
@@ -2615,6 +2637,7 @@ fn a_legend_measured_in_its_own_columns_lays_out_only_those() {
         exclude: &[],
         labels: &NO_LABELS,
         class_labels: &NO_CLASS_LABELS,
+        show_counts: false,
     };
     let six = legend_sizes_asked_mm(&mut map, 1e6, &asked).unwrap();
     for (columns, laid_in) in [(0, 1), (1, 1), (2, 2), (3, 3), (6, 6), (9, 6)] {
@@ -2665,11 +2688,13 @@ fn a_legend_shows_a_layers_label() {
             names: true,
             text_size: 9.0,
             class_labels: &NO_CLASS_LABELS,
+            counts: None,
         };
         legend_rows(&map, None, &opts)
             .iter()
             .filter_map(|r| match r {
-                LegendRow::Head(n) | LegendRow::Plain(_, n) => Some(n.to_string()),
+                LegendRow::Head(n) => Some(n.to_string()),
+                LegendRow::Plain(_, n) => Some(n.to_string()),
                 _ => None,
             })
             .collect()
@@ -2700,6 +2725,7 @@ fn a_legend_shows_a_layers_label() {
             names: true,
             text_size: 9.0,
             class_labels: &NO_CLASS_LABELS,
+            counts: None,
         };
         crate::canvas::with_canvas(&mut pm, |c| {
             legend(c, Rect::from_xywh(0.0, 0.0, 400.0, 200.0).unwrap(), &map, ("", 1), None, opts, 1.0)
@@ -2753,6 +2779,7 @@ fn legends_leave_out_what_the_frame_does_not_draw() {
             names: true,
             text_size: 9.0,
             class_labels: &NO_CLASS_LABELS,
+            counts: None,
         };
         crate::canvas::with_canvas(&mut pm, |c| {
             legend(c, Rect::from_xywh(0.0, 0.0, 300.0, 400.0).unwrap(), map, ("", 1), drawn, opts, 1.0)
@@ -2792,6 +2819,7 @@ fn legends_leave_out_what_the_frame_does_not_draw() {
                     names: true,
                     text_size: 9.0,
                     class_labels: &NO_CLASS_LABELS,
+                    counts: None,
                 },
                 1.0,
             )
@@ -3134,6 +3162,7 @@ fn a_legend_lists_a_classified_rasters_classes() {
         names: true,
         text_size: 9.0,
         class_labels: &NO_CLASS_LABELS,
+        counts: None,
     };
     let labels = |rows: &[LegendRow]| -> Vec<String> {
         rows.iter()
@@ -7035,6 +7064,7 @@ fn point_legend(map: &Map) -> Pixmap {
         names: true,
         text_size: 9.0,
         class_labels: &NO_CLASS_LABELS,
+        counts: None,
     };
     crate::canvas::with_canvas(&mut pm, |c| legend(c, Rect::from_xywh(0.0, 0.0, 200.0, 200.0).unwrap(), map, ("", 1), None, opts, 1.0));
     pm
@@ -7054,6 +7084,7 @@ fn recorded_legend(map: &Map, side: u32) -> Pixmap {
         names: true,
         text_size: 9.0,
         class_labels: &NO_CLASS_LABELS,
+        counts: None,
     };
     legend(&mut c, Rect::from_xywh(0.0, 0.0, side as f32, side as f32).unwrap(), map, ("", 1), None, opts, 1.0);
     let (_, _, items) = c.into_drawing().unwrap().finish();
@@ -7279,6 +7310,7 @@ fn a_legend_grows_to_hold_a_large_point() {
         names: true,
         text_size: 9.0,
         class_labels: &NO_CLASS_LABELS,
+        counts: None,
     };
     crate::canvas::with_canvas(&mut pm, |c| legend(c, Rect::from_xywh(0.0, 0.0, 200.0, 47.0).unwrap(), &map, ("", 1), None, opts, 1.0));
     assert!(pm.data() == blank.data());
@@ -7324,6 +7356,7 @@ fn a_legends_text_size_scales_its_rows_but_not_its_point_symbols() {
         names: true,
         text_size: 18.0,
         class_labels: &NO_CLASS_LABELS,
+        counts: None,
     };
     crate::canvas::with_canvas(&mut pm, |c| legend(c, Rect::from_xywh(0.0, 0.0, 200.0, 200.0).unwrap(), &map, ("", 1), None, opts, 1.0));
     assert!(same_corner(&pm, &drawn_point(&s(40.0), &[], (24.0, 24.0), 1.0), 48, 48), "the symbol as the map draws it");
@@ -7744,6 +7777,7 @@ fn a_recorded_point_is_cut_at_its_box() {
         names: true,
         text_size: 9.0,
         class_labels: &NO_CLASS_LABELS,
+        counts: None,
     };
     legend(&mut c, Rect::from_xywh(0.5, 0.5, 2099.0, 2099.0).unwrap(), &map, ("", 1), None, opts, 1.0);
     let (_, _, items) = c.into_drawing().unwrap().finish();
@@ -7878,6 +7912,7 @@ fn an_oversized_point_stays_in_its_row() {
             names: true,
             text_size: 9.0,
             class_labels: &NO_CLASS_LABELS,
+            counts: None,
         };
         crate::canvas::with_canvas(&mut pm, |c| {
             legend(c, Rect::from_xywh(0.0, 0.0, 2100.0, 2100.0).unwrap(), &map, ("", 1), None, opts, 1.0)
@@ -7917,6 +7952,7 @@ fn a_see_through_point_larger_than_the_canvas_covers_it_from_off_its_edge() {
         names: true,
         text_size: 9.0,
         class_labels: &NO_CLASS_LABELS,
+        counts: None,
     };
     crate::canvas::with_canvas(&mut pm, |c| {
         legend(c, Rect::from_xywh(-50.0, -50.0, 2100.0, 2100.0).unwrap(), &map, ("", 1), None, opts, 1.0)
@@ -8303,6 +8339,7 @@ fn a_legend_labels_a_layers_classes_itself() {
         exclude: &[],
         labels: &NO_LABELS,
         class_labels,
+        counts: None,
         scale: 1e6,
         size: 1.0,
         text_size: 9.0,
@@ -8329,10 +8366,116 @@ fn a_legend_labels_a_layers_classes_itself() {
             exclude: &[],
             labels: &NO_LABELS,
             class_labels,
+            show_counts: false,
         };
         legend_size_asked_mm(&mut map, 1e6, &asked, 1).unwrap().0
     };
     let plain = width(&listed);
     own.by_layer.get_mut("PTS").unwrap().insert("c1".into(), "A much longer text for the second class".into());
     assert!(width(&own) > plain);
+}
+
+/// A legend that counts features (#3237) ends each class row, and a one-symbol layer's row, in the
+/// number of features the layer's filters keep, after whatever text the row shows.
+#[test]
+fn a_legend_counts_the_features_of_each_row() {
+    use rustgis_data::{Dataset, Field, FieldType, Geometry, Value};
+    use rustgis_map::layout::ClassLabels;
+    let mut map = rows_map(4);
+    let at = || Some(Geometry::Point(Coord::new(0.0, 0.0)));
+    let pts = &mut map.layers[0];
+    // c0 three times, c1 none, and one value no class has.
+    pts.dataset = Dataset::new("pts", GeometryType::Point, vec![Field::new("g", FieldType::Text)]);
+    for v in ["c0", "c0", "c0", "zz"] {
+        pts.dataset.push(at(), vec![Value::Text(v.into())]);
+    }
+    let mut cities = Dataset::new("Cities", GeometryType::Point, vec![Field::new("n", FieldType::Integer)]);
+    for n in 0..5 {
+        cities.push(at(), vec![Value::Int(n)]);
+    }
+    let cities = map.add_dataset(cities);
+    if let Some(l) = map.layers.iter_mut().find(|l| l.id == cities) {
+        l.definition_query = Some("n < 2".into());
+    }
+    let env = Env::default();
+    let mut own = ClassLabels::default();
+    own.by_layer.insert("pts".into(), BTreeMap::from([("c0".into(), "First".into())]));
+    let rows = |map: &mut Map, all: bool, counted: bool, own: &ClassLabels| -> Vec<String> {
+        let drawn = (!all).then(|| complete_shown_legends(map, 1e6, false, &[], &mut None, &Env::default()).unwrap());
+        let opts = LegendOptions {
+            show_no_data: false,
+            hide_other: false,
+            names: true,
+            exclude: &[],
+            labels: &NO_LABELS,
+            class_labels: own,
+            counts: counted.then_some(&env),
+            scale: 1e6,
+            size: 1.0,
+            text_size: 9.0,
+        };
+        legend_rows(map, drawn.as_deref(), &opts)
+            .iter()
+            .map(|r| match r {
+                LegendRow::Head(n) => n.to_string(),
+                LegendRow::Plain(_, n) => n.to_string(),
+                LegendRow::Class(_, e) => e.label.clone(),
+                LegendRow::Picture(_) => "picture".into(),
+            })
+            .collect()
+    };
+    assert_eq!(rows(&mut map, false, false, &ClassLabels::NONE), ["Cities", "pts", "c0", "c99"]);
+    assert_eq!(rows(&mut map, false, true, &own), ["Cities (2)", "pts", "First (3)", "c99 (1)"]);
+    // Every class listed: one with no feature says so.
+    assert_eq!(rows(&mut map, true, true, &ClassLabels::NONE), ["Cities (2)", "pts", "c0 (3)", "c1 (0)", "c99 (1)"]);
+    // Over its diagram's rows a one-symbol layer's name is a heading, which still counts; those
+    // rows don't, and a classed layer's heading doesn't either.
+    for l in &mut map.layers {
+        l.diagram = Some(rustgis_map::DiagramSettings {
+            kind: rustgis_map::DiagramKind::Pie,
+            categories: vec![rustgis_map::DiagramCategory { field: "n".into(), colour: Rgba::rgb(255, 0, 0) }],
+            size: rustgis_map::DiagramSize::Fixed(12.0),
+            start_angle: 0.0,
+            background: None,
+            stroke: rustgis_map::DiagramSettings::default_stroke(),
+            stroke_width: 0.75,
+            labels: rustgis_map::DiagramLabel::None,
+        });
+    }
+    assert_eq!(rows(&mut map, false, true, &ClassLabels::NONE), ["Cities (2)", "n", "pts", "c0 (3)", "c99 (1)", "n"]);
+    // A streamed layer holds only the view's features, which are no count of the layer.
+    for l in &mut map.layers {
+        l.dataset.windowed = true;
+    }
+    assert_eq!(rows(&mut map, false, true, &ClassLabels::NONE), ["Cities", "n", "pts", "c0", "c99", "n"]);
+}
+
+/// Graduated Colors counts each range and its missing values.
+#[test]
+fn a_legend_counts_graduated_ranges_and_missing_values() {
+    use rustgis_data::{Dataset, Field, FieldType, Geometry, Value};
+    let mut d = Dataset::new("g", GeometryType::Point, vec![Field::new("v", FieldType::Double)]);
+    for v in [Value::Float(1.0), Value::Float(2.0), Value::Float(9.0), Value::Null] {
+        d.push(Some(Geometry::Point(Coord::new(0.0, 0.0))), vec![v]);
+    }
+    let mut map = Map::new("m");
+    let id = map.add_dataset(d);
+    let layer = map.layers.iter_mut().find(|l| l.id == id).unwrap();
+    let symbol = rustgis_map::Symbol::default_for(GeometryType::Point, 0);
+    layer.renderer = rustgis_map::Renderer::Graduated {
+        field: "v".into(),
+        breaks: vec![5.0, 10.0],
+        symbols: vec![symbol, symbol],
+        ramp: rustgis_map::Ramp::Ember,
+        method: rustgis_map::ClassMethod::NaturalBreaks,
+        min: 0.0,
+        classes: 2,
+        class_labels: BTreeMap::from([(0, "Low".into()), (1, "High".into())]),
+        class_strokes: Default::default(),
+        class_fills: Default::default(),
+    };
+    let (entries, total) = layer.counted_legend(1e6, &Env::default(), false, true);
+    let said: Vec<_> = entries.iter().map(|e| (e.label.as_str(), e.count)).collect();
+    assert_eq!(said, [("Low", Some(2)), ("High", Some(1)), ("No data", Some(1))]);
+    assert_eq!(total, 4);
 }

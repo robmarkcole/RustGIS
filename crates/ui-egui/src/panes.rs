@@ -8202,6 +8202,7 @@ pub(crate) mod tests {
             strokes: vec![LineStroke { markers: Some(LineMarkers { size: mark, ..LineMarkers::default() }), ..LineStroke::default() }],
             fills: Vec::new(),
             fallback: false,
+            count: None,
         };
         assert_eq!(size_rows_scale(cities, &[row(10.0, 4.0), row(20.0, 7.0)]), 1.0, "marks that fit as drawn");
         assert_eq!(size_rows_scale(cities, &[row(10.0, 14.0), row(20.0, 28.0)]), 0.5, "the largest marks, not the symbol");

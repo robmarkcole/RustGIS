@@ -276,6 +276,9 @@ pub(in crate::cmd::layout) fn add_element(s: &mut Session, p: &Value) -> CmdResu
         return Err(ONLY_LEGEND_COLUMNS.into());
     }
     // A value that isn't true or false is refused on any kind first, as the legend's arm would.
+    if legend_counts_param(p)?.is_some() && kind != "legend" {
+        return Err(ONLY_LEGEND_COUNTS.into());
+    }
     if legend_names_param(p)?.is_some() && kind != "legend" {
         return Err(ONLY_LEGEND_NAMES.into());
     }
@@ -402,6 +405,7 @@ pub(in crate::cmd::layout) fn add_element(s: &mut Session, p: &Value) -> CmdResu
                 text_size_param(p, "textSize", rustgis_map::layout::LEGEND_TEXT_PT)?.unwrap_or(rustgis_map::layout::LEGEND_TEXT_PT);
             let fit = legend_fit_param(p)?.unwrap_or_default();
             let show_layer_names = legend_names_param(p)?.map_or(LayerNames::Shown, LayerNames::from_shown);
+            let show_counts = legend_counts_param(p)?.map_or(FeatureCounts::Hidden, FeatureCounts::from_shown);
             (
                 "Legend",
                 place(p, l, (pw - 70.0, 45.0, 60.0, 80.0))?,
@@ -419,6 +423,7 @@ pub(in crate::cmd::layout) fn add_element(s: &mut Session, p: &Value) -> CmdResu
                     fit,
                     show_layer_names,
                     class_labels,
+                    show_counts,
                 },
             )
         }
@@ -986,6 +991,7 @@ const ADD_LEGEND_KEYS: &[&str] = &[
     "textSize",
     "fit",
     "showLayerNames",
+    "showCounts",
     "color",
 ];
 
@@ -1470,7 +1476,7 @@ mod tests {
         let calls = [
             json!({"kind": "northArrow", "layout": 0, "frame": frame, "x": 10, "y": 10, "w": 15, "h": 20, "style": "compass", "fill": "#112233", "outline": "#445566", "background": {"fill": "#FFFFFF"}}),
             json!({"kind": "scaleBar", "frame": frame, "x": 10, "y": 10, "w": 60, "h": 12, "style": "stepped", "units": "miles", "divisions": 3, "subdivisions": 2, "divisionsBeforeZero": 1, "labelPosition": "below", "unitLabel": "mi", "unitLabelPosition": "afterBar", "fit": "adjustWidth", "decimals": 1, "textSize": 9, "color": "#112233", "fill": "#FFFFFF"}),
-            json!({"kind": "legend", "frame": frame, "title": "T", "allClasses": true, "hideOther": true, "showNoData": true, "exclude": [], "columns": 2, "labels": {}, "textSize": 8, "fit": "adjustSize", "showLayerNames": false, "color": "#112233"}),
+            json!({"kind": "legend", "frame": frame, "title": "T", "allClasses": true, "hideOther": true, "showNoData": true, "exclude": [], "columns": 2, "labels": {}, "textSize": 8, "fit": "adjustSize", "showLayerNames": false, "showCounts": true, "color": "#112233"}),
             json!({"kind": "colorbar", "frame": frame, "title": "T", "orientation": "vertical", "ticks": 3, "tickSide": "left", "reverse": true, "color": "#112233"}),
             json!({"kind": "text", "text": "A", "size": 14, "color": "#112233", "bold": true, "italic": true, "align": "center", "letterSpacing": 1, "font": "Some Family", "fallback": "serif", "rotation": 90, "wrap": true, "valign": "middle", "lineSpacing": 1.5, "case": "upper", "name": "ignored"}),
             json!({"kind": "dynamicText", "text": "{map}", "size": 10}),

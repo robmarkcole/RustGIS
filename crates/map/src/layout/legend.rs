@@ -245,6 +245,65 @@ impl<'de> Deserialize<'de> for LayerNames {
     }
 }
 
+/// Whether a legend ends its rows in the number of features each stands for (#3237).
+///
+/// `Invalid` is what a file's value that is not `true` or `false` is read as; it is never kept:
+/// [`Layout::clamp`] sends it to the default and counts the element, and a save leaves it out, as
+/// it does the default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FeatureCounts {
+    /// No numbers.
+    #[default]
+    Hidden,
+    /// Each class row, and a one-symbol layer's row, ends in its number.
+    Shown,
+    /// A value read from a file that is not `true` or `false`; repaired to the default on load.
+    #[doc(hidden)]
+    Invalid,
+}
+
+impl FeatureCounts {
+    /// Whether the numbers are shown: a value that is neither reads as hidden.
+    pub fn shown(self) -> bool {
+        self == FeatureCounts::Shown
+    }
+
+    /// This value, or the default where it is [`FeatureCounts::Invalid`].
+    pub fn kept(self) -> FeatureCounts {
+        if self == FeatureCounts::Invalid { FeatureCounts::default() } else { self }
+    }
+
+    /// Whether a save leaves a legend's counts out: hidden, or a value that is not `true` or
+    /// `false`, which reads back as hidden.
+    pub fn is_hidden(&self) -> bool {
+        !self.shown()
+    }
+
+    /// The setting a `"showCounts"` of `shown` gives: on, or off, which a save leaves out.
+    pub fn from_shown(shown: bool) -> FeatureCounts {
+        if shown { FeatureCounts::Shown } else { FeatureCounts::Hidden }
+    }
+}
+
+impl Serialize for FeatureCounts {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bool(self.shown())
+    }
+}
+
+impl<'de> Deserialize<'de> for FeatureCounts {
+    /// `true` or `false`; null as the default; anything else (a name, a number, a list) as
+    /// `Invalid`, so the read never fails and `Layout::clamp` repairs and counts it.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<FeatureCounts, D::Error> {
+        let v: Option<serde_json::Value> = Deserialize::deserialize(d)?;
+        Ok(match v {
+            None | Some(serde_json::Value::Null) => FeatureCounts::default(),
+            Some(serde_json::Value::Bool(shown)) => FeatureCounts::from_shown(shown),
+            Some(_) => FeatureCounts::Invalid,
+        })
+    }
+}
+
 /// The most columns a legend lays its rows in.
 pub const MAX_LEGEND_COLUMNS: usize = 6;
 

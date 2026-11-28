@@ -8,12 +8,12 @@ use std::sync::LazyLock;
 use rustgis_geom::{Coord, Extent};
 use rustgis_map::layout::{
     Arrange, ArrowStyle, Background, CHART_BAR, CHART_BARS, CHART_OUTLINE, ChartOrder, ChartOutline, ClassLabels, CoordFormat, ElementKind,
-    FontFamily, FrameShape, GRID_LABEL_PT, Grid, GridEdges, GridKind, GridStyle, Guides, LAYOUT_TEXT_SIZE, LINE_SPACING, LayerNames,
-    Layout, LegendFit, LineDir, LineHead, MAX_CHART_BARS, MAX_CHART_DECIMALS, MAX_CHART_OUTLINE_WIDTH, MAX_COLORBAR_TICKS, MAX_GRID_WIDTH,
-    MAX_GUIDES, MAX_LEGEND_COLUMNS, MAX_LEGEND_LABEL_CHARS, MAX_LEGEND_LABELS, MAX_LINE_SPACING, MAX_SCALE_BEFORE_ZERO, MAX_SCALE_DECIMALS,
-    MAX_SCALE_DIVISIONS, MAX_SCALE_SUBDIVISIONS, MAX_SECTIONS, MAX_TICK_MM, MAX_UNIT_LABEL_CHARS, MIN_ELEMENT_MM, MIN_LINE_SPACING,
-    MapSeries, Orientation, PAGES, SCALE_BAR_TEXT_PT, ScaleBarFit, ScaleBarStyle, ScaleLabelPosition, ScaleUnits, Section, SectionLine,
-    TextAlign, TextCase, TextVAlign, TickSide, UnitLabelPosition, fit_scale, line_angle, line_at_angle, line_length,
+    FeatureCounts, FontFamily, FrameShape, GRID_LABEL_PT, Grid, GridEdges, GridKind, GridStyle, Guides, LAYOUT_TEXT_SIZE, LINE_SPACING,
+    LayerNames, Layout, LegendFit, LineDir, LineHead, MAX_CHART_BARS, MAX_CHART_DECIMALS, MAX_CHART_OUTLINE_WIDTH, MAX_COLORBAR_TICKS,
+    MAX_GRID_WIDTH, MAX_GUIDES, MAX_LEGEND_COLUMNS, MAX_LEGEND_LABEL_CHARS, MAX_LEGEND_LABELS, MAX_LINE_SPACING, MAX_SCALE_BEFORE_ZERO,
+    MAX_SCALE_DECIMALS, MAX_SCALE_DIVISIONS, MAX_SCALE_SUBDIVISIONS, MAX_SECTIONS, MAX_TICK_MM, MAX_UNIT_LABEL_CHARS, MIN_ELEMENT_MM,
+    MIN_LINE_SPACING, MapSeries, Orientation, PAGES, SCALE_BAR_TEXT_PT, ScaleBarFit, ScaleBarStyle, ScaleLabelPosition, ScaleUnits,
+    Section, SectionLine, TextAlign, TextCase, TextVAlign, TickSide, UnitLabelPosition, fit_scale, line_angle, line_at_angle, line_length,
 };
 use rustgis_map::report::StatKind;
 use rustgis_map::symbology::{Dash, MAX_DASH_STEP, MAX_DASH_STEPS};
@@ -41,7 +41,7 @@ pub(crate) use inputs::*;
 mod legend;
 pub(in crate::cmd) use legend::say_unfitted_legends_in;
 use legend::*;
-pub(crate) use legend::{legend_columns_param, legend_fit_param, legend_names_param};
+pub(crate) use legend::{legend_columns_param, legend_counts_param, legend_fit_param, legend_names_param};
 mod page;
 use page::*;
 mod publication;
@@ -208,6 +208,7 @@ pub fn commands() -> Vec<C> {
                 r##""columns"?: 1..6 (legend: the columns its rows are laid in; default 1; with a fit that adds columns, the fewest it starts from), "##,
                 r##""textSize"?: points, 4 to 100 (legend: its layers' names and classes' labels, its title, rows, swatches and gaps following in proportion and a point symbol keeping the size the map draws it at; default 9; scaleBar: its labels, the room over the bar and between them following, the bar keeping its size; default 8; refused outside that range, and for other kinds unless null, as showNoData is), "##,
                 r##""classLabels"?: {"<layer>": {"<class label>": "<text>"}} (legend: its own text for a class, by the label the layer shows for it, up to 200 characters; the layer keeps its label; a layer or class it can't find is refused), "##,
+                r##""showCounts"?: bool (legend: each class row, and a one-symbol layer's row, ends in the number of features the layer's filters keep; default false; none for rasters, web layers, size and diagram rows, streamed layers, or Unique Values by an expression over too many features and classes; refused for other kinds), "##,
                 r##""showLayerNames"?: bool (legend: the name over each layer's classes and over a web layer's legend picture; default true; a layer drawn in one symbol keeps its name; refused for other kinds), "##,
                 r##""orientation"?: "horizontal"|"vertical" (colorbar; chart: bars running across, the default, or columns standing up, each label centred under its column), "##,
                 r##""ticks"?: 2..21 (colorbar: labelled values, ends included), "##,
@@ -310,6 +311,7 @@ pub fn commands() -> Vec<C> {
                 r##""columns"?: 1..6 (legend), "##,
                 r##""textSize"?: points, 4 to 100 (legend, scaleBar, as in layout.addElement, null giving each its default again; refused outside that range, and for other elements unless null), "##,
                 r##""showLayerNames"?: bool (legend, as in layout.addElement; null leaves it as it is), "##,
+                r##""showCounts"?: bool (legend, as in layout.addElement; null leaves it as it is), "##,
                 r##""orientation"? (colorbar, chart), "##,
                 r##""ticks"?, "##,
                 r##""tickSide"?, "##,
@@ -605,6 +607,7 @@ pub(crate) fn new_layout(s: &mut Session, p: &Value) -> CmdResult {
                     fit: rustgis_map::layout::LegendFit::Manual,
                     show_layer_names: rustgis_map::layout::LayerNames::Shown,
                     class_labels: Default::default(),
+                    show_counts: Default::default(),
                 },
             );
             l.add("North Arrow", (side + sw / 2.0 - 8.0, m + 16.0 + fh * 0.62, 16.0, 24.0), ElementKind::north_arrow(frame));

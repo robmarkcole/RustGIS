@@ -151,6 +151,10 @@ pub enum ElementKind {
         /// layer gives it. Left out when empty, so layouts saved before keep their bytes.
         #[serde(default, skip_serializing_if = "ClassLabels::is_empty")]
         class_labels: ClassLabels,
+        /// Whether its rows end in the number of features each stands for (#3237). Left out when
+        /// not, so layouts saved before keep their bytes.
+        #[serde(default, skip_serializing_if = "FeatureCounts::is_hidden")]
+        show_counts: FeatureCounts,
     },
     /// The colour scale of a raster layer in a frame's map: a gradient bar for a stretch, steps
     /// for classes, a block per value for unique values and colour tables (#326).
@@ -437,6 +441,12 @@ impl ElementKind {
     pub fn legend_labels_classes(&self) -> bool {
         let ElementKind::Legend { class_labels, .. } = self else { return false };
         class_labels.by_layer.values().flat_map(|classes| classes.values()).any(|text| !text.trim().is_empty())
+    }
+
+    /// Whether this is a legend that shows feature counts: what a layout file needs a newer reader
+    /// for.
+    pub fn legend_counts_features(&self) -> bool {
+        matches!(self, ElementKind::Legend { show_counts, .. } if show_counts.shown())
     }
 
     /// Whether this is a scale bar with any of the details set: subdivisions, divisions before

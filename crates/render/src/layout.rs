@@ -527,6 +527,7 @@ fn draw_page(
                 fit,
                 show_layer_names,
                 class_labels,
+                show_counts,
             } => {
                 if let Some(&(_, mi, cam, ..)) = frame(*f)
                     && let Some(map) = maps.get(mi)
@@ -556,6 +557,7 @@ fn draw_page(
                         exclude,
                         labels,
                         class_labels,
+                        counts: show_counts.shown().then_some(env),
                         scale,
                         size,
                         text_size: *text_size,
@@ -1015,6 +1017,7 @@ pub(crate) fn legend_pin_pages() -> Vec<(Layout, Vec<Map>)> {
             fit: rustgis_map::layout::LegendFit::Manual,
             show_layer_names: rustgis_map::layout::LayerNames::Shown,
             class_labels: Default::default(),
+            show_counts: Default::default(),
         };
         f(&mut kind);
         l.add("Legend", at, kind);

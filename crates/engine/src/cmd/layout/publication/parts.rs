@@ -170,6 +170,7 @@ impl PublicationLegend {
                     exclude: &exclude,
                     labels: &labels,
                     class_labels: &rustgis_map::layout::ClassLabels::NONE,
+                    show_counts: false,
                 };
                 [legend_size_asked_mm(map, scale, &asked, columns)?; PUBLICATION_LEGEND_COLUMNS]
             }

@@ -1010,6 +1010,8 @@ pub struct LegendEntry {
     /// The Unique Values fallback row (`<all other values>`), told apart from a class whatever
     /// its label: a legend can leave it out without touching a class that bears the same name.
     pub fallback: bool,
+    /// The features its row stands for, in a legend that counts them (#3237).
+    pub count: Option<u64>,
 }
 
 impl LegendEntry {
@@ -1021,12 +1023,13 @@ impl LegendEntry {
             strokes: strokes.cloned().unwrap_or_default(),
             fills: fills.cloned().unwrap_or_default(),
             fallback: false,
+            count: None,
         }
     }
 
     /// A row with no stacked strokes or fills of its own.
     pub fn plain(label: String, symbol: Symbol) -> Self {
-        LegendEntry { label, symbol, strokes: Vec::new(), fills: Vec::new(), fallback: false }
+        LegendEntry { label, symbol, strokes: Vec::new(), fills: Vec::new(), fallback: false, count: None }
     }
 }
 
@@ -1772,7 +1775,6 @@ impl Renderer {
     /// Classes present among the kept rows at the drawing scale and page.
     pub fn legend_with(&self, ds: &Dataset, rows: &[bool], env: rustgis_data::query::Env) -> Vec<LegendEntry> {
         let Renderer::Unique {
-            field,
             classes,
             other,
             class_labels,
@@ -1787,32 +1789,72 @@ impl Renderer {
         else {
             return self.legend();
         };
-        // A fallback that draws nothing has nothing to stand for in a legend: its own symbol as
-        // `Symbol::draws` has it (as a web style does), else its stacked strokes (on lines and
-        // points) or stacked fills (on areas); a point of size 0 draws none of them.
-        let polygon = ds.geometry_type == GeometryType::Polygon;
-        let strokes = !polygon
-            && other_strokes.iter().any(|s| s.color.unwrap_or(other.stroke).a() > 0 && s.width.unwrap_or(other.stroke_width) > 0.0);
-        let fills = polygon && other_fills.iter().any(|f| f.draws(other.fill));
-        let sized = ds.geometry_type != GeometryType::Point || other.size > 0.0;
-        let visible = other.draws(ds.geometry_type) || (sized && (strokes || fills));
+        let visible = self.fallback_draws(ds);
         if expression.is_some() && ds.features.len().saturating_mul(classes.len().max(1)) > MAX_LEGEND_STEPS {
             let mut all = self.legend();
             all.retain(|e| visible || !e.fallback);
             return all;
         }
-        // A value matches its first class, as in `symbol_for`.
+        let mut used = vec![false; classes.len()];
+        let mut other_used = false;
+        // Distinct classes still unseen: once every class and "other" are in, the rest can't add any.
+        let mut unseen = classes.iter().map(|(k, _)| k.as_str()).collect::<std::collections::HashSet<_>>().len() + 1;
+        self.visit_unique(ds, rows, env, |class| {
+            let seen = match class.and_then(|i| used.get_mut(i)) {
+                Some(u) => std::mem::replace(u, true),
+                None => std::mem::replace(&mut other_used, true),
+            };
+            if !seen {
+                unseen -= 1;
+            }
+            unseen > 0
+        });
+        let mut v: Vec<LegendEntry> = self
+            .class_order()
+            .into_iter()
+            .filter(|i| used.get(*i).copied().unwrap_or(false))
+            .filter_map(|i| classes.get(i))
+            .map(|(k, s)| LegendEntry::class(unique_label(class_labels, k), *s, class_strokes.get(k), class_fills.get(k)))
+            .collect();
+        if other_used && visible {
+            v.push(LegendEntry {
+                label: other_label.clone().unwrap_or_else(|| OTHER_VALUES.into()),
+                symbol: *other,
+                strokes: other_strokes.clone(),
+                fills: other_fills.clone(),
+                fallback: true,
+                count: None,
+            });
+        }
+        v
+    }
+
+    /// Whether Unique Values' fallback draws something on `ds`; false for the other renderers.
+    /// One that draws nothing has nothing to stand for in a legend: its own symbol as
+    /// `Symbol::draws` has it (as a web style does), else its stacked strokes (on lines and
+    /// points) or stacked fills (on areas); a point of size 0 draws none of them.
+    fn fallback_draws(&self, ds: &Dataset) -> bool {
+        let Renderer::Unique { other, other_strokes, other_fills, .. } = self else { return false };
+        let polygon = ds.geometry_type == GeometryType::Polygon;
+        let strokes = !polygon
+            && other_strokes.iter().any(|s| s.color.unwrap_or(other.stroke).a() > 0 && s.width.unwrap_or(other.stroke_width) > 0.0);
+        let fills = polygon && other_fills.iter().any(|f| f.draws(other.fill));
+        let sized = ds.geometry_type != GeometryType::Point || other.size > 0.0;
+        other.draws(ds.geometry_type) || (sized && (strokes || fills))
+    }
+
+    /// Gives `visit` the class of each kept row of Unique Values, as an index into `classes`
+    /// (`None` for `<all other values>`), until it returns false. A value matches its first class,
+    /// as in `symbol_for`; by expression, each feature is classed as it is drawn. Nothing for the
+    /// other renderers.
+    fn visit_unique(&self, ds: &Dataset, rows: &[bool], env: rustgis_data::query::Env, mut visit: impl FnMut(Option<usize>) -> bool) {
+        let Renderer::Unique { field, classes, expression, .. } = self else { return };
         let mut index: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
         for (i, (k, _)) in classes.iter().enumerate() {
             index.entry(k.as_str()).or_insert(i);
         }
         let fi = ds.field_index(field);
-        // By expression: each feature classed as it is drawn.
         let classer = expression.as_ref().map(|_| self.classer_with(ds, env));
-        let mut used = vec![false; classes.len()];
-        let mut other_used = false;
-        // Distinct classes still unseen: once every class and "other" are in, the rest can't add any.
-        let mut unseen = index.len() + 1;
         // One buffer for every value's text, rather than a string per feature.
         let mut text = String::new();
         for r in (0..ds.features.len()).filter(|r| rows.get(*r).copied().unwrap_or(true)) {
@@ -1829,34 +1871,64 @@ impl Renderer {
                     index.get(text.as_str()).copied()
                 })
             };
-            let seen = match class.and_then(|i| used.get_mut(i)) {
-                Some(u) => std::mem::replace(u, true),
-                None => std::mem::replace(&mut other_used, true),
-            };
-            if !seen {
-                unseen -= 1;
-                if unseen == 0 {
-                    break;
-                }
+            if !visit(class) {
+                break;
             }
         }
-        let mut v: Vec<LegendEntry> = self
-            .class_order()
-            .into_iter()
-            .filter(|i| used.get(*i).copied().unwrap_or(false))
-            .filter_map(|i| classes.get(i))
-            .map(|(k, s)| LegendEntry::class(unique_label(class_labels, k), *s, class_strokes.get(k), class_fills.get(k)))
-            .collect();
-        if other_used && visible {
-            v.push(LegendEntry {
-                label: other_label.clone().unwrap_or_else(|| OTHER_VALUES.into()),
-                symbol: *other,
-                strokes: other_strokes.clone(),
-                fills: other_fills.clone(),
-                fallback: true,
-            });
+    }
+
+    /// The rows of a legend that counts features (#3237): those [`Renderer::legend_with`] lists of
+    /// the kept `rows` (with `all`, every row of [`Renderer::legend`]), each with the number of
+    /// those rows it stands for. No number for Proportional sizes, nor by an expression past
+    /// [`MAX_LEGEND_STEPS`], which is listed without classing its features.
+    pub fn legend_counted(&self, ds: &Dataset, rows: &[bool], env: rustgis_data::query::Env, all: bool) -> Vec<LegendEntry> {
+        let listed = || if all { self.legend() } else { self.legend_with(ds, rows, env.clone()) };
+        match self {
+            Renderer::Unique { classes, expression, .. } => {
+                if expression.is_some() && ds.features.len().saturating_mul(classes.len().max(1)) > MAX_LEGEND_STEPS {
+                    return listed();
+                }
+                let mut counts = vec![0u64; classes.len()];
+                let mut other = 0u64;
+                self.visit_unique(ds, rows, env, |class| {
+                    match class.and_then(|i| counts.get_mut(i)) {
+                        Some(n) => *n += 1,
+                        None => other += 1,
+                    }
+                    true
+                });
+                // `legend()` lists the classes in `class_order`, then the fallback: so do the counts.
+                let counts = self.class_order().into_iter().filter_map(|i| counts.get(i).copied());
+                let mut entries: Vec<LegendEntry> = self.legend();
+                for (e, n) in entries.iter_mut().zip(counts.chain([other])) {
+                    e.count = Some(n);
+                }
+                if !all {
+                    // As `legend_with` lists them: the classes with a feature, and the fallback
+                    // when it has one and draws something.
+                    let visible = self.fallback_draws(ds);
+                    entries.retain(|e| e.count != Some(0) && (!e.fallback || visible));
+                }
+                entries
+            }
+            Renderer::Graduated { breaks, .. } => {
+                let classer = self.classer_with(ds, env.clone());
+                let mut counts = vec![0u64; breaks.len()];
+                for r in (0..ds.features.len()).filter(|r| rows.get(*r).copied().unwrap_or(true)) {
+                    if let Some(Slot::Class(i)) = self.class_in(ds, r, &classer)
+                        && let Some(n) = counts.get_mut(i)
+                    {
+                        *n += 1;
+                    }
+                }
+                let mut entries = listed();
+                for (e, n) in entries.iter_mut().zip(counts) {
+                    e.count = Some(n);
+                }
+                entries
+            }
+            Renderer::Single(_) | Renderer::Proportional { .. } => listed(),
         }
-        v
     }
 
     /// The order `legend()` lists the Unique Values classes in: their indices in `classes`, by
@@ -1917,6 +1989,7 @@ impl Renderer {
                     strokes: other_strokes.clone(),
                     fills: other_fills.clone(),
                     fallback: true,
+                    count: None,
                 });
                 v
             }

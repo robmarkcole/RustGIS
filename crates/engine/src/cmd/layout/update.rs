@@ -455,6 +455,7 @@ pub(in crate::cmd::layout) fn update(s: &mut Session, p: &Value) -> CmdResult {
     };
     let new_columns = legend_columns_param(p)?;
     let new_names = legend_names_param(p)?;
+    let new_counts = legend_counts_param(p)?;
     let kind_of = s.project.layouts.get(li).and_then(|l| l.element(id)).map(|e| &e.kind);
     let is_legend = kind_of.is_some_and(|k| matches!(k, ElementKind::Legend { .. }));
     let sized = is_legend || kind_of.is_some_and(|k| matches!(k, ElementKind::ScaleBar { .. }));
@@ -465,6 +466,9 @@ pub(in crate::cmd::layout) fn update(s: &mut Session, p: &Value) -> CmdResult {
     }
     if new_names.is_some() && !is_legend {
         return Err(ONLY_LEGEND_NAMES.into());
+    }
+    if new_counts.is_some() && !is_legend {
+        return Err(ONLY_LEGEND_COUNTS.into());
     }
     if p.get("textSize").is_some_and(|v| !v.is_null()) && !sized {
         return Err(ONLY_LAYOUT_TEXT_SIZE.into());
@@ -590,8 +594,12 @@ pub(in crate::cmd::layout) fn update(s: &mut Session, p: &Value) -> CmdResult {
             fit,
             show_layer_names,
             class_labels,
+            show_counts,
             ..
         } => {
+            if let Some(shown) = new_counts {
+                *show_counts = FeatureCounts::from_shown(shown);
+            }
             if let Some(given) = new_class_labels {
                 *class_labels = given;
             }

@@ -9,7 +9,9 @@ use serde_json::{Value, json};
 
 /// A legend's rows in the grid.
 pub(super) fn legend_property_rows(app: &mut RustGisApp, ui: &mut Ui, li: usize, e: &Element, update: &dyn Fn(&mut RustGisApp, Value)) {
-    let ElementKind::Legend { title, all_classes, hide_other, show_no_data, columns, text_size, fit, show_layer_names, .. } = &e.kind
+    let ElementKind::Legend {
+        title, all_classes, hide_other, show_no_data, columns, text_size, fit, show_layer_names, show_counts, ..
+    } = &e.kind
     else {
         return;
     };
@@ -76,6 +78,17 @@ pub(super) fn legend_property_rows(app: &mut RustGisApp, ui: &mut Ui, li: usize,
         .changed()
     {
         update(app, json!({"showLayerNames": names}));
+    }
+    ui.end_row();
+    let input_label = ui.label(tl!("Feature counts"));
+    let mut counts = show_counts.shown();
+    if ui
+        .checkbox(&mut counts, "")
+        .labelled_by(input_label.id)
+        .on_hover_text(tl!("The number of features after each class, and after the name of a layer drawn in one symbol"))
+        .changed()
+    {
+        update(app, json!({"showCounts": counts}));
     }
     ui.end_row();
     // Its names' and labels' points; the title, rows and swatches follow (#2581).

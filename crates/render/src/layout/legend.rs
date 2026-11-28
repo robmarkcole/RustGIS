@@ -172,6 +172,8 @@ pub(super) struct LegendOptions<'a> {
     pub(super) exclude: &'a [String],
     pub(super) labels: &'a BTreeMap<String, String>,
     pub(super) class_labels: &'a ClassLabels,
+    /// The page its features are counted on (#3237); none, no numbers.
+    pub(super) counts: Option<&'a Env>,
     pub(super) scale: f64,
     pub(super) size: f32,
     pub(super) text_size: f64,
@@ -197,8 +199,8 @@ impl<'a> LegendOptions<'a> {
 /// classes, or one of them, or a WMS or WMTS layer's legend picture (under its name). The name is
 /// the one the legend shows: the layer's label, if the legend gives it one.
 pub(super) enum LegendRow<'a> {
-    Plain(&'a rustgis_map::Layer, &'a str),
-    Head(&'a str),
+    Plain(&'a rustgis_map::Layer, std::borrow::Cow<'a, str>),
+    Head(std::borrow::Cow<'a, str>),
     Class(&'a rustgis_map::Layer, LegendEntry),
     Picture(std::sync::Arc<rustgis_tiles::cache::Payload>),
 }
@@ -243,8 +245,8 @@ impl LegendRow<'_> {
     /// picture, which has none.
     pub(super) fn text_width(&self, size: f32) -> f32 {
         let (shown, pt, bold) = match self {
-            LegendRow::Plain(_, name) => (*name, LEGEND_NAME_PT * size, false),
-            LegendRow::Head(name) => (*name, LEGEND_NAME_PT * size, true),
+            LegendRow::Plain(_, name) => (name.as_ref(), LEGEND_NAME_PT * size, false),
+            LegendRow::Head(name) => (name.as_ref(), LEGEND_NAME_PT * size, true),
             LegendRow::Class(_, en) => (en.label.as_str(), LEGEND_LABEL_PT * size, false),
             LegendRow::Picture(_) => return 0.0,
         };
@@ -955,7 +957,7 @@ pub(super) fn legend_rows_missing<'a>(
                     && let Some(p) = tile_legend(t, opts.scale, &mut missing)
                 {
                     if opts.names {
-                        rows.push(LegendRow::Head(opts.shown(&t.name)));
+                        rows.push(LegendRow::Head(opts.shown(&t.name).into()));
                     }
                     rows.push(LegendRow::Picture(p));
                 }
@@ -965,16 +967,29 @@ pub(super) fn legend_rows_missing<'a>(
         if !(map.shows(l) && legend_lists(l) && !excluded(&l.name)) {
             continue;
         }
-        let mut entries = match drawn {
+        let listed = match drawn {
             Some(d) => match d.iter().find(|(id, _)| *id == l.id) {
-                Some((_, entries)) => entries.clone(),
+                Some((_, entries)) => Some(entries),
                 None => continue,
             },
-            None => every_class(l),
+            None => None,
         };
-        if drawn.is_none() && opts.show_no_data {
-            entries.extend(l.renderer.no_data_legend(&l.dataset, None));
-        }
+        // Counted from the features themselves, so only a vector layer holding all of them: a
+        // streamed one holds the view's (#3237, #3238).
+        let counted = opts
+            .counts
+            .filter(|_| !l.is_raster() && !l.dataset.windowed)
+            .map(|env| l.counted_legend(opts.scale, env, listed.is_none(), opts.show_no_data));
+        let (mut entries, total) = match counted {
+            Some((entries, total)) => (entries, Some(total)),
+            None => {
+                let mut entries = listed.map_or_else(|| every_class(l), Clone::clone);
+                if listed.is_none() && opts.show_no_data {
+                    entries.extend(l.renderer.no_data_legend(&l.dataset, None));
+                }
+                (entries, None)
+            }
+        };
         // The fallback row only (a class that happens to bear its name stays).
         if opts.hide_other && entries.iter().any(|e| e.fallback) {
             entries.retain(|e| !e.fallback);
@@ -992,12 +1007,15 @@ pub(super) fn legend_rows_missing<'a>(
             // A Unique Values layer that lists nothing draws nothing visible (#207); a raster has
             // no symbol of its own to show.
             if !l.is_raster() && !matches!(l.renderer, rustgis_map::Renderer::Unique { .. }) {
-                rows.push(LegendRow::Plain(l, opts.shown(&l.name)));
+                rows.push(LegendRow::Plain(l, counted_name(opts.shown(&l.name), total)));
             }
             continue;
         }
         if opts.names {
-            rows.push(LegendRow::Head(opts.shown(&l.name)));
+            // A one-symbol layer counts beside its name over its diagram's rows too; a classed
+            // layer's numbers are on its rows.
+            let single = matches!(l.renderer, rustgis_map::Renderer::Single(_));
+            rows.push(LegendRow::Head(counted_name(opts.shown(&l.name), total.filter(|_| single))));
         }
         // The legend's own text for a class, by the label the layer gives it (#3187).
         let own = opts.class_labels.of(&l.name);
@@ -1005,10 +1023,19 @@ pub(super) fn legend_rows_missing<'a>(
             if let Some(text) = own.and_then(|o| o.get(&en.label)) {
                 en.label.clone_from(text);
             }
+            // After the text the row shows, whoever's it is.
+            if let Some(n) = en.count {
+                en.label = format!("{} ({n})", en.label);
+            }
             LegendRow::Class(l, en)
         }));
     }
     (rows, missing)
+}
+
+/// A layer's name as its row shows it, ending in its number of features when the row counts them.
+fn counted_name(name: &str, count: Option<u64>) -> std::borrow::Cow<'_, str> {
+    count.map_or_else(|| name.into(), |n| format!("{name} ({n})").into())
 }
 
 /// The legend of a frame's map: its title, and its rows ([`legend_rows`]) under it in `columns`
@@ -1269,7 +1296,17 @@ pub fn legend_sizes_in_columns_mm<const N: usize>(
     // come here (`legend_sizes_mm`, `legend_sizes_with_no_data_mm`) take none. A saved legend is
     // measured through `LegendAsked`, which carries its own.
     let class_labels = &ClassLabels::NONE;
-    let asked = LegendAsked { all_classes, hide_other, show_no_data, layer_names: true, text_size, exclude, labels, class_labels };
+    let asked = LegendAsked {
+        all_classes,
+        hide_other,
+        show_no_data,
+        layer_names: true,
+        text_size,
+        exclude,
+        labels,
+        class_labels,
+        show_counts: false,
+    };
     sizes_asked_mm(map, scale, &asked)
 }
 
@@ -1285,6 +1322,7 @@ pub struct LegendAsked<'a> {
     pub exclude: &'a [String],
     pub labels: &'a BTreeMap<String, String>,
     pub class_labels: &'a ClassLabels,
+    pub show_counts: bool,
 }
 
 /// The columns and text size a legend's fit draws its rows at, and whether they are still wider
@@ -1300,11 +1338,14 @@ pub struct LegendFitted {
 /// The rows of the legend `asked` of `map` at the renderer's scale denominator `scale`, as the
 /// drawing makes them, given to `with`. `None` when a listed layer's complete source can't be read.
 fn asked_rows<T>(map: &mut Map, scale: f64, asked: &LegendAsked, with: impl FnOnce(&[LegendRow]) -> T) -> Option<T> {
-    let LegendAsked { all_classes, hide_other, show_no_data, layer_names, text_size, exclude, labels, class_labels } = *asked;
+    let LegendAsked { all_classes, hide_other, show_no_data, layer_names, text_size, exclude, labels, class_labels, show_counts } = *asked;
+    let env = Env::default();
     let drawn =
         if all_classes { None } else { Some(complete_shown_legends(map, scale, show_no_data, exclude, &mut None, &Env::default())?) };
     let size = legend_size(text_size);
-    let opts = LegendOptions { show_no_data, hide_other, names: layer_names, exclude, labels, class_labels, scale, size, text_size };
+    let counts = show_counts.then_some(&env);
+    let opts =
+        LegendOptions { show_no_data, hide_other, names: layer_names, exclude, labels, class_labels, counts, scale, size, text_size };
     Some(with(&legend_rows(map, drawn.as_deref(), &opts)))
 }
 

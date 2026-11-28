@@ -136,6 +136,7 @@ impl SizeBy {
                     strokes: scaled_marks(strokes, k),
                     fills: Vec::new(),
                     fallback: false,
+                    count: None,
                 }
             })
             .collect()

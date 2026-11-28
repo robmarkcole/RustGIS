@@ -436,7 +436,7 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
     short fills each column in turn and leaves out the last rows (a **Fit**, below, can change
     that).
     A legend says when its box loses rows or closes its columns up when it is given `"columns"`,
-    `"textSize"` (`null` included), `"showNoData"`, `"labels"`, `"classLabels"`, `"fit"` or `"showLayerNames"`, and,
+    `"textSize"` (`null` included), `"showNoData"`, `"labels"`, `"classLabels"`, `"fit"`, `"showLayerNames"` or `"showCounts"`, and,
     in columns, at a text size of its own or with a fit, when its box or what it lists changes. A
     legend in one column at the default size and with no fit is told so only when given one of
     those. A manual legend is checked when it is added or changed, as it always has been, not again
@@ -462,6 +462,14 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
     and over a web layer's legend picture, is left off. A layer drawn in one symbol keeps its name
     beside its swatch, since that is what labels it; classes that carry no label of their own
     (some raster classes) are then drawn as bare swatches.
+  - **Feature counts** (`"showCounts"`, off by default): on, each class row, and the row of a
+    layer drawn in one symbol, ends in the number of features it stands for, such as
+    `Highway (12)`: those the layer's definition query, display filters and time window keep (the
+    page's in a map series), wherever the frame looks. A class with none shows `(0)` where every
+    class is listed. Rasters, web layers, size and diagram rows, streamed layers (read in place, a
+    view at a time), and Unique Values by an expression over too many features and classes show no
+    number.
+    A project with such a legend can't be opened by an older RustGIS.
   - **In scripts and files**: scripts set `"fit": "adjustSize"` and `"showLayerNames": false` on
     `layout.addElement` and `layout.update` (a scale bar's `fit` takes its own values); an unknown
     fit is refused, and `null` leaves each as it is. Each change is one undo step, and a value set

@@ -1889,6 +1889,34 @@ impl Layer {
         rows.contains(&true).then(|| self.with_size_legend(self.renderer.legend_with(&self.dataset, &rows, env.at_scale(Some(scale)))))
     }
 
+    /// [`Layer::shown_legend_with`] for a legend that counts features (#3237): its rows at 1:`scale`
+    /// with their numbers (with `all`, every class), and the number of rows the layer draws, which
+    /// a layer of one symbol shows beside its name. With `no_data`, Graduated Colors' missing-value
+    /// row after the classes, counted.
+    pub fn counted_legend(
+        &self,
+        scale: f64,
+        env: &rustgis_data::query::Env,
+        all: bool,
+        no_data: bool,
+    ) -> (Vec<symbology::LegendEntry>, u64) {
+        let rows = self.drawn_rows_with(scale, env);
+        let total = rows.iter().filter(|r| **r).count() as u64;
+        let mut entries = self.with_size_legend(self.renderer.legend_counted(&self.dataset, &rows, env.at_scale(Some(scale)), all));
+        let missing = (!all).then_some(rows.as_slice());
+        if no_data && let Some(mut entry) = self.renderer.no_data_legend(&self.dataset, missing) {
+            if let Renderer::Graduated { field, .. } = &self.renderer {
+                let fi = self.dataset.field_index(field);
+                let n = (0..rows.len())
+                    .filter(|r| rows.get(*r) == Some(&true) && fi.and_then(|fi| self.dataset.value(*r, fi).as_f64()).is_none())
+                    .count();
+                entry.count = Some(n as u64);
+            }
+            entries.push(entry);
+        }
+        (entries, total)
+    }
+
     /// A legend's colour classes with the sizes of [`Layer::size_by`] after them, where it applies:
     /// the smallest, middle and largest value, drawn as the first class is. No size rows for a field
     /// the layer doesn't have, which the map can't size by either, under a Size expression, or while

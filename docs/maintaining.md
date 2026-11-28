@@ -318,6 +318,13 @@ layer's labels and saving the legend again without its own (#3187). Saved `layou
 an empty object need nothing. A saved `layout.import` whose `text` has such a legend requires it as
 well, and a layout file (`.rgislayout`) with one lists it in its header.
 
+Projects with a legend that shows feature counts (`show_counts` on a legend element) require
+`layout-legend-counts`, so an older reader refuses them instead of drawing no numbers and saving
+the legend again without the setting (#3237). Saved `layout.addElement` and `layout.update`
+commands with `"showCounts": true` require it too; `false` and `null` need nothing. A saved
+`layout.import` or `report.existingTemplate` carrying such a legend requires it as well, and a
+layout file (`.rgislayout`) with one lists it in its header.
+
 Projects with a scale bar that has subdivisions, divisions before zero, labels below, a unit
 label of its own or placed elsewhere, decimals or a fit other than the defaults
 (`subdivisions`, `divisions_before_zero`, `label_position`, `unit_label`, `unit_label_position`,

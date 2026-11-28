@@ -5,6 +5,7 @@ use super::*;
 pub(in crate::cmd::layout) const ONLY_LEGEND_COLUMNS: &str = "only legends have columns";
 /// A legend's layer names given to another element.
 pub(in crate::cmd::layout) const ONLY_LEGEND_NAMES: &str = "only legends take showLayerNames";
+pub(in crate::cmd::layout) const ONLY_LEGEND_COUNTS: &str = "only legends take showCounts";
 /// A fit given to an element that is neither a legend nor a scale bar, each of which reads `fit`
 /// as its own.
 pub(in crate::cmd::layout) const ONLY_FIT: &str = "only legends and scale bars take fit";
@@ -120,7 +121,7 @@ pub(in crate::cmd::layout) fn tells_legend_fit(kind: &ElementKind, p: &Value) ->
     let given = |k: &str| p.get(k).is_some_and(|v| !v.is_null());
     let watched = *columns > 1 || *text_size != rustgis_map::layout::LEGEND_TEXT_PT || fit.kept() != LegendFit::Manual;
     let refitted = ["w", "h", "title", "allClasses", "hideOther", "exclude", "labels", "classLabels"].iter().any(|k| given(k));
-    ["columns", "showNoData", "labels", "classLabels", "fit", "showLayerNames"].iter().any(|k| given(k))
+    ["columns", "showNoData", "labels", "classLabels", "fit", "showLayerNames", "showCounts"].iter().any(|k| given(k))
         || p.get("textSize").is_some()
         || (watched && refitted)
 }
@@ -145,6 +146,7 @@ pub(in crate::cmd::layout) fn say_legend_fit(s: &mut Session, li: usize, id: u32
         fit,
         show_layer_names,
         class_labels,
+        show_counts,
         ..
     } = &e.kind
     else {
@@ -158,6 +160,7 @@ pub(in crate::cmd::layout) fn say_legend_fit(s: &mut Session, li: usize, id: u32
     let (all_classes, hide_other, show_no_data, exclude, columns, labels, text_size) =
         (*all_classes, *hide_other, *show_no_data, exclude.clone(), *columns, labels.clone(), *text_size);
     let (fit, layer_names, class_labels) = (fit.kept(), show_layer_names.shown(), class_labels.clone());
+    let show_counts = show_counts.shown();
     let found = shown
         .and_then(|(name, center, scale)| Some((s.project.maps.iter_mut().find(|m| m.name.eq_ignore_ascii_case(&name))?, center, scale)));
     let Some((map, center, scale)) = found else {
@@ -174,6 +177,7 @@ pub(in crate::cmd::layout) fn say_legend_fit(s: &mut Session, li: usize, id: u32
         exclude: &exclude,
         labels: &labels,
         class_labels: &class_labels,
+        show_counts,
     };
     let measured = if fit == LegendFit::Manual {
         let n = rustgis_map::layout::legend_columns_in_range(columns);
@@ -278,6 +282,16 @@ pub(crate) fn legend_names_param(p: &Value) -> Result<Option<bool>, String> {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Bool(shown)) => Ok(Some(*shown)),
         Some(_) => Err("showLayerNames is true or false".into()),
+    }
+}
+
+/// The `"showCounts"` a legend is given, `true` or `false` only (`null` is not given): the one
+/// reader the commands and the `layout-legend-counts` capability check share.
+pub(crate) fn legend_counts_param(p: &Value) -> Result<Option<bool>, String> {
+    match p.get("showCounts") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(shown)) => Ok(Some(*shown)),
+        Some(_) => Err("showCounts is true or false".into()),
     }
 }
 

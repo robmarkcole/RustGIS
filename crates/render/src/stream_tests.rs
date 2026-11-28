@@ -587,6 +587,7 @@ fn layout_export_keeps_all_drawn_legend_classes() {
             fit: rustgis_map::layout::LegendFit::Manual,
             show_layer_names: rustgis_map::layout::LayerNames::Shown,
             class_labels: Default::default(),
+            show_counts: Default::default(),
         },
     );
     let expected = layout::render(&page, &mut [base.clone()], 96.0, &layout::PageInfo::default()).unwrap();
