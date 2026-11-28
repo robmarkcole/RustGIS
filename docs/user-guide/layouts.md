@@ -982,6 +982,9 @@ previews, edits and plays it.
   coloured page, an **Image** page a picture with a caption, and a **Video** page a video file or
   URL with an optional poster picture.
 - Each page has a title, speaker notes and a duration (for **Play**), and can move up or down.
+- A **Map** page follows its map by name. While the project has no map of that name, the page is
+  drawn over the active map; deleting the map (or the offline area that goes with it), or
+  importing a presentation that names it, says which pages.
 - **Publish › Output › Presentation › Export Presentation** writes an HTML slideshow (arrow
   keys, `N` for notes, `P` to play; videos play in place), a PDF (kept as vectors as a layout's
   is), or the first page as PNG.

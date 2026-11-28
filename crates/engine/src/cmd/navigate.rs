@@ -215,7 +215,7 @@ pub fn commands() -> Vec<C> {
             }
             let i = required_map_at(s,p)?;
             let named = super::layout::maps_layouts_name(&s.project);
-            s.project.maps.remove(i);
+            let gone = s.project.maps.remove(i).name;
             // Deleting another map keeps the one in view (a map tab's close button).
             let active = s.project.active_map;
             if i < active {
@@ -226,6 +226,7 @@ pub fn commands() -> Vec<C> {
                 s.table_layer = None;
             }
             super::layout::say_map_texts(s, &named);
+            super::presentation::say_pages_without_their_map(s, super::presentation::PagesOf::Map(&gone));
             Ok(Value::Null)
         }).transition(unmodelled_transition).inputs(required_map_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
         .params(r#"{"name": string}"#),

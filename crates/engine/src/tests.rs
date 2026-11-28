@@ -117,6 +117,9 @@ mod layout_title;
 #[path = "tests/layout_removed_layer.rs"]
 mod layout_removed_layer;
 
+#[path = "tests/layout_removed_map.rs"]
+mod layout_removed_map;
+
 #[path = "tests/layout_edge.rs"]
 mod layout_edge;
 

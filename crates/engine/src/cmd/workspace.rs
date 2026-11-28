@@ -303,10 +303,11 @@ pub fn commands() -> Vec<C> {
                     m.offline_area_id = None;
                 }
             }
+            let mut gone = None;
             if let Some(i) = kept
                 && s.project.maps.len() > 1
             {
-                s.project.maps.remove(i);
+                gone = Some(s.project.maps.remove(i).name);
                 // The active map stays the same map; if it was the removed one, a neighbour.
                 let a = s.project.active_map;
                 s.project.active_map = if a > i { a - 1 } else { a.min(s.project.maps.len().saturating_sub(1)) };
@@ -323,6 +324,9 @@ pub fn commands() -> Vec<C> {
                 s.notify(format!("The offline area's map was the only one, so it was kept as '{kept}'"), false);
             }
             super::layout::say_map_texts(s, &named);
+            if let Some(gone) = gone {
+                super::presentation::say_pages_without_their_map(s, super::presentation::PagesOf::Map(&gone));
+            }
             Ok(Value::Null)
         }).roles(&[]).effects(crate::policy::Effects::NONE)
         .params(r#"{"name": offline area}"#),
