@@ -764,7 +764,7 @@ words: **Add** draws the whole map or one layer such as Flood Hazard Zones alone
 **Features** downloads a layer's features in the view (up to the server's limit). Its flood layers are drawn only from zoom 15 (closer than about 1:36,000),
 and FEMA's server can be slow to answer.
 
-**The National Map…** lists 31 map services of the USGS
+**The National Map…** lists 30 map services of the USGS
 [The National Map](https://www.usgs.gov/programs/national-geospatial-program/national-map) and
 partners by category (basemaps, hydrography, elevation, imagery, cartography, hazards, other data,
 indexes), searched by words; **Add** adds one as a tile layer (the basemaps from their tile caches,
