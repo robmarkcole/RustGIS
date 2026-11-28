@@ -794,7 +794,14 @@ thread_local! {
     /// For tests: the values a piece holds at most, in place of [`super::cube::MAX_VALUES`], so a
     /// small cube is read in several pieces.
     pub(crate) static PIECE_VALUES: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    /// For tests: the dates read at once, in place of [`STAC_READERS`], so one at a time reads
+    /// them in turn.
+    pub(crate) static READERS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
+
+/// For tests: the band files a STAC cube read the values of, by address, in the order read.
+#[cfg(test)]
+pub(crate) static BANDS_READ: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 /// A STAC collection's band as a data cube for `cube.trend` (#579): each date's files (a grid
 /// tile each, MODIS's h13v09 and h13v10 for one date), read in place from their tiled GeoTIFFs
@@ -1100,6 +1107,11 @@ const SHARE_PIXELS: f64 = 1_000_000.0;
 #[cfg(not(target_arch = "wasm32"))]
 type Mask = (String, Vec<f32>);
 
+/// A mask file's header, its level read for a band window, and the window's columns' and rows'
+/// pixels in it (`None` off the file): [`StacCube::mask_place`].
+#[cfg(not(target_arch = "wasm32"))]
+type MaskPlace = (std::sync::Arc<crate::render::rustgis_tiles::cog::Info>, usize, Vec<Option<u32>>, Vec<Option<u32>>);
+
 /// A window of a mask's values (band 1), as [`read_values_counted_blocking`] reads them: refused
 /// when `f32` rounded any (whole numbers past 2^24, in a 32- or 64-bit band), whose classes or
 /// bits can't then be told; `stop` heard within the read.
@@ -1136,6 +1148,29 @@ fn level_near(layout: &rustgis_data::raster::cog::Layout, size: f64) -> usize {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl StacCube {
+    /// Where a band window's pixels (as [`mask_window`](Self::mask_window) takes them) fall in
+    /// the mask file `href`: its header, the level read, and each column's and row's pixel of it
+    /// (`None` off the file). Only the header is read, cached per address.
+    fn mask_place(
+        &self,
+        href: &str,
+        lt: &rustgis_data::raster::GeoTransform,
+        cols: (u32, u32),
+        rows: (u32, u32),
+    ) -> Result<MaskPlace, String> {
+        use super::cube_mask::nearest;
+        use crate::render::rustgis_tiles::cog;
+        let info = cog::info_blocking(href)?;
+        if info.layout.crs != self.crs {
+            return Err(crate::sources::message_with_address(href, "a mask in another coordinate system than its band"));
+        }
+        let level = level_near(&info.layout, lt.pixel_width.abs());
+        let lv = info.layout.levels.get(level).ok_or_else(|| crate::sources::message_with_address(href, "a mask with no image"))?;
+        let mt = info.layout.transform_of(lv);
+        let xs = nearest(lt.origin_x, lt.pixel_width, cols, mt.origin_x, mt.pixel_width, lv.width);
+        let ys = nearest(lt.origin_y, lt.pixel_height, rows, mt.origin_y, mt.pixel_height, lv.height);
+        Ok((info, level, xs, ys))
+    }
     /// The mask's say over a window of a band file's level (`lt` its grid; columns `cols`, rows
     /// `rows`), pixel by pixel in the window's order: the mask file `href` read at its level
     /// nearest the band's pixels, each band pixel taking the mask pixel holding its centre;
@@ -1148,17 +1183,8 @@ impl StacCube {
         cols: (u32, u32),
         rows: (u32, u32),
     ) -> Result<Vec<Option<bool>>, String> {
-        use super::cube_mask::{nearest, span};
-        use crate::render::rustgis_tiles::cog;
-        let info = cog::info_blocking(href)?;
-        if info.layout.crs != self.crs {
-            return Err(crate::sources::message_with_address(href, "a mask in another coordinate system than its band"));
-        }
-        let level = level_near(&info.layout, lt.pixel_width.abs());
-        let lv = info.layout.levels.get(level).ok_or_else(|| crate::sources::message_with_address(href, "a mask with no image"))?;
-        let mt = info.layout.transform_of(lv);
-        let xs = nearest(lt.origin_x, lt.pixel_width, cols, mt.origin_x, mt.pixel_width, lv.width);
-        let ys = nearest(lt.origin_y, lt.pixel_height, rows, mt.origin_y, mt.pixel_height, lv.height);
+        use super::cube_mask::span;
+        let (info, level, xs, ys) = self.mask_place(href, lt, cols, rows)?;
         let (Some(mc), Some(mr)) = (span(&xs), span(&ys)) else { return Ok(vec![None; xs.len() * ys.len()]) };
         let m = mask_values(&info, href, level, mc, mr, &std::sync::atomic::AtomicBool::new(false))?;
         let across = (mc.1 - mc.0) as usize;
@@ -1199,6 +1225,10 @@ impl super::cube::TimeCube for StacCube {
         Some((self.width as usize, self.height as usize))
     }
     fn readers(&self) -> usize {
+        #[cfg(test)]
+        if let Some(n) = READERS.with(std::cell::Cell::get) {
+            return n;
+        }
         STAC_READERS
     }
     fn nothing_read(&self) -> Option<String> {
@@ -1312,6 +1342,33 @@ impl super::cube::TimeCube for StacCube {
     /// scaled as its metadata says, a cell the mean of the pixels read in it (one, or a block of
     /// the full images'); a cell no file covers (or none has a value for) is NaN.
     fn slice_of(&self, i: usize, piece: usize) -> Result<Option<(std::sync::Arc<rustgis_data::raster::Raster>, usize)>, String> {
+        self.read_slice(i, piece, None)
+    }
+    /// As [`slice_of`](Self::slice_of), but an item whose pixels the mask lets through (all of
+    /// them, unmasked) all fall in `decided` cells isn't read past its mask: its bands' windows
+    /// couldn't change a cell. One with pixels its mask file doesn't cover is read, so those are
+    /// said as ever; the pixels with a value in only some of the bands are counted over the items
+    /// read (a skipped item's lie in cells a better date filled).
+    fn first_slice_of(
+        &self,
+        i: usize,
+        piece: usize,
+        decided: &(dyn Fn(usize) -> bool + Sync),
+    ) -> Result<Option<(std::sync::Arc<rustgis_data::raster::Raster>, usize)>, String> {
+        self.read_slice(i, piece, Some(decided))
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl StacCube {
+    /// [`TimeCube::slice_of`](super::cube::TimeCube::slice_of), or with `decided`
+    /// [`TimeCube::first_slice_of`](super::cube::TimeCube::first_slice_of).
+    fn read_slice(
+        &self,
+        i: usize,
+        piece: usize,
+        decided: Option<&(dyn Fn(usize) -> bool + Sync)>,
+    ) -> Result<Option<(std::sync::Arc<rustgis_data::raster::Raster>, usize)>, String> {
         use crate::render::rustgis_tiles::cog;
         let files = self.files.get(i).ok_or_else(|| format!("no date {i}"))?;
         let top = u32::try_from(piece).ok().and_then(|p| p.checked_mul(self.rows)).filter(|t| *t < self.height).ok_or("no such piece")?;
@@ -1362,6 +1419,29 @@ impl super::cube::TimeCube for StacCube {
             self.met.store(true, std::sync::atomic::Ordering::Relaxed);
             let cols = (fc0 as u32, fc1 as u32);
             let rows = (fr0 as u32, fr1 as u32);
+            let across = (fc1 - fc0) as usize;
+            let pixels = across * (fr1 - fr0) as usize;
+            // The piece's cell of the window's pixel `i`.
+            let cell_of = |i: usize| {
+                let row = ((fr0 - dy - top_f) as usize + i / across) / f as usize;
+                let col = ((fc0 - dx) as usize + i % across) / f as usize;
+                row * w as usize + col
+            };
+            // First: an item whose window's cells all hold a better date's value, its mask file
+            // covering the window (its header says), could fill none and has no pixel to say
+            // outside its mask, so neither its mask nor its bands are read.
+            if let Some(decided) = decided
+                && (0..pixels).all(|i| decided(cell_of(i)))
+                && match (&self.mask, mask) {
+                    (Some(_), Some((m, _))) => {
+                        let (_, _, xs, ys) = self.mask_place(m, &lt, cols, rows)?;
+                        xs.iter().chain(&ys).all(Option::is_some)
+                    }
+                    _ => self.mask.is_none(),
+                }
+            {
+                continue;
+            }
             // A masked cube's pixels go in only where the same item's mask lets them through.
             let keep = match (&self.mask, mask) {
                 (Some(test), Some(m)) => Some(self.mask_window(m, test, &lt, cols, rows)?),
@@ -1370,10 +1450,20 @@ impl super::cube::TimeCube for StacCube {
                 (Some(_), None) => return Err(crate::sources::message_with_address(href, "has no quality band to mask its cells by")),
                 _ => None,
             };
+            // First: an item that could fill no cell (each pixel the mask lets through falls in one
+            // holding a better date's value) isn't read; one with pixels its mask doesn't cover
+            // is, so they are counted and said as they would be.
+            if let Some(decided) = decided
+                && !keep.as_ref().is_some_and(|k| k.iter().any(Option::is_none))
+            {
+                let lets = |i: usize| keep.as_ref().is_none_or(|k| k.get(i).copied().flatten() == Some(true));
+                if !(0..pixels).any(|i| lets(i) && !decided(cell_of(i))) {
+                    continue;
+                }
+            }
             // The item's pixels with a value that the mask file doesn't cover, and those with a value
             // in only some of the bands asked for.
             let mut outside = 0u64;
-            let across = (fc1 - fc0) as usize;
             let mut partial = 0u64;
             let bands = std::iter::once((href, scale, fill)).chain(more.iter().map(|(h, s, f)| (h, s, f)));
             // Every band's window is read before any pixel goes in, so a cell's bands are the mean of
@@ -1398,6 +1488,10 @@ impl super::cube::TimeCube for StacCube {
                     }
                     cog::read_values_blocking(&bi, bh, self.level, 0, cols, rows)?
                 };
+                #[cfg(test)]
+                if let Ok(mut read) = BANDS_READ.lock() {
+                    read.push(bh.clone());
+                }
                 reads.push((read, fill, (*k, *o)));
             }
             let pixels = reads.iter().map(|(r, ..)| r.len()).min().unwrap_or(0);
@@ -1423,10 +1517,7 @@ impl super::cube::TimeCube for StacCube {
                     partial += 1;
                     continue;
                 }
-                let (r, c) = (i / across, i % across);
-                let row = ((fr0 - dy - top_f) as usize + r) / f as usize;
-                let col = ((fc0 - dx) as usize + c) / f as usize;
-                let cell = row * w as usize + col;
+                let cell = cell_of(i);
                 for ((read, _, (k, o)), (sum, count)) in reads.iter().zip(sums.iter_mut().zip(&mut counts)) {
                     if let (Some(s), Some(n)) = (sum.get_mut(cell), count.get_mut(cell)) {
                         *s += f64::from(read[i]) * k + o;

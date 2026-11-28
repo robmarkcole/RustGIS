@@ -134,7 +134,7 @@ fn several_bands_summarised_as_one_rgb_layer() {
     assert!(!said.iter().any(|t| t.contains("pixel(s) had a value")), "{said:?}");
     // What can't be asked.
     for (bad, why) in [
-        (json!({"stat": "max"}), "assets takes mean, median or first"),
+        (json!({"stat": "max"}), "assets takes mean, median, first or firstDate"),
         (json!({"stat": "first", "asset": "B04"}), "not both"),
         (json!({"stat": "first", "assets": ["B04"]}), "2 to 16"),
         (json!({"stat": "first", "assets": ["B04", "b04"]}), "names b04 twice"),

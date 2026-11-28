@@ -2319,10 +2319,20 @@ an even count), **min**, **max**, **sum**, **std** (the population standard devi
 of values, or **countAbove** a threshold (`"above"`), as Summarise over time does for a Zarr
 variable (see [Data](data.md)); or **first**, each cell's value at its first date with one, in the
 order `"order"` gives: `"date"` (the earliest first, the default without a mask), `"-date"` (the
-latest first) or `"clear"` (below). The median holds every date's value of the cells being read,
-within the run's 64 million values on the desktop and 16 million in the web app (cells × dates,
+latest first) or `"clear"` (below); or **firstDate**, the date of the value first takes in each
+cell, as the number of days since 1970-01-01 (empty where no date has a value), its legend naming
+each date held, a colour each (past 256 dates, the default stretch, the dates still named in the
+band; a day before 1970 is labelled by its number). A band's names are indexed by day, so a run's
+layers hold 2 million of them in all, about a hundred layers of today's dates: the layers past
+that keep their days unnamed, drawn as a stretch, and that is said. First and firstDate read the dates in that order and leave out what can't change a cell: a
+date whose cells all hold a better date's value is not read, nor a STAC item whose mask lets
+through only such cells (an item whose mask file doesn't cover all of its part of the area is
+read, so the pixels outside it are counted and said; and nothing is left out when `"minValid"`
+asks a cell for more than one date), so a dry season's composite reads little past its clearest
+dates. The median holds every date's value of
+the cells being read, within the run's 64 million values on the desktop and 16 million in the web app (cells × dates,
 4 bytes each: up to 256 MB; a STAC collection is read in pieces that keep to it), and like first
-is the data cube summary's only.
+and firstDate is the data cube summary's only.
 
 - **Cloud-free composites:** a STAC collection's dates can be masked by each item's own quality band
   with `"mask"`: `{"asset": "SCL", "keep": [4, 5, 6]}` takes a cell at a date only where the same
@@ -2345,7 +2355,8 @@ is the data cube summary's only.
 
 - **Several bands:** `"assets": ["B04", "B03", "B02"]` (instead of `"asset"`) reads 2 to 16 of a
   collection's bands from the same items and makes one layer of a band for each, drawn as RGB when
-  there are three. It takes **mean**, **median** and **first**, which keep each cell's bands
+  there are three. It takes **mean**, **median**, **first** and **firstDate** (one band: the date
+  all of them were taken at), which keep each cell's bands
   together: a pixel goes in at a date only with a value in every band (one with a value in only
   some is left out at that date, and said with how many), so an averaged cell's bands are the mean
   of the same pixels, first takes all its bands from the
@@ -2395,7 +2406,10 @@ is the data cube summary's only.
   outputs hold up to 32 million values (cells times groups; 8 million in the web app). A summary by
   month keeps every month's totals while it reads, up to five times the outputs' memory for
   **std** (three for mean, min, max, sum and countAbove), so a large area by month may need a
-  coarser cell size or a smaller area. `rustgis-cli run` takes a STAC collection's search up to
+  coarser cell size or a smaller area. First and firstDate read one group after another, so they
+  hold the totals of the groups of the dates being read, one at a time read in turn (16 bytes a
+  cell, and 4 more for the best date's rank).
+  `rustgis-cli run` takes a STAC collection's search up to
   10,000 items, as for a trend (the app and Python 2,000), and prints a summary's progress
   (`cube.reduce: 42%`). The layers
   are named after what they hold (`NDVI mean 2001`, `NDVI mean 2001–2025 month 03`, or the

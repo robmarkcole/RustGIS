@@ -14,7 +14,7 @@
 //! for the whole period or a year (or a month of the year) at a time.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use rustgis_analysis::rasterops;
 use rustgis_analysis::trend::{self, Test};
@@ -29,7 +29,7 @@ pub fn commands() -> Vec<C> {
         r#"{"cube"?: an entry of cube.catalog (its STAC API, collection, band, cell size and cloud cap, or its Zarr store and variable) | "layers"?: [raster layers, a date each; one on another grid is resampled (nearest) onto the first's] | "layer"?: a Zarr layer (or "path" | "url", "variable", "index", "crs" as for zarr.reduce) or a raster of several bands, a date each (default: the active layer) | "collection": a STAC collection (desktop; read in place over an area, in pieces when large; with url, asset, bbox, maxCloud, cellSize and resampling below, and "start", "end"), "url"?: the collection's STAC API (as for stac.addCube), "asset"?: the collection's band, such as NDVI ("assets", several bands, is cube.reduce's: a trend refuses it), "mask"?: a collection's quality band (as for cube.reduce), "bbox"?: [w, s, e, n] | "view" (the collection's area), "maxCloud"?: a collection's cloud cover cap, "cellSize"?: a collection's cell size in the files' units (the overview level nearest it is read), "resampling"?: "nearest" (default: that overview's pixels as stored) | "average" (each cell the mean of the full images' pixels in it, which reads them), "band"?: 1-based (a stack's band), "dates"?: [dates] (a stack's or the bands' dates, in their order; default: read from the layers' names or files, or the bands' names), "start"?, "end"?: dates (a whole number from 1000 to 9999 is a year; an end given as a year or a month takes all of it), "months"?: [1–12] (one season across years), "test"?: "hamedRao" (default) | "yueWang" | "seasonal" | "original", "seasons"?: parts of a year for the seasonal test (default 12), "alpha"?: 0.05 (above 0, below 0.5), "minValid"?: dates a cell needs (default: half of them, at least 4; the seasonal test also needs 4 in seasons of two or more), "per"?: "year" (default) | "decade", "name"?: text, "ran"?: (internal: a trend the app has worked out)} → four raster layers: Sen's slope, the test's Z and p-value, and the slope where p < alpha"#,
     ),
     C::new("cube.reduce", "Summarise a Data Cube over Time", "Analyze › Workflows", reduce_cmd).inputs(cube_inputs).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network).with(crate::policy::Effect::Files)).params(
-        r#"{"cube"?: an entry of cube.catalog (as for cube.trend) | "layers"?: [raster layers, a date each; one on another grid is resampled (nearest) onto the first's] | "layer"?: a Zarr layer or a raster of several bands, a date each (default: the active layer) | "path"?: a Zarr store's folder | "url"?: a Zarr store's address, or a STAC collection's API (as for stac.addCube) | "collection": a STAC collection (desktop; read in place over an area, in pieces when large; with url, asset, bbox, maxCloud, cellSize and resampling below, and "start", "end"), "variable"?, "index"?, "crs"?: a Zarr variable's (as for zarr.reduce), "asset"?: the collection's band, such as NDVI, "assets"?: [2–16 of the collection's bands, such as ["B04", "B03", "B02"]] (instead of asset, for mean, median or first: one layer a group with a band for each, drawn as RGB when three; a cell goes in at a date only with a value in every band, and median takes each cell's bands from one date, the one whose bands' sum is the middle (the lower of two); items without all of them are left out), "mask"?: {"asset": the items' quality band, such as SCL, Fmask, qa_pixel or CMASK, and one of "keep": [classes] | "drop": [classes] | "bits": {"set"?: [bits on], "unset"?: [bits off]} (bits 0–63)} (a collection's: a cell is taken at a date only where the same item's quality band lets it through, read onto the band's grid by nearest neighbour; items without it are left out), "bbox"?: [w, s, e, n] | "view" (the collection's area), "maxCloud"?: a collection's cloud cover cap, "cellSize"?: a collection's cell size in the files' units (the overview level nearest it is read), "resampling"?: "nearest" (default) | "average" (as for cube.trend), "band"?: 1-based (a stack's band), "dates"?: [dates] (a stack's or the bands' dates, in their order; default: read from the layers' names or files, or the bands' names), "stat": "mean"|"median"|"min"|"max"|"sum"|"std" (the population standard deviation, n)|"count"|"countAbove"|"first" (the value at the cell's first date with one, in "order": the best pixel)|"mode" or "majority" (a categorical cube's most frequent class; the least of those tied)|"modeCount" (how many dates had the mode)|"variety" (how many classes)|"changes" (how many times the class changed from one valued date to the next)|"longestRun" (the class of the longest run of dates in one class; the least of those tied)|"longestRunLength" (how many dates that run lasted)|"frequency" (a layer for each class met: its count of dates)|"countIn" (how many dates in the classes given), "order"?: first's order of the dates: "clear" (the default with a mask: by the share of the area the mask lets through, the clearest first) | "date" (the default without one: the earliest first) | "-date" (the latest first), "above"?: number (countAbove's threshold), "classes"?: [whole numbers 0–255, at most 256] (countIn's classes), "by"?: "all" (default: one layer) | "year" (a layer for each calendar year) | "month" (a layer for each month of the year, across years), "start"?, "end"?: dates (as for cube.trend), "months"?: [1–12] (a season across years), "minValid"?: 0–1 (a cell with a smaller share of its group's dates is left empty; default 0), "name"?: text} → raster layers of the statistic, one for each group (frequency: one for each class of each group)"#,
+        r#"{"cube"?: an entry of cube.catalog (as for cube.trend) | "layers"?: [raster layers, a date each; one on another grid is resampled (nearest) onto the first's] | "layer"?: a Zarr layer or a raster of several bands, a date each (default: the active layer) | "path"?: a Zarr store's folder | "url"?: a Zarr store's address, or a STAC collection's API (as for stac.addCube) | "collection": a STAC collection (desktop; read in place over an area, in pieces when large; with url, asset, bbox, maxCloud, cellSize and resampling below, and "start", "end"), "variable"?, "index"?, "crs"?: a Zarr variable's (as for zarr.reduce), "asset"?: the collection's band, such as NDVI, "assets"?: [2–16 of the collection's bands, such as ["B04", "B03", "B02"]] (instead of asset, for mean, median, first or firstDate: one layer a group with a band for each, drawn as RGB when three (firstDate: one band, the date all of them were taken at); a cell goes in at a date only with a value in every band, and median takes each cell's bands from one date, the one whose bands' sum is the middle (the lower of two); items without all of them are left out), "mask"?: {"asset": the items' quality band, such as SCL, Fmask, qa_pixel or CMASK, and one of "keep": [classes] | "drop": [classes] | "bits": {"set"?: [bits on], "unset"?: [bits off]} (bits 0–63)} (a collection's: a cell is taken at a date only where the same item's quality band lets it through, read onto the band's grid by nearest neighbour; items without it are left out), "bbox"?: [w, s, e, n] | "view" (the collection's area), "maxCloud"?: a collection's cloud cover cap, "cellSize"?: a collection's cell size in the files' units (the overview level nearest it is read), "resampling"?: "nearest" (default) | "average" (as for cube.trend), "band"?: 1-based (a stack's band), "dates"?: [dates] (a stack's or the bands' dates, in their order; default: read from the layers' names or files, or the bands' names), "stat": "mean"|"median"|"min"|"max"|"sum"|"std" (the population standard deviation, n)|"count"|"countAbove"|"first" (the value at the cell's first date with one, in "order": the best pixel)|"firstDate" (the date of the value first takes, as days since 1970-01-01, its legend the dates)|"mode" or "majority" (a categorical cube's most frequent class; the least of those tied)|"modeCount" (how many dates had the mode)|"variety" (how many classes)|"changes" (how many times the class changed from one valued date to the next)|"longestRun" (the class of the longest run of dates in one class; the least of those tied)|"longestRunLength" (how many dates that run lasted)|"frequency" (a layer for each class met: its count of dates)|"countIn" (how many dates in the classes given), "order"?: first's and firstDate's order of the dates: "clear" (the default with a mask: by the share of the area the mask lets through, the clearest first) | "date" (the default without one: the earliest first) | "-date" (the latest first), "above"?: number (countAbove's threshold), "classes"?: [whole numbers 0–255, at most 256] (countIn's classes), "by"?: "all" (default: one layer) | "year" (a layer for each calendar year) | "month" (a layer for each month of the year, across years), "start"?, "end"?: dates (as for cube.trend), "months"?: [1–12] (a season across years), "minValid"?: 0–1 (a cell with a smaller share of its group's dates is left empty; default 0), "name"?: text} → raster layers of the statistic, one for each group (frequency: one for each class of each group)"#,
     )]
 }
 
@@ -78,6 +78,20 @@ pub trait TimeCube: Send + Sync {
     fn slice_of(&self, i: usize, piece: usize) -> Result<Option<(Arc<Raster>, usize)>, String> {
         let _ = piece;
         self.slice(i)
+    }
+    /// Date `i`'s piece `piece` for first and firstDate, leaving out what can't change it:
+    /// `decided(c)` says whether cell `c` of the piece (row by row) already holds the value of a
+    /// date ranked before this one, which this date's can't replace. A cube that can tell where a
+    /// date could fill a cell before reading its values (a STAC cube, by its items' masks) doesn't
+    /// read an item that could fill none, its cells left empty; the others read the whole slice.
+    fn first_slice_of(
+        &self,
+        i: usize,
+        piece: usize,
+        decided: &(dyn Fn(usize) -> bool + Sync),
+    ) -> Result<Option<(Arc<Raster>, usize)>, String> {
+        let _ = decided;
+        self.slice_of(i, piece)
     }
     /// The whole grid's columns and rows, when known before any slice is read (a STAC cube's area),
     /// so a run too long is refused before it reads.
@@ -867,14 +881,15 @@ fn read_slices(
     in_order: bool,
     place: &mut dyn FnMut(usize, Option<(Arc<Raster>, usize)>) -> Result<(), String>,
 ) -> Result<(), String> {
-    read_each(cube, steps, cancel, in_order, &|i| cube.slice_of(i, piece), place)
+    read_each(cube, steps.len(), cancel, in_order, &|k| cube.slice_of(steps.get(k).copied().unwrap_or(0), piece), place)
 }
 
-/// Reads something of each of `steps`' dates with `read` (a slice, a clear share) and hands it
-/// to `place` with its place among the steps, as [`read_slices`] says.
+/// Reads something of each of `count` steps with `read`, given the step's place (a slice, a clear
+/// share), and hands it to `place` with that place, as [`read_slices`] says: asked for in their
+/// places' order.
 fn read_each<T: Send>(
     cube: &dyn TimeCube,
-    steps: &[usize],
+    count: usize,
     cancel: &AtomicBool,
     in_order: bool,
     read: &(dyn Fn(usize) -> Result<T, String> + Sync),
@@ -883,13 +898,13 @@ fn read_each<T: Send>(
     // One at a time in the browser, which has no threads to read on, and where the slices must come
     // in their order (`in_order`): several readers place them as they are read, and one slow read
     // lets the others run ahead of it.
-    let readers = if cfg!(target_arch = "wasm32") || in_order { 1 } else { cube.readers().clamp(1, 16).min(steps.len().max(1)) };
+    let readers = if cfg!(target_arch = "wasm32") || in_order { 1 } else { cube.readers().clamp(1, 16).min(count.max(1)) };
     let in_turn = |place: &mut dyn FnMut(usize, T) -> Result<(), String>| -> Result<(), String> {
-        for (k, &i) in steps.iter().enumerate() {
+        for k in 0..count {
             if cancel.load(Ordering::Relaxed) {
                 return Err("cancelled".into());
             }
-            place(k, read(i)?)?;
+            place(k, read(k)?)?;
         }
         Ok(())
     };
@@ -918,8 +933,7 @@ fn read_each<T: Send>(
                             let _diagnostic_scope = capture.enter();
                             loop {
                                 let k = next.fetch_add(1, Ordering::Relaxed);
-                                let Some(&i) = steps.get(k) else { break };
-                                if cancel.load(Ordering::Relaxed) || tx.send((k, read(i))).is_err() {
+                                if k >= count || cancel.load(Ordering::Relaxed) || tx.send((k, read(k))).is_err() {
                                     break;
                                 }
                             }
@@ -1205,11 +1219,38 @@ pub fn add_outputs(s: &mut Session, rasters: Vec<Raster>, dates: usize) -> CmdRe
         let name = r.name.clone();
         let tif = raster::geotiff::write_all(&r).map_err(|e| e.to_string())?;
         let file: String = name.chars().map(|c| if c.is_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' }).collect();
-        let layer = rustgis_map::raster::RasterLayer::from_written(r, format!("{file}.tif"), tif);
+        let named = class_values(&r);
+        let mut layer = rustgis_map::raster::RasterLayer::from_written(r, format!("{file}.tif"), tif);
+        // Named classes (firstDate's dates): a colour each for every value held, from the
+        // earliest, labelled by its name (a day before 1970, unnamed, by its number).
+        if !named.is_empty() && named.len() <= rustgis_map::raster::MAX_UNIQUE_VALUES {
+            let ramp = rustgis_map::color::Ramp::Viridis;
+            let values = named.iter().enumerate().map(|(k, v)| (*v, ramp.pick(k, named.len()))).collect();
+            layer.style.renderer = rustgis_map::raster::RasterRenderer::UniqueValues { band: 0, ramp, values };
+            layer.style.stretch = rustgis_map::raster::Stretch::None;
+            layer.style.resampling = rustgis_map::raster::Resampling::Nearest;
+        }
         let out = super::raster::add_raster(s, &name, layer)?;
         layers.push(out["layer"].clone());
     }
     Ok(json!({ "layers": layers, "dates": dates }))
+}
+
+/// The values held by a raster's first band when it names its classes (firstDate's dates), in
+/// order, named or not; none when it names none. Only distinct values are kept, and no more than
+/// one past what a Unique Values renderer draws, so a large layer of few dates takes no copy of
+/// its cells.
+fn class_values(r: &Raster) -> Vec<f64> {
+    let Some(b) = r.bands.first().filter(|b| b.classes.iter().any(|n| !n.is_empty())) else { return Vec::new() };
+    let mut held = std::collections::HashSet::new();
+    for v in b.data.iter().filter(|v| v.is_finite()) {
+        if held.insert(v.to_bits()) && held.len() > rustgis_map::raster::MAX_UNIQUE_VALUES {
+            break;
+        }
+    }
+    let mut held: Vec<f64> = held.into_iter().map(|v| f64::from(f32::from_bits(v))).collect();
+    held.sort_by(f64::total_cmp);
+    held
 }
 
 // --- A summary over time of any cube -------------------------------------------------------------
@@ -1246,6 +1287,8 @@ pub enum Stat {
     Median,
     /// The value at the first date with one, in the run's order ([`Order`]): the best pixel.
     First,
+    /// The date of the value first takes, as days since 1970-01-01 (which `f32` holds exactly).
+    FirstDate,
 }
 
 impl Stat {
@@ -1268,7 +1311,13 @@ impl Stat {
             Stat::Frequency => "frequency",
             Stat::Median => "median",
             Stat::First => "first",
+            Stat::FirstDate => "firstDate",
         }
+    }
+
+    /// Whether it takes each cell's value at its best-ranked date ([`Order`]): first and firstDate.
+    pub(crate) fn picks_first(self) -> bool {
+        matches!(self, Stat::First | Stat::FirstDate)
     }
 
     /// Whether it takes the values as classes (whole numbers), as of a land-cover map.
@@ -1304,7 +1353,7 @@ impl Stat {
     /// The statistic asked for: `stat`, countAbove's threshold (`above`) and countIn's classes
     /// (`classes`).
     pub(crate) fn parse(p: &Value) -> Result<Stat, String> {
-        const STATS: &str = "mean, median, min, max, sum, std, count, countAbove, first, mode (or majority), modeCount, variety, changes, longestRun, longestRunLength, frequency or countIn";
+        const STATS: &str = "mean, median, min, max, sum, std, count, countAbove, first, firstDate, mode (or majority), modeCount, variety, changes, longestRun, longestRunLength, frequency or countIn";
         Ok(match ps(p, "stat").map(str::trim).ok_or_else(|| format!("stat is required ({STATS})"))? {
             x if x.eq_ignore_ascii_case("mean") => Stat::Mean,
             x if x.eq_ignore_ascii_case("min") || x.eq_ignore_ascii_case("minimum") => Stat::Min,
@@ -1325,6 +1374,7 @@ impl Stat {
             x if x.eq_ignore_ascii_case("frequency") => Stat::Frequency,
             x if x.eq_ignore_ascii_case("median") => Stat::Median,
             x if x.eq_ignore_ascii_case("first") => Stat::First,
+            x if x.eq_ignore_ascii_case("firstDate") => Stat::FirstDate,
             x => return Err(format!("unknown stat '{x}' ({STATS})")),
         })
     }
@@ -1384,10 +1434,25 @@ pub(crate) struct Totals {
     /// Median: each cell's values, `per` a cell (its group's dates), in the order they came.
     values: Vec<f32>,
     per: usize,
-    /// First: each cell's value's rank so far (`acc` the value), and the rank of the date being
-    /// added ([`Totals::at`]).
+    /// First and firstDate: each cell's value's rank so far (`acc` the value, or for firstDate
+    /// its date's day), and the rank of the date being added ([`Totals::at`]).
     rank: Vec<u32>,
     at: u32,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// For tests: the totals open on this thread, and the most open at once.
+    pub(crate) static OPEN_TOTALS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+    /// For tests: first's groups' best ranks held on this thread, and the most held at once.
+    pub(crate) static OPEN_RANKS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+#[cfg(test)]
+impl Drop for Totals {
+    fn drop(&mut self) {
+        OPEN_TOTALS.with(|o| o.set((o.get().0.saturating_sub(1), o.get().1)));
+    }
 }
 
 impl Totals {
@@ -1424,7 +1489,7 @@ impl Totals {
         } else {
             Vec::new()
         };
-        let rank = if stat == Stat::First { each(cells, u32::MAX)? } else { Vec::new() };
+        let rank = if stat.picks_first() { each(cells, u32::MAX)? } else { Vec::new() };
         Ok(Totals {
             stat,
             n: each(cells, 0)?,
@@ -1440,6 +1505,10 @@ impl Totals {
             per: dates,
             rank,
             at: 0,
+        })
+        .inspect(|_| {
+            #[cfg(test)]
+            OPEN_TOTALS.with(|o| o.set((o.get().0 + 1, o.get().1.max(o.get().0 + 1))));
         })
     }
 
@@ -1459,7 +1528,8 @@ impl Totals {
         self.n.len()
     }
 
-    /// The rank of the date whose values come next, for first: the lowest rank's value is kept.
+    /// The rank of the date whose values come next, for first and firstDate: the lowest rank's
+    /// value is kept.
     pub(crate) fn at(&mut self, rank: u32) {
         self.at = rank;
     }
@@ -1491,7 +1561,7 @@ impl Totals {
             }
             return;
         }
-        if self.stat == Stat::First {
+        if self.stat.picks_first() {
             if let (Some(r), Some(a)) = (self.rank.get_mut(c), self.acc.get_mut(c))
                 && self.at < *r
             {
@@ -1532,7 +1602,8 @@ impl Totals {
             | Stat::LongestRunLength
             | Stat::Frequency
             | Stat::Median
-            | Stat::First => {}
+            | Stat::First
+            | Stat::FirstDate => {}
         }
     }
 
@@ -1740,7 +1811,7 @@ impl ReduceRun {
 
     /// Whether the dates are ranked by their clear share, read before the slices.
     fn ranks_clear(&self) -> bool {
-        self.stat == Stat::First && self.order == Order::Clear
+        self.stat.picks_first() && self.order == Order::Clear
     }
 
     /// Each step's rank for first, 0 the first taken: in date order, latest first, or by the clear
@@ -1755,13 +1826,21 @@ impl ReduceRun {
             Order::Clear => {
                 let mut share = vec![0.0f64; self.steps.len()];
                 let cube = self.cube.as_ref();
-                read_each(cube, &self.steps, cancel, false, &|i| cube.clear_share(i, cancel), &mut |k, got| {
-                    if let Some(s) = share.get_mut(k) {
-                        *s = got.unwrap_or(0.0);
-                    }
-                    done.fetch_add(1, Ordering::Relaxed);
-                    Ok(())
-                })?;
+                let steps = &self.steps;
+                read_each(
+                    cube,
+                    steps.len(),
+                    cancel,
+                    false,
+                    &|k| cube.clear_share(steps.get(k).copied().unwrap_or(0), cancel),
+                    &mut |k, got| {
+                        if let Some(s) = share.get_mut(k) {
+                            *s = got.unwrap_or(0.0);
+                        }
+                        done.fetch_add(1, Ordering::Relaxed);
+                        Ok(())
+                    },
+                )?;
                 by.sort_by(|a, b| share[*b].total_cmp(&share[*a]).then(date(*a).total_cmp(&date(*b))));
             }
         }
@@ -1780,13 +1859,17 @@ impl ReduceRun {
     /// Reads the slices piece by piece ([`TimeCube::pieces`]), each folded into its group's
     /// running totals, and puts the pieces' outputs together row by row: a raster for each group
     /// (for frequency, one for each class of each group). `done` counts the slices read; `cancel`
-    /// stops it between slices.
+    /// stops it between slices. First and firstDate ask for one group after another, its dates in
+    /// rank order (with one group, its best first, alone), and leave out what can't change a cell
+    /// ([`ReduceRun::skips`]).
     pub fn run(&self, cancel: &AtomicBool, done: &AtomicUsize) -> Result<Vec<Raster>, String> {
         let outputs = self.groups.len();
-        // A slot for each band of each group (one band but for "assets"): group `g`'s are
-        // `g * nb..(g + 1) * nb`, folded together so a cell's bands take the same dates.
+        // A slot for each band of each group (one band but for "assets"; firstDate's one date for
+        // all of them): group `g`'s are `g * per..(g + 1) * per`, folded together so a cell's
+        // bands take the same dates.
         let nb = self.cube.assets().len().max(1);
-        let slots = outputs * nb;
+        let per = if self.stat == Stat::FirstDate { 1 } else { nb };
+        let slots = outputs * per;
         let too_many = |cells: usize| {
             let values = (cells as u64).saturating_mul(slots as u64);
             (values > MAX_REDUCED).then(|| {
@@ -1798,7 +1881,14 @@ impl ReduceRun {
         if let Some(e) = whole.and_then(too_many) {
             return Err(e);
         }
-        let rank = if self.stat == Stat::First { self.ranks(cancel, done)? } else { Vec::new() };
+        let rank = if self.stat.picks_first() { self.ranks(cancel, done)? } else { Vec::new() };
+        // The steps' places in the order they are asked for: first's in rank order, so the readers
+        // start with the dates likeliest to fill cells; the others' in theirs.
+        let mut asked: Vec<usize> = (0..self.steps.len()).collect();
+        if self.stat.picks_first() {
+            asked.sort_by_key(|k| rank.get(*k).copied().unwrap_or(u32::MAX));
+        }
+        let skips = self.skips();
         let mut stitch = Stitch::default();
         // Each group's columns so far, by class for frequency; and for frequency each group's
         // value where a class is missing, for a class met first in a later piece.
@@ -1813,15 +1903,23 @@ impl ReduceRun {
             // last. Dates are asked for in order: read one at a time they come in order, so a
             // summary by year holds one year's totals at a time; with several readers (a STAC
             // cube's) they come as read, and the groups open are those of the dates in flight, a
-            // couple of years' for 16-day composites. Totals are f64 and the outputs f32, so the
-            // order of arrival can move an output's last bit at most, and only then.
+            // couple of years' for 16-day composites. First and firstDate ask for a group after
+            // another, so they hold those of the dates in flight however their ranks order them.
+            // Totals are f64 and the outputs f32, so the order of arrival can move an output's
+            // last bit at most, and only then.
             let mut totals: Vec<Option<Totals>> = (0..slots).map(|_| None).collect();
             let mut seen = vec![0usize; outputs];
             let mut finished: Vec<Option<(Columns, Vec<f32>)>> = vec![None; slots];
+            // First's: each group's cells' best rank so far, which the readers look at to leave
+            // out what can't change a cell. Made with the group's totals and let go with them
+            // (once the readers holding it are done); a rank only goes down.
+            let best: Vec<std::sync::RwLock<Option<Arc<Ranks>>>> = (0..outputs).map(|_| std::sync::RwLock::new(None)).collect();
+            let ranks_of = |g: usize| best.get(g).and_then(|b| b.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone());
             let mut place = |k: usize, slice: Option<(Arc<Raster>, usize)>| -> Result<(), String> {
                 let g = self.group_of.get(k).copied().filter(|g| *g < outputs).ok_or("a date in no group")?;
-                let span = g * nb..(g + 1) * nb;
-                // A date with nothing written only lowers the counts.
+                let span = g * per..(g + 1) * per;
+                // A date with nothing written (or left out, as it can't change a cell) only lowers
+                // the counts.
                 if let Some((r, b)) = slice {
                     let i = self.steps.get(k).copied().unwrap_or(0);
                     let layers: Vec<&[f32]> = (b..b + nb)
@@ -1850,17 +1948,39 @@ impl ReduceRun {
                     }
                     let mut ts: Vec<&mut Totals> = group.iter_mut().flatten().collect();
                     let cells = ts.first().map_or(0, |t| t.cells());
+                    let at = rank.get(k).copied().unwrap_or(0);
                     for t in &mut ts {
-                        t.at(rank.get(k).copied().unwrap_or(0));
+                        t.at(at);
                     }
+                    let ranks = match (skips, best.get(g)) {
+                        (true, Some(b)) => {
+                            let mut held = b.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+                            if held.is_none() {
+                                *held = Some(Arc::new(Ranks::new(cells)?));
+                            }
+                            held.clone()
+                        }
+                        _ => None,
+                    };
+                    // FirstDate's value: the date's day.
+                    let day = (self.stat == Stat::FirstDate).then(|| (self.cube.dates().get(i).copied().unwrap_or(f64::NAN) / DAY).floor());
                     let nodata = r.nodata.map(|v| v as f32);
                     let valued = |v: Option<&f32>| v.is_some_and(|v| v.is_finite() && Some(*v) != nodata);
                     // A cell goes in at a date only with a value in every band, so they keep together.
                     for c in 0..cells {
-                        if layers.iter().all(|l| valued(l.get(c))) {
-                            for (t, l) in ts.iter_mut().zip(&layers) {
-                                t.add(c, f64::from(l.get(c).copied().unwrap_or(f32::NAN)));
+                        if !layers.iter().all(|l| valued(l.get(c))) {
+                            continue;
+                        }
+                        match day {
+                            Some(day) => ts.iter_mut().for_each(|t| t.add(c, day)),
+                            None => {
+                                for (t, l) in ts.iter_mut().zip(&layers) {
+                                    t.add(c, f64::from(l.get(c).copied().unwrap_or(f32::NAN)));
+                                }
                             }
+                        }
+                        if let Some(b) = ranks.as_ref().and_then(|b| b.0.get(c)) {
+                            b.fetch_min(at, Ordering::Relaxed);
                         }
                     }
                     if let Some(e) = ts.iter().find_map(|t| t.refused()) {
@@ -1880,6 +2000,10 @@ impl ReduceRun {
                     for (out, slot) in outs.into_iter().zip(finished.get_mut(span).unwrap_or_default()) {
                         *slot = Some(out);
                     }
+                    // Its dates are all read: its ranks go with its totals.
+                    if let Some(b) = best.get(g) {
+                        *b.write().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                    }
                     if let Some(e) = classes_over(&totals, &finished, class_cap(self.stat)) {
                         return Err(e);
                     }
@@ -1887,8 +2011,47 @@ impl ReduceRun {
                 done.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             };
-            // Changes and the longest run compare each date with the one before: read in date order.
-            read_slices(self.cube.as_ref(), &self.steps, piece, cancel, self.stat.in_order(), &mut place)?;
+            let cube = self.cube.as_ref();
+            // Step `k`'s piece. First's leaves out a date none of whose cells it could fill: once
+            // each of its group's cells holds a better-ranked date's value, an unmasked cube's
+            // date reads nothing (a masked one's is still asked, so that its items' pixels outside
+            // their mask files are counted and said as a read would), and until then the cube
+            // leaves out what it can tell can't fill a cell. The ranks compared, not whether a cell
+            // is filled, so a worse date read first never makes a better one look idle: the
+            // outputs are the same whatever order the dates come in.
+            let read = |k: usize| -> Result<Option<(Arc<Raster>, usize)>, String> {
+                let i = self.steps.get(k).copied().unwrap_or(0);
+                let ranks = if skips { self.group_of.get(k).and_then(|g| ranks_of(*g)) } else { None };
+                let Some(ranks) = ranks else { return cube.slice_of(i, piece) };
+                let at = rank.get(k).copied().unwrap_or(0);
+                if !cube.masked() && !ranks.0.is_empty() && ranks.0.iter().all(|r| r.load(Ordering::Relaxed) < at) {
+                    return Ok(None);
+                }
+                cube.first_slice_of(i, piece, &|c| ranks.0.get(c).is_some_and(|r| r.load(Ordering::Relaxed) < at))
+            };
+            // First's dates are asked for a group after another, each's in rank order, so the
+            // groups open are those of the dates in flight however the ranks interleave them (one
+            // at a time, read in turn), with no wait between groups. Leaving dates out with one
+            // group, its best-ranked date is read before the rest, so they can be left out against
+            // it rather than read alongside it: over a dry season, the clearest date often fills
+            // every cell. The others' dates are read as asked.
+            let mut order: Vec<usize> = asked.clone();
+            if self.stat.picks_first() {
+                order.sort_by_key(|k| self.group_of.get(*k).copied().unwrap_or(usize::MAX));
+            }
+            let lead = usize::from(skips && outputs == 1).min(order.len());
+            let waves = [&order[..lead], &order[lead..]];
+            for wave in waves.iter().filter(|w| !w.is_empty()) {
+                // Changes and the longest run compare each date with the one before: read in date order.
+                read_each(
+                    cube,
+                    wave.len(),
+                    cancel,
+                    self.stat.in_order(),
+                    &|j| read(wave.get(j).copied().unwrap_or(0)),
+                    &mut |j, slice| place(wave.get(j).copied().unwrap_or(0), slice),
+                )?;
+            }
             let grid = grid.ok_or("none of the dates in the period has data written")?;
             stitch.check(&grid)?;
             let cells = (grid.width as usize).saturating_mul(grid.height as usize);
@@ -1900,17 +2063,17 @@ impl ReduceRun {
             }
             for g in 0..outputs {
                 let dates = self.groups.get(g).map_or(0, |(_, d)| *d);
-                let span = g * nb..(g + 1) * nb;
+                let span = g * per..(g + 1) * per;
                 let done_before: Vec<_> = finished.get_mut(span.clone()).unwrap_or_default().iter_mut().filter_map(Option::take).collect();
                 // A group with no data written in this piece: no values, as its totals would give.
-                let outs = if done_before.len() == nb {
+                let outs = if done_before.len() == per {
                     done_before
                 } else if let Some(outs) = finish_group(totals.get_mut(span.clone()).unwrap_or_default(), self.min_share, dates, frequency)
                 {
                     outs
                 } else {
                     let none = finish(&Totals::new(self.stat, cells, 0)?, self.min_share, dates, frequency);
-                    vec![none; nb]
+                    vec![none; per]
                 };
                 for ((columns, piece_mask), (band, mask)) in outs
                     .into_iter()
@@ -1946,7 +2109,7 @@ impl ReduceRun {
         done.store(self.total(), Ordering::Relaxed);
         let grid = &grid;
         // Several bands: one raster a group, a band for each asset (drawn as RGB when three).
-        if nb > 1 {
+        if per > 1 {
             let mut slots = bands.into_iter();
             let outputs = self
                 .groups
@@ -1954,10 +2117,10 @@ impl ReduceRun {
                 .map(|(name, _)| {
                     let columns: Vec<Vec<f32>> = slots
                         .by_ref()
-                        .take(nb)
+                        .take(per)
                         .map(|c| c.into_iter().next().map(|(_, b)| b).ok_or_else(|| format!("{name}: a band came out with no values")))
                         .collect::<Result<_, _>>()?;
-                    let hint = if nb == 3 { raster::ColorHint::Rgb { alpha: false } } else { raster::ColorHint::Gray };
+                    let hint = if per == 3 { raster::ColorHint::Rgb { alpha: false } } else { raster::ColorHint::Gray };
                     let mut r = Raster::new(name.clone(), grid.width, height, columns, grid.transform, grid.crs, None, hint, "Float32")
                         .map_err(|e| e.to_string())?;
                     for (band, asset) in r.bands.iter_mut().zip(self.cube.assets()) {
@@ -1983,8 +2146,108 @@ impl ReduceRun {
                 })
             })
             .collect();
-        with_lost(outputs, self.cube.as_ref())
+        let mut outputs = with_lost(outputs, self.cube.as_ref())?;
+        if self.stat == Stat::FirstDate {
+            name_days(&mut outputs);
+        }
+        Ok(outputs)
     }
+
+    /// Whether first (or firstDate) leaves out what can't change a cell: a date's piece where each
+    /// cell it could fill already holds a better-ranked date's value. Only when a cell needs one
+    /// value (`minValid` asks for no more than one of any group's dates), as the dates left out
+    /// aren't counted.
+    fn skips(&self) -> bool {
+        #[cfg(test)]
+        if !SKIPS.with(std::cell::Cell::get) {
+            return false;
+        }
+        self.stat.picks_first() && self.groups.iter().all(|(_, dates)| needed(self.min_share, *dates) <= 1)
+    }
+}
+
+/// A day in milliseconds.
+const DAY: f64 = 86_400_000.0;
+
+/// First's best rank so far of each cell of a group's piece, which the readers look at while the
+/// run places dates: 4 bytes a cell, reserved first (#1291).
+struct Ranks(Vec<AtomicU32>);
+
+impl Ranks {
+    fn new(cells: usize) -> Result<Ranks, String> {
+        let mut v = Vec::new();
+        reserve(&mut v, cells)?;
+        v.extend((0..cells).map(|_| AtomicU32::new(u32::MAX)));
+        #[cfg(test)]
+        OPEN_RANKS.with(|o| o.set((o.get().0 + 1, o.get().1.max(o.get().0 + 1))));
+        Ok(Ranks(v))
+    }
+}
+
+#[cfg(test)]
+impl Drop for Ranks {
+    fn drop(&mut self) {
+        OPEN_RANKS.with(|o| o.set((o.get().0.saturating_sub(1), o.get().1)));
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Whether first leaves out what can't change a cell, for a test to compare with it off.
+    pub(crate) static SKIPS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// The values a cell needs among `dates` dates for a summary's value, `min_share` of them (at
+/// least one).
+fn needed(min_share: f64, dates: usize) -> u32 {
+    (min_share.clamp(0.0, 1.0) * dates as f64 - 1e-9).ceil().max(1.0) as u32
+}
+
+/// The most names firstDate's layers hold in all: a band's names are indexed by day, each date
+/// taking the days since 1970 up to it (about 20,000 in 2025), some 24 bytes each.
+pub(crate) const MAX_DATE_NAMES: usize = 2_000_000;
+
+/// FirstDate's legends: each layer's dates named ([`day_names`]), in turn while their names keep
+/// within [`MAX_DATE_NAMES`]; the layers past it keep their days unnamed, said on the first.
+fn name_days(outputs: &mut [Raster]) {
+    let (mut held, mut unnamed) = (0usize, 0usize);
+    for r in outputs.iter_mut() {
+        let Some(b) = r.bands.first_mut() else { continue };
+        let names = day_names(&b.data);
+        if held + names.len() <= MAX_DATE_NAMES {
+            held += names.len();
+            b.classes = names;
+        } else {
+            unnamed += 1;
+        }
+    }
+    let all = outputs.len();
+    if unnamed > 0
+        && let Some(first) = outputs.first_mut()
+    {
+        first.lost.push(rustgis_data::loss::Note::loss(
+            rustgis_data::loss::LossCode::DroppedOverLimit,
+            format!(
+                "{unnamed} of the {all} date layers keep their dates unnamed, drawn as a stretch of days since 1970-01-01: naming them all would take more than {MAX_DATE_NAMES} names"
+            ),
+        ));
+    }
+}
+
+/// FirstDate's classes, by value: each day held (days since 1970-01-01) named by its date, the
+/// others unnamed; a day before 1970 (or after about 3000) is left unnamed, its number its label.
+fn day_names(days: &[f32]) -> Vec<String> {
+    let last = 376_200.0;
+    let held: std::collections::BTreeSet<u32> =
+        days.iter().filter(|d| d.is_finite() && **d >= 0.0 && **d <= last && d.fract() == 0.0).map(|d| *d as u32).collect();
+    let Some(&top) = held.last() else { return Vec::new() };
+    let mut names = vec![String::new(); top as usize + 1];
+    for d in held {
+        if let Some(n) = names.get_mut(d as usize) {
+            *n = rustgis_data::time::format(f64::from(d) * DAY, "YYYY-MM-DD");
+        }
+    }
+    names
 }
 
 /// A group's outputs, as columns of cells: one keyed `None`, or frequency's one for each class.
@@ -2111,9 +2374,9 @@ pub fn reduce_start(s: &mut Session, p: &Value) -> Result<ReduceRun, String> {
     let p: &Value = &merged;
     let stat = Stat::parse(p)?;
     // Several bands keep a cell's bands together: from the same dates (mean), or one date's.
-    if p.get("assets").is_some_and(|a| !a.is_null()) && !matches!(stat, Stat::Mean | Stat::Median | Stat::First) {
+    if p.get("assets").is_some_and(|a| !a.is_null()) && !matches!(stat, Stat::Mean | Stat::Median | Stat::First | Stat::FirstDate) {
         return Err(format!(
-            "assets takes mean, median or first, which keep each cell's bands of the same dates, not {}: give one \"asset\" for it",
+            "assets takes mean, median, first or firstDate, which keep each cell's bands of the same dates, not {}: give one \"asset\" for it",
             stat.code()
         ));
     }
@@ -2128,7 +2391,9 @@ pub fn reduce_start(s: &mut Session, p: &Value) -> Result<ReduceRun, String> {
     // First's order, checked before the cube is read; a masked cube's dates by clear share by default.
     let order = match p.get("order").filter(|v| !v.is_null()) {
         None => None,
-        Some(_) if stat != Stat::First => return Err(format!("order is first's (which date a cell takes first), not {}'s", stat.code())),
+        Some(_) if !stat.picks_first() => {
+            return Err(format!("order is first's and firstDate's (which date a cell takes first), not {}'s", stat.code()));
+        }
         Some(v) => Some(match v.as_str().map(str::trim) {
             Some(x) if x.eq_ignore_ascii_case("clear") => Order::Clear,
             Some(x) if x.eq_ignore_ascii_case("date") => Order::Date,
@@ -2213,6 +2478,185 @@ fn reduce_cmd(s: &mut Session, p: &Value) -> CmdResult {
 
 #[cfg(test)]
 mod tests {
+    /// First and firstDate over a cube whose readers deliver the dates out of rank order (the
+    /// best date's read the slowest): the same outputs as read one at a time, a date left out
+    /// once every cell holds a better one, and the progress bar's total reached.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn first_is_the_same_whatever_order_the_dates_come_in() {
+        use super::{Order, Stat};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+        use std::sync::{Arc, Mutex};
+        const DATES: [f64; 4] = [0.0, super::DAY, 2.0 * super::DAY, 3.0 * super::DAY];
+        /// Four dates of 3 × 1 cells: the first has a value in cells 0 and 1, the second in 1 and
+        /// 2, the third everywhere, the fourth in cell 2; date i's values 10 (i + 1) plus the cell.
+        struct Cube {
+            readers: usize,
+            read: Arc<Mutex<Vec<usize>>>,
+        }
+        impl super::TimeCube for Cube {
+            fn dates(&self) -> &[f64] {
+                &DATES
+            }
+            fn label(&self) -> String {
+                "stub".into()
+            }
+            fn readers(&self) -> usize {
+                self.readers
+            }
+            fn slice(&self, i: usize) -> Result<Option<(Arc<super::Raster>, usize)>, String> {
+                // The earlier the date, the slower: with several readers the later come first.
+                if self.readers > 1 {
+                    std::thread::sleep(std::time::Duration::from_millis(40 * (3 - i as u64))); // test-wait: the later dates read first
+                }
+                self.read.lock().unwrap().push(i);
+                let (v, n) = ((10 * (i + 1)) as f32, f32::NAN);
+                let cells = [[v, v + 1.0, n], [n, v + 1.0, v + 2.0], [v, v + 1.0, v + 2.0], [n, n, v + 2.0]][i].to_vec();
+                let t = rustgis_data::raster::GeoTransform { origin_x: 0.0, origin_y: 1.0, pixel_width: 1.0, pixel_height: -1.0 };
+                let r = super::Raster::new(
+                    "s",
+                    3,
+                    1,
+                    vec![cells],
+                    t,
+                    rustgis_data::raster::Crs::LonLat,
+                    None,
+                    super::raster::ColorHint::Gray,
+                    "Float32",
+                )
+                .map_err(|e| e.to_string())?;
+                Ok(Some((Arc::new(r), 0)))
+            }
+        }
+        // The output's cells and the dates read.
+        let run = |readers: usize, stat: Stat, order: Order| {
+            let read = Arc::new(Mutex::new(Vec::new()));
+            let run = super::ReduceRun {
+                cube: Box::new(Cube { readers, read: read.clone() }),
+                steps: vec![0, 1, 2, 3],
+                stat,
+                min_share: 0.0,
+                group_of: vec![0; 4],
+                groups: vec![("stub".into(), 4)],
+                order,
+            };
+            let done = AtomicUsize::new(0);
+            let out = run.run(&AtomicBool::new(false), &done).unwrap();
+            assert_eq!(done.load(SeqCst), run.total(), "the progress bar's total");
+            let mut read = read.lock().unwrap().clone();
+            read.sort_unstable();
+            (out[0].bands[0].data.clone(), read)
+        };
+        for order in [Order::Date, Order::Latest] {
+            let (one, read) = run(1, Stat::First, order);
+            assert_eq!(one, run(4, Stat::First, order).0, "{order:?}");
+            let (dates, _) = run(1, Stat::FirstDate, order);
+            assert_eq!(dates, run(4, Stat::FirstDate, order).0, "{order:?}");
+            if order == Order::Date {
+                // The first two dates fill every cell: the third and fourth are left out.
+                assert_eq!(one, [10.0, 11.0, 22.0]);
+                assert_eq!(dates, [0.0, 0.0, 1.0]);
+                assert_eq!(read, [0, 1]);
+            } else {
+                // The fourth, then the third, fill every cell: the others are left out.
+                assert_eq!(one, [30.0, 31.0, 42.0]);
+                assert_eq!(dates, [2.0, 2.0, 3.0]);
+                assert_eq!(read, [2, 3]);
+            }
+        }
+    }
+
+    /// A named band's values come back distinct and in order, however many cells hold them, and
+    /// no more than one past what a Unique Values renderer draws.
+    #[test]
+    fn class_values_are_the_distinct_values_up_to_the_renderers_limit() {
+        use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster};
+        let t = GeoTransform { origin_x: 0.0, origin_y: 1.0, pixel_width: 1.0, pixel_height: -1.0 };
+        let named = |cells: Vec<f32>| {
+            let mut r = Raster::new("d", cells.len() as u32, 1, vec![cells], t, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
+            r.bands[0].classes = vec!["a".into()];
+            r
+        };
+        let few: Vec<f32> = (0..3000).map(|c| [20.0, -1.0, 5.0, f32::NAN][c % 4]).collect();
+        assert_eq!(super::class_values(&named(few)), [-1.0, 5.0, 20.0]);
+        let max = rustgis_map::raster::MAX_UNIQUE_VALUES;
+        let many: Vec<f32> = (0..max * 4).map(|c| c as f32).collect();
+        assert_eq!(super::class_values(&named(many)).len(), max + 1);
+        let mut unnamed = named(vec![1.0, 2.0]);
+        unnamed.bands[0].classes.clear();
+        assert!(super::class_values(&unnamed).is_empty());
+    }
+
+    /// First by year holds one year's totals at a time, as the other statistics do, whether its
+    /// dates are ranked by date or by a clear share that interleaves the years.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn first_by_year_holds_one_years_totals_at_a_time() {
+        use super::{OPEN_RANKS, OPEN_TOTALS, Order, Stat};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        const DATES: [f64; 6] = [0.0, super::DAY, 400.0 * super::DAY, 401.0 * super::DAY, 800.0 * super::DAY, 801.0 * super::DAY];
+        /// Six dates, two a year, each with a value in one of two cells; clear shares that rank
+        /// them 1, 3, 5, 4, 2, 0, across the years.
+        struct Cube;
+        impl super::TimeCube for Cube {
+            fn dates(&self) -> &[f64] {
+                &DATES
+            }
+            fn label(&self) -> String {
+                "stub".into()
+            }
+            fn masked(&self) -> bool {
+                true
+            }
+            fn clear_share(&self, i: usize, _: &AtomicBool) -> Result<Option<f64>, String> {
+                Ok([0.1, 0.9, 0.2, 0.8, 0.3, 0.7].get(i).copied())
+            }
+            fn slice(&self, i: usize) -> Result<Option<(Arc<super::Raster>, usize)>, String> {
+                let v = i as f32;
+                let cells = if i.is_multiple_of(2) { vec![v, f32::NAN] } else { vec![f32::NAN, v] };
+                let t = rustgis_data::raster::GeoTransform { origin_x: 0.0, origin_y: 1.0, pixel_width: 1.0, pixel_height: -1.0 };
+                let r = super::Raster::new(
+                    "s",
+                    2,
+                    1,
+                    vec![cells],
+                    t,
+                    rustgis_data::raster::Crs::LonLat,
+                    None,
+                    super::raster::ColorHint::Gray,
+                    "Float32",
+                )
+                .map_err(|e| e.to_string())?;
+                Ok(Some((Arc::new(r), 0)))
+            }
+        }
+        for (stat, order) in
+            [(Stat::Mean, Order::Date), (Stat::First, Order::Date), (Stat::First, Order::Clear), (Stat::FirstDate, Order::Clear)]
+        {
+            let run = super::ReduceRun {
+                cube: Box::new(Cube),
+                steps: (0..6).collect(),
+                stat,
+                min_share: 0.0,
+                group_of: vec![0, 0, 1, 1, 2, 2],
+                groups: (0..3).map(|y| (format!("y{y}"), 2)).collect(),
+                order,
+            };
+            OPEN_TOTALS.with(|o| o.set((0, 0)));
+            OPEN_RANKS.with(|o| o.set((0, 0)));
+            let out = run.run(&AtomicBool::new(false), &AtomicUsize::new(0)).unwrap();
+            assert_eq!(out.len(), 3);
+            assert_eq!(OPEN_TOTALS.with(|o| o.get().1), 1, "{stat:?} by {order:?}: the most years' totals open at once");
+            // First's best ranks too: one year's at a time, let go with its totals.
+            assert!(
+                OPEN_RANKS.with(|o| o.get().1) <= 1,
+                "{stat:?} by {order:?}: {} years' ranks held at once",
+                OPEN_RANKS.with(|o| o.get().1)
+            );
+        }
+    }
+
     /// Both I/O thread hops retain the initiating request context; numeric workers don't need it.
     #[cfg(not(target_arch = "wasm32"))]
     #[test]

@@ -1923,8 +1923,8 @@ impl ReduceRun {
 pub fn reduce_start(s: &Session, p: &Value) -> Result<ReduceRun, String> {
     let stat = Stat::parse(p)?;
     // A variable of classes is summarised by cube.reduce, which reads its dates in order; so is a
-    // median, which holds every date's value, and first, which ranks them.
-    if stat.categorical() || matches!(stat, Stat::Median | Stat::First) {
+    // median, which holds every date's value, and first and firstDate, which rank them.
+    if stat.categorical() || matches!(stat, Stat::Median | Stat::First | Stat::FirstDate) {
         return Err(format!(
             "zarr.reduce takes mean, min, max, sum, std, count or countAbove: {} is cube.reduce's (give it this layer or store)",
             stat.code()

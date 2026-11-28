@@ -41,6 +41,9 @@ mod said_not_silent;
 mod cancellation;
 
 #[cfg(not(target_arch = "wasm32"))]
+#[path = "tests/cube_first.rs"]
+mod cube_first;
+#[cfg(not(target_arch = "wasm32"))]
 #[path = "tests/cube_mask.rs"]
 mod cube_mask;
 #[cfg(not(target_arch = "wasm32"))]
