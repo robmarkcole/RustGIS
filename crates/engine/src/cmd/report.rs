@@ -1179,8 +1179,9 @@ fn report_pages_bytes(
     let mut out = Vec::new();
     let mut held = 0usize;
     let (mut frames_pictured, mut pages_pictured) = (Vec::new(), Vec::new());
-    // The legends its layouts' pages drew under a fit still cut, by layout ([`keep_unfitted`]).
-    let mut unfitted = Vec::new();
+    // The legends its layouts' pages drew under a fit still cut, and the charts they drew, by
+    // layout ([`keep_drawn`]).
+    let (mut unfitted, mut charts) = (Vec::new(), Vec::new());
     // Counted, and stopped on Cancel, a page at a time.
     rustgis_data::progress::begin(n);
     for k in 0..n {
@@ -1190,28 +1191,29 @@ fn report_pages_bytes(
             _ => None,
         };
         if !pdf {
-            let (drawn, listed) = rustgis_render::layout::unfitted_legends(|| {
-                rustgis_render::report::draw_page(doc, pages, k, dpi, &s.project.layouts, &mut s.project.maps)
-            });
+            let (drawn, listed, shown) =
+                listing(|| rustgis_render::report::draw_page(doc, pages, k, dpi, &s.project.layouts, &mut s.project.maps));
             let (img, ..) = drawn?;
-            keep_unfitted(&mut unfitted, page_layout, listed);
+            keep_drawn(&mut unfitted, page_layout, listed);
+            keep_drawn(&mut charts, page_layout, shown);
             say_report_unfitted(s, &unfitted);
+            say_report_charts(s, &charts);
             say_sections_not_drawn(s, pages, 1);
             return Ok((img.encode_png().map_err(|e| e.to_string())?, pages.len()));
         }
-        let (drawn, listed) = rustgis_render::layout::unfitted_legends(|| {
-            rustgis_render::report::pdf_page(doc, pages, k, dpi, &s.project.layouts, &mut s.project.maps)
-        });
+        let (drawn, listed, shown) =
+            listing(|| rustgis_render::report::pdf_page(doc, pages, k, dpi, &s.project.layouts, &mut s.project.maps));
         let (page, pictured) = drawn?;
-        keep_unfitted(&mut unfitted, page_layout, listed);
+        keep_drawn(&mut unfitted, page_layout, listed);
+        keep_drawn(&mut charts, page_layout, shown);
         if page.overflowed() {
             // Too large for vectors all the same: the page as one picture.
             pages_pictured.push(k + 1);
-            let (drawn, listed) = rustgis_render::layout::unfitted_legends(|| {
-                rustgis_render::report::draw_page(doc, pages, k, dpi, &s.project.layouts, &mut s.project.maps)
-            });
+            let (drawn, listed, shown) =
+                listing(|| rustgis_render::report::draw_page(doc, pages, k, dpi, &s.project.layouts, &mut s.project.maps));
             let (img, w, h) = drawn?;
-            keep_unfitted(&mut unfitted, page_layout, listed);
+            keep_drawn(&mut unfitted, page_layout, listed);
+            keep_drawn(&mut charts, page_layout, shown);
             out.push(rustgis_render::pdf::Page::new(&img, w, h));
         } else {
             frames_pictured.extend(pictured);
@@ -1229,6 +1231,7 @@ fn report_pages_bytes(
         }
     }
     say_report_unfitted(s, &unfitted);
+    say_report_charts(s, &charts);
     super::layout::pictured_notices(s, &frames_pictured, &pages_pictured);
     say_sections_not_drawn(s, pages, n);
     Ok((rustgis_render::pdf::write(&out, &doc.title), pages.len()))
@@ -1257,16 +1260,19 @@ fn say_sections_not_drawn(s: &mut Session, pages: &[rustgis_render::report::Page
     }
 }
 
-/// Keeps the legends `listed` as cut on a page that draws the layout `layout` (by its index), each
-/// with that layout: the ids are a layout's own, so two layouts' legends sharing one are two. Only
-/// an exact repeat (the same legend of the same layout, cut the same way) is dropped: the page
-/// drawn again as a picture, or the layout on another page of the report. A page that draws no
-/// layout draws no legend.
-fn keep_unfitted(
-    kept: &mut Vec<(usize, rustgis_render::layout::UnfittedLegend)>,
-    layout: Option<usize>,
-    listed: Vec<rustgis_render::layout::UnfittedLegend>,
-) {
+/// Runs `f`, and returns its result with the legends it drew under a fit still cut and the charts
+/// it drew.
+fn listing<T>(f: impl FnOnce() -> T) -> (T, Vec<rustgis_render::layout::UnfittedLegend>, Vec<rustgis_render::layout::DrawnChart>) {
+    let ((drawn, legends), charts) = rustgis_render::layout::drawn_charts(|| rustgis_render::layout::unfitted_legends(f));
+    (drawn, legends, charts)
+}
+
+/// Keeps what a page that draws the layout `layout` (by its index) `listed`, a legend cut under
+/// its fit or a chart drawn, each with that layout: the ids are a layout's own, so two layouts'
+/// elements sharing one are two. Only an exact repeat (the same element of the same layout, cut
+/// the same way or drawn with the same data) is dropped: the page drawn again as a picture, or
+/// the layout on another page of the report. A page that draws no layout lists nothing.
+fn keep_drawn<T: PartialEq>(kept: &mut Vec<(usize, T)>, layout: Option<usize>, listed: Vec<T>) {
     let Some(li) = layout else { return };
     for l in listed {
         let item = (li, l);
@@ -1276,12 +1282,21 @@ fn keep_unfitted(
     }
 }
 
-/// Says the legends [`keep_unfitted`] kept, each named with its layout, as a layout's export
+/// Says the legends [`keep_drawn`] kept, each named with its layout, as a layout's export
 /// says its own ([`super::layout::say_unfitted_legends_in`]).
 fn say_report_unfitted(s: &mut Session, kept: &[(usize, rustgis_render::layout::UnfittedLegend)]) {
     let named: Vec<_> =
         kept.iter().map(|(li, l)| (s.project.layouts.get(*li).map(|layout| (*li, layout.name.clone())), l.clone())).collect();
     super::layout::say_unfitted_legends_in(s, &named);
+}
+
+/// Says what the charts [`keep_drawn`] kept leave out, each named with its layout, as a layout's
+/// export says its own ([`super::layout::chart_notice_lines_in`]).
+fn say_report_charts(s: &mut Session, kept: &[(usize, rustgis_render::layout::DrawnChart)]) {
+    let drawn = kept.iter().filter_map(|(li, chart)| Some((Some(*li), s.project.layouts.get(*li)?, chart)));
+    for note in super::layout::chart_notice_lines_in(drawn) {
+        s.warn(note);
+    }
 }
 
 /// Resolves the report creator's string-name or active/default layer convention.
@@ -1537,12 +1552,12 @@ mod tests {
             too_tall: true,
         };
         let mut kept = Vec::new();
-        super::keep_unfitted(&mut kept, Some(0), vec![cut(1)]);
+        super::keep_drawn(&mut kept, Some(0), vec![cut(1)]);
         // The vector page, then the same page drawn as a picture.
-        super::keep_unfitted(&mut kept, Some(0), vec![cut(1)]);
-        super::keep_unfitted(&mut kept, Some(1), vec![cut(1)]);
-        super::keep_unfitted(&mut kept, Some(0), vec![cut(2)]);
-        super::keep_unfitted(&mut kept, None, vec![cut(3)]);
+        super::keep_drawn(&mut kept, Some(0), vec![cut(1)]);
+        super::keep_drawn(&mut kept, Some(1), vec![cut(1)]);
+        super::keep_drawn(&mut kept, Some(0), vec![cut(2)]);
+        super::keep_drawn(&mut kept, None, vec![cut(3)]);
         assert_eq!(kept, [(0, cut(1)), (1, cut(1)), (0, cut(2))]);
     }
 }

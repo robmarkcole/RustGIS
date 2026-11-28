@@ -179,3 +179,102 @@ fn a_chart_with_bars_under_a_point_says_so() {
         assert_eq!(exported(&mut s, "svg"), [want], "{key}");
     }
 }
+
+/// A report "R" over Shops that draws each of `layouts` as a page after its own pages.
+fn report(s: &mut Session, layouts: &[&str]) {
+    s.run("report.new", &json!({"layer": "Shops", "name": "R"})).unwrap();
+    for layout in layouts {
+        s.run("report.existingTemplate", &json!({"report": "R", "layout": layout, "end": true})).unwrap();
+    }
+}
+
+/// Removed however the test ends.
+struct Dir(std::path::PathBuf);
+
+impl Drop for Dir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).ok();
+    }
+}
+
+/// What exporting the report "R" to a file of `ext` says of charts.
+fn reported(s: &mut Session, ext: &str) -> Vec<String> {
+    let dir = std::env::temp_dir().join(format!("rustgis-3166-{}-{:?}", std::process::id(), std::thread::current().id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir = Dir(dir);
+    let path = dir.0.join(format!("report.{ext}"));
+    let mut all = said(s, "report.export", json!({"report": "R", "path": path, "dpi": 36}));
+    all.retain(|t| t.contains("chart"));
+    all
+}
+
+/// What a report says of the chart `id` of the layout `li`'s `note`.
+fn of_page(s: &Session, li: usize, id: u64, note: &str) -> String {
+    let layout = &s.project.layouts[li];
+    let name = &layout.element(id as u32).unwrap().name;
+    format!("Chart \"{name}\" ({id}) in \"{}\": {note}", layout.name)
+}
+
+const TWO_OF_THREE: &str =
+    "the chart draws 2 of 3 bars: 1 left out (\"bars\" draws up to 100, \"other\": true gathers the rest in an Other bar)";
+
+#[test]
+fn a_report_says_what_the_charts_of_its_layout_pages_leave_out() {
+    let mut s = shops();
+    let id = chart(&mut s, json!({"bars": 2}));
+    // The same layout twice: said once.
+    report(&mut s, &["Charts", "Charts"]);
+    let want = of_page(&s, 0, id, TWO_OF_THREE);
+    assert_eq!(reported(&mut s, "pdf"), std::slice::from_ref(&want));
+    // A project opened again says it too.
+    let mut again = Session::new(serde_json::from_value(serde_json::to_value(&s.project).unwrap()).unwrap());
+    assert_eq!(reported(&mut again, "pdf"), std::slice::from_ref(&want));
+    // The layout's own export names no layout.
+    assert_eq!(exported(&mut s, "pdf"), [of(&s, id, TWO_OF_THREE)]);
+}
+
+#[test]
+fn a_report_image_says_the_charts_of_its_first_page_alone() {
+    let mut s = shops();
+    let id = chart(&mut s, json!({"bars": 2}));
+    report(&mut s, &["Charts"]);
+    assert!(reported(&mut s, "png").is_empty(), "the layout is not on the first page");
+    s.run("report.existingTemplate", &json!({"report": "R", "layout": "Charts"})).unwrap();
+    assert_eq!(reported(&mut s, "png"), [of_page(&s, 0, id, TWO_OF_THREE)]);
+}
+
+#[test]
+fn a_report_names_charts_of_two_layouts_with_the_same_notice_in_one() {
+    let mut s = shops();
+    let first = chart(&mut s, json!({"bars": 2}));
+    s.run("layout.new", &json!({"name": "More"})).unwrap();
+    let second = chart(&mut s, json!({"layout": 1, "bars": 2}));
+    assert_eq!(first, second, "each layout numbers its own elements");
+    report(&mut s, &["Charts", "More"]);
+    let named = |li: usize| {
+        let name = &s.project.layouts[li].element(first as u32).unwrap().name;
+        format!("\"{name}\" ({first}) in \"{}\"", s.project.layouts[li].name)
+    };
+    let want = format!("2 charts ({}, {}): {TWO_OF_THREE}", named(0), named(1));
+    assert_eq!(reported(&mut s, "pdf"), [want]);
+}
+
+#[test]
+fn a_report_says_a_chart_box_too_small_for_it() {
+    let mut s = shops();
+    let id = chart(&mut s, json!({"orientation": "vertical", "values": true, "h": 10}));
+    report(&mut s, &["Charts"]);
+    assert_eq!(reported(&mut s, "pdf"), [of_page(&s, 0, id, COLUMNS)]);
+}
+
+#[test]
+fn a_report_says_nothing_of_charts_with_no_losses_or_with_no_layout_page() {
+    let mut s = shops();
+    let id = chart(&mut s, json!({}));
+    report(&mut s, &[]);
+    assert!(reported(&mut s, "pdf").is_empty(), "no layout page");
+    s.run("report.existingTemplate", &json!({"report": "R", "layout": "Charts"})).unwrap();
+    assert!(reported(&mut s, "pdf").is_empty(), "nothing lost");
+    s.run("layout.update", &json!({"element": id, "bars": 2, "visible": false})).unwrap();
+    assert!(reported(&mut s, "pdf").is_empty(), "hidden");
+}

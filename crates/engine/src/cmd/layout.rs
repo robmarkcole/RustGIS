@@ -28,6 +28,7 @@ use chart::*;
 mod elements;
 pub(crate) use elements::*;
 mod export;
+pub(in crate::cmd) use export::chart_notice_lines_in;
 pub use export::*;
 mod files;
 pub(crate) use files::*;

@@ -109,19 +109,32 @@ pub fn layout_png(s: &mut Session, li: usize, dpi: f64, region: Option<[f64; 4]>
     img.encode_png().map_err(|e| e.to_string())
 }
 
-/// [`chart_notices`] of the charts of `layout` a drawing of it drew, one notice for each text,
-/// in the order first met, naming the charts it is true of by name and id, each once whatever the
-/// pages: the first ten, and how many more.
+/// [`chart_notices`] of the charts of `layout` a drawing of it drew, as [`chart_notice_lines_in`]
+/// words them.
 fn chart_notice_lines(layout: &Layout, drawn: &[rustgis_render::layout::DrawnChart]) -> Vec<String> {
-    let mut said: Vec<(String, Vec<(u32, String)>)> = Vec::new();
-    for (id, data) in drawn {
+    chart_notice_lines_in(drawn.iter().map(|chart| (None, layout, chart)))
+}
+
+/// [`chart_notices`] of each chart of `drawn` in its layout, one notice for each text, in the
+/// order first met, naming the charts it is true of by name and id, each once whatever the pages:
+/// the first ten, and how many more. A chart given its layout's index, as a report's pages give
+/// it, is named with that layout, and is another chart than one of the same id in another layout.
+pub(in crate::cmd) fn chart_notice_lines_in<'a>(
+    drawn: impl IntoIterator<Item = (Option<usize>, &'a Layout, &'a rustgis_render::layout::DrawnChart)>,
+) -> Vec<String> {
+    let mut said: Vec<(String, Vec<((Option<usize>, u32), String)>)> = Vec::new();
+    for (li, layout, (id, data)) in drawn {
         let Some(e) = layout.element(*id) else { continue };
-        let named = (*id, format!("\"{}\" ({id})", crate::project::short_name(&e.name)));
+        let mut named = format!("\"{}\" ({id})", crate::project::short_name(&e.name));
+        if li.is_some() {
+            named.push_str(&format!(" in \"{}\"", crate::project::short_name(&layout.name)));
+        }
+        let chart = (li, *id);
         for note in chart_notices(e, data, false) {
             match said.iter_mut().find(|(n, _)| *n == note) {
-                Some((_, charts)) if charts.iter().any(|(at, _)| at == id) => {}
-                Some((_, charts)) => charts.push(named.clone()),
-                None => said.push((note, vec![named.clone()])),
+                Some((_, charts)) if charts.iter().any(|(at, _)| *at == chart) => {}
+                Some((_, charts)) => charts.push((chart, named.clone())),
+                None => said.push((note, vec![(chart, named.clone())])),
             }
         }
     }
