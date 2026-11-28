@@ -59,11 +59,13 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
     be, a globe, an inset or none), the north arrow (auto, always or none), the legend or not, which
     can be set always on a box and to list the context layers, the colorbar and the scale bar or
     not, whether the map may be veiled for the legend's room, and the decimal mark; a choice the
-    sheet can't use is off and isn't sent. The **placement** is the arrangement (below): `best`, the
-    favourite, one by name or one saved, or **Custom**, a corner for each surround (a corner another
-    has swaps the two; on Panel, Editorial and Modular only the north arrow and scale bar take one,
-    the locator and legend sitting in the column; a surround left out in the elements takes none, as
-    a figure's locator unless asked for); a chosen one can be made the favourite, once the layout is
+    sheet can't use is off and isn't sent. Under them, the north arrow's style, the scale bar's
+    units and style, and the legend's title and columns (Auto, or 1 to 6) can be picked. The
+    **placement** is the arrangement (below): `best`, the favourite, one by name or one saved, or
+    **Custom**, a corner for each surround (a corner another has swaps the two; on Panel, Editorial
+    and Modular only the north arrow and scale bar take one, the locator and legend sitting in the
+    column; a surround left out in the elements takes none, as a figure's locator unless asked for);
+    a chosen one can be made the favourite, once the layout is
     made. A saved one removed after it was picked is said at Create and nothing is made. A figure
     goes from its size to its map, its elements, its placement, its reference (each line typed; with
     no heading, and it can be left out) and the review, as it takes no style, accent or other text.

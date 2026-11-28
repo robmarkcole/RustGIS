@@ -425,7 +425,7 @@ pub(super) fn picture_size(p: &rustgis_tiles::cache::Payload) -> (f32, f32) {
 }
 
 /// Whether a legend lists a WMS or WMTS layer: drawn, and with a legend.
-pub(super) fn tile_listed(t: &rustgis_map::TileLayer) -> bool {
+pub fn tile_listed(t: &rustgis_map::TileLayer) -> bool {
     t.draws() && t.opacity > 0.0 && !t.legends.is_empty()
 }
 
