@@ -2,6 +2,7 @@
 //! layer templates, tasks, and 3D export (Home › Add; Data › Layer Templates and Styles; Publish ›
 //! Package, Save As and Output; Command Search for map/template imports).
 
+use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::path::Path;
 
@@ -457,7 +458,7 @@ pub fn can_be_step(s: &Session, id: &str) -> bool {
 /// The JSON of an item from `text`, or the file at `path`.
 pub(crate) fn read_text(p: &Value) -> Result<String, String> {
     if let Some(text) = inline_text(p)? {
-        return Ok(text);
+        return Ok(text.into_owned());
     }
     match (ps(p, "text"), ps(p, "path")) {
         (Some(t), _) if t.len() as u64 <= max_file() => Ok(t.to_string()),
@@ -2051,8 +2052,9 @@ fn durable_bytes_with<T: crate::durable::Durable>(
     Ok(bytes)
 }
 
-/// Decodes the same data-before-text choice without opening a path.
-pub(crate) fn inline_text(p: &Value) -> Result<Option<String>, String> {
+/// Decodes the same data-before-text choice without opening a path. `text` is lent, not copied:
+/// every save asks each capability check about it.
+pub(crate) fn inline_text(p: &Value) -> Result<Option<Cow<'_, str>>, String> {
     if let Some(d) = ps(p, "data") {
         use base64::Engine;
         if d.len() as u64 > max_file() / 3 * 4 {
@@ -2060,12 +2062,12 @@ pub(crate) fn inline_text(p: &Value) -> Result<Option<String>, String> {
         }
         let bytes = base64::engine::general_purpose::STANDARD.decode(d.trim()).map_err(|_| "data must be base64".to_string())?;
         if bytes.starts_with(b"PK") {
-            return package_text(&bytes).map(Some);
+            return package_text(&bytes).map(|t| Some(t.into()));
         }
-        return String::from_utf8(bytes).map(Some).map_err(|_| "not a RustGIS file".to_string());
+        return String::from_utf8(bytes).map(|t| Some(t.into())).map_err(|_| "not a RustGIS file".to_string());
     }
     match ps(p, "text") {
-        Some(t) if t.len() as u64 <= max_file() => Ok(Some(t.to_string())),
+        Some(t) if t.len() as u64 <= max_file() => Ok(Some(t.into())),
         Some(_) => Err(too_large()),
         None => Ok(None),
     }
