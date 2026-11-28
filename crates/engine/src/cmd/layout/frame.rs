@@ -3,7 +3,7 @@
 use super::*;
 
 pub(in crate::cmd::layout) fn add_frame(s: &mut Session, p: &Value) -> CmdResult {
-    let shape = match ps(p, "shape").unwrap_or("rectangle") {
+    let shape = match given_name(p, "shape", "rectangle, circle, ellipse, polygon or lasso")?.unwrap_or("rectangle") {
         "rectangle" => FrameShape::Rectangle,
         "circle" => FrameShape::Circle,
         "ellipse" => FrameShape::Ellipse,

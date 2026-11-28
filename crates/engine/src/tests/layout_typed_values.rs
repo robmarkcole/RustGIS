@@ -1,7 +1,7 @@
-//! A grid, scale bar or north arrow value of the wrong type is refused, not ignored (#3110).
+//! A layout value of the wrong type is refused, not ignored (#3110, #3169).
 
 use super::*;
-use rustgis_map::layout::{Element, ElementKind, Grid};
+use rustgis_map::layout::{Element, ElementKind, Grid, TickSide};
 
 /// A layout with a map frame, a grid on it, a scale bar and a north arrow.
 fn laid_out() -> Session {
@@ -141,4 +141,72 @@ fn a_number_given_as_text_and_a_known_name_are_read_as_before() {
 fn a_colorbar_orientation_of_the_wrong_type_is_refused() {
     let mut s = laid_out();
     refused(&mut s, "layout.addElement", json!({"kind": "colorbar", "orientation": 17}), "orientation is ");
+}
+
+/// [`laid_out`], with a legend and a colorbar too.
+fn with_keys() -> Session {
+    let mut s = laid_out();
+    for kind in ["legend", "colorbar"] {
+        s.run("layout.addElement", &json!({"kind": kind})).unwrap();
+    }
+    s
+}
+
+#[test]
+fn a_colorbar_or_legend_value_of_the_wrong_type_is_refused() {
+    let mut s = with_keys();
+    let bar = id(&s, |k| matches!(k, ElementKind::Colorbar { .. }));
+    let legend = id(&s, |k| matches!(k, ElementKind::Legend { .. }));
+    for v in wrong() {
+        let keys = [("colorbar", bar, "tickSide"), ("colorbar", bar, "ticks"), ("colorbar", bar, "layer")];
+        for (kind, element, key) in keys.into_iter().chain([("colorbar", bar, "title"), ("legend", legend, "title")]) {
+            // A number is what ticks takes: text that isn't one stands in for it.
+            let v = if key == "ticks" && v.is_number() { json!("many") } else { v.clone() };
+            let mut add = json!({"kind": kind});
+            add[key] = v.clone();
+            refused(&mut s, "layout.addElement", add, &format!("{key} is "));
+            let mut update = json!({"element": element});
+            update[key] = v.clone();
+            refused(&mut s, "layout.update", update, &format!("{key} is "));
+        }
+    }
+    // The title beside it isn't changed either.
+    refused(&mut s, "layout.update", json!({"element": bar, "title": "Height", "ticks": "many"}), "ticks is ");
+}
+
+#[test]
+fn a_frame_shape_of_the_wrong_type_is_refused() {
+    let mut s = laid_out();
+    for v in wrong() {
+        refused(&mut s, "layout.addFrame", json!({"shape": v}), "shape is ");
+    }
+    refused(&mut s, "layout.addFrame", json!({"shape": "hex"}), "unknown frame shape 'hex'");
+}
+
+#[test]
+fn a_null_or_valid_colorbar_legend_or_shape_value_is_read_as_before() {
+    let mut s = with_keys();
+    let bar = id(&s, |k| matches!(k, ElementKind::Colorbar { .. }));
+    let legend = id(&s, |k| matches!(k, ElementKind::Legend { .. }));
+    let kept = serde_json::to_value(elements(&s)).unwrap();
+    s.run("layout.update", &json!({"element": bar, "tickSide": null, "ticks": null, "layer": null, "title": null})).unwrap();
+    s.run("layout.update", &json!({"element": legend, "title": null})).unwrap();
+    assert_eq!(serde_json::to_value(elements(&s)).unwrap(), kept);
+    s.run("layout.addElement", &json!({"kind": "colorbar", "tickSide": null, "ticks": null, "layer": null, "title": null})).unwrap();
+    s.run("layout.addElement", &json!({"kind": "legend", "title": null})).unwrap();
+    assert!(matches!(&elements(&s).last().unwrap().kind, ElementKind::Legend { title, .. } if title == "Legend"));
+    s.run("layout.update", &json!({"element": bar, "tickSide": "above", "ticks": "7", "layer": "", "title": "Height"})).unwrap();
+    let e = elements(&s).iter().find(|e| u64::from(e.id) == bar).unwrap();
+    assert!(
+        matches!(&e.kind, ElementKind::Colorbar { tick_side: TickSide::Start, ticks: 7, layer: None, title, .. } if title == "Height"),
+        "{:?}",
+        e.kind
+    );
+    s.run("layout.addFrame", &json!({"shape": null})).unwrap();
+    s.run("layout.addFrame", &json!({"shape": "circle"})).unwrap();
+    refused(&mut s, "layout.update", json!({"element": bar, "tickSide": "sideways"}), "unknown tickSide 'sideways'");
+    // A chart says what its own title takes, as before.
+    s.run("layout.addElement", &json!({"kind": "chart", "layer": "Countries"})).unwrap();
+    let chart = id(&s, |k| matches!(k, ElementKind::Chart { .. }));
+    refused(&mut s, "layout.update", json!({"element": chart, "title": 17}), "a chart's title is a text");
 }

@@ -353,7 +353,7 @@ pub(in crate::cmd::layout) fn add_element(s: &mut Session, p: &Value) -> CmdResu
         }
         "legend" => {
             let frame = frame_of(l, p)?;
-            let title = crate::cmd::within("title", "a legend's title", ps(p, "title").unwrap_or("Legend"), 200)?;
+            let title = crate::cmd::within("title", "a legend's title", given_name(p, "title", "text")?.unwrap_or("Legend"), 200)?;
             let all_classes = b(p, "allClasses").unwrap_or(false);
             let hide_other = b(p, "hideOther").unwrap_or(false);
             let show_no_data = b(p, "showNoData").unwrap_or(false);
@@ -388,8 +388,9 @@ pub(in crate::cmd::layout) fn add_element(s: &mut Session, p: &Value) -> CmdResu
         }
         "colorbar" => {
             let frame = frame_of(l, p)?;
-            let layer = colorbar_layer(s, l, frame, ps(p, "layer"))?;
-            let title = match ps(p, "title") {
+            let named = given_name(p, "layer", "a raster layer's name")?;
+            let layer = colorbar_layer(s, l, frame, named)?;
+            let title = match given_name(p, "title", "text")? {
                 Some(t) => crate::cmd::within("title", "a colorbar's title", t, 200)?,
                 None => layer.clone().unwrap_or_default(),
             };
@@ -402,10 +403,10 @@ pub(in crate::cmd::layout) fn add_element(s: &mut Session, p: &Value) -> CmdResu
                 frame,
                 // Kept only when named: otherwise (none, or "") it follows the map's top shown raster with a
                 // colour scale, not drawn by classes.
-                layer: ps(p, "layer").filter(|n| !n.trim().is_empty()).and(layer),
+                layer: named.filter(|n| !n.trim().is_empty()).and(layer),
                 title,
                 orientation,
-                ticks: ticks(p).unwrap_or(5),
+                ticks: ticks(p)?.unwrap_or(5),
                 tick_side: tick_side(p)?.unwrap_or_default(),
                 reverse: b(p, "reverse").unwrap_or(false),
                 color: ink,
@@ -689,14 +690,14 @@ pub(in crate::cmd::layout) fn orientation_of(p: &Value, key: &str) -> Result<Opt
 }
 
 pub(in crate::cmd::layout) fn tick_side(p: &Value) -> Result<Option<TickSide>, String> {
-    match ps(p, "tickSide") {
+    match given_name(p, "tickSide", "below, above, right or left")? {
         None => Ok(None),
         Some(t) => TickSide::from_name(t).map(Some).ok_or_else(|| format!("unknown tickSide '{t}' (below, above, right or left)")),
     }
 }
 
-pub(in crate::cmd::layout) fn ticks(p: &Value) -> Option<usize> {
-    f(p, "ticks").filter(|v| v.is_finite()).map(|v| v.round().clamp(2.0, MAX_COLORBAR_TICKS as f64) as usize)
+pub(in crate::cmd::layout) fn ticks(p: &Value) -> Result<Option<usize>, String> {
+    Ok(given_num(p, "ticks", "a number")?.map(|v| v.round().clamp(2.0, MAX_COLORBAR_TICKS as f64) as usize))
 }
 
 /// An extent indicator's outline colour and width (points) from `color` and `width` in `p`, each
