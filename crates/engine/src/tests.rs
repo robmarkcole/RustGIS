@@ -30,6 +30,8 @@ mod unplaced_gp;
 #[path = "tests/unplaced_out.rs"]
 mod unplaced_out;
 
+#[path = "tests/message_runs.rs"]
+mod message_runs;
 #[cfg(not(target_arch = "wasm32"))]
 #[path = "tests/said_not_silent.rs"]
 mod said_not_silent;

@@ -3,6 +3,7 @@
 //! ```text
 //! rustgis-cli commands                                  # list command ids and parameters
 //! rustgis-cli tools                                     # list geoprocessing tools
+//! rustgis-cli explain changed.rounded                   # what a loss code means and what to do, offline
 //! rustgis-cli info data.geojson                         # layer summary as JSON
 //! rustgis-cli render data.geojson out.png [--basemap ocean] [--tiles URL] [--width 1600 --height 900]
 //! rustgis-cli run [--sample | --project p.rgis | --data f.geojson …] \
@@ -50,9 +51,25 @@ use serde_json::{Map, Value, json};
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage:\n  rustgis-cli commands | tools\n  rustgis-cli plugins [install <file|folder> | uninstall <id> | enable <id> | disable <id> | browse | get <id> | prepare <id>] [--registry URL]\n  rustgis-cli skills [add <SKILL.md|folder|.zip> | remove <name> | enable <name> | disable <name>]\n  rustgis-cli info <data>\n  rustgis-cli logo <out.png|out.ico|out.bmp> [--size N] [--canvas WxH --at X,Y (.bmp only)]\n  rustgis-cli render <data|project> <out.png> [--basemap NAME] [--tiles URL] [--width N] [--height N] [--dpi N] [--worldview auto|default|CODE] [--worldview-detail simplified|original]\n  rustgis-cli run [--sample] [--project P] [--data F]… --cmd 'id={{json}}'… [--save P] [--strict [--allow KIND|CODE]…] [--worldview auto|default|CODE] [--worldview-detail simplified|original]\n  rustgis-cli ask [--sample] [--project P] [--data F]… \"request\" [--image PICTURE]… [--provider P] [--model M] [--base-url URL] [--yes] [--save P]\n  rustgis-cli ask --models [--provider P]\n  rustgis-cli ask --login [--another-account] [--account CLIENT_ID] | --logout\n  rustgis-cli ask --accounts | --account CLIENT_ID | --remove-account CLIENT_ID\n  common options: --use-saved-secrets (use the connections, passwords, keys, ChatGPT sign-in and Earthdata Login token the RustGIS app saved; reads the system keychain), --threads N (the most threads one piece of work uses, 1-1024; default: the cores, up to 16)\n  rustgis-cli mcp [--sample] [--project P] [--data F]… [--yes] [--attach [PORT] [--token-file FILE] [--timeout SECONDS (5-600)]]\n  rustgis-cli mcp-register [--client claude] [--name NAME] [--port PORT]"
+        "usage:\n  rustgis-cli commands | tools\n  rustgis-cli explain [CODE]\n  rustgis-cli plugins [install <file|folder> | uninstall <id> | enable <id> | disable <id> | browse | get <id> | prepare <id>] [--registry URL]\n  rustgis-cli skills [add <SKILL.md|folder|.zip> | remove <name> | enable <name> | disable <name>]\n  rustgis-cli info <data>\n  rustgis-cli logo <out.png|out.ico|out.bmp> [--size N] [--canvas WxH --at X,Y (.bmp only)]\n  rustgis-cli render <data|project> <out.png> [--basemap NAME] [--tiles URL] [--width N] [--height N] [--dpi N] [--worldview auto|default|CODE] [--worldview-detail simplified|original]\n  rustgis-cli run [--sample] [--project P] [--data F]… --cmd 'id={{json}}'… [--save P] [--strict [--allow KIND|CODE]…] [--worldview auto|default|CODE] [--worldview-detail simplified|original]\n  rustgis-cli ask [--sample] [--project P] [--data F]… \"request\" [--image PICTURE]… [--provider P] [--model M] [--base-url URL] [--yes] [--save P]\n  rustgis-cli ask --models [--provider P]\n  rustgis-cli ask --login [--another-account] [--account CLIENT_ID] | --logout\n  rustgis-cli ask --accounts | --account CLIENT_ID | --remove-account CLIENT_ID\n  common options: --use-saved-secrets (use the connections, passwords, keys, ChatGPT sign-in and Earthdata Login token the RustGIS app saved; reads the system keychain), --threads N (the most threads one piece of work uses, 1-1024; default: the cores, up to 16)\n  rustgis-cli mcp [--sample] [--project P] [--data F]… [--yes] [--attach [PORT] [--token-file FILE] [--timeout SECONDS (5-600)]]\n  rustgis-cli mcp-register [--client claude] [--name NAME] [--port PORT]"
     );
     ExitCode::from(2)
+}
+
+/// `explain [CODE]`: what a loss code means and what to do about it, from the text built into
+/// RustGIS, so it reads offline, as a compiler explains its error codes; with no code, every code.
+fn explain(code: Option<&str>) -> Result<(), String> {
+    let Some(id) = code else {
+        for code in LossCode::ALL {
+            let spec = code.spec();
+            out!("{:<28} {}", spec.id, spec.meaning);
+        }
+        return Ok(());
+    };
+    let code = LossCode::from_id(id).ok_or_else(|| format!("explain {id}: not a loss code (`rustgis-cli explain` lists them)"))?;
+    let spec = code.spec();
+    out!("{}: {}\n\n{}\n\nWhat to do: {}\n\nMore: {}", spec.id, spec.kind.id(), spec.meaning, spec.action, code.doc_url());
+    Ok(())
 }
 
 /// The value after `name`. A flag that takes one is in [`VALUE_FLAGS`], which [`check_values`]
@@ -1047,6 +1064,23 @@ fn cli() -> ExitCode {
             }
             print(&out);
             Ok(())
+        }
+        "explain" => {
+            // The common options (`--threads 2`, `--use-saved-secrets`) are taken, and their values.
+            let mut words = Vec::new();
+            let mut rest = args.iter().skip(1);
+            while let Some(arg) = rest.next() {
+                if VALUE_FLAGS.contains(&arg.as_str()) {
+                    rest.next();
+                } else if !arg.starts_with("--") {
+                    words.push(arg.as_str());
+                }
+            }
+            match words.as_slice() {
+                [] => explain(None),
+                [code] => explain(Some(code)),
+                _ => Err("explain takes one loss code, or none to list them all".into()),
+            }
         }
         "skills" => skills(&args),
         "mcp-register" => mcp_register(&args),

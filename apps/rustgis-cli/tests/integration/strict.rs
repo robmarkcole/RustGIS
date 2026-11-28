@@ -116,3 +116,22 @@ fn allow_takes_a_known_kind_or_code_and_needs_strict() {
         assert!(err.contains(said), "{args:?}: {err}");
     }
 }
+
+#[test]
+fn explain_says_what_a_code_means_and_what_to_do_offline() {
+    let explain = |args: &[&str]| Command::new(env!("CARGO_BIN_EXE_rustgis-cli")).arg("explain").args(args).output().unwrap();
+    let out = explain(&["dropped.ring"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{text}");
+    assert!(text.starts_with("dropped.ring: dropped\n\nA polygon ring was left out."), "{text}");
+    assert!(text.contains("What to do: Correct the unreadable polygon ring"), "{text}");
+    assert!(text.contains("More: https://rustgis.app/user-guide/loss-codes/#dropped.ring"), "{text}");
+    // Every code, one line each, starting with the code.
+    let all = String::from_utf8_lossy(&explain(&[]).stdout).into_owned();
+    for code in ["dropped.legend", "changed.rounded", "assumed.encoding"] {
+        assert!(all.lines().any(|line| line.starts_with(code)), "{all}");
+    }
+    let unknown = explain(&["dropped.everything"]);
+    assert!(!unknown.status.success());
+    assert!(String::from_utf8_lossy(&unknown.stderr).contains("not a loss code"));
+}

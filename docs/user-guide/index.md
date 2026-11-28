@@ -126,13 +126,20 @@ Open **View › Windows › Messages**, click the status-bar notice or **Message
 or search for **Messages** in Command Search (`ui.pane.diagnosticLog`). This troubleshooting
 history is separate from **Help › Diagnostic Monitor**, which still shows performance metrics.
 
-Messages are collected even while the pane is closed. The newest entries appear first, with
-a UTC timestamp, severity, and source (such as the command id or Network). Expand **Technical
+Messages are collected even while the pane is closed. The newest entries appear first. A
+command's messages sit under its name, what it worked on (a layer or table) and the UTC time of its
+latest message; a message no command said shows its own time and source (such as Network).
+
+A message that reports lost data is laid out like a compiler's: its severity and
+[loss code](loss-codes.md) (`Warning [changed.truncated] data changed`), the message, then
+**What happened** and **What to do** for that code. Both are built into RustGIS, so
+they read offline; **More in the guide** opens the code's entry. **Undo to before this** takes
+the project back to before that command, and the changes after it, while Undo still reaches it. Expand **Technical
 details** for failed requests: their address, method, observed HTTP status and duration when
 available. Native connection failures and timeouts are identified when the transport knows
 them; an opaque browser failure does not claim a status or a specific DNS, CORS, or connection cause.
 
-Use **All**, **Errors**, **Warnings**, **Info**, or **Network failures** to filter the history
+Use **All**, **Errors**, **Warnings**, **Info**, **Network failures** or **Data losses** to filter the history
 (**Network failures** also lists the notes below about omitted absences). **Copy diagnostics**
 copies the filtered entries and their technical details, including folded details, as plain
 text: oldest entry first, with UTC Unix-millisecond timestamps, where the pane shows the newest

@@ -686,6 +686,23 @@ impl RoomMade {
     }
 }
 
+/// What a command run worked on, as its parameters name it, for the messages it says: a layer, a
+/// table or an input by name, cut short. File paths are left out, as they can hold a login.
+fn run_target(params: &Value) -> Option<String> {
+    let name = ["layer", "table", "input", "map"].iter().find_map(|key| params.get(*key).and_then(Value::as_str))?;
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    // As a message is: addresses, credentials and the values of the logins in use masked.
+    let name = Session::redacted(name).into_string();
+    let mut cut: String = name.chars().take(80).collect();
+    if cut.len() < name.len() {
+        cut.push('…');
+    }
+    Some(cut)
+}
+
 /// An undo or redo step: the project before it, the layout open then, its label, who made it,
 /// which state of the project it is ([`Session::dirty`]), and the identities of its feature
 /// allocations for memory accounting. File origins accompany changes made by the command only:
@@ -1041,6 +1058,9 @@ pub struct Session {
     pub(crate) depth: u32,
     /// Only the command's registered id, never its parameters. Nested commands restore this.
     pub(crate) diagnostic_source: Option<&'static str>,
+    /// The top-level command running, as the messages it says remember it, and how many have run.
+    run: Option<rustgis_data::diagnostics::Run>,
+    runs: u64,
     /// How many of the commands running now restore the project if they fail: a replacement is
     /// put aside only under one of them, as only then can it be rolled back.
     restorable: u32,
@@ -1553,6 +1573,8 @@ impl Session {
             put_aside: None,
             depth: 0,
             diagnostic_source: None,
+            run: None,
+            runs: 0,
             restorable: 0,
             published_syncs: Vec::new(),
             actor: None,
@@ -1941,6 +1963,21 @@ impl Session {
         // Restored on every path, including panics outside `guarded`, so a later notice is not
         // attributed to an aborted command. Mirrors the capture scope's restore-on-drop.
         let previous = std::mem::replace(&mut self.diagnostic_source, source);
+        // A run of its own for a top-level command: its messages are grouped by it, and the pane can
+        // undo back to before it.
+        let previous_run = outermost.then(|| {
+            self.runs = self.runs.wrapping_add(1);
+            let run = rustgis_data::diagnostics::Run {
+                id: self.runs,
+                // The registered command's own id, never the text asked for: an unknown one could
+                // hold anything, a login included.
+                command: source.unwrap_or("unknown command").to_string(),
+                before: self.state,
+                after: None,
+                target: run_target(params),
+            };
+            self.run.replace(run)
+        });
         let history_deferred = std::mem::replace(&mut self.undo_memory.deferred, true);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let notice_mark = self.notice_mark();
@@ -2027,6 +2064,14 @@ impl Session {
             res
         }));
         self.diagnostic_source = previous;
+        if let Some(run) = previous_run {
+            // Undo makes no step of its own: it moves back one, so "before" it isn't a step to take
+            // back. Redo's step is its own, and undoing it returns to before it.
+            if let Some(ended) = self.run.as_ref().filter(|_| id != "edit.undo") {
+                self.diagnostics.finish_run(ended.id, self.state);
+            }
+            self.run = run;
+        }
         self.undo_memory.deferred = history_deferred;
         // Every top-level invocation consumes its key, even a refusal or panic before guarded.
         if outermost {
@@ -3622,7 +3667,7 @@ impl Session {
         if severity == rustgis_data::diagnostics::Severity::Error && self.rerun_said.iter().any(|said| said == text.as_str()) {
             return;
         }
-        self.diagnostics.push_redacted(severity, source.unwrap_or("Application"), &text, loss);
+        self.diagnostics.push_redacted(severity, source.unwrap_or("Application"), &text, loss, self.run.clone());
         self.notices.push(Notice {
             text: text.into_string(),
             error: severity == rustgis_data::diagnostics::Severity::Error,
@@ -3700,6 +3745,23 @@ impl Session {
     /// Labels of changes after the current state, in the order redo would restore them.
     pub fn redo_labels(&self) -> impl Iterator<Item = &'static str> + '_ {
         self.redo.iter().rev().map(|step| step.2)
+    }
+
+    /// How many Undo steps take back the change of a run that went from the state `before` to
+    /// `after` (a message's [`Run`](rustgis_data::diagnostics::Run)), with the changes made since:
+    /// `None` when the history no longer holds that change as a step of its own. A change makes a
+    /// state no other has, so an edit made after undoing it, from the same state before, isn't taken
+    /// for it; and the step Undo lands on must be `before`, so a run whose step was merged into an
+    /// earlier one, or that made no step, isn't taken back past that earlier command.
+    pub fn undo_steps_back_past(&self, before: u64, after: u64) -> Option<usize> {
+        let steps = if self.state == after {
+            1
+        } else {
+            // The step after the change keeps the state the change left.
+            self.undo.len() - self.undo.iter().rposition(|step| step.4 == after)? + 1
+        };
+        let landing = self.undo.len().checked_sub(steps)?;
+        (self.undo.get(landing)?.4 == before).then_some(steps)
     }
 
     /// Identifies the current position and the history it belongs to. Editing and then undoing

@@ -337,6 +337,14 @@ pub(crate) struct HistoryJump {
     cancel_pressed: bool,
 }
 
+impl HistoryJump {
+    /// `total` Undo steps from the history position `position`, as the Messages pane's Undo to
+    /// before this asks: a long jump has the same progress and Cancel as Undo History's.
+    pub(crate) fn undo(position: (u64, u64), total: usize) -> Self {
+        Self { command: "edit.undo", position, total, done: 0, cancel_pressed: false }
+    }
+}
+
 /// Advances a jump within the frame budget. Each step uses the UI's normal undo/redo cleanup.
 /// A step already in progress finishes before yielding. Project changes invalidate the rest.
 pub(crate) fn advance_history_jump(app: &mut RustGisApp, ctx: &egui::Context) {

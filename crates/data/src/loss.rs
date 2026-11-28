@@ -35,7 +35,7 @@ impl LossKind {
 
 /// Declares the codes once, so the list of every code can't miss one.
 macro_rules! loss_codes {
-    ($($code:ident => ($id:literal, $kind:ident, $action:literal),)*) => {
+    ($($code:ident => ($id:literal, $kind:ident, $meaning:literal, $action:literal $(,)?),)*) => {
         /// The specific cause of a loss. Add causes here so producers use the same code for the
         /// same loss.
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -51,7 +51,7 @@ macro_rules! loss_codes {
             /// The registry entry that supplies the untranslated identifier and remediation.
             pub const fn spec(self) -> LossSpec {
                 match self {
-                    $(Self::$code => LossSpec { id: $id, kind: LossKind::$kind, action: $action },)*
+                    $(Self::$code => LossSpec { id: $id, kind: LossKind::$kind, meaning: $meaning, action: $action },)*
                 }
             }
         }
@@ -59,95 +59,142 @@ macro_rules! loss_codes {
 }
 
 loss_codes! {
-    DroppedLegend => ("dropped.legend", Dropped, "Use a service with short HTTP or HTTPS addresses for its legend pictures."),
-    DroppedRing => ("dropped.ring", Dropped, "Correct the unreadable polygon ring in the source, or write to a format that holds holes, such as GeoPackage."),
+    DroppedLegend => (
+        "dropped.legend",
+        Dropped,
+        "A map service offered legend pictures that RustGIS does not show, so they were left out. These are pictures with addresses that fail RustGIS's checks, are in another format, or past the limit on legends per layer.",
+        "Use a service with short HTTP or HTTPS addresses for its legend pictures.",
+    ),
+    DroppedRing => (
+        "dropped.ring",
+        Dropped,
+        "A polygon ring was left out. Rings that could not be read, or that have no area, are skipped, and a format with no holes keeps only the outer edge of each polygon.",
+        "Correct the unreadable polygon ring in the source, or write to a format that holds holes, such as GeoPackage.",
+    ),
     DroppedExtraAttributes => (
         "dropped.extra-attributes",
         Dropped,
+        "A row had more attribute values than the layer has fields, and the extra values were not kept.",
         "Add fields for the extra attribute values or remove those values from the input."
     ),
-    DroppedTime => ("dropped.time", Dropped, "Write to a date-time field to keep the time of day."),
-    DroppedValue => ("dropped.value", Dropped, "Correct the value or use a destination field that can hold it."),
+    DroppedTime => (
+        "dropped.time",
+        Dropped,
+        "A date-time was written to a date field, which keeps only the day, so the time of day was lost.",
+        "Write to a date-time field to keep the time of day.",
+    ),
+    DroppedValue => (
+        "dropped.value",
+        Dropped,
+        "A value could not be kept and was read or written as empty (null). Examples are spreadsheet error cells, text in a date or yes/no column, and a result that is not a number.",
+        "Correct the value or use a destination field that can hold it.",
+    ),
     DroppedCalculationResult => (
         "dropped.calculation-result",
         Dropped,
+        "A calculation gave no result for some rows, so the field was left empty there. The input may have no place that can be given in longitude and latitude, or the result may be too large to hold.",
         "Correct the expression or check the input rows named in the notice."
     ),
     DroppedZm => (
         "dropped.zm",
         Dropped,
+        "Z (height) or M (measure) values were not kept. RustGIS keeps x and y only.",
         "Keep the source file where heights or measures matter: RustGIS keeps x and y only."
     ),
     DroppedCrsName => (
         "dropped.crs-name",
         Dropped,
+        "A coordinate system's name or definition could not be written with the data, so the file holds the coordinates without it.",
         "Keep the source file's coordinate system definition with the export, or export in WGS 84, which every format can name."
     ),
     DroppedFeature => (
         "dropped.feature",
         Dropped,
+        "Whole features, rows or items were left out because they could not be read or are not supported.",
         "Correct those features in the source, or read the source in the way the notice suggests."
     ),
     DroppedGeometry => (
         "dropped.geometry",
         Dropped,
+        "A feature's geometry could not be read or written. The feature was kept without its place, or the place was left out.",
         "Correct the geometry in the source, or give the coordinate system its coordinates are in."
     ),
     DroppedOverLimit => (
         "dropped.over-limit",
         Dropped,
+        "RustGIS read only part of the data because it is past a size limit.",
         "Read less at once, such as by filtering or clipping the source first."
     ),
-    ChangedTruncated => ("changed.truncated", Changed, "Use a decimal field to keep the fractional part."),
+    ChangedTruncated => (
+        "changed.truncated",
+        Changed,
+        "A number lost its fractional part because the field holds whole numbers.",
+        "Use a decimal field to keep the fractional part.",
+    ),
     ChangedFieldName => (
         "changed.field-name",
         Changed,
+        "A field name was changed to fit the format it was written to.",
         "Use field names the format holds: at most 10 bytes and unique ignoring case for a Shapefile, unique ignoring case for a GeoPackage."
     ),
     ChangedCut => (
         "changed.cut",
         Changed,
+        "Text was cut short to fit a format or a limit.",
         "Shorten the text to what the format holds (254 bytes for a Shapefile; nothing past a NUL character), or write to a format without the limit, such as GeoPackage."
     ),
-    ChangedBody => ("changed.body", Changed, "Export in the layer's own coordinate system, which keeps its body."),
+    ChangedBody => (
+        "changed.body",
+        Changed,
+        "Longitude and latitude on a body other than the Earth were written as Earth coordinates, because the format cannot say which body they are on.",
+        "Export in the layer's own coordinate system, which keeps its body.",
+    ),
     ChangedEncoding => (
         "changed.encoding",
         Changed,
+        "Text that is not valid in the encoding it was read with was read with a replacement character in its place.",
         "Put a .cpg file naming the file's own encoding beside it."
     ),
     ChangedRounded => (
         "changed.rounded",
         Changed,
+        "A number or time was rounded to what the format or the field holds.",
         "Keep the source file where finer values matter, or write to a format that holds them (times finer than the format keeps, numbers past a dBase field's precision, or whole numbers past 2^53 in a decimal field)."
     ),
     ChangedPosition => (
         "changed.position",
         Changed,
+        "Positions were moved to fit the coordinate system they were written in, for example vertices beyond 85.05 degrees north or south in Web Mercator.",
         "Export in a coordinate system that holds the positions, such as WGS 84."
     ),
     ApproximatedDatum => (
         "approximated.datum",
         Approximated,
+        "A datum RustGIS does not shift was treated as WGS 84, so places may be a little off.",
         "Export in the layer's own coordinate system, or give that system with a known transformation to WGS 84."
     ),
     ApproximatedCurve => (
         "approximated.curve",
         Approximated,
+        "Curves, circles or rotated boxes were drawn or written as straight segments.",
         "Keep the source file where exact curves matter: RustGIS draws curves as straight segments."
     ),
     AssumedNullMarker => (
         "assumed.null-marker",
         Assumed,
+        "A value written as the text <Null>, which some programs write for a missing value, was read as empty (null).",
         "Write the value another way if the text Null is meant as text, not as an empty value."
     ),
     AssumedCrs => (
         "assumed.crs",
         Assumed,
+        "The file does not say which coordinate system its coordinates are in, or says one RustGIS cannot use, so RustGIS read them as longitude and latitude (WGS 84).",
         "Give the coordinate system the coordinates are in (\"crs\" when adding the data, or Define Projection)."
     ),
     AssumedEncoding => (
         "assumed.encoding",
         Assumed,
+        "The file does not name its text encoding, or names one RustGIS does not read, so RustGIS assumed one (UTF-8, or Latin-1 for a DXF).",
         "Give the file's encoding in a form RustGIS reads: a .cpg beside a Shapefile or dBASE file naming UTF-8 or its Windows code page, or a DXF saved as UTF-8."
     ),
 }
@@ -172,6 +219,9 @@ impl LossCode {
 pub struct LossSpec {
     pub id: &'static str,
     pub kind: LossKind,
+    /// What happened to the data, said the same way wherever the code comes from: the app shows it
+    /// beside a notice, offline, and the guide's entry opens with it.
+    pub meaning: &'static str,
     pub action: &'static str,
 }
 
@@ -554,6 +604,8 @@ mod tests {
             let entry = guide.split(&format!("\n{heading}\n")).nth(1).unwrap_or_default();
             let entry = entry.split("\n### ").next().unwrap_or_default().split("\n## ").next().unwrap_or_default();
             assert!(!entry.is_empty(), "docs/user-guide/loss-codes.md should have the entry\n{heading}");
+            let opening = entry.trim_start().split("\n\n").next().unwrap_or_default().split_whitespace().collect::<Vec<_>>().join(" ");
+            assert_eq!(opening.replace('`', ""), spec.meaning, "docs/user-guide/loss-codes.md: `{}` should open with its meaning", spec.id);
             let action = format!("**What to do:** {}", spec.action);
             assert!(entry.replace('\n', " ").contains(&action), "docs/user-guide/loss-codes.md: `{}` should say\n{action}", spec.id);
             assert!(code.doc_url().ends_with(&format!("/user-guide/loss-codes/#{}", spec.id)));
