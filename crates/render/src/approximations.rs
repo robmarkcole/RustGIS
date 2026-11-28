@@ -324,6 +324,50 @@ pub(crate) fn walls_left_plain(name: &str, n: usize) {
     );
 }
 
+/// What a block diagram's top band (#2607) drew of layer `name`: `n` of the polygons along it
+/// fill with hatches, markers, gradients or shapebursts, which the band leaves off.
+pub(crate) fn band_left_plain(name: &str, n: usize) {
+    note(
+        format!("{name}\0band"),
+        format!(
+            "{name}: the block diagram's top band shows solid fills only, so {n} of its polygons along the walls show there without their hatches, markers, gradients or shapebursts"
+        ),
+    );
+}
+
+/// What a block diagram's top band (#2607) drew of layer `name`, its thickness read from `field`:
+/// `n` of its polygons along the walls have no value over 0 there, so no band under them.
+pub(crate) fn band_unmeasured(name: &str, field: &str, n: usize) {
+    note(
+        format!("{name}\0band thickness"),
+        format!(
+            "{name}: {n} of its polygons along the block diagram's walls have no thickness over 0 in field '{field}', so its top band leaves them out"
+        ),
+    );
+}
+
+/// What a block diagram's top band (#2607) drew of layer `name` when its thickness `field` isn't a
+/// numeric field of it (deleted, renamed or turned to text since it was set): no band.
+pub(crate) fn band_no_field(name: &str, field: &str) {
+    note(
+        format!("{name}\0band field"),
+        format!(
+            "{name}: the block diagram's top band takes its thickness from field '{field}', which isn't a numeric field of it, so there is no band"
+        ),
+    );
+}
+
+/// What a block diagram's top band (#2607) drew of layer `name` where it is thicker than the
+/// ground stands over the base: `n` of its stretches along the walls stop at the base.
+pub(crate) fn band_at_base(name: &str, n: usize) {
+    note(
+        format!("{name}\0band base"),
+        format!(
+            "{name}: the block diagram's top band is thicker than the ground stands over the base along {n} stretches of the walls, so it stops at the base there"
+        ),
+    );
+}
+
 /// What a block diagram's walls drew of the water's bed raster `name` (#2434): it has no heights
 /// along `n` stretches of the walls' water, in `bodies` water bodies, where the floor is the
 /// water's depth or field instead (no water there without either).

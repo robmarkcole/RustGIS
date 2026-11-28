@@ -291,6 +291,100 @@ pub(super) fn off_dem(extent: Option<[f64; 4]>, dem: Option<&(String, Option<[f6
     }
 }
 
+/// What a block's walls layer (#1914), walls' top band (#2607) and water bed (#2434) can't be
+/// drawn from in the project's maps `range` says: as a project opens ([`reset`]) and as maps are
+/// imported (`map.import`), each kept by name so a layer of that name brings it back.
+pub(crate) fn say_block_layers(s: &mut Session, range: std::ops::Range<usize>) {
+    // A block whose walls layer (#1914) is missing, holds no polygons, is read a view at a time or
+    // shares its name with another layer draws its walls in their own colour (`block::runs`, as
+    // the terrain command refuses such a layer): said, and kept, so a polygon layer of that name
+    // colours them again.
+    let plain: Vec<String> = s
+        .project
+        .maps
+        .get(range.clone())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|m| {
+            let l = m.view.terrain.as_ref()?.block.as_ref()?.walls_layer.as_ref()?;
+            rustgis_render::terrain::walls_layer(m, l).is_none().then(|| format!("{} ('{l}')", m.name))
+        })
+        .collect();
+    match plain.as_slice() {
+        [] => {}
+        [one] => s.notify(
+            format!("{one}: the block diagram's walls layer is missing, isn't a polygon layer, holds its features only a view at a time, or shares its name with another layer, so its walls are one colour"),
+            false,
+        ),
+        _ => s.notify(
+            format!(
+                "{} block diagrams have a walls layer that is missing, isn't a polygon layer, holds its features only a view at a time, or shares its name with another layer, so their walls are one colour: {}",
+                plain.len(),
+                plain.join(", ")
+            ),
+            false,
+        ),
+    }
+    // So does a walls' top band (#2607) whose layer can't be read: no band, said, and kept.
+    let bandless: Vec<String> = s
+        .project
+        .maps
+        .get(range.clone())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|m| {
+            let l = &m.view.terrain.as_ref()?.block.as_ref()?.walls_top.as_ref()?.layer;
+            rustgis_render::terrain::walls_layer(m, l).is_none().then(|| format!("{} ('{l}')", m.name))
+        })
+        .collect();
+    match bandless.as_slice() {
+        [] => {}
+        [one] => s.notify(
+            format!("{one}: the block diagram's walls' top layer is missing, isn't a polygon layer, holds its features only a view at a time, or shares its name with another layer, so its walls have no top band"),
+            false,
+        ),
+        _ => s.notify(
+            format!(
+                "{} block diagrams have a walls' top layer that is missing, isn't a polygon layer, holds its features only a view at a time, or shares its name with another layer, so their walls have no top band: {}",
+                bandless.len(),
+                bandless.join(", ")
+            ),
+            false,
+        ),
+    }
+    // A block's water bed (#2434) that is missing, isn't a raster layer or shares its name with
+    // another layer gives no floor (`block::water_runs` reads it as the terrain command takes it):
+    // said, and kept, so a raster layer of that name brings it back.
+    let unread: Vec<String> = s
+        .project
+        .maps
+        .get(range.clone())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|m| {
+            let bed = m.view.terrain.as_ref()?.block.as_ref()?.water.as_ref()?.bed.as_ref()?;
+            let mut named = m.layers.iter().filter(|l| l.name.eq_ignore_ascii_case(bed));
+            let read = named.next().filter(|l| l.raster.is_some()).is_some() && named.next().is_none();
+            (!read).then(|| format!("{} ('{bed}')", m.name))
+        })
+        .collect();
+    match unread.as_slice() {
+        [] => {}
+        [one] => s.notify(
+            format!("{one}: the block's water bed is missing, isn't a raster layer, or shares its name with another layer, so its walls show the water down to its depth or field (none without either)"),
+            false,
+        ),
+        _ => s.notify(
+            format!(
+                "{} block diagrams have a water bed that is missing, isn't a raster layer, or shares its name with another layer, so their walls show the water down to its depth or field (none without either): {}",
+                unread.len(),
+                unread.join(", ")
+            ),
+            false,
+        ),
+    }
+}
+
 /// Replaces project authority, clearing the exchange record, item trust and active connections.
 fn reset(s: &mut Session, p: Project) {
     s.exchange = None;
@@ -386,19 +480,6 @@ fn reset(s: &mut Session, p: Project) {
             );
         }
     }
-    // A block whose walls layer (#1914) is missing, holds no polygons, is read a view at a time or
-    // shares its name with another layer draws its walls in their own colour (`block::runs`, as
-    // the terrain command refuses such a layer): said, and kept, so a polygon layer of that name
-    // colours them again.
-    let plain: Vec<String> = s
-        .project
-        .maps
-        .iter()
-        .filter_map(|m| {
-            let l = m.view.terrain.as_ref()?.block.as_ref()?.walls_layer.as_ref()?;
-            rustgis_render::terrain::walls_layer(m, l).is_none().then(|| format!("{} ('{l}')", m.name))
-        })
-        .collect();
     // A block cut to polygons (#2318) whose layer is missing or picks no polygon with an area
     // isn't drawn: said, and kept, so a polygon layer of that name, or an edit, brings it back.
     // One whose outline was simplified to stay under 65 535 sides is said as `map.terrain` says
@@ -436,50 +517,7 @@ fn reset(s: &mut Session, p: Project) {
         );
         super::terrain_blocks::told_uncut(s);
     }
-    match plain.as_slice() {
-        [] => {}
-        [one] => s.notify(
-            format!("{one}: the block diagram's walls layer is missing, isn't a polygon layer, holds its features only a view at a time, or shares its name with another layer, so its walls are one colour"),
-            false,
-        ),
-        _ => s.notify(
-            format!(
-                "{} block diagrams have a walls layer that is missing, isn't a polygon layer, holds its features only a view at a time, or shares its name with another layer, so their walls are one colour: {}",
-                plain.len(),
-                plain.join(", ")
-            ),
-            false,
-        ),
-    }
-    // A block's water bed (#2434) that is missing, isn't a raster layer or shares its name with
-    // another layer gives no floor (`block::water_runs` reads it as the terrain command takes it):
-    // said, and kept, so a raster layer of that name brings it back.
-    let unread: Vec<String> = s
-        .project
-        .maps
-        .iter()
-        .filter_map(|m| {
-            let bed = m.view.terrain.as_ref()?.block.as_ref()?.water.as_ref()?.bed.as_ref()?;
-            let mut named = m.layers.iter().filter(|l| l.name.eq_ignore_ascii_case(bed));
-            let read = named.next().filter(|l| l.raster.is_some()).is_some() && named.next().is_none();
-            (!read).then(|| format!("{} ('{bed}')", m.name))
-        })
-        .collect();
-    match unread.as_slice() {
-        [] => {}
-        [one] => s.notify(
-            format!("{one}: the block's water bed is missing, isn't a raster layer, or shares its name with another layer, so its walls show the water down to its depth or field (none without either)"),
-            false,
-        ),
-        _ => s.notify(
-            format!(
-                "{} block diagrams have a water bed that is missing, isn't a raster layer, or shares its name with another layer, so their walls show the water down to its depth or field (none without either): {}",
-                unread.len(),
-                unread.join(", ")
-            ),
-            false,
-        ),
-    }
+    say_block_layers(s, 0..s.project.maps.len());
     // Water on a layer read a view at a time (#2305), which `map.terrain` refuses, would come
     // from the rows the view holds (the map draws none from it): dropped and said, as the project
     // opens.

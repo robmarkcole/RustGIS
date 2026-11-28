@@ -33,6 +33,13 @@ pub struct State {
     countries_asked: bool,
     pub countries_error: Option<String>,
     pub country: String,
+    country_filter: String,
+    /// Names as received, with their search text cached once per country list.
+    country_search: std::collections::BTreeMap<String, (String, String)>,
+    /// Each successful catalogue is authoritative only for its own level.
+    availability: [Option<std::collections::BTreeMap<String, Option<u64>>>; 6],
+    availability_errors: [Option<String>; 6],
+    level_waiting: Vec<(usize, Answer)>,
     pub level: String,
     waiting: Option<(Asked, Answer)>,
     pub error: Option<String>,
@@ -49,6 +56,11 @@ impl Default for State {
             countries_asked: false,
             countries_error: None,
             country: String::new(),
+            country_filter: String::new(),
+            country_search: Default::default(),
+            availability: Default::default(),
+            availability_errors: Default::default(),
+            level_waiting: Vec::new(),
             level: "ADM1".into(),
             waiting: None,
             error: None,
@@ -63,8 +75,38 @@ fn fetch(url: &str, ceiling: Reach) -> Answer {
     crate::fetch_within(url, cache::MAX_DOWNLOAD, None, ceiling)
 }
 
+/// Catalogues are small metadata lists, not feature downloads. Keep even an oversized service
+/// answer bounded independently of the large data-download allowance.
+const MAX_CATALOGUE: usize = 4 << 20;
+
+fn fetch_catalogue(url: &str) -> Answer {
+    crate::fetch_within(url, MAX_CATALOGUE, None, Reach::Local)
+}
+
 /// Lands the answers.
 pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
+    app.ui.portals.level_waiting.retain(|(level, slot)| {
+        let Some(result) = slot.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            return true;
+        };
+        let result = result.and_then(|(bytes, _)| boundaries::parse_availability(&bytes));
+        if let (Some(catalogue), Some(error)) =
+            (app.ui.portals.availability.get_mut(*level), app.ui.portals.availability_errors.get_mut(*level))
+        {
+            match result {
+                Ok(available) => {
+                    *catalogue = Some(available);
+                    *error = None;
+                }
+                Err(reason) => {
+                    *catalogue = None;
+                    *error = Some(reason);
+                }
+            }
+        }
+        false
+    });
     let Some((_, slot)) = &app.ui.portals.waiting else { return };
     let Some(r) = slot.lock().unwrap_or_else(|e| e.into_inner()).take() else {
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
@@ -93,6 +135,8 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
             app.ui.portals.countries_error = match r.and_then(|b| boundaries::parse_countries(&b)) {
                 Ok(c) if c.is_empty() => Some(tl!("geoBoundaries listed no countries: type a country's code").to_string()),
                 Ok(c) => {
+                    app.ui.portals.country_search =
+                        c.iter().map(|(iso, name)| (iso.clone(), (name.clone(), format!("{name} {iso}").to_lowercase()))).collect();
                     app.ui.portals.countries = c;
                     None
                 }
@@ -185,14 +229,40 @@ pub fn osm(app: &mut RustGisApp, ui: &mut egui::Ui) {
     status(app, ui);
 }
 
+/// A successfully read catalogue is authoritative for its level. Unknown catalogues and
+/// invalid or unfinished country codes leave the choices open for normal input validation.
+fn level_info(st: &State, level: &str) -> (bool, Option<u64>) {
+    let Ok(country) = boundaries::country(&st.country) else {
+        return (true, None);
+    };
+    let catalogue =
+        level.strip_prefix("ADM").and_then(|n| n.parse::<usize>().ok()).and_then(|n| st.availability.get(n)).and_then(Option::as_ref);
+    match catalogue {
+        Some(c) => (c.contains_key(&country), c.get(&country).copied().flatten()),
+        None => (true, None),
+    }
+}
+
+/// Explains a disabled choice with the country's name when the country list is available.
+fn missing_level(st: &State, level: &str) -> String {
+    let country = boundaries::country(&st.country).unwrap_or_else(|_| st.country.clone());
+    let name = st.countries.iter().find(|(iso, _)| *iso == country).map_or(country.as_str(), |(_, name)| name.as_str());
+    crate::i18n::fmt("geoBoundaries has no {level} for {country}", &[("level", level), ("country", name)])
+}
+
 /// Boundaries: a country's administrative areas at a level, from geoBoundaries.
 pub fn boundaries(app: &mut RustGisApp, ui: &mut egui::Ui) {
-    ui.label(egui::RichText::new(tl!("A country's administrative boundaries from geoBoundaries (CC BY 4.0): the country itself (ADM0), its first-level divisions (ADM1, such as states) and finer ones.")).weak());
+    ui.label(egui::RichText::new(tl!("A country's administrative boundaries from geoBoundaries (CC BY 4.0): the country itself (ADM0), its first-level divisions (ADM1) and finer ones.")).weak());
     let busy = app.ui.portals.waiting.is_some();
     // The country list, asked for once.
     if !app.ui.portals.countries_asked && !busy {
         app.ui.portals.countries_asked = true;
-        app.ui.portals.waiting = Some((Asked::Countries, fetch(&boundaries::countries_url(), Reach::Local)));
+        for level in 1..=5 {
+            if let Ok(url) = boundaries::level_url(&level.to_string()) {
+                app.ui.portals.level_waiting.push((level, fetch_catalogue(&url)));
+            }
+        }
+        app.ui.portals.waiting = Some((Asked::Countries, fetch_catalogue(&boundaries::countries_url())));
     }
     if let Some(e) = &app.ui.portals.countries_error {
         ui.label(egui::RichText::new(e).small().weak());
@@ -203,23 +273,38 @@ pub fn boundaries(app: &mut RustGisApp, ui: &mut egui::Ui) {
         if st.countries.is_empty() {
             ui.add(egui::TextEdit::singleline(&mut st.country).hint_text("CHE").desired_width(260.0)).labelled_by(input_label.id);
         } else {
+            let selected = boundaries::country(&st.country).ok();
             let shown = st
                 .countries
                 .iter()
-                .find(|(iso, _)| *iso == st.country)
+                .find(|(iso, _)| Some(iso.as_str()) == selected.as_deref())
                 .map(|(iso, n)| format!("{n} ({iso})"))
                 .unwrap_or_else(|| tl!("Choose a country").to_string());
             egui::ComboBox::from_id_salt("gb_country")
                 .selected_text(shown)
                 .width(260.0)
                 .height(360.0)
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                 .show_ui(ui, |ui| {
+                    ui.add(egui::TextEdit::singleline(&mut st.country_filter).hint_text(tl!("Search countries")))
+                        .labelled_by(input_label.id);
+                    let needle = st.country_filter.trim().to_lowercase();
                     for (iso, name) in &st.countries {
-                        ui.selectable_value(&mut st.country, iso.clone(), format!("{name} ({iso})"));
+                        let cached = st.country_search.get(iso).filter(|(original, _)| original == name);
+                        let matches = cached.map_or_else(
+                            || format!("{name} {iso}").to_lowercase().contains(&needle),
+                            |(_, search)| search.contains(&needle),
+                        );
+                        if !matches {
+                            continue;
+                        }
+                        if ui.selectable_value(&mut st.country, iso.clone(), format!("{name} ({iso})")).clicked() {
+                            ui.close();
+                        }
                     }
                 })
                 .response
-                .on_hover_text(tl!("Country"));
+                .labelled_by(input_label.id);
         }
         ui.end_row();
         let input_label = ui.label(tl!("Level"));
@@ -229,20 +314,55 @@ pub fn boundaries(app: &mut RustGisApp, ui: &mut egui::Ui) {
             .show_ui(ui, |ui| {
                 for (l, label) in [
                     ("ADM0", "ADM0 — the country"),
-                    ("ADM1", "ADM1 — states, provinces"),
-                    ("ADM2", "ADM2 — districts, counties"),
-                    ("ADM3", "ADM3"),
-                    ("ADM4", "ADM4"),
-                    ("ADM5", "ADM5"),
+                    ("ADM1", "ADM1 — first-level divisions"),
+                    ("ADM2", "ADM2 — second-level divisions"),
+                    ("ADM3", "ADM3 — third-level divisions"),
+                    ("ADM4", "ADM4 — fourth-level divisions"),
+                    ("ADM5", "ADM5 — fifth-level divisions"),
                 ] {
-                    ui.selectable_value(&mut st.level, l.to_string(), tl!(label));
+                    let (available, count) = level_info(st, l);
+                    let shown = count.map_or_else(
+                        || tl!(label).to_string(),
+                        |n| {
+                            let key = if n == 1 { "{level} — {count} unit" } else { "{level} — {count} units" };
+                            crate::i18n::fmt(key, &[("level", l), ("count", &n.to_string())])
+                        },
+                    );
+                    let response = ui.add_enabled(available, egui::Button::selectable(st.level == l, shown));
+                    if response.clicked() {
+                        st.level = l.to_string();
+                    }
+                    if !available {
+                        response.on_disabled_hover_text(missing_level(st, l));
+                    }
                 }
             })
             .response
             .labelled_by(input_label.id);
         ui.end_row();
     });
-    if ui.add_enabled(!busy, egui::Button::new(tl!("Add"))).clicked() {
+    let st = &app.ui.portals;
+    let (available, _) = level_info(st, &st.level);
+    if let Some(error) = st
+        .level
+        .strip_prefix("ADM")
+        .and_then(|n| n.parse::<usize>().ok())
+        .and_then(|n| st.availability_errors.get(n))
+        .and_then(Option::as_ref)
+    {
+        ui.small(crate::i18n::fmt(
+            "Availability for {level} couldn't be read ({error}); this level remains offered without unit counts.",
+            &[("level", &st.level), ("error", error)],
+        ));
+    }
+    if !available {
+        ui.small(missing_level(st, &st.level));
+    }
+    if ui
+        .add_enabled(!busy && available, egui::Button::new(tl!("Add")))
+        .on_disabled_hover_text(if available { tl!("Downloading…").to_string() } else { missing_level(st, &st.level) })
+        .clicked()
+    {
         let st = &app.ui.portals;
         match boundaries::country(&st.country).and_then(|c| Ok((c, boundaries::level(&st.level)?))) {
             Ok((c, l)) => {
@@ -260,6 +380,91 @@ pub fn boundaries(app: &mut RustGisApp, ui: &mut egui::Ui) {
 mod tests {
     use super::*;
     use rustgis_engine::render::rustgis_tiles::address::Origin;
+
+    /// Exercises the actual Web Data pane: normalized typed codes, disabled levels and
+    /// country filtering retain their accessible labels and affect the Add action.
+    #[test]
+    fn boundary_picker_filters_and_keeps_typed_codes_available() {
+        use egui_kittest::kittest::{By, NodeT, Queryable};
+        let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        app.ui.portals.countries_asked = true;
+        app.ui.portals.country = " per ".into();
+        app.ui.portals.availability[1] = Some(std::collections::BTreeMap::from([("PER".into(), Some(26))]));
+        app.ui.portals.availability[3] = Some(Default::default());
+        app.run("ui.dialog", json!({"name":"boundaries"})).unwrap();
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1400.0, 900.0)).build_ui_state(
+            |ui, app: &mut RustGisApp| {
+                app.logic(ui.ctx());
+                app.ui(ui);
+            },
+            app,
+        );
+        h.run();
+        assert!(!h.get_by_label("Add").accesskit_node().is_disabled());
+        h.get_by_label("Level").click();
+        h.run();
+        assert!(!h.get_by_label("ADM1 — 26 units").accesskit_node().is_disabled());
+        assert!(h.get_by_label("ADM3 — third-level divisions").accesskit_node().is_disabled());
+        h.get_by_label("ADM1 — 26 units").click();
+        h.run();
+        h.state_mut().ui.portals.countries = vec![("PER".into(), "Peru".into()), ("POL".into(), "Poland".into())];
+        h.step();
+        h.get_by_label("Country").click();
+        h.run();
+        let input = h.get(By::new().role(egui::accesskit::Role::TextInput).label("Country"));
+        input.click();
+        h.run();
+        h.get(By::new().role(egui::accesskit::Role::TextInput).label("Country")).type_text("pol");
+        h.run();
+        assert!(h.query_by_label("Peru (PER)").is_none());
+        h.get_by_label("Poland (POL)").click();
+        h.run();
+        assert_eq!(h.state().ui.portals.country, "POL");
+        assert!(h.get_by_label("Add").accesskit_node().is_disabled());
+    }
+
+    /// Availability lands even with no dialog open and a failed level never disables choices.
+    #[test]
+    fn availability_lands_independently_of_boundary_downloads() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        let answer = |result| std::sync::Arc::new(std::sync::Mutex::new(Some(result)));
+        app.ui.portals.level_waiting = vec![
+            (2, answer(Ok((br#"[{"boundaryISO":"PER","admUnitCount":"196"}]"#.to_vec(), Reach::Public)))),
+            (3, answer(Ok((b"[]".to_vec(), Reach::Public)))),
+            (4, answer(Err("offline".to_string()))),
+            (5, answer(Ok((b"{}".to_vec(), Reach::Public)))),
+        ];
+        poll(&mut app, &egui::Context::default());
+        assert_eq!(app.ui.portals.availability[2].as_ref().unwrap().get("PER"), Some(&Some(196)));
+        assert!(!app.ui.portals.availability[3].as_ref().unwrap().contains_key("PER"));
+        assert!(app.ui.portals.availability[4].is_none());
+        assert_eq!(app.ui.portals.availability_errors[4].as_deref(), Some("offline"));
+        assert_eq!(app.ui.portals.availability_errors[5].as_deref(), Some("the geoBoundaries list isn't a list"));
+        assert!(app.ui.portals.level_waiting.is_empty());
+        app.ui.portals.countries_asked = true;
+        app.ui.portals.country = "PER".into();
+        app.run("ui.dialog", json!({"name":"boundaries"})).unwrap();
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1400.0, 900.0)).build_ui_state(
+            |ui, app: &mut RustGisApp| {
+                app.logic(ui.ctx());
+                app.ui(ui);
+            },
+            app,
+        );
+        h.run();
+        assert!(h.query_by_label_contains("couldn't be read").is_none());
+        for (level, reason) in [("ADM4", "offline"), ("ADM5", "the geoBoundaries list isn't a list")] {
+            h.state_mut().ui.portals.level = level.into();
+            h.run();
+            let note = crate::i18n::fmt(
+                "Availability for {level} couldn't be read ({error}); this level remains offered without unit counts.",
+                &[("level", level), ("error", reason)],
+            );
+            assert!(h.query_by_label(&note).is_some(), "{note}");
+            assert!(level_info(&h.state().ui.portals, level).0);
+        }
+    }
 
     /// The boundaries geoBoundaries' description names are read within the reach the description
     /// was read at: only from the internet when it came from there; from a description read on the

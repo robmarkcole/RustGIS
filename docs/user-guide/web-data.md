@@ -494,8 +494,11 @@ a larger area is better read from an extract (`.osm.pbf`). `"url"` names another
 when the public one is busy.
 
 **Home › Add › Web Data › Boundaries…** (`boundaries.add`) adds a country's administrative boundaries from
-[geoBoundaries](https://www.geoboundaries.org) (CC BY 4.0): the country itself (`ADM0`), its states
-or provinces (`ADM1`) and finer divisions down to `ADM5` where they exist, simplified for the map.
+[geoBoundaries](https://www.geoboundaries.org) (CC BY 4.0): the country itself (`ADM0`), its first-level
+divisions (`ADM1`) and finer divisions down to `ADM5` where they exist, simplified for the map.
+Filter the country list by name or ISO code. Once a level's catalogue arrives, its unit count is
+shown and levels unavailable for the country are disabled with a reason. If a catalogue cannot be
+read, its levels remain offered and the selected level shows why its availability is unknown.
 `boundaries.countries` lists the countries.
 
 ```sh

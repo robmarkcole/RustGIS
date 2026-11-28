@@ -225,6 +225,10 @@ pub struct TerrainBlock {
     /// straight down (schematic: no dip or thickness). None: the walls are `walls` all along.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub walls_layer: Option<String>,
+    /// A band along the top of the walls from a second polygon layer (#2607): soil over the rock
+    /// `walls_layer` shows. None: no band.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub walls_top: Option<WallsTop>,
     /// The outline the ground is cut to inside the box (#2318).
     #[serde(default, skip_serializing_if = "BlockShape::is_box")]
     pub shape: BlockShape,
@@ -233,6 +237,26 @@ pub struct TerrainBlock {
     /// the water's level as ground.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub water: Option<BlockWater>,
+}
+
+/// The band along the top of a block diagram's walls (#2607): under each polygon of `layer` (by
+/// name, as the terrain's DEM) the box's edge meets, its fill, `thickness` deep below the ground,
+/// its contacts straight across it. Schematic: as a rule far thicker than the real soil.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WallsTop {
+    pub layer: String,
+    /// How deep the band reaches down from the ground, before exaggeration.
+    pub thickness: BandThickness,
+}
+
+/// How thick a block's walls' top band is (#2607): metres all along, or a numeric field of its
+/// layer holding each polygon's (no band under a polygon without a value over 0 there). Saved as
+/// a number, or as `{"field": name}`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum BandThickness {
+    Metres(f64),
+    Field { field: String },
 }
 
 /// The outline a block diagram's ground is cut to (#2318).
@@ -347,6 +371,20 @@ impl TerrainBlock {
         }
         if self.walls.a() != 255 {
             return Err("block's walls is an opaque colour, #RRGGBB".into());
+        }
+        if let Some(t) = &self.walls_top {
+            if t.layer.trim().is_empty() {
+                return Err("block's walls' top needs a layer: a polygon layer of the band's units".into());
+            }
+            match &t.thickness {
+                BandThickness::Metres(d) if !(d.is_finite() && *d > 0.0 && *d <= BLOCK_MAX_DEPTH) => {
+                    return Err(format!("block's walls' top thickness is metres, over 0 and up to {BLOCK_MAX_DEPTH:.0}"));
+                }
+                BandThickness::Field { field } if field.trim().is_empty() => {
+                    return Err("block's walls' top thickness field needs a name: a numeric field of the top layer".into());
+                }
+                _ => {}
+            }
         }
         if let Some(w) = &self.water {
             if w.depth.is_none() && w.field.is_none() && w.bed.is_none() {

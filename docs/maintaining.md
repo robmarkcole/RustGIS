@@ -115,6 +115,7 @@ diagram cut to a circle or to polygons), `terrain-block-polygon` (one cut to pol
 `terrain-block-water` (water in a block diagram's walls),
 `terrain-block-water-bed` (that water's floor read from a bed raster),
 `terrain-block-walls-layer` (the layer a block diagram's walls are coloured by),
+`terrain-block-walls-top` (the band along the top of its walls from a second layer),
 `shaded-relief-effects` (cast shadows, sky visibility, fill light or rock colour),
 `shaded-relief-light` (a Shaded Relief's ambient or balanced light),
 `shaded-relief-shadow-softness` (a softness stored for a Shaded Relief's cast shadows, or set by a saved step;

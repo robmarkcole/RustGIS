@@ -651,6 +651,9 @@ fn import_maps(s: &mut Session, p: &Value) -> CmdResult {
     crate::s3_connections::resolve_project_s3(s);
     s.wait_in_place_reads();
     super::project::say_conversion_fallbacks(s);
+    // What the imported maps' block diagrams can't draw their walls, top band or water bed
+    // from, as when a project opens.
+    super::project::say_block_layers(s, first_map..s.project.maps.len());
     super::connections::note_waiting(s);
     if let Some(n) = names.last()
         && let Some(i) = s.project.maps.iter().position(|m| &m.name == n)
