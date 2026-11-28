@@ -83,8 +83,9 @@ pub enum MarkerRefusal {
     /// count, `svg::work`), or more elements than `svg::ELEMENTS` (10,000).
     TooMuchToDraw,
     /// It is an SVG whose style sheets and `style` attributes, or whose elements' attributes, take
-    /// more to read than `svg::STYLE_UNITS` and `svg::ATTRIBUTE_PAIRS` allow, or whose entities
-    /// hold tags, which no count sees.
+    /// more to read than `svg::STYLE_UNITS` and `svg::ATTRIBUTE_PAIRS` allow, whose namespaces
+    /// take more to resolve, or whose entities expand to more, than
+    /// `rustgis_data::xml::check_limits` allows, or whose entities hold tags, which no count sees.
     SvgTooMuchToRead,
     /// It is an SVG with more XML nodes than `svg::XML_NODES` (40,000) or nested deeper than
     /// `svg::DEPTH` (64).
@@ -141,7 +142,7 @@ refusal_phrases! {
     TooManyBytes => "is longer than 2 MiB as base64",
     TooManyPixels => "has more pixels than 2048 × 2048",
     TooMuchToDraw => "is an SVG with more to draw than a 2048 × 2048 image",
-    SvgTooMuchToRead => "is an SVG whose style sheets, element attributes or entities holding tags take more to read than RustGIS allows",
+    SvgTooMuchToRead => "is an SVG whose style sheets, element attributes, namespaces or entities take more to read than RustGIS allows",
     SvgTooNested => "is an SVG with more than 40,000 XML nodes or nested deeper than 64 levels",
     SvgUnknownRadius => "is an SVG with a radius whose size RustGIS can't know (in em or ex, or in % of a size in em or ex, or of a nested size in % over 100%)",
     SvgTooSmall => "is an SVG too small to draw",
@@ -928,6 +929,15 @@ mod tests {
             (svg(&nodes), SvgTooNested),
             // Its own cause (#2800), not "more to draw": 20,000 declarations in a `style` take too long to read.
             (svg(&format!(r#"<rect width="1" height="1" style="{}"/>"#, "fill: red; ".repeat(20_000))), SvgTooMuchToRead),
+            // So do namespaces by the thousand around many elements (#3220).
+            (
+                svg(&format!(
+                    "<g{}>{}</g>",
+                    (0..3000).map(|i| format!(r#" xmlns:n{i}="u{i}""#)).collect::<String>(),
+                    r#"<g xmlns:a="v"/>"#.repeat(1000)
+                )),
+                SvgTooMuchToRead,
+            ),
             (svg(r#"<circle r="1em"/>"#), SvgUnknownRadius),
             (svg(r#"<rect width="9" height="9" rx="2ex"/>"#), SvgUnknownRadius),
             // A radius in % of a size in em or ex with no view box, or of a nested one past 100%.

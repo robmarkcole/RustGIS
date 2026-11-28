@@ -34,8 +34,9 @@ pub(super) enum Refusal {
     /// It has more to draw than the cap given, or more elements than [`ELEMENTS`].
     TooMuch,
     /// Its style sheets and `style` attributes come to more than [`STYLE_UNITS`], the attributes
-    /// of its elements to more than [`ATTRIBUTE_PAIRS`], or an entity of it holds a tag, whose
-    /// expansion no count sees: more to read than the readers do in time.
+    /// of its elements to more than [`ATTRIBUTE_PAIRS`], its namespaces or what its entities
+    /// expand to more than [`rustgis_data::xml::check_limits`] allows, or an entity of it holds a
+    /// tag, whose expansion no count sees: more to read than the readers do in time.
     TooMuchToRead,
     /// It has more XML nodes than [`XML_NODES`], or nests deeper than [`DEPTH`].
     TooNested,
@@ -101,7 +102,8 @@ const NODE: u64 = 100;
 const STOPS_PER_UNIT: u64 = 16;
 
 /// SVG text `text` as XML with an `<svg>` root, within what reading its tags may cost:
-/// [`XML_NODES`], [`ATTRIBUTE_PAIRS`], no entity holding a tag.
+/// [`XML_NODES`], [`ATTRIBUTE_PAIRS`], the namespace work and entity expansion every XML reader
+/// allows ([`rustgis_data::xml::check_limits`]), no entity holding a tag.
 fn parse(text: &str) -> Result<roxmltree::Document<'_>, Refusal> {
     // An entity of a tag expands to tags `attribute_pairs` doesn't see, once for each use (a text
     // entity, as in an Illustrator file's `xmlns` values, is no way round it).
@@ -112,6 +114,14 @@ fn parse(text: &str) -> Result<roxmltree::Document<'_>, Refusal> {
     if attribute_pairs(text) > ATTRIBUTE_PAIRS {
         return Err(Refusal::TooMuchToRead);
     }
+    // Before roxmltree resolves each name among the namespaces around it (#3220), and expands
+    // each use of an entity (#3232).
+    rustgis_data::xml::check_limits(text, true).map_err(|why| match why.as_str() {
+        rustgis_data::xml::TOO_MANY_NAMESPACES | rustgis_data::xml::TOO_MUCH_ENTITY_TEXT => Refusal::TooMuchToRead,
+        why if why.starts_with(rustgis_data::xml::TOO_DEEP) => Refusal::TooNested,
+        // A DOCTYPE that never ends, which roxmltree refuses too.
+        _ => Refusal::NotSvg,
+    })?;
     let xml = roxmltree::ParsingOptions { allow_dtd: true, nodes_limit: XML_NODES, ..Default::default() };
     let doc = roxmltree::Document::parse_with_options(text, xml).map_err(|e| match e {
         roxmltree::Error::NodesLimitReached => Refusal::TooNested,
@@ -1140,6 +1150,37 @@ mod tests {
         }
     }
 
+    /// Namespaces that take more to resolve than the SVG's size allows are refused before the
+    /// parser meets them (#3220: 74 KB took 7 s), searched for params too; a few dozen on the
+    /// root with text entities for them, as an Illustrator file has, are read.
+    #[test]
+    fn an_svg_of_namespaces_too_costly_to_resolve_isnt_parsed() {
+        let declarations: String = (0..3000).map(|i| format!(r#" xmlns:n{i}="u{i}""#)).collect();
+        let flood = sized(&declarations, &r#"<g xmlns:a="v"/>"#.repeat(1000));
+        let started = std::time::Instant::now();
+        assert_eq!(read(&flood).err(), Some(Refusal::TooMuchToRead));
+        assert_eq!(with_params(&flood, &COLOURS), Err(Refusal::TooMuchToRead));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1), "{:?}", started.elapsed());
+        let entities: String = (0..40).map(|i| format!(r#"<!ENTITY ns{i} "http://ns.example/{i}/">"#)).collect();
+        let used: String = (0..40).map(|i| format!(r#" xmlns:n{i}="&ns{i};""#)).collect();
+        let drawn = r#"<rect width="1" height="1"/>"#.repeat(1000);
+        let real = format!("<!DOCTYPE svg [{entities}]>{}", sized(&used, &drawn));
+        assert!(read(&real).is_ok());
+    }
+
+    /// A text entity used many times is refused before the parser expands it, searched for params
+    /// too (#3232: 112 KB took 847 MB).
+    #[test]
+    fn an_svg_of_entities_expanding_too_far_isnt_parsed() {
+        let entity = format!(r#"<!ENTITY e "{}">"#, "a".repeat(100_000));
+        let rect = format!(r#"<rect x="{}"/>"#, "&e;".repeat(4000));
+        let flood = format!("<!DOCTYPE svg [{entity}]>{}", sized("", &rect));
+        let started = std::time::Instant::now();
+        assert_eq!(read(&flood).err(), Some(Refusal::TooMuchToRead));
+        assert_eq!(with_params(&flood, &COLOURS), Err(Refusal::TooMuchToRead));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1), "{:?}", started.elapsed());
+    }
+
     /// Before its values are set, an SVG is held to what [`super::read`] holds one to.
     #[test]
     fn an_svg_too_costly_to_read_isnt_searched_for_params() {
@@ -1156,14 +1197,15 @@ mod tests {
     }
 
     /// What a text entity expands to in `style` attributes is written out only as far as a marker
-    /// image may be long, then refused: a 100 KB entity in 20 of them would come to 2 MB.
+    /// image may be long, then refused: a 100 KB entity in 16 of them would come to 1.6 MB.
     #[test]
     fn param_values_are_set_in_no_longer_an_svg_than_an_image_may_be() {
         let long = "a".repeat(100_000);
         let rects = |n: usize| r#"<rect style="x:&e;;fill:param(fill)"/>"#.repeat(n);
         let svg = |n: usize| format!(r#"<!DOCTYPE svg [<!ENTITY e "{long}">]>{}"#, sized("", &rects(n)));
         assert!(with_params(&svg(10), &COLOURS).is_ok_and(|set| set.is_some()));
-        assert_eq!(with_params(&svg(20), &COLOURS), Err(Refusal::TooMuchToRead));
+        assert!(read(&svg(16)).is_ok());
+        assert_eq!(with_params(&svg(16), &COLOURS), Err(Refusal::TooMuchToRead));
     }
 
     /// [`elements`] of `body`.
@@ -1384,10 +1426,10 @@ mod tests {
         assert_eq!(read("<html/>").err(), Some(Refusal::NotSvg));
         assert_eq!(read("not xml").err(), Some(Refusal::NotSvg));
         let laughs = r#"<?xml version="1.0"?><!DOCTYPE svg [<!ENTITY a "aaaaaaaaaa"><!ENTITY b "&a;&a;&a;&a;&a;&a;&a;&a;&a;&a;"><!ENTITY c "&b;&b;&b;&b;&b;&b;&b;&b;&b;&b;"><!ENTITY d "&c;&c;&c;&c;&c;&c;&c;&c;&c;&c;"><!ENTITY e "&d;&d;&d;&d;&d;&d;&d;&d;&d;&d;"><!ENTITY f "&e;&e;&e;&e;&e;&e;&e;&e;&e;&e;"><!ENTITY g "&f;&f;&f;&f;&f;&f;&f;&f;&f;&f;">]><svg xmlns="http://www.w3.org/2000/svg"><desc>&g;</desc></svg>"#;
-        assert_eq!(read(laughs).err(), Some(Refusal::NotSvg));
+        assert_eq!(read(laughs).err(), Some(Refusal::TooMuchToRead));
         // The same in an attribute's value, quickly.
         let started = std::time::Instant::now();
-        assert_eq!(read(&laughs.replace("<desc>&g;</desc>", r#"<path d="&g;"/>"#)).err(), Some(Refusal::NotSvg));
+        assert_eq!(read(&laughs.replace("<desc>&g;</desc>", r#"<path d="&g;"/>"#)).err(), Some(Refusal::TooMuchToRead));
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
         assert_eq!(read(&svg(&"<!-- -->".repeat(XML_NODES as usize))).err(), Some(Refusal::TooNested));
         let deep = format!("{}{}", "<g>".repeat(2000), "</g>".repeat(2000));

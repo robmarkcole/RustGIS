@@ -2968,7 +2968,7 @@ fn svg_image_markers_that_dont_draw_are_said_with_why() {
         (MarkerRefusal::TooManyBytes, "Image markers in \"Cities\", \"Rivers\" are longer than 2 MiB as base64 and are drawn as circles"),
         (
             MarkerRefusal::SvgTooMuchToRead,
-            "Image markers in \"Cities\", \"Rivers\" are SVGs whose style sheets, element attributes or entities holding tags take more to read than RustGIS allows and are drawn as circles",
+            "Image markers in \"Cities\", \"Rivers\" are SVGs whose style sheets, element attributes, namespaces or entities take more to read than RustGIS allows and are drawn as circles",
         ),
         (
             MarkerRefusal::SvgTooNested,

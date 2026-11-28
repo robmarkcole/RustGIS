@@ -888,8 +888,8 @@ pub fn parse(url: &str, body: &[u8]) -> Result<Service, String> {
 /// Parses a service's XML document through [`crate::xml::parse`], which refuses deep nesting
 /// (a stack-overflow hazard) and, with the DTD allowed here, entities holding markup.
 fn xml(text: &str, nodes_limit: u32) -> Result<roxmltree::Document<'_>, String> {
-    // WMS 1.1.1 documents start with a DOCTYPE, so DTDs are allowed; roxmltree still refuses
-    // entity bombs and external entities, and the node count is capped.
+    // WMS 1.1.1 documents start with a DOCTYPE, so DTDs are allowed; what its entities expand to
+    // is bounded by `check_limits`, roxmltree reads no external entity, and the node count is capped.
     let opts = ParsingOptions { allow_dtd: true, nodes_limit, ..ParsingOptions::default() };
     crate::xml::parse(text.trim_start(), opts)
 }
