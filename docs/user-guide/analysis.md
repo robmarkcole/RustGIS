@@ -1693,6 +1693,14 @@ statistics; converting a mean angle would not give the mean percent. The result'
 named **Slope (degrees)** or **Slope (percent)**, which `raster.info` shows and a saved project
 or GeoTIFF export keeps; a later step in a chain names it again.
 
+Slope, aspect and hillshade keep a missing centre cell as NoData. At the raster boundary,
+they use the nearest edge cell for a neighbour outside the grid. An invalid neighbour inside
+the grid is replaced by the centre cell's elevation. A notice names the function and counts
+the valid output cells using each treatment; a cell can appear in both counts. These choices
+also apply in the Function Editor. A function run in blocks counts only kept output cells.
+For an intermediate terrain step in a tiled chain, the notice gives an upper bound that can
+include repeated margin evaluations needed by later steps; it says when this applies.
+
 Slope, aspect and hillshade need the cell size in the elevation's unit. On a projected DEM the
 cell size is taken as it is, so elevations must be in the same unit as the coordinates (feet
 aren't converted). On a geographic DEM the cell size is worked out in metres once for the whole

@@ -473,6 +473,7 @@ fn installed(mut layer: rustgis_map::RasterLayer, dest: &std::path::Path) -> rus
 /// cell with a value.
 #[derive(Default)]
 struct Remaps {
+    terrain: Vec<(String, rasterops::TerrainEdges)>,
     empty: Vec<(String, f64, f64)>,
     emptied: Option<String>,
 }
@@ -483,6 +484,13 @@ impl Remaps {
     fn then(self) -> Then {
         let mut notes: Vec<String> = rasterops::empty_ranges_note(&self.empty).into_iter().collect();
         notes.extend(self.emptied.map(|name| format!("{name}: the remap left no cells with values")));
+        for (stage, (name, edges)) in self.terrain.into_iter().enumerate() {
+            if edges.clamped > 0 || edges.filled > 0 {
+                let limit = if edges.at_most { "at most " } else { "" };
+                let margin = if edges.at_most { "; counts include repeated intermediate tile margins" } else { "" };
+                notes.push(format!("{name}, terrain step {}: {limit}{} output cells used clamped boundary neighbours; {limit}{} output cells used the centre height for invalid neighbours{margin}", stage + 1, edges.clamped, edges.filled));
+            }
+        }
         notices(notes)
     }
 }
@@ -1606,30 +1614,37 @@ fn apply_function(
     target: Option<&Raster>,
     remaps: &mut Remaps,
     ground: Option<&rustgis_geom::Extent>,
+    core: Option<([usize; 4], bool)>,
 ) -> Result<Vec<f32>, String> {
     let band = band_of(p, r)?;
     let zf = f(p, "zFactor").unwrap_or(1.0).clamp(0.0001, 100_000.0);
-    match ps(p, "function").ok_or("function is required")? {
-        "slope" => match p.get("units") {
-            None => rasterops::slope_on(r, band, zf, ground),
-            Some(Value::String(units)) if units == "degrees" => rasterops::slope_on(r, band, zf, ground),
-            // A part read with a margin: its cells past Float32's range are counted where they're
-            // kept ([`super::in_blocks::Shape::overflow`]).
-            Some(Value::String(units)) if units == "percent" && ground.is_some() => {
-                rasterops::slope_percent_cells_on(r, band, zf, ground).map(|(p, _)| p)
-            }
-            Some(Value::String(units)) if units == "percent" => rasterops::slope_percent_on(r, band, zf, ground),
-            _ => Err("slope units must be degrees or percent".into()),
-        },
-        "aspect" => rasterops::aspect_on(r, band, ground),
-        "hillshade" => rasterops::hillshade_on(
-            r,
-            band,
-            f(p, "azimuth").unwrap_or(315.0),
-            f(p, "altitude").unwrap_or(45.0).clamp(0.0, 90.0),
-            zf,
-            ground,
-        ),
+    let function = ps(p, "function").ok_or("function is required")?;
+    let terrain = match function {
+        "slope" => Some(match p.get("units") {
+            None => rasterops::TerrainFunction::Slope,
+            Some(Value::String(units)) if units == "degrees" => rasterops::TerrainFunction::Slope,
+            Some(Value::String(units)) if units == "percent" => rasterops::TerrainFunction::SlopePercent,
+            _ => return Err("slope units must be degrees or percent".into()),
+        }),
+        "aspect" => Some(rasterops::TerrainFunction::Aspect),
+        "hillshade" => Some(rasterops::TerrainFunction::Hillshade {
+            azimuth: f(p, "azimuth").unwrap_or(315.0),
+            altitude: f(p, "altitude").unwrap_or(45.0).clamp(0.0, 90.0),
+        }),
+        _ => None,
+    };
+    if let Some(terrain) = terrain {
+        let (core, at_most) = core.unwrap_or(([0, 0, r.width as usize, r.height as usize], false));
+        let zf = if function == "aspect" { 1.0 } else { zf };
+        let (pixels, mut edges, overflow) = rasterops::terrain_reported(r, band, zf, ground, Some(core), terrain)?;
+        if overflow > 0 && ground.is_none() {
+            return Err(format!("{overflow} {}", rasterops::PERCENT_OVERFLOW));
+        }
+        edges.at_most = at_most;
+        remaps.terrain.push((format!("{} ({function})", r.name), edges));
+        return Ok(pixels);
+    }
+    match function {
         "ndvi" => {
             let (nir, red) = (p.get("nir").and_then(Value::as_u64).unwrap_or(4), p.get("red").and_then(Value::as_u64).unwrap_or(3));
             rasterops::band_math(r, &format!("(b{nir} - b{red}) / (b{nir} + b{red})"))
@@ -1710,10 +1725,10 @@ fn function_work(s: &Session, p: &Value) -> Result<Work, String> {
         let shape = function_shape(&p);
         return Ok(Box::new(move || {
             let met = std::cell::RefCell::new(BlockRemaps::default());
-            let made = blocks.with_halo(halo).run(
-                |block, ground| {
+            let made = blocks.with_halo(halo).run_window(
+                |block, ground, core| {
                     let mut remaps = Remaps::default();
-                    let pixels = apply_function(block, &p, None, &mut remaps, Some(ground))?;
+                    let pixels = apply_function(block, &p, None, &mut remaps, Some(ground), Some((core, false)))?;
                     met.borrow_mut().add(remaps);
                     Ok(pixels)
                 },
@@ -1727,10 +1742,11 @@ fn function_work(s: &Session, p: &Value) -> Result<Work, String> {
         let src = src.read()?;
         let target = read_target(target.as_ref())?;
         let mut remaps = Remaps::default();
-        let pixels = apply_function(&src, &p, target.as_deref(), &mut remaps, None)?;
+        let pixels = apply_function(&src, &p, target.as_deref(), &mut remaps, None, None)?;
         // Only a resample takes another raster's grid.
         let raster = derive_function(target.as_deref().unwrap_or(&src), &name, &p, pixels)?;
-        if is_hillshade(&p) { made_hillshade(raster, &defaults) } else { made_then(raster, None, Some(remaps.then())) }
+        let made = made_then(raster, None, Some(remaps.then()))?;
+        Ok(if is_hillshade(&p) { hillshade_look(made, &defaults) } else { made })
     }))
 }
 
@@ -1812,6 +1828,7 @@ pub(crate) fn also(mut m: Made, then: Then) -> Made {
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Default)]
 struct BlockRemaps {
+    terrain: Vec<(String, rasterops::TerrainEdges)>,
     /// The ranges that match nothing, as every block so far found them; `None` before the first.
     empty: Option<Vec<(String, f64, f64)>>,
     /// Whether every block so far was left with no value, and the raster it was said of.
@@ -1822,6 +1839,15 @@ struct BlockRemaps {
 impl BlockRemaps {
     /// Adds what one block's remaps met.
     fn add(&mut self, r: Remaps) {
+        for (i, (name, edges)) in r.terrain.into_iter().enumerate() {
+            if let Some((_, total)) = self.terrain.get_mut(i) {
+                total.clamped = total.clamped.saturating_add(edges.clamped);
+                total.filled = total.filled.saturating_add(edges.filled);
+                total.at_most |= edges.at_most;
+            } else {
+                self.terrain.push((name, edges));
+            }
+        }
         self.empty = Some(match self.empty.take() {
             None => r.empty,
             Some(mut e) => {
@@ -1840,7 +1866,7 @@ impl BlockRemaps {
 
     /// What every block's remaps met together.
     fn met(self) -> Remaps {
-        Remaps { empty: self.empty.unwrap_or_default(), emptied: self.emptied.flatten() }
+        Remaps { terrain: self.terrain, empty: self.empty.unwrap_or_default(), emptied: self.emptied.flatten() }
     }
 }
 
@@ -1881,13 +1907,26 @@ fn function_chain_work(s: &Session, p: &Value) -> Result<Work, String> {
             let shape = function_shape(&last);
             return Ok(Box::new(move || {
                 let met = std::cell::RefCell::new(BlockRemaps::default());
-                let made = blocks.with_halo(halo).run(
-                    |block, ground| {
+                let made = blocks.with_halo(halo).run_window(
+                    |block, ground, core| {
                         let mut remaps = Remaps::default();
                         let mut cur: Option<Raster> = None;
                         for (i, st) in steps.iter().enumerate() {
                             let input = cur.as_ref().unwrap_or(block);
-                            let pixels = apply_function(input, st, None, &mut remaps, Some(ground))
+                            // Earlier outputs in the remaining halo feed later terrain steps.
+                            let halo: usize = steps
+                                .iter()
+                                .skip(i + 1)
+                                .filter_map(|st| ps(st, "function").and_then(super::in_blocks::function_halo))
+                                .map(|v| v as usize)
+                                .sum();
+                            let kept = [
+                                core[0].saturating_sub(halo),
+                                core[1].saturating_sub(halo),
+                                core[2].saturating_add(halo).min(input.width as usize),
+                                core[3].saturating_add(halo).min(input.height as usize),
+                            ];
+                            let pixels = apply_function(input, st, None, &mut remaps, Some(ground), Some((kept, halo > 0)))
                                 .map_err(|e| format!("step {} ({}): {e}", i + 1, func(st)))?;
                             cur = Some(derive_function(input, &input.name, st, pixels)?);
                         }
@@ -1914,7 +1953,7 @@ fn function_chain_work(s: &Session, p: &Value) -> Result<Work, String> {
             let target = read_target(target.as_ref()).map_err(|e| format!("step {} ({f}): {e}", i + 1))?;
             let input = cur.as_ref().unwrap_or(&src);
             let pixels =
-                apply_function(input, st, target.as_deref(), &mut remaps, None).map_err(|e| format!("step {} ({f}): {e}", i + 1))?;
+                apply_function(input, st, target.as_deref(), &mut remaps, None, None).map_err(|e| format!("step {} ({f}): {e}", i + 1))?;
             // Only a resample takes another raster's grid; otherwise the grid is the current one.
             let next = derive_function(target.as_deref().unwrap_or(input), &input.name, st, pixels)?;
             cur = Some(next);

@@ -594,6 +594,104 @@ fn indices_over_a_file_too_large_to_read_whole_run_a_block_at_a_time() {
     assert!(folder.join("scripted.tif").is_file());
 }
 
+/// Notices count affected output cells, not missing samples or skipped centre cells.
+#[test]
+fn terrain_functions_report_clamped_edges_and_filled_nodata_neighbours() {
+    let d = dir("terrain-edge-notes");
+    let path = d.join("height.tif");
+    let mut heights = vec![10.0; 25];
+    heights[12] = -9999.0;
+    let dem = Raster::new(
+        "height",
+        5,
+        5,
+        vec![heights],
+        GeoTransform { origin_x: 0.0, origin_y: 5.0, pixel_width: 1.0, pixel_height: -1.0 },
+        Crs::WebMercator,
+        Some(-9999.0),
+        ColorHint::Gray,
+        "Float32",
+    )
+    .unwrap();
+    std::fs::write(&path, rustgis_data::raster::geotiff::write(&dem, 0).unwrap()).unwrap();
+    for function in ["slope", "aspect", "hillshade"] {
+        let mut s = Session::new(Project::default());
+        s.run("layer.addData", &json!({"path": path})).unwrap();
+        let mark = s.notice_mark();
+        s.run("raster.function", &json!({"layer": "height", "function": function, "name": "out"})).unwrap();
+        let notes = said(&s, mark);
+        let edge = notes.iter().filter(|n| n.contains("clamped") && n.contains("neighbour")).collect::<Vec<_>>();
+        assert_eq!(edge.len(), 1, "{function}: {notes:?}");
+        assert!(edge[0].contains("16 output cells"), "{}", edge[0]);
+        assert!(edge[0].contains("8 output cells"), "{}", edge[0]);
+        assert!(edge[0].contains(function), "{}", edge[0]);
+    }
+}
+
+/// A missing centre at four block corners must be counted once for the kept outputs,
+/// not once per read margin. A chained stage also says when its margin counts are bounds.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn terrain_notices_and_pixels_agree_across_block_margins() {
+    let d = dir("terrain-block-notes");
+    let path = d.join("height.tif");
+    let (w, h) = (1025, 1025);
+    let mut values = vec![10.0; (w * h) as usize];
+    values[511 * w as usize + 383] = -9999.0;
+    let dem = Raster::new(
+        "height",
+        w,
+        h,
+        vec![values],
+        GeoTransform { origin_x: 0.0, origin_y: h as f64, pixel_width: 1.0, pixel_height: -1.0 },
+        Crs::WebMercator,
+        Some(-9999.0),
+        ColorHint::Gray,
+        "Float32",
+    )
+    .unwrap();
+    let info = rustgis_data::raster::cogwrite::write_file(&dem, 0, &path).unwrap();
+    assert_eq!(info.levels, vec![(1025, 1025), (513, 513), (257, 257)]);
+    for (command, p) in [
+        ("raster.function", json!({"layer": "height", "function": "slope", "name": "out"})),
+        ("raster.functionChain", json!({"layer": "height", "steps": [{"function": "slope"}, {"function": "slope"}], "name": "out"})),
+    ] {
+        let mut whole = Session::new(Project::default());
+        whole.run("layer.addData", &json!({"path": path})).unwrap();
+        let mark = whole.notice_mark();
+        whole.run(command, &p).unwrap();
+        let want = raster(&whole, "out").data.clone().unwrap();
+        let whole_notes: Vec<_> = said(&whole, mark).into_iter().filter(|n| n.contains("clamped boundary")).collect();
+        // Nine padded 512-pixel tiles exceed the reader's overview budget; the
+        // 513-pixel overview fits. Planning budgets input at 8 bytes per sample,
+        // while its Float32 output still fits this threshold.
+        let (_held, _blocks) = (HeldWhole::at(1000), BlocksPast::at(1_100_000));
+        let mut blocked = Session::new(Project::default());
+        blocked.run("layer.addData", &json!({"path": path})).unwrap();
+        assert!(raster(&blocked, "height").tiled);
+        assert_eq!(raster(&blocked, "height").data.as_ref().unwrap().overview, Some((w, h)));
+        let mark = blocked.notice_mark();
+        let reads = crate::cmd::gp::TILED_READS.with(std::cell::Cell::get);
+        blocked.run(command, &p).unwrap();
+        assert_eq!(crate::cmd::gp::TILED_READS.with(std::cell::Cell::get), reads, "{command}: no whole-file fallback");
+        let got = raster(&blocked, "out").data.as_ref().unwrap();
+        assert_eq!(got.bands[0].data, want.bands[0].data, "{command}");
+        let notes: Vec<_> = said(&blocked, mark).into_iter().filter(|n| n.contains("clamped boundary")).collect();
+        assert_eq!(notes.len(), whole_notes.len(), "{command}: {notes:?}");
+        if command == "raster.function" {
+            assert_eq!(notes, whole_notes);
+            assert!(
+                notes[0].contains("4096 output cells used clamped") && notes[0].contains("8 output cells used the centre"),
+                "{notes:?}"
+            );
+        } else {
+            assert_eq!(notes.len(), 2);
+            assert!(notes[0].contains("at most") && notes[0].contains("repeated intermediate tile margins"), "{notes:?}");
+            assert_eq!(notes[1], whole_notes[1], "the last stage counts only kept outputs");
+        }
+    }
+}
+
 /// The other commands that work cell by cell, or over a cell's neighbours, run a block at a time
 /// over a file too large to read whole too (#2865), each making the raster it makes of the file
 /// held whole, held or written to the results folder: Raster Functions by cell and over a cell's

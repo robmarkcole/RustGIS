@@ -115,6 +115,8 @@ fn z(r: &Raster, data: &[f32], col: i64, row: i64) -> Option<f32> {
 }
 
 /// The surface gradient (dz/dx east, dz/dy north) at a cell (Horn's method), in metres per metre.
+/// Outside-grid neighbours use the nearest edge cell; an invalid sampled neighbour uses the
+/// centre elevation. A missing centre is rejected by the terrain traversal before this call.
 fn gradient(r: &Raster, data: &[f32], col: i64, row: i64, zf: f64, (cx, cy): (f64, f64)) -> Option<(f64, f64)> {
     let g = |dc: i64, dr: i64| z(r, data, col + dc, row + dr).or_else(|| z(r, data, col, row)).map(|v| v as f64 * zf);
     let (a, b, c) = (g(-1, -1)?, g(0, -1)?, g(1, -1)?);
@@ -182,29 +184,84 @@ pub fn per_index<S>(
 /// The cells [`weighted_overlay`] makes at a time: its criteria carry no grid, so no rows.
 const OVERLAY_CHUNK: usize = 1 << 14;
 
+/// Output cells that needed a boundary clamp or a centre-filled invalid neighbour. One cell
+/// may be in both counts; missing centres are excluded. The counts describe a caller's kept
+/// rectangle, so tiled runs do not count their disposable margins again.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TerrainEdges {
+    pub clamped: usize,
+    pub filled: usize,
+    /// Repeated intermediate tile-margin evaluations make these counts upper bounds.
+    pub at_most: bool,
+}
+
+/// A counted traversal's accumulators. Only scalar fallback cells can need either treatment;
+/// the fast path already proved that all eight neighbours are valid and in bounds.
+struct TerrainCounter {
+    core: Option<[usize; 4]>,
+    clamped: std::sync::atomic::AtomicUsize,
+    filled: std::sync::atomic::AtomicUsize,
+}
+
+impl TerrainCounter {
+    fn new(core: Option<[usize; 4]>) -> Self {
+        Self { core, clamped: Default::default(), filled: Default::default() }
+    }
+
+    /// Observes a valid scalar output in the same pass that made it. Eight bounded lookups
+    /// distinguish actual NoData substitution from a clamped but valid edge neighbour.
+    fn observe(&self, r: &Raster, data: &[f32], col: i64, row: i64) {
+        use std::sync::atomic::Ordering;
+        let Some([x0, y0, x1, y1]) = self.core else { return };
+        if col < x0 as i64 || row < y0 as i64 || col >= x1 as i64 || row >= y1 as i64 {
+            return;
+        }
+        if col == 0 || row == 0 || col + 1 == i64::from(r.width) || row + 1 == i64::from(r.height) {
+            self.clamped.fetch_add(1, Ordering::Relaxed);
+        }
+        if [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)]
+            .iter()
+            .any(|(dc, dr)| z(r, data, col + dc, row + dr).is_none())
+        {
+            self.filled.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn finish(&self) -> TerrainEdges {
+        use std::sync::atomic::Ordering;
+        TerrainEdges { clamped: self.clamped.load(Ordering::Relaxed), filled: self.filled.load(Ordering::Relaxed), at_most: false }
+    }
+}
+
 /// Draw the interior from three borrowed rows; edges and no-data keep the scalar path. On
 /// `threads` threads (none: as many as pay off). Each output row is made from the
 /// three input rows around it and written where it lies, so rows go on several threads (#1252).
 /// Its cells measured on `ground` when given ([`Raster::cell_size_m_on`]), as the whole raster of
 /// which `r` is a part measures them, else on `r`'s own.
-fn terrain_on(
+fn terrain_counted_on(
     threads: Option<usize>,
     r: &Raster,
     data: &[f32],
     zf: f64,
     ground: Option<&Extent>,
+    core: Option<[usize; 4]>,
     f: impl Fn(f64, f64) -> f64 + Sync,
-) -> Result<Vec<f32>, String> {
+) -> Result<(Vec<f32>, TerrainEdges), String> {
     let (w, h) = (r.width as usize, r.height as usize);
     let cell = ground.map_or_else(|| r.cell_size_m(), |g| r.cell_size_m_on(g));
+    let counts = TerrainCounter::new(core);
     let scalar = |c, row| {
         z(r, data, c, row)?;
         let (x, y) = gradient(r, data, c, row, zf, cell)?;
-        Some(f(x, y))
+        let value = f(x, y);
+        if value.is_finite() {
+            counts.observe(r, data, c, row);
+        }
+        Some(value)
     };
-    let Some(len) = w.checked_mul(h) else { return per_cell(r, 1, scalar) };
+    let Some(len) = w.checked_mul(h) else { return per_cell(r, 1, scalar).map(|pixels| (pixels, counts.finish())) };
     if w < 3 || h < 3 || data.len() != len {
-        return per_cell(r, 1, scalar);
+        return per_cell(r, 1, scalar).map(|pixels| (pixels, counts.finish()));
     }
     let value = |v: Option<f64>| v.filter(|v| v.is_finite()).map(|v| v as f32).unwrap_or(NODATA);
     let mut out = new_band(w, h, NODATA)?;
@@ -249,7 +306,68 @@ fn terrain_on(
             }
         },
     )?;
-    Ok(out)
+    Ok((out, counts.finish()))
+}
+
+/// The terrain operation, with the same defaults and formulas as its standalone entrypoint.
+#[derive(Clone, Copy, Debug)]
+pub enum TerrainFunction {
+    Slope,
+    SlopePercent,
+    Aspect,
+    Hillshade { azimuth: f64, altitude: f64 },
+}
+
+/// Terrain pixels with boundary-treatment counts and percent-slope overflow count. `core` is
+/// the half-open rectangle [left, top, right, bottom] whose outputs the caller retains; None
+/// disables boundary counting. Counts are made while traversing, without another raster pass.
+pub fn terrain_reported(
+    r: &Raster,
+    b: usize,
+    zf: f64,
+    ground: Option<&Extent>,
+    core: Option<[usize; 4]>,
+    function: TerrainFunction,
+) -> Result<(Vec<f32>, TerrainEdges, usize), String> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let data = band(r, b)?;
+    let overflow = AtomicUsize::new(0);
+    let (zen, az) = match function {
+        TerrainFunction::Hillshade { azimuth, altitude } => ((90.0 - altitude).to_radians(), azimuth.to_radians()),
+        _ => (0.0, 0.0),
+    };
+    let (cos_zen, sin_zen, cos_az, sin_az) = (zen.cos(), zen.sin(), az.cos(), az.sin());
+    let (pixels, edges) = terrain_counted_on(None, r, data, zf, ground, core, |gx, gy| match function {
+        TerrainFunction::Slope => gx.hypot(gy).atan().to_degrees(),
+        TerrainFunction::SlopePercent => {
+            let value = 100.0 * gx.hypot(gy);
+            if !value.is_finite() || value > f64::from(f32::MAX) {
+                overflow.fetch_add(1, Ordering::Relaxed);
+                f64::MAX
+            } else {
+                value
+            }
+        }
+        TerrainFunction::Aspect => {
+            if gx.abs() < 1e-12 && gy.abs() < 1e-12 {
+                -1.0
+            } else {
+                (-gx).atan2(-gy).to_degrees().rem_euclid(360.0)
+            }
+        }
+        TerrainFunction::Hillshade { .. } => {
+            let q = 1.0 + gx * gx + gy * gy;
+            let value = if q.is_finite() {
+                (cos_zen - sin_zen * (gy * cos_az + gx * sin_az)) / q.sqrt()
+            } else {
+                let slope = gx.hypot(gy).atan();
+                let aspect = (-gx).atan2(-gy);
+                cos_zen * slope.cos() + sin_zen * slope.sin() * (az - aspect).cos()
+            };
+            rustgis_data::raster::round_positive(value.max(0.0) * 255.0).max(1.0)
+        }
+    })?;
+    Ok((pixels, edges, overflow.load(Ordering::Relaxed)))
 }
 
 /// Slope in degrees.
@@ -260,8 +378,7 @@ pub fn slope(r: &Raster, b: usize, zf: f64) -> Result<Vec<f32>, String> {
 /// [`slope`] of `r`, a part of a raster covering `ground`, its cells measured as the whole's are
 /// ([`Raster::cell_size_m_on`]); `None`: `r` is the whole.
 pub fn slope_on(r: &Raster, b: usize, zf: f64, ground: Option<&Extent>) -> Result<Vec<f32>, String> {
-    let d = band(r, b)?;
-    terrain_on(None, r, d, zf, ground, |gx, gy| gx.hypot(gy).atan().to_degrees())
+    terrain_reported(r, b, zf, ground, None, TerrainFunction::Slope).map(|(pixels, _, _)| pixels)
 }
 
 /// Slope as percent rise: 100 times the gradient magnitude, equivalent to 100 × tan(angle in radians).
@@ -284,19 +401,7 @@ pub const PERCENT_OVERFLOW: &str = "percent slope cells exceed the Float32 range
 /// part of a raster read with a margin, whose cells past the range the caller counts only where
 /// it keeps them.
 pub fn slope_percent_cells_on(r: &Raster, b: usize, zf: f64, ground: Option<&Extent>) -> Result<(Vec<f32>, usize), String> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let d = band(r, b)?;
-    let overflow = AtomicUsize::new(0);
-    let pixels = terrain_on(None, r, d, zf, ground, |gx, gy| {
-        let value = 100.0 * gx.hypot(gy);
-        if !value.is_finite() || value > f64::from(f32::MAX) {
-            overflow.fetch_add(1, Ordering::Relaxed);
-            // Finite, so it isn't taken for no value; infinite as a Float32.
-            return f64::MAX;
-        }
-        value
-    })?;
-    Ok((pixels, overflow.load(Ordering::Relaxed)))
+    terrain_reported(r, b, zf, ground, None, TerrainFunction::SlopePercent).map(|(pixels, _, overflow)| (pixels, overflow))
 }
 
 /// Aspect: the compass direction the slope faces, in degrees (flat cells are -1).
@@ -306,10 +411,7 @@ pub fn aspect(r: &Raster, b: usize) -> Result<Vec<f32>, String> {
 
 /// [`aspect`], as [`slope_on`].
 pub fn aspect_on(r: &Raster, b: usize, ground: Option<&Extent>) -> Result<Vec<f32>, String> {
-    let d = band(r, b)?;
-    terrain_on(None, r, d, 1.0, ground, |gx, gy| {
-        if gx.abs() < 1e-12 && gy.abs() < 1e-12 { -1.0 } else { (-gx).atan2(-gy).to_degrees().rem_euclid(360.0) }
-    })
+    terrain_reported(r, b, 1.0, ground, None, TerrainFunction::Aspect).map(|(pixels, _, _)| pixels)
 }
 
 /// Hillshade (1–255) lit from `azimuth` and `altitude` degrees: a cell in full shadow is 1, so
@@ -328,21 +430,7 @@ pub fn hillshade(r: &Raster, b: usize, azimuth: f64, altitude: f64, zf: f64) -> 
 /// (cos zenith − sin zenith · (gy · cos azimuth + gx · sin azimuth)) / √(1 + p²): a square root a
 /// cell and no trigonometry. Where 1 + p² overflows, the angles are taken instead.
 pub fn hillshade_on(r: &Raster, b: usize, azimuth: f64, altitude: f64, zf: f64, ground: Option<&Extent>) -> Result<Vec<f32>, String> {
-    let d = band(r, b)?;
-    let (zen, az) = ((90.0 - altitude).to_radians(), azimuth.to_radians());
-    let (cos_zen, sin_zen) = (zen.cos(), zen.sin());
-    let (cos_az, sin_az) = (az.cos(), az.sin());
-    terrain_on(None, r, d, zf, ground, |gx, gy| {
-        let q = 1.0 + gx * gx + gy * gy;
-        let v = if q.is_finite() {
-            (cos_zen - sin_zen * (gy * cos_az + gx * sin_az)) / q.sqrt()
-        } else {
-            let slope = gx.hypot(gy).atan();
-            let aspect = (-gx).atan2(-gy);
-            cos_zen * slope.cos() + sin_zen * slope.sin() * (az - aspect).cos()
-        };
-        rustgis_data::raster::round_positive(v.max(0.0) * 255.0).max(1.0)
-    })
+    terrain_reported(r, b, zf, ground, None, TerrainFunction::Hillshade { azimuth, altitude }).map(|(pixels, _, _)| pixels)
 }
 
 /// A band arithmetic expression over `b1`, `b2`… (+ - * / and parentheses, numbers).
@@ -2465,6 +2553,18 @@ impl Expr {
 mod tests {
     use super::*;
 
+    /// Uncounted traversal used by the scalar/parallel equivalence regressions.
+    fn terrain_on(
+        threads: Option<usize>,
+        r: &Raster,
+        data: &[f32],
+        zf: f64,
+        ground: Option<&Extent>,
+        f: impl Fn(f64, f64) -> f64 + Sync,
+    ) -> Result<Vec<f32>, String> {
+        terrain_counted_on(threads, r, data, zf, ground, None, f).map(|(pixels, _)| pixels)
+    }
+
     /// A grid the machine can't hold is an error naming its size, not the end of the program
     /// (#1291); one it can is the size asked for.
     #[test]
@@ -3136,6 +3236,32 @@ mod tests {
             // The cell centred on the last point takes its value.
             assert_eq!(fast.bands[0].data[0], 1234.5, "{neighbours} neighbours");
         }
+    }
+
+    /// Counts belong to valid outputs in the kept rectangle, including at most one of each
+    /// treatment per output. The interior clean control never enters either count.
+    #[test]
+    fn terrain_counts_keep_the_output_basis_and_thread_parity() {
+        let mut values = vec![10.0; 25];
+        values[12] = -9999.0;
+        let gt = GeoTransform { origin_x: 0.0, origin_y: 5.0, pixel_width: 1.0, pixel_height: -1.0 };
+        let mut r = Raster::new("height", 5, 5, vec![values], gt, Crs::WebMercator, Some(-9999.0), ColorHint::Gray, "Float32").unwrap();
+        let f = |x: f64, y: f64| x.hypot(y).atan().to_degrees();
+        let data = band(&r, 0).unwrap();
+        let (want, full) = terrain_counted_on(Some(1), &r, data, 1.0, None, Some([0, 0, 5, 5]), f).unwrap();
+        assert_eq!(full, TerrainEdges { clamped: 16, filled: 8, at_most: false });
+        assert_eq!(want[12], NODATA);
+        for threads in [2, 7] {
+            let (got, counts) = terrain_counted_on(Some(threads), &r, data, 1.0, None, Some([0, 0, 5, 5]), f).unwrap();
+            assert_eq!(got, want);
+            assert_eq!(counts, full);
+        }
+        let (got, inner) = terrain_counted_on(Some(1), &r, data, 1.0, None, Some([1, 1, 4, 4]), f).unwrap();
+        assert_eq!(got, want, "counting a core does not clip the computed raster");
+        assert_eq!(inner, TerrainEdges { clamped: 0, filled: 8, at_most: false });
+        r.bands[0].data[12] = 10.0;
+        let (_, clean) = terrain_counted_on(Some(1), &r, band(&r, 0).unwrap(), 1.0, None, Some([1, 1, 4, 4]), f).unwrap();
+        assert_eq!(clean, TerrainEdges::default());
     }
 
     #[test]

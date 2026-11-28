@@ -436,10 +436,20 @@ impl Blocks {
         cells: impl Fn(&Raster, &rustgis_geom::Extent) -> Result<Vec<f32>, String>,
         shape: Shape,
     ) -> Result<Made, String> {
+        self.run_window(|r, ground, _| cells(r, ground), shape)
+    }
+
+    /// Like run, exposing the kept rectangle in each block's grid so diagnostics do not
+    /// count disposable margin cells again.
+    pub(crate) fn run_window(
+        self,
+        cells: impl Fn(&Raster, &rustgis_geom::Extent, [usize; 4]) -> Result<Vec<f32>, String>,
+        shape: Shape,
+    ) -> Result<Made, String> {
         let Blocks { input, layer, path, out, folder, full, halo, nodata: first } = self;
         let (nodata, kind) = shape.nodata();
-        let cells = |r: &Raster, ground: &rustgis_geom::Extent| -> Result<Vec<f32>, String> {
-            let mut v = cells(r, ground)?;
+        let cells = |r: &Raster, ground: &rustgis_geom::Extent, core: [usize; 4]| -> Result<Vec<f32>, String> {
+            let mut v = cells(r, ground, core)?;
             if shape.bytes {
                 v.iter_mut().filter(|v| !v.is_finite() || **v < 1.0).for_each(|v| *v = 0.0);
             }
@@ -680,7 +690,7 @@ impl Source<'_> {
     /// full grid, its system, and how many values were rounded as they were read.
     fn each_row(
         &self,
-        cells: &impl Fn(&Raster, &rustgis_geom::Extent) -> Result<Vec<f32>, String>,
+        cells: &impl Fn(&Raster, &rustgis_geom::Extent, [usize; 4]) -> Result<Vec<f32>, String>,
         halo: u32,
         mut row: impl FnMut(u32, &[f32], (rustgis_data::raster::GeoTransform, rustgis_data::raster::Crs)) -> Result<(), String>,
     ) -> Result<(rustgis_data::raster::GeoTransform, rustgis_data::raster::Crs, u64), String> {
@@ -700,7 +710,9 @@ impl Source<'_> {
                     // With the cells around it, within the image.
                     let around = |(a, b): (u32, u32), n: u32| (a.saturating_sub(halo), b.saturating_add(halo).min(n));
                     let read = self.block(around((c0, c1), fw), around((r0, r1), fh))?;
-                    let values = cells(&read.0.raster, &read.0.bounds)?;
+                    let (ax, ay) = read.0.at;
+                    let core = [(c0 - ax) as usize, (r0 - ay) as usize, (c1 - ax) as usize, (r1 - ay) as usize];
+                    let values = cells(&read.0.raster, &read.0.bounds, core)?;
                     Ok((read, values))
                 })?;
                 let r = &read.raster;
