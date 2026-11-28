@@ -193,11 +193,7 @@ pub(in crate::cmd::layout) fn publication(s: &mut Session, p: &Value) -> CmdResu
     let strip_scale = grid.as_ref().map_or(k, |g| k * (g.label_size / grid_pt));
     let room_side = if labelled.left || labelled.right { LABEL_ROOM_SIDE * strip_scale } else { 0.0 };
     let room_end = if labelled.top || labelled.bottom { LABEL_ROOM_END * strip_scale } else { 0.0 };
-    let reference = reference.unwrap_or_else(|| {
-        let [projection_line, datum_and_grid] = PUBLICATION_DEFAULT_REFERENCE;
-        let line = if step.is_some() { datum_and_grid } else { "Datum: {datum}" };
-        vec![projection_line.into(), line.into()]
-    });
+    let reference = reference.unwrap_or_else(|| publication_default_reference(step.is_some()).map(Into::into).to_vec());
     let step_said = step.map_or_else(|| "—".to_string(), step_text);
     let fill = |t: &str| t.replace("{projection}", &projection).replace("{datum}", &datum).replace("{grid}", &step_said);
     // Text is measured as it is drawn: bold as bold, and the tokens the layout fills only when it

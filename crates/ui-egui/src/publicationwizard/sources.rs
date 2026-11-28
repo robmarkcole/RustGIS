@@ -21,7 +21,8 @@ pub(super) fn reference_step(ui: &mut egui::Ui, d: &mut Draft) {
 
 /// The reference's box and the tick that leaves it out, as two rows of a step's grid.
 fn reference_rows(ui: &mut egui::Ui, d: &mut Draft) {
-    list(ui, d, tl!("Reference"), Field::Reference, &PUBLICATION_DEFAULT_REFERENCE.join("\n"), 2);
+    let hint = publication_default_reference(d.elements.frame_grid).join("\n");
+    list(ui, d, tl!("Reference"), Field::Reference, &hint, 2);
     ui.label("");
     // Wrapped to the column: a long label would widen the narrowed window.
     let width = field_width(ui);
@@ -490,6 +491,76 @@ mod tests {
                 _ => None,
             });
             assert_eq!(text, Some(want));
+            h.state_mut().run("edit.undo", Value::Null).unwrap();
+            assert_eq!(h.state().session.project.layouts.len(), before);
+        }
+    }
+
+    /// Without a frame grid the review's default names the projection and datum alone, on a sheet
+    /// and on a figure; lines typed and no reference read as with one.
+    #[test]
+    fn without_a_frame_grid_the_default_reference_names_no_graticule() {
+        let with = "The default: projection, datum and graticule, filled in on the sheet";
+        let without = "The default: projection and datum, filled in on the sheet";
+        for size in ["a4", "figure-1col"] {
+            let mut h = at(Step::Review, |d| (d.size, d.elements.frame_grid) = (size.into(), false));
+            assert!(h.query_by_label(without).is_some() && h.query_by_label(with).is_none(), "{size}");
+            h.state_mut().dialogs.publication.as_mut().unwrap().reference = "UTM 23S".into();
+            h.run_steps(4);
+            assert!(h.query_by_label("UTM 23S").is_some() && h.query_by_label(without).is_none(), "{size}");
+            assert_eq!(wizard(&h).params()["reference"], json!(["UTM 23S"]), "{size}");
+            let d = h.state_mut().dialogs.publication.as_mut().unwrap();
+            (d.reference, d.no_reference) = (String::new(), true);
+            h.run_steps(4);
+            assert!(h.query_by_label(without).is_none(), "{size}: left out");
+        }
+    }
+
+    /// The reference's box hints the default's lines, following the frame grid's tick, on a sheet
+    /// and on a figure.
+    #[test]
+    fn the_reference_box_hints_the_default() {
+        let with = "Projection: {projection}\nDatum: {datum} · Graticule: {grid}";
+        let without = "Projection: {projection}\nDatum: {datum}";
+        for (step, size) in [(Step::Sources, "a4"), (Step::Reference, "figure-1col")] {
+            let mut h = at(step, |d| d.size = size.into());
+            let hint = |h: &Wizard| {
+                let edit = h.get_by_role_and_label(Role::MultilineTextInput, "Reference");
+                edit.accesskit_node().placeholder().map(str::to_owned)
+            };
+            assert_eq!(hint(&h).as_deref(), Some(with), "{size}");
+            h.state_mut().dialogs.publication.as_mut().unwrap().elements.frame_grid = false;
+            h.run_steps(4);
+            assert_eq!(hint(&h).as_deref(), Some(without), "{size}");
+        }
+    }
+
+    /// Create draws the default reference with a frame grid and without one, a figure's on one
+    /// line; the frame's grid follows, and Undo takes the layout away.
+    #[test]
+    fn create_draws_the_default_reference() {
+        let sheet = "Projection: Web Mercator\nDatum: WGS 84";
+        let figure = "Projection: Web Mercator · Datum: WGS 84";
+        for (size, graticule, want) in [
+            ("a4", true, format!("{sheet} · Graticule: 30°")),
+            ("a4", false, sheet.to_string()),
+            ("figure-1col", true, format!("{figure} · Graticule: 30°")),
+            ("figure-1col", false, figure.to_string()),
+        ] {
+            let mut h = at(Step::Review, |d| (d.size, d.elements.frame_grid) = (size.into(), graticule));
+            let before = h.state().session.project.layouts.len();
+            click(&mut h, "Create");
+            let layout = h.state().session.project.layouts.last().unwrap();
+            let text = layout.elements.iter().find_map(|e| match &e.kind {
+                ElementKind::Text { text, .. } if e.name == "Reference" => Some(text.as_str()),
+                _ => None,
+            });
+            assert_eq!(text, Some(want.as_str()), "{size} {graticule}");
+            let grid = layout.elements.iter().find_map(|e| match &e.kind {
+                ElementKind::MapFrame { grid, extent_of: None, .. } => Some(grid.is_some()),
+                _ => None,
+            });
+            assert_eq!(grid, Some(graticule), "{size}");
             h.state_mut().run("edit.undo", Value::Null).unwrap();
             assert_eq!(h.state().session.project.layouts.len(), before);
         }

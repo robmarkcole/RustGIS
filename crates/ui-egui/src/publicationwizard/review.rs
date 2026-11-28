@@ -66,7 +66,10 @@ fn reference_value(d: &Draft) -> String {
     match d.left_out(Field::Reference) {
         Some(_) if typed.is_empty() => tl!("(none)").to_string(),
         Some(_) => tl!("(none; the lines typed aren't used)").to_string(),
-        None if typed.is_empty() => tl!("The default: projection, datum and graticule, filled in on the sheet").to_string(),
+        None if typed.is_empty() && d.elements.frame_grid => {
+            tl!("The default: projection, datum and graticule, filled in on the sheet").to_string()
+        }
+        None if typed.is_empty() => tl!("The default: projection and datum, filled in on the sheet").to_string(),
         None => typed,
     }
 }

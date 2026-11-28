@@ -20,7 +20,7 @@ use map::{Area, area_extent, map_step};
 use review::review_step;
 use rustgis_engine::Session;
 use rustgis_engine::cmd::layout::{
-    MAX_PUBLICATION_LINES, MAX_PUBLICATION_TEXT, PUBLICATION_DEFAULT_REFERENCE, PUBLICATION_HEADINGS, PUBLICATION_PROFILES,
+    MAX_PUBLICATION_LINES, MAX_PUBLICATION_TEXT, PUBLICATION_HEADINGS, PUBLICATION_PROFILES, publication_default_reference,
     publication_style_accent,
 };
 use rustgis_engine::geom::Extent;

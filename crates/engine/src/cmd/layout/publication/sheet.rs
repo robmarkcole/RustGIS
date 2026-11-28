@@ -63,10 +63,11 @@ pub const PUBLICATION_DEFAULT_CREDIT: &str = "Made with RustGIS · {date}";
 /// give them.
 pub const PUBLICATION_HEADINGS: [&str; 2] = ["Sources", "Cartographic reference"];
 
-/// The cartographic reference's lines when `"reference"` isn't given, on a sheet with a graticule
-/// (`{projection}`, `{datum}` and `{grid}` are filled with the sheet's). Without one the command
-/// writes the datum alone in place of the second.
-pub const PUBLICATION_DEFAULT_REFERENCE: [&str; 2] = ["Projection: {projection}", "Datum: {datum} · Graticule: {grid}"];
+/// The cartographic reference's lines when `"reference"` isn't given, with a graticule or without
+/// one (`{projection}`, `{datum}` and `{grid}` are filled with the sheet's).
+pub fn publication_default_reference(graticule: bool) -> [&'static str; 2] {
+    ["Projection: {projection}", if graticule { "Datum: {datum} · Graticule: {grid}" } else { "Datum: {datum}" }]
+}
 
 /// The most texts a publication layout takes in one list, such as its sources.
 pub const MAX_PUBLICATION_LINES: usize = 50;

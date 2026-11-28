@@ -57,11 +57,13 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
     `Publication`; the review says when a layout has that name, so the new one is numbered. The
     **elements** are what is drawn around the map: the locator (the default, named as what it will
     be, a globe, an inset or none), the north arrow (auto, always or none), the legend or not, which
-    can be set always on a box and to list the context layers, the colorbar and the scale bar or
-    not, whether the map may be veiled for the legend's room, and the decimal mark; a choice the
-    sheet can't use is off and isn't sent. Under them, the north arrow's style, the scale bar's
-    units and style, and the legend's title and columns (Auto, or 1 to 6) can be picked, and
-    layers ticked to be left out of the legend (every layer of that name). The
+    can be set always on a box and to list the context layers, the colorbar, the scale bar and the
+    frame grid or not (without it the default reference leaves the graticule out; the map's own
+    graticule is still drawn when on), whether the map may be veiled for the legend's room, and the
+    decimal mark; a choice the sheet can't use is off and isn't sent. Under them, the north
+    arrow's style, the scale bar's units and style, and the legend's title and columns (Auto, or 1
+    to 6) can be picked, and layers ticked to be left out of the legend (every layer of that
+    name). The
     **placement** is the arrangement (below): `best`, the favourite, one by name or one saved, or
     **Custom**, a corner for each surround (a corner another has swaps the two; on Panel, Editorial
     and Modular only the north arrow and scale bar take one, the locator and legend sitting in the
@@ -201,8 +203,9 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
     font (the title and headings bold, as drawn) and wrapped to their box, so none runs past it,
     and each box grows to hold them. `{projection}`, `{datum}` and
     `{grid}` are filled from the map when the layout is made. `{date}` and the other dynamic text
-    tokens stay live. The reference defaults to the projection, datum and graticule, and the
-    authorship to "Made with RustGIS · {date}" (`"author": ""` leaves it out). `headings` renames the two columns.
+    tokens stay live. The reference defaults to the projection, datum and graticule (the
+    projection and datum alone with `"grid": "none"`), and the authorship to
+    "Made with RustGIS · {date}" (`"author": ""` leaves it out). `headings` renames the two columns.
   - **The locator** (at the frame's top left unless the data is there): `"locator": "globe"` (a
     sheet's default) adds a separate globe map with simplified copies of the map's visible polygon
     layers held in the project. Streamed layers, rasters, points, lines and labels are left out.

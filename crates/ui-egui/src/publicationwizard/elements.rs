@@ -50,6 +50,8 @@ pub struct Elements {
     pub scale_bar: bool,
     /// Whether the map outside the extent may be veiled for the legend's room.
     pub veil: bool,
+    /// Whether the map frame has its grid; the map's own graticule is drawn either way.
+    pub frame_grid: bool,
     /// A decimal comma rather than a point.
     pub comma: bool,
     pub north_style: ArrowStyle,
@@ -74,6 +76,7 @@ impl Default for Elements {
             colorbar: true,
             scale_bar: true,
             veil: true,
+            frame_grid: true,
             comma: false,
             north_style: ArrowStyle::default(),
             scale_units: ScaleUnits::default(),
@@ -256,6 +259,7 @@ impl Draft {
             ("contextInLegend", (e.context && self.usable(Control::Context, s)).then(|| true.into())),
             ("colorbar", (!e.colorbar && self.usable(Control::Colorbar, s)).then(|| "none".into())),
             ("scaleBar", scale_bar),
+            ("grid", (!e.frame_grid).then(|| "none".into())),
             ("veil", (!e.veil && self.usable(Control::Veil, s)).then(|| false.into())),
             ("decimal", e.comma.then(|| ",".into())),
         ] {
@@ -370,6 +374,7 @@ pub(super) fn elements_value(s: &Session, d: &Draft) -> String {
     push_if(e.context && d.usable(Control::Context, s), tl!("Context layers listed"));
     push_if(d.draws_colorbar(s), tl!("Colorbar"));
     push_if(d.draws_scale_bar(s), &scale);
+    push_if(!e.frame_grid, tl!("No frame grid"));
     push_if(!e.veil && d.usable(Control::Veil, s), tl!("No veil"));
     push_if(true, if e.comma { tl!("Decimal comma") } else { tl!("Decimal point") });
     on.join("\n")
@@ -440,6 +445,7 @@ pub(super) fn elements_step(ui: &mut egui::Ui, s: &Session, d: &mut Draft) {
             tl!(v.label())
         });
     });
+    ui.checkbox(&mut d.elements.frame_grid, tl!("Frame grid"));
     let usable = d.usable(Control::Veil, s);
     let why = if d.column() { tl!("In this style the map isn't veiled.") } else { tl!("There is no legend or colorbar to make room for.") };
     tick(ui, usable, &mut d.elements.veil, tl!("Veil the map outside the extent if the legend needs room"), why);
@@ -549,7 +555,8 @@ mod tests {
     type Wizard = egui_kittest::Harness<'static, RustGisApp>;
 
     /// The keys the step may send.
-    const KEYS: [&str; 9] = ["locator", "northArrow", "legend", "legendBox", "contextInLegend", "colorbar", "scaleBar", "veil", "decimal"];
+    const KEYS: [&str; 10] =
+        ["grid", "locator", "northArrow", "legend", "legendBox", "contextInLegend", "colorbar", "scaleBar", "veil", "decimal"];
 
     /// What the step adds to the command's parameters, by key.
     fn added(s: &Session, d: &Draft) -> Value {
@@ -618,7 +625,8 @@ mod tests {
         let mut app = app();
         raster(&mut app);
         type Set = fn(&mut Elements);
-        let cases: [(Set, Value); 12] = [
+        let cases: [(Set, Value); 13] = [
+            (|e| e.frame_grid = false, json!({"grid": "none"})),
             (|e| e.locator = LocatorChoice::Globe, json!({"locator": "globe"})),
             (|e| e.locator = LocatorChoice::Inset, json!({"locator": "inset"})),
             (|e| e.locator = LocatorChoice::None, json!({"locator": "none"})),
@@ -1235,6 +1243,31 @@ mod tests {
             };
         });
         let want = "Locator: Inset\nLegend\nAlways on a box\nContext layers listed\nColorbar\nNo veil\nDecimal comma";
+        assert!(h.query_by_label(want).is_some());
+    }
+
+    /// The frame grid's box is on, and unticked it sends no grid, on a whole globe too.
+    #[test]
+    fn the_frame_grid_box_sets_the_answer() {
+        for prepare in [(|_| {}) as fn(&mut RustGisApp), globe] {
+            let mut h = step_of(prepare);
+            assert!(!off(&h, "Frame grid"));
+            click_box(&mut h, "Frame grid");
+            assert!(!draft(&h).elements.frame_grid);
+            assert_eq!(draft(&h).sent(&h.state().session)["grid"], "none");
+            click_box(&mut h, "Frame grid");
+            assert!(draft(&h).sent(&h.state().session).get("grid").is_none());
+        }
+    }
+
+    /// The review says a frame grid left out, and nothing for the default.
+    #[test]
+    fn the_review_says_there_is_no_frame_grid() {
+        let mut h = step_of(|app| app.dialogs.publication.as_mut().unwrap().step = Step::Review);
+        assert!(h.query_by_label_contains("No frame grid").is_none());
+        h.state_mut().dialogs.publication.as_mut().unwrap().elements.frame_grid = false;
+        h.run_steps(4);
+        let want = "Locator: Default (globe)\nNorth arrow: Auto (none from 20°)\nLegend\nScale bar\nNo frame grid\nDecimal point";
         assert!(h.query_by_label(want).is_some());
     }
 

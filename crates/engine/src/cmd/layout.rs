@@ -74,7 +74,7 @@ pub fn commands() -> Vec<C> {
                 r#""title"?: text, "#,
                 r#""subtitle"?: text, "#,
                 r#""sources"?: text | [texts] (any of the texts may hold a layer's figure as the layout's texts do: {count:Layer}, {sum:Layer:field}, {mean:…}, {min:…}, {max:…}, filled in when the page is drawn), "#,
-                r#""reference"?: text | [texts] (default: the projection, datum and graticule), "#,
+                r#""reference"?: text | [texts] (default: the projection, datum and graticule; the projection and datum alone with "grid": "none"), "#,
                 r#""note"?: text, "#,
                 r#""author"?: text (default: "Made with RustGIS · {date}"; "" or [] for none), "#,
                 r#""headings"?: [the sources' heading, the reference's heading, an editorial column's heading], "#,
