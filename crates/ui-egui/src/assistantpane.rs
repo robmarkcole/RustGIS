@@ -155,6 +155,16 @@ fn provider_settings(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens, cfg: &mut Co
             .response
             .labelled_by(provider_label.id);
         ui.end_row();
+        if let Some(p) = provider::preset(&cfg.provider) {
+            ui.label("");
+            let description = if p.login || matches!(p.id, "custom" | "ollama") {
+                tl!(p.description).to_owned()
+            } else {
+                crate::i18n::fmt("At the default address: {description}", &[("description", crate::tl_raw!(p.description))])
+            };
+            ui.add(egui::Label::new(RichText::new(description).small().color(t.text_dim)).wrap());
+            ui.end_row();
+        }
         if cfg.login() {
             ui.label(tl!("Account"));
             ui.vertical(|ui| account_row(app, ui, t, cfg));
@@ -234,6 +244,10 @@ fn provider_settings(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens, cfg: &mut Co
         ui.end_row();
     });
     let preset = provider::preset(&cfg.provider);
+    if cfg.provider == "openrouter" {
+        ui.checkbox(&mut cfg.openrouter_private, tl!("Private routing"))
+            .on_hover_text(tl!("Ask OpenRouter to exclude endpoints that collect request data. Turning this off permits more endpoints, subject to your OpenRouter account settings."));
+    }
     let mut notes = Vec::new();
     if cfg.login() {
         notes.push(sign_in_storage_note(app.assistant.account.as_ref().filter(|_| !cfg.key.is_empty())));
@@ -1630,6 +1644,7 @@ pub(crate) mod tests {
                 client_id: String::new(),
                 session: String::new(),
                 reasoning: None,
+                openrouter_private: true,
                 tool_output_token_limit: rustgis_assistant::tools::DEFAULT_OUTPUT_TOKENS,
             };
             let mut agent = Agent::new(config, &app.session);
@@ -2112,6 +2127,7 @@ pub(crate) mod tests {
             client_id: String::new(),
             session: String::new(),
             reasoning: None,
+            openrouter_private: true,
             tool_output_token_limit: rustgis_assistant::tools::DEFAULT_OUTPUT_TOKENS,
         };
         app.assistant.agent = Some(Agent::new(cfg.clone(), &app.session));
@@ -2133,6 +2149,7 @@ pub(crate) mod tests {
             client_id: String::new(),
             session: String::new(),
             reasoning: None,
+            openrouter_private: true,
             tool_output_token_limit: rustgis_assistant::tools::DEFAULT_OUTPUT_TOKENS,
         };
         let mut agent = Agent::new(cfg.clone(), &app.session);
@@ -2141,6 +2158,25 @@ pub(crate) mod tests {
         app.assistant.agent = Some(agent);
         app.assistant.inflight = Some((generation, Slot::default()));
         apply_config(&mut app, Config { provider: "openai".into(), ..cfg });
+        let agent = app.assistant.agent.as_ref().unwrap();
+        assert!(!agent.busy());
+        assert_ne!(agent.generation(), generation);
+        assert!(app.assistant.inflight.is_none());
+    }
+
+    #[test]
+    fn openrouter_privacy_change_stops_the_previous_request() {
+        let mut app = RustGisApp::with_sample();
+        let mut cfg = Config::from_env("openrouter");
+        cfg.key = "k".into();
+        cfg.openrouter_private = false;
+        let mut agent = Agent::new(cfg.clone(), &app.session);
+        assert!(matches!(agent.ask("hello", &app.session), Step::Send(_)));
+        let generation = agent.generation();
+        app.assistant.agent = Some(agent);
+        app.assistant.inflight = Some((generation, Slot::default()));
+        cfg.openrouter_private = true;
+        apply_config(&mut app, cfg);
         let agent = app.assistant.agent.as_ref().unwrap();
         assert!(!agent.busy());
         assert_ne!(agent.generation(), generation);

@@ -439,6 +439,7 @@ mod tests {
             client_id: String::new(),
             session: String::new(),
             reasoning: None,
+            openrouter_private: true,
             tool_output_token_limit: rustgis_assistant::tools::DEFAULT_OUTPUT_TOKENS,
         };
         app.assistant.agent = Some(rustgis_assistant::Agent::new(cfg, &app.session));

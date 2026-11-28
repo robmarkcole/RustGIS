@@ -683,6 +683,7 @@ mod tests {
             client_id: String::new(),
             session: String::new(),
             reasoning: None,
+            openrouter_private: true,
             tool_output_token_limit: rustgis_assistant::tools::DEFAULT_OUTPUT_TOKENS,
         };
         let app = h.state_mut();

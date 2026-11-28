@@ -181,6 +181,9 @@ fn load_config(app: &mut RustGisApp, provider: &str, ctx: &egui::Context) -> Con
     if let Some(u) = pref(app, &provider::url_pref(provider)).filter(|_| !c.login()) {
         c.base_url = u;
     }
+    if provider == "openrouter" {
+        c.openrouter_private = pref(app, provider::OPENROUTER_PRIVATE_PREF).as_deref() != Some("off");
+    }
     if !c.login() {
         let legacy = pref(app, &format!("assistant_key_{provider}"));
         #[cfg(not(target_arch = "wasm32"))]
@@ -416,6 +419,9 @@ pub(crate) fn save_config(app: &mut RustGisApp, c: &Config, ctx: &egui::Context)
     save_pref(app, provider::PROVIDER_PREF, &c.provider);
     save_pref(app, &format!("assistant_model_{}", c.provider), c.model.trim());
     save_pref(app, &provider::url_pref(&c.provider), c.base_url.trim());
+    if c.provider == "openrouter" {
+        save_pref(app, provider::OPENROUTER_PRIVATE_PREF, provider::remember_key_value(c.openrouter_private));
+    }
     // A key from the environment stays there; a sign-in's tokens live in their own file.
     let from_env = Config::from_env(&c.provider).key;
     if c.login() {
@@ -552,12 +558,13 @@ pub(crate) fn list_models(app: &mut RustGisApp, cfg: &Config, ctx: &egui::Contex
     app.assistant.models_slot = Some(dispatch(app, req, cfg.login().then(|| cfg.binding()), None, ctx));
 }
 
-/// Replaces provider settings and stops work bound to a different provider or sign-in.
+/// Replaces settings, stopping work when its provider, sign-in or OpenRouter privacy policy changes.
 pub(crate) fn apply_config(app: &mut RustGisApp, cfg: Config) {
-    let another = app
-        .assistant
-        .config()
-        .is_some_and(|c| c.provider != cfg.provider || (c.login() && (c.binding() != cfg.binding() || c.key != cfg.key)));
+    let another = app.assistant.config().is_some_and(|c| {
+        c.provider != cfg.provider
+            || (c.provider == "openrouter" && c.openrouter_private != cfg.openrouter_private)
+            || (c.login() && (c.binding() != cfg.binding() || c.key != cfg.key))
+    });
     if another {
         stop(app);
     }

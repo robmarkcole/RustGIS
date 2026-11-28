@@ -36,6 +36,7 @@ fn sample() -> Session {
     s
 }
 
+/// Deterministic provider defaults with a synthetic key and private routing enabled.
 fn cfg(provider: &str) -> Config {
     let p = preset(provider).unwrap_or(&PRESETS[0]);
     Config {
@@ -47,6 +48,7 @@ fn cfg(provider: &str) -> Config {
         client_id: String::new(),
         session: String::new(),
         reasoning: None,
+        openrouter_private: true,
         tool_output_token_limit: crate::tools::DEFAULT_OUTPUT_TOKENS,
     }
 }
@@ -5427,4 +5429,31 @@ fn a_message_joining_one_left_unanswered_takes_no_more_than_four_pictures() {
     assert!(text.contains("a1.jpg") && text.contains("no longer attached"), "{text}");
     let said = "A message takes at most 4 pictures: a1.jpg, a2.jpg, a3.jpg, a4.jpg left out.";
     assert!(a.transcript.iter().any(|e| matches!(e, Entry::Note(n) if n.to_string() == said)));
+}
+
+#[test]
+fn openrouter_private_routing_filters_only_openrouter_and_can_be_disabled() {
+    let mut c = cfg("openrouter");
+    let body = |c: &Config| -> Value { serde_json::from_str(&chat_request(c, "system", &[], &[]).body.unwrap()).unwrap() };
+    assert_eq!(body(&c)["provider"], json!({"data_collection":"deny"}));
+    c.openrouter_private = false;
+    assert!(body(&c).get("provider").is_none());
+    for p in PRESETS.iter().filter(|p| p.api == Api::OpenAi && p.id != "openrouter") {
+        assert!(body(&cfg(p.id)).get("provider").is_none(), "{}", p.id);
+    }
+}
+
+#[test]
+fn openrouter_data_policy_refusal_names_the_privacy_checkbox() {
+    let mut session = sample();
+    let mut a = Agent::new(cfg("openrouter"), &session);
+    assert!(matches!(a.ask("hello", &session), Step::Send(_)));
+    let response = HttpResponse {
+        status: 404,
+        headers: vec![],
+        body: br#"{"error":{"message":"No endpoints found matching your data policy"}}"#.to_vec(),
+    };
+    let generation = a.generation();
+    assert!(matches!(a.receive(generation, Ok(response), &mut session), Step::Done));
+    assert!(a.transcript.iter().any(|e| matches!(e, Entry::Note(n) if n.template.contains("Check Private routing"))));
 }
