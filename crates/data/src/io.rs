@@ -3298,7 +3298,7 @@ pub(crate) fn read_rows(
     let gt = if xy.is_some() { GeometryType::Point } else { GeometryType::None };
     let mut ds = Dataset::new(name, gt, fields);
     let mut srid: Option<u32> = None;
-    let (mut unread_dates, mut null_text) = (Vec::new(), Vec::new());
+    let (mut unread_dates, mut null_text, mut whitespace) = (Vec::new(), Vec::new(), Vec::new());
     for (k, &i) in columns.iter().enumerate() {
         crate::source::unread_dates_by(&mut unread_dates, k, workbook.and_then(|(_, empty)| empty.get(i)).copied().unwrap_or(0));
     }
@@ -3367,6 +3367,9 @@ pub(crate) fn read_rows(
                     crate::source::null_text_at(&mut null_text, k);
                 }
                 let value = Value::parse_file(&text, f.ty);
+                if value.is_null() && f.ty != FieldType::Text && !text.is_empty() && text.trim().is_empty() {
+                    crate::source::null_text_at(&mut whitespace, k);
+                }
                 // The marker is counted once, as one, not also as a date that isn't one.
                 if f.ty.is_temporal() && !marker && !text.trim().is_empty() && value.is_null() {
                     crate::source::unread_date(&mut unread_dates, k);
@@ -3473,6 +3476,14 @@ pub(crate) fn read_rows(
     report.unread_dates = crate::source::unread_dates_note(&ds.fields, &unread_dates);
     report.messages.extend(report.unread_dates.clone());
     report.messages.extend(crate::source::null_text_note(&ds.fields, &null_text));
+    let total: usize = whitespace.iter().sum();
+    if total > 0 {
+        let what = if total == 1 { "1 whitespace-only value was".into() } else { format!("{total} whitespace-only values were") };
+        report.messages.push(crate::loss::Note::loss(
+            crate::loss::LossCode::DroppedValue,
+            format!("{what} read as empty (null), in {}", named_fields(&ds.fields, &whitespace)),
+        ));
+    }
     Ok((ds, report))
 }
 
@@ -8701,6 +8712,21 @@ mod tests {
         assert_eq!(column("code"), Some(vec![Value::Int(5), Value::Int(6)]));
         let clean = text_layer(&["code"], &[&[Some("5")], &[Some("6")]]);
         assert!(losses(&clean).is_empty());
+    }
+
+    #[test]
+    fn csv_counts_only_whitespace_values_that_numeric_typing_loses() {
+        let csv = "value,note\n1,keep\n\" \",\" \"\n\"  \",two\n\"\t\",three\n\" \t \",four\n,empty\n<Null>,marker\n";
+        let (ds, report) = read_csv(csv, "typed").unwrap();
+        assert_eq!(ds.fields[0].ty, FieldType::Integer);
+        assert_eq!(ds.value(1, 0), &Value::Null);
+        assert_eq!(ds.value(1, 1), &Value::Text(" ".into()));
+        let losses = report.messages.iter().filter(|n| n.contains("whitespace-only")).collect::<Vec<_>>();
+        assert_eq!(losses.len(), 1, "{:?}", report.messages);
+        assert_eq!(losses[0].loss, Some(crate::loss::LossCode::DroppedValue));
+        assert_eq!(losses[0].as_str(), "4 whitespace-only values were read as empty (null), in 'value'");
+        let (_, clean) = read_csv("value,note\n1,keep\n,empty\n", "clean").unwrap();
+        assert!(clean.messages.iter().all(|n| !n.contains("whitespace-only")));
     }
 
     /// CSV and dBase read text `<Null>`, in any case and with spaces around it, as null.
