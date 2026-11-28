@@ -258,6 +258,17 @@ impl RasterLayer {
         self.in_place || self.tiled
     }
 
+    /// Whether a read of its pixels is still under way.
+    pub fn is_reading(&self) -> bool {
+        self.opening.is_some()
+    }
+
+    /// Whether its style is a placeholder until its pixels land: how it draws, by classes or not,
+    /// isn't known yet.
+    pub fn awaits_style(&self) -> bool {
+        self.restyle
+    }
+
     /// Detaches a fully read replacement from the prior opening's pending reads and notices.
     pub fn reset_replacement_read(&mut self) {
         self.read_generation = next_read_generation();

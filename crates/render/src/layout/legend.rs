@@ -52,12 +52,14 @@ pub(super) fn failed_source_error(map: &Map, failed_source: Option<u64>) -> Opti
     layer.source.as_ref()?.read_error().map(|why| format!("{}: {why}", layer.name))
 }
 
-/// Complete-source legends retain one minimal value per used class, never its geometry.
-/// A failed traversal returns its live layer identity for the page's source-error report.
+/// Complete-source legends retain one minimal value per used class, never its geometry. A layer
+/// named in `exclude` isn't read from its source. A failed traversal returns its live layer
+/// identity for the page's source-error report.
 pub(super) fn complete_shown_legends(
     map: &mut Map,
     scale: f64,
     show_no_data: bool,
+    exclude: &[String],
     failed_source: &mut Option<u64>,
     env: &Env,
 ) -> Option<Vec<(u32, Vec<LegendEntry>)>> {
@@ -66,8 +68,15 @@ pub(super) fn complete_shown_legends(
         return Some(shown_legends(map, scale, show_no_data, env));
     }
     let style_env = env.at_scale(Some(scale));
-    let wanted: Vec<usize> =
-        map.layers.iter().enumerate().filter(|(_, l)| map.draws_at(l, scale) && legend_lists(l)).map(|(i, _)| i).collect();
+    // A layer left out is not read: its rows aren't listed, and its failure doesn't stop the rest.
+    let excluded = |name: &str| exclude.iter().any(|n| n.eq_ignore_ascii_case(name));
+    let wanted: Vec<usize> = map
+        .layers
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| map.draws_at(l, scale) && legend_lists(l) && !excluded(&l.name))
+        .map(|(i, _)| i)
+        .collect();
     let mut out = Vec::new();
     for index in wanted {
         let layer = map.layers.get_mut(index)?;
@@ -1217,9 +1226,10 @@ pub(super) fn legend_picture(pm: &mut Canvas, r: Rect, y: f32, pic: &Pixmap, ppp
 /// its rows as [`legend`] draws them, the classes a frame shows at the renderer's scale denominator
 /// `scale` (as the layout finds it for a frame, a complete source read through as [`render`] reads
 /// it), or every class with `all_classes`. For sizing a legend to its content. `None` when a
-/// complete source can't be read, as [`render`] then draws no page. A WMS or WMTS layer's legend
-/// picture still on its way isn't waited for, nor counted ([`tile_legends_pending`] says whether
-/// one is). Its layers' rows are measured by the `labels` it shows for them, else their names.
+/// listed layer's complete source can't be read; one in `exclude` isn't read. A WMS or WMTS
+/// layer's legend picture still on its way isn't waited for, nor counted
+/// ([`tile_legends_pending`] says whether one is). Its layers' rows are measured by the `labels`
+/// it shows for them, else their names.
 pub fn legend_sizes_mm(
     map: &mut Map,
     scale: f64,
@@ -1288,10 +1298,11 @@ pub struct LegendFitted {
 }
 
 /// The rows of the legend `asked` of `map` at the renderer's scale denominator `scale`, as the
-/// drawing makes them, given to `with`. `None` when a complete source can't be read.
+/// drawing makes them, given to `with`. `None` when a listed layer's complete source can't be read.
 fn asked_rows<T>(map: &mut Map, scale: f64, asked: &LegendAsked, with: impl FnOnce(&[LegendRow]) -> T) -> Option<T> {
     let LegendAsked { all_classes, hide_other, show_no_data, layer_names, text_size, exclude, labels, class_labels } = *asked;
-    let drawn = if all_classes { None } else { Some(complete_shown_legends(map, scale, show_no_data, &mut None, &Env::default())?) };
+    let drawn =
+        if all_classes { None } else { Some(complete_shown_legends(map, scale, show_no_data, exclude, &mut None, &Env::default())?) };
     let size = legend_size(text_size);
     let opts = LegendOptions { show_no_data, hide_other, names: layer_names, exclude, labels, class_labels, scale, size, text_size };
     Some(with(&legend_rows(map, drawn.as_deref(), &opts)))
@@ -1337,7 +1348,7 @@ fn measure_mm(m: Measured, columns: usize) -> (f64, f64) {
 /// The columns and text size the legend `asked` of `map` at the renderer's scale denominator
 /// `scale` is drawn at under its `fit` from its `columns`, in a room of `room_mm` (its box less its
 /// title, as [`legend_title_mm`] gives it), and whether it is still wider or taller than that: the
-/// drawing's own rule ([`fit_legend`]). `None` when a complete source can't be read.
+/// drawing's own rule ([`fit_legend`]). `None` when a listed layer's complete source can't be read.
 pub fn legend_fitted_mm(
     map: &mut Map,
     scale: f64,

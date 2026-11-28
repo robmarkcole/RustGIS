@@ -1163,15 +1163,36 @@ pub(in crate::cmd::layout) fn publication(s: &mut Session, p: &Value) -> CmdResu
             (fw * 0.3, fh * 0.25)
         }
     };
-    // Whether a layer the legend isn't asked to leave out may have rows in it.
-    let listed = legend.as_ref().is_some_and(|legend| {
-        let asked_out = |name: &str| legend.exclude.iter().any(|n| n.eq_ignore_ascii_case(name));
-        s.map().layers.iter().any(|l| s.map().shows(l) && crate::render::layout::legend_lists(l) && !asked_out(&l.name))
+    // Of the layers the legend lists, or may list once read (a raster still without its style):
+    // whether one is still reading, and whether a raster's read failed, leaving it no classes to
+    // measure. Those it leaves out, asked or as context, count for neither.
+    let (listed_reading, listed_failed) = legend.as_ref().map_or((false, false), |legend| {
+        let out = legend.left_out(&context);
+        s.map().layers.iter().filter(|l| s.map().draws_at(l, render_scale) && !out.iter().any(|n| n.eq_ignore_ascii_case(&l.name))).fold(
+            (false, false),
+            |(reading, failed), l| {
+                let lists = crate::render::layout::legend_lists(l);
+                let raster = l.raster.as_ref();
+                (
+                    reading
+                        || raster.is_some_and(|r| r.is_reading() && (lists || r.awaits_style()))
+                        || (lists && l.source.as_ref().is_some_and(|src| src.is_pending())),
+                    failed || (lists && raster.is_some_and(|r| r.error.is_some() && r.data.is_none() && !r.is_reading())),
+                )
+            },
+        )
     });
-    if reading && listed {
+    let unread = if reading && listed_reading {
+        Some("the legend's classes aren't known yet (a layer still reading): it has a fixed size to fit by hand")
+    } else if listed_failed {
+        Some("a layer the legend lists couldn't be read, so the legend has a fixed size to fit by hand")
+    } else {
+        None
+    };
+    if let Some(why) = unread {
         (cw, ch) = (cw.max(fw * 0.3), ch.max(fh * 0.25));
         sizes = None;
-        warnings.push("the legend's classes aren't known yet (a layer still reading): it has a fixed size to fit by hand".into());
+        warnings.push(why.into());
     } else if pictures_pending(s, render_scale) {
         // Not waited for: a slow legend server would hold the command up.
         (cw, ch) = (cw.max(fw * 0.3), ch.max(fh * 0.25));

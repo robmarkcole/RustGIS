@@ -799,7 +799,7 @@ fn layout_no_data_legend_follows_the_frame() {
     .unwrap();
     let fallback = l.renderer.symbol_for(&l.dataset, 2);
     let listed = |map: &mut Map, all: bool, show: bool| {
-        let drawn = (!all).then(|| complete_shown_legends(map, 1e6, show, &mut None, &Env::default()).unwrap());
+        let drawn = (!all).then(|| complete_shown_legends(map, 1e6, show, &[], &mut None, &Env::default()).unwrap());
         let opts = LegendOptions {
             show_no_data: show,
             hide_other: true,

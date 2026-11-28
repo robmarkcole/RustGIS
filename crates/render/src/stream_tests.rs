@@ -683,6 +683,36 @@ fn legend_sizing_clears_recovered_source_errors_and_reports_a_later_failure() {
 }
 
 #[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn legend_sizing_reads_no_source_the_legend_leaves_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("classes.shp");
+    let mut ds = Dataset::new("classes", GeometryType::Point, vec![]);
+    ds.push(Some(Geometry::Point(Coord::new(0.0, 0.0))), vec![]);
+    rustgis_data::io::write_path(&ds, &path).unwrap();
+    let source = SourceLayer::from_path(path.to_string_lossy(), None, rustgis_data::source::open_path(&path, None).unwrap());
+    let mut map = Map::new("legend exclude");
+    let id = map.add_streamed("Survey classes", source);
+    // A listed layer beside it, so the legend has rows to measure.
+    map.add_dataset(ds);
+    std::fs::remove_file(&path).unwrap();
+    let mut sized = |exclude: &[String]| {
+        layout::legend_sizes_with_no_data_mm(
+            &mut map,
+            300000.0,
+            false,
+            false,
+            (false, rustgis_map::layout::LEGEND_TEXT_PT),
+            (exclude, &Default::default()),
+        )
+    };
+    // Left out, under any capitalisation: not read, and the layers listed are measured.
+    assert!(sized(&["survey CLASSES".to_string()]).is_some());
+    assert!(sized(&[]).is_none());
+    assert!(map.layer_mut(id).unwrap().source.as_ref().unwrap().error.is_some());
+}
+
+#[test]
 fn chunked_label_compaction_keeps_late_priorities_stable_ties_and_nan_order() {
     let candidates: Vec<Candidate> = (0..50_003)
         .map(|i| {

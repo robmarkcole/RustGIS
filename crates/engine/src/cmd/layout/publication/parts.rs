@@ -130,7 +130,7 @@ impl PublicationLegend {
     /// The legend's size in each number of columns the placement tries, in mm, its text `text_pt`
     /// points, at the renderer's scale denominator `scale`, with its title when it has rows. A
     /// legend asked for some columns has that size in every one, so the placement has no other to
-    /// pick. `None` when a complete source can't be read.
+    /// pick. `None` when a listed layer's complete source can't be read.
     pub(super) fn sizes(
         &self,
         map: &mut Map,

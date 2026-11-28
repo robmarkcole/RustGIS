@@ -488,6 +488,97 @@ fn a_publication_legend_does_not_wait_for_a_layer_it_leaves_out() {
 }
 
 #[test]
+fn a_publication_legend_is_sized_while_only_a_layer_it_leaves_out_reads() {
+    let points = temp("sites.geojson");
+    let point = json!({"type": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [5.0, 5.0]}});
+    std::fs::write(&points, json!({"type": "FeatureCollection", "features": [point]}).to_string()).unwrap();
+    let mut s = Session::new(Project::default());
+    s.run("layer.addData", &json!({"path": points.display().to_string()})).unwrap();
+    // A raster read in place from a host that never answers: still reading throughout.
+    let host = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = format!("http://{}/depth.tif", host.local_addr().unwrap());
+    let mut raster = rustgis_map::raster::RasterLayer::opening_in_place(address);
+    raster.style.renderer = rustgis_map::raster::RasterRenderer::Colormap;
+    s.map_mut().add_raster("Depth".to_string(), raster);
+    let mut said = |legend: Value| {
+        let p = json!({"profile": "a4-portrait", "extent": [0, 0, 10, 10], "colorbar": "none", "legend": legend});
+        s.run("layout.publication", &p).unwrap()["warnings"].to_string()
+    };
+    let listed = said(json!({}));
+    assert!(listed.contains("classes aren't known yet"), "{listed}");
+    let left_out = said(json!({"exclude": ["depth"]}));
+    assert!(!left_out.contains("classes aren't known yet") && !left_out.contains("fixed size"), "{left_out}");
+    let _ = std::fs::remove_file(points);
+}
+
+#[test]
+fn a_publication_legend_waits_for_a_raster_whose_style_isnt_known_yet() {
+    let points = temp("stations.geojson");
+    let point = json!({"type": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [5.0, 5.0]}});
+    std::fs::write(&points, json!({"type": "FeatureCollection", "features": [point]}).to_string()).unwrap();
+    let mut s = Session::new(Project::default());
+    s.run("layer.addData", &json!({"path": points.display().to_string()})).unwrap();
+    // Added and not yet read, from a host that never answers: a placeholder style until its pixels
+    // say whether it draws classes.
+    let host = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = format!("http://{}/cover.tif", host.local_addr().unwrap());
+    s.map_mut().add_raster("Cover".to_string(), rustgis_map::raster::RasterLayer::opening_in_place(address));
+    let mut said = |legend: Value| {
+        let p = json!({"profile": "a4-portrait", "extent": [0, 0, 10, 10], "colorbar": "none", "legend": legend});
+        s.run("layout.publication", &p).unwrap()["warnings"].to_string()
+    };
+    let listed = said(json!({}));
+    assert!(listed.contains("classes aren't known yet"), "{listed}");
+    let left_out = said(json!({"exclude": ["Cover"]}));
+    assert!(!left_out.contains("fixed size"), "{left_out}");
+    let _ = std::fs::remove_file(points);
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_publication_legend_is_sized_past_an_unreadable_source_it_leaves_out() {
+    let path = temp("survey.shp");
+    let mut ds = rustgis_data::Dataset::new("sites", rustgis_data::GeometryType::Point, vec![]);
+    ds.push(Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(5.0, 5.0))), vec![]);
+    rustgis_data::io::write_path(&ds, &path).unwrap();
+    let handle = rustgis_data::source::open_path(&path, None).unwrap();
+    let source = rustgis_map::source::SourceLayer::from_path(path.to_string_lossy(), None, handle);
+    let mut s = Session::new(Project::default());
+    s.map_mut().add_streamed("Survey", source);
+    s.map_mut().add_dataset(ds);
+    std::fs::remove_file(&path).unwrap();
+    let p = json!({"profile": "a4-portrait", "extent": [0, 0, 10, 10], "legend": {"exclude": ["Survey"]}});
+    let said = s.run("layout.publication", &p).unwrap()["warnings"].to_string();
+    for ext in ["shx", "dbf", "prj", "cpg"] {
+        let _ = std::fs::remove_file(path.with_extension(ext));
+    }
+    assert!(!said.contains("so the legend has a fixed size"), "{said}");
+}
+
+#[test]
+fn a_publication_legend_has_a_fixed_size_for_a_listed_raster_that_failed() {
+    let points = temp("wells.geojson");
+    let point = json!({"type": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [5.0, 5.0]}});
+    std::fs::write(&points, json!({"type": "FeatureCollection", "features": [point]}).to_string()).unwrap();
+    let mut s = Session::new(Project::default());
+    s.run("layer.addData", &json!({"path": points.display().to_string()})).unwrap();
+    // A classified raster whose read failed: no pixels, so none of its classes.
+    let mut raster = rustgis_map::raster::RasterLayer::unread_in_place("https://example.invalid/soil.tif");
+    raster.style.renderer = rustgis_map::raster::RasterRenderer::Colormap;
+    raster.fail("the host is gone");
+    s.map_mut().add_raster("Soil".to_string(), raster);
+    let mut said = |legend: Value| {
+        let p = json!({"profile": "a4-portrait", "extent": [0, 0, 10, 10], "colorbar": "none", "legend": legend});
+        s.run("layout.publication", &p).unwrap()["warnings"].to_string()
+    };
+    let listed = said(json!({}));
+    assert!(listed.contains("couldn't be read, so the legend has a fixed size"), "{listed}");
+    let left_out = said(json!({"exclude": ["Soil"]}));
+    assert!(!left_out.contains("fixed size"), "{left_out}");
+    let _ = std::fs::remove_file(points);
+}
+
+#[test]
 fn a_publication_legend_lists_the_layers_asked_to_leave_out_first() {
     // A loaded project keeps the first `MAX_LEGEND_EXCLUDED` names: those asked come first.
     let mut s = world();
