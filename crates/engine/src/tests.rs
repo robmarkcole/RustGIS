@@ -31296,17 +31296,17 @@ fn csv_and_gpx_exports_say_what_they_leave_out() {
     assert!(n.iter().any(|t| t.contains("'height'")) && n.iter().any(|t| t.contains("tracks")), "{n:?}");
     let n = said(&mut s, "data.convert", json!({"layer": "Areas", "format": "csv"}));
     assert!(n.iter().any(|t| t.contains("wasn't written, only the attributes")), "{n:?}");
-    // Both formats count the row without geometry and name the omitted null field.
+    // Both formats count the row without geometry; KML also declares the all-null field.
     let mut rows = layer("Rows", GeometryType::Point, vec![(Geometry::Point(Coord::new(1.0, 2.0)), vec![V::Text("P".into()), V::Null])]);
     rows.push(None, vec![V::Text("no place".into()), V::Null]);
     s.map_mut().add_dataset(rows);
     for format in ["kml", "gpx"] {
         let n = said(&mut s, "data.convert", json!({"layer": "Rows", "format": format}));
         assert!(n.iter().any(|t| t.contains("1 features without drawable geometry were left out")), "{format}: {n:?}");
-        assert_eq!(n.len(), 2, "{format}: {n:?}");
         if format == "kml" {
-            assert!(n.iter().any(|t| t.contains("KML omitted 1 field with no values in the placemarks written ('height')")), "{n:?}");
+            assert_eq!(n.len(), 1, "{n:?}");
         } else {
+            assert_eq!(n.len(), 2, "{n:?}");
             assert!(n.iter().any(|t| t.contains("1 field wasn't written: 'height'")), "{n:?}");
         }
     }

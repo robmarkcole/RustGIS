@@ -110,13 +110,33 @@ fn text(out: Vec<u8>) -> crate::Result<String> {
     String::from_utf8(out).map_err(|e| crate::DataError::Format(e.to_string()))
 }
 
+/// The opaque text identifier written with explicit XML Schema string typing. Loss prediction
+/// uses the same rule, because these values are neither trimmed nor inferred on re-import.
+pub(crate) fn kml_typed_string(field: &crate::Field) -> bool {
+    field.name == "id" && field.ty == crate::FieldType::Text
+}
+
 /// [`to_kml`]'s document, written to `out` as it is made.
 pub(crate) fn write_kml(ds: &Dataset, name_field: Option<usize>, out: &mut impl Write) -> crate::Result<()> {
-    write!(
+    out.write_all(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<kml xmlns=\"http://www.opengis.net/kml/2.2\"")?;
+    writeln!(
         out,
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<kml xmlns=\"http://www.opengis.net/kml/2.2\"><Document><name>{}</name>\n",
+        " xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xs=\"http://www.w3.org/2001/XMLSchema\"><Document><name>{}</name>",
         xml(&ds.name, "KML", || "layer name".to_string())?
     )?;
+    // Declare columns independently of populated values, so all-null columns survive a read.
+    out.write_all(b"<Schema id=\"fields\">")?;
+    for field in &ds.fields {
+        crate::progress::check()?;
+        let name = xml(&field.name, "KML", || format!("{}, field name '{}'", ds.name, field.name.escape_debug()))?
+            .replace('\t', "&#9;")
+            .replace('\n', "&#10;");
+        // ExtendedData's Data/value entries are text. Keep their inferred-reader behavior;
+        // a 64-bit integer must not be mislabeled as KML's 32-bit int type.
+        let ty = "string";
+        write!(out, "<SimpleField name=\"{name}\" type=\"{ty}\"/>")?;
+    }
+    out.write_all(b"</Schema>\n")?;
     // KML's description is text. Other types and differently-cased columns stay in
     // ExtendedData, where the reader preserves their values and reports name collisions.
     let description = ds.fields.iter().position(|f| f.name == "description" && f.ty == crate::FieldType::Text);
@@ -147,7 +167,10 @@ pub(crate) fn write_kml(ds: &Dataset, name_field: Option<usize>, out: &mut impl 
                 let name = xml(&fd.name, "KML", || format!("{}, field name '{}'", ds.name, fd.name.escape_debug()))?
                     .replace('\t', "&#9;")
                     .replace('\n', "&#10;");
-                Ok(format!("<Data name=\"{name}\"><value>{value}</value></Data>"))
+                // An opaque source id can look numeric, including ids accepted from malformed
+                // XML ID attributes. Explicit string typing keeps its exact spelling on read.
+                let ty = if kml_typed_string(fd) { " xsi:type=\"xs:string\"" } else { "" };
+                Ok(format!("<Data name=\"{name}\"><value{ty}>{value}</value></Data>"))
             })
             .collect::<crate::Result<String>>()?;
         write!(

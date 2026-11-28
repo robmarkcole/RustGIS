@@ -83,11 +83,13 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<Layer>> {
         duplicate_placemarks: 0,
         rows: Vec::new(),
         keys: Vec::new(),
+        string_keys: Default::default(),
         skipped: 0,
         geometry_losses: GeometryLosses::default(),
     };
     r.collect_styles(doc.root());
     r.walk(doc.root(), &mut Vec::new(), 0);
+    r.collect_fields(doc.root());
     Ok(r.layers(&name))
 }
 
@@ -192,6 +194,7 @@ fn ground_overlays_within(file_name: &str, bytes: &[u8], budget: usize) -> Resul
 /// One placemark, before it's put in a layer.
 struct Row {
     geometry: Geometry,
+    id: Option<String>,
     name: Option<String>,
     description: Option<String>,
     folder: String,
@@ -211,12 +214,23 @@ struct Reader {
     rows: Vec<Row>,
     /// Extended data keys, in the order first seen.
     keys: Vec<String>,
+    /// Explicit string keys from retained points, lines and polygons, each bounded by MAX_KEYS.
+    string_keys: [HashSet<String>; 3],
     /// Extended data entries past the column cap.
     dropped_keys: usize,
     duplicate_entries: usize,
     duplicate_placemarks: usize,
     skipped: usize,
     geometry_losses: GeometryLosses,
+}
+
+/// Resolve an explicit XML Schema string type by namespace, independent of the chosen prefix.
+/// KML's value element is already a schema string; the explicit annotation preserves an opaque
+/// identifier through readers that would otherwise infer numbers from ExtendedData values.
+fn explicit_string(n: &Node) -> bool {
+    let Some(ty) = n.attribute(("http://www.w3.org/2001/XMLSchema-instance", "type")) else { return false };
+    let (prefix, name) = ty.trim().split_once(':').map_or((None, ty.trim()), |(prefix, name)| (Some(prefix), name));
+    name == "string" && n.lookup_namespace_uri(prefix) == Some("http://www.w3.org/2001/XMLSchema")
 }
 
 fn local<'a>(n: &Node<'a, '_>) -> &'a str {
@@ -528,6 +542,23 @@ impl Reader {
         }
     }
 
+    /// Adds declared headers after populated keys, so empty declarations cannot displace
+    /// fields with values at the column cap. It retains only the existing bounded key list.
+    fn collect_fields(&mut self, root: Node) {
+        for schema in root.descendants().filter(|n| n.is_element() && local(n) == "Schema") {
+            for field in schema.children().filter(|f| f.is_element() && local(f) == "SimpleField") {
+                let Some(name) = field.attribute("name").filter(|n| !n.trim().is_empty()) else { continue };
+                if !self.keys.iter().any(|k| k == name) {
+                    if self.keys.len() >= MAX_KEYS {
+                        self.dropped_keys += 1;
+                    } else {
+                        self.keys.push(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+
     /// The style id a placemark draws with: its inline style, else its styleUrl (through a style
     /// map). Only ids defined in this document count.
     fn style_for(&mut self, pm: &Node) -> Option<String> {
@@ -590,18 +621,22 @@ impl Reader {
         // geometry's loss.
         let losses = std::mem::take(&mut parts.losses);
         let mut data = Vec::new();
+        let mut string_indices = Vec::new();
         let mut seen = HashSet::new();
         let mut duplicates = 0usize;
         if let Some(ext) = child(pm, "ExtendedData") {
             for d in ext.descendants().filter(|d| d.is_element()) {
                 let pair = match local(&d) {
-                    "Data" => {
-                        d.attribute("name").map(|k| (k.to_string(), child(&d, "value").map(|v| data_text(&v, k)).unwrap_or_default()))
-                    }
-                    "SimpleData" => d.attribute("name").map(|k| (k.to_string(), data_text(&d, k))),
+                    "Data" => d.attribute("name").map(|k| {
+                        let value = child(&d, "value");
+                        let string = value.as_ref().is_some_and(explicit_string);
+                        let text = value.map(|v| if string { raw_text_of(&v) } else { data_text(&v, k) }).unwrap_or_default();
+                        (k.to_string(), text, string)
+                    }),
+                    "SimpleData" => d.attribute("name").map(|k| (k.to_string(), data_text(&d, k), false)),
                     _ => None,
                 };
-                if let Some((k, v)) = pair.filter(|(k, _)| !k.trim().is_empty()) {
+                if let Some((k, v, string)) = pair.filter(|(k, _, _)| !k.trim().is_empty()) {
                     // The attribute reader uses the first entry for a key. Count and discard
                     // later entries here, including duplicates across Data and SimpleData and
                     // names past the column cap.
@@ -617,6 +652,9 @@ impl Reader {
                         }
                         self.keys.push(k.clone());
                     }
+                    if string {
+                        string_indices.push(data.len());
+                    }
                     data.push((k, v));
                 }
             }
@@ -628,10 +666,20 @@ impl Reader {
         // A placemark mixing kinds (a MultiGeometry of a point and a line) gives one feature per
         // kind, each in its layer.
         let mut any = false;
-        let mut push = |geometry: Geometry, zm: &Cell<bool>, rows: &mut Vec<Row>| {
+        let mut push = |geometry: Geometry, zm: &Cell<bool>, rows: &mut Vec<Row>, typed: &mut HashSet<String>| {
             any = true;
+            // Only retained rows affect inference, and each geometry layer is typed separately.
+            // The temporary indices avoid another string copy for each placemark's annotation.
+            for index in &string_indices {
+                if let Some((key, _)) = data.get(*index)
+                    && !typed.contains(key)
+                {
+                    typed.insert(key.clone());
+                }
+            }
             rows.push(Row {
                 geometry,
+                id: pm.attribute("id").map(str::to_string),
                 name: name.clone(),
                 description: description.clone(),
                 folder: folder.clone(),
@@ -642,14 +690,14 @@ impl Reader {
         };
         match parts.points.as_slice() {
             [] => {}
-            [p] => push(Geometry::Point(*p), &parts.zm[0], &mut self.rows),
-            _ => push(Geometry::MultiPoint(parts.points), &parts.zm[0], &mut self.rows),
+            [p] => push(Geometry::Point(*p), &parts.zm[0], &mut self.rows, &mut self.string_keys[0]),
+            _ => push(Geometry::MultiPoint(parts.points), &parts.zm[0], &mut self.rows, &mut self.string_keys[0]),
         }
         if !parts.lines.is_empty() {
-            push(Geometry::Line(parts.lines), &parts.zm[1], &mut self.rows);
+            push(Geometry::Line(parts.lines), &parts.zm[1], &mut self.rows, &mut self.string_keys[1]);
         }
         if !parts.polygons.is_empty() {
-            push(Geometry::Polygon(parts.polygons), &parts.zm[2], &mut self.rows);
+            push(Geometry::Polygon(parts.polygons), &parts.zm[2], &mut self.rows, &mut self.string_keys[2]);
         }
         if any {
             self.geometry_losses.add(&losses);
@@ -672,6 +720,11 @@ impl Reader {
             Field::new("folder", FieldType::Text),
             Field::new("style", FieldType::Text),
         ];
+        let has_ids = self.rows.iter().any(|r| r.id.is_some());
+        if has_ids {
+            fields.push(Field::new("id", FieldType::Text));
+        }
+        let fixed_fields = fields.len();
         // Each extended data key's column, as (key, column name). A key named like one of those,
         // ignoring case, is left out when it only repeats that column (an exported name field
         // does), else kept under a free name.
@@ -689,9 +742,14 @@ impl Reader {
                     0 => r.name.as_deref(),
                     1 => r.description.as_deref(),
                     2 => Some(r.folder.as_str()),
-                    _ => r.style.as_deref(),
+                    3 => r.style.as_deref(),
+                    _ => r.id.as_deref(),
                 };
-                r.data.iter().find(|(dk, _)| dk == k).is_none_or(|(_, v)| v == fixed.unwrap_or_default())
+                r.data.iter().find(|(dk, _)| dk == k).is_none_or(|(_, v)| match fixed {
+                    Some(fixed) => v == fixed,
+                    // An explicit empty Data id differs from an absent source identifier.
+                    None => i != 4 && v.is_empty(),
+                })
             };
             if (i != 1 || k == "description") && self.rows.iter().all(repeats) {
                 continue;
@@ -715,6 +773,9 @@ impl Reader {
                     if r.folder.is_empty() { Value::Null } else { Value::Text(r.folder.clone()) },
                     r.style.clone().map(Value::Text).unwrap_or_default(),
                 ];
+                if has_ids {
+                    attrs.push(r.id.clone().map(Value::Text).unwrap_or_default());
+                }
                 attrs.extend(
                     keys.iter()
                         .map(|(k, _)| r.data.iter().find(|(dk, _)| dk == k).map(|(_, v)| Value::Text(v.clone())).unwrap_or_default()),
@@ -727,8 +788,16 @@ impl Reader {
                 ds.push_next(Some(r.geometry.clone()), attrs);
                 zm_rows += usize::from(r.zm);
             }
-            // Extended data is typed; names, descriptions, folders and style ids stay text.
-            crate::io::type_text_columns(&mut ds, &["name", "description", "folder", "style"]);
+            // Fixed columns and this layer's explicitly typed strings stay text; other data
+            // is inferred from its own retained rows, even when only one kind is present.
+            let string_keys = match *kind {
+                GeometryType::Point => &self.string_keys[0],
+                GeometryType::Polyline => &self.string_keys[1],
+                _ => &self.string_keys[2],
+            };
+            crate::io::type_text_columns_keeping(&mut ds, |column, _| {
+                column < fixed_fields || keys.get(column - fixed_fields).is_some_and(|(key, _)| string_keys.contains(key))
+            });
             let mut report = ReadReport::default();
             // The notes go with the first layer only.
             if i == 0 {
@@ -767,8 +836,9 @@ impl Reader {
                     } else {
                         format!("{} extended data names were", renamed.len())
                     };
+                    let columns = if has_ids { "name, description, folder, style and id" } else { "name, description, folder and style" };
                     report.messages.push(format!(
-                        "{name}: {count} renamed, as RustGIS gives every placemark a name, description, folder and style column: {}{more}",
+                        "{name}: {count} renamed, as RustGIS gives every placemark a {columns} column: {}{more}",
                         listed.join(", ")
                     ));
                 }
@@ -1019,6 +1089,21 @@ mod tests {
         assert!(messages.iter().any(|m| m.contains("distinct names")), "{messages:?}");
     }
 
+    /// Schema-only headers fill remaining capacity after populated data, regardless of their
+    /// earlier position in the document; the omitted headers are still reported.
+    #[test]
+    fn declared_empty_headers_do_not_displace_populated_kml_keys() {
+        let fields = (0..=MAX_KEYS).map(|i| format!("<SimpleField name=\"empty{i}\" type=\"string\"/>")).collect::<String>();
+        let xml = format!(
+            "<kml><Document><Schema id=\"fields\">{fields}</Schema><Placemark><ExtendedData><Data name=\"important\"><value>7</value></Data></ExtendedData><Point><coordinates>1,2</coordinates></Point></Placemark></Document></kml>"
+        );
+        let layer = read("capped.kml", xml.as_bytes()).unwrap().remove(0);
+        let column = layer.dataset.field_index("important").unwrap();
+        assert_eq!(layer.dataset.value(0, column), &Value::Int(7));
+        assert_eq!(layer.dataset.fields.len(), 4 + MAX_KEYS);
+        assert!(layer.report.messages.iter().any(|n| n.contains("distinct names")), "{:?}", layer.report.messages);
+    }
+
     #[test]
     fn distinct_extended_data_keys_across_placemarks_are_clean() {
         let xml = r#"<kml><Document><Placemark><ExtendedData><Data name="n"><value>0</value></Data>
@@ -1038,6 +1123,130 @@ mod tests {
         let ds = &layers[0].dataset;
         let id = ds.field_index("id").unwrap();
         assert_eq!(ds.value(0, id), &Value::Text("12345678901234567891".into()));
+    }
+
+    #[test]
+    fn source_ids_and_declared_empty_columns_survive_kml_round_trips() {
+        let xml = r##"<kml><Document><Schema id="fields"><SimpleField name="empty" type="string"/></Schema>
+          <Placemark id="Permits.001"><ExtendedData><SchemaData schemaUrl="#fields"/></ExtendedData><Point><coordinates>1,2</coordinates></Point></Placemark>
+          <Placemark id="Permits.002"><Point><coordinates>3,4</coordinates></Point></Placemark></Document></kml>"##;
+        let layer = read("permits.kml", xml.as_bytes()).unwrap().remove(0);
+        let ds = &layer.dataset;
+        let id = ds.field_index("id").expect("keep the original opaque identifier");
+        assert_eq!(ds.fields[id].ty, FieldType::Text);
+        assert_eq!(ds.value(0, id), &Value::Text("Permits.001".into()));
+        assert_eq!(ds.value(1, id), &Value::Text("Permits.002".into()));
+        let empty = ds.field_index("empty").expect("keep a declared field with no populated values");
+        assert_eq!(ds.value(0, empty), &Value::Null);
+        assert_eq!(ds.value(1, empty), &Value::Null);
+        assert!(layer.report.messages.is_empty());
+        let exported = crate::interop::to_kml(ds, None).unwrap();
+        let back = read("again.kml", exported.as_bytes()).unwrap().remove(0);
+        assert!(back.dataset.field_index("id_1").is_none());
+        assert_eq!(back.dataset.value(0, back.dataset.field_index("id").unwrap()), &Value::Text("Permits.001".into()));
+        assert!(back.dataset.field_index("empty").is_some());
+    }
+
+    /// Numeric-looking source identifiers are opaque text even when an accepted input id is
+    /// not an XML ID; exporting it as ordinary untyped Data must not change its spelling.
+    #[test]
+    fn numeric_source_identifiers_stay_text_in_kml_and_kmz_round_trips() {
+        let ids = ["123", "1e3", "-7", " 1e3 "];
+        let placemarks = ids
+            .iter()
+            .map(|id| format!("<Placemark id=\"{id}\"><Point><coordinates>1,2</coordinates></Point></Placemark>"))
+            .collect::<String>();
+        let source = format!("<kml>{placemarks}</kml>");
+        let layer = read("source.kml", source.as_bytes()).unwrap().remove(0);
+        let xml = crate::interop::to_kml(&layer.dataset, None).unwrap();
+        for ext in ["kml", "kmz"] {
+            let bytes = if ext == "kmz" {
+                crate::zip::write(&[("doc.kml".into(), xml.as_bytes().to_vec())]).unwrap()
+            } else {
+                xml.as_bytes().to_vec()
+            };
+            let back = read(&format!("again.{ext}"), &bytes).unwrap().remove(0);
+            let id = back.dataset.field_index("id").unwrap();
+            assert_eq!(back.dataset.fields[id].ty, FieldType::Text);
+            for (row, value) in ids.iter().enumerate() {
+                assert_eq!(back.dataset.value(row, id), &Value::Text((*value).into()));
+            }
+        }
+        let untyped = br#"<kml><Placemark><ExtendedData><Data name="id"><value>123</value></Data></ExtendedData><Point><coordinates>1,2</coordinates></Point></Placemark></kml>"#;
+        let plain = read("plain.kml", untyped).unwrap().remove(0);
+        assert_eq!(plain.dataset.value(0, plain.dataset.field_index("id").unwrap()), &Value::Int(123));
+    }
+
+    /// Type annotations use namespace identities, and apply to their exact data key rather
+    /// than every column sharing a case-insensitive spelling.
+    #[test]
+    fn explicit_kml_strings_resolve_namespaces_without_typing_other_keys() {
+        let xml =
+            br#"<kml xmlns:i="http://www.w3.org/2001/XMLSchema-instance" xmlns:t="http://www.w3.org/2001/XMLSchema" xmlns:fake="urn:other">
+          <Placemark><ExtendedData>
+            <Data name="id"><value i:type="t:string"> 1e3 </value></Data>
+            <Data name="ID"><value>7</value></Data>
+            <Data name="other"><value i:type="fake:string">9</value></Data>
+          </ExtendedData><Point><coordinates>1,2</coordinates></Point></Placemark></kml>"#;
+        let layer = read("typed.kml", xml).unwrap().remove(0);
+        assert_eq!(layer.dataset.value(0, layer.dataset.field_index("id").unwrap()), &Value::Text(" 1e3 ".into()));
+        assert_eq!(layer.dataset.value(0, layer.dataset.fields.iter().position(|f| f.name == "ID").unwrap()), &Value::Int(7));
+        assert_eq!(layer.dataset.value(0, layer.dataset.field_index("other").unwrap()), &Value::Int(9));
+    }
+
+    /// Skipped placemarks and other geometry layers cannot determine a retained column's type.
+    #[test]
+    fn explicit_kml_string_types_follow_retained_geometry_layers() {
+        let point = "<Point><coordinates>1,2</coordinates></Point>";
+        let line = "<LineString><coordinates>1,2 2,3</coordinates></LineString>";
+        let polygon =
+            "<Polygon><outerBoundaryIs><LinearRing><coordinates>0,0 1,0 0,1 0,0</coordinates></LinearRing></outerBoundaryIs></Polygon>";
+        for (typed_geometry, plain_geometry, plain_kind) in [
+            ("", point, GeometryType::Point),
+            ("", line, GeometryType::Polyline),
+            ("", polygon, GeometryType::Polygon),
+            (point, line, GeometryType::Polyline),
+            (line, polygon, GeometryType::Polygon),
+        ] {
+            let xml = format!(
+                r#"<kml xmlns:i="http://www.w3.org/2001/XMLSchema-instance" xmlns:t="http://www.w3.org/2001/XMLSchema">
+              <Placemark><ExtendedData><Data name="code"><value i:type="t:string"> 1e3 </value></Data></ExtendedData>{typed_geometry}</Placemark>
+              <Placemark><ExtendedData><Data name="code"><value>7</value></Data></ExtendedData>{plain_geometry}</Placemark></kml>"#
+            );
+            let layers = read("kinds.kml", xml.as_bytes()).unwrap();
+            let plain = &layers.iter().find(|layer| layer.dataset.geometry_type == plain_kind).unwrap().dataset;
+            assert_eq!(plain.value(0, plain.field_index("code").unwrap()), &Value::Int(7));
+            if !typed_geometry.is_empty() {
+                let typed = &layers.iter().find(|layer| layer.dataset.geometry_type != plain_kind).unwrap().dataset;
+                assert_eq!(typed.value(0, typed.field_index("code").unwrap()), &Value::Text(" 1e3 ".into()));
+            }
+        }
+    }
+
+    /// A missing XML id is null, while explicitly empty extended data is present text. Only
+    /// present, equal identifiers coalesce; retaining both columns reports the collision.
+    #[test]
+    fn empty_kml_data_identifier_does_not_repeat_an_absent_xml_identifier() {
+        let xml = br#"<kml xmlns:i="http://www.w3.org/2001/XMLSchema-instance" xmlns:t="http://www.w3.org/2001/XMLSchema">
+          <Placemark id="A"><ExtendedData><Data name="id"><value i:type="t:string">A</value></Data></ExtendedData><Point><coordinates>1,2</coordinates></Point></Placemark>
+          <Placemark><ExtendedData><Data name="id"><value i:type="t:string"></value></Data></ExtendedData><Point><coordinates>3,4</coordinates></Point></Placemark></kml>"#;
+        let layer = read("ids.kml", xml).unwrap().remove(0);
+        let ds = &layer.dataset;
+        assert_eq!(ds.value(1, ds.field_index("id").unwrap()), &Value::Null);
+        let data = ds.field_index("id_1").expect("empty data differs from an absent source id");
+        assert_eq!(ds.value(0, data), &Value::Text("A".into()));
+        assert_eq!(ds.value(1, data), &Value::Text(String::new()));
+        assert_eq!(layer.report.messages.iter().filter(|n| n.contains("'id' → 'id_1'")).count(), 1);
+    }
+
+    #[test]
+    fn source_id_collision_keeps_both_distinct_values_and_names_the_rename() {
+        let xml = br#"<kml><Placemark id="Permits.001"><ExtendedData><Data name="id"><value>different</value></Data></ExtendedData><Point><coordinates>1,2</coordinates></Point></Placemark></kml>"#;
+        let layer = read("permits.kml", xml).unwrap().remove(0);
+        assert_eq!(layer.dataset.value(0, layer.dataset.field_index("id").unwrap()), &Value::Text("Permits.001".into()));
+        assert_eq!(layer.dataset.value(0, layer.dataset.field_index("id_1").unwrap()), &Value::Text("different".into()));
+        assert_eq!(layer.report.messages.len(), 1);
+        assert!(layer.report.messages[0].contains("'id' → 'id_1'"));
     }
 
     #[test]
