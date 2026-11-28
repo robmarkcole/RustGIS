@@ -280,14 +280,48 @@ fn stacked_bars_draw_their_stretches_and_key() {
     short.labelled = true;
     let (w, h) = (200.0 / PT_PER_MM, 40.0 / PT_PER_MM);
     let valued = |orientation| ChartLook { orientation, values: true, ..ChartLook::default() };
-    assert!(chart_crowded(&short, &valued(Orientation::Vertical), w, h));
-    assert!(!chart_crowded(&short, &valued(Orientation::Horizontal), w, h));
-    assert!(!chart_crowded(&stacked(vec![6.0, 4.0]), &ChartLook::default(), w, 120.0 / PT_PER_MM));
+    assert_eq!(chart_crowded(&short, &valued(Orientation::Vertical), w, h), Some(Crowded::Head));
+    assert_eq!(chart_crowded(&short, &valued(Orientation::Horizontal), w, h), None);
+    assert_eq!(chart_crowded(&stacked(vec![6.0, 4.0]), &ChartLook::default(), w, 120.0 / PT_PER_MM), None);
+    // Unstacked, columns without height and bars under a point are told apart; no bar, nothing.
+    let mut plain = short.clone();
+    (plain.key, plain.stretches) = (Vec::new(), Vec::new());
+    assert_eq!(chart_crowded(&plain, &valued(Orientation::Vertical), w, 20.0 / PT_PER_MM), Some(Crowded::Columns));
+    assert_eq!(chart_crowded(&plain, &valued(Orientation::Vertical), 1.0 / PT_PER_MM, h * 2.0), Some(Crowded::Thin));
+    assert_eq!(chart_crowded(&plain, &valued(Orientation::Horizontal), w, 1.0 / PT_PER_MM), Some(Crowded::Thin));
+    // Columns left some height, under a point of it.
+    assert_eq!(chart_crowded(&plain, &valued(Orientation::Vertical), w, 28.5 / PT_PER_MM), Some(Crowded::Thin));
+    plain.bars = vec![(0.0, String::new())];
+    assert_eq!(chart_crowded(&plain, &valued(Orientation::Vertical), w, 1.0 / PT_PER_MM), None);
     // A box narrower than a swatch draws the placeholder too, nothing past its right.
     // Sample above the centered "Chart" label so system font glyph shapes at y=60 don't mask the fill.
     let mut c = Canvas::new(200, 120).unwrap();
     chart(&mut c, Rect::from_xywh(0.0, 0.0, 5.0, 120.0).unwrap(), &stacked(vec![6.0, 4.0]), &ChartLook::default(), INK, 1.0, false);
     assert!(is(&c, 2, 10, Rgba::rgb(0xF0, 0xF1, 0xF3)) && (6..20).all(|x| c.pixmap().pixel(x, 7).is_some_and(|p| p.alpha() == 0)));
+}
+
+/// An unstacked chart in a box too small draws what it did before it was warned of (#3156): as
+/// columns without height its placeholder; across, bars under a point high.
+#[test]
+fn an_unstacked_chart_too_small_draws_as_before() {
+    let data = rustgis_map::layout::ChartData {
+        bars: (0..4).map(|k| (f64::from(k + 1), String::new())).collect(),
+        title: "Shops".into(),
+        labelled: true,
+        ..Default::default()
+    };
+    let draw = |orientation, h: f32| {
+        let mut c = Canvas::new(200, 60).unwrap();
+        let look = ChartLook { orientation, values: true, ..ChartLook::default() };
+        chart(&mut c, Rect::from_xywh(0.0, 0.0, 200.0, h).unwrap(), &data, &look, INK, 1.0, false);
+        c
+    };
+    let c = draw(Orientation::Vertical, 40.0);
+    assert!(c.pixmap().pixel(100, 5).is_some_and(|p| p.red() == 0xF0 && p.blue() == 0xF3), "the placeholder");
+    // 4 pt under its title: bars a pixel high, no placeholder.
+    let c = draw(Orientation::Horizontal, 20.0);
+    assert!((0..200).all(|x| c.pixmap().pixel(x, 40).is_some_and(|p| p.alpha() == 0)), "nothing under the box");
+    assert!((100..110).any(|x| (15..21).any(|y| c.pixmap().pixel(x, y).is_some_and(|p| p.alpha() > 0))), "its bars");
 }
 
 fn bar_blue(c: &Canvas, x: u32, y: u32) -> bool {

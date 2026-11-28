@@ -663,6 +663,7 @@ fn draw_page(
                 });
                 match data {
                     Some(data) => {
+                        drawn_chart(e.id, &data);
                         let look = e.kind.chart_look().unwrap_or_default();
                         chart(&mut pm, r, &data, &look, color.unwrap_or(INK), ppp, layout.decimal_comma)
                     }

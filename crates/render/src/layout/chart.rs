@@ -2,6 +2,54 @@
 
 use super::*;
 
+/// A chart as a page drew it ([`drawn_charts`]): its element's id and the data it read.
+pub type DrawnChart = (u32, rustgis_map::layout::ChartData);
+
+thread_local! {
+    /// While [`drawn_charts`] runs on this thread: the charts drawn, each with each data once.
+    static DRAWN: std::cell::RefCell<Option<Vec<DrawnChart>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Ends the list [`drawn_charts`] opened when dropped, even by a panic.
+struct DrawnList(bool);
+
+impl Drop for DrawnList {
+    fn drop(&mut self) {
+        if self.0 {
+            DRAWN.set(None);
+        }
+    }
+}
+
+/// `f`, and the charts the pages it drew on this thread drew, each once for each data it was
+/// drawn with (a map series draws a chart a page), in the order first drawn: what an export says
+/// of them, from the rows each page read, which a streamed layer holds only as it is drawn. A
+/// call inside another lists nothing and leaves its charts to the outer one.
+pub fn drawn_charts<T>(f: impl FnOnce() -> T) -> (T, Vec<DrawnChart>) {
+    let opened = DRAWN.with_borrow_mut(|d| {
+        let none = d.is_none();
+        if none {
+            *d = Some(Vec::new());
+        }
+        none
+    });
+    let _list = DrawnList(opened);
+    let out = f();
+    let listed = if opened { DRAWN.with_borrow_mut(Option::take).unwrap_or_default() } else { Vec::new() };
+    (out, listed)
+}
+
+/// Lists the chart `id` drawn with `data`, while [`drawn_charts`] runs.
+pub(super) fn drawn_chart(id: u32, data: &rustgis_map::layout::ChartData) {
+    DRAWN.with_borrow_mut(|d| {
+        if let Some(listed) = d
+            && !listed.iter().any(|(i, drawn)| *i == id && drawn == data)
+        {
+            listed.push((id, data.clone()));
+        }
+    });
+}
+
 /// A bar chart of `data`'s bars ([`ElementKind::chart_data`]) drawn as `look` says, its title,
 /// labels and values in `dark`, its values with a decimal comma when `comma`. With a negative
 /// value, bars run either way from a zero line (#2487). Stacked, each bar is drawn as its
@@ -10,10 +58,7 @@ use super::*;
 pub(super) fn chart(pm: &mut Canvas, r: Rect, data: &rustgis_map::layout::ChartData, look: &ChartLook, dark: Rgba, ppp: f64, comma: bool) {
     let ppp = ppp as f32;
     let vals = &data.bars;
-    let (min, reach) = chart_span(data);
-    // A fixed maximum is the far end of the bars' room, whatever they reach (#2487 part 4).
-    let max = look.max.unwrap_or(reach);
-    if vals.is_empty() || (reach <= 0.0 && min >= 0.0) {
+    if !has_bars(data) {
         placeholder(pm, r, "Chart", ppp as f64);
         return;
     }
@@ -26,27 +71,8 @@ pub(super) fn chart(pm: &mut Canvas, r: Rect, data: &rustgis_map::layout::ChartD
         text::text_at(pm, &data.title, r.x(), r.y() + title_h / 2.0, px * 1.15, dark, true, text::Align::Left, false);
     }
     chart_key(Some(pm), r, r.y() + title_h, &data.key, px, ppp, dark);
-    // Each bar's value as written past its end, when it has them.
-    let values: Vec<String> = if look.values {
-        vals.iter().map(|(v, _)| decimal(rustgis_map::layout::chart_value_text(*v, look.decimals), comma)).collect()
-    } else {
-        Vec::new()
-    };
-    let bars = ChartBars {
-        r,
-        title_h: title_h + key_h,
-        vals,
-        values: &values,
-        colors: &data.colors,
-        stretches: &data.stretches,
-        key: &data.key,
-        min,
-        max,
-        px,
-        ppp,
-        dark,
-        look,
-    };
+    let values = written_values(vals, look, comma);
+    let bars = ChartBars::new(r, title_h + key_h, data, &values, look, (px, ppp), dark);
     let labelled = data.labelled && !look.hide_labels;
     match look.orientation {
         Orientation::Horizontal => bars.across(pm, labelled),
@@ -85,12 +111,86 @@ pub(super) fn chart_head(r: Rect, data: &rustgis_map::layout::ChartData, look: &
     (data.key.is_empty() || title_h + key_h + line + below <= r.height()).then_some((title_h, key_h))
 }
 
-/// Whether a chart with bars to draw, `w` × `h` mm in its look, draws its placeholder instead as
-/// its title and key leave the bars no room ([`chart_head`]): what the commands warn of, so the page and the commands
-/// never tell it apart.
-pub fn chart_crowded(data: &rustgis_map::layout::ChartData, look: &ChartLook, w: f64, h: f64) -> bool {
-    let Some(r) = Rect::from_xywh(0.0, 0.0, (w * PT_PER_MM).max(1.0) as f32, (h * PT_PER_MM).max(1.0) as f32) else { return false };
-    !data.bars.is_empty() && chart_head(r, data, look, 7.5 * 1.33, 1.0).is_none()
+/// Whether a chart has a bar to draw: without one it draws its placeholder whatever its box.
+fn has_bars(data: &rustgis_map::layout::ChartData) -> bool {
+    let (min, reach) = chart_span(data);
+    !data.bars.is_empty() && (reach > 0.0 || min < 0.0)
+}
+
+/// Each bar's value as written past its end, when the look has them.
+fn written_values(vals: &[(f64, String)], look: &ChartLook, comma: bool) -> Vec<String> {
+    if !look.values {
+        return Vec::new();
+    }
+    vals.iter().map(|(v, _)| decimal(rustgis_map::layout::chart_value_text(*v, look.decimals), comma)).collect()
+}
+
+/// Why a chart's box is too small for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Crowded {
+    /// Stacked, its title and key leave its bars no room: it draws its placeholder.
+    Head,
+    /// As columns, their labels and values leave them no height: it draws its placeholder.
+    Columns,
+    /// Its bars, or the room they run in, come under a point.
+    Thin,
+}
+
+/// Why a chart with bars to draw, `w` × `h` mm in its look, can't be read in that box, if it
+/// can't: what the commands warn of, worked out as [`chart`] lays it out at a pixel per
+/// [`PT_PER_MM`] unit, so the page and the commands never tell it apart.
+pub fn chart_crowded(data: &rustgis_map::layout::ChartData, look: &ChartLook, w: f64, h: f64) -> Option<Crowded> {
+    let r = Rect::from_xywh(0.0, 0.0, (w * PT_PER_MM).max(1.0) as f32, (h * PT_PER_MM).max(1.0) as f32)?;
+    if !has_bars(data) {
+        return None;
+    }
+    let px = 7.5 * 1.33;
+    let Some((title_h, key_h)) = chart_head(r, data, look, px, 1.0) else { return Some(Crowded::Head) };
+    let values = written_values(&data.bars, look, false);
+    let bars = ChartBars::new(r, title_h + key_h, data, &values, look, (px, 1.0), INK);
+    let labelled = data.labelled && !look.hide_labels;
+    match look.orientation {
+        Orientation::Horizontal => {
+            let room = bars.across_room(labelled);
+            (room.bar_h * BAR_SHARE < POINT || room.bar_area < POINT).then_some(Crowded::Thin)
+        }
+        Orientation::Vertical => {
+            let room = bars.column_room(labelled);
+            if room.plot_h <= 0.0 {
+                Some(Crowded::Columns)
+            } else {
+                (room.plot_h < POINT || room.slot * BAR_SHARE < POINT).then_some(Crowded::Thin)
+            }
+        }
+    }
+}
+
+/// A typographic point (1/72 inch) in the layout's units ([`PT_PER_MM`], 96 to the inch).
+const POINT: f32 = (PT_PER_MM * 25.4 / 72.0) as f32;
+
+/// The part of its row, or of its slot, that a bar is thick.
+const BAR_SHARE: f32 = 0.7;
+
+/// The room [`ChartBars::across`] lays its bars in: the labels' column, each bar's row and the
+/// size its label and value are written at, the room for values at either side and the bars'.
+pub(super) struct AcrossRoom {
+    label_w: f32,
+    bar_h: f32,
+    size: f32,
+    value_size: f32,
+    room_lo: f32,
+    bar_area: f32,
+}
+
+/// The room [`ChartBars::columns`] stands its columns in: each one's slot, the size and the line
+/// of its value, the line of the labels, and the columns' top and height.
+pub(super) struct ColumnRoom {
+    slot: f32,
+    value_px: f32,
+    value_h: f32,
+    label_h: f32,
+    top: f32,
+    plot_h: f32,
 }
 
 /// How far a bar's stretches reach below zero (its negative ones added up) and above it.
@@ -159,7 +259,38 @@ pub(super) struct ChartBars<'a> {
     pub(super) look: &'a ChartLook,
 }
 
-impl ChartBars<'_> {
+impl<'a> ChartBars<'a> {
+    /// The bars of `data` in `r`, under a title and key `title_h` high, `values` written out, text
+    /// `px` high at `ppp` pixels per point.
+    fn new(
+        r: Rect,
+        title_h: f32,
+        data: &'a rustgis_map::layout::ChartData,
+        values: &'a [String],
+        look: &'a ChartLook,
+        (px, ppp): (f32, f32),
+        dark: Rgba,
+    ) -> Self {
+        let (min, reach) = chart_span(data);
+        // A fixed maximum is the far end of the bars' room, whatever they reach (#2487 part 4).
+        let max = look.max.unwrap_or(reach);
+        Self {
+            r,
+            title_h,
+            vals: &data.bars,
+            values,
+            colors: &data.colors,
+            stretches: &data.stretches,
+            key: &data.key,
+            min,
+            max,
+            px,
+            ppp,
+            dark,
+            look,
+        }
+    }
+
     /// Bar `i` (of value `v`) as the stretches it is drawn in, each with the share of the span
     /// ([`ChartBars::share`]) where it starts from zero, its own share (negative running back) and
     /// its colour. A whole bar (none stacked, or no stretches) is one stretch, in its own colour or
@@ -206,9 +337,7 @@ impl ChartBars<'_> {
             .fold(0.0, f32::max)
     }
 
-    /// Bars running across, labels in a column at their left, each value past its bar's end with
-    /// room kept for it at the side its bar runs to.
-    pub(super) fn across(&self, pm: &mut Canvas, labelled: bool) {
+    pub(super) fn across_room(&self, labelled: bool) -> AcrossRoom {
         let (r, ppp, px) = (self.r, self.ppp, self.px);
         let label_w = if labelled { r.width() * 0.32 } else { 0.0 };
         let bh = ((r.height() - self.title_h) / self.vals.len() as f32).min(18.0 * ppp);
@@ -230,6 +359,15 @@ impl ChartBars<'_> {
             (room_lo, room_hi) = (room(true, value_size), room(false, value_size));
         }
         let bar_area = beside - room_lo - room_hi;
+        AcrossRoom { label_w, bar_h: bh, size, value_size, room_lo, bar_area }
+    }
+
+    /// Bars running across, labels in a column at their left, each value past its bar's end with
+    /// room kept for it at the side its bar runs to.
+    pub(super) fn across(&self, pm: &mut Canvas, labelled: bool) {
+        let (r, ppp) = (self.r, self.ppp);
+        let AcrossRoom { label_w, bar_h: bh, size, value_size, room_lo, bar_area } = self.across_room(labelled);
+        let gap = 2.0 * ppp;
         // Where the bars start: the left of the bar area when none is negative.
         let zero = r.x() + label_w + room_lo + bar_area * self.share(-self.min);
         let right = self.look.label_align == TextAlign::Right;
@@ -250,7 +388,7 @@ impl ChartBars<'_> {
                 drawn.push((place(x, w), w, colour));
                 (left, right_end) = (left.min(x), right_end.max(x + w));
             }
-            self.bar(pm, &drawn, (y + bh * 0.15, bh * 0.7), true);
+            self.bar(pm, &drawn, (y + bh * (1.0 - BAR_SHARE) / 2.0, bh * BAR_SHARE), true);
             if labelled {
                 let t = fit_label(name, |t| text::measure(t, 7.5, false) * ppp > label_w - 4.0 * ppp);
                 // At the column's right, the label ends where the bars' side begins.
@@ -272,10 +410,8 @@ impl ChartBars<'_> {
         }
     }
 
-    /// Columns standing on a zero line, each label centred under its column and cut to its width,
-    /// each value over a column (under one going down), made smaller to fit a narrow column.
-    pub(super) fn columns(&self, pm: &mut Canvas, labelled: bool) {
-        let (r, ppp, px) = (self.r, self.ppp, self.px);
+    pub(super) fn column_room(&self, labelled: bool) -> ColumnRoom {
+        let (r, px) = (self.r, self.px);
         let slot = r.width() / self.vals.len() as f32;
         let widest = self.widest(px, false).max(self.widest(px, true));
         let value_px = if widest > slot * 0.95 { px * slot * 0.95 / widest } else { px };
@@ -285,6 +421,14 @@ impl ChartBars<'_> {
         let label_h = if labelled { px * 1.4 } else { 0.0 };
         let top = r.y() + self.title_h + room_hi;
         let plot_h = r.bottom() - label_h - room_lo - top;
+        ColumnRoom { slot, value_px, value_h, label_h, top, plot_h }
+    }
+
+    /// Columns standing on a zero line, each label centred under its column and cut to its width,
+    /// each value over a column (under one going down), made smaller to fit a narrow column.
+    pub(super) fn columns(&self, pm: &mut Canvas, labelled: bool) {
+        let (r, ppp, px) = (self.r, self.ppp, self.px);
+        let ColumnRoom { slot, value_px, value_h, label_h, top, plot_h } = self.column_room(labelled);
         if plot_h <= 0.0 {
             placeholder(pm, r, "Chart", ppp as f64);
             return;
@@ -308,7 +452,7 @@ impl ChartBars<'_> {
                 drawn.push((place(y, h), h, colour));
                 (top_end, bottom) = (top_end.min(y), bottom.max(y + h));
             }
-            self.bar(pm, &drawn, (cx - slot * 0.35, slot * 0.7), false);
+            self.bar(pm, &drawn, (cx - slot * BAR_SHARE / 2.0, slot * BAR_SHARE), false);
             if let Some(t) = self.values.get(i) {
                 let vy = if *v < 0.0 { bottom + value_h / 2.0 } else { top_end - value_h / 2.0 };
                 text::text_at(pm, t, cx, write(vy), value_px, self.dark, false, text::Align::Center, false);

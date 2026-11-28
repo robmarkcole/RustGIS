@@ -514,6 +514,30 @@ fn partial_source_failure_and_incomplete_summary_reach_unchanged_owner() {
     }
 }
 
+/// An export says a chart's notices of the rows its page drew (#3156): a streamed layer holding
+/// none before the page is drawn is listed with those the frame read.
+#[test]
+fn drawn_charts_list_the_rows_a_streamed_layer_held_as_drawn() {
+    use rustgis_map::layout::{ElementKind, Layout};
+    let mut ds = Dataset::new("points", GeometryType::Point, vec![Field::new("value", FieldType::Integer)]);
+    ds.push(Some(Geometry::Point(Coord::new(0.0, 0.0))), vec![Value::Int(5)]);
+    let mut map = Map::new("streamed");
+    map.add_dataset(ds);
+    map.layers[0] = streamed(&map.layers[0], 1);
+    map.layers[0].dataset.features = Vec::new().into();
+    let mut page = Layout::new("page", 140.0, 100.0);
+    let frame = serde_json::json!({"MapFrame": {"map": "streamed", "center": {"x": 0.0, "y": 0.0}, "scale": 300000.0}});
+    let frame = page.add("map", (0.0, 0.0, 60.0, 60.0), serde_json::from_value(frame).unwrap());
+    let chart = serde_json::json!({"Chart": {"frame": frame, "layer": "points", "field": "value"}});
+    let chart: ElementKind = serde_json::from_value(chart).unwrap();
+    let id = page.add("chart", (70.0, 0.0, 60.0, 40.0), chart);
+    let mut maps = [map];
+    let (drawn, charts) = layout::drawn_charts(|| layout::render(&page, &mut maps, 72.0, &layout::PageInfo::default()));
+    drawn.unwrap();
+    let [(listed, data)] = &charts[..] else { panic!("{charts:?}") };
+    assert_eq!((*listed, data.bars.len()), (id, 1));
+}
+
 #[test]
 fn layout_export_keeps_all_drawn_legend_classes() {
     use rustgis_map::layout::{ElementKind, FrameShape, INDICATOR_COLOR, INDICATOR_WIDTH, Layout};
