@@ -486,7 +486,7 @@ raster.rotation layer? angle
 raster.setDefaultStyle fromLayer? layer? ramp? invert? stretch? low? high? n? resampling? reset?
 raster.spectral layer lon? lat? points? zone?
 raster.stretch layer? type low? high? n? min? max? like?
-raster.symbology layer? type band? ramp? invert? classes? method? azimuth? altitude? zFactor? shadow? sky? fill? ambient? balanced? rock? grey?
+raster.symbology layer? type band? ramp? invert? classes? method? azimuth? altitude? zFactor? shadow? sky? fill? ambient? balanced? shadowSoftness? rock? grey?
 raster.zarrInfo path url bbox? variable?
 report.activate report
 report.attachments report? field

@@ -2923,6 +2923,7 @@ fn a_page_says_why_a_frame_drew_no_cast_shadows() {
         rock: None,
         ambient: None,
         balanced: false,
+        shadow_softness: None,
     };
     for shadow in [0.0, 1.0] {
         let map = ramp_map(relief(shadow), rustgis_map::raster::Stretch::MinMax);
@@ -2975,6 +2976,7 @@ fn page_settles_with_suns(suns: &[f64]) {
             rock: None,
             ambient: None,
             balanced: false,
+            shadow_softness: None,
         };
         let mut m = Map::new(name.clone());
         assert_eq!(m.add_raster("dem", copy), 1);
@@ -3019,6 +3021,68 @@ fn two_maps_lit_otherwise_on_a_page_keep_their_own_shadows() {
 #[test]
 fn many_maps_lit_otherwise_on_a_page_all_get_their_shadows() {
     page_settles_with_suns(&[315.0, 135.0, 45.0, 225.0, 0.0]);
+}
+
+/// A page exported with a relief's shadow softness (#3144): left out or set to the default's own
+/// value it draws today's pixels; a crisp or a wide one draws other pixels, the change growing
+/// with the distance from the default.
+#[test]
+fn a_reliefs_shadow_softness_changes_its_page_only_off_the_default() {
+    use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster};
+    let n = 300usize;
+    let heights: Vec<f32> = (0..n * n).map(|i| (((i % n) as f32 / 9.0).sin() + ((i / n) as f32 / 7.0).cos()) * 400.0).collect();
+    let gt = GeoTransform { origin_x: -1.0, origin_y: 1.0, pixel_width: 2.0 / n as f64, pixel_height: -2.0 / n as f64 };
+    let dem = Raster::new("dem", n as u32, n as u32, vec![heights], gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
+    let page = |softness: Option<f64>| {
+        let mut rl = rustgis_map::raster::RasterLayer::from_path(dem.clone(), "dem.tif");
+        rl.style.renderer = rustgis_map::raster::RasterRenderer::ShadedRelief {
+            band: 0,
+            ramp: None,
+            azimuth: 315.0,
+            altitude: 15.0,
+            // Slopes up to about 35°, so that much of the page lies in or at the edge of a shadow.
+            z_factor: 12.0,
+            shadow: 1.0,
+            sky: 0.0,
+            fill: 0.0,
+            rock: None,
+            ambient: None,
+            balanced: false,
+            shadow_softness: softness,
+        };
+        let mut m = Map::new("m");
+        assert_eq!(m.add_raster("dem", rl), 1);
+        let mut l = Layout::new("Layout", 100.0, 100.0);
+        let frame = ElementKind::MapFrame {
+            map: "m".into(),
+            center: Coord::new(0.0, 0.0),
+            scale: 2.5e6,
+            shape: FrameShape::Rectangle,
+            grid: None,
+            sections: Vec::new(),
+            extent_of: None,
+            extent_color: rustgis_map::layout::INDICATOR_COLOR,
+            extent_width: rustgis_map::layout::INDICATOR_WIDTH,
+            border_color: rustgis_map::layout::FRAME_BORDER_COLOR,
+            border_width: rustgis_map::layout::FRAME_BORDER_WIDTH,
+            bearing: 0.0,
+            pitch: 0.0,
+        };
+        l.add("m", (5.0, 5.0, 90.0, 90.0), frame);
+        let (drawn, said) = crate::shadows_said(|| render(&l, &mut [m], 48.0, &PageInfo::default()));
+        assert!(said.notices.is_empty() && !said.to_come, "{softness:?}: {said:?}");
+        drawn.unwrap().data().to_vec()
+    };
+    let today = page(None);
+    assert_eq!(page(Some(rustgis_map::shadow::SOFT_EDGE)), today, "the default's own value draws today's page");
+    // The mean change of a channel from today's page.
+    let change = |other: &[u8]| {
+        assert_eq!(other.len(), today.len());
+        other.iter().zip(&today).map(|(a, b)| f64::from(a.abs_diff(*b))).sum::<f64>() / today.len() as f64
+    };
+    let (crisp, wide, widest) = (change(&page(Some(1.0))), change(&page(Some(10.0))), change(&page(Some(15.0))));
+    assert!(crisp > 0.0 && wide > 0.0, "crisp {crisp}, wide {wide}");
+    assert!(widest > wide, "wide {wide}, widest {widest}");
 }
 
 /// A map with one 100 × 1 raster valued 0–99 by column, styled by `renderer`.

@@ -7825,6 +7825,58 @@ fn shaded_relief_keeps_its_ambient_and_balanced_light() {
     assert_eq!(light(&t), (Some(0.35), true), "back when opened");
 }
 
+/// Shaded Relief's shadow softness (#3144) is set, kept when left out, refused by name outside its
+/// range (never brought into it), saved only when set, and back when the project is opened again;
+/// null, or the default's own value, is the default again, which saves nothing new.
+#[test]
+fn shaded_relief_keeps_its_shadow_softness() {
+    let mut s = with_raster();
+    let softness = |s: &Session| match s.map().layers.iter().find_map(|l| l.raster.as_ref()).map(|r| &r.style.renderer) {
+        Some(rustgis_map::RasterRenderer::ShadedRelief { shadow_softness, .. }) => *shadow_softness,
+        other => panic!("{other:?}"),
+    };
+    let saved = |s: &mut Session| s.project.saved_text(None).unwrap().0;
+    s.run("raster.symbology", &json!({"type": "shadedRelief", "shadow": 0.8})).unwrap();
+    assert_eq!(softness(&s), None);
+    assert!(!saved(&mut s).contains("shadow_softness") && !saved(&mut s).contains("shaded-relief-shadow-softness"));
+    s.run("raster.symbology", &json!({"type": "shadedRelief", "shadowSoftness": 1.5})).unwrap();
+    s.run("raster.symbology", &json!({"type": "shadedRelief", "azimuth": 200})).unwrap();
+    assert_eq!(softness(&s), Some(1.5), "left out, kept");
+    for refused in [json!(0.4), json!(15.5), json!(-1), json!("soft"), json!(true)] {
+        let e = s.run("raster.symbology", &json!({"type": "shadedRelief", "shadowSoftness": refused})).unwrap_err();
+        assert!(e.contains("\"shadowSoftness\"") && e.contains("0.5 to 15"), "{refused}: {e}");
+        assert_eq!(softness(&s), Some(1.5), "{refused}: refused, nothing changed");
+    }
+    for bound in [0.5, 15.0] {
+        s.run("raster.symbology", &json!({"type": "shadedRelief", "shadowSoftness": bound})).unwrap();
+        assert_eq!(softness(&s), Some(bound));
+    }
+    let text = saved(&mut s);
+    assert!(text.contains("\"shadow_softness\":15.0") && text.contains("shaded-relief-shadow-softness"), "saved, and required by name");
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let dir = std::env::temp_dir().join(format!("rustgis-softness-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("softness.rgis");
+    s.run("project.saveAs", &json!({"path": path.display().to_string()})).unwrap();
+    let mut t = Session::new(Project::default());
+    t.run("project.open", &json!({"path": path.display().to_string()})).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(softness(&t), Some(15.0), "back when opened");
+    for default in [json!(null), json!(5)] {
+        s.run("raster.symbology", &json!({"type": "shadedRelief", "shadowSoftness": 2})).unwrap();
+        s.run("raster.symbology", &json!({"type": "shadedRelief", "shadowSoftness": default})).unwrap();
+        assert_eq!(softness(&s), None, "{default}: the default");
+    }
+    s.run("raster.symbology", &json!({"type": "shadedRelief", "shadowSoftness": 2})).unwrap();
+    s.run("edit.undo", &json!({})).unwrap();
+    assert_eq!(softness(&s), None, "undone");
+    assert!(!saved(&mut s).contains("shadow_softness"), "the default saves nothing new");
+    // The fixture reads back as saved, requiring what it sets by name.
+    let fixture = Project::from_json(include_str!("../../../schema/fixtures/shaded_relief_shadow_softness.rgis")).unwrap();
+    assert_eq!(softness(&Session::new(fixture.clone())), Some(1.5));
+    assert_eq!(serde_json::to_value(&fixture).unwrap()["requires"], json!(["shaded-relief-effects", "shaded-relief-shadow-softness"]));
+}
+
 /// Shaded Relief's rock on steep slopes (#1913): an object turns it on, its missing keys from the
 /// current rock or the defaults; kept when left out; `false` removes it; a `from` not below `to`
 /// or a bad colour is refused; saved with the project only when set.

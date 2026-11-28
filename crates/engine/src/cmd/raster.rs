@@ -39,7 +39,7 @@ pub fn commands() -> Vec<C> {
         C::new("layer.addDataBytes", "Add Data (from file contents)", "Home › Add", add_bytes::<MAX_UPLOAD_BYTES>).roles(&[]).effects(crate::policy::Effects::NONE)
             .params(r#"{"fileName": "name.tif|.tiff|.asc|.grb|.grib|.grb2|.grib2 (GRIB)|.hgt|.dt0|.dt1|.dt2|.geojson|.csv|.zip|.kml|.kmz|.gpx|.parquet|.fgb|.gpkg|.mbtiles|.jp2|.j2k|.dxf|.pdf (JPEG 2000: desktop, through GDAL; PDF: desktop, command line and Python)", "data": base64, "zoom"?: bool, "layer"?: "one layer of a zip, KML or GPX by name, or a PDF's page number (the first when left out or blank)", "name"?: text, "x"?, "y"?, "wkt"?, "crs"?, "delimiter"?, "paperSpace"?, "blocks"?, "stream"?, "as"? (as layer.addData)}"#),
         C::new("raster.symbology", "Symbology", "Style › Rendering", symbology).when(need_raster).roles(&[]).effects(crate::policy::Effects::NONE).params(
-            r#"{"layer"?, "type": "stretch"|"rgb"|"classify"|"unique"|"colormap"|"shadedRelief", "band"?: 1.., "ramp"?, "invert"?: bool, "classes"?: 1..32, "method"?, "azimuth"?, "altitude"?, "zFactor"?, "shadow"?: 0..1 (shadedRelief: how dark the shadows the terrain casts are; left out, kept; 0 casts none), "sky"?: 0..1 (shadedRelief: how much the share of the sky each cell sees dims its ambient light; left out, kept; 0 leaves it whole), "fill"?: 0..1 (shadedRelief: a fill light from the side opposite the sun that lightens the slopes turned toward it; left out, kept; 0 has none), "ambient"?: 0..1|null (shadedRelief: the share of the colour a slope turned fully from the sun keeps; left out, kept; null, the default: 0.25, or 0.5 balanced), "balanced"?: bool (shadedRelief: flat ground keeps the ramp's colour and slopes facing the sun brighten, up to 1.3; left out, kept; false, the default, lights as before), "rock"?: {"from"?: 0..90, "to"?: 0..90, "color"?: #RRGGBB} | false (shadedRelief: steep slopes tinted toward a rock colour before the light, from the ground's own slope in degrees, without the Z factor: the ramp below from, the colour above to, blended between; left out, kept; an object's missing keys keep the current rock's, or 25, 40 and #B2ACA4; false or null removes it), "grey"?: bool (shadedRelief without its colour ramp)}"#,
+            r#"{"layer"?, "type": "stretch"|"rgb"|"classify"|"unique"|"colormap"|"shadedRelief", "band"?: 1.., "ramp"?, "invert"?: bool, "classes"?: 1..32, "method"?, "azimuth"?, "altitude"?, "zFactor"?, "shadow"?: 0..1 (shadedRelief: how dark the shadows the terrain casts are; left out, kept; 0 casts none), "sky"?: 0..1 (shadedRelief: how much the share of the sky each cell sees dims its ambient light; left out, kept; 0 leaves it whole), "fill"?: 0..1 (shadedRelief: a fill light from the side opposite the sun that lightens the slopes turned toward it; left out, kept; 0 has none), "ambient"?: 0..1|null (shadedRelief: the share of the colour a slope turned fully from the sun keeps; left out, kept; null, the default: 0.25, or 0.5 balanced), "balanced"?: bool (shadedRelief: flat ground keeps the ramp's colour and slopes facing the sun brighten, up to 1.3; left out, kept; false, the default, lights as before), "shadowSoftness"?: 0.5..15|null (shadedRelief: how soft the edges of its cast shadows are, as half the sun's apparent size in degrees; left out, kept; outside 0.5 to 15, refused; null, the default: 5), "rock"?: {"from"?: 0..90, "to"?: 0..90, "color"?: #RRGGBB} | false (shadedRelief: steep slopes tinted toward a rock colour before the light, from the ground's own slope in degrees, without the Z factor: the ramp below from, the colour above to, blended between; left out, kept; an object's missing keys keep the current rock's, or 25, 40 and #B2ACA4; false or null removes it), "grey"?: bool (shadedRelief without its colour ramp)}"#,
         ),
         C::new("raster.stretch", "Stretch Type", "Style › Rendering", stretch).inputs(stretch_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
         .when(need_raster)
@@ -1034,13 +1034,13 @@ fn symbology(s: &mut Session, p: &Value) -> CmdResult {
                 RasterRenderer::Colormap
             }
             "shadedrelief" | "hillshade" => {
-                // Left out, a Shaded Relief keeps its own shadows, sky, fill light, rock, ambient
-                // and balanced light; a new one has none (and the default ambient).
-                let (cur_shadow, cur_sky, cur_fill, cur_rock, cur_ambient, cur_balanced) = match rl.style.renderer {
-                    RasterRenderer::ShadedRelief { shadow, sky, fill, rock, ambient, balanced, .. } => {
-                        (shadow, sky, fill, rock, ambient, balanced)
+                // Left out, a Shaded Relief keeps its own shadows (and their softness), sky, fill
+                // light, rock, ambient and balanced light; a new one has none (and the defaults).
+                let (cur_shadow, cur_sky, cur_fill, cur_rock, cur_ambient, cur_balanced, cur_softness) = match rl.style.renderer {
+                    RasterRenderer::ShadedRelief { shadow, sky, fill, rock, ambient, balanced, shadow_softness, .. } => {
+                        (shadow, sky, fill, rock, ambient, balanced, shadow_softness)
                     }
-                    _ => (0.0, 0.0, 0.0, None, None, false),
+                    _ => (0.0, 0.0, 0.0, None, None, false, None),
                 };
                 RasterRenderer::ShadedRelief {
                     band: bi,
@@ -1062,6 +1062,11 @@ fn symbology(s: &mut Session, p: &Value) -> CmdResult {
                         Some(_) => Some(f(p, "ambient").ok_or("\"ambient\" must be a number from 0 to 1, or null")?.clamp(0.0, 1.0)),
                     },
                     balanced: b(p, "balanced").unwrap_or(cur_balanced),
+                    shadow_softness: match p.get("shadowSoftness") {
+                        None => cur_softness,
+                        Some(Value::Null) => None,
+                        Some(_) => relief_shadow_softness(f(p, "shadowSoftness"))?,
+                    },
                 }
             }
             other => return Err(format!("unknown raster symbology '{other}'")),
@@ -1073,6 +1078,19 @@ fn symbology(s: &mut Session, p: &Value) -> CmdResult {
         }
         Ok(())
     })
+}
+
+/// A Shaded Relief's `"shadowSoftness"` (see `raster.symbology`), `v` being the number given, if
+/// it is one: refused by name outside the range, never brought into it. The default's own value
+/// is kept as none, so a project that sets nothing new saves as it did.
+fn relief_shadow_softness(v: Option<f64>) -> Result<Option<f64>, String> {
+    use rustgis_map::shadow::{SOFT_EDGE, SOFT_EDGE_MAX, SOFT_EDGE_MIN};
+    match v {
+        Some(v) if (SOFT_EDGE_MIN..=SOFT_EDGE_MAX).contains(&v) => Ok(Some(v).filter(|v| *v != SOFT_EDGE)),
+        _ => Err(format!(
+            "\"shadowSoftness\" must be a number of degrees from {SOFT_EDGE_MIN} to {SOFT_EDGE_MAX}, or null for the default ({SOFT_EDGE})"
+        )),
+    }
 }
 
 /// The rock of a Shaded Relief's `"rock"` (see `raster.symbology`): `false` or null for none, or

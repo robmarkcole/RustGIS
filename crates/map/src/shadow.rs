@@ -2,10 +2,11 @@
 //! each cell of an elevation raster sees over the terrain between it and the sun ([`light`]), and
 //! how much of the sky it sees over the terrain around it ([`sky`]).
 //!
-//! The sun is a disc [`SOFT_EDGE`] degrees either side of its altitude, so a shadow has a soft
-//! edge. Each cell traces the terrain toward the sun's azimuth one column or row at a time,
-//! reading heights between cells (bilinear: reading the nearest cell instead over-shadows diagonal
-//! suns, franciscoparrao/surtgis#153), and keeps the steepest angle up to the terrain it passes.
+//! The sun is a disc some degrees either side of its altitude ([`SOFT_EDGE`] unless the layer sets
+//! its shadow softness), so a shadow has a soft edge. Each cell traces the terrain toward the sun's
+//! azimuth one column or row at a time, reading heights between cells (bilinear: reading the
+//! nearest cell instead over-shadows diagonal suns, franciscoparrao/surtgis#153), and keeps the
+//! steepest angle up to the terrain it passes.
 //! The share of the disc above that angle is the light the cell keeps. The trace stops once
 //! nothing farther can change it: the terrain left can't rise above the angle kept (or the disc's
 //! lower edge), or the disc is already hidden. The sky is traced likewise, in [`SKY_DIRECTIONS`]
@@ -19,8 +20,23 @@ use rustgis_data::raster::Raster;
 use crate::raster::RasterMask;
 
 /// Half the sun's apparent size, in degrees: how wide a shadow's soft edge is. Far larger than the
-/// real sun's quarter of a degree, for a soft edge at map scale.
+/// real sun's quarter of a degree, for a soft edge at map scale. A layer's shadow softness
+/// replaces it (see [`soft_edge`]).
 pub const SOFT_EDGE: f64 = 5.0;
+
+/// The narrowest half disc a layer's shadow softness sets, in degrees (#3144): a much smaller disc
+/// would step at the cell size.
+pub const SOFT_EDGE_MIN: f64 = 0.5;
+/// The widest half disc a layer's shadow softness sets, in degrees (#3144): a much larger one would
+/// blur the shadows away.
+pub const SOFT_EDGE_MAX: f64 = 15.0;
+
+/// The half disc a layer's shadow softness `setting` gives, in degrees: [`SOFT_EDGE`] with none
+/// (or one that isn't a number), and within [`SOFT_EDGE_MIN`] to [`SOFT_EDGE_MAX`] whatever a
+/// file holds (`raster.symbology` refuses a value outside them).
+pub fn soft_edge(setting: Option<f64>) -> f64 {
+    setting.filter(|v| v.is_finite()).map_or(SOFT_EDGE, |v| v.clamp(SOFT_EDGE_MIN, SOFT_EDGE_MAX))
+}
 
 /// The most cells a raster's shadows, or its sky, are worked out for in the browser, which has one
 /// thread: past it, the relief is drawn without them, and said.
@@ -42,23 +58,28 @@ pub enum Unlit {
 
 /// The light left by cast shadows on each cell of `band` (`0` in shadow to `255` lit), row by row
 /// as the raster's pixels are, for a sun at `azimuth` (degrees clockwise from north) and `altitude`
-/// (degrees above the horizon), heights scaled by `z_factor`. Cells that are no data or masked are
-/// lit and cast no shadow. Rows are split over up to `threads` threads, each the same as on one.
-/// Looks at `stop` between rows, and at the run's Cancel (see [`rustgis_data::progress`]) on a
-/// thread that has one (the browser, which works it out where it is asked). On the desktop the
-/// worker has none: a cancelled export that waited for it alone sets `stop`. A sun under about 5°
-/// traces far over gentle ground: the cost grows with the raster's width as well as its cells.
+/// (degrees above the horizon), its disc `soft_edge` degrees either side of it (see [`soft_edge`]),
+/// heights scaled by `z_factor`. Cells that are no data or masked are lit and cast no shadow. Rows
+/// are split over up to `threads` threads, each the same as on one. Looks at `stop` between rows,
+/// and at the run's Cancel (see [`rustgis_data::progress`]) on a thread that has one (the browser,
+/// which works it out where it is asked). On the desktop the worker has none: a cancelled export
+/// that waited for it alone sets `stop`. The trace runs down to the disc's lower edge
+/// (`altitude` less `soft_edge`): with that edge near the horizon or below it (a sun under about
+/// 5° at the default disc, under about 15° at the widest), each cell traces far over gentle ground
+/// and the cost grows with the raster's width as well as its cells, some ten times that of an edge
+/// at 5°. No softness costs much more than a sun on the horizon does at the default disc.
 pub fn light(
     r: &Raster,
     band: usize,
     mask: &RasterMask,
     azimuth: f64,
     altitude: f64,
+    soft_edge: f64,
     z_factor: f64,
     threads: usize,
     stop: &AtomicBool,
 ) -> Result<Vec<u8>, Unlit> {
-    let sun = Sun::new(r, azimuth, altitude);
+    let sun = Sun::new(r, azimuth, altitude, soft_edge);
     each_row(r, band, mask, z_factor, threads, stop, |trace, row, out| {
         for (col, cell) in out.iter_mut().enumerate() {
             if let Some(z0) = trace.at(col, row) {
@@ -248,17 +269,34 @@ impl Way {
 /// The sun as each cell's trace needs it.
 struct Sun {
     way: Way,
-    /// The tangents of the disc's lower and upper edges.
+    /// The tangents of the disc's lower and upper edges. A softness set has the upper one infinite
+    /// when the disc reaches the zenith; the default disc's are held under 90°, as they always were.
     low: f64,
     high: f64,
     altitude: f64,
+    /// Half the disc, in degrees.
+    soft: f64,
 }
 
 impl Sun {
-    fn new(r: &Raster, azimuth: f64, altitude: f64) -> Self {
+    fn new(r: &Raster, azimuth: f64, altitude: f64, soft: f64) -> Self {
         let altitude = altitude.clamp(0.0, 90.0);
-        let edge = |a: f64| a.clamp(-89.9, 89.9).to_radians().tan();
-        Sun { way: Way::new(r, azimuth), low: edge(altitude - SOFT_EDGE), high: edge(altitude + SOFT_EDGE), altitude }
+        let soft = soft_edge(Some(soft));
+        let (low, high) = if soft == SOFT_EDGE {
+            // The default disc keeps the edges it was traced with before a softness could be set,
+            // held under 90°, so a layer that sets none draws the pixels it did (#3144).
+            let held = |a: f64| a.clamp(-89.9, 89.9).to_radians().tan();
+            (held(altitude - soft), held(altitude + soft))
+        } else {
+            // The altitude is 0° to 90° and the half disc 0.5° to 15°, so the lower edge lies from
+            // 15° below the horizon to 89.5° and an upper edge short of the zenith has a finite
+            // tangent: neither is held under 90°, which would hide the whole of a disc nearer the
+            // zenith. A disc reaching the zenith has no upper edge any terrain hides it past: the
+            // share above the terrain is still lit, however steep that is.
+            let edge = |a: f64| a.to_radians().tan();
+            (edge(altitude - soft), if altitude + soft >= 90.0 { f64::INFINITY } else { edge(altitude + soft) })
+        };
+        Sun { way: Way::new(r, azimuth), low, high, altitude, soft }
     }
 
     /// The share of the disc above the steepest tangent `t` seen toward it, 0 to 255.
@@ -270,7 +308,7 @@ impl Sun {
             return 0;
         }
         let seen = t.atan().to_degrees();
-        let share = (self.altitude + SOFT_EDGE - seen) / (2.0 * SOFT_EDGE);
+        let share = (self.altitude + self.soft - seen) / (2.0 * self.soft);
         (share.clamp(0.0, 1.0) * 255.0).round() as u8
     }
 }
@@ -396,7 +434,12 @@ mod tests {
     }
 
     fn lit(r: &Raster, azimuth: f64, altitude: f64) -> Vec<u8> {
-        light(r, 0, &RasterMask::default(), azimuth, altitude, 1.0, 4, &AtomicBool::new(false)).unwrap_or_else(|e| panic!("{e:?}"))
+        soft(r, azimuth, altitude, SOFT_EDGE)
+    }
+
+    fn soft(r: &Raster, azimuth: f64, altitude: f64, soft_edge: f64) -> Vec<u8> {
+        light(r, 0, &RasterMask::default(), azimuth, altitude, soft_edge, 1.0, 4, &AtomicBool::new(false))
+            .unwrap_or_else(|e| panic!("{e:?}"))
     }
 
     fn sky_of(r: &Raster, threads: usize) -> Vec<u8> {
@@ -433,26 +476,44 @@ mod tests {
         assert!((127..=128).contains(&g[20 * 40 + 20]), "{}", g[20 * 40 + 20]);
     }
 
-    /// A wall casts a shadow as long as its height over the sun's tangent, at each main azimuth.
+    /// A wall casts a shadow as long as its height over the sun's tangent, its edge as wide as the
+    /// softness set: the default's, a crisp one's and a wide one's (#3144).
     #[test]
     fn a_walls_shadow_has_the_length_its_height_gives() {
         let (height, altitude) = (300.0, 45.0);
         // Lit from the east, a north–south wall at column 40 shades the cells west of it.
         let r = dem(60, 20, |e, _| if (e / CELL).round() == 40.0 { height } else { 0.0 });
-        let g = lit(&r, 90.0, altitude);
-        let row = &g[10 * 60..11 * 60];
-        // The whole disc is hidden up to height / tan(45° + 5°) away, none of it past
-        // height / tan(45° − 5°).
-        let full = (height / f64::to_radians(altitude + SOFT_EDGE).tan() / CELL).floor() as usize;
-        let none = (height / f64::to_radians(altitude - SOFT_EDGE).tan() / CELL).ceil() as usize;
-        for d in 1..=full {
-            assert_eq!(row[40 - d], 0, "{d} cells west");
+        let mut edges = Vec::new();
+        for half in [SOFT_EDGE_MIN, SOFT_EDGE, SOFT_EDGE_MAX] {
+            let g = soft(&r, 90.0, altitude, half);
+            let row = &g[10 * 60..11 * 60];
+            // The whole disc is hidden up to height / tan(45° + half) away, none of it past
+            // height / tan(45° − half).
+            let full = (height / f64::to_radians(altitude + half).tan() / CELL).floor() as usize;
+            let none = (height / f64::to_radians(altitude - half).tan() / CELL).ceil() as usize;
+            for d in 1..=full {
+                assert_eq!(row[40 - d], 0, "{half}°: {d} cells west");
+            }
+            for d in none + 1..30 {
+                assert_eq!(row[40 - d], 255, "{half}°: {d} cells west");
+            }
+            // East of the wall, facing the sun, nothing is shaded.
+            assert!(row[41..].iter().all(|v| *v == 255));
+            edges.push(row.iter().filter(|v| (1..255).contains(*v)).count());
         }
-        for d in none + 1..30 {
-            assert_eq!(row[40 - d], 255, "{d} cells west");
-        }
-        // East of the wall, facing the sun, nothing is shaded.
-        assert!(row[41..].iter().all(|v| *v == 255));
+        // The wider the disc, the more cells are part lit.
+        assert!(edges[0] < edges[1] && edges[1] < edges[2], "{edges:?}");
+    }
+
+    /// No setting, or one that isn't a number, is the default; a file's value outside the range
+    /// traces at its nearest bound, never a disc of no size or one past the zenith.
+    #[test]
+    fn a_softness_outside_the_range_traces_at_its_bound() {
+        assert_eq!([soft_edge(None), soft_edge(Some(f64::NAN)), soft_edge(Some(1.5))], [SOFT_EDGE, SOFT_EDGE, 1.5]);
+        assert_eq!([soft_edge(Some(-3.0)), soft_edge(Some(0.0)), soft_edge(Some(1e9))], [SOFT_EDGE_MIN, SOFT_EDGE_MIN, SOFT_EDGE_MAX]);
+        let r = dem(60, 20, |e, _| if (e / CELL).round() == 40.0 { 300.0 } else { 0.0 });
+        assert_eq!(soft(&r, 90.0, 45.0, 0.0), soft(&r, 90.0, 45.0, SOFT_EDGE_MIN));
+        assert_eq!(soft(&r, 90.0, 45.0, f64::INFINITY), soft(&r, 90.0, 45.0, SOFT_EDGE));
     }
 
     /// A trace stopped part-way gives no grid; flat ground, no data and a mask cast nothing.
@@ -460,7 +521,7 @@ mod tests {
     fn stopped_flat_and_missing_cells() {
         let flat = dem(300, 300, |_, _| 100.0);
         let stop = AtomicBool::new(true);
-        assert_eq!(light(&flat, 0, &RasterMask::default(), 315.0, 30.0, 1.0, 4, &stop), Err(Unlit::Stopped));
+        assert_eq!(light(&flat, 0, &RasterMask::default(), 315.0, 30.0, SOFT_EDGE, 1.0, 4, &stop), Err(Unlit::Stopped));
         assert_eq!(sky(&flat, 0, &RasterMask::default(), 1.0, 4, &stop), Err(Unlit::Stopped));
         assert!(lit(&flat, 315.0, 30.0).iter().all(|v| *v == 255));
         assert!(sky_of(&flat, 4).iter().all(|v| *v == 255), "flat ground sees the whole sky");
@@ -470,12 +531,12 @@ mod tests {
         assert!(sky_of(&tower, 1).iter().any(|v| *v < 255));
         assert_eq!(sky_of(&tower, 1)[20 * 40 + 20], 255, "its top sees the whole sky");
         let masked = RasterMask { values: vec![1000.0], ..RasterMask::default() };
-        let g = light(&tower, 0, &masked, 90.0, 30.0, 1.0, 1, &AtomicBool::new(false)).unwrap_or_default();
+        let g = light(&tower, 0, &masked, 90.0, 30.0, SOFT_EDGE, 1.0, 1, &AtomicBool::new(false)).unwrap_or_default();
         assert!(g.iter().all(|v| *v == 255));
         let g = sky(&tower, 0, &masked, 1.0, 1, &AtomicBool::new(false)).unwrap_or_default();
         assert!(g.iter().all(|v| *v == 255));
         // A band that isn't there leaves every cell lit.
-        let g = light(&tower, 3, &RasterMask::default(), 90.0, 30.0, 1.0, 1, &AtomicBool::new(false)).unwrap_or_default();
+        let g = light(&tower, 3, &RasterMask::default(), 90.0, 30.0, SOFT_EDGE, 1.0, 1, &AtomicBool::new(false)).unwrap_or_default();
         assert!(g.iter().all(|v| *v == 255));
         let g = sky(&tower, 3, &RasterMask::default(), 1.0, 1, &AtomicBool::new(false)).unwrap_or_default();
         assert!(g.iter().all(|v| *v == 255));
@@ -485,8 +546,8 @@ mod tests {
     #[test]
     fn threads_give_the_same_grid() {
         let r = dem(300, 300, |e, n| 400.0 * ((e / 900.0).sin() * (n / 700.0).cos()) + e * 0.05);
-        let one = light(&r, 0, &RasterMask::default(), 315.0, 25.0, 1.0, 1, &AtomicBool::new(false));
-        let many = light(&r, 0, &RasterMask::default(), 315.0, 25.0, 1.0, 7, &AtomicBool::new(false));
+        let one = light(&r, 0, &RasterMask::default(), 315.0, 25.0, SOFT_EDGE, 1.0, 1, &AtomicBool::new(false));
+        let many = light(&r, 0, &RasterMask::default(), 315.0, 25.0, SOFT_EDGE, 1.0, 7, &AtomicBool::new(false));
         assert_eq!(one, many);
         assert!(one.unwrap_or_default().iter().any(|v| *v < 255));
         let one = sky_of(&r, 1);
@@ -562,6 +623,51 @@ mod tests {
                 for col in 25..35 {
                     assert_eq!(g[row * 60 + col], want, "uphill {uphill}, cell {col},{row}");
                 }
+            }
+        }
+    }
+
+    /// A disc of a softness set reaching past the zenith (a high sun, a wide disc), or just short
+    /// of it, keeps the share of it above the terrain seen, however steep: none of it is hidden
+    /// whole at an edge held under 90°. The default disc is traced as it was (see
+    /// `the_default_disc_is_traced_as_it_was`).
+    #[test]
+    fn a_disc_past_the_zenith_keeps_its_share_above_steep_terrain() {
+        let r = dem(3, 3, |_, _| 0.0);
+        for (altitude, soft, t) in [(80.0, 15.0, 1000.0), (88.0, 3.0, 1000.0), (89.45, 0.5, f64::to_radians(89.92).tan())] {
+            let share = (altitude + soft - t.atan().to_degrees()) / (2.0 * soft);
+            let lit = Sun::new(&r, 315.0, altitude, soft).lit(t);
+            assert_eq!(lit, (share * 255.0).round() as u8, "{altitude}° ± {soft}°");
+            assert!(lit > 0, "{altitude}° ± {soft}°");
+        }
+    }
+
+    /// The default disc is traced as it was before a softness could be set (#3144), its edges held
+    /// under 90° even near the zenith, so a layer that sets none draws the pixels it did: the
+    /// same edges (where the trace stops) and the same light, at every altitude from 80° to 90°
+    /// and every tangent up to 89.95°'s.
+    #[test]
+    fn the_default_disc_is_traced_as_it_was() {
+        let r = dem(3, 3, |_, _| 0.0);
+        let held = |a: f64| a.clamp(-89.9, 89.9).to_radians().tan();
+        for a in 0..=100 {
+            let altitude = 80.0 + f64::from(a) / 10.0;
+            let (low, high) = (held(altitude - SOFT_EDGE), held(altitude + SOFT_EDGE));
+            let was = |t: f64| {
+                if t <= low {
+                    255
+                } else if t >= high {
+                    0
+                } else {
+                    let share = (altitude + SOFT_EDGE - t.atan().to_degrees()) / (2.0 * SOFT_EDGE);
+                    (share.clamp(0.0, 1.0) * 255.0).round() as u8
+                }
+            };
+            let sun = Sun::new(&r, 315.0, altitude, SOFT_EDGE);
+            assert_eq!((sun.low.to_bits(), sun.high.to_bits()), (low.to_bits(), high.to_bits()), "edges at {altitude}°");
+            for d in 0..=2000 {
+                let t = f64::to_radians(70.0 + f64::from(d) * 0.00995).tan();
+                assert_eq!(sun.lit(t), was(t), "{altitude}° seeing {t}");
             }
         }
     }

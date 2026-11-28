@@ -131,6 +131,7 @@ pub const CAPABILITIES: &[&str] = &[
     "layout-text-statistics",
     "layout-publication-parts",
     "layout-publication-legend",
+    "shaded-relief-shadow-softness",
 ];
 /// An offline area keeping the versions that lost a sync or a Bring Back
 /// (`OfflineArea::conflicts`, #2468): an older reader would save it again without them.

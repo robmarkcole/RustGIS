@@ -182,6 +182,7 @@ const COMMAND_CAPABILITIES: &[(&str, CommandCheck)] = &[
     ("layout-text-statistics", command_uses_text_statistics),
     ("layout-publication-parts", command_sets_publication_parts),
     ("layout-publication-legend", command_sets_publication_legend),
+    ("shaded-relief-shadow-softness", command_sets_shadow_softness),
 ];
 
 /// A saved `layout.publication` that leaves out or sets up its grid, scale bar or north arrow
@@ -210,6 +211,17 @@ fn command_sets_publication_legend(id: &str, params: &Value) -> bool {
             params.get("legend").is_some_and(|v| !v.is_null() && v.as_object().is_none_or(|o| !o.values().all(nothing)))
         }
         "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_sets_publication_legend)),
+        _ => false,
+    }
+}
+
+/// A saved `raster.symbology` that sets a Shaded Relief's shadow softness (#3144): an older reader
+/// runs it without the key, saying nothing, so the shadows would be traced at the default disc.
+/// `null` asks for that default.
+fn command_sets_shadow_softness(id: &str, params: &Value) -> bool {
+    match id {
+        "raster.symbology" => params.get("shadowSoftness").is_some_and(|v| !v.is_null()),
+        "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_sets_shadow_softness)),
         _ => false,
     }
 }
@@ -976,6 +988,15 @@ fn relief_light(layer: &Layer) -> bool {
     )
 }
 
+/// Whether a layer sets how soft its Shaded Relief's cast shadows are (#3144): an older reader
+/// would trace them at the default and save the layer again without the setting.
+fn sets_shadow_softness(layer: &Layer) -> bool {
+    layer
+        .raster
+        .as_ref()
+        .is_some_and(|r| matches!(&r.style.renderer, RasterRenderer::ShadedRelief { shadow_softness, .. } if shadow_softness.is_some()))
+}
+
 /// Whether a layer is a window of a Zarr variable following the time slider (#1720): an older
 /// reader would drop the window and read the whole map at each step.
 fn zarr_window(layer: &Layer) -> bool {
@@ -1018,6 +1039,7 @@ fn layer_capabilities(layer: &Layer) -> Vec<&'static str> {
     [
         (relief_effects(layer), "shaded-relief-effects"),
         (relief_light(layer), "shaded-relief-light"),
+        (sets_shadow_softness(layer), "shaded-relief-shadow-softness"),
         (layer.size_by.is_some(), super::SIZE_BY_CAPABILITY),
         (layer.has_picture_markers(), "picture-markers"),
         (layer.any_picture(svg_picture), "svg-markers"),
@@ -1054,7 +1076,7 @@ fn map_capabilities<'a>(maps: impl IntoIterator<Item = &'a Map>) -> Vec<&'static
     let (mut polygon, mut svg) = (false, false);
     let (mut offline_area_id, mut paper, mut native, mut guided, mut weighed, mut cleared, mut deduped) =
         (false, false, false, false, false, false, false);
-    let (mut crisp, mut bed) = (false, false);
+    let (mut crisp, mut bed, mut soft) = (false, false, false);
     for map in maps {
         offline_area_id |= map.offline_area_id.is_some();
         // A blank basemap's paper colour (#2532), which an older reader would draw and save white.
@@ -1089,6 +1111,7 @@ fn map_capabilities<'a>(maps: impl IntoIterator<Item = &'a Map>) -> Vec<&'static
         }
         relief |= map.layers.iter().any(relief_effects);
         light |= map.layers.iter().any(relief_light);
+        soft |= map.layers.iter().any(sets_shadow_softness);
         sized |= map.layers.iter().any(|layer| layer.size_by.is_some());
         pictures |= map.layers.iter().any(Layer::has_picture_markers);
         svg |= map.layers.iter().any(|layer| layer.any_picture(svg_picture));
@@ -1109,6 +1132,7 @@ fn map_capabilities<'a>(maps: impl IntoIterator<Item = &'a Map>) -> Vec<&'static
         (walls_layer, "terrain-block-walls-layer"),
         (relief, "shaded-relief-effects"),
         (light, "shaded-relief-light"),
+        (soft, "shaded-relief-shadow-softness"),
         (legends, "normalized-legend-urls"),
         (sized, super::SIZE_BY_CAPABILITY),
         (pictures, "picture-markers"),
@@ -1573,6 +1597,9 @@ mod tests {
             (&["layout-text-statistics"], "layout.addElement", json!({"kind": "text", "text": "{count:Cities}"})),
             (&["layout-publication-parts"], "layout.publication", json!({"grid": "none"})),
             (&["layout-publication-legend"], "layout.publication", json!({"legend": "none"})),
+            (&["shaded-relief-shadow-softness"], "raster.symbology", json!({"type": "shadedRelief", "shadowSoftness": 1.5})),
+            // `null` is the default an older reader draws.
+            (&[], "raster.symbology", json!({"type": "shadedRelief", "shadowSoftness": null})),
             // An SVG image is a picture marker as well, in a node as in a saved command.
             (&["picture-markers", "svg-markers"], "layer.marker", json!({"image": svg})),
             (&[], "buffer", json!({"input": "Cities", "distance": 1})),
@@ -3192,7 +3219,7 @@ mod tests {
         }))
         .unwrap();
         let clean = Layer::new_raster(1, "DEM", raster);
-        for field in ["shadow", "sky", "fill", "rock", "ambient", "balanced"] {
+        for field in ["shadow", "sky", "fill", "rock", "ambient", "balanced", "shadow_softness"] {
             let mut value = serde_json::to_value(&clean).unwrap();
             value["raster"]["style"]["renderer"]["ShadedRelief"][field] = match field {
                 "rock" => serde_json::to_value(rustgis_map::raster::Rock::DEFAULT).unwrap(),
@@ -3207,7 +3234,11 @@ mod tests {
                 json_bytes(&map_file_bytes(p.map()).unwrap()),
                 json_bytes(&layer_file_bytes(&layer).unwrap()),
             ] {
-                let needs = if matches!(field, "ambient" | "balanced") { "shaded-relief-light" } else { "shaded-relief-effects" };
+                let needs = match field {
+                    "ambient" | "balanced" => "shaded-relief-light",
+                    "shadow_softness" => "shaded-relief-shadow-softness",
+                    _ => "shaded-relief-effects",
+                };
                 assert_eq!(document["requires"], json!([needs]), "{field}: {document}");
             }
         }

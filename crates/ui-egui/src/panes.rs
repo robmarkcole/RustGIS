@@ -7514,8 +7514,23 @@ fn raster_symbology(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
         RasterRenderer::Colormap => {
             ui.label(egui::RichText::new(tl!("Colors from the raster's own color table.")).size(11.5).color(t.text_dim));
         }
-        RasterRenderer::ShadedRelief { band, ramp, azimuth, altitude, z_factor, shadow, sky, fill, rock, ambient, balanced } => {
+        RasterRenderer::ShadedRelief {
+            band,
+            ramp,
+            azimuth,
+            altitude,
+            z_factor,
+            shadow,
+            sky,
+            fill,
+            rock,
+            ambient,
+            balanced,
+            shadow_softness,
+        } => {
+            use rustgis_engine::map::shadow::{SOFT_EDGE_MAX, SOFT_EDGE_MIN, soft_edge};
             let (az, alt, zf, sh, sk, fl) = (*azimuth, *altitude, *z_factor, *shadow, *sky, *fill);
+            let ss = soft_edge(*shadow_softness);
             let am = relief_ambient(*ambient, *balanced);
             let rp = ramp.as_ref().map(|r| r.name().to_string());
             let relief = move |band: usize, az: f64, alt: f64, zf: f64, sh: f64| {
@@ -7535,6 +7550,7 @@ fn raster_symbology(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
                     ("Altitude", alt, 0.0..=90.0, 0.5, 1),
                     ("Z factor", zf, 0.001..=1000.0, 0.01, 2),
                     ("Cast shadows", sh, 0.0..=1.0, 0.01, 3),
+                    ("Shadow softness", ss, SOFT_EDGE_MIN..=SOFT_EDGE_MAX, 0.1, 7),
                     ("Sky visibility", sk, 0.0..=1.0, 0.01, 4),
                     ("Fill light", fl, 0.0..=1.0, 0.01, 5),
                     ("Ambient", am, 0.0..=1.0, 0.01, 6),
@@ -7555,6 +7571,9 @@ fn raster_symbology(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
                             "A light from the side opposite the sun that lightens the slopes turned toward it, from 0 (none) to 1"
                         )),
                         6 => r.on_hover_text(tl!("The share of the colour a slope turned fully from the sun keeps, from 0 to 1")),
+                        7 => r.on_hover_text(tl!(
+                            "How soft the edges of the cast shadows are: half the sun's apparent size, from 0.5° (crisp) to 15°"
+                        )),
                         _ => r,
                     };
                     if drag.settled(ui, &r, &mut x) && x != v {
@@ -7570,6 +7589,7 @@ fn raster_symbology(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
                             4 => p["sky"] = json!(x),
                             5 => p["fill"] = json!(x),
                             6 => p["ambient"] = json!(x),
+                            7 => p["shadowSoftness"] = json!(x),
                             _ => {}
                         }
                         let _ = app.run("raster.symbology", p);

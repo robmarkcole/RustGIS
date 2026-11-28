@@ -963,8 +963,8 @@ impl RasterLayer {
     }
 
     /// The light its cast shadows leave on each cell (see [`crate::shadow::light`]), when it is
-    /// drawn as Shaded Relief with shadows. Worked out once per pixels, band, sun, Z factor and
-    /// mask and kept: each owner's latest, and a few of suns left, for going back.
+    /// drawn as Shaded Relief with shadows. Worked out once per pixels, band, sun (its softness
+    /// too), Z factor and mask and kept: each owner's latest, and a few of suns left, for going back.
     /// `owner` is who draws it (its map's and its layer's live identities, see
     /// [`crate::Layer::instance_id`]; a layer's id repeats from map to map): a new sun from the
     /// same owner stops the work
@@ -973,11 +973,13 @@ impl RasterLayer {
     /// export does, this waits for it. The browser, which has one thread, works it out here, for
     /// at most [`crate::shadow::MAX_BROWSER_CELLS`] cells.
     pub fn cast_shadows(&self, wait: bool, owner: (u64, u64), landed: impl FnOnce() + Send + 'static) -> CastShadows {
-        let RasterRenderer::ShadedRelief { azimuth, altitude, shadow, .. } = self.style.renderer else {
+        let RasterRenderer::ShadedRelief { azimuth, altitude, shadow, shadow_softness, .. } = self.style.renderer else {
             return CastShadows::None;
         };
         let finite = azimuth.is_finite() && altitude.is_finite();
-        self.light_grid(Grid::Shadows { azimuth, altitude }, shadow > 0.0 && finite, wait, owner, landed)
+        // The half disc traced, not the setting: none and the default's own value share a grid.
+        let soft_edge = crate::shadow::soft_edge(shadow_softness);
+        self.light_grid(Grid::Shadows { azimuth, altitude, soft_edge }, shadow > 0.0 && finite, wait, owner, landed)
     }
 
     /// The share of the sky each cell sees (see [`crate::shadow::sky`]), when it is drawn as
@@ -1094,7 +1096,7 @@ struct LightKey {
 /// Which grid: the light cast shadows leave for a sun, or the sky seen.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Grid {
-    Shadows { azimuth: f64, altitude: f64 },
+    Shadows { azimuth: f64, altitude: f64, soft_edge: f64 },
     Sky,
 }
 
@@ -1260,8 +1262,8 @@ fn start_light(r: Arc<Raster>, key: LightKey, work: Arc<LightWork>) {
         drop(LIGHT_HOLD.read().unwrap_or_else(|e| e.into_inner()));
         let threads = rustgis_data::threads::max();
         let traced = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match key.grid {
-            Grid::Shadows { azimuth, altitude } => {
-                crate::shadow::light(&r, key.band, &key.mask, azimuth, altitude, key.z_factor, threads, &work.stop)
+            Grid::Shadows { azimuth, altitude, soft_edge } => {
+                crate::shadow::light(&r, key.band, &key.mask, azimuth, altitude, soft_edge, key.z_factor, threads, &work.stop)
             }
             Grid::Sky => crate::shadow::sky(&r, key.band, &key.mask, key.z_factor, threads, &work.stop),
         }));
@@ -1667,7 +1669,10 @@ pub enum RasterRenderer {
     /// share of the colour a slope turned fully from the sun keeps; none, the default, is
     /// [`relief_ambient`]'s. `balanced` divides the sun's light by its value on flat ground, so flat
     /// ground keeps the ramp's colour and slopes facing the sun brighten (#1977); off, the default,
-    /// lights as before.
+    /// lights as before. `shadow_softness` is half the sun's apparent size its cast shadows are
+    /// traced with, in degrees ([`crate::shadow::SOFT_EDGE_MIN`] to
+    /// [`crate::shadow::SOFT_EDGE_MAX`]): how soft their edges are (#3144); none, the default, is
+    /// [`crate::shadow::SOFT_EDGE`].
     ShadedRelief {
         band: usize,
         ramp: Option<Ramp>,
@@ -1686,6 +1691,8 @@ pub enum RasterRenderer {
         ambient: Option<f64>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         balanced: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        shadow_softness: Option<f64>,
     },
 }
 
@@ -2717,6 +2724,7 @@ mod tests {
             rock: None,
             ambient: None,
             balanced: false,
+            shadow_softness: None,
         }
     }
 
@@ -3307,6 +3315,7 @@ mod tests {
             rock,
             ambient: None,
             balanced: false,
+            shadow_softness: None,
         };
         let (mut rocky, mut plain) = (RasterStyle::default_for(&r), RasterStyle::default_for(&r));
         (rocky.renderer, plain.renderer) = (relief(Some(rock)), relief(None));
@@ -3362,6 +3371,7 @@ mod tests {
             rock: None,
             ambient,
             balanced,
+            shadow_softness: None,
         };
         let relief = |altitude, ambient, balanced| tinted_relief(None, altitude, ambient, balanced);
         // Grey relief: white shaded, so a channel is 255 times the light.
@@ -3453,6 +3463,21 @@ mod tests {
         if let RasterRenderer::ShadedRelief { shadow, .. } = &mut rl.style.renderer {
             *shadow = 0.3;
         }
+        assert!(matches!(rl.cast_shadows(false, (0, 1), || {}), CastShadows::Ready(g) if Arc::ptr_eq(&g, &grid)));
+        // The default softness set by its value traces the same disc: the grid is kept. Another
+        // softness is worked out again (another grid: this tower's shadow is whole under both),
+        // and going back to the default finds its grid kept (#3144).
+        let soften = |rl: &mut RasterLayer, to: Option<f64>| {
+            if let RasterRenderer::ShadedRelief { shadow_softness, .. } = &mut rl.style.renderer {
+                *shadow_softness = to;
+            }
+        };
+        soften(&mut rl, Some(crate::shadow::SOFT_EDGE));
+        assert!(matches!(rl.cast_shadows(false, (0, 1), || {}), CastShadows::Ready(g) if Arc::ptr_eq(&g, &grid)));
+        soften(&mut rl, Some(1.0));
+        let CastShadows::Ready(crisp) = rl.cast_shadows(true, (0, 1), || {}) else { panic!("waited for") };
+        assert!(!Arc::ptr_eq(&crisp, &grid), "another softness, another grid");
+        soften(&mut rl, None);
         assert!(matches!(rl.cast_shadows(false, (0, 1), || {}), CastShadows::Ready(g) if Arc::ptr_eq(&g, &grid)));
         // Another sun: worked out again, lit from the west now.
         if let RasterRenderer::ShadedRelief { azimuth, .. } = &mut rl.style.renderer {
@@ -3551,7 +3576,7 @@ mod tests {
         // The worker stops and says so (the map draws again), with no grid.
         assert!(landings.recv_timeout(std::time::Duration::from_secs(60)).is_ok(), "landed");
         let work = rl.cast.0.lock().unwrap().first().map(|j| j.work.clone()).unwrap();
-        assert!(work.was_stopped(Grid::Shadows { azimuth: 0.0, altitude: 0.0 }.stopped()));
+        assert!(work.was_stopped(Grid::Shadows { azimuth: 0.0, altitude: 0.0, soft_edge: 0.0 }.stopped()));
         // Asked again, it starts over.
         rl.cast_shadows(false, (0, 1), || {});
         let again = rl.cast.0.lock().unwrap().first().map(|j| j.work.clone()).unwrap();

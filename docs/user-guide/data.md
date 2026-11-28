@@ -1750,6 +1750,16 @@ whole image is held: either way the layer is drawn without them, and a notice sa
 outside the raster casts nothing on it, and a grid spanning 0 to 360° casts nothing across its
 seam.
 
+**Shadow softness**, on a Shaded Relief layer (`raster.symbology` `"shadowSoftness"`, 0.5 to 15
+degrees), is how soft the edges of its cast shadows are: half the apparent size of the sun they are
+traced with. A shadow's edge is the share of the sun's disc the terrain hides, so a wider disc
+keeps a shadow sharp near what casts it and fades it farther away, as real shadows do; it isn't a
+blur. 5, the default, draws the shadows as before; a small value gives a crisp shadow line, for a
+large-scale map of a cliff, and a large one fades the shadows of a mountain range at a small scale.
+Changing it works the shadows out again, as moving the sun does, and going back to a softness used
+before draws at once. A value outside 0.5 to 15 is refused; `"shadowSoftness": null` goes back to
+the default. It changes nothing while Cast shadows is 0.
+
 **Sky visibility**, on a Shaded Relief layer (`raster.symbology` `"sky"`, 0 to 1), dims the
 relief's ambient light where the terrain around a cell hides part of the sky: valley floors, pits
 and the foot of a cliff get less of it than a plain or a ridge, whatever the sun. Each cell's sky is

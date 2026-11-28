@@ -1138,6 +1138,7 @@ mod tests {
             rock: None,
             ambient: None,
             balanced: false,
+            shadow_softness: None,
         }
     }
 
@@ -1234,6 +1235,7 @@ mod tests {
                 rock: None,
                 ambient: None,
                 balanced: false,
+                shadow_softness: None,
             };
             style.resampling = Resampling::Nearest;
             let mut pm = Pixmap::new(1, 1).unwrap();
@@ -1409,6 +1411,7 @@ mod tests {
                 rock: None,
                 ambient: None,
                 balanced: false,
+                shadow_softness: None,
             };
             style.resampling = Resampling::Nearest;
             let view = View {
@@ -1774,6 +1777,7 @@ mod tests {
             rock,
             ambient: None,
             balanced: false,
+            shadow_softness: None,
         };
         style.resampling = resampling;
         let view = View {
