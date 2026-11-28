@@ -43,24 +43,30 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
     (a sheet turned Auto, Portrait or Landscape, or a figure), the map extent and the layout's name,
     the style (each beside an outline of where its title, map and footer go, and its column or panel
     if it has one, with the accent colour picked, or else its own, where the sheet takes it, which
-    Classic's doesn't; a click on the outline picks the style), the texts (title, the active map's
-    name until one is typed; subtitle, note and credit line, or none; an Editorial sheet's column
-    heading), the sources and reference (each one per line, with its heading; the reference can be
-    left out) and the accent colour, then shows what was picked; **Create** makes the layout as the
-    menu does. **Insert Statistic**, on the texts and sources steps, adds a layer figure of the
-    active map to the field the cursor was last in there (the note or the sources, where it was in
-    none). The map extent is the view, the features one layer shows (hidden or not, in their
-    longitude/latitude box) or the selected features (a point or a straight line is widened to
-    0.01°, and what lies past ±180° or ±90° is left out of the frame; an area with nothing to frame,
-    one gone by Create, or one picked before the map or the project was switched or the map renamed,
-    is said and nothing is made); without a name the layout is `Publication`; the review says when a
-    layout has that name, so the new one is numbered. A figure goes from its size to its map, its
-    reference (each line typed; with no heading, and it can be left out) and the review, as it takes
-    no style, accent or other text. A field left empty is left out (for the credit
-    line, the reference and the headings, the command's default applies); the title is the
-    exception: empty, it means no title. A layout the command refuses is said, and the wizard stays
-    open. The window can be resized. Its steps are listed on the left, and a click goes to one; a
-    narrow screen leaves the list out, and the heading still says which step this is.
+    Classic's doesn't; a click on the outline picks the style), the placement, the texts (title, the
+    active map's name until one is typed; subtitle, note and credit line, or none; an Editorial
+    sheet's column heading), the sources and reference (each one per line, with its heading; the
+    reference can be left out) and the accent colour, then shows what was picked; **Create** makes
+    the layout as the menu does. **Insert Statistic**, on the texts and sources steps, adds a layer
+    figure of the active map to the field the cursor was last in there (the note or the sources,
+    where it was in none). The map extent is the view, the features one layer shows (hidden or not,
+    in their longitude/latitude box) or the selected features (a point or a straight line is widened
+    to 0.01°, and what lies past ±180° or ±90° is left out of the frame; an area with nothing to
+    frame, one gone by Create, or one picked before the map or the project was switched or the map
+    renamed, is said and nothing is made); without a name the layout is `Publication`; the review
+    says when a layout has that name, so the new one is numbered. The **placement** is the
+    arrangement (below): `best`, the favourite, one by name or one saved, or **Custom**, a corner
+    for each surround (a corner another has swaps the two; on Panel, Editorial and Modular only the
+    north arrow and scale bar take one, the locator and legend sitting in the column, and a figure
+    gives the locator none, as it draws none); a chosen one can be made the favourite, once the
+    layout is made. A saved one removed after it was picked is said at Create and nothing is made. A
+    figure goes from its size to its map, its placement, its reference (each line typed; with no
+    heading, and it can be left out) and the review, as it takes no style, accent or other text. A
+    field left empty is left out (for the credit line, the reference and the headings, the command's
+    default applies); the title is the exception: empty, it means no title. A layout the command
+    refuses is said, and the wizard stays open. The window can be resized. Its steps are listed on
+    the left, and a click goes to one; a narrow screen leaves the list out, and the heading still
+    says which step this is.
   - **The map**: the `extent` given (or the view) fitted north-up, without tilt, at a round scale,
     two significant figures, rounded up so it still fits within the strips the graticule's labels
     take inside the frame. A graticule's step follows the extent (2° for a state, 15′ for a city),

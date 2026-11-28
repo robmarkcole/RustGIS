@@ -79,6 +79,12 @@ pub fn publication_style_accent(style: &str) -> Option<Rgba> {
     Style::parse(style).map(Style::accent)
 }
 
+/// Whether a [`PUBLICATION_STYLES`] style id keeps the locator and legend in a column beside the
+/// map, leaving only the north arrow and scale bar to the frame's corners.
+pub fn publication_style_has_column(style: &str) -> bool {
+    Style::parse(style).is_some_and(Style::has_column)
+}
+
 /// How a publication sheet is arranged around its map.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(in crate::cmd::layout) enum Style {
@@ -142,6 +148,11 @@ impl Style {
             Style::Poster => Rgba::rgb(0x3A, 0x26, 0x18),
             Style::Edge => Rgba::rgb(0xB4, 0x43, 0x2E),
         }
+    }
+
+    /// Whether it has a column beside the map for the locator and legend.
+    pub(in crate::cmd::layout) fn has_column(self) -> bool {
+        matches!(self, Style::Panel | Style::Editorial | Style::Modular)
     }
 
     /// Whether its surrounds sit on cards with rounded corners.

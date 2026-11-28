@@ -141,7 +141,7 @@ pub(in crate::cmd::layout) fn arrangement_label(v: &Value, homes: Homes, saved: 
 }
 
 /// The corners of an arrangement, by surround.
-pub(in crate::cmd::layout) fn corners_of(homes: Homes) -> Value {
+pub fn corners_of(homes: Homes) -> Value {
     Value::Object(ARRANGEMENT_KEYS.iter().zip(homes).map(|(k, h)| ((*k).to_string(), json!(CORNER_NAMES[h]))).collect())
 }
 

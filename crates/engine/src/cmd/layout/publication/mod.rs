@@ -62,7 +62,7 @@ pub(in crate::cmd::layout) fn landscape_suits(aspect: f64, short: f64, long: f64
         // An edge sheet's map takes the page's whole width.
         let sides = if style == Style::Edge { 0.0 } else { 30.0 * k };
         let (iw, ih) = (w - sides, h - texts);
-        let fw = if matches!(style, Style::Panel | Style::Editorial | Style::Modular) { 0.68 * iw } else { iw };
+        let fw = if style.has_column() { 0.68 * iw } else { iw };
         let (fw, fh) = (fw - 2.0 * LABEL_ROOM_SIDE * k, ih - 2.0 * LABEL_ROOM_END * k);
         fw.min(fh / aspect.max(1e-6))
     };
