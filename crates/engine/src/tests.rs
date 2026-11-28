@@ -4344,8 +4344,8 @@ fn qgis_raster_image_markers_read_their_files_from_the_style_folder() {
     }
 }
 
-/// A QGIS style's and project's SVG markers draw their file through the importer's one reader, and
-/// saving asks for `svg-markers`; one whose colours the style sets is a circle, noted.
+/// A QGIS style's and project's SVG markers draw their file through the importer's one reader, in
+/// the layer's colours where it takes them, and saving asks for `svg-markers`.
 #[test]
 #[cfg(not(target_arch = "wasm32"))]
 fn qgis_svg_markers_draw_their_file_and_saving_requires_svg_markers() {
@@ -4380,11 +4380,20 @@ fn qgis_svg_markers_draw_their_file_and_saving_requires_svg_markers() {
         assert!(notes(&r).is_empty(), "{:?}", notes(&r));
         assert_eq!(serde_json::to_value(&s.project).unwrap()["requires"], json!(["picture-markers", "svg-markers"]));
     }
-    std::fs::write(&path, qml("tinted.svg")).unwrap();
-    let mut s = world();
-    let r = s.run("style.importQgis", &json!({"layer": "Cities", "path": path.to_string_lossy()})).unwrap();
-    assert_eq!(marker(&s), Marker::Circle);
-    assert_eq!(notes(&r), ["SVG markers whose colours the style sets, which RustGIS doesn't apply yet, drawn as circles"]);
+    // One whose colours the style sets takes the layer's, from the file and embedded.
+    let tinted = svg.replace("#c81e1e", "param(fill) #c81e1e");
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&tinted);
+    let set = base64::engine::general_purpose::STANDARD.encode(svg.replace("#c81e1e", "#1e963c"));
+    for file in ["tinted.svg".to_string(), format!("base64:{b64}")] {
+        let colour = r#"<Option name="color" value="30,150,60,255"/></Option></layer>"#;
+        std::fs::write(&path, qml(&file).replace("</Option></layer>", colour)).unwrap();
+        let mut s = world();
+        let r = s.run("style.importQgis", &json!({"layer": "Cities", "path": path.to_string_lossy()})).unwrap();
+        assert!(notes(&r).is_empty(), "{:?}", notes(&r));
+        assert_eq!(marker(&s), Marker::Picture(Picture::new(&set)), "{file}");
+        assert!(rustgis_render::picture_marker_draws(Picture::new(&set)));
+        assert_eq!(serde_json::to_value(&s.project).unwrap()["requires"], json!(["picture-markers", "svg-markers"]));
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -6534,7 +6543,8 @@ fn a_qgis_project_opens_as_a_map_and_a_qgis_style_styles_a_layer() {
         <maplayer type="raster" hasScaleBasedVisibilityFlag="1" minScale="100000" maxScale="1000"><id>w</id><datasource>url=https://wms.example/wms&amp;layers=a</datasource><layername>Web</layername><provider>wms</provider>
         <pipe><rasterrenderer opacity="0.5" type="singlebandcolordata"/></pipe><blendMode>6</blendMode></maplayer></projectlayers></qgis>"#;
     let mut report = rustgis_map::qgis::Report::default();
-    let project = rustgis_map::qgis::read_project(web, "", &mut |_| Err(rustgis_map::qgis::IMAGE_UNOPENED), &mut report).unwrap();
+    let project =
+        rustgis_map::qgis::read_project(web, "", &mut |_, _| Err((rustgis_map::qgis::IMAGE_UNOPENED, false)), &mut report).unwrap();
     let mut w = world();
     let before = w.active_layer;
     w.active_layer = w.map().layers.iter().map(|l| l.id).find(|id| Some(*id) != before);

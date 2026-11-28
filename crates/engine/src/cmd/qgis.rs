@@ -90,30 +90,38 @@ const MARKER_READ_BYTES: usize = if cfg!(test) { 1 << 10 } else { rustgis_map::s
 /// (`import_project` says why; `import_style` reads on a thread of its own in the desktop app,
 /// [`style_ahead`]): each read is one file of at most 1.5 MiB, only a regular file is opened (a
 /// pipe or a device would wait for a writer), and the bound caps them all. Each looks at Cancel.
-fn marker_images() -> impl FnMut(&str) -> Result<(String, f32), &'static str> {
+fn marker_images() -> impl FnMut(&str, Option<&qgis::SvgColours>) -> Result<(String, f32, bool), (&'static str, bool)> {
     let mut read = 0;
-    move |source| {
+    move |source, colours| {
         // Under a Cancel (a style read on a thread of its own, a project imported by a script or model)
         // a Cancel stops the images here; the import notes each as skipped, so its caller looks at
         // Cancel again once the parse is done and gives the cancelled error. With none, nothing is asked.
         if rustgis_data::progress::check().is_err() {
-            return Err("cancelled");
+            return Err(("cancelled", false));
         }
         if read >= MARKER_READ_BYTES {
-            return Err("past the bytes of images an import reads");
+            return Err(("past the bytes of images an import reads", false));
         }
-        marker_image(source, &mut read)
+        let mut own = false;
+        marker_image(source, colours, &mut read, &mut own).map_err(|why| (why, own))
     }
 }
 
 /// Reads a raster image or SVG marker's image for the importer: its `base64:` text, or its file's,
-/// within what a picture marker keeps (`symbology::MAX_PICTURE_BYTES` of base64, 2 MiB), checked
-/// as `layer.marker` checks an image; with its height over its width. Its base64's length is added
+/// within what a picture marker keeps (`symbology::MAX_PICTURE_BYTES` of base64, 2 MiB), an SVG
+/// marker's `param(…)` values set from `colours`, then checked as `layer.marker` checks an image.
+/// With it, its height over its width and whether any value was set; `own_refusal` is set when a
+/// refusal is those colours' alone. Its base64's length is added
 /// to `read`, or for a file that doesn't read (past the limit, or failing part way) what was read
 /// of it, so the import's bound overshoots by one file at most. Checking it decodes it, within
 /// `render::MARKER_PIXELS` and what the run has left of `render::RUN_MARKER_PIXELS`, as
 /// `layer.marker` does.
-fn marker_image(source: &str, read: &mut usize) -> Result<(String, f32), &'static str> {
+fn marker_image(
+    source: &str,
+    colours: Option<&qgis::SvgColours>,
+    read: &mut usize,
+    own_refusal: &mut bool,
+) -> Result<(String, f32, bool), &'static str> {
     use base64::Engine;
     use rustgis_map::symbology::MAX_PICTURE_BYTES as MARKER_PICTURE_BYTES;
     const TOO_LARGE: &str = "whose image is past 2 MiB of base64";
@@ -149,9 +157,22 @@ fn marker_image(source: &str, read: &mut usize) -> Result<(String, f32), &'stati
     if b64.len() > MARKER_PICTURE_BYTES {
         return Err(TOO_LARGE);
     }
+    // An SVG marker's colours go in before the check, so what is checked is what is kept.
+    let set = match colours {
+        Some(colours) => rustgis_render::picture_marker_with_params(&b64, colours).map_err(rustgis_render::MarkerRefusal::whose)?,
+        None => None,
+    };
+    let painted = set.is_some();
+    let b64 = set.unwrap_or(b64);
     // As `layer.marker` checks one, decoded once for the run, where drawing it finds it.
-    let aspect = rustgis_render::picture_marker_check(&b64).map_err(rustgis_render::MarkerRefusal::whose)?;
-    Ok((b64, aspect))
+    let aspect = rustgis_render::picture_marker_check(&b64).map_err(|why| {
+        // A wider outline is more to draw, past the cap or past what the run has left: that
+        // refusal is these colours' alone.
+        use rustgis_render::MarkerRefusal::{PastRunPixels, TooMuchToDraw};
+        *own_refusal = painted && matches!(why, TooMuchToDraw | PastRunPixels);
+        why.whose()
+    })?;
+    Ok((b64, aspect, painted))
 }
 
 /// The most bytes of a QGIS file read (a `.qgz` can carry data files beside its project).

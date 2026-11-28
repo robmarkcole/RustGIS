@@ -23,6 +23,7 @@
 //! is read.
 
 use resvg::usvg;
+use rustgis_map::{Rgba, qgis::SvgColours, symbology::MAX_PICTURE_BYTES};
 use usvg::roxmltree;
 
 /// Why an SVG isn't taken.
@@ -99,13 +100,9 @@ const NODE: u64 = 100;
 /// 695 ns a pixel, 100 stops 93 ns, 2 stops 21 ns), so each stop costs 1/16 of a unit a pixel.
 const STOPS_PER_UNIT: u64 = 16;
 
-/// SVG text `text` read into a tree: within [`XML_NODES`], [`ELEMENTS`], [`POINTS`], [`CSS_STEPS`],
-/// [`STYLE_UNITS`] and [`ATTRIBUTE_PAIRS`], its root an `<svg>`, with no images resolved and no
-/// files read. Matching its style sheets ([`css_steps`]) stops at `cap` too, what the run has
-/// left, refused there for the run ([`Refusal::PastRun`]) when below [`CSS_STEPS`]; `matched` is
-/// set to the steps it took, refused or not, which its length doesn't bound, for the run to be
-/// charged them.
-pub(super) fn read(text: &str, cap: u64, matched: &mut u64) -> Result<usvg::Tree, Refusal> {
+/// SVG text `text` as XML with an `<svg>` root, within what reading its tags may cost:
+/// [`XML_NODES`], [`ATTRIBUTE_PAIRS`], no entity holding a tag.
+fn parse(text: &str) -> Result<roxmltree::Document<'_>, Refusal> {
     // An entity of a tag expands to tags `attribute_pairs` doesn't see, once for each use (a text
     // entity, as in an Illustrator file's `xmlns` values, is no way round it).
     if rustgis_data::xml::entity_with_markup(text.as_bytes()) {
@@ -123,6 +120,102 @@ pub(super) fn read(text: &str, cap: u64, matched: &mut u64) -> Result<usvg::Tree
     if doc.root_element().tag_name().name() != "svg" {
         return Err(Refusal::NotSvg);
     }
+    Ok(doc)
+}
+
+/// SVG text `text` with the values it leaves to its marker layer set from `colours`, or `None` if
+/// it leaves none. Such a value starts, in any letter case, with `param(fill)`, `param(outline)`,
+/// `param(fill-opacity)`, `param(outline-opacity)` or `param(outline-width)`, and is replaced whole,
+/// whatever default follows: an attribute's, or an entry's of a `style` attribute. Style sheets and
+/// text are left as they are, as QGIS leaves them (seen in what QGIS 4.4.0 writes).
+///
+/// The text is edited where the values are (roxmltree writes no XML). A value set is shorter than
+/// the `param(…)` it replaces, but a `style` is written back with its text entities expanded, so
+/// the result isn't bounded by `text`'s length: it is refused once longer than a marker image may
+/// be.
+pub(super) fn with_params(text: &str, colours: &SvgColours) -> Result<Option<String>, Refusal> {
+    let doc = parse(text)?;
+    let width = outline_width(doc.root_element(), colours);
+    let set = |value: &str| {
+        let value = value.trim_start().to_ascii_lowercase();
+        let (name, _) = value.strip_prefix("param(")?.split_once(')')?;
+        let hex = |c: Rgba| format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b());
+        let opacity = |c: Rgba| number(f64::from(c.a()) / 255.0);
+        Some(match name {
+            "fill" => hex(colours.fill),
+            "outline" => hex(colours.outline),
+            "fill-opacity" => opacity(colours.fill),
+            "outline-opacity" => opacity(colours.outline),
+            "outline-width" => number(width),
+            _ => return None,
+        })
+    };
+    let (mut out, mut at) = (String::new(), 0);
+    for a in doc.descendants().flat_map(|n| n.attributes()) {
+        let range = a.range_value();
+        let new = if a.name() == "style" {
+            let mut changed = false;
+            let entries: Vec<String> = a
+                .value()
+                .split(';')
+                .map(|entry| match entry.split_once(':').and_then(|(key, value)| Some((key, set(value)?))) {
+                    Some((key, value)) => {
+                        changed = true;
+                        format!("{key}:{value}")
+                    }
+                    None => entry.to_string(),
+                })
+                .collect();
+            // Written back whole, escaped for the quote around it: where an entry is in the raw
+            // text isn't where it is in the value read (`&quot;` holds a `;`).
+            let quote = range.start.checked_sub(1).and_then(|i| text.as_bytes().get(i));
+            let (quote, escaped) = if quote == Some(&b'\'') { ('\'', "&apos;") } else { ('"', "&quot;") };
+            changed.then(|| entries.join(";").replace('&', "&amp;").replace('<', "&lt;").replace(quote, escaped))
+        } else {
+            set(a.value())
+        };
+        let Some(new) = new else { continue };
+        out.push_str(text.get(at..range.start).ok_or(Refusal::NotSvg)?);
+        // A `style` written back holds its text entities expanded, as often as they are used.
+        if out.len().saturating_add(new.len()) > MAX_PICTURE_BYTES / 4 * 3 {
+            return Err(Refusal::TooMuchToRead);
+        }
+        out.push_str(&new);
+        at = range.end;
+    }
+    if at == 0 {
+        return Ok(None);
+    }
+    out.push_str(text.get(at..).ok_or(Refusal::NotSvg)?);
+    Ok(Some(out))
+}
+
+/// The outline's width in the units of the SVG whose root is `root`: as large against its view
+/// box's width (without one, its `width`'s number) as the layer's outline against the marker's
+/// width; in the layer's points when the SVG gives neither.
+fn outline_width(root: roxmltree::Node, colours: &SvgColours) -> f64 {
+    let view_box = root.attribute("viewBox").and_then(|v| v.parse::<svgtypes::ViewBox>().ok()).map(|b| b.w);
+    let side = view_box.or_else(|| root.attribute("width")?.trim().parse::<svgtypes::Length>().ok().map(|l| l.number));
+    let width = f64::from(colours.outline_width);
+    side.map_or(width, |side| width * side / f64::from(colours.size))
+}
+
+/// `v` as an SVG's number: from 0 to 10⁹ (0 for what isn't one), with at most six decimals, so
+/// never as long as the `param(…)` it replaces.
+fn number(v: f64) -> String {
+    let v = if v.is_finite() { v.clamp(0.0, 1e9) } else { 0.0 };
+    let text = format!("{v:.6}");
+    text.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+/// SVG text `text` read into a tree: within [`XML_NODES`], [`ELEMENTS`], [`POINTS`], [`CSS_STEPS`],
+/// [`STYLE_UNITS`] and [`ATTRIBUTE_PAIRS`], its root an `<svg>`, with no images resolved and no
+/// files read. Matching its style sheets ([`css_steps`]) stops at `cap` too, what the run has
+/// left, refused there for the run ([`Refusal::PastRun`]) when below [`CSS_STEPS`]; `matched` is
+/// set to the steps it took, refused or not, which its length doesn't bound, for the run to be
+/// charged them.
+pub(super) fn read(text: &str, cap: u64, matched: &mut u64) -> Result<usvg::Tree, Refusal> {
+    let doc = parse(text)?;
     if doc.descendants().any(undrawn) {
         return Err(Refusal::Undrawn);
     }
@@ -987,6 +1080,90 @@ mod tests {
 
     fn svg(body: &str) -> String {
         format!(r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 100 100">{body}</svg>"#)
+    }
+
+    /// The colours QGIS 4.4.0 was asked to set in the same SVG: its output is what these expect.
+    const COLOURS: SvgColours =
+        SvgColours { fill: Rgba::new(30, 150, 60, 128), outline: Rgba::new(200, 30, 30, 255), outline_width: 3.0, size: 24.0 };
+
+    fn sized(root: &str, body: &str) -> String {
+        format!(r#"<svg xmlns="http://www.w3.org/2000/svg"{root}>{body}</svg>"#)
+    }
+
+    /// A layer's colours go where a value starts with `param(fill)` and the like: in attributes and
+    /// the entries of `style`, in any letter case, whatever default follows.
+    #[test]
+    fn param_values_are_set_in_the_layers_colours() {
+        let vb = r#" width="20" height="10" viewBox="0 0 200 100""#;
+        for (body, set) in [
+            (
+                r#"<path fill="param(fill) #ff0000" fill-opacity="param(fill-opacity)" stroke=" PARAM(Outline) " stroke-opacity='param(outline-opacity)' stroke-width="param(outline-width) 2"/>"#,
+                r##"<path fill="#1e963c" fill-opacity="0.501961" stroke="#c81e1e" stroke-opacity='1' stroke-width="25"/>"##,
+            ),
+            (
+                r#"<g><rect style="fill:param(fill); stroke : Param(outline) ;stroke-width:param(outline-width);opacity:.5"/></g>"#,
+                r##"<g><rect style="fill:#1e963c; stroke :#c81e1e;stroke-width:25;opacity:.5"/></g>"##,
+            ),
+            (
+                r#"<rect style="font-family:&quot;a &amp; b&quot;;fill:param(fill)"/>"#,
+                r##"<rect style="font-family:&quot;a &amp; b&quot;;fill:#1e963c"/>"##,
+            ),
+        ] {
+            assert_eq!(with_params(&sized(vb, body), &COLOURS), Ok(Some(sized(vb, set))), "{body}");
+        }
+        // Nowhere else: a style sheet, text, a comment, a value it doesn't start, the SVG's own.
+        for body in [
+            "<style>path { fill: param(fill) }</style><path/>",
+            "<title>param(fill)</title><!-- fill=\"param(fill)\" -->",
+            r#"<path data-x="a param(fill)" class="param(leaf)" style="fill:url(#a) param(fill)"/>"#,
+        ] {
+            assert_eq!(with_params(&sized(vb, body), &COLOURS), Ok(None), "{body}");
+        }
+    }
+
+    /// The outline's width in the SVG's units: its share of the marker's width, of the view box's
+    /// width, else of the `width`'s number, else as it is.
+    #[test]
+    fn an_outline_width_param_is_scaled_to_the_svgs_own_width() {
+        let rect = r#"<rect stroke-width="param(outline-width)"/>"#;
+        for (root, width) in
+            [(r#" width="20" viewBox="0 0 200 100""#, "25"), (r#" width="20mm" height="10mm""#, "2.5"), (r#" width="40""#, "5"), ("", "3")]
+        {
+            let set = sized(root, &rect.replace("param(outline-width)", width));
+            assert_eq!(with_params(&sized(root, rect), &COLOURS), Ok(Some(set)), "{root}");
+        }
+        // A marker of no width, or a view box past any, writes no longer a number than it replaces.
+        for (root, size) in [(r#" viewBox="0 0 1e300 1""#, 1e-30), (r#" viewBox="0 0 200 100""#, 0.0)] {
+            let text = sized(root, rect);
+            let got = with_params(&text, &SvgColours { size, ..COLOURS }).unwrap().unwrap();
+            assert!(got.len() <= text.len(), "{got}");
+        }
+    }
+
+    /// Before its values are set, an SVG is held to what [`super::read`] holds one to.
+    #[test]
+    fn an_svg_too_costly_to_read_isnt_searched_for_params() {
+        let entity = format!(r#"<!DOCTYPE svg [<!ENTITY a "<g/>">]>{}"#, sized("", "&a;"));
+        let attributes: String = (0..5000).map(|i| format!(r#" a{i}="""#)).collect();
+        for (text, refusal) in [
+            (entity, Refusal::TooMuchToRead),
+            (sized("", &format!("<g{attributes}/>")), Refusal::TooMuchToRead),
+            (sized("", &"<!-- -->".repeat(XML_NODES as usize)), Refusal::TooNested),
+            ("<html/>".to_string(), Refusal::NotSvg),
+        ] {
+            assert_eq!(with_params(&text, &COLOURS), Err(refusal));
+        }
+    }
+
+    /// What a text entity expands to in `style` attributes is written out only as far as a marker
+    /// image may be long, then refused: a 100 KB entity in 20 of them would come to 2 MB.
+    #[test]
+    fn param_values_are_set_in_no_longer_an_svg_than_an_image_may_be() {
+        let long = "a".repeat(100_000);
+        let rects = |n: usize| r#"<rect style="x:&e;;fill:param(fill)"/>"#.repeat(n);
+        let svg = |n: usize| format!(r#"<!DOCTYPE svg [<!ENTITY e "{long}">]>{}"#, sized("", &rects(n)));
+        assert!(with_params(&svg(10), &COLOURS).is_ok_and(|set| set.is_some()));
+        assert_eq!(with_params(&svg(20), &COLOURS), Err(Refusal::TooMuchToRead));
     }
 
     /// [`elements`] of `body`.

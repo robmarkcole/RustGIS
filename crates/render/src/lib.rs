@@ -635,6 +635,13 @@ pub fn picture_marker_check(b64: &str) -> Result<f32, MarkerRefusal> {
     picture::check(b64)
 }
 
+/// Base64 `b64`, an SVG marker's image from a style that sets its colours, with its `param(…)`
+/// values set from `colours`, or `None` for an image with none; to be checked after
+/// ([`picture_marker_check`]).
+pub fn picture_marker_with_params(b64: &str, colours: &rustgis_map::qgis::SvgColours) -> Result<Option<String>, MarkerRefusal> {
+    picture::with_params(b64, colours)
+}
+
 /// [`picture_marker_check`] for picture marker `p` (one a file gives).
 pub fn picture_marker_kept_check(p: rustgis_map::Picture) -> Result<f32, MarkerRefusal> {
     picture::marker_drawn(p)

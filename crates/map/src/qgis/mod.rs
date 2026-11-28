@@ -64,23 +64,35 @@ pub struct Report {
     /// Where each closing note is in `notes`, kept in step by [`Report::forget`].
     #[serde(skip)]
     closing: HashMap<(NoteKind, Option<LossCode>), usize>,
-    /// Raster image and SVG markers' images by their path (`imageFile`, `name`), read before the
-    /// symbols showing them (`symbol::read_images`): each kept image, or why it isn't drawn.
-    /// Carried here because every symbol reader already takes the report; passing them beside it
-    /// would add a parameter to each reader and to each of their callers.
+    /// Raster image and SVG markers' images by their path (`imageFile`, `name`) and the colours
+    /// set in them, read before the symbols showing them (`symbol::read_images`): each kept image,
+    /// or why it isn't drawn. Carried here because every symbol reader already takes the report;
+    /// passing them beside it would add a parameter to each reader and to each of their callers.
     #[serde(skip)]
-    images: HashMap<String, Result<symbol::MarkerImage, String>>,
+    images: HashMap<(String, symbol::Paint), Result<symbol::MarkerImage, String>>,
 }
 
 /// A [`ReadImage`]'s reason for a file that doesn't open.
 pub const IMAGE_UNOPENED: &str = "whose image file doesn't open";
 
+/// What an SVG marker layer sets in its SVG's `param(…)` values.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SvgColours {
+    pub fill: Rgba,
+    pub outline: Rgba,
+    /// In points, as `size` is: the outline's width in the SVG's own units follows from their ratio.
+    pub outline_width: f32,
+    /// The marker's width, in points.
+    pub size: f32,
+}
+
 /// Reads a raster image or SVG marker's image for the importer, which opens no file itself: given its
-/// `base64:` text or its file's path (made absolute from the project's folder), the image as
-/// base64 and its height over its width, or why it isn't drawn, as the end of a note's
-/// "raster image markers …, drawn as circles" or "SVG markers …, drawn as circles" (such as
-/// [`IMAGE_UNOPENED`]).
-pub type ReadImage<'a> = dyn FnMut(&str) -> Result<(String, f32), &'static str> + 'a;
+/// `base64:` text or its file's path (made absolute from the project's folder), and for an SVG
+/// marker the colours its layer sets, the image as base64, its height over its width and whether
+/// those colours were set in it (if not, it is the same image whatever they are), or why it isn't
+/// drawn, as the end of a note's "raster image markers …, drawn as circles" or "SVG markers …,
+/// drawn as circles" (such as [`IMAGE_UNOPENED`]), and whether that is so for these colours alone.
+pub type ReadImage<'a> = dyn FnMut(&str, Option<&SvgColours>) -> Result<(String, f32, bool), (&'static str, bool)> + 'a;
 
 /// One thing an import couldn't carry over as QGIS has it.
 #[derive(Clone, Debug, PartialEq, Serialize)]

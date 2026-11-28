@@ -6,12 +6,12 @@ use crate::symbology::{Glyph, LabelPlacement, LineCap, LineMark, Marker, Placeme
 
 /// [`super::read_project`] given no image file (the tests of raster image markers give theirs).
 fn read_project(text: &str, dir: &str, report: &mut Report) -> Result<Project, String> {
-    super::read_project(text, dir, &mut |_| Err(super::IMAGE_UNOPENED), report)
+    super::read_project(text, dir, &mut |_, _| Err((super::IMAGE_UNOPENED, false)), report)
 }
 
 /// [`super::read_style`] given no image file and no folder.
 fn read_style(text: &str, layer: &str, report: &mut Report) -> Result<Style, String> {
-    super::read_style(text, layer, "", &mut |_| Err(super::IMAGE_UNOPENED), report)
+    super::read_style(text, layer, "", &mut |_, _| Err((super::IMAGE_UNOPENED, false)), report)
 }
 
 const PROJECT: &str = r#"<!DOCTYPE qgis PUBLIC 'http://mrcc.com/qgis.dtd' 'SYSTEM'>
@@ -1114,13 +1114,13 @@ fn every_corpus_file_reads() {
     let styles = files("generated/qml", &["qml"]);
     assert_eq!(styles.len(), 126, "style corpus changed: {styles:?}");
     // Raster image markers' files are found from the style's folder and the project's.
-    let mut read = |source: &str| {
+    let mut read = |source: &str, _: Option<&SvgColours>| {
         use base64::Engine;
         let b64 = match source.strip_prefix("base64:") {
             Some(b64) => b64.to_string(),
-            None => base64::engine::general_purpose::STANDARD.encode(std::fs::read(source).map_err(|_| super::IMAGE_UNOPENED)?),
+            None => base64::engine::general_purpose::STANDARD.encode(std::fs::read(source).map_err(|_| (super::IMAGE_UNOPENED, false))?),
         };
-        Ok((b64, 0.5))
+        Ok((b64, 0.5, false))
     };
     for path in &styles {
         let text = std::fs::read_to_string(path).unwrap();
@@ -1137,17 +1137,10 @@ fn every_corpus_file_reads() {
                 report.notes
             );
         }
-        // SVG markers draw their file; those whose colours the style sets (until #2266 part E2b) and
-        // QGIS's own library's are circles, and say why.
+        // SVG markers draw their file; QGIS's own library's are circles, and say why.
         if name.starts_with("symbol-svg-marker-") {
             let circles: Vec<&str> = report.notes.iter().map(|n| n.text.as_str()).filter(|n| n.starts_with("SVG markers")).collect();
-            let expected: &[&str] = if name.starts_with("symbol-svg-marker-params") {
-                &[SVG_COLOURS]
-            } else if name == "symbol-svg-marker-library.qml" {
-                &[SVG_LIBRARY]
-            } else {
-                &[]
-            };
+            let expected: &[&str] = if name == "symbol-svg-marker-library.qml" { &[SVG_LIBRARY] } else { &[] };
             assert_eq!(circles, expected, "{}", path.display());
         }
     }
@@ -1172,7 +1165,7 @@ fn every_corpus_file_reads() {
             let mut circles: Vec<&str> = report.notes.iter().map(|n| n.text.as_str()).filter(|n| n.starts_with("SVG markers")).collect();
             circles.sort_unstable();
             circles.dedup();
-            assert_eq!(circles, [SVG_COLOURS, SVG_LIBRARY], "{:?}", report.notes);
+            assert_eq!(circles, [SVG_LIBRARY], "{:?}", report.notes);
         }
         // The PostGIS and SQL Server projects' made-up password reaches neither the layers nor the notes.
         assert!(!format!("{project:?} {report:?}").contains(PASSWORD), "{}: the password came through", path.display());
@@ -1405,7 +1398,6 @@ fn marker_symbols_of_several_layers_carry_over_as_marks_turned_by_their_field() 
     assert!(report.notes.iter().any(|n| n.text.contains("data-defined")), "{:?}", report.notes);
 }
 
-const SVG_COLOURS: &str = "SVG markers whose colours the style sets, which RustGIS doesn't apply yet, drawn as circles";
 const SVG_LIBRARY: &str = "SVG markers whose file isn't beside the project or style (or is one of QGIS's own SVG library, which RustGIS doesn't include), drawn as circles";
 
 /// An SVG marker layer showing `file`, 4 mm wide, with `extra` settings.
@@ -1416,23 +1408,28 @@ fn svg_marker(file: &str, extra: &str) -> String {
     )
 }
 
-/// A reader giving every source as an SVG of `body`, half as tall as wide.
-fn svg_reader(body: &'static str) -> impl FnMut(&str) -> Result<(String, f32), &'static str> {
+/// A reader giving every source as an SVG of `body`, half as tall as wide; one with `param(` is
+/// painted in the colours given, which its text then tells apart.
+fn svg_reader(body: &'static str) -> impl FnMut(&str, Option<&SvgColours>) -> Result<(String, f32, bool), (&'static str, bool)> {
     use base64::Engine;
-    move |source| Ok((base64::engine::general_purpose::STANDARD.encode(format!("<svg><!--{source}-->{body}</svg>")), 0.5))
+    move |source, colours| {
+        let colours = colours.filter(|_| body.contains("param("));
+        let svg = format!("<svg><!--{source} {colours:?}-->{body}</svg>");
+        Ok((base64::engine::general_purpose::STANDARD.encode(svg), 0.5, colours.is_some()))
+    }
 }
 
 #[test]
 fn svg_markers_draw_their_file_read_once_from_the_style_folder() {
     use crate::symbology::Picture;
-    let picture = |source: &str| Marker::Picture(Picture::new(&svg_reader("")(source).unwrap().0));
+    let picture = |source: &str| Marker::Picture(Picture::new(&svg_reader("")(source, None).unwrap().0));
     // A file beside the style, and one embedded in it.
     for (file, asked_for) in [("./pins/a.svg", "/styles/pins/a.svg"), ("base64:PHN2Zy8+", "base64:PHN2Zy8+")] {
         let mut asked = Vec::new();
         let mut svg = svg_reader("");
-        let mut read = |source: &str| {
+        let mut read = |source: &str, colours: Option<&SvgColours>| {
             asked.push(source.to_string());
-            svg(source)
+            svg(source, colours)
         };
         let mut report = Report::default();
         let twice = format!("{}{}", svg_marker(file, ""), svg_marker(file, ""));
@@ -1498,14 +1495,14 @@ fn svg_markers_draw_their_file_read_once_from_the_style_folder() {
 
 #[test]
 fn svg_markers_rustgis_cant_draw_are_circles_in_their_colour_and_say_why() {
-    let circle = |file: &str, dir: &str, read: &mut dyn FnMut(&str) -> Result<(String, f32), &'static str>| {
+    let circle = |file: &str, dir: &str, read: &mut super::ReadImage| {
         let mut report = Report::default();
         let s = super::read_style(&marker_qml("1", &svg_marker(file, "")), "Pins", dir, read, &mut report).unwrap();
         let Some(Renderer::Single(sym)) = &s.renderer else { panic!("{:?}", s.renderer) };
         assert_eq!((sym.marker, sym.fill), (Marker::Circle, Rgba::rgb(30, 150, 60)), "{file}");
         report.notes.iter().map(|n| n.text.clone()).collect::<Vec<_>>()
     };
-    let unopened = |_: &str| Err(super::IMAGE_UNOPENED);
+    let unopened = |_: &str, _: Option<&SvgColours>| Err((super::IMAGE_UNOPENED, false));
     for (file, dir, note) in [
         ("", "/styles", "SVG markers with no image, drawn as circles"),
         (
@@ -1531,38 +1528,174 @@ fn svg_markers_rustgis_cant_draw_are_circles_in_their_colour_and_say_why() {
         assert_eq!(circle(file, dir, &mut { unopened }), [note], "{file}");
     }
     // What the check refuses is said in its words.
-    let refused = |_: &str| Err("whose image has more pixels than 2048 × 2048");
+    let refused = |_: &str, _: Option<&SvgColours>| Err(("whose image has more pixels than 2048 × 2048", false));
     assert_eq!(
         circle("a.svg", "/styles", &mut { refused }),
         ["SVG markers whose image has more pixels than 2048 × 2048, drawn as circles"]
     );
-    // One whose colours the style sets, however the parameter is written.
-    for body in [
-        r#"<path fill="param(fill) #ff0000"/>"#,
-        r#"<path style="fill: PARAM(Fill)"/>"#,
-        r#"<style>path { fill: param(fill) }</style><path/>"#,
-    ] {
-        assert_eq!(circle("a.svg", "/styles", &mut svg_reader(body)), [SVG_COLOURS], "{body}");
-    }
-    // `param(` where it sets nothing leaves the SVG its own colours.
-    for body in
-        [r##"<!-- Example: param(fill) --><path fill="#ff0000"/>"##, r#"<title>param(fill)</title><desc>param(outline)</desc><path/>"#]
-    {
+}
+
+/// An SVG with `param(…)` values is read once for each set of colours its layers give it (as the
+/// file of a raster image marker's too, which takes none), one without them once whatever they are.
+#[test]
+fn svg_markers_are_read_once_for_each_set_of_colours_their_svg_takes() {
+    let mm = 96.0 / 25.4;
+    let near = |a: f32, b: f32| (a - b).abs() < 1e-3;
+    let layer = |outline: &str| {
+        svg_marker(
+            "a.svg",
+            &format!(
+                r#"<Option name="outline_color" value="{outline}"/><Option name="outline_width" value="0.4"/>
+                <Option name="outline_width_unit" value="MM"/>"#
+            ),
+        )
+    };
+    let layers = format!("{}{}{}", layer("200,30,30,255"), layer("200,30,30,255"), layer("0,0,0,128"));
+    for (body, reads) in [(r#"<path fill="param(fill)"/>"#, 2), ("<path/>", 1)] {
+        let mut asked = Vec::new();
+        let mut svg = svg_reader(body);
+        let mut read = |source: &str, colours: Option<&SvgColours>| {
+            asked.push(colours.copied());
+            svg(source, colours)
+        };
         let mut report = Report::default();
-        let s =
-            super::read_style(&marker_qml("1", &svg_marker("a.svg", "")), "Pins", "/styles", &mut svg_reader(body), &mut report).unwrap();
-        let Some(Renderer::Single(sym)) = &s.renderer else { panic!("{:?}", s.renderer) };
-        assert!(matches!(sym.marker, Marker::Picture(_)), "{body}: {:?}", report.notes);
-        assert!(report.notes.is_empty(), "{body}: {:?}", report.notes);
+        let s = super::read_style(&marker_qml("1", &layers), "Pins", "/styles", &mut read, &mut report).unwrap();
+        assert_eq!(asked.len(), reads, "{body}");
+        let first = asked[0].unwrap();
+        assert_eq!((first.fill, first.outline), (Rgba::rgb(30, 150, 60), Rgba::rgb(200, 30, 30)));
+        assert!(near(first.outline_width, 0.4 * mm) && near(first.size, 4.0 * mm), "{first:?}");
+        if reads == 2 {
+            assert_eq!(asked[1].unwrap().outline, Rgba::new(0, 0, 0, 128));
+        }
+        let marks: Vec<_> = s.line_strokes.unwrap().iter().filter_map(|m| m.markers.map(|k| k.mark)).collect();
+        assert!(matches!(marks[..], [LineMark::Marker(Marker::Picture(_)), ..]), "{marks:?}");
+        assert_eq!(marks[0], marks[1], "{body}");
+        assert_eq!(marks[0] == marks[2], reads == 1, "{body}");
+        assert!(report.notes.is_empty(), "{:?}", report.notes);
     }
-    // The same file as a raster image marker's draws as it is.
+
+    // QGIS 2 names the unit on the symbol.
+    let mut asked = None;
+    let mut svg = svg_reader(r#"<path fill="param(fill)"/>"#);
+    let mut read = |source: &str, colours: Option<&SvgColours>| {
+        asked = colours.copied();
+        svg(source, colours)
+    };
+    let old = marker_qml(
+        "1",
+        r#"<layer class="SvgMarker" enabled="1"><prop k="name" v="a.svg"/><prop k="size" v="12"/><prop k="outline_width" v="3"/></layer>"#,
+    )
+    .replace(r#"type="marker""#, r#"type="marker" outputUnit="Point""#);
+    let mut report = Report::default();
+    super::read_style(&old, "Pins", "/styles", &mut read, &mut report).unwrap();
+    let got = asked.unwrap();
+    assert!(near(got.size, 16.0) && near(got.outline_width, 4.0), "{got:?}");
+    assert!(report.notes.is_empty(), "{:?}", report.notes);
+
+    // Along a line too; and the same file as a raster image marker's is read with no colours.
+    let mut asked = Vec::new();
+    let mut svg = svg_reader(r#"<path fill="param(fill)"/>"#);
+    let mut read = |source: &str, colours: Option<&SvgColours>| {
+        asked.push(colours.is_some());
+        svg(source, colours)
+    };
     let both = format!("{}{}", raster_marker("a.svg", ""), svg_marker("a.svg", ""));
     let mut report = Report::default();
-    let mut read = svg_reader(r#"<path fill="param(fill) #ff0000"/>"#);
     let s = super::read_style(&marker_qml("1", &both), "Pins", "/styles", &mut read, &mut report).unwrap();
     let marks: Vec<_> = s.line_strokes.unwrap().iter().filter_map(|m| m.markers.map(|k| k.mark)).collect();
-    assert!(matches!(marks[..], [LineMark::Marker(Marker::Picture(_)), LineMark::Marker(Marker::Circle)]), "{marks:?}");
-    assert_eq!(report.notes.iter().map(|n| n.text.as_str()).collect::<Vec<_>>(), [SVG_COLOURS]);
+    assert!(matches!(marks[..], [LineMark::Marker(a), LineMark::Marker(b)] if a != b), "{marks:?}");
+    let line = format!(
+        r#"<qgis version="4.2.3"><renderer-v2 type="singleSymbol"><symbols><symbol type="line" name="0" alpha="1">
+        <layer class="MarkerLine" enabled="1"><Option type="Map"><Option name="placements" value="Interval"/><Option name="interval" value="5"/></Option>
+        <symbol type="marker" name="@0@0" alpha="1">{}</symbol></layer></symbol></symbols></renderer-v2></qgis>"#,
+        svg_marker("a.svg", "")
+    );
+    let mut report = Report::default();
+    let s = super::read_style(&line, "Road", "/styles", &mut read, &mut report).unwrap();
+    assert!(matches!(s.line_strokes.unwrap()[0].markers.map(|m| m.mark), Some(LineMark::Marker(Marker::Picture(_)))));
+    assert!(report.notes.is_empty(), "{:?}", report.notes);
+    assert_eq!(asked, [false, true, true]);
+}
+
+/// A refusal of an SVG painted in a layer's colours (a wide outline can be too much to draw) is
+/// that layer's alone: the same file in other colours is read, and drawn.
+#[test]
+fn a_painted_svg_markers_refusal_is_its_own_colours() {
+    let layer = |outline: &str| svg_marker("a.svg", &format!(r#"<Option name="outline_color" value="{outline}"/>"#));
+    let mut svg = svg_reader(r#"<path stroke="param(outline)"/>"#);
+    let mut asked = 0;
+    let mut read = |source: &str, colours: Option<&SvgColours>| {
+        asked += 1;
+        if colours.is_some_and(|c| c.outline == Rgba::rgb(200, 30, 30)) {
+            return Err(("whose image is too much", true));
+        }
+        svg(source, colours)
+    };
+    let layers = format!("{}{}", layer("200,30,30,255"), layer("0,0,0,255"));
+    let mut report = Report::default();
+    let s = super::read_style(&marker_qml("1", &layers), "Pins", "/styles", &mut read, &mut report).unwrap();
+    assert_eq!(asked, 2);
+    let marks: Vec<_> = s.line_strokes.unwrap().iter().filter_map(|m| m.markers.map(|k| k.mark)).collect();
+    assert!(matches!(marks[..], [LineMark::Marker(Marker::Circle), LineMark::Marker(Marker::Picture(_))]), "{marks:?}");
+    assert_eq!(report.notes.iter().map(|n| n.text.as_str()).collect::<Vec<_>>(), ["SVG markers whose image is too much, drawn as circles"]);
+}
+
+/// A picture draws none of a symbol's colours: an SVG painted in its layer's, whose colours or
+/// outline width a field sets, stays a circle, which takes them. One with its own colours is drawn.
+#[test]
+fn a_painted_svg_marker_coloured_by_a_field_is_a_circle_that_takes_it() {
+    const CIRCLE: &str =
+        "SVG markers whose colours the style sets, with colours or outline widths from a field or an expression, drawn as circles";
+    let by_field = |property: &str| {
+        svg_marker("a.svg", "").replace(
+            "</layer>",
+            &format!(
+                r#"<data_defined_properties><Option type="Map"><Option type="Map" name="properties"><Option type="Map" name="{property}">
+                <Option value="true" type="bool" name="active"/><Option value="tint" type="QString" name="field"/>
+                <Option value="2" type="int" name="type"/></Option></Option></Option></data_defined_properties></layer>"#
+            ),
+        )
+    };
+    for property in ["fillColor", "outlineColor", "outlineWidth"] {
+        for (body, painted) in [(r#"<path fill="param(fill)"/>"#, true), ("<path/>", false)] {
+            let mut report = Report::default();
+            let qml = marker_qml("1", &by_field(property));
+            let s = super::read_style(&qml, "Pins", "/styles", &mut svg_reader(body), &mut report).unwrap();
+            let Some(Renderer::Single(sym)) = &s.renderer else { panic!("{:?}", s.renderer) };
+            assert_eq!(sym.marker == Marker::Circle, painted, "{property} {body}");
+            assert_eq!(report.notes.iter().any(|n| n.text == CIRCLE), painted, "{property} {body}: {:?}", report.notes);
+        }
+    }
+    // Marks take no colour from a field whatever their shape: drawn, as it already says.
+    let line = format!(
+        r#"<qgis version="4.2.3"><renderer-v2 type="singleSymbol"><symbols><symbol type="line" name="0" alpha="1">
+        <layer class="MarkerLine" enabled="1"><Option type="Map"><Option name="placements" value="Interval"/><Option name="interval" value="5"/></Option>
+        <symbol type="marker" name="@0@0" alpha="1">{}</symbol></layer></symbol></symbols></renderer-v2></qgis>"#,
+        by_field("fillColor")
+    );
+    let mut report = Report::default();
+    let s = super::read_style(&line, "Road", "/styles", &mut svg_reader(r#"<path fill="param(fill)"/>"#), &mut report).unwrap();
+    assert!(matches!(s.line_strokes.unwrap()[0].markers.map(|m| m.mark), Some(LineMark::Marker(Marker::Picture(_)))));
+    assert!(report.notes.iter().any(|n| n.text.contains("data-defined")), "{:?}", report.notes);
+}
+
+/// A style's own SVG parameters (`param(name)`) aren't applied, and say so.
+#[test]
+fn svg_markers_with_parameters_of_their_own_say_they_are_drawn_without_them() {
+    let own =
+        r##"<Option name="parameters" type="Map"><Option name="leaf" type="Map"><Option name="val" value="#00ff00"/></Option></Option>"##;
+    for (extra, notes) in [
+        (own, vec!["SVG markers with parameters of their own, drawn without them"]),
+        (r#"<Option name="parameters"/>"#, vec![]),
+        (r#"<Option name="parameters" type="Map"/>"#, vec![]),
+    ] {
+        let mut report = Report::default();
+        let qml = marker_qml("1", &svg_marker("a.svg", extra));
+        let s = super::read_style(&qml, "Pins", "/styles", &mut svg_reader(""), &mut report).unwrap();
+        let Some(Renderer::Single(sym)) = &s.renderer else { panic!("{:?}", s.renderer) };
+        assert!(matches!(sym.marker, Marker::Picture(_)), "{extra}");
+        assert_eq!(report.notes.iter().map(|n| n.text.as_str()).collect::<Vec<_>>(), notes, "{extra}");
+    }
 }
 
 /// A raster image marker layer showing `file`, 4 mm wide, with `extra` settings.
@@ -1587,9 +1720,9 @@ fn raster_image_markers_draw_their_image_read_once_from_the_style_folder() {
     let near = |a: f32, b: f32| (a - b).abs() < 1e-3;
     // A file relative to the style's folder; the reader gives the image and its height over width.
     let mut asked = Vec::new();
-    let mut read = |source: &str| {
+    let mut read = |source: &str, _: Option<&SvgColours>| {
         asked.push(source.to_string());
-        Ok((format!("image of {source}"), 0.5))
+        Ok((format!("image of {source}"), 0.5, false))
     };
     let mut report = Report::default();
     let s = super::read_style(&marker_qml("1", &raster_marker("./pins/a.png", "")), "Pins", "/styles", &mut read, &mut report).unwrap();
@@ -1602,9 +1735,9 @@ fn raster_image_markers_draw_their_image_read_once_from_the_style_folder() {
 
     // One file, however its path is written, is read once.
     asked.clear();
-    let mut read = |source: &str| {
+    let mut read = |source: &str, _: Option<&SvgColours>| {
         asked.push(source.to_string());
-        Ok((format!("image of {source}"), 0.5))
+        Ok((format!("image of {source}"), 0.5, false))
     };
     let twice = format!("{}{}", raster_marker("./pins/a.png", ""), raster_marker("pins/a.png", ""));
     super::read_style(&marker_qml("1", &twice), "Pins", "/styles", &mut read, &mut Report::default()).unwrap();
@@ -1613,9 +1746,9 @@ fn raster_image_markers_draw_their_image_read_once_from_the_style_folder() {
     // Two layers of one image read it once, and anchored at their top left they sit half their
     // width right of the point and half their height (the image's, not their width) below it.
     asked.clear();
-    let mut read = |source: &str| {
+    let mut read = |source: &str, _: Option<&SvgColours>| {
         asked.push(source.to_string());
-        Ok((format!("image of {source}"), 0.5))
+        Ok((format!("image of {source}"), 0.5, false))
     };
     let anchored = r#"<Option name="horizontal_anchor_point" value="0"/><Option name="vertical_anchor_point" value="0"/>"#;
     let qml = marker_qml("1", &format!("{}{}", raster_marker("base64:QUJD", ""), raster_marker("base64:QUJD", anchored)));
@@ -1636,7 +1769,7 @@ fn raster_image_markers_draw_their_image_read_once_from_the_style_folder() {
         <symbol type="marker" name="@0@0" alpha="1">{}</symbol></layer></symbol></symbols></renderer-v2></qgis>"#,
         raster_marker("base64:QUJD", "")
     );
-    let mut read = |source: &str| Ok((format!("image of {source}"), 0.5));
+    let mut read = |source: &str, _: Option<&SvgColours>| Ok((format!("image of {source}"), 0.5, false));
     let mut report = Report::default();
     let s = super::read_style(&line, "Road", "", &mut read, &mut report).unwrap();
     assert_eq!(s.line_strokes.unwrap()[0].markers.map(|m| m.mark), Some(picture));
@@ -1661,9 +1794,9 @@ fn raster_image_markers_draw_their_image_read_once_from_the_style_folder() {
 fn raster_image_markers_read_a_file_address_as_the_file_it_names() {
     use crate::symbology::Picture;
     let asked = std::cell::RefCell::new(Vec::new());
-    let mut read = |source: &str| {
+    let mut read = |source: &str, _: Option<&SvgColours>| {
         asked.borrow_mut().push(source.to_string());
-        Ok(("QUJD".to_string(), 1.0))
+        Ok(("QUJD".to_string(), 1.0, false))
     };
     let cases = [
         ("file:///data/my%20pin.png", "/data/my pin.png"),
@@ -1739,7 +1872,7 @@ fn a_raster_image_from_an_expression_is_noted_as_one_not_as_no_image() {
     };
     let from = "raster image markers whose image comes from a field or an expression, which RustGIS doesn't evaluate, drawn as circles";
     let generic = "data-defined symbol settings (from fields or expressions)";
-    let mut read = |_: &str| Ok(("QUJD".to_string(), 1.0));
+    let mut read = |_: &str, _: Option<&SvgColours>| Ok(("QUJD".to_string(), 1.0, false));
     let mut report = Report::default();
     let s = super::read_style(&marker_qml("1", &by_expression("")), "Pins", "", &mut read, &mut report).unwrap();
     let Some(Renderer::Single(sym)) = &s.renderer else { panic!() };
@@ -1775,9 +1908,9 @@ fn a_raster_image_from_an_expression_is_noted_as_one_not_as_no_image() {
 fn raster_image_markers_that_cant_be_drawn_are_circles_saying_why() {
     // Each kind of image the reader isn't asked for, or can't give, with what the note says.
     let mut asked = Vec::new();
-    let mut read = |source: &str| {
+    let mut read = |source: &str, _: Option<&SvgColours>| {
         asked.push(source.to_string());
-        if source.ends_with("gone.png") { Err(super::IMAGE_UNOPENED) } else { Ok(("QUJD".to_string(), 1.0)) }
+        if source.ends_with("gone.png") { Err((super::IMAGE_UNOPENED, false)) } else { Ok(("QUJD".to_string(), 1.0, false)) }
     };
     let cases = [
         ("", "raster image markers with no image, drawn as circles"),
@@ -1827,7 +1960,7 @@ fn raster_image_markers_that_cant_be_drawn_are_circles_saying_why() {
     assert_eq!(asked, ["/data/gone.png"], "neither a web address, a network share nor a relative path without a folder is looked for");
 
     // Drawn, but not as QGIS draws it: a ratio of its own, see-through (the layer's or the symbol's).
-    let mut read = |_: &str| Ok(("QUJD".to_string(), 0.5));
+    let mut read = |_: &str, _: Option<&SvgColours>| Ok(("QUJD".to_string(), 0.5, false));
     let own = r#"<Option name="fixedAspectRatio" value="1"/><Option name="alpha" value="0.5"/>"#;
     let mut report = Report::default();
     super::read_style(&marker_qml("0.5", &raster_marker("base64:QUJD", own)), "Pins", "", &mut read, &mut report).unwrap();
@@ -1838,9 +1971,9 @@ fn raster_image_markers_that_cant_be_drawn_are_circles_saying_why() {
     );
     // A ratio that is the image's own is no change; a switched-off layer's image isn't read.
     let mut asked = 0;
-    let mut read = |_: &str| {
+    let mut read = |_: &str, _: Option<&SvgColours>| {
         asked += 1;
-        Ok(("QUJD".to_string(), 0.5))
+        Ok(("QUJD".to_string(), 0.5, false))
     };
     let off = raster_marker("/data/off.png", "").replace(r#"enabled="1""#, r#"enabled="0""#);
     let qml = marker_qml("1", &format!("{off}{}", raster_marker("base64:QUJD", r#"<Option name="fixedAspectRatio" value="0.5"/>"#)));

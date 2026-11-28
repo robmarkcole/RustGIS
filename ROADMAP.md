@@ -211,8 +211,8 @@ And alongside it:
   ([#995](https://github.com/opengeos/RustGIS/issues/995)); line labels that try other places
   along the line (an offset above or below it is done) ([#1187](https://github.com/opengeos/RustGIS/issues/1187)).
 - Kernel density (heat map) as a renderer; point clustering.
-- QGIS SVG markers brought in by the style importer with the colours the style sets (`param(…)`),
-  or from QGIS's own SVG library (PNG, JPEG and other SVG marker images are done,
+- QGIS SVG markers from QGIS's own SVG library, brought in by the style importer (PNG, JPEG and
+  SVG marker images are done, an SVG in its style's colours,
   [#2266](https://github.com/opengeos/RustGIS/issues/2266)), image fill patterns and a symbol
   library.
 - A legend and colour bar on the map (layouts have both).

@@ -4,6 +4,7 @@
 
 mod svg;
 
+use rustgis_map::qgis::SvgColours;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hash, Hasher, RandomState};
@@ -583,6 +584,21 @@ pub fn check(b64: &str) -> Result<f32, MarkerRefusal> {
         Some(kept) => marker_drawn(kept),
         None => marker(b64).map(|found| found.aspect),
     }
+}
+
+/// Base64 `b64`, an SVG marker's image, with its `param(…)` values set from `colours`
+/// ([`svg::with_params`]), or `None` for one that has none, or isn't SVG text ([`check`] says why
+/// it isn't drawn).
+pub(crate) fn with_params(b64: &str, colours: &SvgColours) -> Result<Option<String>, MarkerRefusal> {
+    if !is_svg(b64) {
+        return Ok(None);
+    }
+    let engine = base64::engine::general_purpose::STANDARD;
+    let Ok(bytes) = engine.decode(b64.trim()) else { return Ok(None) };
+    let Ok(text) = std::str::from_utf8(&bytes) else { return Ok(None) };
+    // From its first `<`, as `svg_in` reads it.
+    let text = text.trim_start_matches('\u{feff}').trim_start();
+    Ok(svg::with_params(text, colours)?.map(|set| engine.encode(set)))
 }
 
 /// What a picture marker's image is, from its first bytes.
