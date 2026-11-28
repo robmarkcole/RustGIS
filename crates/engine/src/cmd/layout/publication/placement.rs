@@ -104,7 +104,7 @@ pub(crate) fn crop_cells(
 pub(crate) fn veil_panel(
     band: Rect,
     legend: (f64, f64),
-    locator: Option<f64>,
+    locator: Option<(f64, f64)>,
     arrow: Option<(f64, f64)>,
     scale: (f64, f64),
     gap: f64,
@@ -113,7 +113,8 @@ pub(crate) fn veil_panel(
     let (aw, ah) = arrow.unwrap_or((0.0, 0.0));
     // The locator and the arrow side by side, with a gap between them only when both are there.
     let between = if locator.is_some() && arrow.is_some() { gap } else { 0.0 };
-    let top = (locator.map_or(0.0, |side| side + between) + aw, locator.unwrap_or(0.0).max(ah));
+    let (lw, lh) = locator.unwrap_or((0.0, 0.0));
+    let top = (lw + between + aw, lh.max(ah));
     // The gap over the scale bar only when there is one and something sits above it.
     let lead = if top.1 > 0.0 && scale.1 > 0.0 { gap } else { 0.0 };
     let group = (top.0.max(scale.0), top.1 + lead + scale.1);
@@ -133,7 +134,7 @@ pub(crate) fn veil_panel(
     };
     Some((
         (legend_at.0, legend_at.1, legend.0, legend.1),
-        locator.map(|side| (group_at.0, group_at.1, side, side)),
+        locator.map(|(lw, lh)| (group_at.0, group_at.1, lw, lh)),
         arrow.map(|(aw, ah)| (group_at.0 + group.0 - aw, group_at.1, aw, ah)),
         (group_at.0, group_at.1 + top.1 + lead, scale.0, scale.1),
     ))

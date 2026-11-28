@@ -168,11 +168,11 @@ pub(in crate::cmd::layout) fn locator_orphan(input: &impl crate::cmd::InputSourc
 pub(in crate::cmd::layout) fn publication_inputs(input: &crate::cmd::InputContext<'_>, p: &Value) -> Result<crate::cmd::Inputs, String> {
     let s = input;
     let (_, profile) = publication_profile(p)?;
-    let locator = publication_locator(p, profile.sheet, shows_whole_globe(s.map(), p))?;
+    let locators = publication_locators(p, profile.sheet, shows_whole_globe(s.map(), p))?;
     let map = s.map();
     let mut inputs = crate::cmd::Inputs::layers(map.layers.iter().filter(|l| map.shows(l)).map(|l| (map, l)));
     inputs.maps.push(map.instance_id());
-    if matches!(locator, Locator::Globe) {
+    if locators.contains(&Locator::Globe) {
         if let Some(old) = locator_orphan(input).and_then(|i| s.project.maps.get(i)) {
             inputs.maps.push(old.instance_id());
             inputs.layers.extend(old.layers.iter().map(|l| (old.instance_id(), l.id)));

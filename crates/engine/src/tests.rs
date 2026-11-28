@@ -141,6 +141,9 @@ mod layout_legend_class_labels;
 #[path = "tests/layout_report_text.rs"]
 mod layout_report_text;
 
+#[path = "tests/layout_publication_locators.rs"]
+mod layout_publication_locators;
+
 #[path = "tests/sde_connections.rs"]
 mod sde_connections;
 
@@ -16334,21 +16337,21 @@ fn a_publication_reads_streamed_layers_for_the_move_searchs_wide_drawing() {
 fn a_veil_panel_groups_the_surrounds_by_the_bands_shape() {
     use crate::cmd::layout::veil_panel;
     let (legend, arrow, scale) = ((80.0, 50.0), Some((8.0, 12.0)), (60.0, 10.0));
-    let (l, locator, a, b) = veil_panel((0.0, 0.0, 160.0, 70.0), legend, Some(40.0), arrow, scale, 3.0).unwrap();
+    let (l, locator, a, b) = veil_panel((0.0, 0.0, 160.0, 70.0), legend, Some((40.0, 40.0)), arrow, scale, 3.0).unwrap();
     let a = a.unwrap();
     assert!(l.0 + l.2 <= locator.unwrap().0, "beside it: {l:?} {locator:?}");
     assert!(a.0 + a.2 <= 160.0 && b.1 >= locator.unwrap().1 + 40.0, "{a:?} {b:?}");
     let apart =
         |p: (f64, f64, f64, f64), q: (f64, f64, f64, f64)| p.0 + p.2 <= q.0 || q.0 + q.2 <= p.0 || p.1 + p.3 <= q.1 || q.1 + q.3 <= p.1;
     assert!(apart(a, l) && apart(a, (locator.unwrap().0, locator.unwrap().1, 40.0, 40.0)), "the arrow clear: {a:?} {l:?} {locator:?}");
-    let (l, locator, _, b) = veil_panel((0.0, 0.0, 90.0, 130.0), legend, Some(40.0), arrow, scale, 3.0).unwrap();
+    let (l, locator, _, b) = veil_panel((0.0, 0.0, 90.0, 130.0), legend, Some((40.0, 40.0)), arrow, scale, 3.0).unwrap();
     assert!(l.1 >= b.1 + b.3 && locator.unwrap().0 == b.0, "under it: {l:?} {b:?}");
-    assert!(veil_panel((0.0, 0.0, 60.0, 60.0), legend, Some(40.0), arrow, scale, 3.0).is_none());
+    assert!(veil_panel((0.0, 0.0, 60.0, 60.0), legend, Some((40.0, 40.0)), arrow, scale, 3.0).is_none());
     // With nothing to group beside it, a legend the size of the band fits it: no gap is kept.
     assert!(veil_panel((0.0, 0.0, legend.0, legend.1), legend, None, None, (0.0, 0.0), 3.0).is_some());
     assert!(veil_panel((0.0, 0.0, 160.0, 70.0), legend, None, arrow, scale, 3.0).unwrap().1.is_none());
     // With no north arrow (a continental extent, #1379), the locator stands alone over the scale bar.
-    let (_, locator, a, b) = veil_panel((0.0, 0.0, 160.0, 70.0), legend, Some(40.0), None, scale, 3.0).unwrap();
+    let (_, locator, a, b) = veil_panel((0.0, 0.0, 160.0, 70.0), legend, Some((40.0, 40.0)), None, scale, 3.0).unwrap();
     assert!(a.is_none(), "no place for an arrow there isn't: {a:?}");
     assert_eq!(locator.unwrap().0, b.0, "the locator over the scale bar: {locator:?} {b:?}");
     // With neither, the scale bar heads its group, with no gap over it: a band just as tall as the

@@ -202,7 +202,7 @@ pub(in crate::cmd::layout) fn scale_text_mm(text: &str, text_pt: f64, bold: bool
 }
 
 /// What a publication places over its map, which a scale bar box measured again must stay off.
-pub(in crate::cmd::layout) const PLACED_OVER_MAP: [&str; 3] = ["Legend Box", "Locator", "North Arrow"];
+pub(in crate::cmd::layout) const PLACED_OVER_MAP: [&str; 5] = ["Legend Box", "Locator", "Locator Inset", "Locator Globe", "North Arrow"];
 
 /// What a publication's scale bar box is measured from: its frame (id, map, centre, scale, width),
 /// its bar (id, and the bar as it is set: every setting changes its labels or their room) and the

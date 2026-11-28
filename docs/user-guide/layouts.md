@@ -217,8 +217,11 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
     It uses the map's basemap, not its web tiles, in a round frame, the globe
     nearly filling it and the area outlined in red; `"inset"` shows the surrounding region (about
     four times the area across) on the map itself, outlined the same way; `"none"` (a figure's
-    default) leaves it out. The legend stops short of it; a frame with no room for a legend beside
-    it leaves the legend out, with a warning. Undo takes the globe's map away with the layout; a
+    default) leaves it out. `["inset", "globe"]` draws both side by side in the locator's corner
+    (or at the top of a style's column, sharing its width): the inset outlines the area, and the
+    globe outlines the inset. Their order in the list changes nothing, and the answer's `locator`
+    names both maps, the inset's first. The legend stops short of the locator; a frame with no room
+    for a legend beside it leaves the legend out, with a warning. Undo takes the globe's map away with the layout; a
     globe map no layout shows any more (its layout deleted) is replaced by the next sheet's rather
     than left beside it, which a warning says.
   - **The style** (`"style"`, on any sheet, portrait or landscape): `"classic"` (the default) sets
