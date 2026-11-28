@@ -1694,8 +1694,10 @@ impl SourceLayer {
             let _progress = rustgis_data::progress::install(progress.map(|p| p as Arc<dyn rustgis_data::progress::Probe>));
             let result = rustgis_data::source::remote::with_optional_still(still, || {
                 rustgis_data::progress::check()?;
-                let source = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
-                    .unwrap_or_else(|_| Err(rustgis_data::DataError::Format("opening the layer failed unexpectedly".into())))?;
+                let source = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).unwrap_or_else(|payload| {
+                    let incident = rustgis_data::incident::caught(payload.as_ref());
+                    Err(rustgis_data::DataError::Format(rustgis_data::incident::message("Opening the layer", false, &incident.id)))
+                })?;
                 rustgis_data::progress::check()?;
                 Ok(Arc::from(source))
             });
@@ -2139,7 +2141,10 @@ impl SourceLayer {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     window::read_mode(h2.as_ref(), &req, budget, &projection, estimate, full_read, fields, query.as_ref())
                 }))
-                .unwrap_or_else(|_| Err(rustgis_data::DataError::Format("the read failed unexpectedly".into())))
+                .unwrap_or_else(|payload| {
+                    let incident = rustgis_data::incident::caught(payload.as_ref());
+                    Err(rustgis_data::DataError::Format(rustgis_data::incident::message("The read", false, &incident.id)))
+                })
             });
             rustgis_data::source::remote::drive(
                 file,
@@ -2162,7 +2167,10 @@ impl SourceLayer {
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             window::read_mode(h.as_ref(), &req, budget, &projection, estimate, full_read, fields, query.as_ref())
                         }))
-                        .unwrap_or_else(|_| Err(rustgis_data::DataError::Format("the read failed unexpectedly".into())))
+                        .unwrap_or_else(|payload| {
+                            let incident = rustgis_data::incident::caught(payload.as_ref());
+                            Err(rustgis_data::DataError::Format(rustgis_data::incident::message("The read", false, &incident.id)))
+                        })
                         .map_err(|e| e.to_string())
                     })
                     .and_then(|r| rustgis_data::source::remote::check_still(&still).map(|()| r));

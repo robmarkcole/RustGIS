@@ -686,6 +686,12 @@ impl RoomMade {
     }
 }
 
+/// What a bug RustGIS caught while doing `what` says ([`rustgis_data::incident::message`]), with its
+/// incident's reference: the panic `payload` is told apart from a refusal, and its details kept.
+pub(crate) fn bug(what: &str, payload: &(dyn std::any::Any + Send)) -> String {
+    rustgis_data::incident::bug(what, payload)
+}
+
 /// What a command run worked on, as its parameters name it, for the messages it says: a layer, a
 /// table or an input by name, cut short. File paths are left out, as they can hold a login.
 fn run_target(params: &Value) -> Option<String> {
@@ -1061,6 +1067,9 @@ pub struct Session {
     /// The top-level command running, as the messages it says remember it, and how many have run.
     run: Option<rustgis_data::diagnostics::Run>,
     runs: u64,
+    /// Told of each top-level command run as it starts, and with `None` as it ends: the desktop app
+    /// notes it in its run marker, so a run that ends without closing can say what it was doing.
+    pub on_run: Option<Box<dyn FnMut(Option<&rustgis_data::diagnostics::Run>) + Send>>,
     /// How many of the commands running now restore the project if they fail: a replacement is
     /// put aside only under one of them, as only then can it be rolled back.
     restorable: u32,
@@ -1456,6 +1465,9 @@ impl Session {
     /// Starts an independent session with fresh runtime selection intent and request order.
     /// Prepared script copies explicitly share request order with their originating session.
     pub fn new(mut project: Project) -> Self {
+        // Every panic an incident with a reference, whatever embeds the session (the apps, Python,
+        // MCP): installed once, before the hook that was there (a crash log) runs.
+        rustgis_data::incident::install();
         // The engine's tests never add Shapefile indexes to the user's cache (#1230).
         #[cfg(all(test, not(target_arch = "wasm32")))]
         rustgis_data::source::shp::use_temporary_index_dir();
@@ -1578,6 +1590,7 @@ impl Session {
             diagnostic_source: None,
             run: None,
             runs: 0,
+            on_run: None,
             restorable: 0,
             published_syncs: Vec::new(),
             actor: None,
@@ -2058,7 +2071,11 @@ impl Session {
                 after: None,
                 target: run_target(params),
             };
-            self.run.replace(run)
+            let previous = self.run.replace(run);
+            if let Some(on_run) = self.on_run.as_mut() {
+                on_run(self.run.as_ref());
+            }
+            previous
         });
         let history_deferred = std::mem::replace(&mut self.undo_memory.deferred, true);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2153,6 +2170,9 @@ impl Session {
                 self.diagnostics.finish_run(ended.id, self.state);
             }
             self.run = run;
+            if let Some(on_run) = self.on_run.as_mut() {
+                on_run(None);
+            }
         }
         self.undo_memory.deferred = history_deferred;
         // Every top-level invocation consumes its key, even a refusal or panic before guarded.
@@ -2569,8 +2589,11 @@ impl Session {
         let retry_state = (self.plugin_retries.clone(), self.url_waits.clone());
         let file_outputs: Vec<_> = self.file_outputs.iter().map(|file| file.id).collect();
         let said = self.notices_given;
-        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)))
-            .unwrap_or_else(|_| Err(format!("{label} failed unexpectedly; the project was restored")));
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self))).unwrap_or_else(|payload| {
+            // A bug in RustGIS: said as one, with a reference to its details in Messages.
+            let incident = rustgis_data::incident::caught(payload.as_ref());
+            Err(rustgis_data::incident::message(label, mutates, &incident.id))
+        });
         self.shared_steps = outer_steps;
         self.depth = self.depth.saturating_sub(1);
         self.restorable = self.restorable.saturating_sub(u32::from(mutates));
@@ -3759,7 +3782,14 @@ impl Session {
         if severity == rustgis_data::diagnostics::Severity::Error && self.rerun_said.iter().any(|said| said == text.as_str()) {
             return;
         }
-        self.diagnostics.push_redacted(severity, source.unwrap_or("Application"), &text, loss, self.run.clone());
+        let record = self.diagnostics.push_redacted(severity, source.unwrap_or("Application"), &text, loss, self.run.clone());
+        // A bug's failure keeps its details (the panic's message and place) under it, for a report,
+        // scrubbed as a message is, logins in use included.
+        if severity == rustgis_data::diagnostics::Severity::Error
+            && let Some(incident) = rustgis_data::incident::named(text.as_str())
+        {
+            self.diagnostics.detail(record, Self::redacted(&incident.details()).as_str());
+        }
         self.notices.push(Notice {
             text: text.into_string(),
             error: severity == rustgis_data::diagnostics::Severity::Error,

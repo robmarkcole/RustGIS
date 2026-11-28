@@ -798,7 +798,11 @@ pub fn run(id: &str, inputs: &dyn Inputs, params: &Value) -> Result<ToolResult, 
             with_pole_loop_notes(result, spec, inputs, &p)
         })
     }))
-    .unwrap_or_else(|_| Err(format!("{} failed unexpectedly", spec.name)))
+    .unwrap_or_else(|payload| {
+        // A bug in a tool, said as one, with a reference to its details.
+        let incident = rustgis_data::incident::caught(payload.as_ref());
+        Err(rustgis_data::incident::message(spec.name, false, &incident.id))
+    })
 }
 
 /// `work` in the plane of the system `inputs` are given in ([`Inputs::work_crs`]): the analysis
@@ -1013,7 +1017,11 @@ pub fn run_resolved(
                 with_pole_loop_notes(result, tool.spec, inputs, &params)
             })
         }))
-        .unwrap_or_else(|_| Err(format!("{} failed unexpectedly", tool.spec.name)))
+        .unwrap_or_else(|payload| {
+            // A bug in a tool, said as one, with a reference to its details.
+            let incident = rustgis_data::incident::caught(payload.as_ref());
+            Err(rustgis_data::incident::message(tool.spec.name, false, &incident.id))
+        })
     })
 }
 

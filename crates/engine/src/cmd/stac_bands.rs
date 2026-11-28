@@ -336,12 +336,12 @@ mod desktop {
                         // Taken as references and values, so the reader thread owns what it uses.
                         let (stop_r, cause_r, diagnostics_r, still_r) = (&stop, &cause, &diagnostics, &still);
                         let (signed_s, bands_n) = (signed.as_str(), *bands);
-                        let message = format!("{href}: the read failed unexpectedly");
+                        let what = format!("{href}: the read");
                         let reader = std::thread::Builder::new().name("STAC band window".into()).spawn_scoped(scope, move || {
                             let _diagnostics = diagnostics_r.enter();
                             rustgis_data::source::remote::with_optional_still(still_r.clone(), || {
                                 // A reader that panics stops the run too (the guard, unless it is disarmed on return).
-                                let mut guard = PanicStop { stop: stop_r, cause: cause_r, message, armed: true };
+                                let mut guard = PanicStop { stop: stop_r, cause: cause_r, what, armed: true };
                                 let read = read_one(signed_s, bbox, cell, bands_n, stop_r);
                                 guard.armed = false;
                                 // A file that failed stops the reads beside it: they would only finish to be dropped.
@@ -363,7 +363,7 @@ mod desktop {
                 started
                     .into_iter()
                     .map(|(href, signed, bands, reader)| match reader {
-                        Ok(r) => r.join().unwrap_or_else(|_| Err(format!("{href}: the read failed unexpectedly"))),
+                        Ok(r) => r.join().unwrap_or_else(|payload| Err(crate::bug(&format!("{href}: the read"), payload.as_ref()))),
                         Err(_) => {
                             // Looked at before it starts: once started, this read runs to its end.
                             rustgis_data::progress::check().map_err(|e| e.to_string())?;
@@ -392,14 +392,21 @@ mod desktop {
     pub(super) struct PanicStop<'a> {
         pub(super) stop: &'a AtomicBool,
         pub(super) cause: &'a std::sync::Mutex<Option<String>>,
-        pub(super) message: String,
+        /// What was being done (`a.tif: the read`): what failed, in the message.
+        pub(super) what: String,
         pub(super) armed: bool,
     }
 
     impl Drop for PanicStop<'_> {
+        /// Said as a bug, with the reference the panic hook gave this thread's panic, when it gave
+        /// one ([`rustgis_data::incident`]).
         fn drop(&mut self) {
             if self.armed {
-                note_failure(self.stop, self.cause, &self.message);
+                let message = match rustgis_data::incident::last_id() {
+                    Some(id) => rustgis_data::incident::message(&self.what, false, &id),
+                    None => format!("{} failed unexpectedly", self.what),
+                };
+                note_failure(self.stop, self.cause, &message);
             }
         }
     }
@@ -1141,17 +1148,19 @@ mod tests {
         // A reader that panics (the guard dropped while unwinding, still armed) stops the others.
         let panicked = std::thread::scope(|s| {
             s.spawn(|| {
-                let _guard = PanicStop { stop: &stop, cause: &cause, message: "a.tif: the read failed unexpectedly".into(), armed: true };
+                let _guard = PanicStop { stop: &stop, cause: &cause, what: "a.tif: the read".into(), armed: true };
                 panic!("a reader panics");
             })
             .join()
         });
         assert!(panicked.is_err());
         assert!(stop.load(Ordering::Relaxed));
-        assert_eq!(cause.lock().unwrap().as_deref(), Some("a.tif: the read failed unexpectedly"));
+        // Said as a bug: with the incident's reference when the panic hook is in.
+        let said = cause.lock().unwrap().clone().unwrap_or_default();
+        assert!(said.starts_with("a.tif: the read failed unexpectedly"), "{said}");
         // One that returned (disarmed) leaves the run alone.
         let (stop, cause) = (AtomicBool::new(false), Mutex::new(None));
-        drop(PanicStop { stop: &stop, cause: &cause, message: "x".into(), armed: false });
+        drop(PanicStop { stop: &stop, cause: &cause, what: "x".into(), armed: false });
         assert!(!stop.load(Ordering::Relaxed) && cause.lock().unwrap().is_none());
     }
 

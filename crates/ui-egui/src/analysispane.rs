@@ -2006,12 +2006,15 @@ fn trend(app: &mut RustGisApp, ui: &mut Ui, rasters: &[String]) {
             // A panic on the thread (a hostile store) lands as an error, so the run always ends;
             // a thread the system can't start is said.
             let diagnostics = app.session.diagnostics.capture();
+            // The interface's language, which is the thread's own: a bug's message is in it.
+            let lang = crate::i18n::current();
             let spawned = std::thread::Builder::new().name("trend".into()).spawn(move || {
+                crate::i18n::set_current(lang);
                 let _diagnostics = diagnostics.enter();
                 let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     job.run(&cancel, &done).map(|rasters| (rasters, job.dates()))
                 }))
-                .unwrap_or_else(|_| Err(tl!("The trend failed unexpectedly").to_string()));
+                .unwrap_or_else(|payload| Err(crate::bug(tl!("The trend"), payload.as_ref())));
                 if let Ok(mut g) = result.lock() {
                     *g = Some(out);
                 }
@@ -2059,7 +2062,13 @@ pub fn land_trend(app: &mut RustGisApp) -> bool {
             show_job(app, "trend", result);
         }
         Err(_) if cancelled => {}
-        Err(e) => show_job(app, "trend", Err(e)),
+        Err(e) => {
+            // A bug's failure, said as it lands, so Messages keeps its details.
+            if rustgis_engine::data::incident::named(&e).is_some() {
+                app.session.notify(e.clone(), true);
+            }
+            show_job(app, "trend", Err(e))
+        }
     }
     false
 }

@@ -313,7 +313,7 @@ fn run(s: &mut Session, p: &Value) -> CmdResult {
             s.narrowed(crate::policy::Narrow::Item { kind: "notebook", name }, |s| run_cells(s, p))?
         }
     }))
-    .unwrap_or_else(|_| Err("the notebook failed unexpectedly".into()));
+    .unwrap_or_else(|payload| Err(crate::bug("The notebook", payload.as_ref())));
     s.notebook_running = false;
     r
 }

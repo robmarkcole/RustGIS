@@ -14,6 +14,9 @@ pub struct ReportState {
     pub page: usize,
     /// The preview: what it shows (report JSON and page), its texture and the page count.
     pub preview: Option<(String, egui::TextureHandle, usize)>,
+    /// A page that failed to draw, for the report, page and project revision it was drawn for: not
+    /// drawn again, nor said again, until one of them changes.
+    pub failed_draw: Option<(String, String)>,
     /// The built report and its pages, for the report and project revision they were built from:
     /// turning pages only redraws a page, it doesn't rebuild the report.
     pub built: Option<((usize, u64), Result<(rustgis_engine::map::report::Doc, Vec<rustgis_engine::render::report::Page>), String>)>,
@@ -315,7 +318,14 @@ fn preview(app: &mut RustGisApp, ui: &mut Ui, i: usize, t: &Tokens) {
         if app.reports.built.as_ref().is_none_or(|b| b.0 != built_for) {
             let s = &app.session;
             let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rustgis_engine::cmd::report::pages(s, i)))
-                .unwrap_or_else(|_| Err("the preview failed unexpectedly".into()));
+                .unwrap_or_else(|payload| Err(crate::bug("the preview", payload.as_ref())));
+            // A bug's failure, said once as it's made (the pane draws it each frame), so Messages
+            // keeps its details.
+            if let Err(e) = &built
+                && rustgis_engine::data::incident::named(e).is_some()
+            {
+                app.session.notify(e.clone(), true);
+            }
             // A failure is kept too, so it isn't retried every frame until something changes.
             app.reports.built = Some((built_for, built));
         }
@@ -327,6 +337,12 @@ fn preview(app: &mut RustGisApp, ui: &mut Ui, i: usize, t: &Tokens) {
             }
             None => return,
         };
+        if let Some((failed, e)) = &app.reports.failed_draw
+            && *failed == key
+        {
+            ui.label(egui::RichText::new(e.as_str()).small().color(Color32::from_rgb(0xC0, 0x30, 0x30)));
+            return;
+        }
         let (s, page) = (&mut app.session, app.reports.page);
         let drawn_at = rustgis_engine::render::rustgis_tiles::cache::generation();
         let (drawn, said) = rustgis_engine::render::shadows_said(|| {
@@ -336,9 +352,16 @@ fn preview(app: &mut RustGisApp, ui: &mut Ui, i: usize, t: &Tokens) {
                     rustgis_engine::render::report::draw_page(doc, pages, page, 60.0, &s.project.layouts, &mut s.project.maps)?;
                 Ok((pm, page, pages.len()))
             }))
-            .unwrap_or_else(|_| Err("the preview failed unexpectedly".into()))
+            .unwrap_or_else(|payload| Err(crate::bug("the preview", payload.as_ref())))
         });
         crate::layoutview::say_frame_shadows(app, &said);
+        // A bug's failure, said once as it's made (the pane draws it each frame), so Messages
+        // keeps its details.
+        if let Err(e) = &drawn
+            && rustgis_engine::data::incident::named(e).is_some()
+        {
+            app.session.notify(e.clone(), true);
+        }
         match drawn {
             Ok((pm, page, total)) => {
                 app.reports.page = page;
@@ -348,7 +371,8 @@ fn preview(app: &mut RustGisApp, ui: &mut Ui, i: usize, t: &Tokens) {
                 app.reports.preview = Some((crate::layoutview::preview_key(&key, &said, drawn_at), tex, total));
             }
             Err(e) => {
-                ui.label(egui::RichText::new(e).small().color(Color32::from_rgb(0xC0, 0x30, 0x30)));
+                ui.label(egui::RichText::new(e.as_str()).small().color(Color32::from_rgb(0xC0, 0x30, 0x30)));
+                app.reports.failed_draw = Some((key, e));
                 return;
             }
         }

@@ -11853,7 +11853,7 @@ mod tests {
         ds.push(Some(Geometry::Line(vec![off.to_vec()])), vec![]);
         let m = Map(HashMap::from([("f".to_string(), ds)]));
         let r = crate::run("buffer", &m, &serde_json::json!({"input": "f", "distance": 1}));
-        assert!(!matches!(&r, Err(e) if e.ends_with("failed unexpectedly")), "{:?}", r.err());
+        assert!(!matches!(&r, Err(e) if e.contains("failed unexpectedly")), "{:?}", r.err());
     }
 
     /// Buffers are geodesic (#394): Web Mercator's scale changes with latitude, so one scale for
@@ -13393,7 +13393,7 @@ mod tests {
             for p in &junk {
                 // A panic is caught and becomes this error, which would pass unnoticed.
                 let r = crate::run(t.id, &m, p);
-                assert!(!matches!(&r, Err(e) if e.ends_with("failed unexpectedly")), "{} panicked on {p}", t.id);
+                assert!(!matches!(&r, Err(e) if e.contains("failed unexpectedly")), "{} panicked on {p}", t.id);
             }
         }
     }

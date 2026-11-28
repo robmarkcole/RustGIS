@@ -169,7 +169,9 @@ mod tests {
             s.notify("Deleted 3 features", false);
             panic!("synthetic loss rollback");
         });
-        assert_eq!(result.unwrap_err(), "Loss rollback failed unexpectedly; the project was restored");
+        let error = result.unwrap_err();
+        assert!(error.starts_with("Loss rollback failed unexpectedly, a bug in RustGIS (incident "), "{error}");
+        assert!(error.contains("the project is as it was before"), "{error}");
         assert_eq!(session.project.name, name);
         let notices = session.notices_since(mark);
         assert_eq!(notices.iter().filter(|n| !n.error).count(), 1);

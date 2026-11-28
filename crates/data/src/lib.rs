@@ -26,6 +26,7 @@ pub mod gml;
 pub mod gpx;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod http;
+pub mod incident;
 pub mod interop;
 pub mod io;
 pub mod kml;
@@ -91,7 +92,9 @@ pub fn no_programs_here() -> &'static str {
 
 #[derive(Debug, thiserror::Error)]
 pub enum DataError {
-    #[error("i/o: {0}")]
+    /// A failure of the computer rather than the data (a full disk, a read-only folder, no
+    /// permission, no memory) says so, and what to do, before the system's own words.
+    #[error("{}", io_text(.0))]
     Io(#[source] std::io::Error),
     #[error("{0}")]
     Format(String),
@@ -117,6 +120,24 @@ impl DataError {
     pub fn of_conversion(e: String) -> Self {
         if e == DataError::Cancelled.to_string() { DataError::Cancelled } else { DataError::Format(e) }
     }
+}
+
+/// An I/O error in words: what the computer ran into and what to do, for a failure of the computer
+/// rather than the data, then the system's own words; `i/o: …` for any other.
+pub fn io_text(e: &std::io::Error) -> String {
+    use std::io::ErrorKind as K;
+    let plain = match e.kind() {
+        K::StorageFull => "the disk is full: free some space, or save somewhere else",
+        K::QuotaExceeded => "the storage quota on this disk is used up: free some space, or save somewhere else",
+        K::FileTooLarge => "the file is larger than this disk or system allows: save it in pieces, or to a disk that holds larger files",
+        K::ReadOnlyFilesystem => "the disk or folder is read-only: save somewhere else",
+        K::PermissionDenied => "RustGIS isn't allowed to use this file or folder: check its permissions, or choose another",
+        K::OutOfMemory => {
+            "the computer ran out of memory: close other programs, or work on a smaller part of the data, such as by filtering or clipping it first"
+        }
+        _ => return format!("i/o: {e}"),
+    };
+    format!("{plain} ({e})")
 }
 
 /// An I/O error, or [`DataError::Cancelled`] when it carries one: a write that only returns I/O
@@ -168,6 +189,25 @@ impl DataError {
 
 #[cfg(test)]
 mod unplaced_out_tests;
+
+#[cfg(test)]
+mod io_text_tests {
+    use super::*;
+
+    #[test]
+    fn a_failure_of_the_computer_says_what_to_do_and_keeps_the_systems_words() {
+        use std::io::{Error, ErrorKind as K};
+        let full = DataError::Io(Error::from(K::StorageFull)).to_string();
+        assert!(full.starts_with("the disk is full: free some space, or save somewhere else ("), "{full}");
+        assert!(full.ends_with(&format!("{})", Error::from(K::StorageFull))), "{full}");
+        for kind in [K::QuotaExceeded, K::FileTooLarge, K::ReadOnlyFilesystem, K::PermissionDenied, K::OutOfMemory] {
+            let said = DataError::Io(Error::from(kind)).to_string();
+            assert!(!said.starts_with("i/o:") && said.contains(':'), "{kind:?}: {said}");
+        }
+        // Any other failure is said as before.
+        assert_eq!(DataError::Io(Error::other("unchanged")).to_string(), "i/o: unchanged");
+    }
+}
 
 #[cfg(test)]
 mod secret_redaction_tests {

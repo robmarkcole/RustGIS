@@ -571,7 +571,10 @@ impl ExportRun {
                 }
             })
         }))
-        .unwrap_or_else(|_| Err(format!("{name} failed unexpectedly")))
+        .unwrap_or_else(|payload| {
+            let incident = rustgis_data::incident::caught(payload.as_ref());
+            Err(rustgis_data::incident::message(name, false, &incident.id))
+        })
         .map(|w| Wrote { owner: Some(owner), crs_used: rustgis_data::raster::crs::take_used(), ..w });
         if let Some(inputs) = inputs {
             started.inputs.lock().unwrap_or_else(|e| e.into_inner()).extend(inputs.inputs());

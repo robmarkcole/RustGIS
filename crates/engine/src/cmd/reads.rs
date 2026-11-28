@@ -191,7 +191,10 @@ impl ReadAhead {
                 })
             })
         }))
-        .unwrap_or_else(|_| Err(format!("{name} failed unexpectedly")));
+        .unwrap_or_else(|payload| {
+            let incident = rustgis_data::incident::caught(payload.as_ref());
+            Err(rustgis_data::incident::message(name, false, &incident.id))
+        });
         res?;
         Ok(Read {
             op,
@@ -232,7 +235,7 @@ pub fn scan_import(
             Ok(())
         })
     }))
-    .unwrap_or_else(|_| Err("Import QGIS Project failed unexpectedly".to_string()));
+    .unwrap_or_else(|payload| Err(crate::bug("Import QGIS Project", payload.as_ref())));
     let inputs = capture.as_ref().map_or_else(Vec::new, rustgis_data::provenance::Capture::inputs);
     res?;
     scanned.map(|scan| scan.with_inputs(inputs))

@@ -152,6 +152,11 @@ pub fn set_clock(clock: fn() -> u64) {
     *lock(&CLOCK) = Some(clock);
 }
 
+/// Milliseconds since 1970 by the application's clock ([`set_clock`]).
+pub(crate) fn now_ms() -> u64 {
+    timestamp_ms()
+}
+
 fn timestamp_ms() -> u64 {
     let clock = *lock(&CLOCK);
     if let Some(clock) = clock {
@@ -247,7 +252,7 @@ impl History {
         message: &Redacted,
         loss: Option<crate::loss::LossCode>,
         run: Option<Run>,
-    ) {
+    ) -> u64 {
         self.retain(Record {
             id: 0,
             timestamp_ms: timestamp_ms(),
@@ -258,11 +263,12 @@ impl History {
             network: None,
             loss,
             run,
-        });
+        })
     }
 
-    fn retain(&self, record: Record) {
-        store(&mut lock(&self.0), record);
+    /// Keeps `record`, and gives the id it was kept under.
+    fn retain(&self, record: Record) -> u64 {
+        store(&mut lock(&self.0), record)
     }
 
     /// Records the state the run `id` left the project in ([`Run::after`]) on the messages it said,
@@ -278,6 +284,17 @@ impl History {
                 None => {}
             }
         }
+    }
+
+    /// Adds `details` (redacted and bounded) to the record kept as `id`, if it still is: what a
+    /// bug's failure keeps for a report ([`crate::incident::Incident::details`]). By id, so a record
+    /// another thread keeps meanwhile isn't given them.
+    pub fn detail(&self, id: u64, details: &str) {
+        let mut state = lock(&self.0);
+        if let Some(record) = state.records.iter_mut().rev().find(|r| r.id == id) {
+            record.details = bounded(&redact(details), MAX_DETAILS_BYTES);
+        }
+        state.generation = state.generation.wrapping_add(1);
     }
 
     /// Oldest first; both the count and every string in this independent snapshot are bounded.

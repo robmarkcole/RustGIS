@@ -919,6 +919,8 @@ fn mcp(s: &mut Session, args: &[String]) -> Result<(), String> {
 
 /// Runs the command line, then stops the session plugins' programs its commands started.
 fn main() -> ExitCode {
+    // A bug caught in a command says so, with a reference to its details.
+    rustgis_engine::data::incident::install();
     let code = cli();
     // Session plugins' programs a command started end with the command line.
     rustgis_engine::plugins::session::stop_all();

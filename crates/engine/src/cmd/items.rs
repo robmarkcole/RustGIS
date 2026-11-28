@@ -1080,7 +1080,7 @@ fn run_task(s: &mut Session, p: &Value) -> CmdResult {
             s.narrowed(crate::policy::Narrow::Item { kind: "task", name }, |s| run_task_steps(s, p))?
         }
     }))
-    .unwrap_or_else(|_| Err("the task failed unexpectedly".into()));
+    .unwrap_or_else(|payload| Err(crate::bug("The task", payload.as_ref())));
     s.task_running = false;
     result
 }
@@ -1127,7 +1127,7 @@ fn run_task_steps(s: &mut Session, p: &Value) -> CmdResult {
             let op = s.authorize(&st.command, &st.params)?;
             s.invoke(op, crate::policy::Txn::Shared)
         }))
-        .unwrap_or_else(|_| Err("failed unexpectedly".into()))
+        .unwrap_or_else(|payload| Err(crate::bug(&st.command, payload.as_ref())))
         .map_err(|e| format!("step {} ({}): {e}", i + 1, st.title))?;
         done.push(json!({"step": i, "title": st.title, "result": r}));
     }

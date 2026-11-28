@@ -364,7 +364,7 @@ fn export(s: &mut Session, p: &Value) -> CmdResult {
     s.map_mut().apply_time();
     // The step it is back at, read here: a command after the export may read the layer.
     super::zarr::follow_time_now(s);
-    let bytes = made.map_err(|_| "exporting the time steps failed unexpectedly".to_string())??;
+    let bytes = made.map_err(|payload| crate::bug("Exporting the time steps", payload.as_ref()))??;
     rustgis_data::io::write_atomic(std::path::Path::new(&path), &bytes).map_err(|e| format!("{path}: {e}"))?;
     s.retain_written_notices(written);
     Ok(json!({"path": path, "frames": steps.len(), "bytes": bytes.len()}))

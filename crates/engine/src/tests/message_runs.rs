@@ -65,3 +65,29 @@ fn a_runs_target_masks_a_login_in_use() {
     assert!(!target.contains(secret), "{target}");
     assert!(target.starts_with("roads "), "{target}");
 }
+
+#[test]
+fn a_bug_in_a_command_is_said_as_one_with_its_details_kept() {
+    rustgis_data::incident::install();
+    let mut s = Session::new(Project::default());
+    s.registry.commands.push(crate::CommandSpec::new("test.bug", "Bug", "Test", |_, _| panic!("the test's bug")));
+    let error = s.run("test.bug", &json!({})).unwrap_err();
+    assert!(error.contains("failed unexpectedly, a bug in RustGIS (incident "), "{error}");
+    let id = rustgis_data::incident::named_in(&error).expect("a reference").to_string();
+    // Messages keeps what a report needs: the reference, the panic's message and its place.
+    let record = s.diagnostics.records().into_iter().rev().find(|r| r.message.contains(&id)).expect("the failure in Messages");
+    assert!(record.details.contains(&format!("Incident {id}")), "{}", record.details);
+    assert!(record.details.contains("the test's bug") && record.details.contains("message_runs.rs"), "{}", record.details);
+    // The next command runs as usual.
+    s.run("map.zoomIn", &json!({})).unwrap();
+}
+
+#[test]
+fn a_command_run_is_told_as_it_starts_and_ends() {
+    let mut s = world();
+    let told = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let heard = told.clone();
+    s.on_run = Some(Box::new(move |run| heard.lock().unwrap().push(run.map(|r| (r.command.clone(), r.target.clone())))));
+    s.run("layer.zoomTo", &json!({"layer": "Cities"})).unwrap();
+    assert_eq!(*told.lock().unwrap(), [Some(("layer.zoomTo".to_string(), Some("Cities".to_string()))), None]);
+}

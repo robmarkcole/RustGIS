@@ -318,7 +318,7 @@ fn handle(m: &Map<String, Value>, host: &mut dyn Host, r: &mut Running) -> Resul
         // A request that fails unexpectedly is an error answer, as in a WebAssembly plugin: the
         // program, out of the list while it's talked to, is never left running untracked.
         let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| host.call(op, &params)))
-            .unwrap_or_else(|_| Err(format!("'{op}' failed unexpectedly")));
+            .unwrap_or_else(|payload| Err(rustgis_data::incident::bug(&format!("'{op}'"), payload.as_ref())));
         let mut reply = match answer {
             Ok(v) => json!({"ok": v}),
             Err(e) => json!({"error": e}),

@@ -696,6 +696,8 @@ impl Bridge<'_> {
         Ok(json!({"layer": id, "skipped": report.skipped}))
     }
 
+    /// Runs a command a plugin asked for, as the plugin may: a RustGIS command's bug is said as
+    /// one, with its incident reference.
     fn command(&mut self, id: &str, params: &Value) -> CmdResult {
         if id.starts_with(rustgis_plugins::PREFIX) {
             return Err("plugins can't run other plugins' commands".into());
@@ -740,7 +742,11 @@ impl Bridge<'_> {
             let op = s.authorize(id, params)?;
             super::workflows::steps_of(s, |s| s.invoke(op, crate::policy::Txn::Shared))
         })
-        .unwrap_or_else(|_| Err(format!("{label} failed unexpectedly")));
+        .unwrap_or_else(|payload| {
+            // A RustGIS command the plugin ran hit a bug: said as ours, with its reference.
+            let incident = rustgis_data::incident::caught(payload.as_ref());
+            Err(rustgis_data::incident::message(label, false, &incident.id))
+        });
         if let Some(before) = before {
             let mut dropped = false;
             for m in &mut self.s.project.maps {
@@ -1087,7 +1093,7 @@ impl Host for Between<'_> {
                 .s
                 .as_session_plugin(plugin.clone(), |s| {
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| bridge(s).0))
-                        .unwrap_or_else(|_| Err(format!("'{op}' failed unexpectedly")))
+                        .unwrap_or_else(|payload| Err(crate::bug(&format!("'{op}'"), payload.as_ref())))
                 })
                 .and_then(|r| r);
         }

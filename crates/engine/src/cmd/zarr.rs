@@ -1053,7 +1053,7 @@ impl PendingRead {
         crate::render::rustgis_tiles::cache::with_optional_still(self.still.clone(), || {
             let _diagnostic_scope = self.capture.enter();
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read_step(&self.zt, self.step, self.key.clone())))
-                .unwrap_or_else(|_| Err(format!("{}: reading step {} failed unexpectedly", self.zt.store, self.step)))
+                .unwrap_or_else(|payload| Err(crate::bug(&format!("{}: reading step {}", self.zt.store, self.step), payload.as_ref())))
         })
     }
 

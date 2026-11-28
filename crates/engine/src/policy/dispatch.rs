@@ -1024,7 +1024,10 @@ impl Session {
                         let add = |s: &mut Session| {
                             let before = crate::service_logins::before(s, spec.id, &params)?;
                             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| spec.run.call(s, &params)))
-                                .unwrap_or_else(|_| Err(format!("{} failed unexpectedly", spec.label)));
+                                .unwrap_or_else(|payload| {
+                                    let incident = rustgis_data::incident::caught(payload.as_ref());
+                                    Err(rustgis_data::incident::message(spec.label, spec.mutates, &incident.id))
+                                });
                             // A nested plugin command may fail after making additions. Its outer
                             // transaction owns rollback; mark those additions anonymous meanwhile.
                             if let Some(before) = before {
@@ -1036,7 +1039,10 @@ impl Session {
                             || (matches!(spec.id, "layer.addUrl" | "layer.addDownload")
                                 && params.get("anonymous").and_then(Value::as_bool) == Some(true));
                         let result = crate::service_logins::anonymously(s, anonymous, add)
-                            .unwrap_or_else(|_| Err(format!("{} failed unexpectedly", spec.label)))
+                            .unwrap_or_else(|payload| {
+                                let incident = rustgis_data::incident::caught(payload.as_ref());
+                                Err(rustgis_data::incident::message(spec.label, spec.mutates, &incident.id))
+                            })
                             .map_err(|e| crate::durable::generated_text(&e));
                         if let Ok(value) = &result {
                             s.trust_after(spec.id, &params, value, editor);

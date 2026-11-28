@@ -596,7 +596,10 @@ impl RasterRun {
                 rustgis_analysis::run_under(name, control, || reading_files(name, work))
             })
         }))
-        .unwrap_or_else(|_| Err(format!("{name} failed unexpectedly")))
+        .unwrap_or_else(|payload| {
+            let incident = rustgis_data::incident::caught(payload.as_ref());
+            Err(rustgis_data::incident::message(name, false, &incident.id))
+        })
         .map(|m| Made {
             ran: Some((name, map)),
             continuation: Some(continuation),

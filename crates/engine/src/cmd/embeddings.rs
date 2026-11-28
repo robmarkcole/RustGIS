@@ -1014,7 +1014,7 @@ fn read_window(url: &str, area: [f64; 4], cell: Option<f64>) -> Result<super::la
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        reader.join().unwrap_or_else(|_| Err(format!("{url}: the read failed unexpectedly")))
+        reader.join().unwrap_or_else(|payload| Err(crate::bug(&format!("{url}: the read"), payload.as_ref())))
     })?;
     rustgis_data::progress::check().map_err(|e| e.to_string())?;
     Ok(w)
