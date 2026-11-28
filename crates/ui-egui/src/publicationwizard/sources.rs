@@ -200,13 +200,13 @@ mod tests {
         assert!(h.get_by_role_and_label(Role::MultilineTextInput, "Reference").accesskit_node().is_disabled());
     }
 
-    /// The figure's step says the command's limits, and not a statistic refused on the sheet's
-    /// sources step.
+    /// The figure's step says the command's limits, and not a statistic refused on a sheet's
+    /// step.
     #[test]
     fn a_figures_step_says_its_limits_only() {
         let mut h = at(Step::Reference, |d| {
             d.size = "figure-1col".into();
-            d.refused = [false, true];
+            d.refused = [true, true];
         });
         assert!(h.query_by_label(&refusal()).is_none());
         assert!(h.query_by_label("At most 50 lines.").is_none());

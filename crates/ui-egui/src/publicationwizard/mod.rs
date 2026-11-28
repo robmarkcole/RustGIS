@@ -44,7 +44,8 @@ pub enum Step {
 
 impl Step {
     /// Where [`Draft`] keeps what each of the two steps with text fields has of its own: the
-    /// texts step's at 0, the sources step's at 1.
+    /// texts step's at 0, the sources step's at 1. A figure's reference step has none: it reads as
+    /// 0, so [`limit_note`] leaves the refusal out there.
     fn slot(self) -> usize {
         usize::from(self == Step::Sources)
     }
@@ -322,7 +323,7 @@ fn statistic_menu(ui: &mut egui::Ui, d: &mut Draft, map: &Map, own: Field) {
 /// done unseen.
 fn limit_note(ui: &mut egui::Ui, d: &mut Draft, fields: &[Field]) {
     let limit = [("limit", &*MAX_PUBLICATION_TEXT.to_string())];
-    // A figure's step adds no statistic: a refusal on the sheet's sources step isn't its own.
+    // A figure's step adds no statistic, so no step's refusal is its own.
     let note = if d.step != Step::Reference && d.refused[d.step.slot()] {
         i18n::fmt("The statistic wasn't added: each field takes at most {limit} characters.", &limit)
     } else if fields.iter().any(|&f| !d.off(f) && d.field_mut(f).chars().count() >= MAX_PUBLICATION_TEXT) {
