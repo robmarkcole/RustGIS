@@ -243,8 +243,10 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
     one the texts are light), `"kicker"` (a short line in spaced capitals over the title) and
     `"figures"` (up to three `{"value", "label"}`, the label optional, in columns of one width
     under the map, the value large and bold; a value or label may hold layer statistics such as
-    `{count:Cities}`); other styles and figures refuse the three. Its graticule labels sit at the
-    page's side edges, so a printer with no bleed may clip them. `"accent"` (`#RRGGBB`) colours the
+    `{count:Cities}`). A panel sheet takes `"figures"` too, stacked in its panel under the title
+    and subtitle, over the locator and the legend; it refuses `"paper"` and `"kicker"`, and the
+    other styles and figures refuse all three. An edge sheet's graticule labels sit at the page's side
+    edges, so a printer with no bleed may clip them. `"accent"` (`#RRGGBB`) colours the
     band, the panel's tint, the headings and rules, a poster's page and an edge sheet's kicker (a
     deep brown, green or blue by default, a brick red on an edge sheet).
     A figure leaves the style to its caption. In the menu, each sheet opens a list of the seven

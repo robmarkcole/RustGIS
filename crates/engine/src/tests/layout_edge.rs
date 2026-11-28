@@ -191,7 +191,9 @@ fn paper_and_kicker_are_refused_with_another_style_and_on_a_figure() {
     let mut s = world();
     let figures = json!([{"value": "12 %"}]);
     for (key, value) in [("paper", json!("#0B1B2B")), ("kicker", json!("Day 22")), ("figures", figures), ("figures", json!([]))] {
-        for style in ["classic", "banner", "panel", "editorial", "modular", "poster"] {
+        // A panel sheet takes the figures too (#3263).
+        let panel = (key != "figures").then_some("panel");
+        for style in ["classic", "banner", "editorial", "modular", "poster"].into_iter().chain(panel) {
             let e = s.run("layout.publication", &json!({"extent": PIAUI, "style": style, key: value})).unwrap_err();
             assert!(e.contains(key) && e.contains("\"edge\""), "{style}: {e}");
         }

@@ -146,10 +146,14 @@ pub(in crate::cmd::layout) fn publication(s: &mut Session, p: &Value) -> CmdResu
     if accent.a() != 255 {
         return Err("accent is an opaque colour as #RRGGBB".into());
     }
-    // Only an edge sheet draws these: given to another, they are refused rather than left out.
+    // Only some sheets draw these: given to another, they are refused rather than left out.
     let edge = sheet && style == Style::Edge;
-    if let Some(k) = ["paper", "kicker", "figures"].into_iter().find(|k| !edge && p.get(*k).is_some_and(|v| !v.is_null())) {
+    let given = |k: &str| p.get(k).is_some_and(|v| !v.is_null());
+    if let Some(k) = ["paper", "kicker"].into_iter().find(|k| !edge && given(k)) {
         return Err(format!("{k} is for a sheet with \"style\": \"edge\""));
+    }
+    if !(edge || sheet && style == Style::Panel) && given("figures") {
+        return Err("figures is for a sheet with \"style\": \"edge\" or \"panel\"".into());
     }
     // White is the page's own colour, kept as none, as `layout.page` keeps it.
     let page_colour = crate::cmd::opaque_color(p, "paper")?.flatten().filter(|c| *c != Rgba::rgb(0xFF, 0xFF, 0xFF));
@@ -306,6 +310,9 @@ pub(in crate::cmd::layout) fn publication(s: &mut Session, p: &Value) -> CmdResu
     // A later pass failing where an earlier one held (its shorter page leaving the texts too
     // little room) settles on the last that held: only the first pass's failure is the request's.
     let (mut held, mut settled) = (0.0f64, false);
+    // The least a panel with headline figures is cut to: a shorter one fails the next pass, and the
+    // sheet would be left uncut.
+    let mut panel_needs = 0.0f64;
     let warned = warnings.len();
     let (w, h, (fx, fy, fw, fh), column) = loop {
         around.clear();
@@ -704,6 +711,29 @@ pub(in crate::cmd::layout) fn publication(s: &mut Session, p: &Value) -> CmdResu
                             ));
                             y += 4.0 * k;
                         }
+                        // The headline figures, one under another, each value over its label.
+                        for (i, (value, label)) in headlines.iter().enumerate() {
+                            let value = wrap_as(value, tw, title_pt, true);
+                            let vh = value.lines.len() as f64 * pitch(title_pt);
+                            let name = format!("Figure {} Value", i + 1);
+                            around.push((name, (ix, y, tw, vh), pub_text(value, title_pt, ink, true, TextAlign::Left)));
+                            y += vh;
+                            let label = label.as_deref().map(|t| wrap(t, tw, body_pt)).unwrap_or_default();
+                            if !label.lines.is_empty() {
+                                let lh = label.lines.len() as f64 * pitch(body_pt);
+                                let name = format!("Figure {} Label", i + 1);
+                                around.push((name, (ix, y, tw, lh), pub_text(label, body_pt, soft, false, TextAlign::Left)));
+                                y += lh;
+                            }
+                            y += if i + 1 < headlines.len() { 2.0 * k } else { 3.0 * k };
+                        }
+                        if !under && !headlines.is_empty() {
+                            // The height down to here, the 30·k the check below asks for the locator and
+                            // the legend with 1·k to spare (a pass may land 0.5 mm short), and what the
+                            // sources and reference take from the map once under it.
+                            let moved = foot - footer(&mut Vec::new(), &plain, true, true);
+                            panel_needs = y - top + ip + 31.0 * k + moved;
+                        }
                         // The sources and the reference, stacked up from the panel's foot.
                         let mut yb = panel_bottom - ip;
                         for (name, head, lines) in sections(tw, head_pt, body_pt).into_iter().rev().filter(|_| !under) {
@@ -724,10 +754,10 @@ pub(in crate::cmd::layout) fn publication(s: &mut Session, p: &Value) -> CmdResu
                             yb -= 3.0 * k;
                         }
                         if yb - y < 30.0 * k {
-                            return Err(
-                            "the panel's texts leave no room for the locator and the legend: shorten the title, the sources or the reference"
-                                .into(),
-                        );
+                            let figures = if headlines.is_empty() { "" } else { " the figures," };
+                            return Err(format!(
+                                "the panel's texts leave no room for the locator and the legend: shorten the title,{figures} the sources or the reference"
+                            ));
                         }
                         (page_w, page_h, (x0, top, mw, room(top, panel_bottom)?), Some(Column { x: ix, y, w: tw, h: yb - y }))
                     }
@@ -866,7 +896,7 @@ pub(in crate::cmd::layout) fn publication(s: &mut Session, p: &Value) -> CmdResu
             target = (sheet && matches!(style, Style::Panel | Style::Editorial))
                 .then(|| aspect(s, &extent))
                 .flatten()
-                .map(|a| (((lw - 2.0 * room_side).max(1.0) * a + 2.0 * room_end) * 1.15).max(40.0 * k))
+                .map(|a| (((lw - 2.0 * room_side).max(1.0) * a + 2.0 * room_end) * 1.15).max(40.0 * k).max(panel_needs))
                 // Only a frame clearly too tall is cut.
                 .filter(|n| *n < 0.97 * lh);
         }
