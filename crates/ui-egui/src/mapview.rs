@@ -3573,7 +3573,8 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
             Tool::EditVertices => crate::vertexedit::click(app, rect, p, c, shift),
             Tool::RotatedBox => {
                 if !middle {
-                    crate::boxedit::click(app, c, shift, ui.input(|i| i.modifiers.alt));
+                    let (command, alt) = ui.input(|i| (i.modifiers.command, i.modifiers.alt));
+                    crate::boxedit::click(app, c, shift, command, alt);
                     if !ui.input(|i| i.modifiers.shift || i.modifiers.command) {
                         crate::annotation::selected_tool(app);
                     }
@@ -3581,7 +3582,8 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
             }
             Tool::Circle => {
                 if !middle {
-                    crate::circleedit::click(app, c, shift, ui.input(|i| i.modifiers.alt));
+                    let (command, alt) = ui.input(|i| (i.modifiers.command, i.modifiers.alt));
+                    crate::circleedit::click(app, c, shift, command, alt);
                     if !ui.input(|i| i.modifiers.shift || i.modifiers.command) {
                         crate::annotation::selected_tool(app);
                     }

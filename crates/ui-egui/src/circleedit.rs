@@ -462,9 +462,9 @@ mod tests {
         let (id, _, b) = create(&mut app);
         app.run("edit.addCircle", json!({"circle":b})).unwrap();
         let c = b.frame.to_lonlat(b.center).unwrap();
-        click(&mut app, c, false, false);
+        click(&mut app, c, false, false, false);
         let one = selected(&app).unwrap().1;
-        click(&mut app, c, false, true);
+        click(&mut app, c, false, false, true);
         let two = selected(&app).unwrap().1;
         assert_ne!(one, two);
         let center = at(&app, rect(), &b.frame, b.center).unwrap();
@@ -480,12 +480,12 @@ mod tests {
         app.run("edit.addCircle", json!({"circle":b})).unwrap();
         app.run("edit.addFeature", json!({"geometry":rustgis_engine::data::io::geometry_to_geojson(&b.geometry().unwrap())})).unwrap();
         let c = b.frame.to_lonlat(b.center).unwrap();
-        click(&mut app, c, false, false);
+        click(&mut app, c, false, false, false);
         assert_eq!(app.session.map().layer(id).unwrap().selection, vec![2]);
         assert!(selected(&app).is_none());
-        click(&mut app, c, false, true);
+        click(&mut app, c, false, false, true);
         assert_eq!(selected(&app).unwrap().1, 1);
-        click(&mut app, c, false, true);
+        click(&mut app, c, false, false, true);
         assert_eq!(selected(&app).unwrap().1, first);
         let p = at(&app, rect(), &b.frame, b.center).unwrap();
         assert!(drag_start(&mut app, rect(), p, false));
