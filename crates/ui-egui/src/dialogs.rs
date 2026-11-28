@@ -4898,20 +4898,26 @@ mod tests {
         app.run("ui.dialog", json!({"name": "selectByAttributes"})).unwrap();
         let mut h = app_harness(app);
         h.run_steps(3);
+        // The match count repaints independently. Wait only for the requested menu entry.
+        let pick_value = |h: &mut egui_kittest::Harness<'static, RustGisApp>, value: &str| {
+            h.get_by_role_and_label(Role::Button, "Values ▾").click();
+            for _ in 0..10 {
+                h.step();
+                if h.query_by_role_and_label(Role::Button, value).is_some() {
+                    break;
+                }
+            }
+            h.get_by_role_and_label(Role::Button, value).click();
+            h.step();
+        };
         h.get_by_role_and_label(Role::Button, "name").click();
-        h.run();
+        h.step();
         h.state_mut().dialogs.text = "name LIKE ".into();
-        h.get_by_role_and_label(Role::Button, "Values ▾").click();
-        h.run();
-        h.get_by_role_and_label(Role::Button, "'a_b'").click();
-        h.run();
+        pick_value(&mut h, "'a_b'");
         assert_eq!(h.state().dialogs.text, "name LIKE ", "nothing written");
         assert!(h.query_by_label_contains("matches more than itself").is_some(), "and it says why");
         // Another value goes in, and the note goes.
-        h.get_by_role_and_label(Role::Button, "Values ▾").click();
-        h.run();
-        h.get_by_role_and_label(Role::Button, "'plain'").click();
-        h.run();
+        pick_value(&mut h, "'plain'");
         assert_eq!(h.state().dialogs.text, "name LIKE 'plain' ");
         assert!(h.query_by_label_contains("matches more than itself").is_none());
     }
