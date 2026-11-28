@@ -51,12 +51,15 @@ pub(in crate::cmd::layout) fn given_num(p: &Value, k: &str, what: &str) -> Resul
     }
 }
 
-/// A table's "rows", when it's given (and not null), held to 1 to 500: an error when it's not a
-/// whole number of 0 or more.
+/// The fewest and the most rows a table shows.
+const TABLE_ROWS: (f64, f64) = (1.0, 500.0);
+
+/// A table's "rows", when it's given (and not null), held to [`TABLE_ROWS`]: an error when it's not
+/// a whole number of 0 or more.
 pub(in crate::cmd::layout) fn table_rows(p: &Value) -> Result<Option<usize>, String> {
     let what = "a whole number of 0 or more";
     match given_num(p, "rows", what)? {
-        Some(n) if n >= 0.0 && n.fract() == 0.0 => Ok(Some(n.clamp(1.0, 500.0) as usize)),
+        Some(n) if n >= 0.0 && n.fract() == 0.0 => Ok(Some(n.clamp(TABLE_ROWS.0, TABLE_ROWS.1) as usize)),
         Some(_) => Err(format!("rows is {what}")),
         None => Ok(None),
     }
@@ -221,6 +224,15 @@ pub(in crate::cmd::layout) fn held_width(p: &Value, what: &str, range: (f64, f64
     let w = f(p, "width")?;
     let kept = w.clamp(range.0, range.1);
     (w != kept).then(|| format!("{what} {w} held to {kept} ({} to {} points)", range.0, range.1))
+}
+
+/// A table's "rows" in `p` held to [`TABLE_ROWS`], said as [`held_to_limits`] says it. Only for a
+/// table, and after [`table_rows`], which refuses a value that isn't a number of rows.
+pub(in crate::cmd::layout) fn held_rows(p: &Value) -> Option<String> {
+    let (least, most) = TABLE_ROWS;
+    let n = f(p, "rows")?;
+    let kept = n.clamp(least, most);
+    (n != kept).then(|| format!("rows {n} held to {kept} ({least} to {most})"))
 }
 
 /// Says what [`held_to_limits`] found, in one notice for the command `title`.
@@ -683,7 +695,11 @@ pub(in crate::cmd::layout) fn add_element(s: &mut Session, p: &Value) -> CmdResu
     if let Some(said) = empty_colorbar {
         s.warn(said);
     }
-    say_held(s, "Add Element", held_to_limits(p, Shape::of_name(kind)));
+    let mut held = held_to_limits(p, Shape::of_name(kind));
+    if kind == "table" {
+        held.extend(held_rows(p));
+    }
+    say_held(s, "Add Element", held);
     say_name_ignored(s, p, kind);
     let mut out = json!({"element": id});
     if let Some(w) = warning {

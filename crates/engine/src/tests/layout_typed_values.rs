@@ -278,3 +278,46 @@ fn a_null_or_valid_table_or_chart_value_is_taken() {
     refused(&mut s, "layout.addElement", json!({"kind": "chart", "field": "nope"}), "no field 'nope'");
     refused(&mut s, "layout.update", json!({"element": chart, "field": "nope"}), "no numeric field 'nope'");
 }
+
+#[test]
+fn a_table_s_rows_held_to_their_range_are_said() {
+    let (mut s, table, chart) = with_data();
+    let said = |s: &Session, mark: u64| -> Vec<String> {
+        s.notices_since(mark).iter().filter(|n| n.text.contains("held to")).map(|n| n.text.clone()).collect()
+    };
+    let cases = [
+        (json!(900), 500, Some("rows 900 held to 500 (1 to 500)")),
+        (json!("900"), 500, Some("rows 900 held to 500 (1 to 500)")),
+        (json!(501), 500, Some("rows 501 held to 500 (1 to 500)")),
+        (json!(0), 1, Some("rows 0 held to 1 (1 to 500)")),
+        (json!(1), 1, None),
+        (json!(500), 500, None),
+        (json!("7"), 7, None),
+    ];
+    for (given, taken, held) in cases {
+        let mark = s.notice_mark();
+        s.run("layout.addElement", &json!({"kind": "table", "rows": given})).unwrap();
+        assert_eq!(rows(&s), taken, "add {given}");
+        let expected: Vec<String> = held.iter().map(|h| format!("Add Element: {h}")).collect();
+        assert_eq!(said(&s, mark), expected, "add {given}");
+        let table = id(&s, |k| matches!(k, ElementKind::Table { .. }));
+        s.run("layout.update", &json!({"element": table, "rows": 3})).unwrap();
+        let mark = s.notice_mark();
+        s.run("layout.update", &json!({"element": table, "rows": given})).unwrap();
+        assert_eq!(rows(&s), taken, "update {given}");
+        let expected: Vec<String> = held.iter().map(|h| format!("Element Properties: {h}")).collect();
+        assert_eq!(said(&s, mark), expected, "update {given}");
+    }
+    // With another held value, both are said in the one notice.
+    let mark = s.notice_mark();
+    s.run("layout.addElement", &json!({"kind": "table", "rows": 900, "background": {"padding": 999}})).unwrap();
+    let notices = said(&s, mark);
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(notices[0].contains("background padding 999 held to") && notices[0].contains("rows 900 held to 500"), "{notices:?}");
+    // Rows not given, or given to an element that has none: nothing to say.
+    let mark = s.notice_mark();
+    s.run("layout.addElement", &json!({"kind": "table", "rows": null})).unwrap();
+    s.run("layout.update", &json!({"element": table, "rows": null})).unwrap();
+    s.run("layout.update", &json!({"element": chart, "rows": 900})).unwrap();
+    assert_eq!(said(&s, mark), Vec::<String>::new());
+}

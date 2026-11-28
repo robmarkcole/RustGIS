@@ -271,6 +271,9 @@ pub(in crate::cmd::layout) fn update(s: &mut Session, p: &Value) -> CmdResult {
             _ => None,
         };
         let mut said = held_to_limits(p, Shape::of_kind(kind));
+        if matches!(kind, ElementKind::Table { .. }) {
+            said.extend(held_rows(p));
+        }
         if let (Some((_, Some(_))), Some(v)) = (&sections, p.get("section")) {
             said.extend(held_width(v, "section width", rustgis_map::layout::SECTION_WIDTHS));
         }
