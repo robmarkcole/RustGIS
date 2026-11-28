@@ -39,14 +39,7 @@ pub(super) fn review_step(ui: &mut egui::Ui, s: &Session, d: &Draft) {
         row(tl!("Reference"), reference_value(d));
         heading_row(&mut row, d, 1, tl!("Reference heading"), PUBLICATION_HEADINGS[1]);
         heading_row(&mut row, d, 2, tl!("Column heading"), none);
-        let credit = if d.no_author {
-            none.to_string()
-        } else if d.author.trim().is_empty() {
-            default_credit()
-        } else {
-            d.author.trim().to_string()
-        };
-        row(tl!("Credit line"), credit);
+        row(tl!("Credit line"), credit_value(d));
         let accent = d.accent.map(hex).unwrap_or_else(|| tl!("The style's own").to_string());
         row(tl!("Accent"), accent);
     });
@@ -72,6 +65,18 @@ fn reference_value(d: &Draft) -> String {
         Some(_) => tl!("(none; the lines typed aren't used)").to_string(),
         None if typed.is_empty() => tl!("The default: projection, datum and graticule, filled in on the sheet").to_string(),
         None => typed,
+    }
+}
+
+/// The credit line as it will be drawn: the one typed, or the command's default; switched off,
+/// none, but one typed then is said not to be used.
+fn credit_value(d: &Draft) -> String {
+    let typed = d.author.trim();
+    match d.off(Field::Author) {
+        true if typed.is_empty() => tl!("(none)").to_string(),
+        true => tl!("(none; the line typed isn't used)").to_string(),
+        false if typed.is_empty() => default_credit(),
+        false => typed.to_string(),
     }
 }
 
@@ -109,5 +114,36 @@ mod tests {
         h.state_mut().dialogs.publication.as_mut().unwrap().size = "figure-1col".into();
         h.run_steps(2);
         assert!(h.query_by_label_contains("its caption").is_some(), "a figure's texts aren't drawn");
+    }
+
+    /// A credit line typed and then switched off is said not to be used, as reference lines are;
+    /// with none typed, the row says "(none)" and nothing more.
+    #[test]
+    fn the_review_says_a_credit_line_switched_off_isnt_used() {
+        let default = "Made with RustGIS · today's date";
+        let unused = "(none; the line typed isn't used)";
+        let mut app = app();
+        open(&mut app);
+        app.dialogs.publication.as_mut().unwrap().step = Step::Review;
+        let mut h = harness(app);
+        // Other empty rows say "(none)" too: the credit row's is the one more.
+        let others = h.query_all_by_label("(none)").count();
+        for (author, no_author, listed) in [
+            ("", false, default),
+            ("J. G.", false, "J. G."),
+            ("   ", false, default),
+            ("J. G.", true, unused),
+            ("", true, "(none)"),
+            ("   ", true, "(none)"),
+        ] {
+            let d = h.state_mut().dialogs.publication.as_mut().unwrap();
+            (d.author, d.no_author) = (author.into(), no_author);
+            h.run_steps(4);
+            for text in [default, "J. G.", unused] {
+                assert_eq!(h.query_by_label(text).is_some(), text == listed, "{text}: {author:?}, off {no_author}");
+            }
+            let none = h.query_all_by_label("(none)").count();
+            assert_eq!(none, others + usize::from(listed == "(none)"), "(none): {author:?}, off {no_author}");
+        }
     }
 }
