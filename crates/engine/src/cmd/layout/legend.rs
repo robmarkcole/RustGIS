@@ -383,14 +383,15 @@ pub(in crate::cmd::layout) fn legend_map<'m>(input: &'m impl crate::cmd::InputSo
     s.project.maps.iter().find(|m| m.name.eq_ignore_ascii_case(map_name)).ok_or_else(|| format!("no map '{map_name}'"))
 }
 
-/// The name of the layer `n` (any case, ends trimmed) of a legend's `map`, as the map spells it:
-/// one of its layers, or a WMS or WMTS layer's (whose legend is its service's picture). One the
-/// map hasn't is an error.
+/// The name of the layer `n` (any case) of a legend's `map`, as the map spells it: one of its
+/// layers, or a WMS or WMTS layer's (whose legend is its service's picture). `n` is looked up as
+/// given first, as a layer's name may begin or end with a space, then with its ends trimmed. One
+/// the map hasn't is an error.
 pub(in crate::cmd::layout) fn legend_layer<'m>(map: &'m Map, n: &str) -> Result<&'m String, String> {
-    map.layer_by_name(n.trim())
-        .map(|l| &l.name)
-        .or_else(|| map.tiles.iter().find(|t| t.name.eq_ignore_ascii_case(n.trim())).map(|t| &t.name))
-        .ok_or_else(|| format!("no layer '{n}' in map '{}'", map.name))
+    let named = |n: &str| {
+        map.layer_by_name(n).map(|l| &l.name).or_else(|| map.tiles.iter().find(|t| t.name.eq_ignore_ascii_case(n)).map(|t| &t.name))
+    };
+    named(n).or_else(|| named(n.trim())).ok_or_else(|| format!("no layer '{n}' in map '{}'", map.name))
 }
 
 /// The shape a legend's `labels` takes.

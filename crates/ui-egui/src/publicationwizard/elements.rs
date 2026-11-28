@@ -2,6 +2,7 @@
 use super::arrange::{LOCATOR, NORTH_ARROW, SCALE_BAR, surround_labels};
 use super::*;
 use rustgis_engine::cmd::layout::{publication_style_cards, publication_style_has_column};
+use rustgis_engine::map::Drawn;
 use rustgis_engine::map::layout::{ArrowStyle, MAX_LEGEND_COLUMNS, ScaleBarStyle, ScaleUnits, colorbar_layer};
 use rustgis_engine::render::layout::{legend_lists, tile_listed};
 
@@ -27,6 +28,14 @@ pub enum NorthChoice {
     None,
 }
 
+/// A layer ticked out of the legend: a map layer by its instance, as it may be renamed while the
+/// wizard is open; a web layer, which has none, by its name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExcludedLayer {
+    Layer(u64),
+    Web(String),
+}
+
 /// What the step asks. A control the sheet can't use keeps its answer, which isn't sent.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Elements {
@@ -50,6 +59,8 @@ pub struct Elements {
     pub legend_title: String,
     /// The legend's columns, or `None` for the placement's pick.
     pub legend_columns: Option<usize>,
+    /// The layers ticked out of the legend.
+    pub legend_exclude: Vec<ExcludedLayer>,
 }
 
 impl Default for Elements {
@@ -69,6 +80,7 @@ impl Default for Elements {
             scale_style: ScaleBarStyle::default(),
             legend_title: String::new(),
             legend_columns: None,
+            legend_exclude: Vec::new(),
         }
     }
 }
@@ -167,7 +179,7 @@ impl Draft {
             Control::Veil => !self.column() && self.draws_legend_place(s),
             Control::NorthStyle => self.draws_arrow(s),
             Control::ScaleLook => self.draws_scale_bar(s),
-            Control::LegendLook => self.elements.legend && legend_lists_rows(s),
+            Control::LegendLook => self.elements.legend && listed(s).iter().any(|l| !l.left_out(&self.elements)),
         }
     }
 
@@ -193,6 +205,14 @@ impl Draft {
         }
         let title = self.elements.legend_title.trim();
         ((!title.is_empty()).then_some(title), self.elements.legend_columns)
+    }
+
+    /// The names of the layers ticked out of a legend drawn, as the map now spells them.
+    fn legend_exclude(&self, s: &Session) -> Vec<String> {
+        if !self.elements.legend {
+            return Vec::new();
+        }
+        listed(s).into_iter().filter(|l| l.left_out(&self.elements)).map(|l| l.name.to_string()).collect()
     }
 
     /// What Create sends: [`Draft::params`] and the elements step's answers, a choice left to the
@@ -221,10 +241,12 @@ impl Draft {
             object([("units", units.map(|u| u.code().into())), ("style", style.map(|v| v.code().into()))])
         };
         let (title, columns) = self.legend_look(s);
+        let exclude = self.legend_exclude(s);
         let legend = if !e.legend {
             Some("none".into())
         } else {
-            object([("title", title.map(Value::from)), ("columns", columns.map(Value::from))])
+            let exclude = (!exclude.is_empty()).then(|| exclude.into());
+            object([("title", title.map(Value::from)), ("columns", columns.map(Value::from)), ("exclude", exclude)])
         };
         for (key, value) in [
             ("locator", locator.map(Value::from)),
@@ -251,12 +273,42 @@ fn object<const N: usize>(options: [(&str, Option<Value>); N]) -> Option<Value> 
     (!given.is_empty()).then(|| given.into())
 }
 
-/// Whether the active map has a layer a legend can give rows to: one it shows and can list, or a
-/// web layer it lists by its picture. The sheet's scale and context layers, which can still leave
-/// the legend empty, are known only to the command.
-fn legend_lists_rows(s: &Session) -> bool {
+/// A name the legend lists, and every layer under it, any case: the command leaves out by name.
+struct Listed<'a> {
+    name: &'a str,
+    layers: Vec<ExcludedLayer>,
+}
+
+impl Listed<'_> {
+    fn left_out(&self, e: &Elements) -> bool {
+        self.layers.iter().any(|l| e.legend_exclude.contains(l))
+    }
+}
+
+/// What a legend of the active map can give rows to, top first: the layers it shows and can list,
+/// and the web layers it lists by their picture. The sheet's scale and context layers, which can
+/// still leave the legend empty, are known only to the command.
+fn listed(s: &Session) -> Vec<Listed<'_>> {
     let map = s.map();
-    map.layers.iter().any(|l| map.shows(l) && legend_lists(l)) || map.tiles.iter().any(tile_listed)
+    let mut out: Vec<Listed> = Vec::new();
+    let mut at = std::collections::HashMap::new();
+    for item in map.stack() {
+        let found = match item {
+            Drawn::Layer(i) => map
+                .layers
+                .get(i)
+                .filter(|l| map.shows(l) && legend_lists(l))
+                .map(|l| (l.name.as_str(), ExcludedLayer::Layer(l.instance_id()))),
+            Drawn::Tile(i) => map.tiles.get(i).filter(|t| tile_listed(t)).map(|t| (t.name.as_str(), ExcludedLayer::Web(t.name.clone()))),
+        };
+        let Some((name, layer)) = found else { continue };
+        let i = *at.entry(name.to_ascii_lowercase()).or_insert_with(|| {
+            out.push(Listed { name, layers: Vec::new() });
+            out.len() - 1
+        });
+        out[i].layers.push(layer);
+    }
+    out
 }
 
 /// Why the colorbar's box is off: [`colorbar_layer`] also gives a raster whose pixels, and so
@@ -270,7 +322,7 @@ fn colorbar_off_reason(s: &Session) -> &'static str {
 }
 
 /// The parts there are, on one line.
-fn joined(parts: [Option<&str>; 2]) -> String {
+fn joined<const N: usize>(parts: [Option<&str>; N]) -> String {
     parts.into_iter().flatten().collect::<Vec<_>>().join(" · ")
 }
 
@@ -302,7 +354,9 @@ pub(super) fn elements_value(s: &Session, d: &Draft) -> String {
     let (title, columns) = d.legend_look(s);
     let title = title.map(|t| i18n::fmt_raw("“{title}”", &[("title", t)]));
     let columns = columns.map(|n| i18n::fmt_raw("Columns: {count}", &[("count", &n.to_string())]));
-    let legend = looked(tl_raw!("Legend"), joined([title.as_deref(), columns.as_deref()]));
+    let exclude = d.legend_exclude(s);
+    let exclude = (!exclude.is_empty()).then(|| i18n::fmt_raw("Left out: {layers}", &[("layers", &exclude.join(", "))]));
+    let legend = looked(tl_raw!("Legend"), joined([title.as_deref(), columns.as_deref(), exclude.as_deref()]));
     let (units, style) = d.scale_look(s);
     let scale = joined([units.map(|u| tl_raw!(u.label())), style.map(|v| tl_raw!(v.label()))]);
     let scale = looked(tl_raw!("Scale bar"), scale);
@@ -363,6 +417,7 @@ pub(super) fn elements_step(ui: &mut egui::Ui, s: &Session, d: &mut Draft) {
             ui.label(egui::RichText::new(own_note).small().weak());
         }
         legend_look_rows(ui, s, d);
+        legend_exclude_rows(ui, s, d);
     });
     let usable = d.usable(Control::Colorbar, s);
     let why = colorbar_off_reason(s);
@@ -426,7 +481,13 @@ fn pick_list<T: Copy + PartialEq>(
 /// The legend's title and columns.
 fn legend_look_rows(ui: &mut egui::Ui, s: &Session, d: &mut Draft) {
     let usable = d.usable(Control::LegendLook, s);
-    let why = if d.elements.legend { tl!("The map has no layer the legend lists.") } else { tl!("There is no legend to title or split.") };
+    let why = if !d.elements.legend {
+        tl!("There is no legend to title or split.")
+    } else if listed(s).is_empty() {
+        tl!("The map has no layer the legend lists.")
+    } else {
+        tl!("Every layer is left out of the legend.")
+    };
     ui.horizontal_wrapped(|ui| {
         let caption = ui.label(tl!("Title"));
         let edit = egui::TextEdit::singleline(&mut d.elements.legend_title).char_limit(MAX_LEGEND_TITLE).desired_width(field_width(ui));
@@ -451,6 +512,26 @@ fn legend_look_rows(ui: &mut egui::Ui, s: &Session, d: &mut Draft) {
     });
     if d.elements.legend && !usable {
         ui.label(egui::RichText::new(why).small().weak());
+    }
+}
+
+/// A box per name the legend lists, ticked to leave its layers out.
+fn legend_exclude_rows(ui: &mut egui::Ui, s: &Session, d: &mut Draft) {
+    let listed = listed(s);
+    if listed.is_empty() {
+        return;
+    }
+    ui.label(tl!("Leave out of the legend"));
+    for l in listed {
+        let mut out = l.left_out(&d.elements);
+        let why = tl!("There is no legend to leave it out of.");
+        let tick = egui::Checkbox::new(&mut out, l.name);
+        if ui.add_enabled(d.elements.legend, tick).on_disabled_hover_text(why).changed() {
+            d.elements.legend_exclude.retain(|k| !l.layers.contains(k));
+            if out {
+                d.elements.legend_exclude.extend(l.layers);
+            }
+        }
     }
 }
 
@@ -732,6 +813,9 @@ mod tests {
     }
 
     fn choose(h: &mut Wizard, caption: &str, nth: usize, value: &str) {
+        // The step scrolls: a list below the window is brought into view first.
+        combo(h, caption, nth).scroll_to_me();
+        h.run_steps(4);
         combo(h, caption, nth).click();
         h.run_steps(4);
         h.get_by_label(value).click();
@@ -846,6 +930,193 @@ mod tests {
         app.session.map_mut().add_raster("Heights", RasterLayer::from_path(r, "dem.tif"));
     }
 
+    /// The sample map's layers replaced by copies of its first, one per name, top first.
+    fn named(app: &mut RustGisApp, names: &[&str]) {
+        let map = app.session.map_mut();
+        let first = map.layers[0].clone();
+        map.layers.clear();
+        for name in names.iter().rev() {
+            let mut l = first.clone();
+            l.name = name.to_string();
+            map.add_layer(l);
+        }
+    }
+
+    /// A web layer with a legend picture.
+    fn web(app: &mut RustGisApp, name: &str) {
+        let mut tile = TileLayer::new(name, TileKind::Raster, "https://tiles.invalid/{z}/{x}/{y}.png");
+        tile.legends = vec![Legend { url: "https://tiles.invalid/legend.png".into(), ..Default::default() }];
+        app.session.map_mut().tiles.push(tile);
+    }
+
+    fn out_of(app: &RustGisApp, names: &[&str]) -> Vec<ExcludedLayer> {
+        let map = app.session.map();
+        let key = |name: &&str| match map.layers.iter().find(|l| l.name == *name) {
+            Some(l) => ExcludedLayer::Layer(l.instance_id()),
+            None => ExcludedLayer::Web(name.to_string()),
+        };
+        names.iter().map(key).collect()
+    }
+
+    /// The layers ticked are sent by name, with the legend's other answers.
+    #[test]
+    fn the_layers_ticked_are_left_out() {
+        let mut app = app();
+        named(&mut app, &["Cities", "Roads"]);
+        web(&mut app, "Parcels");
+        for size in ["a4", "figure-1col"] {
+            let mut d = Draft::new(&app.session);
+            d.size = size.into();
+            d.elements.legend_exclude = out_of(&app, &["Cities", "Parcels"]);
+            assert_eq!(added(&app.session, &d), json!({"legend": {"exclude": ["Cities", "Parcels"]}}), "{size}");
+            d.elements.legend_title = "Key".into();
+            let want = json!({"legend": {"title": "Key", "exclude": ["Cities", "Parcels"]}});
+            assert_eq!(added(&app.session, &d), want, "{size}");
+        }
+    }
+
+    /// The list is what the legend can list: not a hidden layer, a graphics layer or a raster on
+    /// a ramp, ticked or not.
+    #[test]
+    fn only_what_the_legend_lists_is_offered() {
+        let prepare = |app: &mut RustGisApp| {
+            named(app, &["Cities", "Hidden", "Drawings"]);
+            raster(app);
+            for l in &mut app.session.map_mut().layers {
+                l.visible = l.name != "Hidden";
+                l.graphics = l.name == "Drawings";
+            }
+            web(app, "Parcels");
+            let out = out_of(app, &["Hidden", "Drawings", "Heights"]);
+            app.dialogs.publication.as_mut().unwrap().elements.legend_exclude = out;
+        };
+        let h = step_of(prepare);
+        assert_eq!(added(&h.state().session, draft(&h)), json!({}));
+        for label in ["Cities", "Parcels"] {
+            assert!(h.query_by_role_and_label(Role::CheckBox, label).is_some(), "{label}");
+        }
+        for label in ["Hidden", "Drawings", "Heights"] {
+            assert!(h.query_by_role_and_label(Role::CheckBox, label).is_none(), "{label}");
+        }
+    }
+
+    /// Names the same but for their case share one box, as the command leaves out by name.
+    #[test]
+    fn one_box_leaves_out_every_layer_of_a_name() {
+        let mut h = step_of(|app| named(app, &["Cities", "cities", "Roads"]));
+        assert!(h.query_by_role_and_label(Role::CheckBox, "cities").is_none(), "one box");
+        click_box(&mut h, "Cities");
+        assert_eq!(added(&h.state().session, draft(&h)), json!({"legend": {"exclude": ["Cities"]}}));
+        // The first renamed, the other is still left out, under its own name.
+        h.state_mut().session.map_mut().layers[0].name = "Towns".into();
+        h.run_steps(4);
+        assert_eq!(added(&h.state().session, draft(&h)), json!({"legend": {"exclude": ["Towns", "cities"]}}));
+        click_box(&mut h, "Towns");
+        click_box(&mut h, "cities");
+        assert!(draft(&h).elements.legend_exclude.is_empty(), "unticked");
+    }
+
+    /// A layer renamed, removed or on a map left while the wizard is open is followed.
+    #[test]
+    fn the_layers_left_out_are_followed() {
+        let mut app = app();
+        named(&mut app, &["Cities", "Roads"]);
+        let mut d = Draft::new(&app.session);
+        d.elements.legend_exclude = out_of(&app, &["Cities"]);
+        app.session.map_mut().layers[0].name = "Towns".into();
+        assert_eq!(added(&app.session, &d), json!({"legend": {"exclude": ["Towns"]}}), "renamed");
+        let removed = app.session.map_mut().layers.remove(0);
+        assert_eq!(added(&app.session, &d), json!({}), "removed");
+        app.session.map_mut().layers.insert(0, removed);
+        assert_eq!(added(&app.session, &d), json!({"legend": {"exclude": ["Towns"]}}), "back");
+        app.run("map.new", json!({"name": "Other"})).unwrap();
+        assert_eq!(added(&app.session, &d), json!({}), "another map");
+    }
+
+    /// A web layer is ticked by its name: renamed, it is offered unticked, and the tick counts
+    /// again under the old name.
+    #[test]
+    fn a_web_layer_left_out_is_followed_by_its_name() {
+        let mut app = app();
+        web(&mut app, "Parcels");
+        let mut d = Draft::new(&app.session);
+        d.elements.legend_exclude = out_of(&app, &["Parcels"]);
+        app.session.map_mut().tiles.last_mut().unwrap().name = "Lots".into();
+        assert_eq!(added(&app.session, &d), json!({}), "renamed");
+        app.session.map_mut().tiles.last_mut().unwrap().name = "Parcels".into();
+        assert_eq!(added(&app.session, &d), json!({"legend": {"exclude": ["Parcels"]}}), "its name again");
+    }
+
+    /// With no legend the list is off and nothing is sent; the ticks are kept.
+    #[test]
+    fn without_a_legend_nothing_is_left_out() {
+        let h = step_of(|app| {
+            named(app, &["Cities"]);
+            let out = out_of(app, &["Cities"]);
+            let e = &mut app.dialogs.publication.as_mut().unwrap().elements;
+            (e.legend, e.legend_exclude) = (false, out);
+        });
+        assert!(off(&h, "Cities"));
+        assert_eq!(added(&h.state().session, draft(&h)), json!({"legend": "none"}));
+        assert_eq!(draft(&h).elements.legend_exclude.len(), 1, "kept");
+    }
+
+    /// With every layer left out the legend has no title or columns, and says why.
+    #[test]
+    fn with_every_layer_left_out_the_legend_has_no_look() {
+        let h = step_of(|app| {
+            named(app, &["Cities"]);
+            let out = out_of(app, &["Cities"]);
+            let e = &mut app.dialogs.publication.as_mut().unwrap().elements;
+            (e.legend_title, e.legend_columns, e.legend_exclude) = ("Key".into(), Some(2), out);
+        });
+        assert_eq!(added(&h.state().session, draft(&h)), json!({"legend": {"exclude": ["Cities"]}}));
+        assert!(combo(&h, "Columns", 0).accesskit_node().is_disabled());
+        assert!(h.query_by_label_contains("Every layer is left out").is_some(), "said");
+        assert!(!off(&h, "Cities"), "the way back");
+    }
+
+    /// With nothing to list there is no box to tick, and the step says so once.
+    #[test]
+    fn with_nothing_to_list_no_layer_is_offered() {
+        let h = step_of(|app| named(app, &[]));
+        assert!(h.query_by_label_contains("Leave out of the legend").is_none());
+        assert_eq!(h.query_all_by_label_contains("no layer the legend lists").count(), 1);
+    }
+
+    /// The review names the layers left out, each once.
+    #[test]
+    fn the_review_names_the_layers_left_out() {
+        let h = step_of(|app| {
+            named(app, &["Cities", "cities", "Roads", "Rivers"]);
+            let out = out_of(app, &["Cities", "Rivers"]);
+            let d = app.dialogs.publication.as_mut().unwrap();
+            (d.step, d.elements.legend_exclude) = (Step::Review, out);
+        });
+        let want = "Locator: Default (globe)\nNorth arrow: Auto (none from 20°)\n\
+                    Legend: Left out: Cities, Rivers\nScale bar\nDecimal point";
+        assert!(h.query_by_label(want).is_some());
+    }
+
+    /// Create makes the legend without the layers left out; Undo takes the layout away.
+    #[test]
+    fn create_leaves_the_layers_out_of_the_legend() {
+        let mut app = app();
+        named(&mut app, &["Cities", "Roads"]);
+        open(&mut app);
+        let out = out_of(&app, &["Cities"]);
+        let d = app.dialogs.publication.as_mut().unwrap();
+        (d.step, d.elements.legend_exclude) = (Step::Review, out);
+        let before = app.session.project.layouts.len();
+        let mut h = harness(app);
+        click(&mut h, "Create");
+        let l = h.state().session.project.layouts.last().unwrap();
+        let left_out = |k: &ElementKind| matches!(k, ElementKind::Legend { exclude, .. } if exclude == &["Cities"]);
+        assert!(l.elements.iter().any(|e| left_out(&e.kind)));
+        h.state_mut().run("edit.undo", Value::Null).unwrap();
+        assert_eq!(h.state().session.project.layouts.len(), before);
+    }
+
     /// The default locator is named as what it will be.
     #[test]
     fn the_default_locator_says_what_it_draws() {
@@ -925,6 +1196,14 @@ mod tests {
             let rect = combo(&h, caption, nth).rect();
             assert!(rect.left() >= 0.0 && rect.right() <= 320.0, "{caption} {nth} at {rect:?}");
         }
+        let long = "Municipal boundaries of the northern provinces, revised after the 2026 census";
+        let mut app = super::super::harness::app();
+        named(&mut app, &[long]);
+        open(&mut app);
+        app.dialogs.publication.as_mut().unwrap().step = Step::Elements;
+        let h = harness_sized(app, egui::vec2(320.0, 900.0));
+        let rect = ticked_box(&h, long).rect();
+        assert!(rect.left() >= 0.0 && rect.right() <= 320.0, "a long name at {rect:?}");
     }
 
     /// The review lists what is on, on a sheet and on a figure.

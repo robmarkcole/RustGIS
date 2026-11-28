@@ -60,7 +60,8 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
     can be set always on a box and to list the context layers, the colorbar and the scale bar or
     not, whether the map may be veiled for the legend's room, and the decimal mark; a choice the
     sheet can't use is off and isn't sent. Under them, the north arrow's style, the scale bar's
-    units and style, and the legend's title and columns (Auto, or 1 to 6) can be picked. The
+    units and style, and the legend's title and columns (Auto, or 1 to 6) can be picked, and
+    layers ticked to be left out of the legend (every layer of that name). The
     **placement** is the arrangement (below): `best`, the favourite, one by name or one saved, or
     **Custom**, a corner for each surround (a corner another has swaps the two; on Panel, Editorial
     and Modular only the north arrow and scale bar take one, the locator and legend sitting in the

@@ -665,3 +665,25 @@ fn only_modular_and_poster_put_their_surrounds_on_cards() {
     assert_eq!(cards, ["modular", "poster"]);
     assert!(!publication_style_cards("unknown"));
 }
+
+/// A name is found as it is spelled first, so one with edge spaces is left out, not the layer of
+/// the trimmed name (#3234); a name no layer spells that way is still trimmed.
+#[test]
+fn a_legend_name_is_found_as_spelled_before_it_is_trimmed() {
+    let mut s = world();
+    let name = s.map().layers[0].name.clone();
+    let mut padded = s.map().layers[0].clone();
+    padded.name = format!(" {name} ");
+    s.map_mut().add_layer(padded);
+    s.map_mut().tiles.push(rustgis_map::TileLayer::new(" Parcels", rustgis_map::TileKind::Raster, "https://tiles.invalid/{z}/{x}/{y}.png"));
+    let excluded = |s: &mut Session, asked: Value| {
+        publish(s, json!({"contextInLegend": true, "legend": {"exclude": asked}})).unwrap();
+        match &s.project.layouts.last().unwrap().elements.iter().find(|e| e.name == "Legend").unwrap().kind {
+            ElementKind::Legend { exclude, .. } => exclude.clone(),
+            k => panic!("{k:?}"),
+        }
+    };
+    assert_eq!(excluded(&mut s, json!([format!(" {name} "), " Parcels"])), [format!(" {name} "), " Parcels".to_string()]);
+    assert_eq!(excluded(&mut s, json!([format!("  {name}  ")])), std::slice::from_ref(&name));
+    assert_eq!(excluded(&mut s, json!([name.to_uppercase()])), [name]);
+}
