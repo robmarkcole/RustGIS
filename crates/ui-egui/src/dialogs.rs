@@ -4926,16 +4926,22 @@ mod tests {
         app.dialogs.layer = "Countries".into();
         let mut h = app_harness(app);
         h.run_steps(3);
+        // Process each input even while the background match count requests repaints.
         h.ctx.memory_mut(|m| m.request_focus(egui::Id::unique("sba_where")));
-        h.run();
+        h.step();
         h.event(egui::Event::Text("continent".into()));
-        h.run();
+        h.step();
         h.event(egui::Event::Text(" = ".into()));
-        h.run();
+        h.step();
         h.get_by_role_and_label(Role::Button, "Values ▾").click();
-        h.run();
+        for _ in 0..10 {
+            h.step();
+            if h.query_by_role_and_label(Role::Button, "'Asia'").is_some() {
+                break;
+            }
+        }
         h.get_by_role_and_label(Role::Button, "'Asia'").click();
-        h.run();
+        h.step();
         assert_eq!(h.state().dialogs.text, "continent = 'Asia' ", "the operator typed, only the value added");
     }
 
