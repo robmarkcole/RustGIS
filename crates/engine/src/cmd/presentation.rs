@@ -633,24 +633,33 @@ fn page_map<'a>(input: &'a impl super::InputSource, name: &str) -> &'a rustgis_m
     s.project.maps.iter().find(|m| m.name.eq_ignore_ascii_case(name)).unwrap_or_else(|| s.map())
 }
 
-/// Most map names, presentations and page numbers [`say_pages_without_their_map`] lists: an
+/// Most map names, presentations and page numbers [`pages_without_their_map`] lists: an
 /// imported file may hold hundreds of pages, each naming another map.
 const MISSING_MAPS_NAMED: usize = 3;
 const PRESENTATIONS_LISTED: usize = 3;
 const PAGES_LISTED: usize = 5;
 
-/// The map pages [`say_pages_without_their_map`] looks at.
+/// The map pages [`pages_without_their_map`] looks at.
 pub(crate) enum PagesOf<'a> {
+    /// Every one: the project has just been opened.
+    All,
     /// Those naming this map, in every presentation: it has just gone.
     Map(&'a str),
     /// Those of the presentation at this index, whatever they name: it has just come in.
     Presentation(usize),
 }
 
-/// Says, once, which of the map pages `which` name a map the project doesn't have, which
+/// Says [`pages_without_their_map`], if there is anything to say.
+pub(crate) fn say_pages_without_their_map(s: &mut Session, which: PagesOf<'_>) {
+    if let Some(notice) = pages_without_their_map(&s.project, which) {
+        s.notify_text(notice, false);
+    }
+}
+
+/// One notice of which of the map pages `which` name a map the project doesn't have, which
 /// [`page_map`] draws over the active map (#3047). Pages are numbered from 1, as the Presentation
 /// pane shows them. The pages keep the name.
-pub(crate) fn say_pages_without_their_map(s: &mut Session, which: PagesOf<'_>) {
+pub(crate) fn pages_without_their_map(project: &crate::Project, which: PagesOf<'_>) -> Option<crate::notice_text::NoticeText> {
     use crate::notice_text::NoticeText;
 
     /// A presentation listed: where it is, its name, its first pages and how many it has.
@@ -663,14 +672,15 @@ pub(crate) fn say_pages_without_their_map(s: &mut Session, which: PagesOf<'_>) {
 
     let (mut pages, mut places) = (0usize, Vec::<Place<'_>>::new());
     let (mut named, mut more_maps, mut more_places) = (Vec::<&str>::new(), false, false);
-    for (i, pres) in s.project.presentations.iter().enumerate() {
+    for (i, pres) in project.presentations.iter().enumerate() {
         for (k, page) in pres.pages.iter().enumerate() {
             let PageKind::Map { map, .. } = &page.kind else { continue };
             let looked_at = match which {
+                PagesOf::All => true,
                 PagesOf::Map(gone) => map.eq_ignore_ascii_case(gone),
                 PagesOf::Presentation(own) => i == own,
             };
-            if !looked_at || s.project.maps.iter().any(|m| m.name.eq_ignore_ascii_case(map)) {
+            if !looked_at || project.maps.iter().any(|m| m.name.eq_ignore_ascii_case(map)) {
                 continue;
             }
             pages += 1;
@@ -704,9 +714,7 @@ pub(crate) fn say_pages_without_their_map(s: &mut Session, which: PagesOf<'_>) {
         }
         NoticeText::format(key, [("name", place.name.to_string().into()), ("numbers", numbers.into())])
     });
-    let Some(mut places) = listed.reduce(|first, next| NoticeText::format("{first}; {next}", [("first", first), ("next", next)])) else {
-        return;
-    };
+    let mut places = listed.reduce(|first, next| NoticeText::format("{first}; {next}", [("first", first), ("next", next)]))?;
     if more_places {
         places = NoticeText::format("{first}; {next}", [("first", places), ("next", "…".to_string().into())]);
     }
@@ -725,8 +733,7 @@ pub(crate) fn say_pages_without_their_map(s: &mut Session, which: PagesOf<'_>) {
     if more_maps {
         names.push_str(", …");
     }
-    let notice = NoticeText::format(key, [("count", pages.to_string().into()), ("names", names.into()), ("places", places)]);
-    s.notify_text(notice, false);
+    Some(NoticeText::format(key, [("count", pages.to_string().into()), ("names", names.into()), ("places", places)]))
 }
 
 /// Binds the map whose current view initializes the page.

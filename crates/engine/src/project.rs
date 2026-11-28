@@ -1539,9 +1539,14 @@ impl Project {
     /// those `map.addTiles` adds) as raster layers read in place: as the project opens only. A
     /// later repair (a layer file added, maps imported) leaves a tile layer added this session
     /// as it is. Returns a notice for each kind of change that removed, cut or renamed
-    /// something, with the part of the project it is about.
+    /// something, and one for the presentation pages whose map the project doesn't have, each
+    /// with the part of the project it is about.
     pub(crate) fn normalize_opened(&mut self) -> Vec<(ReadPart, NoticeText)> {
-        self.repair(true, "while opening the project")
+        let mut notices = self.repair(true, "while opening the project");
+        // Pages naming a map the project doesn't have are drawn over the active map (#3191).
+        use crate::cmd::presentation::{PagesOf, pages_without_their_map};
+        notices.extend(pages_without_their_map(self, PagesOf::All).map(|notice| (ReadPart::Items, notice)));
+        notices
     }
 
     /// Reports removed or shortened content, renamed items and repaired group display settings

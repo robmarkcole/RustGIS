@@ -1,5 +1,6 @@
 //! A presentation map page whose map the project doesn't have is drawn over the active map:
-//! deleting the map, or importing such a presentation, says which pages (#3047). All keep the name.
+//! deleting the map, importing such a presentation (#3047) or opening a project that has such pages
+//! (#3191) says which pages. All keep the name.
 
 use super::*;
 use rustgis_map::presentation::{Page, PageKind, Presentation};
@@ -209,4 +210,99 @@ fn pages_past_three_presentations_are_counted_and_not_listed() {
             "8 map pages show 'Other', which the project doesn't have, so they are drawn over the active map until a map of that name comes back: presentation 'Tour', pages 2, 3, 4, 5, 6; presentation 'Second', page 2; presentation 'Third', page 2; …"
         ]
     );
+}
+
+const GONE_ON_PAGE_2: &str = "1 map page shows 'Gone', which the project doesn't have, so it is drawn over the active map until a map of that name comes back: presentation 'Tour', page 2";
+
+/// The project of [`with_tour`] with a map page showing `map`, which no command checks any more.
+fn project_showing(map: &str) -> Session {
+    let mut s = with_tour();
+    page(&mut s, "Other");
+    let PageKind::Map { map: shown, .. } = &mut s.project.presentations[0].pages[1].kind else { panic!("a map page") };
+    *shown = map.into();
+    s
+}
+
+fn text_of(s: &Session) -> Value {
+    json!({"text": serde_json::to_string(&s.project).unwrap()})
+}
+
+/// The notices about missing page maps among those `s` holds.
+fn held(s: &Session) -> Vec<String> {
+    s.notices.iter().map(|n| n.text.clone()).filter(|t| t.contains("which the project doesn't have")).collect()
+}
+
+#[test]
+fn opening_a_project_says_the_pages_whose_map_is_missing() {
+    let text = text_of(&project_showing("Gone"));
+    let mut s = Session::new(Project::default());
+    assert_eq!(missing(&mut s, "project.openText", text), [GONE_ON_PAGE_2]);
+    let PageKind::Map { map, .. } = &s.project.presentations[0].pages[1].kind else { panic!("a map page") };
+    assert_eq!(map, "Gone");
+}
+
+#[test]
+fn opening_a_saved_file_after_deleting_the_map_says_so() {
+    let mut saved = with_tour();
+    page(&mut saved, "Other");
+    saved.run("map.remove", &json!({"name": "Other"})).unwrap();
+    let dir = std::env::temp_dir().join(format!("rustgis-pages-without-map-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("tour.rgis");
+    saved.project.save(&path).unwrap();
+    let mut s = Session::new(Project::default());
+    let said = missing(&mut s, "project.open", json!({"path": path}));
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(said, [GONE_ON_PAGE_2.replace("'Gone'", "'Other'")]);
+}
+
+#[test]
+fn a_session_started_with_such_a_project_says_so() {
+    let text = serde_json::to_string(&project_showing("Gone").project).unwrap();
+    let s = Session::new(Project::from_json(&text).unwrap());
+    assert_eq!(held(&s), [GONE_ON_PAGE_2]);
+}
+
+#[test]
+fn a_peer_opening_such_a_project_says_so() {
+    let text = serde_json::to_string(&project_showing("Gone").project).unwrap();
+    let mut s = Session::new(Project::default());
+    s.open_peer_text(crate::Peer::Embedder, &text).unwrap();
+    assert_eq!(held(&s), [GONE_ON_PAGE_2]);
+}
+
+#[test]
+fn opening_a_project_whose_pages_have_their_maps_says_nothing() {
+    let text = text_of(&project_showing("oTHER"));
+    let mut s = Session::new(Project::default());
+    assert_eq!(missing(&mut s, "project.openText", text), Vec::<String>::new());
+}
+
+#[test]
+fn opening_a_project_with_no_presentation_says_nothing() {
+    let text = text_of(&world());
+    let mut s = Session::new(Project::default());
+    assert_eq!(missing(&mut s, "project.openText", text), Vec::<String>::new());
+}
+
+#[test]
+fn opening_a_project_says_the_pages_of_two_presentations_once() {
+    let mut saved = project_showing("Gone");
+    saved.run("presentation.new", &json!({"name": "Second"})).unwrap();
+    let gone = saved.project.presentations[0].pages[1].clone();
+    saved.project.presentations[1].pages.push(gone);
+    let mut s = Session::new(Project::default());
+    assert_eq!(
+        missing(&mut s, "project.openText", text_of(&saved)),
+        [
+            "2 map pages show 'Gone', which the project doesn't have, so they are drawn over the active map until a map of that name comes back: presentation 'Tour', page 2; presentation 'Second', page 2"
+        ]
+    );
+}
+
+#[test]
+fn importing_the_maps_of_such_a_project_says_nothing_of_its_pages() {
+    let text = text_of(&project_showing("Gone"));
+    let mut s = world();
+    assert_eq!(missing(&mut s, "map.import", text), Vec::<String>::new());
 }
