@@ -13,7 +13,7 @@ pub(in crate::cmd::layout) fn restyle(kind: &ElementKind, p: &Value) -> Result<O
             if ["style", "fill", "outline"].iter().all(|k| p.get(k).is_none()) {
                 return Ok(None);
             }
-            let style = match ps(p, "style") {
+            let style = match given_name(p, "style", "classic, compass, triangle or star")? {
                 Some(v) => ArrowStyle::from_name(v)
                     .ok_or_else(|| format!("unknown north arrow style '{v}' (classic, compass, triangle or star)"))?,
                 None => *style,
@@ -44,22 +44,20 @@ pub(in crate::cmd::layout) fn restyle(kind: &ElementKind, p: &Value) -> Result<O
             if SCALE_BAR_LOOK_KEYS.iter().chain(SCALE_BAR_KEYS.iter()).all(|k| p.get(k).is_none()) {
                 return Ok(None);
             }
-            let style = match ps(p, "style") {
+            let style = match given_name(p, "style", "alternating, stepped or line")? {
                 Some(v) => {
                     ScaleBarStyle::from_name(v).ok_or_else(|| format!("unknown scale bar style '{v}' (alternating, stepped or line)"))?
                 }
                 None => *style,
             };
-            let units = match ps(p, "units") {
+            let units = match given_name(p, "units", "auto, kilometers, meters, miles or feet")? {
                 Some(v) => {
                     ScaleUnits::from_name(v).ok_or_else(|| format!("unknown units '{v}' (auto, kilometers, meters, miles or feet)"))?
                 }
                 None => *units,
             };
-            let divisions = match p.get("divisions") {
-                Some(_) => f(p, "divisions").ok_or("divisions is a number")?.round().clamp(1.0, MAX_SCALE_DIVISIONS as f64) as usize,
-                None => *divisions,
-            };
+            let divisions =
+                given_num(p, "divisions", "a number")?.map_or(*divisions, |n| n.round().clamp(1.0, MAX_SCALE_DIVISIONS as f64) as usize);
             let (color, fill) = (color(p, "color", *c)?, color(p, "fill", *fill)?);
             let text_size = text_size_param(p, "textSize", SCALE_BAR_TEXT_PT)?.unwrap_or(*text_size);
             // Its details, each read before any is set: one part is the division whole.

@@ -64,7 +64,7 @@ pub(in crate::cmd::layout) fn grid_params(p: &Value, base: Grid) -> Result<Grid,
     let mut g = base;
     // A graticule or a measured grid; a change of type without a step picks one, as degrees and
     // metres don't carry over.
-    if let Some(v) = ps(p, "type") {
+    if let Some(v) = given_name(p, "type", "graticule or measured")? {
         let kind = GridKind::from_name(v).ok_or_else(|| format!("unknown grid type '{v}' (graticule or measured)"))?;
         if kind != g.kind {
             g.kind = kind;
@@ -116,7 +116,7 @@ pub(in crate::cmd::layout) fn grid_params(p: &Value, base: Grid) -> Result<Grid,
             rustgis_map::graticule::short_crs(c)
         ));
     }
-    if let Some(v) = f(p, "step") {
+    if let Some(v) = given_num(p, "step", "a number of degrees or metres")? {
         g.step = match g.kind {
             GridKind::Graticule => v.clamp(0.0, rustgis_map::layout::MAX_GRATICULE_STEP),
             // (0 picks one; a step below a metre is a metre.)
@@ -128,16 +128,16 @@ pub(in crate::cmd::layout) fn grid_params(p: &Value, base: Grid) -> Result<Grid,
     if let Some(v) = b(p, "labels") {
         g.labels = v;
     }
-    if let Some(v) = ps(p, "style") {
+    if let Some(v) = given_name(p, "style", "lines, ticks or linesAndTicks")? {
         g.style = GridStyle::from_name(v).ok_or_else(|| format!("unknown grid style '{v}' (lines, ticks or linesAndTicks)"))?;
     }
-    if let Some(v) = f(p, "tickLength") {
+    if let Some(v) = given_num(p, "tickLength", "a number of mm")? {
         g.tick_length = v.clamp(0.0, MAX_TICK_MM);
     }
-    if let Some(v) = f(p, "width") {
+    if let Some(v) = given_num(p, "width", "a number of points")? {
         g.width = v.clamp(0.0, MAX_GRID_WIDTH);
     }
-    if let Some(v) = ps(p, "format") {
+    if let Some(v) = given_name(p, "format", "decimal or dms")? {
         g.format = CoordFormat::from_name(v).ok_or_else(|| format!("unknown format '{v}' (decimal or dms)"))?;
     }
     if let Some(v) = b(p, "hemisphere") {

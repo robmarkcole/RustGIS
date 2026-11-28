@@ -680,7 +680,7 @@ pub(in crate::cmd::layout) fn orientation(p: &Value) -> Result<Option<Orientatio
 }
 
 pub(in crate::cmd::layout) fn orientation_of(p: &Value, key: &str) -> Result<Option<Orientation>, String> {
-    match ps(p, key).map(|o| o.trim().to_ascii_lowercase()) {
+    match given_name(p, key, "horizontal or vertical")?.map(|o| o.trim().to_ascii_lowercase()) {
         None => Ok(None),
         Some(o) if o == "horizontal" => Ok(Some(Orientation::Horizontal)),
         Some(o) if o == "vertical" => Ok(Some(Orientation::Vertical)),

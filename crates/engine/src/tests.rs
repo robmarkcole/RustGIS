@@ -114,6 +114,9 @@ mod layout_edge;
 #[path = "tests/layout_publication_parts.rs"]
 mod layout_publication_parts;
 
+#[path = "tests/layout_typed_values.rs"]
+mod layout_typed_values;
+
 #[path = "tests/sde_connections.rs"]
 mod sde_connections;
 
