@@ -5623,6 +5623,13 @@ fn render_frame(
                 let collected = match keeping.as_ref().and_then(|(look, made)| layer_meshes::take(&mut cmds, look, made, &rows)) {
                     Some(used) => Ok(used),
                     None => {
+                        // Panned since, the tiles still in the scene are taken as they were made.
+                        let kept_tiles = match &keeping {
+                            Some((look, made)) if mesh_tiled.is_some() => layer_meshes::tiles(look, made, &rows),
+                            _ => std::sync::Arc::from(Vec::new()),
+                        };
+                        let mut made_tiles = Vec::new();
+                        let tiling = mesh_tiled.map(|area| mesh_tiles::Tiling { area, kept: &kept_tiles, made: &mut made_tiles });
                         let collected = mesh::collect_layer(
                             &mut cmds,
                             layer,
@@ -5630,7 +5637,7 @@ fn render_frame(
                             extents,
                             &rows,
                             &mesh_visible,
-                            mesh_tiled,
+                            tiling,
                             ctx.wireframe,
                             ctx.ppp,
                             map_per_px,
@@ -5638,7 +5645,7 @@ fn render_frame(
                         );
                         if let (Ok(used), Some((look, made))) = (collected, keeping) {
                             let kept = cmds.get(before..).unwrap_or_default();
-                            layer_meshes::keep(layer.instance_id(), look, made, &rows, kept, used, layer.selection.len());
+                            layer_meshes::keep(layer.instance_id(), look, made, &rows, kept, made_tiles, used, layer.selection.len());
                         }
                         collected
                     }

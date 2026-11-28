@@ -17,6 +17,7 @@ use rustgis_geom::{Coord, Extent};
 use rustgis_map::{Layer, Marker, Rgba, Symbol};
 
 use crate::gpu_scene::{DrawCmd, MeshVertex, PointInstance, f32_holds};
+use crate::mesh_tiles::Tiling;
 use crate::{GPU_CULL_MARGIN, SELECTION};
 
 /// Why a mesh wasn't made; the caller falls the layer (or the outline) back to the CPU path.
@@ -463,11 +464,13 @@ fn stroke_reach(g: &Geometry, s: &Symbol, wireframe: bool, ppp: f32, map_per_px:
 /// Collects one GPU-eligible layer, or one streamed batch of it, into Mesh/Points commands.
 /// `geoms`, `extents`, `rows` and `visible` are the render loop's own (geometries as the CPU
 /// draws them, their cached extents, row filter, extent cull), so the GPU draws exactly the
-/// features the CPU would. Its lines and polygons are cut into the tiles of `area` (the scene's
-/// cull, [`crate::mesh_tiles`]), meshed on several threads, or made one mesh when `area` is
-/// `None` (a tilted view, whose far strokes are wider than a tile's reach); its markers follow
-/// them as one command. `limit` is what is left of the layer's [`MAX_LAYER_VERTICES`] (its earlier batches
-/// took the rest). `Ok` with the mesh vertices pushed; `Err(Refused)` when lyon refused a
+/// features the CPU would. Its lines and polygons are cut into the tiles of the scene's cull
+/// ([`Tiling`], [`crate::mesh_tiles`]), those kept from an earlier scene taken as they are and
+/// the rest meshed on several threads, or made one mesh when `tiling` is `None` (a tilted view,
+/// whose far strokes are wider than a tile's reach); its markers follow them as one command.
+/// Tiled, its lines and polygons are those within a tile of the cull's tiles
+/// ([`crate::mesh_tiles::feature_area`]), which may be more than `visible` keeps, out of view. `limit` is what is left of the layer's
+/// [`MAX_LAYER_VERTICES`] (its earlier batches took the rest). `Ok` with the mesh vertices pushed; `Err(Refused)` when lyon refused a
 /// feature, `Err(TooDense)` when the mesh would pass `limit`, `Err(Imprecise)` when the
 /// features reach too far for f32 at this zoom — the caller then draws the layer (or batch)
 /// with tiny-skia instead (nothing is pushed part-way).
@@ -478,7 +481,7 @@ pub(crate) fn collect_layer(
     extents: &[Extent],
     rows: &[bool],
     visible: &dyn Fn(&Extent) -> bool,
-    area: Option<&Extent>,
+    tiling: Option<Tiling<'_>>,
     wireframe: bool,
     ppp: f32,
     map_per_px: f64,
@@ -492,17 +495,28 @@ pub(crate) fn collect_layer(
     let mut estimate = 0usize;
     let mut features = Vec::new();
     let mut markers = Vec::new();
+    // Tiled, a tile's mesh takes every feature reaching it, wherever the cull's edge lies, so a
+    // kept tile is the one meshing it again makes: lines and polygons are kept by the tiles' area
+    // (a tile past them all round), markers by the cull.
+    let side = crate::mesh_tiles::tile_side(map_per_px);
+    let near = tiling.as_ref().and_then(|t| crate::mesh_tiles::feature_area(t.area, map_per_px));
+    let mut farthest = 0f64;
     for (row, g) in geoms.iter().enumerate() {
         let Some(g) = g else { continue };
         // Culled on the extent the CPU path culls on (the full geometry's, cached), so both
         // backends keep the same features; the globe has none cached.
         let e = extents.get(row).copied().unwrap_or_else(|| g.extent());
-        if rows.get(row) != Some(&true) || !visible(&e) {
+        let marker = matches!(g, Geometry::Point(_) | Geometry::MultiPoint(_));
+        let seen = match &near {
+            Some(near) if !marker => e.intersects(near),
+            _ => visible(&e),
+        };
+        if rows.get(row) != Some(&true) || !seen {
             continue;
         }
         ext = ext.union(&e);
         let s = layer.symbol(row);
-        if matches!(g, Geometry::Point(_) | Geometry::MultiPoint(_)) {
+        if marker {
             // A character or an image has no shape template: its layer draws on the CPU.
             if matches!(s.marker, Marker::Char(_) | Marker::Picture(_)) {
                 return Err(TessError::Refused);
@@ -512,31 +526,52 @@ pub(crate) fn collect_layer(
             continue;
         }
         let n = estimate_vertices(g, &s, wireframe);
-        estimate = estimate.saturating_add(n);
         // One mesh takes every feature whole, so a layer estimated past the limit isn't started;
         // tiles take only each feature's part in them, and keep to the limit as they're made.
-        if area.is_none() && estimate > limit {
-            return Err(TessError::TooDense);
+        if tiling.is_none() {
+            estimate = estimate.saturating_add(n);
+            if estimate > limit {
+                return Err(TessError::TooDense);
+            }
         }
         let reach = stroke_reach(g, &s, wireframe, ppp, map_per_px);
+        farthest = farthest.max(reach);
         features.push(crate::mesh_tiles::Feature { geometry: g, symbol: s, estimate: n, extent: e, reach });
     }
     if ext.is_empty() {
         return Ok(0);
     }
-    let tiled = if features.is_empty() {
-        Some(Ok((Vec::new(), 0)))
-    } else {
-        area.and_then(|area| crate::mesh_tiles::tile_meshes(&features, area, wireframe, ppp, map_per_px, limit))
+    let tiled = match tiling {
+        _ if features.is_empty() => Some(Ok((Vec::new(), 0))),
+        Some(t) => {
+            // A stroke reaching a tile or more past its feature could reach in from one left out
+            // (past `near`): its tiles aren't taken again, nor kept.
+            let keeps = side.is_some_and(|side| farthest < side);
+            let kept = if keeps { t.kept } else { &[] };
+            let made = crate::mesh_tiles::tile_meshes(&features, t.area, kept, wireframe, ppp, map_per_px, limit);
+            made.map(|made| {
+                made.map(|(tiles, used)| {
+                    let cmds = tiles.iter().filter_map(|t| t.cmd.as_ref().and_then(DrawCmd::share)).collect();
+                    if keeps {
+                        *t.made = tiles;
+                    }
+                    (cmds, used)
+                })
+            })
+        }
+        None => None,
     };
     let (meshes, used) = match tiled {
         Some(made) => made?,
         // No tiles at this scale, or too many: one mesh, its origin the centre of the drawn
         // features' extent.
         None => {
-            let origin = origin_for(&ext, map_per_px)?;
+            // Only those `visible` keeps: the ones past it were taken for the tiles.
+            let shown: Vec<&crate::mesh_tiles::Feature<'_>> = features.iter().filter(|f| visible(&f.extent)).collect();
+            let at = shown.iter().fold(marked, |e, f| e.union(&f.extent));
+            let origin = if at.is_empty() { [0.0, 0.0] } else { origin_for(&at, map_per_px)? };
             let (mut v, mut i) = (Vec::new(), Vec::new());
-            for f in &features {
+            for f in shown {
                 // The estimate is rough: a feature estimated not to fit isn't started, and
                 // `append_geometry` stops one that overflows at the first vertex past the limit.
                 if v.len().saturating_add(f.estimate) > limit {
