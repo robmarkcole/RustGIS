@@ -549,7 +549,7 @@ const MAX_EXPIRED: usize = 1024;
 /// and what the app adds of its own (`id`), don't count. Another import of the same address
 /// (other columns, another name) isn't it. A byte range of a GRIB file (`"bytes"`) comes back as
 /// the address the front end downloads, with the range marked in it
-/// ([`crate::cmd::layer::ranged_address`]).
+/// ([`crate::cmd::layer::ranged_address`]), and its rows of a box (`"bbox"`) with the box too.
 fn asked_by(asked: &Value, params: &Value) -> bool {
     let Some(o) = asked.as_object() else { return false };
     let range = match asked.get("bytes").and_then(Value::as_array).map(Vec::as_slice) {
@@ -579,8 +579,19 @@ fn asked_by(asked: &Value, params: &Value) -> bool {
         _ if passed_on(k, v) => params.get(k) == Some(v),
         _ => true,
     });
+    // The rows of a box of a range (`"bbox"` with `"bytes"`, #3055) come back with their box marked
+    // (`"window"`, as the app reads them off the frame), or as asked: the range with another box,
+    // or with none (the whole record), isn't it, nor is a box for a range asked without one.
+    let boxed = |q: &Value| {
+        q.get("window")
+            .and_then(|w| w.get("bbox"))
+            .or_else(|| q.get("bbox"))
+            .filter(|b| !b.is_null() && b.as_bool() != Some(false))
+            .cloned()
+    };
+    let boxes = range.is_none() || boxed(asked) == boxed(params);
     // ... and nothing it passes on that wasn't asked for (another import of the address).
-    given && params.as_object().is_none_or(|p| p.iter().all(|(k, v)| k == "url" || !passed_on(k, v) || o.get(k) == Some(v)))
+    given && boxes && params.as_object().is_none_or(|p| p.iter().all(|(k, v)| k == "url" || !passed_on(k, v) || o.get(k) == Some(v)))
 }
 
 impl UrlWaits {
@@ -1364,6 +1375,31 @@ mod tests {
             &json!({"url": u, "name": "rain", "anonymous": true}),
             &json!({"url": ranged, "name": "rain", "anonymous": true})
         ));
+    }
+
+    /// The rows of a box of a range (#3055) land with their box marked (`"window"`, as the app
+    /// reads them off the frame), or as asked: the range with another box, or with none, isn't
+    /// what was asked, nor are the rows of a box what a range asked without one is.
+    #[test]
+    fn the_rows_of_a_box_land_only_with_their_box() {
+        let u = "https://x.org/model.grb";
+        let bbox = json!([-51.45, -23.32, -39.46, -13.83]);
+        let asked = json!({"url": u, "bytes": [100, 199], "bbox": bbox, "name": "rain", "anonymous": true});
+        let ranged = crate::cmd::layer::ranged_address(u, (100, 199));
+        let landed = |window: Value| json!({"url": ranged, "name": "rain", "anonymous": true, "id": 3, "window": window});
+        assert!(asked_by(&asked, &landed(json!({"bbox": bbox}))));
+        assert!(!asked_by(&asked, &landed(json!({"bbox": [-50, -23, -40, -14]}))));
+        assert!(!asked_by(&asked, &json!({"url": ranged, "name": "rain", "anonymous": true, "id": 3})), "the whole record");
+        // A failure the app says with the parameters asked.
+        assert!(asked_by(&asked, &asked));
+        // "view" stays "view": the box it was is the request's own.
+        let view = json!({"url": u, "bytes": [100, 199], "bbox": "view", "anonymous": true});
+        assert!(asked_by(&view, &json!({"url": ranged, "anonymous": true, "window": {"bbox": "view"}})));
+        // A range asked without a box: its whole record lands it, the rows of a box don't.
+        let whole = json!({"url": u, "bytes": [100, 199], "name": "rain", "anonymous": true});
+        assert!(asked_by(&whole, &json!({"url": ranged, "name": "rain", "anonymous": true, "id": 3})));
+        assert!(!asked_by(&whole, &landed(json!({"bbox": bbox}))));
+        assert!(asked_by(&json!({"url": u, "bytes": [100, 199], "bbox": false}), &json!({"url": ranged})), "a false box is none");
     }
 
     fn load_test_plugin(id: &str) -> String {

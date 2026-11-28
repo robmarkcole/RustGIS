@@ -54646,8 +54646,8 @@ fn grib1_grid_message() -> Vec<u8> {
 
 /// `layer.addUrl` with `"bytes"` and `"bbox"` (#3055) asks for the record's first 4,096 octets,
 /// then for the rows of the box only, and adds the cells the box touches, saying how much it
-/// read. A record that can't be read by rows is downloaded whole and cut to the box, and said;
-/// where rows aren't read yet (a plugin's command in the app, the app's own check) it is refused.
+/// read. A record that can't be read by rows is downloaded whole and cut to the box, and said.
+/// A plugin's command leaves them to the app ([`a_plugin_commands_grib_rows_are_read_off_the_frame`]).
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn the_rows_of_a_box_of_a_grib_record_are_asked_for_alone() {
@@ -54679,11 +54679,14 @@ fn the_rows_of_a_box_of_a_grib_record_are_asked_for_alone() {
     let r = s.run("layer.addUrl", &json!({"url": url, "bytes": [0, 87], "bbox": false})).unwrap();
     assert_eq!(cells(&s, &r).4, vec![1.0, 2.0]);
     assert_eq!(count(), 4096 + 360 + 4096 + 88 + 88);
+    // Without a range too: the file is downloaded whole, never read as a window of a GeoTIFF.
+    s.run("layer.addUrl", &json!({"url": url, "bbox": false})).unwrap();
+    assert_eq!(count(), 4096 + 360 + 4096 + 88 + 88 + 4972);
     // Two messages in the range: downloaded whole after the first read, cut to the box, and said.
     let mark = s.notice_mark();
     let r = s.run("layer.addUrl", &json!({"url": url, "bytes": [0, 4971], "bbox": [9.6, 59.6, 10.4, 60.4], "name": "Two"})).unwrap();
     assert_eq!(cells(&s, &r).4, vec![1.0]);
-    assert_eq!(count(), 4096 + 360 + 4096 + 88 + 88 + 4096 + 4972);
+    assert_eq!(count(), 4096 + 360 + 4096 + 88 + 88 + 4972 + 4096 + 4972);
     let said: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
     let whole = "Two: a range that isn't one whole message of one field can't be read row by row: the whole record was downloaded (5 kB) and cut to the box";
     assert!(said.contains(&whole.to_string()), "{said:?}");
@@ -54707,16 +54710,69 @@ fn the_rows_of_a_box_of_a_grib_record_are_asked_for_alone() {
     let e = s.run("layer.addUrl", &json!({"url": url, "bytes": [88, 4971], "bbox": [10, 70, 12, 80]})).unwrap_err();
     assert!(e.contains("the box's latitudes (70° to 80°) are outside the record's grid (20.5° to 60.5°)"), "{e}");
     assert_eq!(count(), before + 4096);
-    // The app's check of a range, and a plugin's command it runs: not read by rows yet, and said.
+    // The app's check of a range takes the box: its rows are read off the frame.
     let asked = json!({"url": url, "bytes": [88, 4971], "bbox": [10.6, 56.7, 12.4, 59.3]});
-    let e = crate::cmd::layer::byte_range(&asked, &url).unwrap_err();
-    assert!(e.contains("is read on the command line for now, not in the app yet"), "{e}");
+    assert_eq!(crate::cmd::layer::byte_range(&asked, &url), Ok(Some((88, 4971))));
+    assert!(crate::cmd::layer::asks_rows(&asked));
+    assert!(!crate::cmd::layer::asks_rows(&json!({"url": url, "bytes": [88, 4971], "bbox": false})));
+}
+
+/// A plugin's command asking for the rows of a box of a GRIB record (#3055) leaves them to the
+/// app, nothing read on the frame. The app reads them on its own thread as it reads a window (the
+/// record's first 4,096 octets, then the box's rows) and adds them with the range marked on the
+/// address and the box in `"window"`: the command runs again and is answered the layer. A read
+/// stopped before it starts (Cancel) asks for nothing.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_plugin_commands_grib_rows_are_read_off_the_frame() {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    let mut file = grib1_message(1, 2);
+    file.extend(grib1_grid_message());
+    let (base, sent) = serve_ranges(file);
     let mut s = world();
-    plugin("eng-grib-rows", &["edit", "network"]);
+    plugin("eng-grib-rows-app", &["edit", "network"]);
+    // Its downloads come from this computer (a test server).
     fetch_mode(true, true);
-    let e = s.run_leaving_downloads("plugin:eng-grib-rows/f", &json!({"op": "layer.addUrl", "params": asked})).unwrap_err();
-    assert!(e.contains("is read on the command line for now, not in the app yet"), "{e}");
-    assert!(s.take_url_requests().is_empty());
+    let url = format!("{base}/run/PREC.grb");
+    let bbox = json!([10.6, 22.7, 12.4, 25.3]);
+    let p = json!({"op": "layer.addUrl", "params": {"url": url, "bytes": [88, 4971], "bbox": bbox, "name": "Rain"}});
+    s.run_leaving_downloads("plugin:eng-grib-rows-app/f", &p).unwrap();
+    assert_eq!(sent.load(Relaxed), 0, "nothing is read on the frame");
+    let asked = s.take_url_requests();
+    assert_eq!(asked.len(), 1);
+    let params = asked[0].params().clone();
+    assert_eq!((params["bytes"].clone(), params["bbox"].clone()), (json!([88, 4971]), bbox.clone()));
+    let id = s.download_started_for(&asked[0]).unwrap();
+    // As the app reads it, off the frame: Cancel before the first request asks for nothing.
+    let window = crate::cmd::layer::window_asked_in(&s, &params, asked[0].view_asked()).unwrap();
+    let e = crate::cmd::layer::read_cog_window_until(&window, &AtomicBool::new(true)).err().unwrap();
+    assert!(e.contains(crate::render::rustgis_tiles::cog::STOPPED), "{e}");
+    assert_eq!(sent.load(Relaxed), 0);
+    let read = crate::cmd::layer::read_cog_window_until(&window, &AtomicBool::new(false)).unwrap();
+    assert_eq!(sent.load(Relaxed), 4096 + 360, "the first read and three rows");
+    assert!(s.download_landed_window(id, read));
+    // Added as the app adds it: the range marked on the address, the box in "window".
+    let mut add = json!({"id": id, "url": crate::cmd::layer::ranged_address(&url, (88, 4971)), "name": "Rain"});
+    for k in ["request", "anonymous"] {
+        add[k] = params[k].clone();
+    }
+    add["window"] = json!({"bbox": bbox});
+    let mark = s.notice_mark();
+    s.complete_download(id, &add).unwrap();
+    let layer = s.map().layer_by_name("Rain").filter(|l| l.is_raster()).unwrap();
+    let added = layer.id;
+    let data = layer.raster.as_ref().unwrap().data.clone().unwrap();
+    assert_eq!((data.width, data.height), (2, 3));
+    assert_eq!(data.bands[0].data, vec![2101.0, 2102.0, 2161.0, 2162.0, 2221.0, 2222.0]);
+    let said: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+    assert!(said.contains(&"Rain: read 3 of 40 rows (5 kB of 5 kB)".to_string()), "{said:?}");
+    // The command runs again, and its `layer.addUrl` answers the layer added.
+    let ran = s.poll_plugin_retries();
+    assert_eq!(ran.len(), 1, "{ran:?}");
+    assert_eq!(ran[0].1.as_ref().unwrap()["layer"], json!(added), "{ran:?}");
+    assert!(s.take_url_requests().is_empty() && !s.plugin_retries_waiting());
+    assert_eq!(sent.load(Relaxed), 4096 + 360, "nothing read again");
+    rustgis_plugins::unload("eng-grib-rows-app");
 }
 
 /// Each page of a map series is georeferenced with its own view, not the first page's (#1191).

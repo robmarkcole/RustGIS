@@ -343,8 +343,14 @@ type PageRead = Slot<Result<(Vec<u8>, rustgis_engine::data::raster::Raster), Str
 
 /// See [`UiState::window_reads`].
 #[cfg(not(target_arch = "wasm32"))]
-type WindowRead =
-    (u64, String, Value, Slot<Result<rustgis_engine::cmd::layer::CogWindow, String>>, std::sync::Arc<std::sync::atomic::AtomicBool>);
+type WindowRead = (
+    u64,
+    String,
+    Value,
+    Slot<Result<rustgis_engine::cmd::layer::CogWindow, String>>,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+    Option<std::sync::Arc<rustgis_engine::render::rustgis_tiles::cache::Progress>>,
+);
 
 /// A window's turn to be read off the frame, or `None` once `left` says its project was closed or
 /// its download was cancelled: one waiting for its turn then gives up its place at once, without
@@ -1074,9 +1080,10 @@ pub struct UiState {
     /// that can be read in place are added so, others downloaded (the `ui.addUrl` parameters,
     /// and the answer).
     pub cog_probes: Vec<(Value, Option<u64>, Slot<Result<bool, String>>)>,
-    /// Windows of cloud-optimised GeoTIFFs (`"bbox"`) being read on threads: the session's
-    /// download id, the address, the parameters to add it with, where the read lands, and whether
-    /// its project was closed.
+    /// Windows of cloud-optimised GeoTIFFs (`"bbox"`), and the rows of a box of GRIB records
+    /// (`"bytes"` with `"bbox"`, #3055), being read on threads: the session's download id, the
+    /// address, the parameters to add it with, where the read lands, whether its project was
+    /// closed, and how far a GRIB record's requests have come (a window's tiles aren't counted).
     #[cfg(not(target_arch = "wasm32"))]
     pub window_reads: Vec<WindowRead>,
     /// PDF downloads whose page is being drawn on a thread before it is added (#2336): the
@@ -3973,6 +3980,18 @@ impl RustGisApp {
                 if let Some(Value::Object(window)) = window {
                     o.extend(window);
                 }
+                // The rows of a box of a GRIB record (#3055): the range marked on the address is
+                // its `"bytes"` again, and an address whose name doesn't say GRIB is one by
+                // `"format"`, as it was asked.
+                let marked = o.get("url").and_then(Value::as_str).map(rustgis_engine::render::rustgis_tiles::cache::split_range);
+                if let Some((url, Some((first, last)))) = marked.map(|(u, r)| (u.to_string(), r)) {
+                    let named = rustgis_engine::data::raster::grib::is_grib_name(url.split(['?', '#']).next().unwrap_or(&url));
+                    o.insert("url".into(), json!(url));
+                    o.insert("bytes".into(), json!([first, last]));
+                    if !named {
+                        o.insert("format".into(), json!("grib"));
+                    }
+                }
             }
             finished = again;
             ("layer.addUrl", &finished)
@@ -6341,7 +6360,10 @@ impl RustGisApp {
             let range = rustgis_engine::cmd::layer::byte_range(p, url)?;
             // A window of a cloud-optimised GeoTIFF is read off the frame (below), with no
             // probe: it is refused unless it is one. In the browser the command refuses it.
-            let window = cfg!(not(target_arch = "wasm32")) && p.get("bbox").is_some_and(|v| !v.is_null());
+            // With a range, the rows of the box of a GRIB record are read off the frame the same
+            // way (#3055), the range marked on the address. A `false` box is no box, as the
+            // command reads it.
+            let window = cfg!(not(target_arch = "wasm32")) && p.get("bbox").is_some_and(|v| !v.is_null() && v.as_bool() != Some(false));
             if !window && url.to_ascii_lowercase().split(['?', '#']).next().is_some_and(|u| u.ends_with(".pmtiles")) {
                 let before = self.session.sources.generation;
                 let result = if let Some(id) = claim {
@@ -6695,7 +6717,7 @@ impl RustGisApp {
         {
             let mut read = Vec::new();
             let session = &self.session;
-            self.ui.window_reads.retain(|(id, url, p, slot, left)| match slot.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            self.ui.window_reads.retain(|(id, url, p, slot, left, _)| match slot.lock().unwrap_or_else(|e| e.into_inner()).take() {
                 Some(r) => {
                     read.push((*id, url.clone(), p.clone(), r));
                     false
@@ -6728,7 +6750,7 @@ impl RustGisApp {
         let downloads = self.ui.downloads.iter().map(|d| shown(d.id, &d.url, Some(&d.progress)));
         #[cfg(not(target_arch = "wasm32"))]
         let downloads = downloads
-            .chain(self.ui.window_reads.iter().map(|(id, url, ..)| shown(*id, url, None)))
+            .chain(self.ui.window_reads.iter().map(|(id, url, _, _, _, progress)| shown(*id, url, progress.as_ref())))
             .chain(self.ui.page_reads.iter().map(|(l, ..)| shown(l.id, &l.url, None)))
             .chain(self.ui.page_queue.iter().map(|(l, ..)| shown(l.id, &l.url, None)));
         let mut under_way: Vec<_> = downloads.collect();
@@ -6749,7 +6771,7 @@ impl RustGisApp {
         #[cfg(not(target_arch = "wasm32"))]
         let cancelled = cancelled.or_else(|| {
             let i = self.ui.window_reads.iter().position(|d| d.0 == id)?;
-            let (_, url, p, _, left) = self.ui.window_reads.remove(i);
+            let (_, url, p, _, left, _) = self.ui.window_reads.remove(i);
             left.store(true, std::sync::atomic::Ordering::Relaxed);
             Some((url, p))
         });
@@ -6833,15 +6855,30 @@ impl RustGisApp {
         let land = slot.clone();
         let left = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let leaving = left.clone();
+        // A GRIB record's rows (#3055) are whole requests on this thread: counted, as a download
+        // is, and stopped at their next bytes once cancelled or no longer wanted by their claim
+        // (a window's tiles look at `left` themselves).
+        let rows = rustgis_engine::cmd::layer::asks_rows(p);
+        let progress = rows.then(std::sync::Arc::<rustgis_engine::render::rustgis_tiles::cache::Progress>::default);
+        let counted = progress.clone();
+        let claimed = claim.and_then(|id| self.session.download_still(id)).filter(|_| rows);
+        let watched = left.clone();
+        let wanted: Option<rustgis_engine::render::rustgis_tiles::cache::Still> =
+            rows.then(|| std::sync::Arc::new(move || !watched.load(std::sync::atomic::Ordering::Relaxed)) as _);
         // Its requests stay in the session's diagnostics.
         let diagnostics = self.session.diagnostics.capture();
         let spawned = std::thread::Builder::new().name("cog-window".into()).spawn(move || {
             let _diagnostics = diagnostics.enter();
             let turn = window_turn(&leaving);
             let read = if turn.is_some() {
+                use rustgis_engine::render::rustgis_tiles::cache;
                 // On a thread no command's catch reaches: a bug must not leave it running forever.
                 let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    rustgis_engine::cmd::layer::read_cog_window_until(&asked, &leaving)
+                    cache::with_optional_still(claimed, || {
+                        cache::with_optional_still(wanted, || {
+                            cache::with_progress(counted, || rustgis_engine::cmd::layer::read_cog_window_until(&asked, &leaving))
+                        })
+                    })
                 }));
                 let read = read.unwrap_or_else(|_| Err(tl!("Reading the window failed unexpectedly").to_string()));
                 // Stopped by `left`: said as one given up before its turn is. A read that failed
@@ -6880,7 +6917,7 @@ impl RustGisApp {
         let shown = rustgis_engine::sources::address_in_message(&url);
         self.session.notify(i18n::fmt("Reading {url}…", &[("url", &shown)]), false);
         let id = claim.unwrap_or_else(|| self.session.download_started());
-        self.ui.window_reads.push((id, url, q, slot, left));
+        self.ui.window_reads.push((id, url, q, slot, left, progress));
         Ok(Value::Null)
     }
 
@@ -9169,6 +9206,21 @@ mod record_tests {
         assert_eq!(steps.len(), 1, "{:?}", app.session.notices);
         assert_eq!(steps[0].command, "layer.addUrl");
         assert_eq!(steps[0].params, json!({"url": "https://example.com/data", "name": "W", "bbox": "view", "cellSize": 30, "cog": true}));
+        // The rows of a box of a GRIB record (#3055): the range marked on the address goes back
+        // to "bytes", so the step reads the same rows again.
+        let url = "https://example.com/run/PREC.grb";
+        let ranged = rustgis_engine::cmd::layer::ranged_address(url, (88, 4971));
+        let p = json!({"id": 2, "url": ranged, "name": "Rain", "request": 8, "window": {"bbox": [-51, -23, -39, -14]}});
+        app.record_step("layer.addDownload", &p, None);
+        let steps = app.ws.recording.as_ref().unwrap();
+        assert_eq!(steps[1].params, json!({"url": url, "bytes": [88, 4971], "name": "Rain", "bbox": [-51, -23, -39, -14]}));
+        // An address whose name doesn't say GRIB keeps "format", without which its range is refused.
+        let unnamed = "https://example.com/record?id=2";
+        let p = json!({"id": 3, "url": rustgis_engine::cmd::layer::ranged_address(unnamed, (0, 87)), "window": {"bbox": [10, 59, 11, 60]}});
+        app.record_step("layer.addDownload", &p, None);
+        let step = &app.ws.recording.as_ref().unwrap()[2].params;
+        assert_eq!(step, &json!({"url": unnamed, "bytes": [0, 87], "format": "grib", "bbox": [10, 59, 11, 60]}));
+        assert_eq!(rustgis_engine::cmd::layer::byte_range(step, unnamed), Ok(Some((0, 87))), "replayed, the range is read");
     }
 
     /// `ui.addUrl` with `"bbox"`: a slow server doesn't hold the
@@ -9232,7 +9284,7 @@ mod record_tests {
     fn too_many_windows_under_way_are_refused() {
         let mut app = RustGisApp::with_sample();
         for _ in 0..crate::MAX_WINDOW_READS {
-            app.ui.window_reads.push((0, String::new(), serde_json::Value::Null, Default::default(), Default::default()));
+            app.ui.window_reads.push((0, String::new(), serde_json::Value::Null, Default::default(), Default::default(), None));
         }
         let e = app.run("ui.addUrl", json!({"url": "https://x.org/a.tif?token=hidden-1330", "bbox": [1, 2, 3, 4]})).unwrap_err();
         assert!(e.contains("x.org/a.tif") && e.contains("16 windows") && !e.contains("hidden-1330"), "{e}");
@@ -9304,6 +9356,48 @@ mod record_tests {
             std::thread::sleep(std::time::Duration::from_millis(20)); // test-wait: legacy settling delay after releasing cancelled window reads
         }
         assert!(app.session.map().layer_by_name("Cancelled").is_none());
+    }
+
+    /// The rows of a box of a GRIB record (`"bytes"` with `"bbox"`, #3055) are read off the frame
+    /// as a window is, the range marked on the address: listed with how much of their requests has
+    /// come, and Cancel drops them, said, with nothing added once the server answers after all.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn the_rows_of_a_grib_record_are_read_off_the_frame_and_cancelled() {
+        use std::sync::atomic::Ordering;
+        let _turn = crate::fetching::turn();
+        let slow = crate::fetching::slow_ranges(vec![0; 8192]);
+        slow.open.store(false, Ordering::Relaxed);
+        let mut app = RustGisApp::with_sample();
+        let url = format!("{}/run/PREC.grb", slow.origin);
+        let asked = std::time::Instant::now();
+        let p = json!({"url": url, "bytes": [0, 8191], "bbox": [10.6, 22.7, 12.4, 25.3], "name": "Rows"});
+        app.run("ui.addUrl", p).unwrap();
+        assert!(asked.elapsed() < std::time::Duration::from_secs(5), "asking for it held the frame");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while slow.held.load(Ordering::Relaxed) == 0 {
+            assert!(std::time::Instant::now() < deadline, "no request held");
+            std::thread::sleep(std::time::Duration::from_millis(20)); // test-wait: polling for the held first read
+        }
+        let under_way = app.downloads_under_way();
+        assert_eq!(under_way.len(), 1, "{under_way:?}");
+        assert!(under_way[0].shown.contains("PREC.grb") && under_way[0].progress.is_some(), "{under_way:?}");
+        assert!(app.ui.window_reads[0].1.contains(rustgis_engine::render::rustgis_tiles::cache::RANGE), "{}", app.ui.window_reads[0].1);
+        app.cancel_download(under_way[0].id);
+        assert!(app.ui.window_reads.is_empty() && app.downloads_under_way().is_empty());
+        let said = |n: &rustgis_engine::Notice| n.text.contains("PREC.grb") && n.text.contains("cancelled") && !n.error;
+        assert!(app.session.notices.iter().any(said), "{:?}", app.session.notices);
+        // The server answers after all: the read's thread ends (its turn comes free once it has
+        // landed whatever it read, or given up), and only then is nothing added looked for.
+        slow.open.store(true, Ordering::Relaxed);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while crate::WINDOW_TURN.try_lock().is_err() {
+            assert!(std::time::Instant::now() < deadline, "the cancelled read never ended");
+            std::thread::sleep(std::time::Duration::from_millis(20)); // test-wait: polling for the cancelled read's thread to end
+        }
+        app.poll_data_downloads();
+        assert!(app.ui.window_reads.is_empty() && app.downloads_under_way().is_empty());
+        assert!(app.session.map().layer_by_name("Rows").is_none());
     }
 
     /// Cancel drops a whole file's download as one that failed: said, and not added when its
